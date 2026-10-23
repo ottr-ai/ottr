@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	rmSync,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	loginProviders,
 	providerLogin,
 	redirectUri,
 	shareProviderCredentials,
@@ -311,5 +313,66 @@ describe("signIns and signOut", () => {
 	test("one store on disk (no pin) skips the copy", () => {
 		const only = store();
 		expect(shareProviderCredentials("anthropic", only, only)).toBeNull();
+	});
+});
+
+describe("loginProviders", () => {
+	// A stand-in for the global omp install: an omp file whose directory anchors module
+	// resolution, and a pi-catalog whose exports map serves the compiled `/login` catalog
+	// (rules.json) exactly as the real package ships it.
+	function ompInstall(rules: unknown): string {
+		const root = join(dir, `omp-${crypto.randomUUID()}`);
+		const pkg = join(root, "node_modules/@oh-my-pi/pi-catalog");
+		mkdirSync(join(pkg, "src/compat"), { recursive: true });
+		mkdirSync(join(root, "bin"), { recursive: true });
+		writeFileSync(join(root, "bin/omp"), "");
+		writeFileSync(
+			join(pkg, "package.json"),
+			JSON.stringify({
+				name: "@oh-my-pi/pi-catalog",
+				type: "module",
+				exports: { "./compat/*": "./src/compat/*.ts" },
+			}),
+		);
+		writeFileSync(join(pkg, "src/compat/auth.ts"), "");
+		writeFileSync(
+			join(pkg, "src/compat/rules.json"),
+			typeof rules === "string" ? rules : JSON.stringify(rules),
+		);
+		return join(root, "bin/omp");
+	}
+
+	test("lists omp's /login providers in catalog order, hiding no-login and hidden entries", () => {
+		const bin = ompInstall({
+			auth: {
+				providers: [
+					{
+						id: "anthropic",
+						name: "Anthropic (Claude Pro/Max)",
+						login: { kind: "oauth-code" },
+					},
+					{ id: "deepseek", name: "DeepSeek" }, // no login flow: /login does not offer it
+					{
+						id: "kimi-code",
+						name: "Kimi Code",
+						login: { kind: "paste-code" },
+						showInLoginList: false,
+					},
+					{ id: "zai", name: "Z.AI (GLM Coding Plan)", login: {} },
+				],
+			},
+		});
+		expect(loginProviders(bin)).toEqual([
+			{ id: "anthropic", name: "Anthropic (Claude Pro/Max)" },
+			{ id: "zai", name: "Z.AI (GLM Coding Plan)" },
+		]);
+		// The read is memoized per omp path: the second call serves the same list.
+		expect(loginProviders(bin)).toBe(loginProviders(bin));
+	});
+
+	test("no omp, or a catalog that is not the expected layout, gives an empty list", () => {
+		expect(loginProviders(join(dir, "absent-omp"))).toEqual([]);
+		expect(loginProviders(ompInstall({}))).toEqual([]);
+		expect(loginProviders(ompInstall("{broken"))).toEqual([]);
 	});
 });

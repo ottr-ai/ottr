@@ -112,7 +112,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Running agents | 3 total, 2 per project | **Settings**; empty = no cap |
 | Extra paths per worktree | none | **Settings** |
 | Alate provisioning | off | **Settings → Alate** (see [Alate](#alate)) |
-| Provider sign-in | omp's existing sign-ins | **Settings → Provider sign-in**; sign-ins and quota live on the machine that runs the board |
+| Provider sign-in | omp's existing sign-ins | **Settings → Provider sign-in**: omp's sign-ins and the full provider list its `omp login` offers; sign-ins and quota live on the machine that runs the board |
 | Retro | off | **Settings**, per project: files one retro card after each Done card |
 | Fork research | off | **Settings**, per project: hourly watch of the project's GitHub forks; findings arrive as proposals you accept |
 | Hindsight server | env on compose | **Settings → Hindsight**: URL and API key for omp's memory backend |

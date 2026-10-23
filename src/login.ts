@@ -4,9 +4,9 @@
 // the provider's redirect to localhost reaches the board (compose publishes those ports), the board
 // hands that address to omp itself and sends the browser back to Settings.
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type Subprocess, stripANSI } from "bun";
 
 interface LoginView {
@@ -21,6 +21,72 @@ interface LoginView {
 
 /** omp's provider ids (`omp login --help`): lowercase words joined by hyphens. */
 export const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/** One provider omp's `/login` picker offers. */
+export interface LoginProvider {
+	/** The id `omp login <id>` accepts. */
+	id: string;
+	/** omp's display name for the picker. */
+	name: string;
+}
+
+let loginProviderCache: { path: string; list: LoginProvider[] } | null = null;
+
+/**
+ * Every provider omp's `/login` offers, in omp's display order, read from the installed omp's
+ * compiled auth catalog (pi-catalog's rules.json — the data `/login` is built from, sitting in
+ * the same global install as the `omp` binary this board spawns). Reading the JSON keeps omp's
+ * code out of this process. Empty when no omp install is found or its layout changed; the
+ * provider field then takes typed ids as before.
+ */
+export function loginProviders(
+	ompPath: string = Bun.which("omp") ?? "",
+): LoginProvider[] {
+	if (loginProviderCache?.path === ompPath) return loginProviderCache.list;
+	// The omp binary is a symlink into its global install; pi-catalog lives in the same
+	// node_modules tree, and the package's own exports map absorbs path moves.
+	let list: LoginProvider[] = [];
+	try {
+		const catalog = dirname(
+			Bun.resolveSync(
+				"@oh-my-pi/pi-catalog/compat/auth",
+				dirname(realpathSync(ompPath)),
+			),
+		);
+		const rules: unknown = JSON.parse(
+			readFileSync(join(catalog, "rules.json"), "utf8"),
+		);
+		let providers: unknown[] = [];
+		if (typeof rules === "object" && rules !== null && "auth" in rules) {
+			const auth: unknown = rules.auth;
+			if (
+				typeof auth === "object" &&
+				auth !== null &&
+				"providers" in auth &&
+				Array.isArray(auth.providers)
+			)
+				providers = auth.providers;
+		}
+		// omp's own filter (pi-ai registry): a login flow, and not hidden from the picker.
+		list = providers.flatMap((p): LoginProvider[] => {
+			if (typeof p !== "object" || p === null || !("id" in p) || !("name" in p))
+				return [];
+			const { id, name } = p;
+			const login = "login" in p ? p.login : undefined;
+			const hidden = "showInLoginList" in p ? p.showInLoginList : undefined;
+			return typeof id === "string" &&
+				typeof name === "string" &&
+				!!login &&
+				hidden !== false
+				? [{ id, name }]
+				: [];
+		});
+	} catch {
+		// No omp on PATH, or an unexpected catalog: stay empty rather than half-guessing.
+	}
+	loginProviderCache = { path: ompPath, list };
+	return list;
+}
 
 const OUTPUT_CAP = 32_000;
 

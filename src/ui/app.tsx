@@ -8713,28 +8713,18 @@ function GithubTokenSection() {
 	);
 }
 
-/** Providers omp signs in to through a browser; the field takes any id `omp login` knows. */
-const LOGIN_PROVIDERS: ReadonlyArray<readonly [id: string, name: string]> = [
-	["anthropic", "Anthropic (Claude Pro/Max)"],
-	["openai-codex", "ChatGPT Plus/Pro (Codex)"],
-	["google-gemini-cli", "Google Cloud Code Assist (Gemini CLI)"],
-	["google-antigravity", "Antigravity"],
-	["github-copilot", "GitHub Copilot"],
-	["zai-coding-plan", "Z.AI (GLM Coding Plan)"],
-	["kimi-code", "Kimi Code"],
-];
-
-const providerName = (id: string): string =>
-	LOGIN_PROVIDERS.find(([p]) => p === id)?.[1] ?? id;
-
 /** A running or finished `omp login` as the server reports it; `ok` stays null until omp exits. */
 type LoginView = { provider: string; output: string; ok: boolean | null };
 /** One provider in omp's credential store; inactive: omp disabled it, e.g. after a failed refresh. */
 type SignIn = { provider: string; kind: string; active: boolean };
+/** One provider omp's `/login` picker offers, as the server reads it from the installed omp. */
+type LoginProvider = { id: string; name: string };
 type SignInState = {
 	signIns: SignIn[] | null;
 	error: string | null;
 	pending: LoginView | null;
+	/** Empty when the machine has no omp install to read; the field then takes typed ids. */
+	providers: LoginProvider[];
 };
 
 /** The provider's sign-in page: the first https URL omp prints; later ones are its local shortcuts. */
@@ -8749,6 +8739,9 @@ function ProviderLoginSection() {
 	const [error, setError] = useState<string | null>(null);
 	const act = useBusy();
 	const quota = useQuota();
+	const providers = state?.providers ?? [];
+	const providerName = (id: string): string =>
+		providers.find((p) => p.id === id)?.name ?? id;
 	const pending = state?.pending ?? null;
 	const waiting = pending !== null && pending.ok === null;
 	const load = useCallback(async (): Promise<void> => {
@@ -8984,9 +8977,9 @@ function ProviderLoginSection() {
 								required
 							/>
 							<datalist id="login-providers">
-								{LOGIN_PROVIDERS.map(([id, name]) => (
-									<option key={id} value={id}>
-										{name}
+								{providers.map((p) => (
+									<option key={p.id} value={p.id}>
+										{p.name}
 									</option>
 								))}
 							</datalist>

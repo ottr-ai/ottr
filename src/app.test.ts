@@ -3128,6 +3128,35 @@ describe("add-project folder-name collisions (R1-5)", () => {
 	});
 });
 
+describe("GET /api/provider-login", () => {
+	test("carries the provider list omp's /login offers, next to the stored sign-ins", async () => {
+		const m = mount({});
+		const res = await m.call("/api/provider-login");
+		expect(res.status).toBe(200);
+		const b: unknown = await res.json();
+		expect(typeof b === "object" && b !== null && "providers" in b).toBe(true);
+		if (typeof b !== "object" || b === null || !("providers" in b)) return;
+		const providers = b.providers;
+		// The machine's omp install decides the ids; the route only pins the shape.
+		expect(Array.isArray(providers)).toBe(true);
+		if (!Array.isArray(providers)) return;
+		for (const p of providers) {
+			expect(
+				typeof p === "object" &&
+					p !== null &&
+					"id" in p &&
+					typeof p.id === "string",
+			).toBe(true);
+			expect(
+				typeof p === "object" &&
+					p !== null &&
+					"name" in p &&
+					typeof p.name === "string",
+			).toBe(true);
+		}
+	});
+});
+
 describe("GET /api/gh-status", () => {
 	test("reports the authed user, the projects dir, and a free name", async () => {
 		const gh: GhFn = async (args) =>

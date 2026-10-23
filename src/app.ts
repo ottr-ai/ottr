@@ -70,6 +70,7 @@ import {
 } from "./images.ts";
 import {
 	agentDir,
+	loginProviders,
 	PROVIDER_ID,
 	providerLogin,
 	type SignIn,
@@ -3248,7 +3249,12 @@ export function createApp(deps: AppDeps) {
 					} catch (err) {
 						error = `cannot read omp's sign-ins: ${errmsg(err)}`;
 					}
-					return json({ signIns: list, error, pending: logins.pending() });
+					return json({
+						signIns: list,
+						error,
+						pending: logins.pending(),
+						providers: loginProviders(),
+					});
 				}),
 			POST: (req) =>
 				api(req, async () => {
