@@ -313,6 +313,27 @@ describe("alateHint", () => {
 		).toBe("up to date");
 		expect(alateHint({ state: "down" })).toBe("server unreachable");
 	});
+
+	test("a running provision is named and replaces the pending flag while it consumes the import", () => {
+		expect(
+			alateHint({
+				state: "ok",
+				version: "1.2.3",
+				behind: false,
+				pending: true,
+				running: true,
+			}),
+		).toBe("version 1.2.3 · provision running");
+		expect(
+			alateHint({
+				state: "ok",
+				version: null,
+				behind: false,
+				pending: true,
+				running: true,
+			}),
+		).toBe("provision running");
+	});
 });
 
 describe("AskBlock", () => {

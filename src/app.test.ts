@@ -1200,6 +1200,31 @@ describe("alate routes", () => {
 		await post("/api/alate", { url: alateUrl });
 	});
 
+	test("a provision outliving the board's wait is 202 running, not 502 failed", async () => {
+		// The mapping under test is the catch: AbortSignal.timeout rejects with a
+		// TimeoutError when the bound fires while alate is still provisioning.
+		// Reject like that directly instead of waiting 110 s.
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			if (new URL(String(input)).pathname === "/provision") {
+				const err = new Error("The operation was aborted due to timeout");
+				err.name = "TimeoutError";
+				throw err;
+			}
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			const res = await post("/api/alate/provision", {});
+			expect(res.status).toBe(202);
+			expect(await res.json()).toEqual({ running: true });
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	test("a redirecting alate never forwards the bearer; the 3xx is an error", async () => {
 		// The host the redirect points at: it must never see a request at all,
 		// because both authenticated paths refuse to follow the redirect.
@@ -1915,6 +1940,7 @@ describe("alate provision trigger (U9)", () => {
 	// Fake provider: /health reports a mutable pending flag; /provision flips it like the
 	// real server and can be told to fail.
 	let pending = true;
+	let running = false;
 	let provisionStatus = 200;
 	let provisions = 0;
 	let lastAuth: string | null = null;
@@ -1930,7 +1956,7 @@ describe("alate provision trigger (U9)", () => {
 				pending = false;
 				return Response.json({ ok: true, results: [] });
 			}
-			return Response.json({ ok: true, pending });
+			return Response.json({ ok: true, pending, running });
 		},
 	});
 	afterAll(() => {
@@ -1992,17 +2018,61 @@ describe("alate provision trigger (U9)", () => {
 		tickStore.updateTask(t.id, { state: "idle" });
 	});
 
-	test("waits an hour after a failure and shows the error", async () => {
-		provisionStatus = 500;
+	test("a provision already running on alate defers the trigger", async () => {
+		// alate single-flights provisions: a run still executing there (its board-side
+		// wait may have timed out) must not be re-triggered into a 409 that would be
+		// recorded as a failure.
+		running = true;
+		await m.app.alateProvisionTick();
+		expect(provisions).toBe(1);
+		const v = (await (await m.call("/api/alate")).json()) as {
+			lastProvisionError: string | null;
+		};
+		expect(v.lastProvisionError).toBe(null);
+		running = false;
+	});
+
+	test("the trigger's own provision outliving the wait records no failure or backoff", async () => {
+		// Same mapping as the manual route: the TimeoutError from the transport bound
+		// means delivered and accepted, so neither an error nor the hour backoff applies.
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			if (new URL(String(input)).pathname === "/provision") {
+				const err = new Error("The operation was aborted due to timeout");
+				err.name = "TimeoutError";
+				throw err;
+			}
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			await m.app.alateProvisionTick();
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+		const v = (await (await m.call("/api/alate")).json()) as {
+			lastProvisionError: string | null;
+		};
+		expect(v.lastProvisionError).toBe(null);
+		// No backoff either: the next tick attempts again and the fake flips pending.
 		await m.app.alateProvisionTick();
 		expect(provisions).toBe(2);
+	});
+
+	test("waits an hour after a failure and shows the error", async () => {
+		provisionStatus = 500;
+		pending = true; // the timed-out attempt above consumed the earlier import
+		await m.app.alateProvisionTick();
+		expect(provisions).toBe(3);
 		const v = (await (await m.call("/api/alate")).json()) as {
 			lastProvisionError: string | null;
 		};
 		expect(v.lastProvisionError).toBe("nope");
 		// Backoff: pending is still true and the board is idle, yet no retry happens.
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(2);
+		expect(provisions).toBe(3);
 		// A manual success clears the recorded error.
 		provisionStatus = 200;
 		pending = false;
@@ -2019,7 +2089,7 @@ describe("alate provision trigger (U9)", () => {
 		const t = tickStore.createTask("busy again");
 		tickStore.updateTask(t.id, { state: "running" });
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(3); // gated: no provision attempt
+		expect(provisions).toBe(4); // gated: no provision attempt
 		const state = (await (await m.call("/api/state")).json()) as {
 			alatePendingSince: number | null;
 		};
@@ -2041,6 +2111,33 @@ describe("alate provision trigger (U9)", () => {
 			alatePendingSince: number | null;
 		};
 		expect(state.alatePendingSince).toBe(null);
+	});
+
+	test("a completed import dates a recorded trigger failure", async () => {
+		// Own mount: the describe's instance sits in the failure backoff from the test
+		// above, and this mapping needs a live trigger to record the error first.
+		const m2 = mount({ projects: tickProjects });
+		const cfg = await m2.call("/api/alate", {
+			url: fake.url.origin,
+			key: "tick_secret",
+		});
+		expect(cfg.status).toBe(200);
+		provisionStatus = 500;
+		pending = true;
+		await m2.app.alateProvisionTick();
+		const v = (await (await m2.call("/api/alate")).json()) as {
+			lastProvisionError: string | null;
+		};
+		expect(v.lastProvisionError).toBe("nope");
+		// The import completes elsewhere (alate's own dashboard): the health section
+		// of the next tick runs ahead of the backoff gate and dates the failure.
+		provisionStatus = 200;
+		pending = false;
+		await m2.app.alateProvisionTick();
+		const after = (await (await m2.call("/api/alate")).json()) as {
+			lastProvisionError: string | null;
+		};
+		expect(after.lastProvisionError).toBe(null);
 	});
 });
 

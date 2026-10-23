@@ -843,9 +843,12 @@ export function createApp(deps: AppDeps) {
 			};
 		return { ok: true, body };
 	}
-	/** POST <alate.url>/provision shared by the route and the U9 trigger, with its in-flight guard. */
+	/** POST <alate.url>/provision shared by the route and the U9 trigger, with its in-flight guard.
+	 *  `running: true` marks a delivered provision that outlived the transport bound: accepted
+	 *  by alate's single-flight guard and still executing there — never a failure. */
 	async function provisionNow(): Promise<
-		{ ok: true; body: unknown } | { ok: false; status: number; error: string }
+		| { ok: true; body: unknown }
+		| { ok: false; status: number; error: string; running?: true }
 	> {
 		if (alate.url === null)
 			return {
@@ -873,6 +876,17 @@ export function createApp(deps: AppDeps) {
 					signal: AbortSignal.timeout(110_000),
 				});
 			} catch (err) {
+				// AbortSignal.timeout rejects with TimeoutError: the POST was delivered
+				// and alate accepted it (single-flight), so the scripts are running —
+				// only this client's wait ended. Report that, never failure. A fast
+				// connect failure still lands in the 502 below.
+				if ((err as Error).name === "TimeoutError")
+					return {
+						ok: false,
+						status: 202,
+						error: "provision still running on alate",
+						running: true,
+					};
 				return {
 					ok: false,
 					status: 502,
@@ -916,6 +930,9 @@ export function createApp(deps: AppDeps) {
 		if (h.ok) {
 			alatePendingSince =
 				h.body.pending === true ? (alatePendingSince ?? Date.now()) : null;
+			// A provision that completed (here, by the manual button, or from alate's
+			// own dashboard) dates any recorded attempt failure: the import is gone.
+			if (h.body.pending !== true) alateProvisionError = null;
 		}
 		if (alate.key === null) return;
 		if (Date.now() < alateBackoffUntil) return;
@@ -926,7 +943,12 @@ export function createApp(deps: AppDeps) {
 			return;
 		}
 		if (h.body.pending !== true) return;
+		// alate single-flights provisions: one still executing means an earlier
+		// attempt (whose wait may have timed out) is mid-flight — wait it out instead
+		// of recording its 409 as a failure.
+		if (h.body.running === true) return;
 		const r = await provisionNow();
+		if (!r.ok && r.running) return; // delivered and accepted; the outcome arrives via health
 		alateProvisionError = r.ok ? null : r.error;
 		if (!r.ok) alateBackoffUntil = Date.now() + 60 * 60_000;
 	}
@@ -3141,6 +3163,9 @@ export function createApp(deps: AppDeps) {
 					// A manual success means the provider no longer holds the import, so a
 					// recorded trigger failure is stale.
 					if (r.ok) alateProvisionError = null;
+					// Delivered past the transport bound: 202 Accepted, not an error — the
+					// health poll delivers the outcome.
+					if (!r.ok && r.running) return json({ running: true }, 202);
 					return r.ok ? json(r.body, 200) : json({ error: r.error }, r.status);
 				}),
 		},

@@ -9137,18 +9137,27 @@ type AlateHealth = {
 	version?: unknown;
 	update?: { behind?: unknown } | undefined;
 	pending?: unknown;
+	running?: unknown;
 };
 /** Probe outcome for the connected alate instance. */
 type AlateHealthState =
-	| { state: "ok"; version: string | null; behind: boolean; pending: boolean }
+	| {
+			state: "ok";
+			version: string | null;
+			behind: boolean;
+			pending: boolean;
+			running?: boolean;
+	  }
 	| { state: "down" };
 
-/** One-line hint for the connected alate instance: its version when the server reports one, else its data-repo update state; names a pending import when one waits. */
+/** One-line hint for the connected alate instance: its version when the server reports one, else its data-repo update state; names a pending import or a running provision. */
 export function alateHint(h: AlateHealthState): string {
 	if (h.state === "down") return "server unreachable";
 	const flags = [
+		h.running === true ? "provision running" : null,
 		h.behind ? "update available" : null,
-		h.pending ? "import pending" : null,
+		// While the provision consumes the import, "pending" adds nothing.
+		h.pending && h.running !== true ? "import pending" : null,
 	].filter((f) => f !== null);
 	if (h.version !== null)
 		return `version ${h.version}${flags.length > 0 ? ` · ${flags.join(" · ")}` : ""}`;
@@ -9193,6 +9202,9 @@ function AlateSection() {
 	>([]);
 	const save = useBusy();
 	const prov = useBusy();
+	// True while a provision is known to run on alate (the board's HTTP wait ended at
+	// its transport bound); the health probe below, not the abandoned wait, reports it.
+	const [awaiting, setAwaiting] = useState(false);
 	const loadHealth = useCallback(
 		(u: string, isLive: () => boolean = () => true) => {
 			if (u === "") {
@@ -9208,6 +9220,7 @@ function AlateSection() {
 						version: typeof h.version === "string" ? h.version : null,
 						behind: h.update?.behind === true,
 						pending: h.pending === true,
+						running: h.running === true,
 					});
 				})
 				.catch(() => {
@@ -9216,6 +9229,22 @@ function AlateSection() {
 		},
 		[],
 	);
+	// Follow a known in-flight provision with the health probe until it converges.
+	useEffect(() => {
+		if (!awaiting) return;
+		const iv = setInterval(() => loadHealth(conn), 15_000);
+		return () => clearInterval(iv);
+	}, [awaiting, conn, loadHealth]);
+	useEffect(() => {
+		if (!awaiting || health === null || health.state !== "ok") return;
+		if (health.running) return;
+		setAwaiting(false);
+		setStatus(
+			health.pending
+				? "Provisioning ended, but alate still holds an unprovisioned import — check the alate dashboard for script output."
+				: "Provisioning finished successfully.",
+		);
+	}, [awaiting, health]);
 	useEffect(() => {
 		let live = true;
 		fetch("/api/alate")
@@ -9275,21 +9304,37 @@ function AlateSection() {
 			try {
 				const res = await post<{
 					ok: boolean;
-					results: Array<{
+					running?: boolean;
+					results?: Array<{
 						script: string;
 						code: number;
 						output: string;
 						truncated: boolean;
 					}>;
 				}>("/api/alate/provision", {});
-				setResults(res.results);
+				if (res.running === true) {
+					// 202 from the board: the POST was delivered and alate accepted it,
+					// but the board's wait hit its transport bound. Not a failure — the
+					// health probe follows the run until it converges. Drop the probe
+					// snapshot taken before the click: it predates the run, so the
+					// convergence effect must wait for the fresh read below.
+					setHealth(null);
+					setStatus(
+						"Provisioning is still running on the alate server; the hint above follows it.",
+					);
+					setAwaiting(true);
+					loadHealth(conn);
+					return true;
+				}
+				const rows = res.results ?? [];
+				setResults(rows);
 				loadHealth(conn);
 				if (res.ok) setLastErr(null);
-				const failed = res.results.filter((r) => r.code !== 0);
+				const failed = rows.filter((r) => r.code !== 0);
 				setStatus(
 					failed.length === 0
-						? `Provisioned ${res.results.length} script${res.results.length === 1 ? "" : "s"} successfully.`
-						: `Provisioning failed: ${failed.length} of ${res.results.length} script${res.results.length === 1 ? "" : "s"} exited non-zero.`,
+						? `Provisioned ${rows.length} script${rows.length === 1 ? "" : "s"} successfully.`
+						: `Provisioning failed: ${failed.length} of ${rows.length} script${rows.length === 1 ? "" : "s"} exited non-zero.`,
 				);
 				return res.ok;
 			} catch (err) {
@@ -9374,11 +9419,13 @@ function AlateSection() {
 					<button
 						type="button"
 						onClick={provision}
-						disabled={prov.busy}
+						disabled={prov.busy || awaiting}
 						className={`primary${health?.state === "ok" && health.pending ? " attention" : ""}`}
 					>
-						{prov.busy && <span className="spinner" aria-hidden="true" />}
-						Provision now
+						{(prov.busy || awaiting) && (
+							<span className="spinner" aria-hidden="true" />
+						)}
+						{awaiting ? "Provisioning…" : "Provision now"}
 					</button>
 				</div>
 			</form>
