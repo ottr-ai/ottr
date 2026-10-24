@@ -1958,6 +1958,26 @@ a.release:hover {
 	border-style: solid;
 	color: var(--text);
 }
+/* Done lane "Show more": a quiet full-width button under the last page of cards. */
+.lane-more {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	width: 100%;
+	margin-top: 2px;
+	padding: 5px;
+	font-size: 11px;
+	color: var(--dim);
+	background: transparent;
+	border: 1px dashed var(--line-soft);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.lane-more:hover {
+	border-style: solid;
+	color: var(--text);
+}
 /* Boundary between pinned unread answers and the landing order below:
    generous margins against the 6px card gap give the two groups separation. */
 .lane-divider {

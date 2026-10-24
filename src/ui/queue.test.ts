@@ -1,6 +1,7 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
+	donePage,
 	dropBeforeId,
 	laneCounts,
 	laneOrder,
@@ -280,4 +281,37 @@ test("reorderIds splices a within-column drop into the global queue order", () =
 	]);
 	// A running card is not in the queue, so there is nothing to reorder.
 	expect(reorderIds(tasks, "in_progress", "t2", "t1")).toBeNull();
+});
+
+describe("donePage", () => {
+	const n = (count: number): string[] =>
+		Array.from({ length: count }, (_, i) => `t${i}`);
+	const noUnread = (): boolean => false;
+
+	test("a short lane stays whole with nothing hidden", () => {
+		const tasks = n(20);
+		expect(donePage(tasks, noUnread, 20)).toEqual({
+			shown: tasks,
+			hidden: 0,
+		});
+	});
+
+	test("a long lane keeps the newest page and counts the rest", () => {
+		const page = donePage(n(45), noUnread, 20);
+		expect(page.shown).toEqual(n(20));
+		expect(page.hidden).toBe(25);
+	});
+
+	test("the cut grows to cover the last unread answer", () => {
+		const tasks = n(45);
+		const page = donePage(tasks, (t) => t === "t30", 20);
+		expect(page.shown).toEqual(n(31));
+		expect(page.hidden).toBe(14);
+	});
+
+	test("an unread answer inside the page changes nothing", () => {
+		const page = donePage(n(45), (t) => t === "t5", 20);
+		expect(page.shown).toEqual(n(20));
+		expect(page.hidden).toBe(25);
+	});
 });

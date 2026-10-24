@@ -279,6 +279,39 @@ describe("LaneCol backlog divider", () => {
 		expect(html).toContain("Nothing landed yet.");
 		expect(html).not.toContain("Backlog");
 	});
+
+	test("the done lane shows its Show more button only with hidden cards", () => {
+		const done = [
+			cardFixture({ id: "t1", stage: "done", state: "idle" }),
+			cardFixture({ id: "t2", stage: "done", state: "idle" }),
+		];
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={done}
+				more={25}
+				onMore={() => {}}
+			/>,
+		);
+		expect(html).toContain("lane-more");
+		expect(html).toContain("Show more");
+		expect(html).toContain(">25</span>");
+		const none = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={done}
+				more={0}
+				onMore={() => {}}
+			/>,
+		);
+		expect(none).not.toContain("lane-more");
+		const defaultOff = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={done} />,
+		);
+		expect(defaultOff).not.toContain("lane-more");
+	});
 });
 
 describe("alateHint", () => {

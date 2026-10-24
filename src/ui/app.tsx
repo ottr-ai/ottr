@@ -93,6 +93,7 @@ import {
 	taskEntryKey,
 } from "./notify.ts";
 import {
+	donePage,
 	dropBeforeId,
 	laneCounts,
 	laneOrder,
@@ -2405,6 +2406,9 @@ function ArchReviewDialog({
 	);
 }
 
+/** Done lane page size: the cards shown before "Show more", and the step each click adds. */
+const DONE_PAGE = 20;
+
 /** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
 function ProjectBoard({
 	project,
@@ -2448,6 +2452,8 @@ function ProjectBoard({
 	const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 	// Done lane layout: flat newest-done-first list (default) or topic sections.
 	const [grouped, setGrouped] = useState(false);
+	// Done lane lazy load: how many read cards render before "Show more" appends a page.
+	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
 	// The setup wizard, opened from the checklist's Open setup button.
 	const [setupOpen, setSetupOpen] = useState(false);
 	/** One settings patch from the checklist row buttons; the board's project state refreshes. */
@@ -2766,9 +2772,19 @@ function ProjectBoard({
 						);
 					}
 					// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
-					const col = c.key === "done" ? filtered : laneOrder(filtered);
 					const unread = (t: TaskCard): boolean =>
 						t.answered && !seenAnswers.has(t.id);
+					let col = c.key === "done" ? filtered : laneOrder(filtered);
+					// Done lazy-loads: the newest page renders and "Show more" appends the next page;
+					// a search shows every match. Unread answers always stay above the cut.
+					// ponytail: the state payload still carries every card; paginate /api/state
+					// instead if boards grow into the thousands of done cards.
+					let doneHidden = 0;
+					if (c.key === "done" && q === "") {
+						const page = donePage(col, unread, doneLimit);
+						col = page.shown;
+						doneHidden = page.hidden;
+					}
 					// Empty search only: the done lane groups into topic sections under sticky heads.
 					const doneGroups =
 						c.key === "done" && q === "" && grouped
@@ -2847,12 +2863,16 @@ function ProjectBoard({
 									</span>
 								)}
 								<span className={q === "" ? "count" : "count filtered"}>
-									{q === "" ? col.length : `${col.length}/${count.total}`}
+									{q === "" && doneHidden === 0
+										? col.length
+										: `${col.length}/${count.total}`}
 								</span>
 							</h2>
 							<LaneCol
 								stage={c.key}
 								tasks={col}
+								more={c.key === "done" ? doneHidden : 0}
+								onMore={() => setDoneLimit((n) => n + DONE_PAGE)}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
 								// joined the lane's own list and the search filter already applied.
 								parked={
@@ -3516,6 +3536,8 @@ export function LaneCol({
 	parked,
 	parkedTotal,
 	onAddDraft,
+	more = 0,
+	onMore,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
@@ -3525,6 +3547,9 @@ export function LaneCol({
 	parkedTotal?: number;
 	/** Todo lane only: opens the draft mask from the backlog row's Add draft button. */
 	onAddDraft?: () => void;
+	/** Done lane only: cards hidden behind the "Show more" button; 0 renders no button. */
+	more?: number;
+	onMore?: () => void;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
 	/** Done lane only: topic sections to render instead of the flat landing order. */
@@ -3815,6 +3840,17 @@ export function LaneCol({
 							pending?.before === t.id ? slot : null,
 							card(t),
 						])}
+			{more > 0 && onMore && (
+				<button
+					type="button"
+					className="lane-more"
+					onClick={onMore}
+					title="Show older done cards"
+				>
+					Show more
+					<span className="topic-count">{more}</span>
+				</button>
+			)}
 			{parked != null && (
 				<>
 					<hr className="lane-divider" />
