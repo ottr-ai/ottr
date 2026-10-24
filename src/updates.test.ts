@@ -6,14 +6,9 @@ import { GlobalStore } from "./globalStore.ts";
 import fc from "./test/properties.ts";
 import {
 	addSkip,
-	dropPendingDecisions,
-	enqueueDecision,
-	hiddenUpdateIds,
-	loadFiledApprovals,
-	loadPendingDecisions,
 	loadSkips,
 	mapRepo,
-	migrateSkipsToPending,
+	migratePendingToSkips,
 	planUpdatesPush,
 	updatePrompt,
 	validateUpdates,
@@ -179,142 +174,31 @@ describe("skips", () => {
 });
 
 describe("update decisions", () => {
-	const at = "2026-10-16T08:00:00Z";
-	const envelope = (extra: unknown): unknown => ({
-		checkedAt: "2026-10-16T08:00:00Z",
-		updates: [],
-		decisions: extra,
-	});
-
-	test("an absent decisions map yields an empty map and no drops", () => {
+	test("a provider decisions map is ignored, not an envelope error", () => {
 		const v = validateUpdates({
 			checkedAt: "2026-10-16T08:00:00Z",
 			updates: [],
+			decisions: 7,
 		});
-		expect(v!.decisions).toEqual({});
-		expect(v!.droppedDecisions).toBe(0);
+		expect(v).not.toBeNull();
+		expect(v!.updates).toEqual([]);
 	});
 
-	test("parses a well-formed decisions map, keeping propose", () => {
-		const v = validateUpdates(
-			envelope({
-				"rtk@v1.2.3": {
-					decision: "approved",
-					at,
-					by: "ottr-board",
-					propose: true,
-				},
-				"skills@abc": { decision: "skipped", at, by: "hand" },
-			}),
-		);
-		expect(v!.decisions).toEqual({
-			"rtk@v1.2.3": {
-				decision: "approved",
-				at,
-				by: "ottr-board",
-				propose: true,
-			},
-			"skills@abc": { decision: "skipped", at, by: "hand" },
-		});
-		expect(v!.droppedDecisions).toBe(0);
-	});
-
-	test("drops bad entries, counts them, and keeps good ones", () => {
-		const v = validateUpdates(
-			envelope({
-				good: { decision: "approved", at, by: "hand" },
-				badDecision: { decision: "deferred", at, by: "hand" },
-				badBy: { decision: "approved", at, by: "ghost" },
-				badAt: { decision: "approved", at: "yesterday", by: "hand" },
-				badPropose: { decision: "approved", at, by: "hand", propose: false },
-				notAnObject: 7,
-			}),
-		);
-		expect(Object.keys(v!.decisions)).toEqual(["good"]);
-		expect(v!.droppedDecisions).toBe(5);
-	});
-
-	test("a non-object decisions map makes the whole envelope bad", () => {
-		expect(validateUpdates(envelope(7))).toBeNull();
-		expect(validateUpdates(envelope(["x"]))).toBeNull();
-		expect(validateUpdates(envelope(null))).toBeNull();
-	});
-
-	test("caps decisions at 500 entries", () => {
-		const map: Record<string, unknown> = {};
-		for (let i = 0; i < 505; i++)
-			map[`id-${i}`] = { decision: "skipped", at, by: "hand" };
-		const v = validateUpdates(envelope(map));
-		expect(Object.keys(v!.decisions).length).toBe(500);
-		expect(v!.droppedDecisions).toBe(5);
-	});
-
-	test("pending queue round-trips, replaces same-id entries, and survives a reopen", () => {
-		const a = GlobalStore.open(join(tmp, "decisions"));
-		expect(loadPendingDecisions(a)).toEqual([]);
-		enqueueDecision(a, { id: "rtk@v1", decision: "approved" });
-		enqueueDecision(a, { id: "rtk@v1", decision: "skipped", propose: true });
-		enqueueDecision(a, { id: "skills@abc", decision: "skipped" });
-		expect(loadPendingDecisions(a)).toEqual([
-			{ id: "rtk@v1", decision: "skipped", propose: true },
-			{ id: "skills@abc", decision: "skipped" },
-		]);
-		a.close();
-		const b = GlobalStore.open(join(tmp, "decisions"));
-		expect(loadPendingDecisions(b)).toEqual([
-			{ id: "rtk@v1", decision: "skipped", propose: true },
-			{ id: "skills@abc", decision: "skipped" },
-		]);
-		dropPendingDecisions(b, ["rtk@v1", "nope"]);
-		expect(loadPendingDecisions(b)).toEqual([
-			{ id: "skills@abc", decision: "skipped" },
-		]);
-		b.close();
-	});
-
-	test("migrateSkipsToPending moves legacy skips and empties them, idempotently", () => {
+	test("migratePendingToSkips moves queued skips into updateSkips and empties the queue", () => {
 		const a = GlobalStore.open(join(tmp, "migrate"));
-		addSkip(a, "rtk@v1.2.3");
-		addSkip(a, "skills@abc");
-		migrateSkipsToPending(a);
-		expect(loadPendingDecisions(a)).toEqual([
-			{ id: "rtk@v1.2.3", decision: "skipped" },
-			{ id: "skills@abc", decision: "skipped" },
-		]);
-		expect(loadSkips(a)).toEqual([]);
-		migrateSkipsToPending(a);
-		expect(loadPendingDecisions(a)).toEqual([
-			{ id: "rtk@v1.2.3", decision: "skipped" },
-			{ id: "skills@abc", decision: "skipped" },
-		]);
-		a.close();
-	});
-
-	test("migrateSkipsToPending is a no-op without legacy skips", () => {
-		const a = GlobalStore.open(join(tmp, "migrate-empty"));
-		migrateSkipsToPending(a);
-		expect(loadPendingDecisions(a)).toEqual([]);
-		a.close();
-	});
-
-	test("hiddenUpdateIds unions legacy skips, pending skips, and provider skips", () => {
-		const a = GlobalStore.open(join(tmp, "hidden"));
 		addSkip(a, "legacy@1");
-		enqueueDecision(a, { id: "pending-skip@1", decision: "skipped" });
-		enqueueDecision(a, { id: "pending-approve@1", decision: "approved" });
-		expect(
-			hiddenUpdateIds(a, {
-				"provider-skip@1": { decision: "skipped", at, by: "hand" },
-			}),
-		).toEqual(new Set(["legacy@1", "pending-skip@1", "provider-skip@1"]));
-		a.close();
-	});
-
-	test("loadFiledApprovals reads the persisted id set", () => {
-		const a = GlobalStore.open(join(tmp, "filed"));
-		expect(loadFiledApprovals(a)).toEqual([]);
-		a.set("filedApprovals", ["rtk@v1", 7, "skills@abc"]);
-		expect(loadFiledApprovals(a)).toEqual(["rtk@v1", "skills@abc"]);
+		a.set("updateDecisionsPending", [
+			{ id: "rtk@v1.2.3", decision: "skipped" },
+			{ id: "skills@abc", decision: "skipped", propose: true },
+			{ id: "approved@1", decision: "approved" },
+			"junk",
+		]);
+		migratePendingToSkips(a);
+		expect(loadSkips(a)).toEqual(["legacy@1", "rtk@v1.2.3", "skills@abc"]);
+		expect(a.get<unknown[]>("updateDecisionsPending")).toEqual([]);
+		// Idempotent: a second run changes nothing.
+		migratePendingToSkips(a);
+		expect(loadSkips(a)).toEqual(["legacy@1", "rtk@v1.2.3", "skills@abc"]);
 		a.close();
 	});
 });

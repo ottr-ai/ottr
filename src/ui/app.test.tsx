@@ -147,34 +147,18 @@ describe("UpdateRowLine", () => {
 		expect(html).toContain(">Skip</button>");
 	});
 
-	test("decision chips: pending push, approved, or none", () => {
-		const base = {
-			act: async () => true,
-			card: null,
-			selected: false,
-			onToggle: () => {},
-			openTask: () => {},
-		} as const;
-		const pending = renderToStaticMarkup(
+	test("a plain row renders no decision chip", () => {
+		const html = renderToStaticMarkup(
 			<UpdateRowLine
-				{...base}
-				row={{ ...qualifiedRow, decisionPending: true }}
+				row={qualifiedRow}
+				act={async () => true}
+				card={null}
+				selected={false}
+				onToggle={() => {}}
+				openTask={() => {}}
 			/>,
 		);
-		expect(pending).toContain("updates-decision");
-		expect(pending).toContain("pending push");
-		const approved = renderToStaticMarkup(
-			<UpdateRowLine
-				{...base}
-				row={{ ...qualifiedRow, decision: "approved" }}
-			/>,
-		);
-		expect(approved).toContain("updates-decision");
-		expect(approved).toContain("approved");
-		const none = renderToStaticMarkup(
-			<UpdateRowLine {...base} row={qualifiedRow} />,
-		);
-		expect(none).not.toContain("updates-decision");
+		expect(html).not.toContain("updates-decision");
 	});
 });
 

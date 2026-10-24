@@ -615,10 +615,6 @@ export interface UpdateRecord {
 export interface UpdateRow extends UpdateRecord {
 	/** Board project name, or null when no project's origin remote matches. */
 	project: string | null;
-	/** Provider decision for this id. */
-	decision?: "approved" | "skipped";
-	/** This board decided for the id and the provider has not acked it yet. */
-	decisionPending?: true;
 }
 
 /** Last good provider pull, kept in the global store so a restart shows it (U5). Skipped rows are removed. */

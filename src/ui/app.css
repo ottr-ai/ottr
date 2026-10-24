@@ -5156,11 +5156,6 @@ dialog.updates {
 .updates-qualifies {
 	font-size: 12px;
 }
-.updates-decision {
-	font-size: 12px;
-	color: var(--dim);
-	white-space: nowrap;
-}
 /* Removed rows keep text and Skip in one cell so the phone grid cannot overlap them. */
 .updates-removed {
 	display: flex;

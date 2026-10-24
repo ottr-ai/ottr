@@ -132,51 +132,6 @@ export interface ValidatedUpdates {
 	updates: UpdateRecord[];
 	/** Records dropped by validation; the server logs the count. */
 	dropped: number;
-	/** Per-id provider decisions; empty when the envelope has none. */
-	decisions: Record<string, ValidatedDecision>;
-	/** Decision entries dropped by validation; the server logs the count. */
-	droppedDecisions: number;
-}
-
-/** One provider decision as the contract allows; `propose` only rides an approved pick. */
-export interface ValidatedDecision {
-	decision: "approved" | "skipped";
-	propose?: true;
-	at: string;
-	by: "alate-dashboard" | "ottr-board" | "hand";
-}
-
-const DECISION_OK: Record<ValidatedDecision["decision"], true> = {
-	approved: true,
-	skipped: true,
-};
-const BY_OK: Record<ValidatedDecision["by"], true> = {
-	"alate-dashboard": true,
-	"ottr-board": true,
-	hand: true,
-};
-
-/** One checked decision entry; null when any field is out of contract. */
-function decision(raw: unknown): ValidatedDecision | null {
-	if (typeof raw !== "object" || raw === null) return null;
-	const d = raw as Record<string, unknown>;
-	const at = iso(d.at);
-	if (
-		typeof d.decision !== "string" ||
-		!(d.decision in DECISION_OK) ||
-		typeof d.by !== "string" ||
-		!(d.by in BY_OK) ||
-		at === null ||
-		(d.propose !== undefined && d.propose !== true)
-	)
-		return null;
-	const out: ValidatedDecision = {
-		decision: d.decision as ValidatedDecision["decision"],
-		at,
-		by: d.by as ValidatedDecision["by"],
-	};
-	if (d.propose === true) out.propose = true;
-	return out;
 }
 
 /** Validates a parsed /api/updates body; null when the envelope itself is bad (keep the last good result). */
@@ -196,27 +151,9 @@ export function validateUpdates(body: unknown): ValidatedUpdates | null {
 		if (rec === null) dropped++;
 		else updates.push(rec);
 	}
-	const decisions: Record<string, ValidatedDecision> = {};
-	let droppedDecisions = 0;
-	if (b.decisions !== undefined) {
-		if (
-			typeof b.decisions !== "object" ||
-			b.decisions === null ||
-			Array.isArray(b.decisions)
-		)
-			return null;
-		for (const [k, v] of Object.entries(b.decisions)) {
-			if (Object.keys(decisions).length >= ROWS_MAX) {
-				droppedDecisions++;
-				continue;
-			}
-			const id = text(k);
-			const d = decision(v);
-			if (id === null || d === null) droppedDecisions++;
-			else decisions[id] = d;
-		}
-	}
-	return { checkedAt, updates, dropped, decisions, droppedDecisions };
+	// A provider "decisions" map (dropped design, 2026-10-24) is ignored: decisions
+	// are local to the board now.
+	return { checkedAt, updates, dropped };
 }
 
 /** Maps `owner/name` to a board project through the project's GitHub remote (case-insensitive, `.git` ignored). */
@@ -245,88 +182,25 @@ export function addSkip(store: GlobalStore, id: string): string[] {
 	return skips;
 }
 
-/** One board decision waiting for the provider to ack it; sent to <alate>/api/updates/decision. */
-export interface PendingDecision {
-	id: string;
-	decision: ValidatedDecision["decision"];
-	propose?: true;
-}
-
-function pendingEntry(raw: unknown): PendingDecision | null {
-	if (typeof raw !== "object" || raw === null) return null;
-	const d = raw as Record<string, unknown>;
-	if (
-		typeof d.id !== "string" ||
-		typeof d.decision !== "string" ||
-		!(d.decision in DECISION_OK) ||
-		(d.propose !== undefined && d.propose !== true)
-	)
-		return null;
-	const out: PendingDecision = {
-		id: d.id,
-		decision: d.decision as PendingDecision["decision"],
-	};
-	if (d.propose === true) out.propose = true;
-	return out;
-}
-
-export function loadPendingDecisions(store: GlobalStore): PendingDecision[] {
+/**
+ * The dropped forward design queued board decisions in `updateDecisionsPending` to POST them
+ * to <alate>/api/updates/decision. Decisions stay local now: a queued skip migrates into
+ * `updateSkips` (the plain local skip store) so no user Skip is lost; queued approvals had no
+ * local effect (Allow files the card immediately) and are dropped. Idempotent.
+ */
+export function migratePendingToSkips(store: GlobalStore): void {
 	const v = store.get<unknown>("updateDecisionsPending");
-	if (!Array.isArray(v)) return [];
-	return v.map(pendingEntry).filter((d): d is PendingDecision => d !== null);
-}
-
-/** Last decision for an id wins: replaces any queued entry for the same id. */
-export function enqueueDecision(
-	store: GlobalStore,
-	d: PendingDecision,
-): PendingDecision[] {
-	const queue = loadPendingDecisions(store).filter((e) => e.id !== d.id);
-	queue.push(d);
-	store.set("updateDecisionsPending", queue);
-	return queue;
-}
-
-export function dropPendingDecisions(
-	store: GlobalStore,
-	ids: Iterable<string>,
-): void {
-	const gone = new Set(ids);
-	store.set(
-		"updateDecisionsPending",
-		loadPendingDecisions(store).filter((e) => !gone.has(e.id)),
-	);
-}
-
-/** Legacy `updateSkips` ids become pending skipped decisions; empty skips stay untouched. Idempotent. */
-export function migrateSkipsToPending(store: GlobalStore): void {
-	const skips = loadSkips(store);
-	if (skips.length === 0) return;
-	let queue = loadPendingDecisions(store);
-	for (const id of skips)
-		if (!queue.some((e) => e.id === id))
-			queue = [...queue, { id, decision: "skipped" }];
-	store.set("updateDecisionsPending", queue);
-	store.set("updateSkips", []);
-}
-
-/** Every id the panel must hide: legacy skips, pending skips, and provider-skipped ids. */
-export function hiddenUpdateIds(
-	store: GlobalStore,
-	decisions: Record<string, ValidatedDecision>,
-): Set<string> {
-	const hidden = new Set(loadSkips(store));
-	for (const d of loadPendingDecisions(store))
-		if (d.decision === "skipped") hidden.add(d.id);
-	for (const [id, d] of Object.entries(decisions))
-		if (d.decision === "skipped") hidden.add(id);
-	return hidden;
-}
-
-/** Approved ids already filed as cards; guards the auto-file re-filing. */
-export function loadFiledApprovals(store: GlobalStore): string[] {
-	const v = store.get<unknown>("filedApprovals");
-	return Array.isArray(v) ? v.filter((s) => typeof s === "string") : [];
+	if (!Array.isArray(v)) return;
+	const pending: string[] = [];
+	for (const raw of v) {
+		if (typeof raw !== "object" || raw === null) continue;
+		const d = raw as Record<string, unknown>;
+		if (typeof d.id === "string" && d.decision === "skipped")
+			pending.push(d.id);
+	}
+	if (pending.length > 0)
+		store.set("updateSkips", [...new Set([...loadSkips(store), ...pending])]);
+	store.set("updateDecisionsPending", []);
 }
 
 /** Push throttle state: the last day a push went out and the qualified ids it named. */

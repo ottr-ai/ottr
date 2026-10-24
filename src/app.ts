@@ -153,17 +153,12 @@ import {
 import board from "./ui/index.html";
 import {
 	addSkip,
-	dropPendingDecisions,
-	enqueueDecision,
-	hiddenUpdateIds,
-	loadFiledApprovals,
-	loadPendingDecisions,
+	loadSkips,
 	mapRepo,
-	migrateSkipsToPending,
+	migratePendingToSkips,
 	planUpdatesPush,
 	type UpdatesPushState,
 	updatePrompt,
-	type ValidatedDecision,
 	validateUpdates,
 } from "./updates.ts";
 import {
@@ -546,7 +541,6 @@ export function createApp(deps: AppDeps) {
 	let updates: {
 		checkedAt: string;
 		updates: UpdateRecord[];
-		decisions: Record<string, ValidatedDecision>;
 	} | null = (() => {
 		const v = deps.gstore.get<unknown>("updates");
 		if (typeof v !== "object" || v === null) return null;
@@ -555,40 +549,25 @@ export function createApp(deps: AppDeps) {
 			? {
 					checkedAt: r.checkedAt,
 					updates: r.updates,
-					// Lenient like the records: the boot blob predates full re-validation.
-					decisions:
-						typeof r.decisions === "object" &&
-						r.decisions !== null &&
-						!Array.isArray(r.decisions)
-							? (r.decisions as Record<string, ValidatedDecision>)
-							: {},
 				}
 			: null;
 	})();
 	let updatesInFlight: Promise<void> | null = null;
-	// Legacy skip ids ride the decision queue so alate learns them too.
-	migrateSkipsToPending(deps.gstore);
+	// Pending decisions from the dropped forward design become local skips.
+	migratePendingToSkips(deps.gstore);
 
 	/** State-frame view: repo→project mapping and decision/skip filtering run against live projects. */
 	function updatesView(): UpdatesView | null {
 		if (updates === null) return null;
-		const hidden = hiddenUpdateIds(deps.gstore, updates.decisions);
-		const pendingIds = new Set(
-			loadPendingDecisions(deps.gstore).map((d) => d.id),
-		);
+		const hidden = new Set(loadSkips(deps.gstore));
 		return {
 			checkedAt: updates.checkedAt,
 			rows: updates.updates
 				.filter((rec) => !hidden.has(rec.id))
-				.map((rec) => {
-					const d = updates!.decisions[rec.id];
-					return {
-						...rec,
-						project: mapRepo(rec.repo, deps.projects.values()),
-						...(d === undefined ? {} : { decision: d.decision }),
-						...(pendingIds.has(rec.id) ? { decisionPending: true } : {}),
-					};
-				}),
+				.map((rec) => ({
+					...rec,
+					project: mapRepo(rec.repo, deps.projects.values()),
+				})),
 		};
 	}
 
@@ -596,7 +575,7 @@ export function createApp(deps: AppDeps) {
 	async function pushUpdates(): Promise<void> {
 		if (updates === null || loadSubs(deps.gstore).length === 0) return;
 		const today = new Date().toISOString().slice(0, 10);
-		const hidden = hiddenUpdateIds(deps.gstore, updates.decisions);
+		const hidden = new Set(loadSkips(deps.gstore));
 		const qualifiedIds = updates.updates
 			.filter((r) => r.target !== null && !hidden.has(r.id))
 			.map((r) => r.id);
@@ -687,65 +666,15 @@ export function createApp(deps: AppDeps) {
 			else groups.push({ project: e.name, recs: [rec] });
 		}
 		const created: Array<{ project: string; id: string }> = [];
-		const filedIds: string[] = [];
 		for (const { project, recs } of groups) {
 			const e = deps.projects.get(project)!;
 			const prompt = updatePrompt(recs, propose);
 			const t = e.store.createTask(prompt);
 			e.store.updateTask(t.id, { updateIds: recs.map((r) => r.id) });
 			created.push({ project, id: t.id });
-			filedIds.push(...recs.map((r) => r.id));
 		}
-		// Allow and provider approvals share one filed mark per version: a done or
-		// cancelled card, or a stale provider check, must never re-file the version.
-		deps.gstore.set("filedApprovals", [
-			...new Set([...loadFiledApprovals(deps.gstore), ...filedIds]),
-		]);
 		deps.schedule();
 		return created;
-	}
-
-	/** Send queued decisions to alate; a 2xx acks one entry, a network error stops the round. */
-	async function flushDecisions(): Promise<void> {
-		for (const d of loadPendingDecisions(deps.gstore)) {
-			let res: Response;
-			try {
-				res = await noRedirectFetch(alate.url + "/api/updates/decision", {
-					method: "POST",
-					headers: {
-						authorization: "Bearer " + alate.key,
-						"content-type": "application/json",
-					},
-					body: JSON.stringify(d),
-					// Bounded like the pull: a hung alate must not hold the flush open.
-					signal: AbortSignal.timeout(10_000),
-				});
-			} catch (err) {
-				logError("updates decision flush failed", err);
-				return;
-			}
-			if (!res.ok)
-				logError(
-					"updates decision flush",
-					new Error(`alate returned ${res.status} for ${d.id}`),
-				);
-			else dropPendingDecisions(deps.gstore, [d.id]);
-		}
-	}
-
-	/** Auto-file cards for provider-approved ids that no card covers yet (filedApprovals). */
-	async function fileApprovedDecisions(): Promise<void> {
-		const filed = new Set(loadFiledApprovals(deps.gstore));
-		for (const [id, d] of Object.entries(updates!.decisions)) {
-			if (d.decision !== "approved" || filed.has(id)) continue;
-			if (!updates!.updates.some((r) => r.id === id)) continue;
-			try {
-				// fileUpdateCards records the filed mark on success.
-				await fileUpdateCards([id], d.propose === true);
-			} catch (err) {
-				logError(`updates auto-file failed for ${id}`, err);
-			}
-		}
 	}
 
 	/** Single-flight pull from the alate provider; failure keeps the last good result. */
@@ -754,7 +683,6 @@ export function createApp(deps: AppDeps) {
 		if (alate.url === null || alate.key === null) return Promise.resolve();
 		updatesInFlight = (async () => {
 			try {
-				await flushDecisions();
 				let res: Response;
 				try {
 					res = await noRedirectFetch(alate.url + "/api/updates", {
@@ -791,18 +719,12 @@ export function createApp(deps: AppDeps) {
 					updates: good.updates.filter(
 						(r) => r.current !== r.latest && r.current !== r.target,
 					),
-					decisions: good.decisions,
 				};
 				deps.gstore.set("updates", updates);
 				if (good.dropped > 0)
 					console.log(
 						`updates: dropped ${good.dropped} invalid record(s) from alate`,
 					);
-				if (good.droppedDecisions > 0)
-					console.log(
-						`updates: dropped ${good.droppedDecisions} invalid decision(s) from alate`,
-					);
-				await fileApprovedDecisions();
 				await pushUpdates();
 				publishSoon();
 			} finally {
@@ -3286,8 +3208,6 @@ export function createApp(deps: AppDeps) {
 					if (!updates?.updates.some((rec) => rec.id === id))
 						return json({ error: "unknown update id" }, 400);
 					addSkip(deps.gstore, id);
-					// The provider must learn the skip too; the next refresh flushes it.
-					enqueueDecision(deps.gstore, { id, decision: "skipped" });
 					publishSoon();
 					return json(updatesView());
 				}),
@@ -3315,13 +3235,6 @@ export function createApp(deps: AppDeps) {
 						if (body.propose !== undefined && typeof body.propose !== "boolean")
 							return json({ error: "propose must be a boolean" }, 400);
 						created = await fileUpdateCards(ids, body.propose === true);
-						// The provider must learn the approval too; the next refresh flushes it.
-						for (const id of ids)
-							enqueueDecision(deps.gstore, {
-								id,
-								decision: "approved",
-								...(body.propose === true ? { propose: true } : {}),
-							});
 						publishSoon();
 					} catch (err) {
 						const e = err as { status?: unknown; error?: unknown };

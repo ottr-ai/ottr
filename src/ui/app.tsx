@@ -4323,25 +4323,6 @@ export function UpdateRowLine({
 					</span>
 				)}
 			</span>
-			{row.decisionPending ? (
-				<span
-					className="updates-decision"
-					title="Decided here, awaiting ack from the provider"
-				>
-					pending push
-				</span>
-			) : row.decision === "approved" ? (
-				<span
-					className="updates-decision"
-					title="Approved in the data repo via the Alate dashboard"
-				>
-					approved
-				</span>
-			) : row.decision === "skipped" ? (
-				<span className="updates-decision" title="Skipped in the data repo">
-					skipped on alate
-				</span>
-			) : null}
 			{row.removed === true ? (
 				// One cell so the phone layout cannot stack text and Skip onto the same grid area.
 				<span className="updates-removed">

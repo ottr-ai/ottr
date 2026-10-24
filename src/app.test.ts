@@ -43,6 +43,7 @@ import {
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
 import type { AddProjectResponse, Task } from "./types.ts";
+import { loadSkips } from "./updates.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
 
@@ -1079,8 +1080,8 @@ describe("alate routes", () => {
 		body?: unknown;
 	};
 	let lastAlateReq: AlateReq | null = null;
-	// Some tests need more than the last request: the refresh flushes decisions
-	// before its pull, so the decision POST is never the last one.
+	// Some tests need more than the last request: a pull is never the only
+	// provider call a test wants to inspect.
 	let alateReqs: AlateReq[] = [];
 	let alateDelay = 0;
 	// When set, the fake answers every path with a 302 to this origin: the
@@ -1411,8 +1412,6 @@ describe("alate routes", () => {
 		afterAll(() => {
 			// Leave the shared store and closure clean for later describes.
 			gstore.set("updateSkips", []);
-			gstore.set("updateDecisionsPending", []);
-			gstore.set("filedApprovals", []);
 			gstore.set("updatesPush", null);
 			gstore.set("updates", null);
 			saveSubs(gstore, []);
@@ -1490,188 +1489,9 @@ describe("alate routes", () => {
 			);
 			expect((await post("/api/updates/skip", { id: 7 })).status).toBe(400);
 			gstore.set("updateSkips", []);
-			gstore.set("updateDecisionsPending", []);
 		});
 
-		test("an approved provider decision shows on the row; a skipped one hides it", async () => {
-			const p1 = projects.get("p1")!;
-			p1.github = "https://github.com/Octo/Repo.GIT";
-			try {
-				alateReqs = [];
-				alateBody = {
-					checkedAt: iso,
-					updates: [goodRec, otherRec],
-					decisions: {
-						[goodRec.id]: {
-							decision: "approved",
-							at: "2026-10-16T08:00:00Z",
-							by: "alate-dashboard",
-						},
-						[otherRec.id]: {
-							decision: "skipped",
-							at: "2026-10-16T08:00:00Z",
-							by: "alate-dashboard",
-						},
-					},
-				};
-				const res = await post("/api/updates/refresh", {});
-				expect(res.status).toBe(200);
-				const rows = (await readView(res)).rows;
-				expect(rows.map((r) => r.id)).toEqual([goodRec.id]);
-				expect(rows[0]).toMatchObject({
-					id: goodRec.id,
-					decision: "approved",
-				});
-				expect(await stateUpdates()).toEqual({ checkedAt: iso, rows });
-				// No pending decisions were queued: provider decisions are never re-sent.
-				expect(alateReqs.every((r) => r.url === "/api/updates")).toBe(true);
-			} finally {
-				p1.github = null;
-				// The approval auto-files a card on p1: cancel it and clear the
-				// filedApprovals mark so later tests start without its coverage.
-				for (const t of p1.store.listTasks())
-					if (t.updateIds.includes(goodRec.id))
-						p1.store.updateTask(t.id, { cancelledAt: Date.now() });
-				gstore.set("filedApprovals", []);
-				alateBody = envelope([goodRec, otherRec]);
-			}
-		});
-
-		test("an approved decision auto-files one card with updateIds and never re-files", async () => {
-			const p1 = projects.get("p1")!;
-			p1.github = "https://github.com/Octo/Repo.GIT";
-			try {
-				const auto = {
-					...goodRec,
-					id: "octo/repo@auto1",
-					latest: "vAuto",
-					// propose marks a too-young release: no qualified target (G21).
-					target: null,
-					notesUrl: "https://github.com/octo/repo/releases/tag/vAuto",
-				};
-				alateBody = {
-					checkedAt: iso,
-					updates: [auto],
-					decisions: {
-						[auto.id]: {
-							decision: "approved",
-							at: "2026-10-16T08:00:00Z",
-							by: "hand",
-							propose: true,
-						},
-					},
-				};
-				const res = await post("/api/updates/refresh", {});
-				expect(res.status).toBe(200);
-				const filed = p1.store
-					.listTasks()
-					.filter((t) => t.updateIds.includes(auto.id));
-				expect(filed.length).toBe(1);
-				// The decision's propose rides onto the card prompt.
-				expect(filed[0]!.prompt).toContain("(a G21 exception)");
-				expect(gstore.get<string[]>("filedApprovals")).toEqual([auto.id]);
-				// A second refresh files no duplicate.
-				await post("/api/updates/refresh", {});
-				expect(
-					p1.store.listTasks().filter((t) => t.updateIds.includes(auto.id))
-						.length,
-				).toBe(1);
-				// A cancelled card does not re-file either: filedApprovals already guards it.
-				p1.store.updateTask(filed[0]!.id, { cancelledAt: Date.now() });
-				await post("/api/updates/refresh", {});
-				expect(
-					p1.store.listTasks().filter((t) => t.updateIds.includes(auto.id))
-						.length,
-				).toBe(1);
-			} finally {
-				p1.github = null;
-				alateBody = envelope([goodRec, otherRec]);
-			}
-		});
-
-		test("allow enqueues approved decisions; the next refresh flushes them to alate", async () => {
-			const p1 = projects.get("p1")!;
-			p1.github = "https://github.com/Octo/Repo.GIT";
-			try {
-				const flush = {
-					...goodRec,
-					id: "octo/repo@v8",
-					latest: "v8",
-					target: "v8",
-					notesUrl: "https://github.com/octo/repo/releases/tag/v8",
-				};
-				alateReqs = [];
-				alateBody = envelope([flush]);
-				await post("/api/updates/refresh", {});
-				const res = await post("/api/updates/allow", { ids: [flush.id] });
-				expect(res.status).toBe(200);
-				// The store holds the pending approval…
-				expect(
-					gstore.get<Array<{ id: string; decision: string }>>(
-						"updateDecisionsPending",
-					),
-				).toEqual([{ id: flush.id, decision: "approved" }]);
-				// …and the next refresh POSTs it before the pull, then empties the queue.
-				await post("/api/updates/refresh", {});
-				const decision = alateReqs.find(
-					(r) => r.url === "/api/updates/decision",
-				);
-				expect(decision).toEqual({
-					method: "POST",
-					url: "/api/updates/decision",
-					auth: "Bearer alate_secret",
-					body: { id: flush.id, decision: "approved" },
-				});
-				expect(
-					gstore.get<Array<{ id: string; decision: string }>>(
-						"updateDecisionsPending",
-					),
-				).toEqual([]);
-				expect(lastAlateReq).toMatchObject({ url: "/api/updates" });
-			} finally {
-				p1.github = null;
-			}
-		});
-
-		test("a failing decision flush keeps entries; a later 200 drops them", async () => {
-			const p1 = projects.get("p1")!;
-			p1.github = "https://github.com/Octo/Repo.GIT";
-			try {
-				const held = {
-					...goodRec,
-					id: "octo/repo@v9",
-					latest: "v9",
-					target: "v9",
-					notesUrl: "https://github.com/octo/repo/releases/tag/v9",
-				};
-				alateReqs = [];
-				alateBody = envelope([held]);
-				await post("/api/updates/refresh", {});
-				expect(
-					(await post("/api/updates/allow", { ids: [held.id] })).status,
-				).toBe(200);
-				// The decision endpoint answers 500; the entry stays queued.
-				alateStatus = 500;
-				await post("/api/updates/refresh", {});
-				expect(
-					gstore.get<Array<{ id: string; decision: string }>>(
-						"updateDecisionsPending",
-					),
-				).toEqual([{ id: held.id, decision: "approved" }]);
-				// Back to 200: the next refresh drops the entry.
-				alateStatus = 200;
-				await post("/api/updates/refresh", {});
-				expect(
-					gstore.get<Array<{ id: string; decision: string }>>(
-						"updateDecisionsPending",
-					),
-				).toEqual([]);
-			} finally {
-				p1.github = null;
-			}
-		});
-
-		test("skip enqueues a pending skip, hides the row, and flushes on the next refresh", async () => {
+		test("a board skip hides the row after a pull and posts no decision", async () => {
 			alateReqs = [];
 			alateBody = envelope([goodRec, otherRec]);
 			await post("/api/updates/refresh", {});
@@ -1680,25 +1500,36 @@ describe("alate routes", () => {
 			expect((await readView(skip)).rows.map((r) => r.id)).toEqual([
 				goodRec.id,
 			]);
-			expect(
-				gstore.get<Array<{ id: string; decision: string }>>(
-					"updateDecisionsPending",
-				),
-			).toEqual([{ id: otherRec.id, decision: "skipped" }]);
+			// The next pull keeps the row hidden and never forwards the decision:
+			// the only provider request is the pull itself.
 			alateReqs = [];
 			await post("/api/updates/refresh", {});
-			expect(alateReqs).toContainEqual({
-				method: "POST",
-				url: "/api/updates/decision",
-				auth: "Bearer alate_secret",
-				body: { id: otherRec.id, decision: "skipped" },
-			});
-			expect(
-				gstore.get<Array<{ id: string; decision: string }>>(
-					"updateDecisionsPending",
-				),
-			).toEqual([]);
+			expect((await stateUpdates())!.rows.map((r) => r.id)).toEqual([
+				goodRec.id,
+			]);
+			expect(alateReqs).toEqual([
+				{ method: "GET", url: "/api/updates", auth: "Bearer alate_secret" },
+			]);
 			gstore.set("updateSkips", []);
+		});
+
+		test("a pending decision from the old store migrates to a skip and still hides its row", async () => {
+			const oldId = "octo/repo@vOld";
+			const oldG = GlobalStore.open(join(root, "g-old-pending"));
+			oldG.set("updateDecisionsPending", [{ id: oldId, decision: "skipped" }]);
+			oldG.set("updates", {
+				checkedAt: iso,
+				updates: [goodRec, { ...goodRec, id: oldId }],
+			});
+			const m = mount({ gstore: oldG });
+			// Boot migrated the queued skip into the plain skip store…
+			expect(loadSkips(oldG)).toEqual([oldId]);
+			expect(oldG.get<unknown[]>("updateDecisionsPending")).toEqual([]);
+			// …so the state view hides the row.
+			const state = (await (await m.call("/api/state")).json()) as {
+				updates: { rows: Array<{ id: string }> } | null;
+			};
+			expect(state.updates!.rows.map((r) => r.id)).toEqual([goodRec.id]);
 		});
 
 		test("push fires once per day; a skipped qualified id does not count", async () => {
@@ -1935,34 +1766,13 @@ describe("alate routes", () => {
 				await post("/api/updates/refresh", {});
 				const ares = await post("/api/updates/allow", { ids: [again.id] });
 				expect(ares.status).toBe(200);
-				// The allow itself records the filed mark (earlier tests left theirs).
-				expect(gstore.get<string[]>("filedApprovals")).toContain(again.id);
-				const card = p1.store
+				// Exactly one card covers the id after Allow.
+				const cards = p1.store
 					.listTasks()
-					.find((t) => t.updateIds.includes(again.id))!;
-				p1.store.updateTask(card.id, { cancelledAt: Date.now() });
-				// The provider echoes the acked approval while its stale daily check
-				// still lists the row: no second card for the same version.
-				alateBody = {
-					checkedAt: iso,
-					updates: [again],
-					decisions: {
-						[again.id]: {
-							decision: "approved",
-							at: "2026-10-16T08:00:00Z",
-							by: "ottr-board",
-						},
-					},
-				};
-				await post("/api/updates/refresh", {});
-				expect(
-					p1.store.listTasks().filter((t) => t.updateIds.includes(again.id))
-						.length,
-				).toBe(1);
+					.filter((t) => t.updateIds.includes(again.id));
+				expect(cards.length).toBe(1);
 			} finally {
 				p1.github = null;
-				gstore.set("filedApprovals", []);
-				gstore.set("updateDecisionsPending", []);
 				alateBody = envelope([goodRec, otherRec]);
 			}
 		});
