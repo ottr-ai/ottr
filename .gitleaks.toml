@@ -1,10 +1,11 @@
 # Fake token fixtures in tests (e.g. glpat-echoed-secret-000 in
 # src/worktree.test.ts) trip the generic-api-key rule. A real GitLab PAT is
 # 20 random characters; these fixtures are lowercase words with an all-zero
-# suffix, so this pattern cannot match a real token.
+# suffix, so this pattern cannot match a real token. The WebSocket upgrade test
+# sends the published RFC 6455 sample key ("the sample nonce" in base64).
 [extend]
 useDefault = true
 
 [allowlist]
-description = "fake token fixtures in tests"
-regexes = ['''\bglpat-[a-z-]+-0{3,}\b''']
+description = "fake token fixtures and the RFC 6455 sample key in tests"
+regexes = ['''\bglpat-[a-z-]+-0{3,}\b''', '''dGhlIHNhbXBsZSBub25jZQ==''']
