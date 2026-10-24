@@ -1616,6 +1616,36 @@ describe("applyEvent", () => {
 		expect(s.model).toBe("glm-5.3-flash");
 	});
 
+	test("provider errors ignore other roles and clear after a successful retry", () => {
+		const s = newEventState();
+		const failed = {
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "429 quota exhausted",
+		};
+		feed(s, { type: "message_end", message: failed });
+		expect(s.providerError).toBe("429 quota exhausted");
+		feed(s, {
+			type: "message_end",
+			message: {
+				...failed,
+				role: "toolResult",
+				errorMessage: "not a provider",
+			},
+		});
+		expect(s.providerError).toBe("429 quota exhausted");
+		feed(s, {
+			type: "message_end",
+			message: { role: "assistant", stopReason: "toolUse" },
+		});
+		expect(s.providerError).toBeNull();
+		feed(s, {
+			type: "message_end",
+			message: { ...failed, errorMessage: { message: "malformed" } },
+		});
+		expect(s.providerError).toBeNull();
+	});
+
 	test("j. report_outcome through the xd:// device takes its args from the end event's details", () => {
 		// Shape recorded from omp's JSON stream on 2026-09-27: the `write` tool carries the call.
 		const start = {
@@ -1887,6 +1917,58 @@ describe("startRun", () => {
 			expect(log).toContain("plain stdout noise");
 			expect(log).toContain("! warn: slow disk");
 		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a provider error reaches the card without stderr and hides credentials", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-provider-error-"));
+		const stored = "plain-stored-0000";
+		setGitSecrets([stored]);
+		try {
+			const logPath = join(dir, "run.log");
+			const { handle, fake } = fakeStart({ logPath });
+			const hidden = "test-only-value";
+			const event = {
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: [
+						"429 Weekly/Monthly Limit Exhausted.",
+						`Authorization: Bearer ${hidden}`,
+						`password="${hidden} \\"private-fragment\\""`,
+						`https://${hidden}:${hidden}@example.invalid/?token=${hidden}`,
+						`sk-proj-${hidden} github_pat_${hidden} AIza${hidden}`,
+						`eyJ${hidden}.payload.signature`,
+						`retry with Bearer ${hidden}`,
+						`echo ${stored}`,
+					].join("\n"),
+				},
+			};
+			fake.stdout.emit("data", Buffer.from(JSON.stringify(event)));
+			fake.emit("close", 1);
+			const r = await handle.done;
+			const next = classify({
+				kind: "work",
+				result: r,
+				git: git(),
+				target: "origin/main",
+				previousError: null,
+				images: 1,
+			});
+			expect(next.state).toBe("needs_you");
+			expect(next.needsReason).toContain("429 Weekly/Monthly Limit Exhausted");
+			expect(next.needsReason).not.toContain("test-only-value");
+			expect(next.needsReason).not.toContain("private-fragment");
+			expect(next.needsReason).not.toContain(stored);
+			const log = readFileSync(logPath, "utf8");
+			expect(log).toContain("429 Weekly/Monthly Limit Exhausted");
+			expect(log).not.toContain("test-only-value");
+			expect(log).not.toContain("private-fragment");
+			expect(next.quarantineImages).toBeUndefined();
+		} finally {
+			setGitSecrets([]);
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -2404,6 +2486,7 @@ describe("arch-review changed-line coverage", () => {
 				approvalRefused: false,
 				sawTerminalEnd: true,
 				finalText: "done text",
+				providerError: null,
 				exitCode: 3,
 				killed: true,
 				stderrTail: "boom\n",

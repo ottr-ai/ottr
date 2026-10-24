@@ -181,6 +181,33 @@ function textParts(content: unknown): string {
 		.join("");
 }
 
+/** Only the provider's diagnostic field reaches the card, never the request or message body. */
+function providerError(message: AnyRec): string | null {
+	if (
+		message.stopReason !== "error" ||
+		typeof message.errorMessage !== "string"
+	)
+		return null;
+	// ponytail: cap diagnostics at 4,000 chars; raise the cap only if it hides the cause.
+	return (
+		message.errorMessage
+			.slice(0, 4000)
+			.replace(/\s+/g, " ")
+			.replace(/[\p{Cc}\p{Cf}]/gu, "")
+			.replace(
+				/\b(authorization|api[-_ ]?key|(?:access[-_ ]?|refresh[-_ ]?)?token|password|secret)\b["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|(?:bearer\s+)?[^\s"',;]+)/gi,
+				"$1=[REDACTED]",
+			)
+			.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+			.replace(/\bbearer\s+[^\s"',;]+/gi, "Bearer [REDACTED]")
+			.replace(
+				/\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]+|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g,
+				"[REDACTED]",
+			)
+			.trim() || null
+	);
+}
+
 /** The ask tool by itself or with a mount prefix; `task` and other names merely ending in "ask" do not match. */
 const ASK_TOOL = /(?:^|[./:_-])ask$/;
 
@@ -206,11 +233,14 @@ export function renderEvent(ev: unknown): string {
 		}
 		case "message_end": {
 			const m = e.message;
-			return typeof m === "object" &&
-				m !== null &&
-				(m as AnyRec).role === "assistant"
-				? "\n"
-				: "";
+			if (
+				typeof m !== "object" ||
+				m === null ||
+				(m as AnyRec).role !== "assistant"
+			)
+				return "";
+			const error = providerError(m as AnyRec);
+			return error ? `\n! provider: ${error}\n` : "\n";
 		}
 		case "tool_execution_start": {
 			const name = e.toolName;
@@ -396,7 +426,8 @@ export function classify(o: {
 		if (
 			result.sessionId === null &&
 			result.outcome === null &&
-			result.stderrTail.trim() === ""
+			result.stderrTail.trim() === "" &&
+			!result.providerError
 		) {
 			if ((o.images ?? 0) > 0)
 				return {
@@ -414,10 +445,8 @@ export function classify(o: {
 					`The provider rejects this prompt's content - reword the task (evidence: ~/.omp/logs/http-400-requests/${evidence}).`,
 				);
 		}
-		// No stderr and the run never spoke: the death itself must carry the dispatch context
-		// (worker or local, argv, cwd, pid, duration, worker-request error), or the operator
-		// gets "exit code 1" and nothing else.
-		const last = deathLine(result.stderrTail);
+		// Prefer stderr, then the provider's structured error, then dispatch context.
+		const last = deathLine(result.stderrTail) ?? result.providerError;
 		const ctx = last
 			? `: ${last}`
 			: result.dispatch
@@ -545,6 +574,7 @@ export interface EventState {
 	approvalRefused: boolean;
 	sawTerminalEnd: boolean;
 	finalText: string;
+	providerError: string | null;
 	/** toolCallId -> args of report_outcome calls awaiting their tool_execution_end. */
 	remembered: Map<string, unknown>;
 	/** The agent's last ask call, normalized; null while none. */
@@ -563,6 +593,7 @@ export function newEventState(): EventState {
 		approvalRefused: false,
 		sawTerminalEnd: false,
 		finalText: "",
+		providerError: null,
 		remembered: new Map(),
 		asked: null,
 		proposed: null,
@@ -600,6 +631,16 @@ export function applyEvent(
 						: rec.model;
 			}
 		}
+		return {};
+	}
+	if (e.type === "message_end") {
+		const m = e.message;
+		if (
+			typeof m === "object" &&
+			m !== null &&
+			(m as AnyRec).role === "assistant"
+		)
+			state.providerError = providerError(m as AnyRec);
 		return {};
 	}
 	if (
@@ -868,6 +909,9 @@ export function createRunSink(o: {
 				approvalRefused: es.approvalRefused,
 				sawTerminalEnd: es.sawTerminalEnd,
 				finalText: es.finalText,
+				// Patterns miss secrets with no known shape: also strip the values Ottr holds.
+				providerError:
+					es.providerError && redact(es.providerError, liveSecrets()),
 				...r,
 			};
 		},

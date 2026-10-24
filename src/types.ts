@@ -354,6 +354,8 @@ export interface RunResult {
 	killed: boolean;
 	/** Last 4000 chars of stderr. */
 	stderrTail: string;
+	/** Last assistant provider error; a later successful message clears it. */
+	providerError?: string | null;
 	/** How the run was dispatched: mode (local / worker URL / local fallback + worker error), argv
 	 * length, cwd basename, pid when one existed, wall duration. classify shows it when a death
 	 * has no stderr, so the board answers "why did my turn die" in one glance. */
