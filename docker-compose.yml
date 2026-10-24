@@ -1,6 +1,6 @@
 # ottr compose topology: one host, the board (service server) + disposable workers.
 #
-# `docker compose up -d --build` builds ottr-worker:local and starts the server
+# `docker compose up -d --build` builds ottr-worker:local (or OTTR_IMAGE) and starts the server
 # plus worker-a/worker-b. Provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...)
 # must exist in the host shell — they are passed through, never baked.
 # Worker containers are NEVER port-mapped to the host; only the board's
@@ -8,7 +8,7 @@
 name: ottr
 
 x-worker: &worker
-  image: ottr-worker:local
+  image: ${OTTR_IMAGE:-ottr-worker:local}
   command: bun /app/src/worker.ts
   restart: always
   # tini as PID 1 reaps the orphans that omp and test runs leave behind: with bun as
@@ -63,7 +63,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    image: ottr-worker:local
+    image: ${OTTR_IMAGE:-ottr-worker:local}
     command: bun /app/src/server.ts
     init: true # reaps orphans as on the workers (148 zombies here after 7 hours, 2026-10-12)
     networks:

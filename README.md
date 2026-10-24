@@ -81,6 +81,14 @@ docker compose build
 docker compose up -d
 ```
 
+Each GitHub release also publishes the image as `ghcr.io/ottr-ai/ottr` (amd64). To use it instead of a local build, replace the last two lines with:
+
+```sh
+export OTTR_IMAGE=ghcr.io/ottr-ai/ottr:latest
+docker compose pull
+docker compose up -d --no-build
+```
+
 The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_API_URL` for fleet memory, and provider keys pass through from the host shell. [docs/WORKERS.md](docs/WORKERS.md) has the full topology, updates and crash story.
 
 Hindsight is the preferred way to share memory between workers. Without `HINDSIGHT_API_URL`, omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only containers on the same host see it. Set the URL to a [Hindsight](https://github.com/vectorize-io/hindsight) server, and every worker on every machine reads and writes the same memory. See [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
