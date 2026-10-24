@@ -711,16 +711,20 @@ export async function isIntegrated(
 }
 
 /**
- * The server's merge push (D6: no agent holds git host credentials; the merge prompt tells
- * the agent not to push). Pushes the local target branch to origin when the worktree's HEAD
- * is in the local branch (proof of the local merge) and origin lacks that tip. git() adds the
- * host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local tip is
- * refs/heads/<branch>: `origin/<branch>` names the remote-tracking ref, which only this push moves.
+ * The server's merge push (no agent holds git host credentials; the merge prompt tells the
+ * agent not to push). Pushes the local target branch to origin when origin lacks its tip and
+ * the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
+ * in the local branch. A merge agent may remove both before it reports (a project's AGENTS.md
+ * can say so). Then the local branch ahead of origin is the proof: only merge turns move it.
+ * git() adds the host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local
+ * tip is refs/heads/<branch>: `origin/<branch>` names the remote-tracking ref, which only this
+ * push moves.
  */
 export async function serverMergePush(
 	mainPath: string,
 	worktreePath: string,
 	target: string,
+	taskBranch: string,
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
@@ -728,21 +732,28 @@ export async function serverMergePush(
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
-	const sha = async (ref: string) => {
+	const sha = async (ref: string, cwd = mainPath) => {
 		const r = await git(
 			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
-			mainPath,
+			cwd,
 		);
 		return r.code === 0 ? r.stdout.trim() : null;
 	};
 	const local = await sha(`refs/heads/${branch}`);
 	if (local === null || local === (await sha(`refs/remotes/origin/${branch}`)))
 		return { status: "skipped" };
-	const merged = await git(
-		["merge-base", "--is-ancestor", "HEAD", `refs/heads/${branch}`],
-		worktreePath,
-	);
-	if (merged.code !== 0) return { status: "skipped" };
+	const head = (await worktreeLinked(worktreePath))
+		? await sha("HEAD", worktreePath)
+		: taskBranch === ""
+			? null
+			: await sha(`refs/heads/${taskBranch}`);
+	if (head !== null) {
+		const merged = await git(
+			["merge-base", "--is-ancestor", head, local],
+			mainPath,
+		);
+		if (merged.code !== 0) return { status: "skipped" };
+	}
 	const r = await git(
 		["push", "origin", `refs/heads/${branch}:refs/heads/${branch}`],
 		mainPath,

@@ -180,12 +180,14 @@ describe("serverMergePush", () => {
 		try {
 			const local = run(f.main, "rev-parse", "refs/heads/main");
 			expect(run(f.bare, "rev-parse", "main")).not.toBe(local);
-			expect((await serverMergePush(f.main, f.wt, "origin/main")).status).toBe(
-				"pushed",
-			);
+			expect(
+				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+			).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(local);
 			// Already on origin: a second call has nothing to do.
-			expect(await serverMergePush(f.main, f.wt, "origin/main")).toEqual({
+			expect(
+				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+			).toEqual({
 				status: "skipped",
 			});
 		} finally {
@@ -199,9 +201,9 @@ describe("serverMergePush", () => {
 			const up = join(f.dir, "upstream.git");
 			run(f.dir, "init", "-q", "--bare", "-b", "main", up);
 			run(f.main, "remote", "add", "upstream", up);
-			expect((await serverMergePush(f.main, f.wt, "origin/main")).status).toBe(
-				"pushed",
-			);
+			expect(
+				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+			).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(
 				run(f.main, "rev-parse", "refs/heads/main"),
 			);
@@ -220,7 +222,48 @@ describe("serverMergePush", () => {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
 			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
 			const before = run(f.bare, "rev-parse", "main");
-			expect(await serverMergePush(f.main, f.wt, "origin/main")).toEqual({
+			expect(
+				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+			).toEqual({
+				status: "skipped",
+			});
+			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a removed worktree proves the merge by its branch, and a removed branch by main ahead of origin", async () => {
+		const f = fixture();
+		try {
+			run(f.main, "worktree", "remove", f.wt);
+			expect(
+				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+			).toBe("pushed");
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "next");
+			run(f.main, "branch", "-q", "-D", "ott/x");
+			expect(
+				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+			).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(
+				run(f.main, "rev-parse", "refs/heads/main"),
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a removed worktree whose kept branch is not merged gets no push", async () => {
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
+			run(f.main, "worktree", "remove", f.wt);
+			const before = run(f.bare, "rev-parse", "main");
+			expect(
+				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+			).toEqual({
 				status: "skipped",
 			});
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
@@ -240,7 +283,7 @@ describe("serverMergePush", () => {
 				"origin",
 				join(f.dir, "gone.git"),
 			);
-			const r = await serverMergePush(f.main, f.wt, "origin/main");
+			const r = await serverMergePush(f.main, f.wt, "origin/main", "ott/x");
 			expect(r.status).toBe("failed");
 			expect("error" in r && r.error.length > 0).toBe(true);
 		} finally {

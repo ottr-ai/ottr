@@ -3743,20 +3743,48 @@ describe("turn ci watch pinning", () => {
 
 	test("the server push runs before the integration check, so a local-only merge lands", async () => {
 		let pushed = false;
-		const calls: [string, string, string][] = [];
+		const calls: [string, string, string, string][] = [];
 		const { store, record, loop, task } = mergeDoneSetup({
 			// Origin holds the merge only after the server push: the check must come after it.
 			isIntegrated: async () => pushed,
-			serverMergePush: async (mainPath: string, wt: string, target: string) => {
-				calls.push([mainPath, wt, target]);
+			serverMergePush: async (
+				mainPath: string,
+				wt: string,
+				target: string,
+				branch: string,
+			) => {
+				calls.push([mainPath, wt, target, branch]);
 				pushed = true;
 				return { status: "pushed" as const, output: "" };
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(calls).toEqual([[store.path, "wt-m", "origin/main"]]);
+		expect(calls).toEqual([[store.path, "wt-m", "origin/main", "ott/m"]]);
 		expect(store.getTask(task.id)!.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
+		expect(logText(store, task.id)).toContain(
+			"- pushed origin/main from the server",
+		);
+	});
+
+	test("a merge agent that removed its worktree still gets the server push", async () => {
+		const calls: string[] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			worktreeHusk: async () => true,
+			branchMergedOrGone: async () => true,
+			serverMergePush: async (
+				_m: string,
+				_w: string,
+				_t: string,
+				branch: string,
+			) => {
+				calls.push(branch);
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toEqual(["ott/m"]);
+		expect(store.getTask(task.id)!.stage).toBe("done");
 		expect(logText(store, task.id)).toContain(
 			"- pushed origin/main from the server",
 		);

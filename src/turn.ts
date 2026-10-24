@@ -1465,20 +1465,15 @@ export function createTurnLoop(
 					appendLog(store, id, `quarantine failed: ${errmsg(err)}`);
 				}
 			}
-			// D6: per-host git credentials never enter an agent, so the server pushes a merge to a
-			// non-GitHub remote itself. It runs before the integration facts: the check reads origin's
-			// tip, which only this push moves. It is gated on proof of the local merge (the
-			// worktree's HEAD is in the local target branch), never on what the agent reported.
+			// Per-host git credentials never enter an agent, so the server pushes a merge itself.
+			// It runs before the integration facts: the check reads origin's tip, which only this
+			// push moves. It is gated on proof of the local merge in the main repo, never on what
+			// the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
+			// local branch, and only this push moves it to origin.
 			let pushError: string | null = null;
-			if (
-				kind === "merge" &&
-				!fromMain &&
-				!interview &&
-				!grill &&
-				!releaseCard
-			) {
+			if (kind === "merge" && !interview && !grill && !releaseCard) {
 				const p = await ops
-					.serverMergePush(e.path, wt, target)
+					.serverMergePush(e.path, wt, target, task.branch ?? "")
 					.catch((err: unknown) => ({
 						status: "failed" as const,
 						error: errmsg(err),
