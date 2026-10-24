@@ -120,6 +120,7 @@ import {
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { ProjectStore } from "./store.ts";
+import { listedEnvNames } from "./tools.ts";
 import {
 	type CancelOutcome,
 	errmsg,
@@ -261,6 +262,8 @@ interface AppDeps {
 		workCheck: boolean;
 		removedPaths: string[];
 		projectPaths: string[];
+		/** Secret env values from Settings, for the turn loop's redaction/env seeding. */
+		envValues: Record<string, string>;
 	};
 	serverRef: { current: Server<undefined> | undefined };
 	/** NODE_ENV=production: the board serves the static bundle and refuses live updates. */
@@ -275,6 +278,8 @@ interface AppDeps {
 	listProcesses?: () => ProcessInfo[];
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
+	/** Worker-folder base home (<home>/.ottr/workers holds env.txt); injectable for tests. */
+	workersHome?: string;
 	/** ssh-keyscan seam for the host-key check; defaults to realKeyscan. Tests inject a stub. */
 	keyscan?: Keyscan;
 }
@@ -322,6 +327,8 @@ export function createApp(deps: AppDeps) {
 	const prod = deps.prod === true;
 	// Server-only ssh material: a data dir outside every checkout.
 	const sshDir = deps.sshDir ?? defaultSshDir();
+	// Base home whose .ottr/workers folders hold the env.txt name lists (tests inject it).
+	const workersHome = deps.workersHome ?? homedir();
 	const keyscan = deps.keyscan ?? realKeyscan;
 	const ambientHelpers = readAmbientHelpers();
 	/** Sorted task ids marked as read; missing/corrupt row = empty. */
@@ -451,6 +458,11 @@ export function createApp(deps: AppDeps) {
 	};
 	/** GitHub token from onboarding or Settings; stored plaintext like apiKey (same trust level). */
 	let githubToken: string | null = null;
+	/**
+	 * Secret env values from Settings, one per env.txt name; stored plaintext in the config
+	 * file like githubToken (same trust level), never served back after save.
+	 */
+	let envValues: Record<string, string> = {};
 	/**
 	 * Per-host HTTPS tokens for every git host; stored plaintext like
 	 * githubToken (same trust level). One entry per host; the token is handed to git through a
@@ -987,6 +999,7 @@ export function createApp(deps: AppDeps) {
 			alate,
 			githubToken,
 			gitTokens,
+			envValues,
 			hindsightToken,
 			hindsightUrl,
 		});
@@ -1004,6 +1017,7 @@ export function createApp(deps: AppDeps) {
 		alate?: unknown;
 		githubToken?: unknown;
 		gitTokens?: unknown;
+		envValues?: unknown;
 		hindsightToken?: unknown;
 		hindsightUrl?: unknown;
 	}>("config");
@@ -1076,19 +1090,31 @@ export function createApp(deps: AppDeps) {
 			hindsightToken = parsed.hindsightToken;
 		if (typeof parsed.hindsightUrl === "string")
 			hindsightUrl = parsed.hindsightUrl;
+		if (typeof parsed.envValues === "object" && parsed.envValues !== null) {
+			// Each stored row re-runs the request validation; a corrupt entry is dropped.
+			const vals: Record<string, string> = {};
+			for (const [name, value] of Object.entries(parsed.envValues)) {
+				if (/^[A-Z_][A-Z0-9_]*$/.test(name) && typeof value === "string")
+					vals[name] = value;
+			}
+			envValues = vals;
+		}
 	}
 	applyGithubToken();
-	// Every git/ssh output the board logs or shows passes redact() with these: the stored
-	// tokens and the ssh dir, which holds every key path (in both slash forms, since
-	// GIT_SSH_COMMAND names it with forward slashes). Kept in sync on each token change.
+	// Every git/ssh/env output the board logs or shows passes redact() with these: the stored
+	// tokens, the ssh dir (which holds every key path, in both slash forms, since
+	// GIT_SSH_COMMAND names it with forward slashes) and the secret env values. Kept in sync
+	// on each token or env change.
 	function applyGitSecrets(): void {
 		setGitSecrets([
 			...gitTokens.map((t) => t.token),
+			...Object.values(envValues),
 			sshDir,
 			sshDir.replaceAll("\\", "/"),
 		]);
 	}
 	applyGitSecrets();
+	deps.shared.envValues = { ...envValues };
 	// D6: every network git call (clone/fetch/ls-remote/pull/push, merge turns included) picks
 	// up the auth of the project that owns cwd. Workers get none of these names: the runner
 	// strips them from the env it forwards (GIT_AUTH_ENV_RE in src/worktree.ts).
@@ -2555,6 +2581,50 @@ export function createApp(deps: AppDeps) {
 					saveConfig();
 					applyGithubToken();
 					return json({ tokenSet: true });
+				}),
+		},
+		// Secret env values, one per env.txt name. No answer ever holds a value; a re-save
+		// replaces it (parity with the GitHub token: no delete).
+		"/api/settings/env": {
+			GET: (req) =>
+				api(req, async () =>
+					json({
+						names: listedEnvNames(workersHome)
+							.map((row) => ({
+								...row,
+								set: envValues[row.name] !== undefined,
+							}))
+							.sort((a, b) => a.name.localeCompare(b.name)),
+					}),
+				),
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const name = r.body.name;
+					const value = r.body.value;
+					const listed = listedEnvNames(workersHome).some(
+						(row) => row.name === name,
+					);
+					if (
+						typeof name !== "string" ||
+						!/^[A-Z_][A-Z0-9_]*$/.test(name) ||
+						!listed ||
+						typeof value !== "string" ||
+						value === ""
+					)
+						return json(
+							{
+								error:
+									"name must be listed in an env.txt (A_Z format) and value must be non-empty",
+							},
+							400,
+						);
+					envValues[name] = value;
+					saveConfig();
+					applyGitSecrets();
+					deps.shared.envValues = { ...envValues };
+					return json({ ok: true });
 				}),
 		},
 		// Git hosts other than GitHub. No answer ever holds a token

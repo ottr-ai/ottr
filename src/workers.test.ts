@@ -378,6 +378,119 @@ describe("serveWorker", () => {
 		expect(existsSync(marker)).toBe(false);
 	});
 
+	test("a failed tools install ends the run like a failed apt install", async () => {
+		const marker = join(dir, "omp-started-tools");
+		const markPath = join(dir, "mark-omp-tools.js");
+		writeFileSync(
+			markPath,
+			`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");`,
+		);
+		const url = start({
+			ompPath: process.execPath,
+			ensureTools: async () => {
+				throw new Error("tools: pip install failed (exit 1): nope");
+			},
+		});
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "r6b",
+				argv: [markPath],
+				cwd: dir,
+				stdin: "",
+				env: { OTTR_PROJECT: "p" },
+			}),
+		});
+		expect(res.status).toBe(200);
+		const lines = await readLines(res);
+		expect(lines).toHaveLength(1);
+		const sentinel = JSON.parse(lines[0]!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		expect(sentinel[WORKER_DONE].exitCode).toBe(1);
+		expect(sentinel[WORKER_DONE].stderrTail).toContain(
+			"pip install failed (exit 1)",
+		);
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	test("the tools link dir prefixes only the child's PATH; its notes ride stdout", async () => {
+		// Real omp fake: reports the PATH it saw, so the test checks the spawned env.
+		const pathEchoPath = join(dir, "echo-path.js");
+		writeFileSync(
+			pathEchoPath,
+			`process.stdout.write(JSON.stringify({ path: process.env.PATH }) + "\\n");process.exit(0);`,
+		);
+		const linkDir = join(dir, "tools-link");
+		const containerPath = "/usr/local/bin:/usr/bin";
+		const url = start({
+			ompPath: process.execPath,
+			ensureTools: async () => ["tools: installed ruff"],
+			buildPath: () => linkDir,
+		});
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "r7",
+				argv: [pathEchoPath],
+				cwd: dir,
+				stdin: "",
+				env: { OTTR_PROJECT: "velvarr", PATH: containerPath },
+			}),
+		});
+		const lines = await readLines(res);
+		const sentinel = JSON.parse(lines.at(-1)!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		expect(lines[0]).toBe("tools: installed ruff");
+		expect(JSON.parse(lines[1]!) as { path: string }).toEqual({
+			path: `${linkDir}:${containerPath}`,
+		});
+		expect(sentinel[WORKER_DONE].exitCode).toBe(0);
+	});
+
+	test("no OTTR_PROJECT: no tools install and no PATH prefix", async () => {
+		let toolsAsked = false;
+		let pathAsked = false;
+		const pathEchoPath = join(dir, "echo-path.js");
+		writeFileSync(
+			pathEchoPath,
+			`process.stdout.write(JSON.stringify({ path: process.env.PATH }) + "\\n");process.exit(0);`,
+		);
+		const containerPath = "/usr/local/bin:/usr/bin";
+		const url = start({
+			ompPath: process.execPath,
+			ensureTools: async () => {
+				toolsAsked = true;
+				return [];
+			},
+			buildPath: () => {
+				pathAsked = true;
+				return join(dir, "never");
+			},
+		});
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "r8",
+				argv: [pathEchoPath],
+				cwd: dir,
+				stdin: "",
+				env: { PATH: containerPath },
+			}),
+		});
+		const lines = await readLines(res);
+		expect(toolsAsked).toBe(false);
+		expect(pathAsked).toBe(false);
+		expect(JSON.parse(lines[0]!) as { path: string }).toEqual({
+			path: containerPath,
+		});
+		expect(lines).toHaveLength(2);
+	});
+
 	test("client abort kills the child: the response ends without a sentinel", async () => {
 		const url = start({ ompPath: process.execPath });
 		const controller = new AbortController();

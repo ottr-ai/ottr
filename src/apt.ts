@@ -10,7 +10,7 @@ import { join } from "node:path";
 const PACKAGE = /^[a-z0-9][a-z0-9+.-]+$/;
 // One path segment that cannot climb out of the workers dir; mirrors the New tab, which
 // rejects only separators and the dot names, so any other folder name is legal here.
-const PROJECT = /^(?!\.\.?$)[^/\\]+$/;
+export const PROJECT = /^(?!\.\.?$)[^/\\]+$/;
 
 /** Where alate provisions a project's package list. */
 export function aptListPath(project: string, home = homedir()): string {

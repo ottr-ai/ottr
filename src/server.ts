@@ -32,6 +32,7 @@ import {
 	ProjectStore,
 } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
+import { buildToolsPath, ensureProjectTools, turnEnvValues } from "./tools.ts";
 import {
 	appendLog,
 	createTurnLoop,
@@ -101,6 +102,8 @@ const shared: {
 	workCheck: boolean;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
+	/** /api/settings/env writes saved values here; the loop reads them per turn. */
+	envValues: Record<string, string>;
 } = {
 	// "none" starts the board with no global cap, like the Settings choice.
 	maxTotalRuns:
@@ -109,6 +112,7 @@ const shared: {
 			: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 3),
 	reviewCheck: true,
 	workCheck: true,
+	envValues: {},
 	...storedProjectPaths(gstore),
 };
 
@@ -386,6 +390,14 @@ const loop = createTurnLoop(projects, {
 	workerTarget: workerFromEnv(),
 	startRun,
 	ensurePackages: ensureProjectPackages,
+	prepareTurn: async (project) => {
+		const lines = await ensureProjectTools(project);
+		return {
+			lines,
+			pathDir: await buildToolsPath(project),
+			...turnEnvValues(project, shared.envValues),
+		};
+	},
 	publishRelease,
 	runReleaseCommand,
 	archReviewDelta,
@@ -412,6 +424,9 @@ const app = createApp({
 	// Server-only ssh keys and known_hosts: a data dir outside every
 	// checkout, which no worker mounts (compose: OTTR_SSH_DIR on the ottr-state volume).
 	sshDir: defaultSshDir(),
+	// Base home whose .ottr/workers folders hold the provisioned env.txt name lists
+	// (Settings -> Env); the dev board pins a fixture so demo names stay off the real home.
+	workersHome: process.env.OTTR_WORKERS_HOME,
 	projects,
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,

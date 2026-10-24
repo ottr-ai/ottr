@@ -5,6 +5,7 @@ import { ensureProjectPackages } from "./apt.ts";
 import { platform } from "./platform/index.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
+import { buildToolsPath, ensureProjectTools } from "./tools.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv } from "./worktree.ts";
 
@@ -39,6 +40,10 @@ export function serveWorker(opts: {
 	ompPath?: string;
 	/** Only for tests: replaces the apt install that runs before omp. */
 	ensurePackages?: typeof ensureProjectPackages;
+	/** Only for tests: replaces the tools.json install that runs before omp. */
+	ensureTools?: typeof ensureProjectTools;
+	/** Only for tests: replaces the link dir prepended to the child's PATH. */
+	buildPath?: typeof buildToolsPath;
 }): Bun.Server<never> {
 	return Bun.serve({
 		port: opts.port ?? 8787,
@@ -73,13 +78,18 @@ export function serveWorker(opts: {
 			// The project's package list (alate provisions it into the shared home) is installed
 			// in this container before omp starts; a failed install ends the run with apt's error.
 			let notes = "";
+			let pathDir = "";
 			const project = body.env?.OTTR_PROJECT;
 			if (typeof project === "string" && project !== "") {
 				try {
-					const lines = await (opts.ensurePackages ?? ensureProjectPackages)(
+					const aptLines = await (opts.ensurePackages ?? ensureProjectPackages)(
 						project,
 					);
-					notes = lines.map((l) => `${l}\n`).join("");
+					const toolLines = await (opts.ensureTools ?? ensureProjectTools)(
+						project,
+					);
+					pathDir = await (opts.buildPath ?? buildToolsPath)(project);
+					notes = [...aptLines, ...toolLines].map((l) => `${l}\n`).join("");
 				} catch (err) {
 					const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
 					return new Response(
@@ -102,6 +112,10 @@ export function serveWorker(opts: {
 			stripGitAuthEnv(env);
 			delete env.OTTR_WORKER_TOKEN;
 			let child: ChildProcess;
+			// The tools link dir is per-turn: project pins, then _all pins, then the container
+			// PATH. The daemon's own PATH never changes, and two projects never see each
+			// other's pins because the link dir is rebuilt per project.
+			if (pathDir) env.PATH = `${pathDir}:${String(env.PATH ?? "")}`;
 			try {
 				child = spawn(opts.ompPath ?? "omp", body.argv, {
 					cwd: body.cwd,

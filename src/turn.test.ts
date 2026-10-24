@@ -1042,11 +1042,12 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 		const merge = store.createTask("merge please");
 		store.updateTask(merge.id, { stage: "merging" });
 		await loop.runTurn(store.name, merge.id);
-		expect(record.runs[0]!.env).toBeUndefined();
+		// env is always an object now; the assertion is that it carries no git auth.
+		expect(record.runs[0]!.env).toEqual({});
 
 		const work = store.createTask("work please");
 		await loop.runTurn(store.name, work.id);
-		expect(record.runs[1]!.env).toBeUndefined();
+		expect(record.runs[1]!.env).toEqual({});
 	} finally {
 		setNetworkGitAuth(() => ({}));
 	}
@@ -3067,6 +3068,7 @@ describe("turn release cards", () => {
 				reviewCheck: true,
 				workCheck: true,
 				removedPaths: [],
+				envValues: {},
 				projectPaths: [],
 			},
 			serverRef: { current: undefined },
@@ -5087,6 +5089,71 @@ describe("package list", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("Unable to locate package nope");
+	});
+});
+
+describe("prepareTurn", () => {
+	test("a local turn logs one env line naming listed-but-valueless names", async () => {
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			prepareTurn: async () => ({
+				lines: [],
+				pathDir: null,
+				env: {},
+				missing: ["FOO", "BAR"],
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(logText(store, task.id)).toContain(
+			"env: no value for FOO, BAR (set it under Settings, Env)",
+		);
+	});
+
+	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0,
+			prepareTurn: async () => ({
+				lines: [],
+				pathDir: "/tmp/x",
+				env: { FOO: "v" },
+				missing: [],
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const env = record.runs[0]!.env;
+		expect(env?.FOO).toBe("v");
+		expect(env?.PATH?.startsWith("/tmp/x:")).toBe(true);
+	});
+
+	test("a worker-dispatched turn never calls prepareTurn", async () => {
+		let called = false;
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			prepareTurn: async () => {
+				called = true;
+				return { lines: [], pathDir: null, env: {}, missing: [] };
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(called).toBe(false);
+	});
+
+	test("a prepareTurn rejection stops the turn before omp starts", async () => {
+		const { store, record, loop } = setup({
+			prepareTurn: async () => {
+				throw new Error("tools: download failed");
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("tools: download failed");
 	});
 });
 

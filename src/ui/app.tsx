@@ -8713,6 +8713,111 @@ function GithubTokenSection() {
 	);
 }
 
+/** One env name as GET /api/settings/env reports it. */
+type EnvNameRow = { name: string; projects: string[]; set: boolean };
+
+/** Settings "Env" section: one secret value per env.txt name; values never come back after save. */
+function EnvSection() {
+	const [rows, setRows] = useState<EnvNameRow[] | null>(null);
+	const [values, setValues] = useState<Record<string, string>>({});
+	const [error, setError] = useState<string | null>(null);
+	const saveState = useBusy();
+	const load = useCallback(async (): Promise<void> => {
+		setRows(
+			(await unwrap<{ names: EnvNameRow[] }>(await fetch("/api/settings/env")))
+				.names,
+		);
+	}, []);
+	useEffect(() => {
+		load().catch((err) =>
+			setError(err instanceof Error ? err.message : String(err)),
+		);
+	}, [load]);
+	const save = (name: string): void =>
+		saveState.start(async () => {
+			setError(null);
+			try {
+				await post("/api/settings/env", { name, value: values[name] ?? "" });
+				setValues((v) => ({ ...v, [name]: "" }));
+				await load();
+				return true;
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	return (
+		<section className="settings-sec">
+			<h2>Env</h2>
+			<p className="hint">
+				Names come from the data repo's{" "}
+				<code>workers/&lt;project&gt;/env.txt</code> files (alate provisions
+				them into the home volume). One secret value per name serves every
+				project that lists it. Values are never shown after save.
+			</p>
+			{rows !== null && rows.length === 0 && (
+				<p className="hint">No env.txt file declares a name yet.</p>
+			)}
+			{rows !== null && rows.length > 0 && (
+				<form
+					className="settings-form"
+					onSubmit={(e) => {
+						e.preventDefault();
+					}}
+				>
+					<div className="alate-def-rows">
+						{rows.map((row) => (
+							<div className="alate-def-row" key={row.name}>
+								<div className="alate-def-name">
+									<b>
+										<code>{row.name}</code>
+									</b>
+									<span className="caption">{row.set ? "Set" : "Missing"}</span>
+									<span>{row.projects.join(", ")}</span>
+								</div>
+								<div className="alate-def-actions">
+									<input
+										type="password"
+										value={values[row.name] ?? ""}
+										onChange={(e) =>
+											setValues((v) => ({ ...v, [row.name]: e.target.value }))
+										}
+										placeholder={
+											row.set
+												? "Paste a new value to replace it"
+												: "Secret value"
+										}
+										autoComplete="off"
+										spellCheck={false}
+										aria-label={`Env value for ${row.name}`}
+										required
+									/>
+									<button
+										type="button"
+										disabled={saveState.busy}
+										className={saveState.failed ? "failed" : undefined}
+										onClick={() => save(row.name)}
+									>
+										{saveState.busy && (
+											<span className="spinner" aria-hidden="true" />
+										)}
+										Save
+									</button>
+								</div>
+							</div>
+						))}
+					</div>
+				</form>
+			)}
+			{error !== null && (
+				<p className="auth-error" role="alert">
+					{error}
+				</p>
+			)}
+		</section>
+	);
+}
+
 /** A running or finished `omp login` as the server reports it; `ok` stays null until omp exits. */
 type LoginView = { provider: string; output: string; ok: boolean | null };
 /** One provider in omp's credential store; inactive: omp disabled it, e.g. after a failed refresh. */
@@ -9679,6 +9784,7 @@ function SettingsPage({
 						<ApiKeySection />
 						<SessionSection />
 						<GithubTokenSection />
+						<EnvSection />
 						<GitHostsSection />
 						<ProviderLoginSection />
 						<HindsightSection />

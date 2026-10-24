@@ -44,7 +44,7 @@ import {
 } from "./turn.ts";
 import type { AddProjectResponse, Task } from "./types.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
-import { git, networkGitAuth } from "./worktree.ts";
+import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
 
 // The push tests observe sends and VAPID details (R1-1, R2-3). The mock must be registered
 // before app.ts evaluates — mock.module cannot intercept a static import — so app.ts loads
@@ -170,6 +170,7 @@ const shared = {
 	workCheck: true,
 	removedPaths: [] as string[],
 	projectPaths: [] as string[],
+	envValues: {} as Record<string, string>,
 };
 // Compose turns reach the board at OTTR_BOARD_URL, a host no allowlist covers ("turns' own host").
 const BOARD_TOKEN = "boot-token-test";
@@ -204,6 +205,8 @@ const app = createApp({
 	defaultDir: root,
 	// Server-only ssh state for the git-hosts routes; a root subdir, not a project checkout.
 	sshDir: join(root, "ssh"),
+	// env.txt name lists for the Settings env routes; a root subdir provisioned below.
+	workersHome: root,
 	projects,
 	...loopStubs(),
 	schedule: () => {
@@ -311,6 +314,7 @@ function mount(
 			reviewCheck: true,
 			workCheck: true,
 			removedPaths: [],
+			envValues: {},
 			projectPaths: [],
 		},
 		defaultDir: input.defaultDir ?? root,
@@ -2418,6 +2422,7 @@ describe("github token", () => {
 				reviewCheck: true,
 				workCheck: true,
 				removedPaths: [],
+				envValues: {},
 				projectPaths: [],
 			},
 			serverRef: { current: undefined },
@@ -2485,6 +2490,62 @@ describe("github token", () => {
 	});
 });
 
+describe("settings env", () => {
+	// env.txt name lists as alate would provision them under <home>/.ottr/workers.
+	const workersDir = join(root, ".ottr", "workers");
+	beforeAll(() => {
+		mkdirSync(join(workersDir, "_all"), { recursive: true });
+		mkdirSync(join(workersDir, "p1"), { recursive: true });
+		writeFileSync(join(workersDir, "_all", "env.txt"), "API_KEY\nDB_PASS\n");
+		writeFileSync(join(workersDir, "p1", "env.txt"), "API_KEY\n");
+	});
+	afterAll(() => {
+		rmSync(workersDir, { recursive: true, force: true });
+	});
+
+	test("GET lists the union of names with projects and set state; POST stores without echoing", async () => {
+		const before = await get("/api/settings/env");
+		expect(before.status).toBe(200);
+		expect(await before.json()).toEqual({
+			names: [
+				{ name: "API_KEY", projects: ["_all", "p1"], set: false },
+				{ name: "DB_PASS", projects: ["_all"], set: false },
+			],
+		});
+		const value = "s3cret-env-value";
+		const saved = await post("/api/settings/env", {
+			name: "API_KEY",
+			value,
+		});
+		expect(saved.status).toBe(200);
+		expect(await saved.json()).toEqual({ ok: true });
+		// The stored value reaches redaction and the turn loop, never an answer.
+		expect(gitSecrets()).toContain(value);
+		expect(shared.envValues["API_KEY"]).toBe(value);
+		const after = await get("/api/settings/env");
+		const text = await after.text();
+		// The parsed answer and its raw body never hold the value.
+		expect(JSON.parse(text)).toEqual({
+			names: [
+				{ name: "API_KEY", projects: ["_all", "p1"], set: true },
+				{ name: "DB_PASS", projects: ["_all"], set: false },
+			],
+		});
+		expect(text).not.toContain(value);
+	});
+
+	test("POST rejects an unlisted name and a bad name", async () => {
+		expect(
+			(await post("/api/settings/env", { name: "NOT_LISTED", value: "x" }))
+				.status,
+		).toBe(400);
+		expect(
+			(await post("/api/settings/env", { name: "bad-name", value: "x" }))
+				.status,
+		).toBe(400);
+	});
+});
+
 describe("hindsight settings", () => {
 	// Stand-in for the NAS Hindsight: its bank list answers only the tenant key.
 	const hindsight = Bun.serve({
@@ -2542,6 +2603,7 @@ describe("hindsight settings", () => {
 				reviewCheck: true,
 				workCheck: true,
 				removedPaths: [],
+				envValues: {},
 				projectPaths: [],
 			},
 			serverRef: { current: undefined },
@@ -2812,6 +2874,7 @@ describe("loopback Host from another machine or container", () => {
 			reviewCheck: true,
 			workCheck: true,
 			removedPaths: [],
+			envValues: {},
 			projectPaths: [],
 		},
 		serverRef: { current: undefined },
@@ -4059,6 +4122,7 @@ describe("sign out everywhere", () => {
 			reviewCheck: true,
 			workCheck: true,
 			removedPaths: [],
+			envValues: {},
 			projectPaths: [],
 		},
 		serverRef: { current: undefined },

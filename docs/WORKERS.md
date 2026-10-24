@@ -1,12 +1,12 @@
 # Workers
 
 Work turns run inside disposable containers built from `Dockerfile.worker`
-omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, Chrome for Testing, Godot and
+omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, Chrome for Testing and
 the language servers for omp's `lsp` tool (TypeScript 7's `tsc`, typescript-language-server, pyright)
 are pinned at build time, so a turn's toolchain is a property of the image, not the host.
 Chrome sits at `/opt/google/chrome/chrome`, where the agent layer's chrome-devtools MCP
-server looks for it, and Godot is `godot` on PATH, where Godot projects' turns and their
-godot MCP server find it; without a display it starts headless. The agent layer (rules,
+server looks for it. Tools a project pins beyond the image (e.g. Godot) come from the data
+repo at runtime (see "System packages per project" below). The agent layer (rules,
 config, skills, plugins) is not in the image: alate
 provisions it from its data repo snapshot into the shared home volume (`/root`), and runs
 chrome-devtools there headless, isolated and without Chrome's sandbox (workers run as
@@ -118,7 +118,7 @@ so name bun in full):
 0 * * * * cd /srv/ottr && $HOME/.bun/bin/bun scripts/update-image.ts -f docker-compose.yml --env-file <env> >> $HOME/ottr-update-image.log 2>&1
 ```
 
-The containers take pass-through keys such as `PIXELLAB_API_KEY` from the
+The containers take provider keys from the
 environment that runs compose, else from the env file. Cron has almost no
 environment, so on Linux put them in the env file. To stay on an older omp, disable
 the workflow, then revert the bump commit.
@@ -132,9 +132,9 @@ pin or sha fails the image build loudly. To update ripwire: take the new version
 
 ## System packages per project
 
-The image carries no project's system packages, with two exceptions: git-lfs,
+The image carries no project's system packages, with one exception: git-lfs,
 because the server checks LFS files out when it creates a worktree, before any
-list installs, and Godot, which has no Debian package. A project lists the Debian
+list installs. A project lists the Debian
 packages its turns need in the data repo as `workers/<project>/apt.txt`: one
 package per line, `#` comments allowed. For example, a project with UI changes
 lists the shared libraries and fonts Chrome needs, so omp's browser tool (it
@@ -146,6 +146,40 @@ fails does not stop the others. Before a turn starts, the container that runs it
 installs the packages it still lacks: a worker for work turns, the server for merge
 turns. The turn log names what was installed. An install that fails stops the turn
 with apt's error. The packages stay until the container is recreated.
+
+A tool with no Debian package (Godot, for example) goes into the same data-repo
+folder as `tools.json`: a JSON array of pinned downloads, one per tool.
+
+```json
+[
+  {
+    "name": "godot",
+    "url": "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip",
+    "sha256": "cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4",
+    "unpack": "zip",
+    "bin": "Godot_v4.7.2-stable_linux.x86_64"
+  }
+]
+```
+
+`name` is the command name the turn's PATH gets, `sha256` pins the download,
+`unpack` is `zip`, `tar.gz` or `none`, and `bin` is the executable inside the
+archive (`none` means the download itself is the executable). Alate provisions
+the file beside `apt.txt`, and the container that runs a turn installs it the
+same moment it installs the apt lists, into `/root/.ottr/tools/<sha256>/` on the
+home volume, keyed by hash: every container on the host shares one download, and
+a recreated container does not download again. Each turn then gets a link folder
+ahead of the image PATH: the project's tools first, then the fleet folder
+`workers/_all/tools.json`, and a project's `name` wins over the same `name` in
+`_all`. The container PATH itself never changes, so two projects never see each
+other's pins. A failed download or a hash mismatch stops the turn with the error,
+like a failed apt install.
+
+An env var name a project's turns need goes into `env.txt` beside the other two
+files: one name per line, `#` comments allowed, never a value. The value is a
+secret and lives on the board: save it once under **Settings → Env**, and every
+turn of a project whose `env.txt` (or `_all/env.txt`) lists the name receives it.
+A listed name with no value does not stop the turn; the card log names it.
 
 ## Env settings
 

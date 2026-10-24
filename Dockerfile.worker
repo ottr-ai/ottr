@@ -27,7 +27,7 @@ ARG RIPWIRE_SHA256=9a1b44da5d17464518be25539354c931499d2b008ff94096384f211d18814
 ARG GH_VERSION=2.102.0
 # sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
 ARG GH_SHA256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
-# Node.js: npx starts the agent layer's MCP servers (chrome-devtools, godot), and projects run
+# Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
 ARG NODE_VERSION=24.21.0
@@ -57,13 +57,6 @@ ARG GIT_LFS_VERSION=3.6.1-1+deb13u1
 # than GitHub. Keys stay on the server; workers get only the binary (D6). A wrong pin fails
 # the build loudly (D1).
 ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
-# Godot for Godot projects' turns (pinned version below) and their godot MCP server, which
-# finds `godot` on PATH. It has no Debian package, so a project's apt list cannot carry it.
-# A wrong pin 404s the download (fails the build loudly).
-ARG GODOT_VERSION=4.7.2
-# sha256 of Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip: the release asset's GitHub digest,
-# checked against the release's SHA512-SUMS.txt when pinned.
-ARG GODOT_SHA256=cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4
 
 # Keep bun's global bin outside /root — the HOME volume would shadow it.
 ENV BUN_INSTALL=/usr/local/bun
@@ -130,22 +123,6 @@ RUN bun -e "await Bun.write('/tmp/chrome.zip', await (await fetch('https://stora
     && mkdir -p /opt/google/chrome \
     && ln -s /opt/chrome-linux64/chrome /opt/google/chrome/chrome
 
-# Godot (pinned, checksum-verified). Turns run it headless, so it needs no display libraries.
-# ponytail: one Godot for every project; a project that pins another version needs a per-project install.
-RUN bun -e "await Bun.write('/tmp/godot.zip', await (await fetch('https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip')).bytes())" \
-    && echo "${GODOT_SHA256}  /tmp/godot.zip" | sha256sum -c - \
-    && unzip -q /tmp/godot.zip -d /tmp \
-    && install -D -m 0755 "/tmp/Godot_v${GODOT_VERSION}-stable_linux.x86_64" /opt/godot/godot \
-    && rm -f /tmp/godot.zip "/tmp/Godot_v${GODOT_VERSION}-stable_linux.x86_64"
-# Without a display Godot exits ("Can't load Xlib"), so `godot` on PATH adds --headless when there
-# is none: godot-mcp's run_project then runs the game and reads its output. A display keeps it.
-COPY --chmod=0755 <<'EOF' /usr/local/bin/godot
-#!/bin/sh
-[ -n "${DISPLAY}${WAYLAND_DISPLAY}" ] || set -- --headless "$@"
-exec /opt/godot/godot "$@"
-EOF
-RUN godot --version
-
 # Language servers for omp's lsp tool. omp starts a built-in server when the repo root holds one
 # of its root markers and the binary is in the project's node_modules/.bin or on PATH; a new
 # worktree has no node_modules when omp starts, so without these a turn gets no language server.
@@ -175,7 +152,8 @@ RUN bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
 
 # No project's system packages are baked in (e.g. the libraries Chrome needs): each project
 # lists them in the data repo, and a worker installs every list when it starts (src/apt.ts).
-# git-lfs and Godot above are the two exceptions.
+# git-lfs above is the one exception. A tool with no Debian package (e.g. Godot) goes into a
+# project's tools.json instead, which a container installs at runtime (docs/WORKERS.md).
 
 # Runtime GitHub auth: the board keeps the token from onboarding/Settings and exports it as
 # GH_TOKEN to server-side git, gh and merge turns only (D6); the worker daemon strips it

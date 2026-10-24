@@ -1,4 +1,5 @@
 import { ensureAllPackages } from "./apt.ts";
+import { ensureAllTools } from "./tools.ts";
 import { serveWorker } from "./workers.ts";
 
 // Fail closed: without the token the 0.0.0.0 /run endpoint lets any client run argv.
@@ -14,11 +15,24 @@ const server = serveWorker({
 });
 
 // Serving starts at once: a turn that arrives during the install queues behind it (src/apt.ts).
-ensureAllPackages().then(
-	(lines) => {
-		for (const line of lines) console.log(line);
+Promise.all([
+	ensureAllPackages().then(
+		(lines) => lines,
+		(err) => {
+			throw new Error(`apt: ${err instanceof Error ? err.message : err}`);
+		},
+	),
+	ensureAllTools().then(
+		(lines) => lines,
+		(err) => {
+			throw new Error(`tools: ${err instanceof Error ? err.message : err}`);
+		},
+	),
+]).then(
+	(results) => {
+		for (const line of results.flat()) console.log(line);
 	},
-	(err) => console.error(`apt: ${err instanceof Error ? err.message : err}`),
+	(err) => console.error(err instanceof Error ? err.message : String(err)),
 );
 
 process.on("SIGINT", () => {

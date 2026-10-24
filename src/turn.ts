@@ -265,6 +265,13 @@ export interface TurnOps {
 	startRun: typeof startRun;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
+	/** Tools install lines, the turn's PATH link dir, and the env values/missing names for local turns (src/tools.ts). */
+	prepareTurn?: (project: string) => Promise<{
+		lines: string[];
+		pathDir: string | null;
+		env: Record<string, string>;
+		missing: string[];
+	}>;
 	/** Override for tests: where findHttp400Rejection reads omp's HTTP-400 request log. */
 	http400Dir?: string;
 	publishRelease: typeof publishRelease;
@@ -1213,6 +1220,13 @@ export function createTurnLoop(
 					: (ops.workerTarget ?? null);
 			// A worker installs the project's packages into its own container; a local run does it here.
 			if (!worker) for (const line of await ops.ensurePackages(name)) log(line);
+			const prep =
+				!worker && ops.prepareTurn ? await ops.prepareTurn(name) : null;
+			for (const l of prep?.lines ?? []) log(l);
+			if (prep && prep.missing.length > 0)
+				log(
+					`env: no value for ${prep.missing.join(", ")} (set it under Settings, Env)`,
+				);
 
 			// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
 			// a merge turn) already owns the card: its kept path wrote the final state. Starting the
@@ -1242,13 +1256,20 @@ export function createTurnLoop(
 				// skill is pinned, and the board env is stripped (the proposal files here).
 				// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,
 				// and the findings are recorded, not filed — Ottr files them after the run.
-				env: retroCard
-					? { OTTR_RETRO: "1" }
-					: reviewCard
-						? { OTTR_REVIEW: "1" }
-						: // No git host auth for any agent, merge turns included (D6): the server
-							// pushes non-GitHub merges itself after the turn.
-							undefined,
+				env: {
+					...(prep?.env ?? {}),
+					...(retroCard
+						? { OTTR_RETRO: "1" }
+						: reviewCard
+							? { OTTR_REVIEW: "1" }
+							: {}),
+					// PATH last, so an env.txt value can never shadow the tools link dir.
+					...(prep?.pathDir
+						? { PATH: `${prep.pathDir}:${process.env.PATH ?? ""}` }
+						: {}),
+					// No git host auth for any agent, merge turns included (D6): the server
+					// pushes non-GitHub merges itself after the turn.
+				},
 				stripBoard: retroCard,
 				tools: retroCard
 					? "read,grep,glob,report_outcome,propose_task"

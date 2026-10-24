@@ -52,9 +52,8 @@ x-worker: &worker
     # No GitHub token here: workers run turns only, and push credentials stay on the
     # server (D6). The worker daemon strips GH_TOKEN and every git host credential from
     # each turn's env, so a token set here would never reach a turn.
-    # Keys that a project's MCP servers read pass through from the host env, like
-    # an image-generation API key that a project's .omp/mcp.json reads.
-    PIXELLAB_API_KEY:
+    # Project tools and env names come from the data repo instead
+    # (workers/<project>/tools.json and env.txt, docs/WORKERS.md).
 
 services:
   server:
@@ -161,7 +160,6 @@ services:
       # other providers (e.g. OPENROUTER_API_KEY, ZAI_API_KEY).
       ANTHROPIC_API_KEY:
       OPENAI_API_KEY:
-      PIXELLAB_API_KEY: # a project MCP server's key, as in x-worker
 
   worker-a:
     <<: *worker
