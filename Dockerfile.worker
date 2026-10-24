@@ -14,9 +14,9 @@ ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
 # when the binary is on PATH; without it every command runs raw. Host scoop runs 0.51.0.
 # Static musl build, no glibc deps. A wrong pin 404s the download (fails the build loudly).
-ARG RTK_VERSION=0.51.0
+ARG RTK_VERSION=1.0.1
 # sha256 of rtk-x86_64-unknown-linux-musl.tar.gz from the release's checksums.txt.
-ARG RTK_SHA256=5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5
+ARG RTK_SHA256=5b919c3bccb799b67a61866d0e617410a4fcdf173e2614440e59de2fa2003436
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
 ARG RIPWIRE_VERSION=0.6.7
