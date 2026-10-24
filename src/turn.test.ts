@@ -5797,11 +5797,12 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(turn.error).toBe("tracker restarted");
 	});
 
-	test("the demo switch keeps seeded running and preparing cards through both sweeps", async () => {
-		const { store, loop } = setup({
+	test("the demo switch keeps seeded cards through both sweeps and starts no queued card", async () => {
+		const { store, record, loop } = setup({
 			pidAlive: () => false,
 			isClean: async () => true,
 			targetSha: async () => "abc123def456",
+			maxTotalRuns: () => null, // the dev board runs with no cap
 		});
 		process.env.OTTR_DEMO = "1";
 		try {
@@ -5809,6 +5810,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			store.startTurn(a.id, "work", "carry on", null);
 			const b = seed(store, { state: "preparing" });
 			store.startTurn(b.id, "work", "carry on", null);
+			store.setSettings({ maxParallel: null }); // only the demo switch may hold it
+			const queued = store.createTask("queued demo card");
 
 			await loop.recoverRestarted();
 			loop.schedule();
@@ -5818,6 +5821,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			expect(store.getTask(b.id)!.state).toBe("preparing");
 			expect(store.listTurns(a.id).at(-1)!.endedAt).toBeNull();
 			expect(store.listTurns(b.id).at(-1)!.endedAt).toBeNull();
+			expect(store.getTask(queued.id)!.state).toBe("queued");
+			expect(record.runs).toHaveLength(0);
 		} finally {
 			delete process.env.OTTR_DEMO;
 		}

@@ -761,7 +761,8 @@ export function createTurnLoop(
 		// Counted in distinct keys: a live run sat in both `running` and `preparing`, so the old
 		// sum counted every run twice and the cap bit at half its number. runTurn claims
 		// synchronously, so the count is exact before each start.
-		const cap = ops.maxTotalRuns();
+		// The dev board's fabricated cards must never start a real agent, whatever the cap says.
+		const cap = demoBoard() ? 0 : ops.maxTotalRuns();
 		const active = () => new Set([...running.keys(), ...preparing]).size;
 		for (const e of projects.values()) {
 			try {

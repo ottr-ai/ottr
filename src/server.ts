@@ -89,7 +89,7 @@ const gstore = GlobalStore.open(STATE_DIR);
 // discovery read them. The persisted project lists load here, before boot discovery: a
 // removed project must stay off the board after a restart.
 const shared: {
-	maxTotalRuns: number;
+	maxTotalRuns: number | null;
 	/** True when a review's findings are checked by a second model before they become cards. */
 	reviewCheck: boolean;
 	/** True when a finished work card is checked by a second model before it enters the merge queue. */
@@ -97,7 +97,11 @@ const shared: {
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 } = {
-	maxTotalRuns: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 3),
+	// "none" starts the board with no global cap, like the Settings choice.
+	maxTotalRuns:
+		process.env.OMP_TRACKER_MAX_TOTAL === "none"
+			? null
+			: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 3),
 	reviewCheck: true,
 	workCheck: true,
 	...storedProjectPaths(gstore),

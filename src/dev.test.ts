@@ -30,7 +30,7 @@ describe("dev board bootstrap", () => {
 			expect(process.env.OTTR_STATE_DIR).toBe(
 				prev.OTTR_STATE_DIR ?? resolve(root, "state"),
 			);
-			expect(process.env.OMP_TRACKER_MAX_TOTAL).toBe("0");
+			expect(process.env.OMP_TRACKER_MAX_TOTAL).toBe("none");
 			// The sweeps must leave the fabricated running/preparing cards alone.
 			expect(process.env.OTTR_DEMO).toBe("1");
 			expect(serverLoads).toHaveLength(1);
