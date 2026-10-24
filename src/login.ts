@@ -311,6 +311,8 @@ export interface SignIn {
 	kind: string;
 	/** False when omp disabled it, e.g. after a refresh failed: the provider needs a new sign-in. */
 	active: boolean;
+	/** omp's own disabled_cause of the kept row; null when the sign-in is active. */
+	cause: string | null;
 }
 
 // The causes omp itself hides (pi-coding-agent usage-cli): a logout or a newer login of the account.
@@ -336,6 +338,7 @@ export function signIns(dbPath = agentDb()): SignIn[] {
 				provider: r.provider,
 				kind: r.credential_type,
 				active: r.disabled_cause === null,
+				cause: r.disabled_cause,
 			};
 			if (!by.get(r.provider)?.active) by.set(r.provider, s);
 		}
@@ -345,6 +348,34 @@ export function signIns(dbPath = agentDb()): SignIn[] {
 	} finally {
 		db.close();
 	}
+}
+
+export interface DeadSignIn {
+	provider: string;
+	/** omp's own disabled_cause message; the advisory prints it verbatim. */
+	cause: string;
+	roles: string[];
+}
+
+/**
+ * Providers a configured model role uses whose only stored sign-in omp disabled: one entry per
+ * provider, in the input order. The cause is omp's own message; no credential data (tokens, keys)
+ * is included — only the provider id, the cause, and the role names.
+ */
+export function deadSignIns(
+	list: readonly SignIn[],
+	roles: Readonly<Record<string, string>>,
+): DeadSignIn[] {
+	return list
+		.filter((s) => !s.active && s.cause !== null && s.cause !== "")
+		.map((s) => ({
+			provider: s.provider,
+			cause: s.cause as string,
+			roles: Object.entries(roles)
+				.filter(([, model]) => model.startsWith(`${s.provider}/`))
+				.map(([role]) => role),
+		}))
+		.filter((d) => d.roles.length > 0);
 }
 
 /**

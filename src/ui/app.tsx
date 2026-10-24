@@ -8821,7 +8821,7 @@ function ProviderLoginSection() {
 	};
 	const page = pending === null ? null : signInPage(pending.output);
 	return (
-		<section className="settings-sec providers">
+		<section className="settings-sec providers" id="signin-section">
 			<div className="providers-head">
 				<h2>Provider sign-in</h2>
 				<p className="hint">
@@ -9157,19 +9157,17 @@ export function alateHint(h: AlateHealthState): string {
 	return flags.length > 0 ? flags.join(" · ") : "up to date";
 }
 
-/** Opens Settings and scrolls to the Alate section; the page remounts on the hash change, so the
+/** Opens Settings and scrolls to the given section; the page remounts on the hash change, so the
  *  poll waits out the mount instead of racing it, and a second pass re-scrolls after the async
  *  sections above finish loading. Advisory link only — it never runs provisioning. */
-function openAlateSettings(): void {
+function openSettingsSection(sectionId: string): void {
 	const scroll = () => {
-		document
-			.getElementById("alate-section")
-			?.scrollIntoView({ block: "start" });
+		document.getElementById(sectionId)?.scrollIntoView({ block: "start" });
 	};
 	location.hash = `#${SETTINGS_HASH}`;
 	let tries = 0;
 	const t = setInterval(() => {
-		if (document.getElementById("alate-section") !== null) {
+		if (document.getElementById(sectionId) !== null) {
 			clearInterval(t);
 			scroll();
 			setTimeout(scroll, 600);
@@ -10796,12 +10794,14 @@ function App() {
 		state?.alatePendingSince ?? null,
 		nowMs,
 	);
+	const signinAdvisories = state?.deadSignIns ?? [];
 	const advisoryLines =
 		state === null ||
 		(orphanList.length === 0 &&
 			keptCount.held === 0 &&
 			orphansError === null &&
-			alatePendingKey === null) ? null : (
+			alatePendingKey === null &&
+			signinAdvisories.length === 0) ? null : (
 			<>
 				{orphansError !== null && (
 					<p className="notif-line">
@@ -10862,7 +10862,7 @@ function App() {
 							<button
 								type="button"
 								className="notif-link"
-								onClick={openAlateSettings}
+								onClick={() => openSettingsSection("alate-section")}
 							>
 								Open Settings
 							</button>
@@ -10872,6 +10872,25 @@ function App() {
 						)}
 					</p>
 				)}
+				{signinAdvisories.map((d) => (
+					<p className="notif-line" key={`signin:${d.provider}`}>
+						<Icon name="info" size={16} />
+						<span>
+							{d.provider}'s sign-in is disabled — {d.cause}. Used by the{" "}
+							{d.roles.join(", ")} model role{d.roles.length === 1 ? "" : "s"}.{" "}
+							<button
+								type="button"
+								className="notif-link"
+								onClick={() => openSettingsSection("signin-section")}
+							>
+								Open Settings
+							</button>
+						</span>
+						{inboxFresh.has(`signin:${d.provider}`) && (
+							<span className="new-tag">New</span>
+						)}
+					</p>
+				))}
 			</>
 		);
 	// One inbox entry per panel row, most urgent first; the bell and the New chips read it.
@@ -10884,6 +10903,7 @@ function App() {
 		orphansKey,
 		keptKey,
 		alatePendingKey,
+		...signinAdvisories.map((d) => `signin:${d.provider}` as const),
 	];
 	const entries: InboxEntry[] = [
 		...(critKey === null ? [] : [{ key: critKey, level: "crit" as const }]),

@@ -1,5 +1,7 @@
 // Shared contract for omp-task-tracker. Every module imports its types from here.
 
+import type { DeadSignIn } from "./login.ts";
+
 /** Board column. `backlog` parks ideas that are not refined enough to run: the board shows the
  * list under the todo lane below a divider, the scheduler never picks it, and a kicked card runs
  * a grilling session (no worktree) until the user promotes it to `todo`. */
@@ -660,6 +662,9 @@ export interface StateResponse {
 	/** Epoch ms when the connected alate server first reported pending true in this episode; null when
 	 *  it reports none or has not answered yet. Advisory only: the bell waits out the threshold. */
 	alatePendingSince: number | null;
+	/** Advisory: providers a configured model role uses whose stored sign-in omp disabled, with the
+	 *  disabled cause and the role names; empty when none or the store is unreadable. */
+	deadSignIns: DeadSignIn[];
 }
 
 /** One provider usage window, e.g. Anthropic's 5-hour or 7-day limit. */

@@ -7886,6 +7886,28 @@ describe("review findings check", () => {
 			/without a final message/,
 		);
 	});
+
+	test("checkRunError reads the death line, not omp's recovery hints", () => {
+		const stderrTail = [
+			"error: No API key found for anthropic.",
+			"Use /login, set an API key environment variable, or create /etc/ottr/omp-agent/agent.db",
+			"      at #di (/usr/local/bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:28745:105)",
+			"      at async #co (/usr/local/bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:28739:41727)",
+			"[Recovery]",
+			"  Main: omp --resume 01a16f59-c1c5-702b-a4e8-9cb3c01ef1b3",
+		].join("\n");
+		expect(checkRunError(runResult({ exitCode: 1, stderrTail }))).toBe(
+			"the check run exited with code 1: anthropic has no usable sign-in. Sign in again under Settings, then reply to re-run the check",
+		);
+		expect(
+			checkRunError(
+				runResult({
+					exitCode: 1,
+					stderrTail: "[Recovery]\n  Main: omp --resume abc",
+				}),
+			),
+		).toBe("the check run exited with code 1: Main: omp --resume abc");
+	});
 });
 
 describe("work card check", () => {

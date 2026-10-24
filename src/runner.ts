@@ -331,9 +331,10 @@ export function findHttp400Rejection(o: {
 /**
  * The stderr line that says why omp died. Bun prints a crash as source lines, `error: <message>`
  * (or `TypeError: …`) and stack frames, then omp appends its `[Recovery]` resume hints. The last
- * error line wins, else the last line before the hints, else the last line.
+ * error line wins, else the last line before the hints, else the last line. Shared with
+ * check-failure reasons so omp's recovery hints never win.
  */
-function deathLine(stderr: string): string | undefined {
+export function deathLine(stderr: string): string | undefined {
 	const all = stderr
 		.split("\n")
 		.map((l) => l.trim())

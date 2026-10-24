@@ -70,6 +70,8 @@ import {
 } from "./images.ts";
 import {
 	agentDir,
+	type DeadSignIn,
+	deadSignIns,
 	loginProviders,
 	PROVIDER_ID,
 	providerLogin,
@@ -1465,6 +1467,13 @@ export function createApp(deps: AppDeps) {
 		}
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
 		const scan = currentOrphanScan();
+		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
+		let dead: DeadSignIn[];
+		try {
+			dead = deadSignIns(signIns(), modelRoles());
+		} catch {
+			dead = [];
+		}
 		return {
 			projects: [...deps.projects.values()].flatMap((e) => {
 				try {
@@ -1490,6 +1499,7 @@ export function createApp(deps: AppDeps) {
 			drainCommits: drainUntil > now ? drainCommits : null,
 			updates: updatesView(),
 			alatePendingSince,
+			deadSignIns: dead,
 		};
 	}
 

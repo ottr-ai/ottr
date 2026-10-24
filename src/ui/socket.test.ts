@@ -33,6 +33,7 @@ describe("parseServerMessage", () => {
 						drainCommits: null,
 						updates: null,
 						alatePendingSince: null,
+						deadSignIns: [],
 					},
 				}),
 			),
@@ -56,6 +57,7 @@ describe("parseServerMessage", () => {
 				drainCommits: null,
 				updates: null,
 				alatePendingSince: null,
+				deadSignIns: [],
 			},
 		});
 		expect(

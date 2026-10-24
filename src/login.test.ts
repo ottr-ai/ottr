@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	deadSignIns,
 	loginProviders,
 	providerLogin,
 	redirectUri,
@@ -252,9 +253,14 @@ describe("signIns and signOut", () => {
 
 	test("one entry per provider: active wins, failed shows as inactive, logged-out and replaced stay hidden", () => {
 		expect(signIns(store())).toEqual([
-			{ provider: "anthropic", kind: "oauth", active: true },
-			{ provider: "deepseek", kind: "api_key", active: true },
-			{ provider: "kimi-code", kind: "oauth", active: false },
+			{ provider: "anthropic", kind: "oauth", active: true, cause: null },
+			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
+			{
+				provider: "kimi-code",
+				kind: "oauth",
+				active: false,
+				cause: "oauth refresh failed: invalid_grant",
+			},
 		]);
 	});
 
@@ -263,7 +269,7 @@ describe("signIns and signOut", () => {
 		expect(signOut("anthropic", path)).toBe(2);
 		expect(signOut("kimi-code", path)).toBe(1);
 		expect(signIns(path)).toEqual([
-			{ provider: "deepseek", kind: "api_key", active: true },
+			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
 		]);
 		// Already gone: nothing changes, and the stamp is omp's own cause.
 		expect(signOut("anthropic", path)).toBe(0);
@@ -284,9 +290,14 @@ describe("signIns and signOut", () => {
 		signOut("anthropic", shared);
 		expect(shareProviderCredentials("anthropic", pinned, shared)).toBeNull();
 		expect(signIns(shared)).toEqual([
-			{ provider: "anthropic", kind: "oauth", active: true },
-			{ provider: "deepseek", kind: "api_key", active: true },
-			{ provider: "kimi-code", kind: "oauth", active: false },
+			{ provider: "anthropic", kind: "oauth", active: true, cause: null },
+			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
+			{
+				provider: "kimi-code",
+				kind: "oauth",
+				active: false,
+				cause: "oauth refresh failed: invalid_grant",
+			},
 		]);
 	});
 
@@ -296,8 +307,13 @@ describe("signIns and signOut", () => {
 		signOut("anthropic", pinned);
 		expect(shareProviderCredentials("anthropic", pinned, shared)).toBeNull();
 		expect(signIns(shared)).toEqual([
-			{ provider: "deepseek", kind: "api_key", active: true },
-			{ provider: "kimi-code", kind: "oauth", active: false },
+			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
+			{
+				provider: "kimi-code",
+				kind: "oauth",
+				active: false,
+				cause: "oauth refresh failed: invalid_grant",
+			},
 		]);
 	});
 
@@ -313,6 +329,110 @@ describe("signIns and signOut", () => {
 	test("one store on disk (no pin) skips the copy", () => {
 		const only = store();
 		expect(shareProviderCredentials("anthropic", only, only)).toBeNull();
+	});
+
+	test("signIns mirrors the disabled cause; an active row has none", () => {
+		const list = signIns(store());
+		const kimi = list.find((s) => s.provider === "kimi-code");
+		expect(kimi?.cause).toBe("oauth refresh failed: invalid_grant");
+		expect(list.find((s) => s.provider === "anthropic")?.cause).toBeNull();
+	});
+
+	test("deadSignIns reports a disabled provider's role with the cause", () => {
+		const dead = deadSignIns(
+			[
+				{
+					provider: "kimi-code",
+					kind: "oauth",
+					active: false,
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			],
+			{ work: "kimi-code/kimi-k2", review: "anthropic/claude-opus-5-5" },
+		);
+		expect(dead).toEqual([
+			{
+				provider: "kimi-code",
+				cause: "oauth refresh failed: invalid_grant",
+				roles: ["work"],
+			},
+		]);
+	});
+
+	test("deadSignIns lists every role the disabled provider backs", () => {
+		const dead = deadSignIns(
+			[
+				{
+					provider: "kimi-code",
+					kind: "oauth",
+					active: false,
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			],
+			{ work: "kimi-code/kimi-k2", review: "kimi-code/kimi-vision" },
+		);
+		expect(dead).toEqual([
+			{
+				provider: "kimi-code",
+				cause: "oauth refresh failed: invalid_grant",
+				roles: ["work", "review"],
+			},
+		]);
+	});
+
+	test("deadSignIns is empty when every credential is active", () => {
+		expect(
+			deadSignIns(
+				[
+					{
+						provider: "anthropic",
+						kind: "oauth",
+						active: true,
+						cause: null,
+					},
+				],
+				{ work: "anthropic/claude-opus-5-5" },
+			),
+		).toEqual([]);
+	});
+
+	test("deadSignIns skips a disabled provider no role uses", () => {
+		expect(
+			deadSignIns(
+				[
+					{
+						provider: "kimi-code",
+						kind: "oauth",
+						active: false,
+						cause: "oauth refresh failed: invalid_grant",
+					},
+					{
+						provider: "anthropic",
+						kind: "oauth",
+						active: true,
+						cause: null,
+					},
+				],
+				{ work: "anthropic/claude-opus-5-5" },
+			),
+		).toEqual([]);
+	});
+
+	test("deadSignIns reports a disabled provider only when a role uses it", () => {
+		// kimi-code is disabled and unused; deepseek is disabled and unused by any role either.
+		expect(
+			deadSignIns(
+				[
+					{
+						provider: "kimi-code",
+						kind: "oauth",
+						active: false,
+						cause: "oauth refresh failed: invalid_grant",
+					},
+				],
+				{},
+			),
+		).toEqual([]);
 	});
 });
 
