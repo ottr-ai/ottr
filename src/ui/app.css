@@ -1,0 +1,5245 @@
+/* Ottr: ISA-101 high-performance HMI, dark by default; [data-theme="light"] flips the neutrals.
+   Direction contract: .impeccable/surfaces/src-ui-app-tsx.md */
+
+:root {
+	color-scheme: dark;
+	--field: #2b2e32; /* work area */
+	--chrome: #24272b; /* app bar and area list: the second neutral layer */
+	--panel: #303338; /* stage columns, table, grouped panels */
+	--card: #3a3f45; /* cards and raised controls */
+	--card-hover: #41464d;
+	--well: #1f2225; /* recessed readouts: meter tracks, logs, code */
+	--line: #4a5057;
+	--line-soft: #3d4248;
+	--text-strong: #eceef1; /* titles and values */
+	--text: #c9ced4;
+	--dim: #a8b0b9; /* secondary text; at least 4.5:1 on --card */
+	--accent: #8fb0d0; /* steel: the single interaction and selection edge */
+	--accent-hover: #a6c2de;
+	--accent-ink: #14181d;
+	--accent-bg: #26303a;
+	--accent-line: #46596e;
+	--normal-fill: #8f979f; /* indicator fill inside the normal band */
+	--alarm: #f0b429; /* needs you, above the normal band */
+	--alarm-bg: #3b3322;
+	--alarm-line: #6b5627;
+	--crit: #e5534b; /* offline, failed action, critical load */
+	--crit-bg: #472326;
+	--crit-line: #6b2d30;
+	--crit-ink: #ffd0cc;
+	--crit-text: #ffb4ae; /* crit-coloured text on normal surfaces */
+	--on-alarm: #14181d; /* ink on a solid amber fill */
+	--on-crit: #1d0d0c; /* ink on a solid red fill */
+	--diff-add: #7cc97f; /* added diff lines: the one non-alarm colour, diff text only */
+	--diff-add-bg: rgb(63 138 66 / 0.16);
+	--line-hover: #5a616a;
+	--card-active: #474d54;
+	--font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+	--mono: "Cascadia Code", ui-monospace, Consolas, monospace;
+	--scrim: rgba(12, 14, 16, 0.6);
+	--shadow-overlay: 0 18px 44px rgba(0, 0, 0, 0.5);
+	--ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+	--bar-h: 48px;
+}
+
+/* Light theme: same ISA-101 contract, inverted neutrals; alarms darken instead of pale. */
+:root[data-theme="light"] {
+	color-scheme: light;
+	--field: #f1f2f4;
+	--chrome: #e6e8eb;
+	--panel: #e9ebee;
+	--card: #fbfcfd;
+	--card-hover: #eef1f4;
+	--card-active: #e3e7eb;
+	--well: #e4e7ea;
+	--line: #c6ccd2;
+	--line-soft: #d6dade;
+	--line-hover: #9aa3ac;
+	--text-strong: #1b1e22;
+	--text: #33383e;
+	--dim: #5d656e;
+	--accent: #3c6a99;
+	--accent-hover: #30577f;
+	--accent-ink: #f2f7fc;
+	--accent-bg: #e7eef5;
+	--accent-line: #b0c6dc;
+	--normal-fill: #8a929b;
+	--alarm: #9a6a00;
+	--alarm-bg: #f9f0d8;
+	--alarm-line: #d8b96a;
+	--crit: #d63b32;
+	--crit-bg: #fbeae8;
+	--crit-line: #e5a49e;
+	--crit-ink: #78201b;
+	--crit-text: #b3261e;
+	--on-alarm: #ffffff;
+	--on-crit: #ffffff;
+	--diff-add: #1a7f37;
+	--diff-add-bg: rgb(52 153 77 / 0.14);
+	--scrim: rgba(30, 34, 40, 0.4);
+	--shadow-overlay: 0 18px 44px rgba(20, 30, 40, 0.16);
+}
+
+* {
+	box-sizing: border-box;
+	scrollbar-width: thin;
+	scrollbar-color: var(--line) transparent;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+}
+
+body {
+	background: var(--field);
+	color: var(--text);
+	font: 14px / 1.5 var(--font);
+	-webkit-font-smoothing: antialiased;
+}
+
+/* Application frame: bar, alarm banners, then panes that scroll on their own. */
+#root {
+	display: grid;
+	grid-template-rows: auto minmax(0, 1fr);
+	grid-template-columns: minmax(
+			0,
+			1fr
+		); /* an implicit auto column would grow to the widest table */
+	height: 100dvh;
+}
+
+::selection {
+	background: rgba(143, 176, 208, 0.35);
+}
+
+h1,
+h2,
+h3,
+h4 {
+	margin: 0;
+}
+
+a {
+	color: var(--accent);
+	text-underline-offset: 2px;
+}
+
+code {
+	font-family: var(--mono);
+	font-size: 0.92em;
+}
+
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+/* Scroll containers are positioned so abspos children (.sr text) stay inside them;
+   unpositioned, those children escape the clip and widen the page on phones. */
+.bar,
+.areas,
+.main,
+.ov-wrap {
+	position: relative;
+}
+
+.sr {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+.dim {
+	color: var(--dim);
+}
+
+.hint {
+	margin: 0;
+	color: var(--dim);
+	font-size: 12.5px;
+}
+
+/* Review-model nudge in the Start review dialog: visible recommendation, not a warning. */
+.model-notice {
+	margin: 0;
+	padding: 8px 10px;
+	border-left: 2px solid var(--accent);
+	background: var(--accent-bg);
+	color: var(--text);
+	font-size: 12.5px;
+	border-radius: 4px;
+}
+
+.icon-svg {
+	flex: none;
+}
+
+/* ---- Controls ---- */
+
+button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 12px;
+	font: inherit;
+	font-size: 13.5px;
+	color: var(--text-strong);
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	cursor: pointer;
+	transition:
+		background-color 0.12s var(--ease),
+		border-color 0.12s var(--ease),
+		color 0.12s var(--ease);
+}
+button:hover {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+button:active {
+	background: var(--card-active);
+}
+button:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+button.primary {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--accent-ink);
+	font-weight: 600;
+}
+button.primary:hover {
+	background: var(--accent-hover);
+	border-color: var(--accent-hover);
+}
+button.primary:disabled:hover {
+	background: var(--accent);
+}
+button.primary kbd {
+	font-family: inherit;
+	font-size: 11px;
+	line-height: 1;
+	padding: 3px 5px;
+	color: inherit;
+	background: color-mix(in srgb, var(--accent-ink) 16%, transparent);
+	border: 1px solid color-mix(in srgb, var(--accent-ink) 30%, transparent);
+	border-radius: 3px;
+}
+button.danger {
+	color: var(--crit-text);
+	background: transparent;
+	border-color: var(--crit-line);
+}
+button.danger:hover {
+	background: var(--crit-bg);
+	border-color: var(--crit);
+}
+button.ghost {
+	color: var(--text);
+	background: transparent;
+	border-color: transparent;
+}
+button.ghost:hover {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
+}
+button.icon {
+	min-width: 28px;
+	min-height: 28px;
+	padding: 0 6px;
+	color: var(--dim);
+	background: transparent;
+	border-color: transparent;
+}
+button.icon:hover {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
+}
+button.icon[aria-pressed="true"] {
+	color: var(--accent);
+}
+button.failed {
+	color: var(--crit-text);
+	border-color: var(--crit);
+}
+button.primary.failed {
+	color: #1d0d0c;
+	background: var(--crit);
+	border-color: var(--crit);
+}
+/* A pending alate import pulses the provision button so the waiting import gets noticed. */
+@keyframes attention-pulse {
+	0%,
+	100% {
+		box-shadow: 0 0 0 3px transparent;
+	}
+	50% {
+		box-shadow: 0 0 0 3px var(--accent);
+	}
+}
+button.attention {
+	animation: attention-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	button.attention {
+		animation: none;
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+}
+
+/* Optical vertical centering: the font's metric box hangs descender space below the cap
+   band, so flex-centered glyphs sit ~1px low while svg icons center exactly. Nudge text
+   up 1px, then re-center the non-text glyphs the nudge also moved. ponytail: tuned to
+   Segoe UI Variable at 13.5px; revisit if the font or button type scale changes.
+   button.icon/thumb (padding: 0) and .turn-head (baseline layout) keep their own padding,
+   and their direct svg children skip the margin compensation. */
+button {
+	padding-bottom: 2px;
+}
+button > .icon-svg,
+button > .gh-mark,
+button > kbd,
+button > .spinner {
+	margin-top: 2px;
+}
+button.icon > .icon-svg,
+button.thumb > .icon-svg,
+.turn-head > .icon-svg {
+	margin-top: 0;
+}
+
+.spinner {
+	width: 13px;
+	height: 13px;
+	flex: none;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* Spinner inside a text line (hints, loading/dim status lines) instead of a flex button. */
+.hint .spinner,
+.loading .spinner,
+.dim .spinner,
+.perf-range .spinner {
+	display: inline-block;
+	vertical-align: -2px;
+	margin-right: 6px;
+}
+
+input,
+textarea,
+select {
+	font: inherit;
+	color: var(--text-strong);
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	padding: 6px 9px;
+}
+input:hover,
+textarea:hover,
+select:hover {
+	border-color: var(--line-hover);
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+	border-color: var(--accent);
+	outline-offset: 0;
+}
+textarea {
+	resize: vertical;
+}
+::placeholder {
+	color: var(--dim);
+}
+
+/* ---- State marks: shape carries the state, colour only the alarms ---- */
+
+.mark {
+	width: 14px;
+	height: 14px;
+	flex: none;
+}
+.mark-needs {
+	fill: var(--alarm);
+}
+.mark-asked {
+	fill: var(--accent);
+}
+.mark-asked .mark-ink {
+	stroke: var(--accent-ink);
+}
+/* Project warnings: the needs triangle as a grey outline — attention without alarm. */
+.mark-warn {
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.4;
+}
+.mark-warn .mark-ink {
+	stroke: var(--dim);
+}
+.mark-crit {
+	fill: var(--crit);
+}
+.mark-ink {
+	fill: none;
+	stroke: #1c1e21;
+	stroke-width: 1.9;
+	stroke-linecap: round;
+}
+.mark-crit .mark-ink {
+	stroke: #fff4f2;
+}
+.mark-running {
+	fill: var(--text-strong);
+	/* Slow breath so live tasks stand out at a glance; silent design keeps it opacity-only. */
+	animation: mark-breathe 3.2s ease-in-out infinite;
+}
+.mark-queued {
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.6;
+}
+.mark-preparing {
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.6;
+}
+.mark-done {
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.8;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+/* A new alarm arrives once, like an unacknowledged HMI alarm; it never blinks. */
+.card .mark-needs,
+.area-ind .mark-needs,
+.needs-count .mark-needs,
+.needs-count .mark-asked,
+.inbox.lit .mark {
+	animation: mark-in 0.22s var(--ease) backwards;
+}
+@keyframes mark-in {
+	from {
+		transform: scale(0.5);
+	}
+}
+@keyframes mark-breathe {
+	50% {
+		opacity: 0.4;
+	}
+}
+
+/* ---- App bar: overview indicators ---- */
+
+.bar {
+	display: flex;
+	align-items: center;
+	gap: 16px;
+	height: var(--bar-h);
+	padding: 0 12px 0 14px;
+	background: var(--chrome);
+	border-bottom: 1px solid var(--line-soft);
+}
+.brand {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	width: 212px;
+	flex: none;
+	color: var(--text-strong);
+	font-weight: 600;
+	text-decoration: none;
+}
+.brand img {
+	width: 22px;
+	height: 22px;
+	border-radius: 50%;
+}
+.meters {
+	gap: 18px;
+	min-height: 36px;
+	padding: 0 10px;
+	/* Pushes the trailing icons (notification bell, theme, logout) to the bar's right edge;
+	   the removed settings gear used to own this anchor. */
+	margin-right: auto;
+	font-size: 12.5px;
+	font-weight: 400;
+	color: var(--text);
+	background: transparent;
+	border-color: transparent;
+}
+.meters:hover,
+.meters:has(+ :popover-open) {
+	background: var(--panel);
+	border-color: var(--line-soft);
+}
+.meter {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+}
+.meter-label {
+	color: var(--dim);
+}
+.meter-track {
+	position: relative;
+	width: 56px;
+	height: 8px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 1px;
+}
+.meter-fill {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
+/* The normal-band limit tick. */
+.meter-limit {
+	position: absolute;
+	top: -3px;
+	bottom: -3px;
+	width: 1px;
+	background: var(--text);
+}
+.meter[data-level="high"] .meter-fill {
+	background: var(--alarm);
+}
+.meter[data-level="crit"] .meter-fill {
+	background: var(--crit);
+}
+.meter-value {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 3.4em;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+}
+.meter-value .mark {
+	width: 12px;
+	height: 12px;
+}
+.meter[data-level="high"] .meter-value {
+	color: var(--alarm);
+}
+.meter[data-level="crit"] .meter-value {
+	color: var(--crit-text);
+}
+.meter-note {
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+/* Running-agent count in the bar; the full Agents meter covers wide viewports,
+   the narrow one hides it and shows this instead (the areas-pop legend explains the mark). */
+.agents-count {
+	display: none;
+	align-items: center;
+	gap: 4px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.agents-count .mark {
+	width: 9px;
+	height: 9px;
+}
+/* Phone-only bar chrome: the areas popout trigger; at wide viewports the rail takes its
+   place. The notification bell is the same on every viewport. */
+.areas-toggle {
+	display: none;
+}
+/* Bar icons: a 16px glyph on a firmer line reads at a glance. Idle icons sit at
+   text grey, not dim; a lit inbox bell overrides this with its solid fill. */
+.bar > button.icon > .icon-svg {
+	width: 16px;
+	height: 16px;
+	stroke-width: 2;
+}
+.bar > button.icon {
+	color: var(--text);
+}
+.bar > button.icon:hover {
+	color: var(--text-strong);
+}
+
+/* Level 3 detail, opened from the indicators. */
+.popover {
+	position: fixed;
+	inset: auto;
+	top: calc(var(--bar-h) + 6px);
+	left: 226px;
+	width: 400px;
+	max-width: calc(100vw - 24px);
+	margin: 0;
+	padding: 14px 16px 16px;
+	color: var(--text);
+	background: var(--field);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	box-shadow: var(--shadow-overlay);
+	/* Four sections outgrow short windows; the panel scrolls instead of leaving the viewport. */
+	max-height: calc(100dvh - var(--bar-h) - 18px);
+	overflow: auto;
+}
+@supports (position-anchor: --a) {
+	.meters {
+		anchor-name: --meters;
+	}
+	.popover {
+		position-anchor: --meters;
+		top: calc(anchor(bottom) + 6px);
+		left: anchor(left);
+	}
+}
+/* Notification panels hang under the right-hand bar icons, not the meters. */
+.popover.notif-pop {
+	position-anchor: auto;
+	top: calc(var(--bar-h) + 6px);
+	right: 12px;
+	left: auto;
+	width: min(480px, calc(100vw - 24px));
+}
+/* Theme menu hangs under the same bar icons; rows instead of wide panels. */
+.popover.theme-pop {
+	width: auto;
+	min-width: 172px;
+}
+.theme-choice {
+	width: 100%;
+	min-height: 28px;
+	padding: 0 8px;
+	font-size: 13px;
+	color: var(--text-strong);
+	background: transparent;
+	border-color: transparent;
+	justify-content: flex-start;
+}
+.theme-choice + .theme-choice {
+	margin-top: 2px;
+}
+.theme-choice > span {
+	flex: 1;
+	text-align: left;
+}
+.theme-choice:hover {
+	background: var(--card);
+	border-color: transparent;
+}
+.theme-choice[aria-pressed="true"] > .icon-svg:last-child {
+	color: var(--accent);
+}
+/* Model + Thinking fields sit side by side in dialogs. */
+.model-fields {
+	display: flex;
+	gap: 10px;
+}
+.model-fields .field {
+	flex: 1;
+	min-width: 0;
+}
+/* Model picker: the trigger looks like the select it replaced and opens the popover
+   holding the search bar and the roles/catalog list. */
+/* Caption row above the trigger: label text left, the selected model's quota chip right. */
+.field-head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 8px;
+}
+.model-quota {
+	font-size: 12px;
+	/* Match the dialog chip inside uppercase form labels (steer, reply): the numbers
+	   read better in normal case, the label text keeps the caption style. */
+	font-weight: 400;
+	letter-spacing: normal;
+	text-transform: none;
+	font-variant-numeric: tabular-nums;
+	color: var(--dim);
+	/* Never wrap: a second caption line pushes the trigger out of row alignment. */
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.model-quota [data-level="high"] {
+	color: var(--alarm);
+}
+.model-quota [data-level="crit"] {
+	color: var(--crit-text);
+}
+.model-trigger {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	width: 100%;
+	font: inherit;
+	text-align: left;
+	color: var(--text-strong);
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	padding: 6px 9px;
+}
+.model-trigger:hover {
+	border-color: var(--line-hover);
+}
+.model-trigger:focus-visible {
+	border-color: var(--accent);
+	outline-offset: 0;
+}
+.model-trigger .icon-svg {
+	flex: none;
+	transform: rotate(90deg); /* the right-chevron points down */
+}
+.model-pop {
+	/* No anchor support: fall back to the popover's centered default placement. */
+	top: auto;
+	left: auto;
+	width: min(420px, calc(100vw - 24px));
+	max-height: min(420px, calc(100dvh - 48px));
+	padding: 10px;
+	gap: 8px;
+	overflow: hidden; /* the list scrolls, not the panel */
+}
+/* Author display would beat the UA's closed [popover] display:none, so the
+   flex layout lives on the open state only. */
+.model-pop:popover-open {
+	display: flex;
+	flex-direction: column;
+}
+.model-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-height: 0;
+	overflow-y: auto;
+}
+.model-option {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	width: 100%;
+	min-height: 28px;
+	padding: 4px 8px;
+	font: inherit;
+	text-align: left;
+	color: var(--text);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 4px;
+}
+.model-option:hover {
+	background: var(--card);
+}
+.model-option[aria-pressed="true"] {
+	color: var(--text-strong);
+}
+.model-option[aria-pressed="true"] > .icon-svg {
+	color: var(--accent);
+}
+/* Divider between the omp role rows and the alphabetical catalog. */
+.model-divider {
+	margin: 6px 0;
+	border: 0;
+	border-top: 1px solid var(--line);
+}
+@supports (position-anchor: --a) {
+	.model-trigger {
+		anchor-name: --model-trigger;
+	}
+	.model-pop {
+		position-anchor: --model-trigger;
+		top: calc(anchor(bottom) + 4px);
+		left: anchor(left);
+	}
+}
+.popover section + section {
+	margin-top: 14px;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.popover h2 {
+	margin-bottom: 8px;
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.caption {
+	margin: 6px 0 0;
+	font-size: 12px;
+	color: var(--dim);
+}
+.readout {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 4px 16px;
+	margin: 0;
+}
+.readout div {
+	display: contents;
+}
+.readout dt {
+	color: var(--dim);
+}
+.readout dd {
+	margin: 0;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+}
+/* Provider quota: one grid for every provider, so tracks and values line up; Meter parts become cells. */
+.quota {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 56px auto auto;
+	align-items: center;
+	gap: 5px 10px;
+	font-size: 12.5px;
+}
+.quota h3 {
+	grid-column: 1 / -1;
+	margin: 0;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text);
+}
+.quota-group + .quota-group h3 {
+	margin-top: 7px;
+}
+.quota-group,
+.quota-row,
+.quota .meter {
+	display: contents;
+}
+.quota .meter-label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+/* Outranks the stacked-shell rule that hides bar tracks: the detail panel keeps its bars. */
+.quota .meter-track {
+	display: block;
+}
+/* Same for the drawer: the work-steps context meter keeps its bar at phone widths. */
+.drawer .meter-track {
+	display: block;
+}
+.quota-reset {
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+
+/* ---- Notification bell (the inbox in the app bar) ----
+   Clear: grey bell. Standing: the most urgent mark plus the total (grey for notices).
+   Lit: solid fill in the most urgent NEW entry's hue, ink on it, the inverted mark and
+   "N new"; the fill is the signal, the mark and the word keep it readable without colour. */
+.inbox {
+	gap: 6px;
+}
+.inbox[data-level="crit"] {
+	--lit: var(--crit);
+	--lit-ink: var(--on-crit);
+}
+.inbox[data-level="needs"] {
+	--lit: var(--alarm);
+	--lit-ink: var(--on-alarm);
+}
+.inbox[data-level="asked"],
+.inbox[data-level="info"] {
+	--lit: var(--accent);
+	--lit-ink: var(--accent-ink);
+}
+.inbox-n {
+	font-size: 12.5px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--text-strong);
+}
+.inbox[data-level="info"]:not(.lit) .inbox-n {
+	color: var(--dim); /* grey is normal */
+}
+.bar > button.inbox.lit {
+	color: var(--lit-ink);
+	background: var(--lit);
+	border-color: var(--lit);
+}
+.bar > button.inbox.lit:hover {
+	color: var(--lit-ink);
+	background: var(--lit);
+	border-color: var(--text-strong);
+}
+.inbox.lit .inbox-n {
+	color: inherit;
+}
+.inbox.lit .mark {
+	fill: currentColor;
+}
+.inbox.lit .mark-ink {
+	stroke: var(--lit); /* inverted mark, so it reads on the solid fill */
+}
+.new-tag {
+	flex: none;
+	padding: 0 5px;
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 16px;
+	color: var(--accent);
+	border: 1px solid var(--accent-line);
+	border-radius: 3px;
+}
+.notif-line > .new-tag {
+	flex: none; /* .notif-line > span { flex: 1 } would stretch the chip */
+	margin-top: 2px;
+}
+/* The desktop-notifications switch under the entries; .notify-toggle hides it on coarse pointers. */
+.inbox-foot {
+	margin-top: 12px;
+	padding-top: 8px;
+	border-top: 1px solid var(--line-soft);
+}
+/* Server connection lost: fixed at the bottom centre, above page content.
+   ponytail: native <dialog> modals still paint over it from the top layer;
+   irrelevant while offline since no dialog can act on a dead server. */
+.conn-banner {
+	position: fixed;
+	inset: auto;
+	left: 50%;
+	bottom: 16px;
+	transform: translateX(-50%);
+	z-index: 90;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	max-width: calc(100vw - 24px);
+	padding: 9px 16px;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--crit-ink);
+	background: var(--crit-bg);
+	border: 1px solid var(--crit-line);
+	border-radius: 6px;
+	box-shadow: var(--shadow-overlay);
+}
+/* Needs-you rows, shared by the notification popover: the popover row pattern
+   (theme menu, model list) with the state mark carrying the alarm colour. */
+.alarm-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.alarm-link {
+	justify-content: flex-start;
+	gap: 8px;
+	width: 100%;
+	padding: 0 8px;
+	font-size: 13px;
+	text-align: left;
+	color: var(--text);
+	background: transparent;
+	border-color: transparent;
+}
+.alarm-link:hover {
+	background: var(--card);
+	border-color: transparent;
+}
+.alarm-project {
+	flex: none;
+	font-size: 12px;
+	color: var(--dim);
+	font-weight: 600;
+}
+.alarm-title {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	color: var(--text-strong);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.notif-line {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	margin: 0;
+}
+.notif-line + .notif-line {
+	margin-top: 8px;
+}
+.notif-line > span {
+	flex: 1;
+}
+.notif-line > .mark {
+	margin-top: 3px;
+}
+.notif-line > .icon-svg {
+	flex: none;
+	margin-top: 2px;
+	color: var(--accent);
+	stroke-width: 2.2;
+}
+.notif-line button.icon {
+	flex: none;
+	min-height: 24px;
+	min-width: 24px;
+	color: var(--dim);
+}
+/* Update banner bullet list: the pending commits, scrollable when a long
+   divergence piles up so the popover stays bounded. */
+.notif-commits {
+	margin: 4px 0 0;
+	padding-left: 20px;
+	font-size: 12.5px;
+	max-height: 240px;
+	overflow-y: auto;
+}
+.notif-commits li {
+	margin: 2px 0;
+	overflow-wrap: anywhere;
+}
+
+/* ---- Shell: area list + main pane ---- */
+
+.shell {
+	display: grid;
+	/* The closed dialog is display:none, so it claims no grid slot; pin the shell to the 1fr row. */
+	grid-row: 2;
+	grid-template-columns: 240px minmax(0, 1fr);
+	min-height: 0;
+}
+.areas {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 10px 8px;
+	overflow-y: auto;
+	background: var(--chrome);
+	border-right: 1px solid var(--line-soft);
+}
+.areas ul,
+.areas-pop ul {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.area {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 36px;
+	padding: 0 10px;
+	color: var(--text);
+	text-decoration: none;
+	border: 1px solid transparent;
+	border-radius: 4px;
+}
+.area:hover {
+	color: var(--text-strong);
+	background: var(--panel);
+}
+/* The one active edge. */
+.area[aria-current="page"] {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--accent);
+}
+.area-name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.area-ind {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.area-ind .mark {
+	width: 9px;
+	height: 9px;
+}
+.area-ind.needs {
+	color: var(--alarm);
+	font-weight: 600;
+}
+.area-ind.needs .mark {
+	width: 13px;
+	height: 13px;
+}
+.area-ind.asked {
+	color: var(--accent);
+	font-weight: 600;
+}
+.area-ind.asked .mark {
+	width: 13px;
+	height: 13px;
+}
+/* The label reads as a divider: a clear step below Overview with a hairline and the legend toggle,
+   so it never passes for a row. The narrow-viewport block later in this file hides it. */
+.areas-label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 18px 10px 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.areas-rule {
+	flex: 1;
+	height: 1px;
+	background: var(--line-soft);
+}
+/* Ghost icon button; overrides the base 32px bordered control. */
+.areas-help {
+	min-height: 0;
+	padding: 0;
+	width: 18px;
+	height: 18px;
+	color: var(--dim);
+	background: transparent;
+	border: none;
+	border-radius: 50%;
+}
+.areas-help:hover,
+.areas-help[aria-expanded="true"] {
+	color: var(--text);
+	background: transparent;
+}
+/* Badge legend behind the (?) toggle: the row marks mean running / needs action / asked /
+   waiting, and a mark without a visible label is a guess (touch screens have no hover). */
+.areas-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px 12px;
+	margin: 0 10px 6px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.areas-legend span {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.areas-legend .mark {
+	width: 9px;
+	height: 9px;
+}
+.area-add {
+	justify-content: flex-start;
+	margin-top: 8px;
+	color: var(--text);
+	background: transparent;
+	border-style: dashed;
+}
+.area-add:hover {
+	border-style: solid;
+}
+.menu-foot {
+	display: flex;
+	gap: 8px;
+	align-items: baseline;
+	justify-content: center;
+	margin-top: auto;
+	padding: 10px;
+	font-size: 12.5px;
+}
+.menu-brand {
+	font-weight: 700;
+	color: var(--text);
+	text-decoration: none;
+}
+.menu-release {
+	color: var(--dim);
+	text-decoration: none;
+}
+.menu-brand:hover,
+.menu-release:hover {
+	text-decoration: underline;
+}
+
+.main {
+	min-width: 0;
+	overflow: auto;
+	padding: 18px 20px 24px;
+	container-type: inline-size;
+}
+.loading {
+	margin: 0;
+	color: var(--dim);
+}
+
+/* ---- Project view (Level 2) ---- */
+
+.project {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	/* Definite height, so .flow's flex-basis resolves and the columns scroll instead of stretching the page. */
+	height: 100%;
+}
+.project-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+}
+.project-head .search {
+	width: 220px;
+}
+/* Filtered-view indication: matched/total beside the search. A value in grey, not an alarm. */
+.filter-note {
+	flex-shrink: 0;
+	font-size: 12.5px;
+	font-variant-numeric: tabular-nums;
+	color: var(--text);
+	white-space: nowrap;
+}
+/* A live filter: the search edge and every lane badge carry the accent. */
+.search.filtered {
+	border-color: var(--accent);
+}
+.count.filtered {
+	border-color: var(--accent-line);
+	color: var(--accent);
+}
+.project-id {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	min-width: 0;
+}
+.project-id-text {
+	min-width: 0;
+}
+/* Project tag: a two-letter plate that tells projects apart by letter shape. Grey stock,
+   never a hue (Grey-Is-Normal): the same plate marks the area row, the header and the
+   New task dialog, so the eye can match them before it reads the name. */
+.ptag {
+	display: inline-grid;
+	flex-shrink: 0;
+	place-items: center;
+	width: 22px;
+	height: 22px;
+	font-size: 12px;
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: 0.02em;
+	color: var(--text-strong);
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.project-id .ptag {
+	width: 44px;
+	height: 44px;
+	font-size: 20px;
+	border-radius: 4px;
+}
+.ptag img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	border-radius: inherit;
+}
+/* An image icon stands alone: no plate behind it, so a transparent icon stays
+   transparent. The plate is the monogram's alone. Contain, not cover, so a
+   non-square artwork keeps its shape inside the slot. */
+.ptag.tag-img {
+	background: none;
+	border-color: transparent;
+}
+.ptag.tag-img img {
+	object-fit: contain;
+	border-radius: 0;
+}
+/* Settings icon section: the tag at header size, then the upload/remove actions beside it. */
+.icon-preview .ptag {
+	width: 44px;
+	height: 44px;
+	font-size: 20px;
+	border-radius: 4px;
+}
+.icon-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+/* File input styled as a ghost button: a label keeps the clipped input focusable, so
+   the picker stays keyboard-operable (tab to it, Enter opens it). */
+.icon-upload {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 12px;
+	font: inherit;
+	font-size: 13.5px;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	cursor: pointer;
+}
+.icon-upload:hover {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
+}
+.icon-upload input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+.ov th a {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+.project-sub {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	vertical-align: middle;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.project-id h1,
+.overview h1,
+.empty h1 {
+	font-size: 20px;
+	font-weight: 600;
+	line-height: 1.25;
+	letter-spacing: -0.01em;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.project-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 14px;
+	margin: 4px 0 0;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.project-meta > * {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+}
+.project-meta a {
+	text-decoration: none;
+}
+.project-meta a:hover {
+	text-decoration: underline;
+}
+/* Architecture-review-due badge: alarm tint, it is a nudge not an error. */
+.project-meta .arch-due {
+	color: var(--alarm);
+	font-weight: 600;
+}
+/* A review already queued or running: normal state, so grey — not an alarm. */
+.project-meta .arch-live {
+	color: var(--dim);
+	font-weight: 600;
+}
+/* Header actions join into one bordered toolbar unit: inner 1px dividers share the
+   edge, so the related controls read as one control. The primary New task stays
+   outside it. An empty group (gitless, no rules, no review due) disappears. */
+.project-actions .seg {
+	display: inline-flex;
+	align-items: stretch;
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.seg:empty {
+	display: none;
+}
+.seg button {
+	border: 0;
+	border-left: 1px solid var(--line-soft);
+	border-radius: 0;
+}
+.seg button:first-child {
+	border-left: 0;
+}
+/* The review action keeps its alarm ink inside the group; the status span in the
+   meta line next to the name carries the words. */
+.seg .arch-start {
+	color: var(--alarm);
+}
+.seg .arch-start:hover {
+	color: var(--alarm);
+	background: var(--alarm-bg);
+}
+/* Below the due cap the same action is an offer, not an alarm: quiet ink. */
+.seg .arch-start.quiet {
+	color: var(--text);
+}
+.seg .arch-start.quiet:hover {
+	color: var(--text-strong);
+}
+.project-actions {
+	display: flex;
+	flex-shrink: 0;
+	align-items: center;
+	gap: 8px;
+}
+/* Release preview: the version change reads first, the notes sit in a recessed scrollable well. */
+.release-line {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 10px;
+	margin: 0;
+}
+.release-line strong {
+	font-variant-numeric: tabular-nums;
+	color: var(--text-strong);
+}
+.release-line span {
+	font-size: 12.5px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.version-input {
+	width: 92px;
+	padding: 2px 8px;
+	font-family: var(--mono);
+	font-size: 12.5px;
+	font-variant-numeric: tabular-nums;
+}
+.release-tasks {
+	margin: 0;
+	padding-left: 22px;
+	max-height: 140px;
+	overflow-y: auto;
+	font-size: 12.5px;
+	line-height: 1.6;
+	color: var(--text);
+}
+.release-notes {
+	max-height: 220px;
+	overflow-y: auto;
+	padding: 10px 12px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+}
+.advisory {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin: 0;
+	padding: 7px 12px;
+	font-size: 13px;
+	color: var(--text);
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+}
+.advisory > .icon-svg {
+	color: var(--dim);
+}
+/* The advisory's one action reads as a steel link at the line's end; touch keeps its 40px target. */
+.advisory > button {
+	margin-left: auto;
+	color: var(--accent);
+	background: transparent;
+	border-color: transparent;
+}
+.advisory > button:hover {
+	color: var(--accent-hover);
+	background: transparent;
+	border-color: transparent;
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
+@media (min-width: 721px) {
+	.advisory > button {
+		min-height: 0;
+		padding: 0 0 2px;
+	}
+}
+
+.flow {
+	flex: 1;
+	/* Never grow with card content: the columns scroll instead, so the board fits the view. */
+	min-height: 0;
+	/* Horizontal pans belong to the swipe handler, not the browser's history-nav gesture;
+	   vertical panning (column scroll, pull-to-refresh) stays native. */
+	touch-action: pan-y;
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	grid-template-rows: minmax(0, 1fr);
+	gap: 10px;
+}
+@container (max-width: 760px) {
+	.flow {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		/* Stacked lanes clamp to the board and scroll their cards internally, like the
+		   4-column grid: content-sized rows let lane paint outgrow the board into the
+		   fixed FAB's zone, where no main padding can create clearance. The auto-rows
+		   line covers the second lane row, which grid implicit placement creates. */
+		grid-template-rows: minmax(0, 1fr);
+		grid-auto-rows: minmax(0, 1fr);
+	}
+}
+/* Board stage tabs: hidden until the single-column tier folds the grid to one lane.
+   Kept ahead of the container block below so its display flip wins the cascade. */
+.stage-tabs {
+	display: none;
+	overflow-x: auto; /* four labels plus counts can pass 320px; scroll, never wrap */
+	margin-bottom: 10px;
+}
+@container (max-width: 440px) {
+	.flow {
+		grid-template-columns: minmax(0, 1fr);
+		/* The tabbed lane scrolls its cards internally like every other tier: an auto row
+		   let the lane paint past the board into the fixed FAB's zone, and no main padding
+		   can create clearance for paint that outgrows the scroll area. */
+		grid-template-rows: minmax(0, 1fr);
+	}
+	/* The four lanes become tabs: the strip shows, only the active column stays in the grid. */
+	.stage-tabs {
+		display: flex;
+	}
+	.stage:not([data-active="true"]) {
+		display: none;
+	}
+}
+.stage {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+/* Landed work recedes: the Done column sits back toward the field. */
+.stage[data-stage="done"] {
+	background: color-mix(in srgb, var(--field) 60%, var(--panel));
+}
+/* Values read first: the column name is a dim label, its count the bright value. */
+.stage-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 9px 12px;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+	border-bottom: 1px solid var(--line-soft);
+}
+.count {
+	min-width: 24px;
+	padding: 0 6px;
+	font-size: 13px;
+	font-weight: 600;
+	text-align: center;
+	color: var(--text-strong);
+	background: var(--field);
+	border: 1px solid var(--line-soft);
+	border-radius: 3px;
+	font-variant-numeric: tabular-nums;
+}
+.stage-cards {
+	flex: 1;
+	min-height: 0;
+	/* Endless scroll: overflowing columns scroll; the global thin scrollbar themes it. */
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 8px;
+}
+.stage-empty {
+	margin: 0;
+	padding: 14px 12px;
+	font-size: 13px;
+	color: var(--dim);
+}
+
+.card {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	background: var(--card);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	transition:
+		background-color 0.12s var(--ease),
+		border-color 0.12s var(--ease),
+		margin-top 0.12s var(--ease);
+}
+.card[draggable="true"] {
+	cursor: grab;
+}
+/* A dragged card leaves a hollow slot behind: its outline stays, its content steps out. */
+.card.dragging,
+.card.dragging:hover {
+	cursor: grabbing;
+	background: transparent;
+	border-color: transparent;
+	outline: 1px dashed var(--line);
+	outline-offset: -1px;
+}
+.card.dragging > * {
+	opacity: 0;
+}
+/* The stretched open-button paints the whole card, so it must follow the card's
+   drag cursor instead of the button pointer; its ::after inherits from it. */
+.card[draggable="true"] .card-open,
+.card.dragging .card-open {
+	cursor: inherit;
+}
+/* Drop targets preview the slot the dragged card will take: a dashed steel placeholder of its height,
+   above the target card or at the end of the column. The target card moves down to make room. */
+.card.drop-before {
+	margin-top: calc(var(--drag-h, 36px) + 6px);
+}
+.card.drop-before::before,
+.stage-cards.drop-end::after {
+	content: "";
+	box-sizing: border-box;
+	height: var(--drag-h, 36px);
+	border: 1px dashed var(--accent);
+	border-radius: 4px;
+}
+/* Part of the target card, so hovering or dropping on the placeholder still targets that card. */
+.card.drop-before::before {
+	position: absolute;
+	right: -1px;
+	bottom: calc(
+		100% +
+		7px
+	); /* the 6px list gap, measured from outside the card's 1px border */
+	left: -1px;
+}
+.stage-cards.drop-end::after {
+	align-self: stretch;
+}
+/* While a reorder request is in flight, the slot stays at the drop point with a spinner and
+   a status label; the dimmed source card cannot start another drag until the order confirms. */
+.drop-slot {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	align-self: stretch;
+	min-height: var(--drag-h, 36px);
+	border: 1px dashed var(--accent);
+	border-radius: 4px;
+	font-size: 12px;
+	color: var(--dim);
+}
+.card.reorder-lock {
+	opacity: 0.55;
+}
+.card:hover {
+	background: var(--card-hover);
+	border-color: var(--line);
+}
+.card:has(.card-open:focus-visible) {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+.card-open {
+	flex-direction: column;
+	align-items: stretch;
+	justify-content: flex-start;
+	gap: 3px;
+	min-height: 0;
+	padding: 9px 10px 8px;
+	color: inherit;
+	font-weight: 400;
+	text-align: left;
+	background: none;
+	border: 0;
+	border-radius: 0;
+}
+.card-open:hover,
+.card-open:active {
+	background: none;
+}
+.card-open:focus-visible {
+	outline: none;
+}
+/* Stretched hit area: the whole card opens it; card-tags sit above for their link. */
+.card-open::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+}
+/* Key header: the state mark, the task key, and the chips go above the name. The name then uses the
+   full width of the card. */
+.card-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 20px;
+}
+.card-head .mark {
+	flex: none;
+	width: 12px;
+	height: 12px;
+	margin-right: 2px;
+}
+.card-title {
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+	margin-top: 1px;
+	font-size: 14px;
+	font-weight: 600;
+	line-height: 1.35;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.card-original,
+.card-error {
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+	font-size: 12px;
+	line-height: 1.35;
+	color: var(--dim);
+}
+/* The needs-attention error sits where the prompt excerpt would; amber like the card's meta line. */
+.card-error {
+	color: var(--alarm);
+}
+/* Follow-up marker: the send icon from the Follow up button, at the right end of the card's head. */
+.card-fu {
+	display: flex;
+	align-items: center;
+	column-gap: 4px;
+	min-width: 0;
+	margin-top: 2px;
+	font-size: 12px;
+	line-height: 1.35;
+	color: var(--dim);
+}
+.card-fu .icon-svg {
+	flex: none;
+	margin-top: 1px;
+}
+.card-fu-title {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.card-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	column-gap: 6px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.card-meta .commits,
+.card-meta .model {
+	margin-left: auto;
+}
+/* Stryker meter row: a running card's live mutation-test progress under the meta line.
+   Stacked, so the stats tail keeps whole words on the narrow board card. */
+.card-stryker {
+	display: grid;
+	gap: 2px;
+	font-size: 12px;
+	color: var(--dim);
+}
+.stryker-stats {
+	overflow: hidden;
+}
+/* Arrival: when a card lands in a column its status mark traces itself once and the meta line follows;
+   nothing loops. Cards cascade by position up to the eighth. Reduced motion skips it entirely. */
+@media (prefers-reduced-motion: no-preference) {
+	.stage-cards .card {
+		--arrive-delay: calc(min(sibling-index() - 1, 8) * 45ms);
+	}
+	.stage-cards .card-head .mark-queued,
+	.stage-cards .card-head .mark-done {
+		stroke-dasharray: 30;
+		animation: mark-draw 0.42s var(--ease) var(--arrive-delay, 0ms) backwards;
+	}
+	.stage-cards .card-meta {
+		animation: card-meta-in 0.42s var(--ease)
+			calc(var(--arrive-delay, 0ms) + 0.14s) backwards;
+	}
+}
+@keyframes mark-draw {
+	from {
+		stroke-dashoffset: 30;
+	}
+}
+@keyframes card-meta-in {
+	from {
+		opacity: 0;
+	}
+}
+/* The head of the Todo queue says "next" at the end of its head line; the rest of the queue stays unnumbered.
+   A card held by unfinished dependencies is never next: the label goes to the first unheld card.
+   ponytail: marks the Todo lane's head; a queued reply in In progress can still run first. Pass the
+   scheduler's head as a data attribute if that ever matters. */
+.card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
+	.card[data-state="queued"]:not([data-held]) ~ .card
+) .card-head {
+	padding-right: 40px;
+}
+.card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
+	.card[data-state="queued"]:not([data-held]) ~ .card
+)::after {
+	content: "next";
+	position: absolute;
+	top: 12px;
+	right: 10px;
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 1;
+	color: var(--text);
+	pointer-events: none;
+}
+.card-tags {
+	position: relative;
+	z-index: 1;
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end; /* the version chip reads as the card's end mark, bottom right */
+	gap: 6px;
+	padding: 0 10px 8px;
+	pointer-events: none;
+}
+.card-tags a {
+	pointer-events: auto;
+}
+.release,
+.commits,
+.model {
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	font-variant-numeric: tabular-nums;
+}
+a.release {
+	color: var(--accent);
+	text-decoration: none;
+}
+a.release:hover {
+	border-color: var(--accent);
+}
+/* Unread answer badge: a done question card whose drawer never opened; opening clears it. */
+.card .unread {
+	flex-shrink: 0;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	font-weight: 500;
+	line-height: 18px;
+	color: var(--accent-ink);
+	background: var(--accent);
+	border-radius: 3px;
+}
+/* Task key: the speaking id (e.g. OTTR-1) leads the card's head as quiet mono metadata. */
+.card .card-key {
+	flex-shrink: 0;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim); /* at least 4.5:1 on --card */
+	font-variant-numeric: tabular-nums;
+}
+
+.card[data-state="needs_you"] {
+	border-color: var(--alarm);
+}
+
+/* Research chip: same shape as the .model chip, muted to read as metadata. Right-aligned
+   on the head line, the way .model right-aligns the meta line. */
+.card .research {
+	flex-shrink: 0;
+	margin-left: auto;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	line-height: 18px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--dim); /* at least 4.5:1 on --card */
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+
+.card[data-state="needs_you"] .card-meta {
+	color: var(--alarm);
+}
+/* Ask rounds recede from alarm: same shape language, steel accent instead of amber. */
+.card[data-state="needs_you"][data-asked] {
+	border-color: var(--accent);
+}
+.card[data-state="needs_you"][data-asked] .card-meta {
+	color: var(--accent);
+}
+/* Unseen answers reuse the ask accent: the answer waits for the operator. */
+.card[data-unread] {
+	border-color: var(--accent);
+}
+/* Group label for the pinned unread answers: quiet small caps, nameable at a glance. */
+.lane-label {
+	margin: 0 2px;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--dim);
+}
+/* Todo lane's backlog row: label, right-aligned count and the Add draft button share one line. */
+.backlog-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.lane-add {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	padding: 1px 5px;
+	font-size: 11px;
+	color: var(--dim);
+	background: transparent;
+	border: 1px dashed var(--line-soft);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.lane-add:hover {
+	border-style: solid;
+	color: var(--text);
+}
+/* Boundary between pinned unread answers and the landing order below:
+   generous margins against the 6px card gap give the two groups separation. */
+.lane-divider {
+	width: 100%;
+	margin: 8px 0;
+	border: 0;
+	border-top: 1px solid var(--line-soft);
+}
+/* The unread chip rides with the total count, right-aligned. */
+.count.fresh {
+	margin-left: auto;
+	border-color: var(--accent-line);
+	color: var(--accent);
+}
+/* The alarm chip on a stage tab: solid fill in the alarm's hue, ink on it, the inverted
+   mark and the count — the lit-bell language. The fill pins the chip to its own tab, so a
+   squeezed strip cannot leave it adrift between neighbours. Ask rounds ride the steel
+   accent: input requested, not a stall. Same tokens as the card alarm coding, so the tab
+   echoes the card it points at. */
+.count.needs {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 7px;
+	color: var(--on-alarm);
+	background: var(--alarm);
+	border-color: var(--alarm);
+}
+.count.needs .mark {
+	width: 11px;
+	height: 11px;
+	fill: currentColor;
+}
+.count.needs .mark-ink {
+	stroke: var(--alarm); /* inverted mark, so it reads on the solid fill */
+}
+.count.needs.asked {
+	color: var(--accent-ink);
+	background: var(--accent);
+	border-color: var(--accent);
+}
+.count.needs.asked .mark-ink {
+	stroke: var(--accent);
+}
+/* Landed work recedes: recessed stock, lighter title weight. A review parked at merging is
+   idle too but not landed; it waits like a queued card (see cardMark in status.ts). */
+.card[data-state="idle"][data-stage="done"] {
+	background: var(--panel);
+}
+.card[data-state="idle"][data-stage="done"]:hover {
+	background: var(--card);
+}
+.card[data-state="idle"][data-stage="done"] .card-title {
+	font-weight: 500;
+	color: var(--text);
+}
+
+/* Parked ideas recede: dashed border marks them as not ready; text keeps full contrast (AA). */
+.card[data-stage="backlog"] {
+	border-style: dashed;
+	background: var(--panel);
+}
+
+/* ---- Done lane topic sections ---- */
+
+.topic-head {
+	position: sticky;
+	top: -9px;
+	z-index: 2;
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	width: 100%;
+	padding: 5px 2px 5px 0;
+	/* Reuse the done column's recessed background so cards scroll under the head. */
+	background: color-mix(in srgb, var(--field) 60%, var(--panel));
+	border: 0;
+	border-bottom: 1px solid var(--line-soft);
+	cursor: pointer;
+	text-align: left;
+	font: inherit;
+}
+.topic-head:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+.chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.5;
+	flex-shrink: 0;
+	transition: transform 160ms var(--ease);
+}
+.topic[data-collapsed] .chev {
+	transform: rotate(-90deg);
+}
+.topic-count {
+	margin-left: auto;
+	padding-right: 2px;
+	font-size: 11.5px;
+	font-weight: 600;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.topic-body {
+	display: grid;
+	grid-template-rows: 1fr;
+	transition: grid-template-rows 160ms var(--ease);
+}
+.topic[data-collapsed] .topic-body {
+	grid-template-rows: 0fr;
+}
+.topic-cards {
+	overflow: hidden;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 6px 0 2px;
+	/* No padding transition: animating padding thrashes layout, and the 6px snap
+	   is invisible inside the 160ms grid-template-rows collapse above. */
+}
+.topic[data-collapsed] .topic-cards {
+	padding-block: 0;
+}
+/* Quiet collapse/expand-all controls in the done stage head. */
+.lane-tools {
+	display: flex;
+	gap: 2px;
+	/* Hug the count badge at the right edge; space-between alone would center the tools. */
+	margin-left: auto;
+}
+.lane-tools button {
+	/* Square icon control, sized to the count badge so the done head keeps the common height. */
+	display: grid;
+	place-items: center;
+	width: 18px;
+	/* The global button min-height (32px) is what inflated the done head past its peers. */
+	min-height: 0;
+	height: 18px;
+	padding: 0;
+	color: var(--dim);
+	background: none;
+	border: 1px solid transparent;
+	border-radius: 3px;
+	cursor: pointer;
+}
+/* The text view toggle keeps its label width; only the icon controls are squares. */
+.lane-tools .view-toggle {
+	width: auto;
+	padding: 0 7px;
+	white-space: nowrap;
+	font: 600 12px / 1.4 var(--font);
+}
+.lane-tools button:hover {
+	color: var(--text-strong);
+	border-color: var(--line-soft);
+}
+.lane-tools button:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+/* The fresh badge rides with the count even with the tools' auto margin present. */
+.stage[data-stage="done"] .stage-head .count.fresh {
+	margin-left: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.chev,
+	.topic-body,
+	.topic-cards {
+		transition: none;
+	}
+}
+
+/* ---- Overview (Level 1) ---- */
+
+/* One column, top to bottom (Option A): stacked sections with even spacing. */
+.overview > * + * {
+	margin-top: 20px;
+}
+.overview > .ov-wrap {
+	/* The live table sits directly under its "Projects now" heading. */
+	margin-top: 8px;
+}
+.overview h1 {
+	margin: 0;
+}
+.ov-wrap {
+	overflow-x: auto;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.ov {
+	width: 100%;
+	border-collapse: collapse;
+	font-variant-numeric: tabular-nums;
+}
+.ov-note {
+	display: block;
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--dim);
+}
+
+.ov th,
+.ov td {
+	padding: 10px 14px;
+	text-align: right;
+	white-space: nowrap;
+	border-bottom: 1px solid var(--line-soft);
+}
+.ov tr:last-child > * {
+	border-bottom: 0;
+}
+.ov thead th {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+}
+.ov thead th:first-child,
+.ov th[scope="row"] {
+	width: 100%;
+	text-align: left;
+}
+.ov th[scope="row"] a {
+	font-weight: 600;
+	color: var(--text-strong);
+	text-decoration: none;
+}
+.ov th[scope="row"] a:hover {
+	color: var(--accent);
+	text-decoration: underline;
+}
+.ov tbody tr {
+	cursor: pointer;
+}
+.ov tbody tr:hover {
+	background: var(--card);
+}
+.ov td {
+	color: var(--text-strong);
+}
+.ov td.zero,
+.ov td.age {
+	color: var(--dim);
+}
+.ov td .mark-running {
+	width: 9px;
+	height: 9px;
+	margin-right: 6px;
+}
+.ov td:last-child {
+	padding: 4px 8px;
+}
+.needs-count {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	font-weight: 600;
+	color: var(--alarm);
+}
+.needs-count.ask-n {
+	color: var(--accent);
+}
+
+/* ---- Performance section on the overview ---- */
+
+/* Range pills ride the section head's right edge; the spinner slots in before them. */
+.perf-range {
+	display: flex;
+	margin-left: auto;
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	overflow: hidden;
+}
+.perf-range button {
+	padding: 2px 9px;
+	font-size: 11.5px;
+	background: none;
+	border: 0;
+	border-radius: 0;
+	color: var(--dim);
+}
+.perf-range button + button {
+	border-left: 1px solid var(--line-soft);
+}
+.perf-range button:hover {
+	color: var(--text-strong);
+	background: var(--card);
+}
+.perf-range button[aria-pressed="true"] {
+	color: var(--accent);
+	background: var(--card);
+}
+/* Rows are facts, not links: no pointer, no hover lift. */
+.perf tbody tr {
+	cursor: default;
+}
+.perf tbody tr:hover {
+	background: transparent;
+}
+.perf th[scope="row"] {
+	color: var(--text-strong);
+	font-weight: 600;
+}
+/* The live table's last column is the New task button; the perf table's Spend column is data,
+   so it keeps full cell padding. */
+.perf td:last-child {
+	padding: 10px 14px;
+}
+.perf-error {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 0;
+	padding: 10px 14px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	color: var(--dim);
+	font-size: 13px;
+}
+
+/* ---- Overview sections (Option A): triage list, KPI strip, per-project inline bars. ---- */
+
+/* Section head: bold label with a count note or the range pills on the same line. */
+.ov-head {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 0 0 8px;
+}
+.ov-sec {
+	margin: 0 0 8px;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.ov-head .ov-sec {
+	margin: 0;
+}
+/* The "Projects now" heading sits bare in the stack; the base rule above would cancel its gap. */
+.overview > .ov-sec {
+	margin-top: 20px;
+}
+.ov-count {
+	color: var(--dim);
+	font-size: 12.5px;
+	font-variant-numeric: tabular-nums;
+}
+
+/* Triage: one full-width row per waiting card, then project warnings; the amber edge marks
+   needs_you cards, questions and warnings stay grey. Rows are links and buttons. */
+.triage {
+	padding: 4px 0;
+}
+.tri {
+	display: grid;
+	grid-template-columns: 14px auto minmax(0, 1fr) auto auto auto;
+	gap: 10px;
+	align-items: center;
+	width: 100%;
+	min-height: 0;
+	padding: 7px 14px;
+	font: inherit;
+	font-size: 13.5px;
+	color: var(--text);
+	text-align: left;
+	text-decoration: none;
+	background: none;
+	border: 0;
+	border-left: 3px solid transparent;
+	border-radius: 0;
+	cursor: pointer;
+}
+.tri:hover {
+	background: var(--card-hover);
+}
+.tri.alarm {
+	border-left-color: var(--alarm);
+}
+.tri .t {
+	overflow: hidden;
+	color: var(--text-strong);
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.tri.warn .t {
+	color: var(--text);
+}
+.tri .k {
+	color: var(--dim);
+	font-family: var(--mono);
+	font-size: 12px;
+}
+.tri .w {
+	min-width: 56px;
+	color: var(--text-strong);
+	font-size: 12.5px;
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+/* Rank and close-candidate chips on triage rows and board cards: text labels,
+   never color alone; both read at least 4.5:1 on --card in both themes. */
+.rank-badges {
+	display: inline-flex;
+	flex-shrink: 0;
+	gap: 6px;
+}
+/* On a board card the chips right-align like the research chip does. */
+.card-head .rank-badges {
+	margin-left: auto;
+}
+.rank-badge {
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	font-weight: 600;
+	line-height: 18px;
+	color: var(--text-strong);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	font-variant-numeric: tabular-nums;
+}
+.close-badge {
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	line-height: 18px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--alarm);
+	border: 1px solid var(--alarm-line);
+	border-radius: 3px;
+	cursor: help;
+}
+/* Drawer triage row: the rank picker and the close-candidate control share one line. */
+.drawer-triage {
+	margin: 10px 0 0;
+}
+.drawer-triage h3 {
+	margin: 0 0 6px;
+}
+.triage-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+}
+.triage-rank {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 13px;
+	color: var(--dim);
+}
+.triage-nominate {
+	display: inline-flex;
+	flex: 1;
+	min-width: 220px;
+	gap: 6px;
+}
+.triage-nominate input {
+	flex: 1;
+	min-width: 0;
+}
+.triage-set {
+	display: inline-flex;
+	flex: 1;
+	min-width: 0;
+	align-items: center;
+	gap: 8px;
+	font-size: 12.5px;
+}
+.triage-reason {
+	overflow: hidden;
+	color: var(--dim);
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+/* Review learnings: one row per convention, then the add form. */
+.learnings-list {
+	margin: 8px 0 0;
+	padding: 0;
+	list-style: none;
+}
+.learnings-list li {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	padding: 6px 0;
+	border-bottom: 1px solid var(--line-soft);
+}
+.learning-text {
+	flex: 1;
+	min-width: 0;
+	overflow-wrap: anywhere;
+	color: var(--text);
+}
+.learning-glob {
+	flex-shrink: 0;
+	padding: 0 6px;
+	font-size: 11.5px;
+	color: var(--dim);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.learning-uses {
+	flex-shrink: 0;
+	color: var(--dim);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+}
+.learnings-add {
+	display: grid;
+	gap: 8px;
+	margin-top: 10px;
+	max-width: 480px;
+}
+.learnings-add label {
+	display: grid;
+	gap: 4px;
+	font-size: 13px;
+	color: var(--dim);
+}
+.tri-sep {
+	height: 1px;
+	margin: 4px 14px;
+	background: var(--line-soft);
+}
+.tri-empty {
+	margin: 0;
+	padding: 10px 14px;
+	color: var(--dim);
+}
+
+/* KPI strip: five tiles over 1px hairline gaps; value, sub-line, delta, sparkline. */
+.kpis {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(0, 1fr));
+	background: var(--line-soft);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	overflow: hidden;
+}
+/* Flex column: tiles in one row share a height, so margin-top:auto pins every sparkline to the
+   bottom edge whether or not the tile shows a delta line. */
+.kpi {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	padding: 12px 14px;
+	background: var(--panel);
+}
+.kpi .l {
+	display: inline-flex;
+	gap: 5px;
+	align-items: center;
+	color: var(--dim);
+	font-size: 12.5px;
+}
+.kpi .l .mark {
+	width: 12px;
+	height: 12px;
+}
+.kpi .v {
+	color: var(--text-strong);
+	font-size: 24px;
+	font-weight: 600;
+	line-height: 1.2;
+	font-variant-numeric: tabular-nums;
+}
+.kpi .v small {
+	display: block;
+	overflow: hidden;
+	color: var(--dim);
+	font-size: 12.5px;
+	font-weight: 400;
+	line-height: 1.4;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.kpi .d {
+	display: inline-flex;
+	gap: 4px;
+	align-items: center;
+	color: var(--dim);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+}
+/* Delta arrow: shape carries direction, currentColor keeps it grey (never colour-coded). */
+.d-arw {
+	width: 10px;
+	height: 10px;
+	flex: none;
+	fill: currentColor;
+}
+.kpi svg.sp {
+	display: block;
+	width: 100%;
+	height: 32px;
+	margin-top: auto;
+	padding-top: 4px;
+}
+.sp polyline {
+	fill: none;
+	stroke: var(--normal-fill);
+	stroke-width: 1.5;
+	vector-effect: non-scaling-stroke;
+}
+.sp .last {
+	fill: var(--text-strong);
+}
+.sp .base {
+	stroke: var(--line-soft);
+	stroke-width: 1;
+	vector-effect: non-scaling-stroke;
+}
+/* Only the failure tile carries colour: an amber frame and tint once the rate passes the alarm line. */
+.kpi.alarm {
+	background: var(--alarm-bg);
+	box-shadow: inset 0 0 0 1px var(--alarm-line);
+}
+.kpi.alarm .sp polyline {
+	stroke: var(--alarm);
+}
+
+/* Per-project table cells: value first, recessed track scaled to the column max via --v. */
+.ov th[scope="row"] .p {
+	display: inline-flex;
+	gap: 8px;
+	align-items: center;
+}
+.cell-bar {
+	display: inline-flex;
+	gap: 8px;
+	align-items: center;
+	justify-content: flex-end;
+}
+.cell-bar i {
+	position: relative;
+	display: inline-block;
+	width: 64px;
+	height: 6px;
+	background: var(--well);
+	border-radius: 1px;
+}
+.cell-bar i::after {
+	content: "";
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: var(--v);
+	background: var(--normal-fill);
+}
+.cell-bar.alarm i::after {
+	background: var(--alarm);
+}
+.sub {
+	margin-left: 4px;
+	color: var(--dim);
+	font-size: 12px;
+}
+@container (max-width: 1100px) {
+	.kpis {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+@media (max-width: 720px) {
+	.kpis {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+
+.empty {
+	max-width: 520px;
+	margin: 12vh auto 0;
+	text-align: center;
+}
+.empty p {
+	margin: 8px 0 18px;
+	color: var(--dim);
+}
+
+/* ---- Dialogs (native, top layer) ---- */
+
+dialog {
+	padding: 0;
+	color: var(--text);
+	background: var(--field);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	box-shadow: var(--shadow-overlay);
+}
+dialog::backdrop {
+	background: var(--scrim);
+}
+dialog[open] {
+	animation: dialog-in 0.16s var(--ease);
+}
+dialog[open]::backdrop {
+	animation: fade 0.16s var(--ease);
+}
+dialog.lightbox {
+	padding: 0;
+	background: none;
+	border: 0;
+	box-shadow: none;
+	overflow: visible;
+}
+.lightbox img {
+	display: block;
+	max-width: 94vw;
+	max-height: 90dvh;
+	border-radius: 4px;
+}
+.lightbox .frame {
+	position: relative;
+}
+.lightbox .page {
+	position: absolute;
+	top: 50%;
+	transform: translateY(-50%);
+	display: grid;
+	place-items: center;
+	width: 40px;
+	height: 40px;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: rgb(0 0 0 / 0.55);
+	color: #fff;
+	cursor: pointer;
+}
+.lightbox .page.prev {
+	left: 8px;
+}
+.lightbox .page.next {
+	right: 8px;
+}
+/* Diff lightbox: solid panel over the base dialog chrome, file path in the head, line-classified text below. */
+dialog.diff-view {
+	width: min(1100px, 94vw);
+	overflow: hidden;
+}
+.diff-head {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+	padding: 10px 14px;
+	border-bottom: 1px solid var(--line-soft);
+}
+.diff-head-path {
+	font-family: var(--mono);
+	font-size: 12px;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.diff-code {
+	margin: 0;
+	padding: 10px 0;
+	overflow: auto;
+	max-height: 78dvh;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.5;
+	background: var(--well);
+}
+.diff-code div {
+	padding: 0 14px;
+	white-space: pre;
+}
+.dl-add {
+	color: var(--diff-add);
+	background: var(--diff-add-bg);
+}
+.dl-del {
+	color: var(--crit-text);
+	background: var(--crit-bg);
+}
+.dl-hunk {
+	color: var(--accent);
+}
+.dl-meta {
+	color: var(--dim);
+}
+.diff-empty {
+	padding: 18px 14px;
+}
+@keyframes dialog-in {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+}
+@keyframes fade {
+	from {
+		opacity: 0;
+	}
+}
+.dialog {
+	width: min(560px, calc(100vw - 24px));
+	max-height: min(85dvh, 760px);
+}
+/* Settings: the head stays put; only the body scrolls under it. */
+.dialog-body {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 14px 18px 18px;
+}
+.dialog-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+.dialog-head h2 {
+	font-size: 16px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.dialog-head h2 .icon-svg {
+	vertical-align: -2px;
+	margin-right: 8px;
+}
+.dialog-sub {
+	margin-left: 10px;
+	font-weight: 400;
+	color: var(--dim);
+}
+.dialog-body h3 {
+	margin-top: 4px;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	font-size: 13px;
+	color: var(--text);
+}
+/* Shared prompt inputs (New task, Reply/follow-up, Steer): label, textarea, attachments. */
+.prompt-field {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.prompt-field textarea {
+	field-sizing: content;
+	min-height: 7em;
+	max-height: 50vh;
+}
+/* File drag hovers the input: the accent pair, same tinting as the asked-state panels. */
+.prompt-field textarea.drop-target {
+	border-color: var(--accent);
+	background: var(--accent-bg);
+}
+.attach-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+}
+/* A refused image pick, shown where the pick happened; crit text on the surface, like the bell's crit line. */
+.attach-error {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	margin: 0;
+	font-size: 12px;
+	color: var(--crit-text);
+	overflow-wrap: anywhere;
+}
+.attach-error .icon {
+	flex: none;
+}
+.dialog-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+}
+/* The image picker sits apart on the row's left edge; Cancel and the primary stay right. */
+.dialog-actions .browse {
+	margin-right: auto;
+}
+
+/* Runners: a flat stack on the section, no box — the dialog surface groups already. */
+.settings-form {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 8px;
+}
+/* Add project: large container in a dialog; one column. */
+.add-form {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 12px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.add-form label {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	gap: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.add-tabs .gh-mark {
+	margin-right: 6px;
+}
+.settings-form .meter-track {
+	width: 120px;
+}
+/* ---- Settings page: a config bench beside a section rail, not a dialog. ---- */
+.settings-page {
+	display: grid;
+	grid-template-columns: 200px minmax(0, 1fr);
+	gap: 20px;
+	align-items: start;
+	max-width: 1200px;
+}
+/* The settings rail is its own grammar, not the main rail's boxed rows: a text
+   index where the current page is the one steel edge on the left. */
+.settings-nav {
+	position: sticky;
+	top: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+.snb {
+	display: block;
+	padding: 5px 8px 5px 12px;
+	color: var(--text);
+	font-size: 13px;
+	text-decoration: none;
+	border-left: 1px solid var(--line-soft);
+}
+.snb:hover {
+	color: var(--text-strong);
+	background: var(--panel);
+}
+.snb[aria-current="page"] {
+	color: var(--text-strong);
+	border-left-color: var(--accent);
+}
+/* The label reads as a divider, same grammar as the main rail's group label. */
+.snb-label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 16px 0 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.snb-label::after {
+	content: "";
+	flex: 1;
+	height: 1px;
+	background: var(--line-soft);
+}
+.settings-content {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+	min-width: 0;
+	/* Signature interaction: a section switch arrives once, on the shared easing. */
+	animation: settings-in 160ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+@keyframes settings-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+}
+.settings-content > h1 {
+	margin: 0;
+}
+/* A project page stacks its sections inside one form; give the form the same column gap. */
+.settings-content > form {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+}
+/* The project page's title row: name left, the page Save right. */
+.settings-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin: 0;
+}
+.settings-head h2 {
+	margin: 0;
+}
+.settings-sec {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 12px;
+	padding: 16px 18px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.settings-sec > h2,
+.settings-sec > h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.settings-sec > .hint {
+	margin: 0;
+}
+/* Field pairs: dim caption over a full-width value, capped for readable line lengths. */
+.settings-field {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	align-self: stretch;
+	max-width: 460px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.settings-field input,
+.settings-field textarea {
+	width: 100%;
+}
+.settings-field input[type="number"] {
+	font-variant-numeric: tabular-nums;
+}
+/* Read-only identity values (folder path, GitHub link): wrap instead of overflow. */
+.settings-field > code,
+.settings-field > a {
+	width: fit-content;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+}
+/* Danger zone: the one red-lined section, last on a project page. */
+.settings-danger {
+	border-color: var(--crit-line);
+}
+.settings-danger > h3 {
+	color: var(--crit);
+}
+@media (max-width: 720px) {
+	.settings-page {
+		grid-template-columns: 1fr;
+		gap: 12px;
+	}
+	.settings-nav {
+		position: static;
+		flex-flow: row wrap;
+		gap: 4px 12px;
+		overflow-x: auto;
+	}
+	.snb {
+		padding: 11px 2px;
+		white-space: nowrap;
+		border-left: 0;
+		border-bottom: 1px solid transparent;
+	}
+	.snb[aria-current="page"] {
+		border-bottom-color: var(--accent);
+	}
+	.snb-label {
+		flex-basis: 100%;
+		margin: 6px 0 2px;
+	}
+}
+.settings-save {
+	justify-content: center;
+	min-width: 72px;
+}
+/* The save-state contract: dim when settled, accent while waiting on you, crit on failure. */
+.settings-sec .settings-head h2 {
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.save-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-left: auto;
+	font-size: 12px;
+	color: var(--dim);
+	white-space: nowrap;
+}
+.save-chip.dirty {
+	color: var(--accent);
+}
+.save-chip.failed {
+	color: var(--crit);
+}
+/* Numeric knobs: one wrapping row of caption-over-input labels. */
+.settings-numbers {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+}
+.settings-numbers input {
+	width: 72px;
+}
+.add-tabs {
+	display: flex;
+	gap: 2px;
+	border-bottom: 1px solid var(--line-soft);
+}
+.add-tabs button,
+.stage-tabs button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 32px;
+	padding: 0 14px;
+	margin-bottom: -1px;
+	background: transparent;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	border-radius: 0;
+	color: var(--dim);
+	transition:
+		color 120ms cubic-bezier(0.2, 0.7, 0.3, 1),
+		border-color 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+.add-tabs button:hover,
+.stage-tabs button:hover {
+	color: var(--text);
+}
+.add-tabs button[aria-selected="true"],
+.stage-tabs button[aria-selected="true"] {
+	color: var(--text-strong);
+	border-bottom-color: var(--accent);
+}
+.add-tabs button:focus-visible,
+.stage-tabs button:focus-visible {
+	outline: 1px solid var(--accent);
+	outline-offset: -1px;
+}
+.stage-tabs button {
+	gap: 6px;
+	white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+	.add-tabs button,
+	.stage-tabs button {
+		transition: none;
+	}
+}
+
+/* ---- Project setup wizard (Add project steps 2-4, Run setup again) ---- */
+.setup-steps {
+	display: flex;
+	gap: 2px;
+	border-bottom: 1px solid var(--line-soft);
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+.setup-steps li {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 12px;
+	margin-bottom: -1px;
+	border-bottom: 2px solid transparent;
+	color: var(--dim);
+	font-size: 13px;
+	white-space: nowrap;
+}
+.setup-steps li.done {
+	color: var(--text);
+}
+.setup-steps li[aria-current="step"] {
+	color: var(--text-strong);
+	border-bottom-color: var(--accent);
+}
+.setup-steps .step-n {
+	color: var(--dim);
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+}
+.setup-sec {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 10px;
+	padding: 12px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.setup-sec h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-sec .settings-field {
+	width: 100%;
+}
+/* Checkbox in column 1; the title and the hint share column 2, so a long title wraps beside the box. */
+.setup-sec label.add-check {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	align-items: center;
+	gap: 4px 8px;
+	font-size: 13px;
+	color: var(--text);
+}
+.setup-sec label.add-check .hint {
+	grid-column: 2;
+}
+/* The friction filter nests under Retro, aligned with the checkboxes' text. */
+label.add-check.setup-sub {
+	margin-left: 23px;
+}
+/* Fork facts: a well readout with tabular numbers, then the recent forks. */
+.setup-facts {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 24px;
+	width: 100%;
+	padding: 8px 10px;
+	background: var(--well);
+	border-radius: 4px;
+}
+.setup-facts div {
+	display: flex;
+	flex-direction: column;
+}
+.setup-facts b {
+	color: var(--text-strong);
+	font-size: 16px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+}
+.setup-facts span {
+	color: var(--dim);
+	font-size: 12px;
+}
+.setup-forks {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 12.5px;
+}
+.setup-forks td {
+	padding: 3px 0;
+	border-top: 1px solid var(--line-soft);
+}
+.setup-forks td:first-child {
+	font-family: var(--mono);
+	color: var(--text);
+}
+.setup-forks td:last-child {
+	text-align: right;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+/* Finish later sits left; Back/Next/Done keep the dialog's right edge. */
+.setup-actions {
+	align-items: center;
+}
+.setup-actions .ghost {
+	margin-right: auto;
+}
+
+/* Board checklist above the lanes while setupChecklist is set: grey panel on a steel line. */
+.setup-checklist {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px 16px;
+	padding: 10px 12px;
+	background: var(--panel);
+	border: 1px solid var(--accent-line);
+	border-radius: 6px;
+}
+.setup-checklist h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-checklist ul {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 16px;
+	flex: 1;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+.setup-checklist li {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 32px;
+	font-size: 13px;
+	color: var(--text);
+}
+.setup-checklist-actions {
+	display: flex;
+	gap: 8px;
+	margin-left: auto;
+}
+@media (max-width: 760px) {
+	.setup-checklist ul {
+		flex-direction: column;
+		align-items: stretch;
+	}
+	.setup-checklist-actions {
+		margin-left: 0;
+	}
+}
+@media (max-width: 440px) {
+	.setup-steps li {
+		padding: 0 8px;
+	}
+	.setup-steps .step-n {
+		display: none;
+	}
+	.setup-checklist li {
+		flex-wrap: wrap;
+	}
+}
+
+.thumbs {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 8px;
+}
+.thumbs:empty {
+	display: none;
+}
+.thumb {
+	position: relative;
+	display: inline-flex;
+}
+button.thumb,
+button.thumb-open {
+	padding: 0;
+	background: none;
+	border: 0;
+	cursor: zoom-in;
+}
+button.thumb:hover,
+button.thumb-open:hover {
+	background: none;
+	border-color: transparent;
+}
+.thumb img {
+	display: block;
+	max-height: 64px;
+	object-fit: contain;
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.thumb .thumb-x {
+	position: absolute;
+	top: -8px;
+	right: -8px;
+	min-width: 22px;
+	min-height: 22px;
+	padding: 0;
+	background: var(--field);
+	border-radius: 50%;
+}
+/* Screenshot thumbs show their file name: the caption stacks under the image. */
+button.thumb.shot {
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 3px;
+}
+.shot-name {
+	font-size: 12px;
+	color: var(--dim);
+	overflow-wrap: anywhere;
+	text-align: left;
+}
+
+/* ---- Task drawer (Level 3 side sheet) ---- */
+
+dialog.drawer {
+	width: min(600px, 100vw);
+	max-width: 100vw;
+	height: 100dvh;
+	max-height: 100dvh;
+	margin: 0 0 0 auto;
+	border: 0;
+	border-left: 1px solid var(--line);
+	border-radius: 0;
+}
+dialog.drawer[open] {
+	animation: drawer-in 0.2s var(--ease);
+}
+@keyframes drawer-in {
+	from {
+		opacity: 0;
+		transform: translateX(24px);
+	}
+}
+.drawer-body {
+	padding: 18px 22px 26px;
+}
+.drawer-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 10px;
+}
+.drawer-head h2 {
+	font-size: 20px;
+	font-weight: 600;
+	line-height: 1.25;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.drawer-head-actions {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+/* The drawer's Workflow modal: a README diagram of the card's workflow with its live stage
+   highlighted. The embedded SVG keeps its styles under its own .wf root class; the ids below
+   are the diagrams' stage nodes. */
+.wf-modal {
+	padding: 18px 22px;
+	width: min(1080px, 94vw);
+}
+.wf-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	margin: 0 0 10px;
+}
+.wf-head h3 {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.wf-view svg {
+	display: block;
+	width: 100%;
+	height: auto;
+}
+.wf-cur-todo #wf-st-todo,
+.wf-cur-in_progress #wf-st-in_progress,
+.wf-cur-merging #wf-st-merging,
+.wf-cur-done #wf-st-done {
+	stroke: #8fb0d0;
+	stroke-width: 2.5;
+}
+.wf-here {
+	margin: 10px 0 0;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+/* The live slot line under the diagram: same quiet register as .wf-here. */
+.wf-live {
+	margin: 10px 0 0;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+/* Quiet meta line: values bright, timestamps dim, dots between; no chip boxes. */
+.drawer-sub {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 0;
+	margin: 8px 0 0;
+	font-size: 12.5px;
+	color: var(--text);
+}
+.drawer-sub > span + span::before {
+	content: "·";
+	margin: 0 7px;
+	color: var(--dim);
+}
+.drawer-sub .sub-dim {
+	color: var(--dim);
+}
+/* Live mutation run: a running card's Stryker/mutate progress as a drawer section —
+   the same data the board card's meter row shows, with room for the full readout. */
+.drawer-mut {
+	margin: 18px 0 16px;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+.drawer-mut h3 {
+	margin: 0 0 10px;
+}
+.drawer-mut .meter-track {
+	width: 200px;
+}
+.drawer-mut .readout {
+	margin: 12px 0 0;
+}
+/* Inline id chip: strips the chrome-button shell; click copies the id. */
+.task-id {
+	min-height: 0;
+	padding: 0;
+	border: 0;
+	background: none;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim);
+}
+.task-id:hover {
+	background: none;
+	color: var(--text-strong);
+}
+/* Parent lineage chip: the origin task as one quiet bordered chip. The title carries the
+   steel link colour (the only interaction colour); the label and glyph stay dim grey. */
+.fu-parent {
+	max-width: 100%;
+	margin: 8px 0 0;
+	padding: 3px 9px;
+	border-color: var(--line-soft);
+	border-radius: 4px;
+	background: none;
+	font-size: 12.5px;
+	gap: 6px;
+	justify-content: flex-start;
+}
+.fu-parent .icon-svg {
+	flex: none;
+	margin-top: 0;
+	color: var(--dim);
+}
+.fu-parent-label {
+	flex: none;
+	color: var(--dim);
+}
+.fu-parent-title {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	color: var(--accent);
+}
+.fu-parent:hover {
+	background: var(--card);
+	border-color: var(--line);
+}
+.fu-parent:hover .fu-parent-title {
+	color: var(--accent-hover);
+}
+.st {
+	color: var(--dim);
+}
+.st-running {
+	color: var(--text-strong);
+}
+.st-needs_you {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	color: var(--alarm);
+	font-weight: 600;
+}
+/* Redundant alarm coding: the triangle or question mark rides in markup (<Mark>), like on the
+   cards — never on ::before, which carries the drawer-sub separator dot. */
+.st-needs_you.st-asked {
+	color: var(--accent);
+}
+.st .mark {
+	width: 11px;
+	height: 11px;
+}
+/* Related-task rows (dependencies, follow-ups): one quiet list, a full-row click target per task;
+   the status word reuses the meta line's coding (dim, amber only for needs-you, steel for an asked
+   round). Kept below the .st rules so specificity never descends. */
+.fu-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	gap: 2px;
+	/* The track shrinks to the drawer, so a long title ellipsizes instead of pushing the status
+	   off a phone screen (the auto track grew to the title's full width). */
+	grid-template-columns: minmax(0, 1fr);
+}
+.fu-list button {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 12px;
+	width: 100%;
+	min-height: 32px;
+	padding: 5px 10px;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	background: none;
+	font: inherit;
+	font-size: 13px;
+	color: var(--text);
+	text-align: left;
+	cursor: pointer;
+}
+.fu-list button:hover {
+	background: var(--card);
+	color: var(--text-strong);
+}
+.fu-title {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	/* Links are steel, same as the parent chip above. */
+	color: var(--accent);
+}
+/* Related-row key: the card's speaking id (e.g. OTTR-6), same quiet mono metadata as the card head. */
+.fu-list .fu-key {
+	flex: none;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim); /* at least 4.5:1 on --card */
+	font-variant-numeric: tabular-nums;
+}
+.fu-list button:hover .fu-title {
+	color: var(--accent-hover);
+}
+.fu-list .st {
+	flex: none;
+	font-size: 12px;
+}
+/* Collapsible Follow-ups head: the h3 keeps the drawer label's caps look (margins, size and
+   color come from `.drawer h3`), the button inside is the click target. The chevron reuses the
+   done-lane topic head's arrow: points down when open, right when collapsed. */
+.fu-head button {
+	display: flex;
+	align-items: center;
+	justify-content: flex-start; /* the global button rule centers; section labels sit left */
+	gap: 6px;
+	width: 100%;
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.fu-head button:hover {
+	color: var(--text-strong);
+}
+.fu-head .chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.5;
+	flex-shrink: 0;
+	transition: transform 160ms var(--ease);
+}
+.fu-head[data-collapsed] .chev {
+	transform: rotate(-90deg);
+}
+/* Section labels: small HMI caps; the content below speaks for itself. */
+.drawer h3 {
+	margin: 22px 0 8px;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+/* Section boundary: the same hairline the ask round uses between its questions,
+   one spacing step on both sides. The first head hangs from the title row unwrapped. */
+.drawer-body > h3:not(:first-of-type),
+.drawer-body > .section-head {
+	margin-top: 18px;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+/* A section head with a trailing action: caps label left, one quiet ghost button right. */
+.section-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin: 22px 0 8px;
+}
+.section-head h3 {
+	margin: 0;
+}
+.section-head button {
+	flex: none;
+	padding: 2px 7px;
+	font-size: 12px;
+}
+/* The ask round is one quiet region: hairline box, no tint. Steel is spent only on the
+   per-question marks, the picked answer, and the send button. */
+.ask-panel {
+	margin: 8px 0;
+	padding: 14px;
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.ask-q {
+	margin: 0;
+}
+/* End-of-question boundary: a hairline plus one spacing step on both sides. */
+.ask-q + .ask-q {
+	margin-top: 14px;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+.ask-text {
+	display: flex;
+	align-items: flex-start;
+	gap: 7px;
+	margin: 0 0 6px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.ask-text .mark {
+	width: 12px;
+	height: 12px;
+	margin-top: 3px;
+}
+/* Answered work recedes: lighter weight and text, the check mark carries the state. */
+.ask-q.answered .ask-text {
+	font-weight: 500;
+	color: var(--text);
+}
+/* Options are a quiet radio list: full-width chrome-less rows; hover and the pick speak. */
+.ask-options {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.ask-opt {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 2px 8px;
+	min-height: 32px;
+	padding: 0 8px;
+	font-size: 13.5px;
+	color: var(--text);
+	border-radius: 4px;
+	cursor: pointer;
+	transition:
+		background-color 0.12s var(--ease),
+		color 0.12s var(--ease);
+}
+/* The whole entry (row + description) is one label, so one hover target. */
+.ask-opt:hover {
+	background: var(--card);
+}
+.ask-opt input {
+	margin: 0;
+	flex: none;
+	accent-color: var(--accent);
+}
+.ask-opt.off {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+/* The pick is the radio itself: steel dot, text steps to bright — never a fill. */
+.ask-opt.chosen {
+	color: var(--text-strong);
+}
+/* Recommended is named in a grey tag at the row's end — guidance, not an alarm and not a click. */
+.ask-rec {
+	margin-left: auto;
+	flex: none;
+	padding: 1px 5px;
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	font-size: 10.5px;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+.ask-q.answered .ask-opt:not(.chosen) {
+	color: var(--dim);
+}
+/* The description shows under its option, indented to the label text: hover titles
+   never reach phones. flex-basis drops it to its own line; 21px = 13px native radio
+   + 8px column gap, inside the row's own 8px padding. */
+.ask-desc {
+	flex-basis: 100%;
+	margin: 0;
+	padding: 0 8px 3px 21px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.ask-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin-top: 14px;
+}
+.ask-custom {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+/* The custom pick sits in the presets' option column: same left inset, same gap, so the field
+   text starts where preset labels start. The mark is the dot (single) or a checkbox (multi);
+   the field text never fills. */
+.ask-custom > input:first-child {
+	margin-left: 8px;
+	flex: none;
+	accent-color: var(--accent);
+}
+.ask-custom > input:not(:first-child) {
+	flex: 1;
+	min-width: 0;
+}
+.kept-panel {
+	margin: 8px 0;
+	padding: 10px 12px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 4px;
+}
+.kept-panel h3 {
+	margin: 0 0 4px;
+}
+.kept-hint {
+	margin: 0 0 8px;
+	color: var(--dim);
+	font-size: 12px;
+}
+.wt-files {
+	margin: 8px 0;
+	padding: 10px 12px;
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.wt-files h3 {
+	margin: 0 0 4px;
+}
+.wt-files .hint {
+	color: var(--dim);
+	font-size: 12px;
+}
+.wt-file {
+	display: block;
+	margin: 6px 0;
+	color: var(--accent);
+	word-break: break-all;
+	text-decoration: underline;
+}
+/* Changed-files rows: path left, +/- count right; counts stay neutral ink (ISA-101: colour is
+   spent on alarms only). */
+.diff-file {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 12px;
+	margin: 4px 0;
+}
+.diff-path {
+	overflow-wrap: anywhere;
+	color: var(--text);
+	font-family: var(--mono);
+	font-size: 12px;
+}
+.diff-num {
+	flex: none;
+	color: var(--dim);
+	font-family: var(--mono);
+	font-size: 12px;
+}
+.diff-link {
+	display: inline;
+	margin: 0;
+}
+/* The view-diff links, file paths, and bell advisory links are buttons styled like the wt-file links. */
+button.diff-link,
+button.notif-link,
+button.diff-path,
+button.jump-link {
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	text-align: left;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+}
+.jump-reply {
+	margin: 0 0 8px;
+}
+button.diff-path {
+	font-family: var(--mono);
+}
+.kept-file {
+	margin: 8px 0;
+}
+.kept-path {
+	display: block;
+	overflow-wrap: anywhere;
+	color: var(--text-strong);
+}
+.kept-choices {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-top: 4px;
+}
+.kept-choice {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px;
+	color: var(--text);
+	background: transparent;
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.kept-choice:hover {
+	color: var(--text-strong);
+}
+.kept-choice.on {
+	color: var(--text-strong);
+	border-color: var(--accent);
+	background: var(--card);
+}
+.kept-choice input {
+	margin: 0;
+	accent-color: var(--accent);
+}
+.kept-actions {
+	margin-top: 10px;
+}
+.needs-reason {
+	display: flex;
+	gap: 8px;
+	margin: 8px 0;
+	padding: 8px 10px;
+	color: var(--text-strong);
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 4px;
+	overflow-wrap: anywhere;
+}
+.needs-reason::before {
+	content: "";
+	flex: none;
+	width: 13px;
+	height: 12px;
+	margin-top: 4px;
+	background: var(--alarm);
+	clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+/* An ask echo is a question, not a stall: the ask panel's hairline box and the steel
+   question mark in markup replace the amber fill and triangle (::before). */
+.needs-reason.asked {
+	background: none;
+	border-color: var(--line-soft);
+}
+.needs-reason.asked::before {
+	content: none;
+}
+.needs-reason.asked .mark {
+	flex: none;
+	width: 13px;
+	height: 13px;
+	margin-top: 1px;
+}
+.summary {
+	margin: 0 0 8px;
+	white-space: pre-wrap;
+}
+.prompt-text {
+	margin: 0 0 10px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.task-prompt {
+	margin: 0;
+}
+.task-prompt p {
+	margin: 0 0 6px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.log {
+	font-family: var(--mono);
+	font-size: 12px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	padding: 8px 10px;
+	white-space: pre-wrap;
+	max-height: 50vh;
+	margin: 0;
+	overflow: auto;
+	word-break: break-word;
+}
+/* Markdown prose: results, research reports, release notes. */
+.md {
+	display: grid;
+	gap: 8px;
+	overflow-wrap: anywhere;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.md h1 {
+	font-size: 14px;
+}
+.md p {
+	margin: 0;
+}
+.md ul,
+.md ol {
+	margin: 0;
+	padding-left: 22px;
+	display: grid;
+	gap: 4px;
+}
+.md li > ul,
+.md li > ol {
+	margin-top: 4px;
+}
+.md code {
+	font-family: var(--mono);
+	font-size: 12px;
+	background: var(--well);
+	border-radius: 3px;
+	padding: 1px 4px;
+}
+.md pre {
+	margin: 0;
+	padding: 8px 10px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	overflow-x: auto;
+}
+.md pre code {
+	background: none;
+	padding: 0;
+}
+.md blockquote {
+	margin: 0;
+	padding: 2px 0 2px 12px;
+	border-left: 2px solid var(--line-soft);
+	color: var(--dim);
+}
+.md a {
+	color: var(--accent);
+}
+.md hr {
+	border: none;
+	border-top: 1px solid var(--line-soft);
+	margin: 0;
+}
+.md table {
+	display: block;
+	max-width: 100%;
+	overflow-x: auto;
+	border-collapse: collapse;
+}
+.md th,
+.md td {
+	border: 1px solid var(--line-soft);
+	padding: 3px 8px;
+	text-align: left;
+	vertical-align: top;
+}
+.md th {
+	background: var(--well);
+	color: var(--text-strong);
+}
+.md del {
+	color: var(--dim);
+}
+/* Work check history: one compact entry per second-model run; quotes read as evidence. */
+.work-checks ul {
+	margin: 4px 0;
+	padding-left: 18px;
+}
+.work-checks blockquote {
+	margin: 2px 0;
+	padding: 2px 0 2px 12px;
+	border-left: 2px solid var(--line-soft);
+	color: var(--dim);
+	font-family: var(--mono, monospace);
+	font-size: 12.5px;
+}
+.wc-run {
+	margin: 6px 0 0;
+	font-size: 12.5px;
+	color: var(--text-strong);
+}
+.work-checks li > ul {
+	margin: 2px 0;
+}
+/* Work steps: one rail, one node per turn; shape carries state, not boxes. */
+.turns {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin: 0;
+	padding: 0 0 0 26px;
+	list-style: none;
+}
+.turns::before {
+	content: "";
+	position: absolute;
+	top: 10px;
+	bottom: 10px;
+	left: 6px;
+	width: 1px;
+	background: var(--line-soft);
+}
+.turns li {
+	position: relative;
+	padding: 7px 9px;
+}
+/* The glow wraps the agent's part only: the turn's steer/reply bubble leads the
+   row display-only (the click skips it), so the hover must not paint it either. */
+.turn-body {
+	border-radius: 4px;
+	cursor: pointer;
+}
+.turn-body:hover {
+	background: var(--card);
+}
+.turn-node {
+	position: absolute;
+	top: 10px;
+	left: -26px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 13px;
+	height: 13px;
+	color: var(--dim);
+	background: var(--panel);
+}
+.turn-node svg {
+	margin-top: -1px; /* optical centering, see the button note */
+}
+.turn-node.live {
+	left: -22.5px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--normal-fill);
+}
+.turn-node.ask {
+	left: -23px;
+	top: 9px;
+	width: 11px;
+	height: 10px;
+	background: var(--alarm);
+	clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+/* A turn that asked a question is an ask, not a blocker: steel accent, not alarm
+   (same scheme as .needs-reason.asked). */
+.turn-node.ask.asked {
+	background: var(--accent);
+}
+.turn-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 8px;
+	/* border-box: 100% + both paddings, so the content column stays where it was */
+	width: calc(100% + 18px);
+	background: none;
+	border: none;
+	/* Padding gives the focus ring breathing room; the negative margin keeps the
+	   row layout pixel-identical to the unpadded head. */
+	padding: 7px 9px;
+	margin: -7px -9px;
+	font: inherit;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.turn-head:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px; /* ring inside the padded box, 2px in from its edge */
+}
+.turn-head:hover,
+.turn-head:active {
+	background: none; /* the turn-body hover is the one glow; the stretched button adds none, like .card-open */
+}
+.turn-head .icon-svg {
+	color: var(--dim);
+	transition: transform 0.15s ease;
+}
+.turn-head[aria-expanded="true"] .icon-svg {
+	transform: rotate(
+		90deg
+	); /* the right-chevron turns down when the log is open */
+}
+.turn-head strong {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.outcome {
+	padding: 0 6px;
+	font-size: 12px;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.o-needs_you {
+	color: var(--alarm);
+	border-color: var(--alarm-line);
+}
+.o-needs_you.asked {
+	color: var(--accent);
+	border-color: var(--line);
+}
+.turn-model {
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim);
+	overflow-wrap: anywhere;
+}
+.turn-time {
+	margin-left: auto;
+	font-size: 12px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.turn-dur {
+	font-size: 12px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.turns .log {
+	margin-top: 8px;
+	cursor: auto; /* the row is a click target; the log itself is text, not a toggle */
+}
+.turn-sum {
+	display: -webkit-box;
+	margin-top: 4px;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+/* User input (reply, steering, resume) speaks from the right: right-aligned bubble,
+   worker turns keep the left rail. Grey surfaces only — user input is not an alarm,
+   and steel is reserved for interaction (One-Edge Rule). */
+.turn .you {
+	margin-bottom: 6px; /* the bubble leads its turn: gap to the head it started */
+	cursor: auto; /* display-only: the pointer stays an arrow over the read-only bubble */
+}
+/* The bubble is outside the row's click-to-toggle, so the hover glow no longer
+   reaches it: the glow lives on .turn-body, which excludes the bubble. */
+.reply-form {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 18px;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+.followup-cta {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-top: 20px;
+}
+.followup-cta > button {
+	flex: none; /* the label must not wrap at narrow drawer widths */
+}
+.followup-cta .hint {
+	margin: 0;
+}
+.reply-form label,
+.prompt-field > label,
+.meta-block > summary {
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+.reply-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 8px;
+}
+/* Secondaries hug the field's left edge; the primary terminates the row's right edge,
+   the same grammar as dialog-actions. */
+.reply-actions .primary {
+	margin-left: auto;
+}
+/* Reply and Steer rows (ComposerActions): the run settings over one button bar. The model
+   field takes the wide column, Thinking the narrow one; every control shares the 32px button
+   height, and a long model name ellipsizes instead of wrapping the trigger to two lines. */
+.composer-actions {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.composer-actions .model-fields {
+	display: grid;
+	grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+	gap: 10px;
+}
+.composer-actions .field {
+	min-width: 0;
+	gap: 4px;
+}
+/* The caption style of .reply-form labels must not reach the controls inside them. */
+.composer-actions .model-trigger,
+.composer-actions select {
+	width: 100%;
+	height: 32px;
+	font-size: 13.5px;
+	font-weight: 400;
+	letter-spacing: normal;
+	text-transform: none;
+	color: var(--text-strong);
+}
+.composer-actions .model-trigger {
+	padding: 0 9px 2px;
+}
+.composer-actions select {
+	padding: 0 9px;
+}
+.composer-actions .model-trigger > span {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+/* Add image hugs the left edge; the secondaries and the primary stay on the right, also when
+   the narrow drawer wraps them to a second line. */
+.composer-bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+}
+.composer-bar > .browse {
+	margin-right: auto;
+}
+.you {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 4px;
+}
+.you-head {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+.you-bubble {
+	display: grid;
+	gap: 4px;
+	max-width: 85%;
+	padding: 8px 10px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	border-bottom-right-radius: 2px; /* the tail corner marks the right-hand speaker */
+}
+.you-msg {
+	margin: 0;
+	color: var(--text);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+/* The literal "." resume marker renders as a named badge, not a dot. */
+.you-chip {
+	justify-self: end;
+	padding: 1px 8px;
+	font-size: 12px;
+	color: var(--text);
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.meta-block {
+	margin-top: 14px;
+}
+.meta-block > summary {
+	cursor: pointer;
+}
+.meta-block > summary:hover {
+	color: var(--text-strong);
+}
+.meta-block[open] > summary {
+	margin-bottom: 8px;
+}
+.drawer-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 20px;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+.meta {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin: 8px 0 0;
+}
+.meta div {
+	display: flex;
+	gap: 8px;
+}
+.meta dt {
+	min-width: 76px;
+	color: var(--dim);
+}
+.meta dd {
+	margin: 0;
+	font-family: var(--mono);
+	font-size: 12px;
+	overflow-wrap: anywhere;
+}
+.meta dd a {
+	text-decoration: none;
+}
+.meta dd a:hover {
+	text-decoration: underline;
+}
+/* Unmark-research control: a small action on the metadata line, quiet until hover. */
+.meta dd .unmark-research {
+	margin-left: 8px;
+	padding: 1px 7px;
+	font-family: var(--ui);
+	font-size: 11px;
+	color: var(--dim);
+	background: none;
+	border: 1px solid var(--line-soft);
+}
+.meta dd .unmark-research:hover {
+	color: var(--accent);
+	border-color: var(--accent);
+}
+.cmd-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+.cmd-row code {
+	flex: 1;
+	padding: 6px 8px;
+	font-size: 12px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	overflow-wrap: anywhere;
+}
+
+/* ---- Narrow windows and phones ---- */
+
+/* Phone-only New task FAB: hidden until the stacked tier shows it. The one documented
+   full-circle shape (DESIGN.md, Shapes); steel fill, 1px line edge, no shadow — an
+   in-page control, not an overlay. */
+.fab {
+	display: none;
+}
+
+@media (max-width: 720px) {
+	.shell {
+		grid-template-columns: minmax(0, 1fr);
+		grid-template-rows: minmax(0, 1fr);
+	}
+	/* The project rail folds into a popout under the bar's menu button. */
+	.areas {
+		display: none;
+	}
+	.areas-toggle {
+		display: inline-flex;
+	}
+	/* The fill already says new and the bar keeps its room for the meters;
+	   the accessible name keeps the word. */
+	.inbox-new {
+		display: none;
+	}
+	/* The menu hangs from its own trigger on the left, not under the right-hand icons. */
+	.popover.areas-pop {
+		left: 12px;
+		right: auto;
+		width: min(360px, calc(100vw - 24px));
+	}
+	/* The wordmark costs the quota item its row; the logo carries the brand on phones. */
+	.brand span {
+		display: none;
+	}
+	.bar {
+		gap: 6px;
+		padding: 0 6px 0 10px;
+		overflow: hidden;
+	}
+	.brand {
+		width: auto;
+	}
+	.meters {
+		gap: 8px;
+		min-width: 0;
+		padding: 0 6px;
+	}
+	.meter-track,
+	.meter-note {
+		display: none;
+	}
+	/* Stats collapse to one inline number: the third meter, the quota (falls
+	   back to agent occupancy when no quota meter renders).
+	   The detail popover (the whole .meters button) still carries every meter. */
+	.meters .meter {
+		display: none;
+	}
+	.meters .meter:nth-of-type(3) {
+		display: inline-flex;
+	}
+	/* The detail panel spans the screen instead of hanging off its anchor past the right edge. */
+	.popover {
+		left: 12px;
+		right: 12px;
+		width: auto;
+	}
+	.meter-value {
+		min-width: 0;
+	}
+	/* The icon and the running count stand in for the hidden Agents meter. */
+	.agents-count {
+		display: inline-flex;
+	}
+	.main {
+		padding: 14px 12px;
+	}
+	/* The FAB floats over the list: no reserved band below the board. The clearance
+	   lives in the lane scroller, so the last card can scroll above the button. */
+	.stage-cards {
+		padding-bottom: 72px; /* FAB 56px + 16px bottom offset */
+	}
+	.project-head {
+		flex-wrap: wrap;
+	}
+	/* The GitHub mark and release tag flow beside the h1 on one line; only a long
+	   name wraps them below. */
+	.project-id-text {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 2px 12px;
+	}
+	.project-meta {
+		margin: 0;
+	}
+	/* Search fills its line, buttons share the next; the row itself takes one full-width line. */
+	.project-actions {
+		flex: 1 1 100%;
+		flex-wrap: wrap;
+	}
+	.project-head .search {
+		flex: 1 1 auto;
+		width: auto;
+		min-width: 0;
+	}
+	/* Icon-only segments share one row: the label hides on touch, the icon plus
+	   its aria-label/tooltip carry the action. Equal thirds, halves, or a lone
+	   full-width icon; min-height 40px comes from the tier's button rule. */
+	.project-actions .seg {
+		display: flex;
+		gap: 8px;
+		width: 100%;
+	}
+	.project-actions .seg button {
+		flex: 1;
+		border: 1px solid var(--line);
+		border-radius: 4px;
+	}
+	.project-actions .seg .seg-label {
+		display: none;
+	}
+	/* No hardware keyboard on touch: the shortcut badge is noise and costs width. */
+	.project-actions kbd {
+		display: none;
+	}
+	/* The FAB replaces the header New task button: the board's only primary action stays
+	   thumb-reachable while reading Done cards. One steel-filled control on screen (One-Edge). */
+	.project-actions .primary {
+		display: none;
+	}
+	.fab {
+		display: inline-flex;
+		position: fixed;
+		right: calc(16px + env(safe-area-inset-right, 0px));
+		bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+		width: 56px;
+		height: 56px;
+		padding: 0;
+		border-radius: 50%;
+		background: var(--accent);
+		color: var(--accent-ink);
+		font-weight: 600;
+		animation: fab-rise 160ms var(--ease) backwards;
+	}
+	.fab:hover,
+	.fab:active {
+		background: var(--accent-hover);
+	}
+	.ov th,
+	.ov td {
+		padding: 9px 10px;
+	}
+	button {
+		min-height: 40px;
+	}
+	button.icon {
+		min-width: 40px;
+	}
+	/* 16px stops iOS Safari zooming the field on focus. */
+	input,
+	select,
+	textarea {
+		font-size: 16px;
+	}
+	/* The composer's narrow select keeps 16px (no iOS zoom) and matches the 40px trigger beside it. */
+	.composer-actions select {
+		height: 40px;
+		font-size: 16px;
+	}
+}
+
+@keyframes fab-rise {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
+	/* Progress feedback stays legible: the spinner keeps turning. */
+	.spinner {
+		animation-duration: 0.7s !important;
+		animation-iteration-count: infinite !important;
+	}
+}
+
+/* Access section in settings: masked key field with an embedded reveal toggle,
+   plus copy and regenerate icon buttons. */
+.access-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.access-key {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 2px 2px 2px 8px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	font-size: 12px;
+}
+.access-key > code {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+/* The reveal toggle sits inside the field, so it drops its own chrome. */
+.access-key button.icon {
+	border: none;
+	background: transparent;
+	color: var(--dim);
+}
+.access-row button.icon.danger,
+.access-row button.icon.danger:hover {
+	color: var(--crit-text);
+}
+.access-row button.icon.danger {
+	border-color: var(--crit-line);
+}
+.access-row button.icon.danger:hover {
+	background: var(--crit-bg);
+	border-color: var(--crit);
+}
+/* Auth page: standalone gate when a public host demands credentials. */
+.auth-page {
+	min-height: 100dvh;
+	display: grid;
+	place-items: center;
+	background: var(--field);
+	padding: 20px;
+}
+.auth-box {
+	width: 100%;
+	max-width: 380px;
+	padding: 32px;
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+}
+.auth-brand {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	margin-bottom: 20px;
+	color: var(--text-strong);
+	font-size: 20px;
+	font-weight: 600;
+}
+.auth-brand img {
+	height: 34px;
+}
+/* .add-form's dialog chrome and column labels are wrong inside the auth box. */
+.auth-box .add-form {
+	padding: 0;
+	background: none;
+	border: 0;
+}
+.add-form label.auth-remember,
+.add-form label.add-check {
+	flex-direction: row;
+	gap: 8px;
+	font-size: 13px;
+	color: var(--text);
+}
+.auth-remember input[type="checkbox"],
+.add-check input[type="checkbox"] {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+.auth-box .add-form button[type="submit"] {
+	width: 100%;
+	margin-top: 4px;
+}
+.auth-version {
+	margin: 18px 0 0;
+	color: var(--dim);
+	font-size: 12px;
+	text-align: center;
+}
+.auth-error {
+	margin: 0;
+	color: var(--crit-text);
+	font-size: 12.5px;
+}
+/* A changed SSH host key: a warning, not an error — the app's grey attention edge. */
+.trust-warn {
+	border-left: 2px solid var(--dim);
+	padding-left: 0.75rem;
+}
+.trust-warn ul {
+	margin: 0.25rem 0;
+	font-family: var(--mono);
+	font-size: 12px;
+}
+/* Pending SSH key: one control per line, so the paste box never floats beside its buttons. */
+.pending-key {
+	display: grid;
+	gap: 0.5rem;
+	justify-items: start;
+}
+.pending-key label {
+	display: grid;
+	gap: 0.25rem;
+	width: 100%;
+}
+
+/* --- Web Push (begin): the bell toggle is desktop-only; phones use the push opt-in instead. --- */
+@media (pointer: coarse) {
+	.notify-toggle {
+		display: none;
+	}
+}
+/* --- Web Push (end) --- */
+/* ---- Touch targets ---- */
+
+/* Coarse pointers (phones on the tailnet) get the 44px hit-area floor; desktop keeps its
+   dense 28px chrome. Selectors restate the compact overrides above so specificity holds. */
+@media (pointer: coarse) {
+	button,
+	select {
+		min-height: 44px;
+	}
+	button.icon,
+	.theme-choice,
+	.model-option,
+	.ask-opt,
+	.add-tabs button,
+	.stage-tabs button,
+	.notif-line button.icon {
+		min-height: 44px;
+		min-width: 44px;
+	}
+	/* The X floats over the image corner: grow around the same center point. */
+	.thumb .thumb-x {
+		top: -14px;
+		right: -14px;
+		min-width: 44px;
+		min-height: 44px;
+	}
+	/* Checkboxes and radios inside label rows stay native; the row is the hit target. */
+	.ask-opt input,
+	input[type="checkbox"],
+	input[type="radio"] {
+		width: 24px;
+		height: 24px;
+	}
+	/* The 24px radio widens the label column; the description keeps its alignment. */
+	.ask-desc {
+		padding-left: 32px;
+	}
+}
+
+/* Alate settings section: definition rows. Each row names the field, its purpose,
+   and the value shape it wants; the input fills the rest. Theme vars keep the rows
+   readable in the light theme too (these rules hardcoded dark-theme colors before). */
+.settings-sec .alate-def-rows {
+	display: grid;
+}
+.settings-sec .alate-def-row {
+	display: grid;
+	grid-template-columns: minmax(180px, 240px) 1fr;
+	gap: 14px;
+	padding: 10px 0;
+	border-bottom: 1px solid var(--line-soft);
+	align-items: center;
+}
+.settings-sec .alate-def-row:first-child {
+	border-top: 1px solid var(--line-soft);
+}
+.settings-sec .alate-def-name {
+	display: grid;
+	gap: 2px;
+}
+.settings-sec .alate-def-name b {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.settings-sec .alate-def-name span {
+	font-size: 12px;
+	color: var(--dim);
+}
+.settings-sec .alate-def-name code {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--dim);
+}
+.settings-sec .alate-def-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 10px;
+	margin-top: 12px;
+}
+/* Usage windows inside a sign-in row: span both columns of the row grid. */
+.settings-sec .alate-def-row .quota {
+	grid-column: 1 / -1;
+}
+/* Provider sign-in: a three-column status table - identity, live quota meters,
+   actions. Every quota row shares one grid, so label, track, value and reset
+   sit on shared vertical edges across all providers. */
+.settings-sec.providers {
+	width: 100%;
+	align-items: stretch;
+}
+.providers-head {
+	display: flex;
+	align-items: baseline;
+	gap: 14px;
+	flex-wrap: wrap;
+}
+.providers-head .hint {
+	margin: 0 0 0 auto;
+	text-align: right;
+}
+.settings-sec.providers .alate-def-row.providers-row {
+	grid-template-columns: 260px minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 12px 18px;
+}
+.provider-name {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	min-width: 0;
+}
+.status-dot {
+	flex: none;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--dim);
+}
+.status-dot.ok {
+	background: var(--diff-add);
+}
+.status-dot.crit {
+	background: var(--crit);
+}
+.providers-meters {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	min-width: 0;
+}
+/* Two-line meters: label and percentage share the line above, the track owns
+   the full width below - every bar is the same length by construction. */
+.providers-meters .quota-row {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 130px;
+	grid-template-areas:
+		"meta  reset"
+		"track reset";
+	align-items: center;
+	column-gap: 12px;
+}
+.providers-meters .meter {
+	display: contents;
+}
+.providers-meters .meter-label {
+	grid-area: meta;
+	justify-self: start;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.providers-meters .meter-value {
+	grid-area: meta;
+	justify-self: end;
+}
+.providers-meters .meter-track {
+	grid-area: track;
+	width: auto;
+	min-width: 0;
+}
+.providers-meters .quota-reset {
+	grid-area: reset;
+	align-self: center;
+	white-space: nowrap;
+}
+.settings-sec.providers .alate-def-actions {
+	justify-self: end;
+}
+.settings-sec.providers .providers-form {
+	display: flex;
+	width: 100%;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	padding: 14px 16px;
+	margin-top: 12px;
+}
+.settings-sec.providers .providers-form .alate-def-row {
+	display: grid;
+	grid-template-columns: 260px minmax(0, 1fr) auto;
+	gap: 12px 18px;
+	align-items: center;
+	width: 100%;
+	padding: 0;
+	border-top: none;
+	border-bottom: none;
+}
+.settings-sec.providers .providers-form label {
+	display: flex;
+}
+.settings-sec.providers .providers-form label input {
+	width: 100%;
+}
+.settings-sec.providers .providers-form button[type="submit"] {
+	justify-self: end;
+}
+.settings-sec.providers .providers-finish {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	width: 100%;
+}
+.settings-sec.providers .providers-finish .alate-def-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 0;
+	border-bottom: none;
+	flex: 1;
+}
+@media (max-width: 720px) {
+	.settings-sec.providers .alate-def-row.providers-row {
+		grid-template-columns: 1fr;
+	}
+	.settings-sec.providers .alate-def-actions {
+		justify-self: start;
+	}
+}
+@media (max-width: 700px) {
+	.settings-sec .alate-def-row {
+		grid-template-columns: 1fr;
+	}
+}
+
+/* ---- Upstream updates panel (U5) ---- */
+/* Head and actions stay put; only the repo list scrolls. */
+dialog.updates {
+	width: min(640px, calc(100vw - 24px));
+	display: flex;
+	flex-direction: column;
+}
+.updates-head {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 14px 18px 12px;
+	border-bottom: 1px solid var(--line-soft);
+}
+.updates-actions {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+}
+.updates-all {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: fit-content;
+	font-size: 12px;
+	color: var(--dim);
+	cursor: pointer;
+}
+.updates-all input[type="checkbox"] {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+}
+.updates-count {
+	margin-right: auto;
+	font-size: 12px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.updates-list {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	/* Keyboard focus must never park under the pinned group heads. */
+	scroll-padding-top: 36px;
+	padding: 2px 8px 12px;
+}
+.updates-group + .updates-group {
+	margin-top: 8px;
+}
+/* Repo heads pin while their rows scroll past. */
+.updates-group h3 {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	margin: 0 -8px;
+	padding: 8px 8px 5px;
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--text-strong);
+	background: var(--field);
+	border-bottom: 1px solid var(--line-soft);
+}
+.updates-group h3 .dialog-sub {
+	margin-left: 0;
+}
+/* Rows share one grid: pick, name, versions, action, links. */
+.updates-row {
+	display: grid;
+	grid-template-columns: 16px minmax(110px, 1fr) minmax(0, 1.5fr) max-content max-content;
+	gap: 2px 12px;
+	align-items: center;
+	padding: 6px 8px;
+	border-radius: 4px;
+	font-size: 13px;
+}
+.updates-row:hover {
+	background: var(--panel);
+}
+.updates-row.actionable {
+	cursor: pointer;
+}
+.updates-row + .updates-row {
+	margin-top: 1px;
+}
+.updates-row > .dialog-sub {
+	margin-left: 0;
+}
+.updates-name {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 2px 6px;
+	min-width: 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.updates-versions {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.updates-ver {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 2px 6px;
+}
+.updates-ver code {
+	font-size: 12px;
+	color: var(--text);
+	overflow-wrap: anywhere;
+}
+.updates-qualifies {
+	font-size: 12px;
+}
+.updates-decision {
+	font-size: 12px;
+	color: var(--dim);
+	white-space: nowrap;
+}
+/* Removed rows keep text and Skip in one cell so the phone grid cannot overlap them. */
+.updates-removed {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	white-space: nowrap;
+}
+.updates-links {
+	font-size: 12px;
+	white-space: nowrap;
+}
+.updates-links a {
+	color: var(--accent);
+}
+/* Changed files of the pinned path: a full-width list under the row, one diff link each. */
+.updates-diffs {
+	grid-column: 2 / -1;
+	display: flex;
+	flex-direction: column;
+	margin-top: 2px;
+	font-size: 12px;
+}
+.updates-diffs a {
+	color: var(--accent);
+}
+.updates-diffs code {
+	overflow-wrap: anywhere;
+}
+/* Phone tier: rows stack to two lines; the pick cell spans both, links drop under the action. */
+@media (max-width: 640px) {
+	.updates-row {
+		grid-template-columns: 16px minmax(0, 1fr) minmax(0, max-content);
+		grid-template-areas:
+			"pick name action"
+			"pick versions links";
+		row-gap: 4px;
+	}
+	.updates-row > .dialog-sub {
+		overflow-wrap: anywhere;
+	}
+	.updates-pick,
+	.updates-box {
+		grid-area: pick;
+	}
+	.updates-name {
+		grid-area: name;
+	}
+	.updates-versions {
+		grid-area: versions;
+	}
+	.updates-inprogress,
+	.updates-row > .dialog-sub,
+	.updates-row > .updates-removed {
+		grid-area: action;
+	}
+	.updates-removed {
+		flex-wrap: wrap;
+		row-gap: 2px;
+	}
+	.updates-links {
+		grid-area: links;
+	}
+}
+/* U6: checkbox cell; the spacer keeps covered rows aligned with actionable ones. */
+.updates-pick {
+	min-width: 15px;
+}
+.updates-pick input[type="checkbox"],
+.updates-box {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+/* U6: link-styled pointer to the open card covering the row. */
+.updates-inprogress {
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	font-size: 13px;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+}
+.updates-inprogress:hover {
+	color: var(--text-strong);
+}
+/* U7: the hold-merges hint wraps to its own line under the checkbox text. */
+.settings-sec label.add-check {
+	flex-direction: row;
+	flex-wrap: wrap;
+	gap: 8px;
+	font-size: 13px;
+	color: var(--text);
+}
+.settings-sec label.add-check .hint {
+	flex-basis: 100%;
+	margin-left: 23px;
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "entry": [
+    "src/worker.ts",
+    "src/ui/app.tsx",
+    "scripts/**/*.{js,mjs,ts}",
+    "extension/tracker.ts"
+  ],
+  "ignoreBinaries": ["tailscale", "omp"],
+  "ignoreUnresolved": ["src/server.ts"]
+}

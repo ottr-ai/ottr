@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 340" role="img" aria-labelledby="t" class="wf">
+  <title id="t">Ottr release workflow: the Create release preview turns into the same review, and once its findings are done Ottr tags the reviewed commit and publishes the GitHub release.</title>
+  <defs>
+    <style>
+      .wf text{font-family:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif}
+      .wf .n{fill:#eceef1;font-size:14px;font-weight:600}
+      .wf .n13{fill:#eceef1;font-size:13.5px;font-weight:600}
+      .wf .s{fill:#a8b0b9;font-size:12px}
+      .wf .m{fill:#c9ced4;font-size:12px;font-family:'Cascadia Code',ui-monospace,Menlo,Consolas,monospace}
+      .wf .lg{fill:#a8b0b9;font-size:12px}
+      .wf .tn{fill:#eceef1;font-size:12.5px;font-weight:600}
+    </style>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L8 4L0 8z" fill="#8fb0d0"/></marker>
+    <marker id="aa" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L8 4L0 8z" fill="#f0b429"/></marker>
+    <g id="g-ring"><circle cx="8" cy="8" r="5.5" fill="none" stroke="#8f979f" stroke-width="1.8"/></g>
+    <g id="g-dot"><circle cx="8" cy="8" r="4.5" fill="#8f979f"/></g>
+    <g id="g-check"><path d="M3 8.5L6.8 12L13 4.5" fill="none" stroke="#8f979f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="g-warn"><path d="M8 1.5L15 14H1z" fill="#f0b429"/><rect x="7.1" y="5.4" width="1.8" height="4.8" rx="0.9" fill="#14181d"/><circle cx="8" cy="12.1" r="1.1" fill="#14181d"/></g>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="1119" height="339" rx="6" fill="#2b2e32" stroke="#3d4248"/>
+
+  <!-- spine -->
+  <rect id="wf-st-todo" x="24" y="88" width="200" height="84" rx="6" fill="#3a3f45" stroke="#8fb0d0" stroke-width="1.2"/>
+  <text x="38" y="117" class="n">Create release</text>
+  <text x="38" y="136" class="s">preview: version · notes</text>
+  <text x="38" y="151" class="s">commits since the tag</text>
+  <text x="38" y="166" class="s">feat → minor · rest → patch</text>
+
+  <line x1="226" y1="130" x2="260" y2="130" stroke="#8fb0d0" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <rect id="wf-st-in_progress" x="264" y="88" width="208" height="84" rx="6" fill="#3a3f45" stroke="#4a5057"/>
+  <use href="#g-dot" transform="translate(276,110) scale(0.875)"/>
+  <text x="298" y="117" class="n">Review card</text>
+  <text x="278" y="136" class="s">changes no code</text>
+  <text x="278" y="152" class="m">check · tests · mutation</text>
+  <text x="278" y="167" class="s">audit · findings → cards</text>
+
+  <line x1="474" y1="130" x2="500" y2="130" stroke="#8fb0d0" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="534" y="188" text-anchor="middle" class="s">when all its findings</text>
+  <text x="534" y="203" text-anchor="middle" class="s">are done</text>
+
+  <rect x="504" y="88" width="200" height="84" rx="6" fill="#3a3f45" stroke="#4a5057"/>
+  <text x="518" y="117" class="n">Tag</text>
+  <text x="518" y="136" class="s">on the reviewed commit</text>
+  <text x="518" y="151" class="s">head must contain it</text>
+  <text x="518" y="166" class="s">first release: v0.1.0</text>
+
+  <line x1="706" y1="130" x2="740" y2="130" stroke="#8fb0d0" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <rect id="wf-st-merging" x="744" y="88" width="210" height="84" rx="6" fill="#3a3f45" stroke="#4a5057"/>
+  <text x="758" y="117" class="n">Publish</text>
+  <use href="#g-check" transform="translate(818,106) scale(0.875)"/>
+  <text x="758" y="136" class="m">tag → push → release</text>
+  <text x="758" y="151" class="s">GitHub release with notes</text>
+  <text x="758" y="166" class="s">or a release command</text>
+
+  <line x1="956" y1="130" x2="980" y2="130" stroke="#8fb0d0" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="963" y="190" text-anchor="middle" class="s">notes list late fixes</text>
+
+  <!-- terminal -->
+  <rect id="wf-st-done" x="984" y="115" width="112" height="30" rx="4" fill="#1f2225" stroke="#3d4248"/>
+  <use href="#g-check" transform="translate(994,122) scale(0.75)"/>
+  <text x="1012" y="134.5" class="tn">Released</text>
+
+  <!-- head mismatch -->
+  <line x1="604" y1="174" x2="604" y2="228" stroke="#f0b429" stroke-width="1.2" marker-end="url(#aa)"/>
+  <text x="612" y="205" class="s">mismatch</text>
+  <rect x="504" y="232" width="210" height="64" rx="6" fill="#3a3f45" stroke="#f0b429" stroke-width="1.2"/>
+  <use href="#g-warn" transform="translate(516,242) scale(0.875)"/>
+  <text x="540" y="256" class="n13">Stops with !</text>
+  <text x="518" y="273" class="s">reviewed commit not in head</text>
+  <text x="518" y="288" class="s">reply, and it retries</text>
+  <polyline points="504,264 440,264 440,174" fill="none" stroke="#f0b429" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#aa)"/>
+
+  <!-- legend -->
+  <use href="#g-ring" transform="translate(24,310) scale(0.75)"/>
+  <text x="42" y="322" class="lg">queued</text>
+  <use href="#g-dot" transform="translate(100,310) scale(0.75)"/>
+  <text x="118" y="322" class="lg">running</text>
+  <use href="#g-check" transform="translate(182,310) scale(0.75)"/>
+  <text x="200" y="322" class="lg">done</text>
+  <use href="#g-warn" transform="translate(250,310) scale(0.75)"/>
+  <text x="268" y="322" class="lg">needs you</text>
+  <line x1="344" y1="316" x2="362" y2="316" stroke="#4a5057" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="368" y="322" class="lg">optional</text>
+</svg>

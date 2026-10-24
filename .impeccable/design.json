@@ -1,0 +1,132 @@
+{
+	"schemaVersion": 2,
+	"generatedAt": "2026-09-30T13:20:00.000Z",
+	"title": "Ottr",
+	"extensions": {
+		"colorMeta": {
+			"accent": { "role": "primary", "displayName": "Steel", "canonical": "#8fb0d0", "tonalRamp": ["#1a2029", "#242d38", "#2f3b48", "#3d4a59", "#556679", "#7490ad", "#8fb0d0", "#c7d9ea"] },
+			"alarm": { "role": "alarm", "displayName": "Alarm Amber", "canonical": "#f0b429", "tonalRamp": ["#2a2110", "#3b3322", "#4d3d1c", "#6b5627", "#96762a", "#c39a28", "#f0b429", "#f8dd9a"] },
+			"crit": { "role": "critical", "displayName": "Critical Red", "canonical": "#e5534b", "tonalRamp": ["#2a1214", "#472326", "#5c2a2d", "#6b2d30", "#9c403c", "#c65248", "#e5534b", "#f4b0aa"] },
+			"field": { "role": "neutral", "displayName": "Field Grey", "canonical": "#2b2e32", "tonalRamp": ["#1f2225", "#2b2e32", "#303338"] },
+			"chrome": { "role": "neutral", "displayName": "Chrome", "canonical": "#24272b", "tonalRamp": ["#1f2225", "#24272b", "#2b2e32"] },
+			"panel": { "role": "neutral", "displayName": "Panel", "canonical": "#303338", "tonalRamp": ["#2b2e32", "#303338", "#3a3f45"] },
+			"card": { "role": "neutral", "displayName": "Card", "canonical": "#3a3f45", "tonalRamp": ["#303338", "#3a3f45", "#41464d"] },
+			"card-hover": { "role": "neutral", "displayName": "Card Hover", "canonical": "#41464d", "tonalRamp": ["#3a3f45", "#41464d", "#4a5057"] },
+			"well": { "role": "neutral", "displayName": "Well", "canonical": "#1f2225", "tonalRamp": ["#14181d", "#1f2225", "#24272b"] },
+			"line": { "role": "neutral", "displayName": "Line", "canonical": "#4a5057", "tonalRamp": ["#3d4248", "#4a5057", "#6b737b"] },
+			"line-soft": { "role": "neutral", "displayName": "Soft Line", "canonical": "#3d4248", "tonalRamp": ["#303338", "#3d4248", "#4a5057"] },
+			"text-strong": { "role": "neutral", "displayName": "Bright Value", "canonical": "#eceef1", "tonalRamp": ["#c9ced4", "#eceef1", "#ffffff"] },
+			"text": { "role": "neutral", "displayName": "Body Text", "canonical": "#c9ced4", "tonalRamp": ["#a8b0b9", "#c9ced4", "#eceef1"] },
+			"dim": { "role": "neutral", "displayName": "Dim Text", "canonical": "#a8b0b9", "tonalRamp": ["#8f979f", "#a8b0b9", "#c9ced4"] },
+			"accent-hover": { "role": "primary", "displayName": "Steel Hover", "canonical": "#a6c2de", "tonalRamp": ["#8fb0d0", "#a6c2de", "#bfd6ea"] },
+			"accent-ink": { "role": "primary", "displayName": "Steel Ink", "canonical": "#14181d", "tonalRamp": ["#0d1015", "#14181d", "#24272b"] },
+			"normal-fill": { "role": "neutral", "displayName": "Normal Fill", "canonical": "#8f979f", "tonalRamp": ["#6b737b", "#8f979f", "#a8b0b9"] },
+			"alarm-bg": { "role": "alarm", "displayName": "Alarm Tint", "canonical": "#3b3322", "tonalRamp": ["#2b2618", "#3b3322", "#4a3f28"] },
+			"alarm-line": { "role": "alarm", "displayName": "Alarm Line", "canonical": "#6b5627", "tonalRamp": ["#4a3f28", "#6b5627", "#8a7332"] },
+			"crit-bg": { "role": "critical", "displayName": "Critical Tint", "canonical": "#472326", "tonalRamp": ["#331a1c", "#472326", "#5c2d31"] },
+			"crit-line": { "role": "critical", "displayName": "Critical Line", "canonical": "#6b2d30", "tonalRamp": ["#522325", "#6b2d30", "#85393c"] },
+			"crit-ink": { "role": "critical", "displayName": "On-Red Ink", "canonical": "#ffd0cc", "tonalRamp": ["#e5a29e", "#ffd0cc", "#fff0ee"] }
+		},
+		"typographyMeta": {
+			"heading": { "displayName": "Heading", "purpose": "Page titles: project name, Overview, empty state. 20px/600, −0.01em." },
+			"title": { "displayName": "Title", "purpose": "Card titles and section heads; dialog headings at 16px. 14px/600." },
+			"body": { "displayName": "Body", "purpose": "The base ramp; buttons run 13.5px. 14px/400." },
+			"label": { "displayName": "Label", "purpose": "Meter labels, counts, metadata, table headers; captions 12px. 12.5px, values always tabular." }
+		},
+		"shadows": [
+			{ "name": "overlay", "value": "0 18px 44px rgba(0, 0, 0, 0.5)", "purpose": "Top-layer surfaces only: native <dialog>, the task drawer, bar popovers. In-page surfaces never take a shadow." }
+		],
+		"motion": [
+			{ "name": "ease", "value": "cubic-bezier(0.2, 0.7, 0.3, 1)", "purpose": "The one easing for every transition in the app." },
+			{ "name": "control", "value": "120ms", "purpose": "Button and control feedback." },
+			{ "name": "dialog", "value": "160ms", "purpose": "Native dialog rise." },
+			{ "name": "drawer", "value": "200ms", "purpose": "Task drawer slide from the right." },
+			{ "name": "arrival", "value": "220ms", "purpose": "Alarm-mark entry and in-column card slides (FLIP)." },
+			{ "name": "flight", "value": "340ms", "purpose": "Card flights between stage columns (FLIP via WAAPI)." },
+			{ "name": "ramp", "value": "400ms", "purpose": "Indicator fill ramps to new values." },
+			{ "name": "trace", "value": "420ms", "purpose": "One-time mark trace when a card lands." },
+			{ "name": "reduced-motion", "value": "0.01ms", "purpose": "Everything collapses under prefers-reduced-motion except the spinner (0.7s); traces and slides do not run." }
+		],
+		"breakpoints": [
+			{ "name": "columns-2", "value": "760px", "purpose": "Stage columns collapse 4 → 2 at this container width." },
+			{ "name": "columns-1", "value": "440px", "purpose": "Stage columns collapse to one; performance charts stack." },
+			{ "name": "shell-stack", "value": "720px", "purpose": "Viewport: the shell stacks, the area list becomes a horizontal strip, touch targets grow to 40px, inputs to 16px." }
+		]
+	},
+	"components": [
+		{
+			"name": "Primary Button",
+			"kind": "button",
+			"refersTo": "button-primary",
+			"description": "The one steel-filled action per view: New task, Create release, dialog confirms.",
+			"html": "<button class=\"primary\" type=\"button\">New task</button>",
+			"css": ".primary { min-height: 32px; padding: 0 12px; background: #8fb0d0; color: #14181d; font: 600 13.5px/1.35 \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, sans-serif; border: none; border-radius: 4px; cursor: pointer; } .primary:hover { background: #a6c2de; } .primary:focus-visible { outline: 2px solid #a6c2de; outline-offset: 1px; }"
+		},
+		{
+			"name": "Task Card",
+			"kind": "card",
+			"refersTo": "card",
+			"description": "The kanban unit; the whole card is the hit area. Landed (done) cards recede to panel stock.",
+			"html": "<article class=\"card\">Fix done_at backfill retry</article>",
+			"css": ".card { padding: 10px 12px; background: #3a3f45; border: 1px solid #3d4248; border-radius: 4px; color: #c9ced4; font-size: 14px; } .card:hover { background: #41464d; border-color: #4a5057; } .card.needs { border-color: #f0b429; } .card.done { background: #303338; font-weight: 500; }"
+		},
+		{
+			"name": "Load Meter",
+			"kind": "custom",
+			"refersTo": "meter",
+			"description": "56×8 recessed indicator with a band-limit tick at 85%; fill is grey in band, amber above, red at critical.",
+			"html": "<span class=\"meter\"><span class=\"fill\" style=\"width: 62%\"></span><span class=\"tick\"></span></span><span class=\"val\">62%</span>",
+			"css": ".meter { position: relative; display: inline-block; width: 56px; height: 8px; background: #1f2225; border-radius: 3px; } .fill { position: absolute; inset: 0 auto 0 0; background: #8f979f; border-radius: 3px; transition: transform 0.4s cubic-bezier(0.2, 0.7, 0.3, 1); } .meter.high .fill { background: #f0b429; } .meter.crit .fill { background: #e5534b; } .tick { position: absolute; top: -1px; bottom: -1px; left: 85%; width: 1px; background: #4a5057; } .val { color: #eceef1; font-variant-numeric: tabular-nums; }"
+		},
+		{
+			"name": "Stage Column Chart",
+			"kind": "custom",
+			"refersTo": null,
+			"description": "Performance stage mix: one vertical bar per stage per project; the value on top and the stage label below carry the meaning, so the grey ramp never has to.",
+			"html": "<span class=\"pf-col\"><span class=\"pf-colval\">2</span><span class=\"pf-colbar\" data-s=\"todo\" style=\"height: 48px\"></span><span class=\"pf-colab\">todo</span></span>",
+			"css": ".pf-cols { display: flex; gap: 8px; align-items: flex-end; height: 110px; } .pf-col { display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 3px; height: 100%; } .pf-colbar { width: 26px; border-radius: 3px 3px 0 0; background: #8f979f; } .pf-colbar[data-s=\"todo\"] { background: #454b52; } .pf-colbar[data-s=\"in_progress\"] { background: #6b737b; } .pf-colbar[data-s=\"merging\"] { background: #949ca4; } .pf-colbar[data-s=\"done\"] { background: #d5dade; } .pf-colval { color: #eceef1; font-size: 12px; font-variant-numeric: tabular-nums; } .pf-colab { color: #a8b0b9; font-size: 11px; }"
+		}
+	],
+	"narrative": {
+		"northStar": "The Control Room",
+		"overview": "Ottr is a control-room overview for coding agents, built as an ISA-101 high-performance HMI in dark. Grey means every agent runs as it should; colour appears only when a task needs the operator or the machine leaves its normal band. It deliberately refuses the category default — a GitHub-dark kanban where every column, badge, and chart is always coloured. The world is flat graphite: a work-area field under a darker chrome layer, panels and cards on 1px lines. There are no gradients, no glass, no glow. Values are brighter than labels and always tabular. Depth is not the signal — state is.",
+		"keyCharacteristics": [
+			"All-grey board at rest; the first amber is the event",
+			"Redundant state coding: shape carries state, hue only severity",
+			"Analog indicators that show their own normal band",
+			"One steel-blue interaction/selection edge, nothing else",
+			"Flat 1px-line elevation; shadow only on top-layer overlays",
+			"Native platform surfaces: <dialog> top layer and Popover API",
+			"WCAG 2.1 AA is binding: contrast, visible focus, names, announced status"
+		],
+		"rules": [
+			{ "name": "The Grey-Is-Normal Rule", "body": "Colour is an alarm channel. If a state is fine, it renders in grey; amber and red are reserved for needs-you and critical.", "section": "colors" },
+			{ "name": "The Redundant-Coding Rule", "body": "No alarm state is carried by hue alone. Needs-you is an amber triangle, critical a red square, band exceedance a tick plus amber fill.", "section": "colors" },
+			{ "name": "The One-Edge Rule", "body": "Steel blue is the only interactive colour. Hover states lighten greys or add the steel edge; they never introduce a second hue.", "section": "colors" },
+			{ "name": "The Values-Read-First Rule", "body": "Data read at a glance uses bright text and tabular figures; labels stay dim.", "section": "typography" },
+			{ "name": "The Operator's-Frame Rule", "body": "The overview bar and navigation hold position; only the work pane scrolls.", "section": "layout" },
+			{ "name": "The Shadow-Is-Overlayer Rule", "body": "A shadow appears only where an element leaves the page layer: dialogs, the drawer, popovers.", "section": "elevation" },
+			{ "name": "The Shape-Says-It Rule", "body": "State marks are a closed set of five glyphs; new states pick a glyph, not a colour.", "section": "shapes" },
+			{ "name": "The Native-Platform Rule", "body": "Modality uses the platform: <dialog> for focus and Esc, the Popover API for light-dismiss detail. No JS re-implements what the browser ships.", "section": "components" },
+			{ "name": "WCAG 2.1 AA Binding", "body": "Contrast 4.5:1 / 3:1 including non-text boundaries, visible steel focus on every interactive element, names on icon-only controls, status in live regions, reflow at 320px, reduced-motion tiers, pointer-free alternative for drag.", "section": "components" }
+		],
+		"dos": [
+			"Do render every healthy state in grey, with bright tabular values for anything numeric.",
+			"Do pair every amber or red with its shape — triangle, square, or band tick.",
+			"Do keep the steel accent as the only interactive colour; one edge per screen for selection.",
+			"Do use native <dialog> and the Popover API for modality and light-dismiss detail.",
+			"Do let landed work recede: recessed stock, lighter title weight, no celebration.",
+			"Do keep all motion on the shared easing, and respect the reduced-motion tiers.",
+			"Do keep WCAG 2.1 AA: contrast, visible focus, names on icon-only controls, announced status."
+		],
+		"donts": [
+			"Don't colour charts, columns, badges, or counts that are not alarming — this is not a GitHub-dark kanban.",
+			"Don't add gradients, glass, blur, or glow; surfaces are flat fills on 1px lines.",
+			"Don't make alarms blink, pulse, or repeat; an alarm arrives once.",
+			"Don't put shadows on in-page surfaces; shadow means top-layer overlay.",
+			"Don't invent a second accent hue; links, focus, and selection are all the same steel.",
+			"Don't drop the redundant coding — a colour-only alarm fails the world and colour-blind operators alike.",
+			"Don't ship a UI change that fails WCAG 2.1 AA — a contrast, focus, name, or status-message regression is a defect."
+		]
+	}
+}

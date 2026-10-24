@@ -1,0 +1,201 @@
+# syntax=docker/dockerfile:1
+# D1 pins are deliberate; a bump is a new image build.
+# oven/bun:1.4.3-debian pinned 2026-10-17 — must stay >= the bun the omp pin needs
+# (omp 18.6.0's dist fails to parse on bun 1.3.3; the host runs 1.4.2).
+# Digest-pinned 2026-10-22: a moved tag would silently change the worker image on the
+# next build. To upgrade bun, read the new tag's digest with
+# `docker buildx imagetools inspect oven/bun:<tag>` and move tag and digest together.
+FROM oven/bun:1.4.3-debian@sha256:923bedb355f7746666659f71e724998159a5c8c54bd1cb1030e1975a0698415b
+# scripts/update-image.ts prunes superseded builds of this image by this label.
+LABEL ottr.image=worker
+
+# Debian trixie git version (the 1.4.2-debian base is trixie); a wrong pin fails the build loudly (D1).
+ARG GIT_VERSION=1:2.47.3-0+deb13u1
+# rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
+# when the binary is on PATH; without it every command runs raw. Host scoop runs 0.51.0.
+# Static musl build, no glibc deps. A wrong pin 404s the download (fails the build loudly).
+ARG RTK_VERSION=0.51.0
+# sha256 of rtk-x86_64-unknown-linux-musl.tar.gz from the release's checksums.txt.
+ARG RTK_SHA256=5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5
+# ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
+# (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
+ARG RIPWIRE_VERSION=0.6.7
+# sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
+ARG RIPWIRE_SHA256=9a1b44da5d17464518be25539354c931499d2b008ff94096384f211d18814755
+# GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
+# GitHub token (D6). Host runs 2.102.0. A wrong pin 404s the download (fails the build loudly).
+ARG GH_VERSION=2.102.0
+# sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
+ARG GH_SHA256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+# Node.js: npx starts the agent layer's MCP servers (chrome-devtools, godot), and projects run
+# their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
+# npx is missing. A wrong pin 404s the download (fails the build loudly).
+ARG NODE_VERSION=24.21.0
+# sha256 of node-v${NODE_VERSION}-linux-x64.tar.gz from the release's SHASUMS256.txt.
+ARG NODE_SHA256=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+# Debian trixie jq version; a wrong pin fails the build loudly (D1).
+ARG JQ_VERSION=1.7.1-6+deb13u4
+# Debian trixie procps version: killTree and the orphan report (src/platform/unix.ts) walk the
+# process tree with `ps`. Without it a cancel kills only omp's own pid, and its children live on
+# in the long-running server and worker containers. A wrong pin fails the build loudly (D1).
+ARG PROCPS_VERSION=2:4.0.4-9
+# Debian trixie curl version: the impeccable skill's launcher downloads the engine that a skill
+# update needs with curl or wget. Without either, `impeccable detect` exits 127 in a container,
+# and UI turns skip their accessibility scan. A wrong pin fails the build loudly (D1).
+ARG CURL_VERSION=8.14.1-2+deb13u7
+# Chrome for Testing for the agent layer's chrome-devtools MCP server, which starts the stable
+# channel from /opt/google/chrome/chrome. Its shared libraries come from the projects' package
+# lists (see below). A wrong pin 404s the download (fails the build loudly).
+ARG CHROME_VERSION=154.0.8037.92
+# sha256 of chrome-linux64.zip, computed when pinned: Chrome for Testing publishes no checksums.
+ARG CHROME_SHA256=ff43322f335e436b2f4dcdfeeec5db032299e335a7e8c1c618b326e100ce8732
+# Debian trixie git-lfs version. Projects keep binary assets in LFS (mystic-realms), and the
+# server checks worktrees out through its filters before any package list installs, so it
+# is in the image. A wrong pin fails the build loudly (D1).
+ARG GIT_LFS_VERSION=3.6.1-1+deb13u1
+# Debian trixie openssh-client version: clone, fetch and push over SSH for git hosts other
+# than GitHub. Keys stay on the server; workers get only the binary (D6). A wrong pin fails
+# the build loudly (D1).
+ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
+# Godot for Godot projects' turns (mystic-realms pins 4.7.2) and their godot MCP server, which
+# finds `godot` on PATH. It has no Debian package, so a project's apt list cannot carry it.
+# A wrong pin 404s the download (fails the build loudly).
+ARG GODOT_VERSION=4.7.2
+# sha256 of Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip: the release asset's GitHub digest,
+# checked against the release's SHA512-SUMS.txt when pinned.
+ARG GODOT_SHA256=cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4
+
+# Keep bun's global bin outside /root — the HOME volume would shadow it.
+ENV BUN_INSTALL=/usr/local/bun
+ENV PATH="/usr/local/bun/bin:${PATH}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      "git=${GIT_VERSION}" \
+      "git-lfs=${GIT_LFS_VERSION}" \
+      "jq=${JQ_VERSION}" \
+      "procps=${PROCPS_VERSION}" \
+      "curl=${CURL_VERSION}" \
+      "openssh-client=${OPENSSH_CLIENT_VERSION}" \
+      ca-certificates \
+      python3 make g++ pkg-config unzip \
+    && rm -rf /var/lib/apt/lists \
+    && git --version \
+    && git lfs install --system --skip-repo \
+    && git lfs version \
+    && jq --version \
+    && ps --version \
+    && curl --version \
+    && ssh -V
+
+# rtk on PATH (pinned, checksum-verified) so pix-optimizer's bash rewrite is active.
+RUN bun -e "await Bun.write('/tmp/rtk.tar.gz', await (await fetch('https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz')).bytes())" \
+    && echo "${RTK_SHA256}  /tmp/rtk.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/rtk.tar.gz -C /tmp \
+    && install -m 0755 /tmp/rtk /usr/local/bin/rtk \
+    && rm -f /tmp/rtk.tar.gz /tmp/rtk \
+    && rtk --version
+
+# ripwire on PATH (pinned, checksum-verified) so turn agents map before they read.
+RUN bun -e "await Bun.write('/tmp/ripwire.tar.gz', await (await fetch('https://github.com/redhat-et/ripwire/releases/download/v${RIPWIRE_VERSION}/ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz')).bytes())" \
+    && echo "${RIPWIRE_SHA256}  /tmp/ripwire.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/ripwire.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64/ripwire" /usr/local/bin/ripwire \
+    && rm -rf "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64" /tmp/ripwire.tar.gz \
+    && ripwire --version
+
+# gh on PATH (pinned, checksum-verified). Workers get no GitHub token (D6), so there it reads
+# public data only.
+RUN bun -e "await Bun.write('/tmp/gh.tar.gz', await (await fetch('https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz')).bytes())" \
+    && echo "${GH_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_amd64/bin/gh" \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64" \
+    && gh --version
+
+# node, npm and npx on PATH (pinned, checksum-verified); they shadow bun's node fallback.
+RUN bun -e "await Bun.write('/tmp/node.tar.gz', await (await fetch('https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz')).bytes())" \
+    && echo "${NODE_SHA256}  /tmp/node.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+      --exclude="node-v${NODE_VERSION}-linux-x64/*.md" --exclude="node-v${NODE_VERSION}-linux-x64/LICENSE" \
+    && rm -f /tmp/node.tar.gz \
+    && node --version \
+    && npx --version
+
+# Chrome on the path chrome-devtools-mcp looks for (pinned, checksum-verified).
+RUN bun -e "await Bun.write('/tmp/chrome.zip', await (await fetch('https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip')).bytes())" \
+    && echo "${CHROME_SHA256}  /tmp/chrome.zip" | sha256sum -c - \
+    && unzip -q /tmp/chrome.zip -d /opt \
+    && rm -f /tmp/chrome.zip \
+    && mkdir -p /opt/google/chrome \
+    && ln -s /opt/chrome-linux64/chrome /opt/google/chrome/chrome
+
+# Godot (pinned, checksum-verified). Turns run it headless, so it needs no display libraries.
+# ponytail: one Godot for every project; a project that pins another version needs a per-project install.
+RUN bun -e "await Bun.write('/tmp/godot.zip', await (await fetch('https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip')).bytes())" \
+    && echo "${GODOT_SHA256}  /tmp/godot.zip" | sha256sum -c - \
+    && unzip -q /tmp/godot.zip -d /tmp \
+    && install -D -m 0755 "/tmp/Godot_v${GODOT_VERSION}-stable_linux.x86_64" /opt/godot/godot \
+    && rm -f /tmp/godot.zip "/tmp/Godot_v${GODOT_VERSION}-stable_linux.x86_64"
+# Without a display Godot exits ("Can't load Xlib"), so `godot` on PATH adds --headless when there
+# is none: godot-mcp's run_project then runs the game and reads its output. A display keeps it.
+COPY --chmod=0755 <<'EOF' /usr/local/bin/godot
+#!/bin/sh
+[ -n "${DISPLAY}${WAYLAND_DISPLAY}" ] || set -- --headless "$@"
+exec /opt/godot/godot "$@"
+EOF
+RUN godot --version
+
+# Language servers for omp's lsp tool. omp starts a built-in server when the repo root holds one
+# of its root markers and the binary is in the project's node_modules/.bin or on PATH; a new
+# worktree has no node_modules when omp starts, so without these a turn gets no language server.
+# TypeScript 7's tsc serves TS/JS (`tsc --lsp`), typescript-language-server serves projects whose
+# own TypeScript is older, pyright serves Python. A wrong pin fails the build loudly.
+ARG TYPESCRIPT_VERSION=7.0.2
+ARG TS_LANGUAGE_SERVER_VERSION=6.0.2
+ARG PYRIGHT_VERSION=1.1.414
+RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
+      "typescript-language-server@${TS_LANGUAGE_SERVER_VERSION}" \
+      "pyright@${PYRIGHT_VERSION}" \
+    && tsc --version \
+    && typescript-language-server --version \
+    && pyright --version
+
+# omp is the main tool and follows its npm releases: .github/workflows/omp-bump.yml moves this
+# pin (docs/WORKERS.md, "Updates"). It is declared here, not with the other pins: a changed ARG
+# invalidates every later RUN, so a bump rebuilds only the layers below.
+ARG OMP_VERSION=18.11.3
+# toon CLI (npm @toon-format/cli) for the bundled toon-json skill — must match
+# the host's toon so workers and host produce identical output.
+ARG TOON_VERSION=4.4.0
+RUN bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+    && bun install -g "@toon-format/cli@${TOON_VERSION}" \
+    && omp --version \
+    && toon --version
+
+# No project's system packages are baked in (e.g. the libraries Chrome needs): each project
+# lists them in the data repo, and a worker installs every list when it starts (src/apt.ts).
+# git-lfs and Godot above are the two exceptions.
+
+# Runtime GitHub auth: the board keeps the token from onboarding/Settings and exports it as
+# GH_TOKEN to server-side git, gh and merge turns only (D6). This helper hands it to git for
+# github.com remotes, and names the cause instead of git's bare prompt failure without it.
+RUN git config --system credential.https://github.com.helper \
+      '!f() { test "$1" = get || exit 0; if [ -z "$GH_TOKEN" ]; then echo "ottr: no GH_TOKEN here; the board passes its GitHub token (Settings) to server-side git only" >&2; exit 0; fi; echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+
+WORKDIR /app
+COPY package.json bun.lock tsconfig.json ./
+COPY src ./src
+COPY extension ./extension
+RUN bun install --frozen-lockfile --production
+# Every Node process preloads the Stryker tap (src/stryker-tap.cjs): a `stryker run` copies
+# its stdout to /tmp/ottr-stryker-<pid>.log, so the running card shows the progress even when
+# the agent's command pipes the output (rtk). Every other process returns at once; bun
+# ignores NODE_OPTIONS. A project script that sets its own NODE_OPTIONS drops the tap.
+ENV NODE_OPTIONS=--require=/app/src/stryker-tap.cjs
+
+COPY docker/ottr-entry.sh /ottr-entry.sh
+RUN chmod +x /ottr-entry.sh
+
+EXPOSE 4747 8787
+ENTRYPOINT ["/ottr-entry.sh"]

@@ -1,0 +1,2 @@
+# LF everywhere: Biome checks for LF, and scoop's Git turns on core.autocrlf, which checks out CRLF on Windows.
+* text=auto eol=lf

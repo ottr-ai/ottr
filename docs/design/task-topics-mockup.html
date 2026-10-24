@@ -1,0 +1,1565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ottr concept - done lane grouped by topic</title>
+<style>
+:root { color-scheme: dark;
+  --field: #2b2e32; --chrome: #24272b; --panel: #303338; --card: #3a3f45; --card-hover: #41464d;
+  --well: #1f2225; --line: #4a5057; --line-soft: #3d4248;
+  --text-strong: #eceef1; --text: #c9ced4; --dim: #a8b0b9;
+  --accent: #8fb0d0; --accent-hover: #a6c2de; --accent-ink: #14181d; --accent-bg: #26303a; --accent-line: #46596e;
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Code", ui-monospace, Consolas, monospace;
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --done-bg: color-mix(in srgb, var(--field) 60%, var(--panel)); }
+* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+html, body { margin: 0; }
+body { background: var(--field); color: var(--text); font: 14px/1.5 var(--font); -webkit-font-smoothing: antialiased; }
+.wrap { display: flex; gap: 24px; align-items: flex-start; padding: 24px; max-width: 1100px; margin: 0 auto; flex-wrap: wrap; }
+.page-note { width: 100%; margin: 0 0 4px; }
+.page-note h1 { margin: 0 0 2px; font-size: 20px; font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; color: var(--text-strong); }
+.page-note p { margin: 0; font-size: 12.5px; color: var(--dim); }
+.proj-head { width: 100%; display: flex; align-items: center; gap: 12px; }
+.proj-name { margin: 0; font-size: 20px; font-weight: 600; line-height: 1.25; color: var(--text-strong); }
+.search { flex: 1; max-width: 280px; margin-left: auto; }
+.search input { width: 100%; padding: 5px 10px; font: 13px/1.4 var(--font); color: var(--text-strong);
+  background: var(--well); border: 1px solid var(--line-soft); border-radius: 4px; }
+.search input::placeholder { color: var(--dim); }
+.search input:hover { border-color: var(--line); }
+.search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.stage { flex: 1 1 340px; max-width: 420px; min-width: 300px; display: flex; flex-direction: column; min-width: 0;
+  background: var(--done-bg); border: 1px solid var(--line-soft); border-radius: 6px; height: 78vh; min-height: 480px; }
+.stage-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; font-size: 12.5px; font-weight: 600;
+  color: var(--dim); border-bottom: 1px solid var(--line-soft); }
+.stage-head .count { margin-left: auto; }
+.lane-tools { display: flex; gap: 2px; }
+.lane-tools button { padding: 2px 7px; font: 600 12px/1.4 var(--font); color: var(--dim); background: none;
+  border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
+.lane-tools button:hover { color: var(--text-strong); border-color: var(--line-soft); }
+.lane-tools button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.count { min-width: 24px; padding: 0 6px; font-size: 13px; font-weight: 600; text-align: center;
+  color: var(--text-strong); background: var(--field); border: 1px solid var(--line-soft); border-radius: 3px;
+  font-variant-numeric: tabular-nums; }
+.stage-cards { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+.topic-head-wrap { margin: 0; }
+.topic:first-child .topic-head-wrap { margin-top: 2px; }
+.topic-head { position: sticky; top: -9px; z-index: 2; display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 5px 2px 5px 0; background: var(--done-bg); border: 0; border-bottom: 1px solid var(--line-soft);
+  cursor: pointer; text-align: left; }
+.topic-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chev { width: 12px; height: 12px; fill: none; stroke: var(--dim); stroke-width: 1.5;
+  transition: transform 160ms var(--ease); flex-shrink: 0; }
+.topic[data-collapsed] .chev { transform: rotate(-90deg); }
+.lane-label { margin: 0; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); }
+.topic-count { margin-left: auto; font-size: 11.5px; font-weight: 600; color: var(--dim);
+  font-variant-numeric: tabular-nums; padding-right: 2px; }
+.topic-body { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 160ms var(--ease); }
+.topic[data-collapsed] .topic-body { grid-template-rows: 0fr; }
+.topic-body > .topic-cards { overflow: hidden; min-height: 0; transition: padding 160ms var(--ease); }
+.topic[data-collapsed] .topic-cards { padding-block: 0; }
+.topic-cards { list-style: none; margin: 0; padding: 6px 0 2px; display: flex; flex-direction: column; gap: 6px; }
+.card { position: relative; display: flex; flex-direction: column; background: var(--panel);
+  border: 1px solid var(--line-soft); border-radius: 4px; }
+.card:hover { background: var(--card); border-color: var(--line); }
+.card-open { display: flex; flex-direction: column; align-items: stretch; gap: 4px; width: 100%; padding: 10px 12px;
+  font: inherit; color: inherit; text-align: left; background: none; border: 0; cursor: pointer; }
+.card-open:focus-visible { outline: none; }
+.card:has(.card-open:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card-title { display: flex; align-items: flex-start; gap: 8px; font-size: 14px; font-weight: 500; color: var(--text); }
+.card-title > span:not(.mark) { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.mark { width: 12px; height: 12px; margin-top: 3px; fill: none; stroke: var(--dim); stroke-width: 1.5; flex-shrink: 0; }
+.card-meta { display: flex; gap: 8px; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.alt { flex: 1 1 300px; min-width: 280px; }
+.alt h2 { margin: 0 0 2px; font-size: 14px; font-weight: 600; color: var(--text-strong); }
+.alt p { margin: 0 0 10px; font-size: 12.5px; color: var(--dim); }
+.rail { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px; background: var(--panel);
+  border: 1px solid var(--line-soft); border-radius: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; font: 12.5px/1.5 var(--font);
+  color: var(--text); background: var(--well); border: 1px solid var(--line-soft); border-radius: 4px; cursor: pointer; }
+.chip:hover { background: var(--card); border-color: var(--line); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip[aria-pressed="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.chip[aria-pressed="true"] .chip-n { color: var(--accent-ink); }
+.chip-n { font-size: 11.5px; font-weight: 600; color: var(--dim); font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) { .wrap { padding: 14px; } .stage { height: 70vh; } }
+@media (prefers-reduced-motion: reduce) { .chev, .topic-body { transition: none; } }</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="page-note">
+    <h1>Done lane, grouped by topic</h1>
+    <p>Concept mockup &middot; static snapshot of the ottr board, done tasks clustered on titles &middot; 2026-10-02</p>
+  </div>
+  <div class="proj-head">
+    <p class="proj-name">ottr</p>
+    <div class="search"><input type="search" placeholder="Search tasks" aria-label="Search tasks"></div>
+  </div>
+  <section class="stage" data-stage="done" aria-label="Done tasks">
+    <div class="stage-head">
+      <span>Done</span>
+      <div class="lane-tools">
+        <button type="button" data-collapse="all">Collapse</button>
+        <button type="button" data-expand="all">Expand</button>
+      </div>
+      <span class="count">217</span>
+    </div>
+    <div class="stage-cards">
+<section class="topic" data-topic="merge">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-0">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Merge</span>
+      <span class="topic-count">15</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-0"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI Failure 36869906930</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI failure on 69d3303</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI failure on merge push</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Diagnose and Fix CI Failure</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>CI failed on the merge push of this card&#39;s parent task (360f418 on origin/main).</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI Failure and Commit</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI failure on b114d92</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix CI failure on b114d92</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Investigate and Fix Failed CI</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Watch GH Actions CI after merges</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Block merges during review</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Merge model-on-running-steps task</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Merge update-badge fix to main</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Can we change the behaviour to do a rebase merge instead of a separate merge com</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Merge Git-Sorted Done-Column Changes</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="detail">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-1">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Detail</span>
+      <span class="topic-count">13</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-1"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Implement Follow-Up Card Flight Animations</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Show worker thinking in task detail view</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Use the same question mark for the task detail view as on the board for ask roun</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Make enter trigger the send for steering and follow up on a task&#39;s detail view (</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Improve and Verify Drawer UI</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Clicking on a picture in a task&#39;s detail view should open that picture in a moda</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Let&#39;s restyle this task detail view in a way that clicking on a &quot;turn&quot;/step open</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Reorganize Task Drawer and Work Logs</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Release notes should be it&#39;s own section at the top of a done task&#39;s detail view</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Display Agent Model in Task Details</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add GitHub Remote Link to Task Details</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Display Clickable Task Image Thumbnails</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Disable all buttons under reply in a task&#39;s detail if the max limit of parallel</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>5d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="follow-up">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-2">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Follow-up</span>
+      <span class="topic-count">11</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-2"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Redesign follow-up link UI</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>fix: report follow-up image-save failures as image errors</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Dedupe supervisor CI follow-up tasks</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Follow-up icon on task cards</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Redesign follow-ups task list</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix follow-up image-save error reporting</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Link follow-up tasks both ways</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Follow-up modal dialog redesign</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Unify task dialog image input</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Filtered view indication follow-up</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Follow-Up Tasks to Completed Tasks</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="setting">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-3">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Setting</span>
+      <span class="topic-count">8</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-3"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Create Tracker Global SQLite Database</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Per-Project Review and Image Limits</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Server-side sync for read state</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Settings nav placement UX</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Gear icon in settings dialog title</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Replace the settings button top right with a gear icon</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Implement Light Theme Styling Support</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Global Maximum Total Setting</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="impeccable">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-4">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Impeccable</span>
+      <span class="topic-count">8</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-4"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Improve Settings Dialog Runners Layout</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Ottr statistics overview page</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Quiet question options redesign</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Redesign the notification popover styling</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Rebase, Verify, and Integrate Branch</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Please use the /impeccable skill to overhaul the settings page (un-aligned contr</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Overhaul the Add Project Dialog</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Keep Settings Dialog Header Visible While Scrolling</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="test">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-5">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Test</span>
+      <span class="topic-count">7</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-5"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Test runner startRun launcher injection</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Test connectLive socket lifecycle</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Windows CI and adapter tests</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Mutation gate speed fix</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Promote e2e-steer to named gate</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Test UI Policy Mutation Coverage</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Whitespace-Only Title Test</span></span>
+    <span class="card-meta"><span>landed Sep 26</span><span>5d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="bar">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-6">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Bar</span>
+      <span class="topic-count">7</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-6"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Optimize Mobile Notifications and Meters</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Search bar opens on dropdown click</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>System icon top bar, theme in dropdown</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Split alarm badges into ! and ?</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Show provider usage limits in top bar</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>The mobile layout is broken due to fixed width for search bar and buttons. Make</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add a search bar so I can search all tasks of a project for keywords. Should fil</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="model">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-7">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Model</span>
+      <span class="topic-count">7</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-7"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Show main-loop model on task card</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Improve Model Selector Role and Model Ordering</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Can we read the models assigned to roles in omp? If so, mark them appropriately</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Model select before review start</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix always-open model popover</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Quick search in model selector</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add the actual default model to the string, e.g. &quot;Default (z.ai/glm-5.3-flash)&quot;</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="menu">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-8">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Menu</span>
+      <span class="topic-count">6</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-8"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Replace avatar menu with logout icon</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add user chip with logout menu</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Theme switcher popup menu</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Make the columns and menu stretch to the full height and only start displaying t</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>This version banner should be centered at the bottom of the menu</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add a version info to the left bottom in the menu with &quot;Ottr&quot; (bold, links to ot</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="look">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-9">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Look</span>
+      <span class="topic-count">5</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-9"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix mobile tailscale host block</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Please overhaul how the queued steering messages look like. Also they resized th</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>The &quot;Folder path&quot; button should be what the previous browse button looks like no</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Looks odd</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Improve Project Board Row Layout</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li></ul></div>
+</section>
+<section class="topic" data-topic="other">
+  <h3 class="topic-head-wrap">
+    <button class="topic-head" type="button" aria-expanded="true" aria-controls="tp-10">
+      <svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+      <span class="lane-label">Everything else</span>
+      <span class="topic-count">130</span>
+    </button>
+  </h3>
+  <div class="topic-body" id="tp-10"><ul class="topic-cards"><li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate top-bar icon anchor fix</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>API key icon buttons rework</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Agent-config install + CI bootstrap</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Prod mode for Bun board</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Style Asked-Question Turn Errors</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Assess Next.js migration for ottr</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Rename access token to API key</span></span>
+    <span class="card-meta"><span>landed today</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix done_at backfill retry</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix Boot Smoke and Static Checks</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Reject plain-HTTP public host origins</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix ask recommended index remap</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Measure new-task creation performance</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Public HTTP origin policy</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Harden public login enumeration</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Extract model-picker and status-line policy</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Shrink unused module surface</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate requestGuards rename branch</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Reconcile root docs with code</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Collaborative Session Host Links</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Persist Push SHA for Tasks</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Run Rules Interview as Tracker Card</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Make Mobile Board Columns Tabs</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix question-added indicator clipping</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Notifications for question error done states</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Extract Task Turn Lifecycle Module</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Manual review trigger button design</span></span>
+    <span class="card-meta"><span>landed Oct 1</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Block reorders while request in flight</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Disable send answers button after click</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Link review-spawned cards to parents</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Style Unasked Card Errors Amber</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>done_at backfill retry after interrupted migration</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix Ask Recommended Index Remapping</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Boot smoke fail fast</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Release waits for review tasks</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Separate server routes from startup</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>1d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Explain enter symbol on cards</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Architecture review of origin/main</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Review task behavior question</span></span>
+    <span class="card-meta"><span>landed Sep 30</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Preparing status before in-progress tasks</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>CSS spinner for BE-waiting actions</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate logout login screen fix</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Release modal: tasks, notes, semver</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Server error handling self-recovery</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Read-state storage: JSON vs SQLite</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Proper Login Page Redesign</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate connection-lost banner</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add test push button to settings</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Worker-image milestone ADR</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Dashboard time range selector</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Performance dashboard charts</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix broken model selector dialog</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Architecture review start button</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Image paging in task modal</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Task ID chip and search</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Enforce periodic architecture reviews</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>2d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Radio for custom ask answer</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Separate Asked Tasks in Overview</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Uppercase sidebar Projects label</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Match system theme label scheme</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Hide cancel button on done tasks</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Space and label unread done group</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Strike-through bell for muted state</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix failing GitHub Actions</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Unread done-card accent border and grouping</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Unread badge for answered tasks</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Agent titles session at in-progress</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Replace paging with endless scroll</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>That info icon is really hard to read. Can we make it bigger or bolder?</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Mnemopi memory for ottr tasks</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Name tasks at in-progress transition</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Browser Notifications and Toggle</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Top-bar quota shows default provider</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Display Submitted Custom Answers</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Restart Mobile-Use Grilling Session</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Clarify ask question separation</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Redesign the Ask UI Component</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate add-task hang fix</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add statistics tracking to tracker</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix Queued Card Grab Cursor</span></span>
+    <span class="card-meta"><span>landed Sep 29</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Biome lint and CI</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Picture-only steering messages</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Integrate ask panel answered-state branch</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Fix missing timeline on done tasks</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>The task was renamed again. Original intent is not visible anymore in the overvi</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>I know we did choose a silent design for maximum focus but can we maybe make the</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Just clicking on any answer closed the whole ask. Bug!</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Make the whole thing click-able to toggle expand. Also that double mouse-over gl</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Track Kept Files on Tasks</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add the latest release to the main info line above the board (next to the github</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Make the mouse cursor a hand which grabs on click (and hold) to indicate a task</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Server Version Change Detection</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Persistent Per-Task Model Selection</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Header Notification Popovers</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Where is that stray ottr string coming from breaking the ui</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Root cause found — the tracker worked as designed; the agent chose the wrong end</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Grill me on the idea on how to make this available for mobile use. In my current</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Those double-scroll bars are pretty ugly. One should be enough</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>After adding an image to a prompt (either in new task, follow up or steer) it sh</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Implement Agent Ask Question Workflow</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Replace Queue Panel With Drag-and-Drop</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Seems as if my latest tasks do not use the auto-generated title anymore</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>paging is broken now</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Remove the github logo from the input field. Add a computer icon to the local fo</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>The text seems to not be vertically centered. Please fix this for all buttons. A</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>3d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Image Attachments to Steering</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Why do all these tasks say &quot;+2&quot; commits? Doing work in a worktree, committing an</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add the github logo to the button at the top and rename it to just &quot;GitHub&quot;, not</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add the GitHub logo there and move the second input part below the first one, no</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add a keyboard shortcut for the &quot;+ New task&quot; button</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Now that we have the task queue per project we don&#39;t need the &quot;prioritize&quot; flag</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Clicking on the line of a project in Overview should open that project&#39;s page -</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Responsive Mobile Dashboard Layout</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add a new widget to the dashboard: task queue overview. So something like 2/10 s</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Implement Persistent Project Removal UI</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>The prompt is now on top - good! But the &quot;outcome reply&quot; is right beneath withou</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Pagination to Board Columns</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Task Priority Flag</span></span>
+    <span class="card-meta"><span>landed Sep 28</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Projects from Folder or GitHub</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Keep Board Column Headers Fixed</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add feedback to all buttons which trigger a client-server communication. For exa</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>auto-resume paused tasks when a new free slot is available if the task was pause</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add Reorderable Per-Project Queue Panels</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Track Task Commits and Progress</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add GPU Statistics Endpoint</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Sort done column tasks by time finished, not started</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Keep Add Task Button Beside Composer</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Edit Prompts for Unstarted Tasks</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Add this as the logo to the project. Use it as the favicon as well.</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Implement Running Task Steering Support</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>4d</span></span>
+  </button>
+</li>
+<li class="card" data-stage="done" data-state="idle">
+  <button class="card-open" type="button">
+    <span class="card-title"><svg class="mark mark-done" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg><span>Please research how we could provide access to this via mobile. I guess for my c</span></span>
+    <span class="card-meta"><span>landed Sep 27</span><span>5d</span></span>
+  </button>
+</li></ul></div>
+</section>
+    </div>
+  </section>
+  <aside class="alt">
+    <h2>Alternative: topic rail filter</h2>
+    <p>Same clusters as filter chips above the lane; the lane stays one flat list. Static sketch &mdash; the recommended direction is the grouped lane on the left.</p>
+    <div class="rail" role="group" aria-label="Filter done tasks by topic">
+<button class="chip" type="button">merge <span class="chip-n">15</span></button>
+<button class="chip" type="button">detail <span class="chip-n">13</span></button>
+<button class="chip" type="button">follow-up <span class="chip-n">11</span></button>
+<button class="chip" type="button">setting <span class="chip-n">8</span></button>
+<button class="chip" type="button">impeccable <span class="chip-n">8</span></button>
+<button class="chip" type="button">test <span class="chip-n">7</span></button>
+<button class="chip" type="button">bar <span class="chip-n">7</span></button>
+<button class="chip" type="button">model <span class="chip-n">7</span></button>
+<button class="chip" type="button">menu <span class="chip-n">6</span></button>
+<button class="chip" type="button">look <span class="chip-n">5</span></button>
+      <button class="chip" type="button">Everything else <span class="chip-n">130</span></button>
+    </div>
+  </aside>
+</div>
+<script>
+const stage = document.querySelector(".stage-cards");
+document.querySelectorAll(".topic-head").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const open = btn.getAttribute("aria-expanded") === "true";
+    btn.setAttribute("aria-expanded", String(!open));
+    btn.closest(".topic").toggleAttribute("data-collapsed", open);
+  });
+});
+document.querySelector("[data-collapse='all']").addEventListener("click", () => setAll(true));
+document.querySelector("[data-expand='all']").addEventListener("click", () => setAll(false));
+function setAll(collapsed) {
+  document.querySelectorAll(".topic").forEach((sec) => {
+    sec.toggleAttribute("data-collapsed", collapsed);
+    sec.querySelector(".topic-head").setAttribute("aria-expanded", String(!collapsed));
+  });
+}
+const input = document.querySelector(".search input");
+input.addEventListener("input", () => {
+  const q = input.value.trim().toLowerCase();
+  document.querySelectorAll(".topic").forEach((sec) => {
+    let hits = 0;
+    sec.querySelectorAll(".card").forEach((li) => {
+      const hit = !q || li.textContent.toLowerCase().includes(q);
+      li.hidden = !hit; if (hit) hits++;
+    });
+    sec.hidden = q ? hits === 0 : false;
+    if (q && hits) { sec.removeAttribute("data-collapsed"); sec.querySelector(".topic-head").setAttribute("aria-expanded", "true"); }
+  });
+});
+document.querySelectorAll(".chip").forEach((chip) => {
+  chip.addEventListener("click", () => { chip.setAttribute("aria-pressed", chip.getAttribute("aria-pressed") !== "true"); });
+});
+</script>
+</body>
+</html>

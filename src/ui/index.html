@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#24272b" />
+    <title>Ottr</title>
+    <link rel="icon" type="image/png" href="./icon-192.png" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./app.css" />
+    <script>
+      // Resolve the saved theme before first paint so light users never see a dark flash.
+      const t = localStorage.getItem("ottr.theme") ?? "system";
+      if (t === "light" || (t !== "dark" && matchMedia("(prefers-color-scheme: light)").matches))
+        document.documentElement.dataset.theme = "light";
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./app.tsx"></script>
+  </body>
+</html>

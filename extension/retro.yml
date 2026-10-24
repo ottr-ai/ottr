@@ -1,0 +1,4 @@
+# Overlay for retro runs (`--config extension/retro.yml`): omp adds the `learn`
+# and `manage_skill` tools when autolearn is on; retro runs must not have them.
+autolearn:
+  enabled: false

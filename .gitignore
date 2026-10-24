@@ -1,0 +1,22 @@
+node_modules/
+/config.json
+/push-subs.json
+*.migrated
+/server.log
+/server.err.log
+.update-restart.cmd
+.update-restart.vbs
+.update-restart.pid
+.dev/
+push-subs.json
+seen-answers.json
+.impeccable/live/*
+!.impeccable/live/config.json
+.env
+.env.*
+*.migrated
+
+# Turn shots live in .tasks; scratch shots never belong in the tree.
+/shots/
+/*.png
+stryker*-incremental.json

@@ -1,0 +1,7 @@
+# Overlay for review check runs (`--config extension/check.yml`): the second-model check of a
+# review's findings must run without omp memory — no injected summaries, no recall, no retain,
+# and no learn tools.
+memory:
+  backend: off
+autolearn:
+  enabled: false

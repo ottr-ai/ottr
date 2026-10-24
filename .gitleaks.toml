@@ -1,0 +1,10 @@
+# Fake token fixtures in tests (e.g. glpat-echoed-secret-000 in
+# src/worktree.test.ts) trip the generic-api-key rule. A real GitLab PAT is
+# 20 random characters; these fixtures are lowercase words with an all-zero
+# suffix, so this pattern cannot match a real token.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fake token fixtures in tests"
+regexes = ['''\bglpat-[a-z-]+-0{3,}\b''']

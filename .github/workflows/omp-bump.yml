@@ -1,0 +1,66 @@
+name: omp bump
+
+# omp is the main tool of every turn and ships almost daily, so the image pin follows the
+# newest omp that is 7 or more days old: workers run about one week behind npm, so a
+# broken or yanked release has a week to surface before we ship it. This job is the only
+# place that moves OMP_VERSION; each host deploys main with scripts/update-image.ts and
+# never pushes (docs/WORKERS.md, "Updates").
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions: {} # nothing at the workflow level; the bump job grants what it needs
+
+concurrency:
+  group: omp-bump
+
+jobs:
+  bump:
+    name: Bump
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the bump commit
+    steps:
+      # Pinned by SHA: this job holds a token that can push to main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # zizmor: ignore[artipacked] the push step below needs the token
+      - name: Move the pin to the newest omp that is 7 or more days old
+        id: pin
+        run: |
+          cutoff=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')
+          target=$(curl -fsS https://registry.npmjs.org/@oh-my-pi%2fpi-coding-agent | jq -r --arg cutoff "$cutoff" '
+            [ (.time | to_entries[])
+              | select(.key | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+              | select(.value <= $cutoff)
+              | .key ]
+            | sort_by(split(".") | map(tonumber))
+            | last // empty')
+          # The registry's answer goes into the Dockerfile: only a plain x.y.z version may.
+          [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::npm named the unexpected version $target"; exit 1; }
+          pinned=$(sed -n 's/^ARG OMP_VERSION=//p' Dockerfile.worker)
+          [ -n "$pinned" ] || { echo "::error::Dockerfile.worker pins no omp version"; exit 1; }
+          if [ "$(printf '%s\n' "$pinned" "$target" | sort -V | tail -n 1)" = "$pinned" ]; then
+            echo "omp $pinned is current"
+            exit 0
+          fi
+          sed -i "s/^ARG OMP_VERSION=.*/ARG OMP_VERSION=$target/" Dockerfile.worker
+          echo "version=$target" >> "$GITHUB_OUTPUT"
+      # The failure this catches: an omp that needs a newer bun than the image's base.
+      - name: Start the new omp on the image's bun
+        if: steps.pin.outputs.version
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          base=$(sed -n 's/^FROM //p' Dockerfile.worker)
+          docker run --rm "$base" sh -c 'bun install -g "@oh-my-pi/pi-coding-agent@$1" && omp --version' _ "$VERSION"
+      - name: Push the bump
+        if: steps.pin.outputs.version
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "chore: bump omp to $VERSION"
+          git push -q origin "HEAD:$GITHUB_REF_NAME"

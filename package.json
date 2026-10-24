@@ -1,0 +1,32 @@
+{
+  "name": "omp-task-tracker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "dev": "bun src/dev.ts",
+    "update": "git fetch origin && git merge --ff-only origin/main && bun install --frozen-lockfile",
+    "check": "tsc --noEmit && biome check src scripts extension && bun scripts/boot-smoke.ts && bun scripts/licenses.ts && bun scripts/no-scratch-images.ts",
+    "audit:quality": "jscpd src scripts extension --min-tokens 70 --reporters console --threshold 2.71 && knip",
+    "test": "bun test",
+    "test:e2e": "bun scripts/e2e-steer.js",
+    "test:mutation":
+      "stryker run && stryker run stryker.release.config.mjs && stryker run stryker.turn.config.mjs && stryker run stryker.worktree.config.mjs && stryker run stryker.update-image.config.mjs"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "web-push": "3.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@stryker-mutator/core": "^10.0.0",
+    "@types/bun": "^1.4.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "fast-check": "^4.10.2",
+    "jscpd": "5.4.1",
+    "knip": "6.41.0",
+    "typescript": "^7.0.2"
+  }
+}

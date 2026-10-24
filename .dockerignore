@@ -1,0 +1,8 @@
+# Deny by default; allow only what the image needs.
+*
+!src
+!extension
+!package.json
+!bun.lock
+!tsconfig.json
+!docker

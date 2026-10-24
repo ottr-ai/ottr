@@ -1,0 +1,9 @@
+# Overlay for every task run (`--config extension/run.yml`): omp moves a bash command
+# that runs longer than bash.autoBackground.thresholdMs (60 s) into a background job
+# and tells the agent the result arrives on its own. A one-shot run (`-p`) exits when
+# the agent's reply ends, so nothing is left to deliver that result. Long commands
+# must stay in the foreground; an agent can still background a job on purpose
+# (`async: true`).
+bash:
+  autoBackground:
+    enabled: false
