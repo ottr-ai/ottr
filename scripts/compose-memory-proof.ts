@@ -1,6 +1,6 @@
 // Compose memory proof: one omp turn inside a worker container over the real HTTP
-// handoff (D4), asserting one memory retain and one recall of the previous run's
-// retain against the shared HOME store (D1). Repeatable: each run recalls the
+// handoff, asserting one memory retain and one recall of the previous run's
+// retain against the shared HOME store. Repeatable: each run recalls the
 // previous run's pass word, retains a fresh one, and chains the state on the
 // workspace volume; the first run on a fresh volume only seeds.
 //

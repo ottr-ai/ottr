@@ -80,7 +80,7 @@ const root = mkdtempSync(join(tmpdir(), "app-routes-"));
 const fixtureRepos = join(root, "fixture-repos");
 mkdirSync(fixtureRepos, { recursive: true });
 const gitConfigGlobal = join(root, "git-config");
-// One rewrite per remote form (spec section 1): each maps its URL prefix onto a fixture
+// One rewrite per remote form: each maps its URL prefix onto a fixture
 // subdir, so clone and ls-remote never touch a network. A rewrite keeps the URL's remainder
 // verbatim, so the fixture dir name is the whole remainder of the URL.
 writeFileSync(
@@ -4746,7 +4746,7 @@ describe("git-host ssh keys", () => {
 		expect(await (await m.call("/api/git-hosts")).text()).not.toContain(
 			"PRIVATE KEY",
 		);
-		// A passphrase-protected paste is rejected (spec section 3).
+		// A passphrase-protected paste is rejected.
 		execSync(
 			`ssh-keygen -t ed25519 -N "passphrase" -q -f ${join(f.dir, "locked")}`,
 		);

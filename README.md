@@ -110,7 +110,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
 | GitHub token | none | asked at onboarding; **Settings → GitHub** replaces it; stored in `.tasks/tracker.db` |
-| Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Git hosts**: per-host HTTPS tokens (optional username) and a global SSH key; a project can set its own key in its **Settings**. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. See [docs/specs/git-hosts.md](docs/specs/git-hosts.md). |
+| Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Git hosts**: per-host HTTPS tokens (optional username) and a global SSH key; a project can set its own key in its **Settings**. Projects on other hosts clone with any `https://…`, `git@host:…` or `ssh://host[:port]/…` URL and work with plain git; the GitHub extras stay GitHub-only. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. |
 | Running agents | 3 total, 2 per project | **Settings**; empty = no cap |
 | Extra paths per worktree | none | **Settings** |
 | Alate provisioning | off | **Settings → Alate** (see [Alate](#alate)) |
@@ -142,8 +142,8 @@ For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no
 
 ## Docs
 
-- [PLAN.md](PLAN.md): design and decisions. The HTTP API is the `routes` object in `src/app.ts`.
-- [docs/decisions](docs/decisions): decision records.
+- [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
+- [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md): the **Review due** feature.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
 
 ## License

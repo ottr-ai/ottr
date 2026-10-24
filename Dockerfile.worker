@@ -49,7 +49,7 @@ ARG CURL_VERSION=8.14.1-2+deb13u7
 ARG CHROME_VERSION=154.0.8037.92
 # sha256 of chrome-linux64.zip, computed when pinned: Chrome for Testing publishes no checksums.
 ARG CHROME_SHA256=ff43322f335e436b2f4dcdfeeec5db032299e335a7e8c1c618b326e100ce8732
-# Debian trixie git-lfs version. Projects keep binary assets in LFS (mystic-realms), and the
+# Debian trixie git-lfs version. Projects can keep binary assets in LFS, and the
 # server checks worktrees out through its filters before any package list installs, so it
 # is in the image. A wrong pin fails the build loudly (D1).
 ARG GIT_LFS_VERSION=3.6.1-1+deb13u1
@@ -57,7 +57,7 @@ ARG GIT_LFS_VERSION=3.6.1-1+deb13u1
 # than GitHub. Keys stay on the server; workers get only the binary (D6). A wrong pin fails
 # the build loudly (D1).
 ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
-# Godot for Godot projects' turns (mystic-realms pins 4.7.2) and their godot MCP server, which
+# Godot for Godot projects' turns (pinned version below) and their godot MCP server, which
 # finds `godot` on PATH. It has no Debian package, so a project's apt list cannot carry it.
 # A wrong pin 404s the download (fails the build loudly).
 ARG GODOT_VERSION=4.7.2

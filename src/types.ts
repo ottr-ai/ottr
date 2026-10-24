@@ -611,7 +611,7 @@ export interface UpdateRecord {
 export interface UpdateRow extends UpdateRecord {
 	/** Board project name, or null when no project's origin remote matches. */
 	project: string | null;
-	/** Provider decision for this id (docs/decisions/2026-10-16-update-decisions-in-the-data-repo.md). */
+	/** Provider decision for this id. */
 	decision?: "approved" | "skipped";
 	/** This board decided for the id and the provider has not acked it yet. */
 	decisionPending?: true;
@@ -745,7 +745,7 @@ export interface MachineStats {
 export const PERF_RANGES = ["1h", "24h", "7d", "30d", "90d", "all"] as const;
 export type PerfRange = (typeof PERF_RANGES)[number];
 
-/** One Overview KPI (docs/specs/overview.md): the window value, the previous equal window (null in
+/** One Overview KPI: the window value, the previous equal window (null in
  *  range "all"), and one value per sparkline bucket (null where the bucket has no input). */
 export interface PerfStat {
 	value: number | null;

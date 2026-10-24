@@ -375,7 +375,7 @@ const serverRef: { current: Server<undefined> | undefined } = {
 const app = createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
-	// Server-only ssh keys and known_hosts (docs/specs/git-hosts.md): a data dir outside every
+	// Server-only ssh keys and known_hosts: a data dir outside every
 	// checkout, which no worker mounts (compose: OTTR_SSH_DIR on the ottr-state volume).
 	sshDir: defaultSshDir(),
 	projects,
@@ -440,12 +440,11 @@ setInterval(() => {
 void app.sampleStats();
 setInterval(() => void app.sampleStats(), 30_000);
 
-// Upstream updates: one pull at boot, then hourly (docs/decisions/2026-10-13-upstream-update-checks.md U5).
+// Upstream updates: one pull at boot, then hourly.
 void app.refreshUpdates();
 setInterval(() => void app.refreshUpdates(), 3_600_000);
 
-// Fork research: hourly poll; change-triggered analysis inside the watcher
-// (docs/decisions/2026-10-14-fork-research.md).
+// Fork research: hourly poll; change-triggered analysis inside the watcher.
 void app.forkResearchTick();
 setInterval(() => void app.forkResearchTick(), 3_600_000);
 

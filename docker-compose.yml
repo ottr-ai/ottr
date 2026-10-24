@@ -1,9 +1,9 @@
-# ottr compose topology (D5): one host, the board (service server) + disposable workers.
+# ottr compose topology: one host, the board (service server) + disposable workers.
 #
 # `docker compose up -d --build` builds ottr-worker:local and starts the server
 # plus worker-a/worker-b. Provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...)
 # must exist in the host shell — they are passed through, never baked.
-# Worker containers are NEVER port-mapped to the host (D3/D5); only the board's
+# Worker containers are NEVER port-mapped to the host; only the board's
 # UI port is exposed, on loopback.
 name: ottr
 
@@ -12,12 +12,12 @@ x-worker: &worker
   command: bun /app/src/worker.ts
   restart: always
   # tini as PID 1 reaps the orphans that omp and test runs leave behind: with bun as
-  # PID 1, worker-a held 5,434 zombies after 7 hours (2026-10-12).
+  # PID 1, worker-a held 5,434 zombies after 7 hours.
   init: true
-  # Stateless per D3: task data (DB, sessions, logs, images) lives on the ottr-data
+  # Stateless: task data (DB, sessions, logs, images) lives on the ottr-data
   # volume, clones and worktrees on workspace. Both mount at the server's paths, so
   # the absolute paths in a run request resolve the same. A dead worker is replaced
-  # by starting a new one (D5).
+  # by starting a new one.
   volumes:
     - workspace:/workspace
     - ottr-data:/data
@@ -26,20 +26,18 @@ x-worker: &worker
     # config and its own omp agent dir to the container filesystem instead (R5-1, see
     # the ottr service env).
     - home:/root
-    # Credentials stay on the host (D1); the named home volume holds writable
+    # Credentials stay on the host; the named home volume holds writable
     # state and the oauth dir is mounted read-only over it.
     - ${OTTR_OAUTH_DIR:?set OTTR_OAUTH_DIR to the host omp oauth dir}:/root/.omp/oauth:ro
     # omp keeps provider auth in agent.db: one file for the stack, seeded once from the host
-    # db (VACUUM INTO) and never baked (D1); the stack then logs in by itself (docs/WORKERS.md).
+    # db (VACUUM INTO) and never baked; the stack then logs in by itself (docs/WORKERS.md).
     - ${OTTR_AGENT_DB:?set OTTR_AGENT_DB to a snapshot file of the host omp agent.db}:/root/.omp/agent/agent.db
   environment:
     # Server-to-worker auth, required and random: turns share this network, so a known
     # value would let them drive any worker (workers strip it from every turn's env).
     OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
-    # Fleet memory backend (D8): workers run omp with memory.backend: hindsight
-    # against the SHARED Hindsight server (2026-10-08 — replaced the embedded
-    # hindsight service; one instance serves local spawns + ottr + future NAS
-    # port). The URL comes from the environment: set HINDSIGHT_API_URL in the
+    # Fleet memory backend: workers run omp with memory.backend: hindsight
+    # against the shared Hindsight server. The URL comes from the environment: set HINDSIGHT_API_URL in the
     # compose env file (or the host shell) to the Hindsight server address, or
     # save it under Settings -> Hindsight (a saved URL beats this env seed at
     # the next boot, and the board switches this shared config.yml's backend
@@ -57,7 +55,7 @@ x-worker: &worker
     # `docker compose up`. Never baked into the image.
     GH_TOKEN: ${GH_TOKEN:-}
     # Keys that a project's MCP servers read pass through from the host env, like
-    # provider keys (mystic-realms' pixellab server, see its .omp/mcp.json).
+    # an image-generation API key that a project's .omp/mcp.json reads.
     PIXELLAB_API_KEY:
 
 services:
@@ -106,14 +104,14 @@ services:
       - ottr-data:/data # per-project task data (OTTR_DATA_DIR), shared with the workers
       - home:/root
       - ottr-state:/app/.tasks # GlobalStore SQLite: board-global kv survives rebuilds
-      # Same read-only credential mount as the workers (D1).
+      # Same read-only credential mount as the workers.
       - ${OTTR_OAUTH_DIR:?set OTTR_OAUTH_DIR to the host omp oauth dir}:/root/.omp/oauth:ro
       - ${OTTR_AGENT_DB:?set OTTR_AGENT_DB to a snapshot file of the host omp agent.db}:/root/.omp/agent/agent.db
     environment:
       OMP_TRACKER_HOST: 0.0.0.0 # default is loopback, which dead-ports through the mapping
       OMP_TRACKER_ROOTS: /workspace
       OTTR_DATA_DIR: /data # task data outside the clones: /data/<project>
-      # Server-only ssh keys and known_hosts (docs/specs/git-hosts.md): on the ottr-state
+      # Server-only ssh keys and known_hosts : on the ottr-state
       # volume, which no worker mounts. /data and /root are worker-mounted, so never there.
       OTTR_SSH_DIR: /app/.tasks/ssh
       OTTR_WORKER_URLS: http://worker-a:8787,http://worker-b:8787
@@ -142,7 +140,7 @@ services:
       PI_CODING_AGENT_DIR: /etc/ottr/omp-agent
       # One shared home volume carries one agent config: with the entry script's
       # backend switch, the whole compose topology runs memory.backend: hindsight
-      # (D8) — server-side merge turns included. Mnemopi stays the default for
+      # — server-side merge turns included. Mnemopi stays the default for
       # direct spawns outside compose.
       HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
       HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
@@ -164,10 +162,8 @@ services:
     # Do NOT use `compose --scale`: round-robin DNS breaks cancel routing —
     # per-run addressability requires stable per-worker names.
 
-  # Embedded hindsight service REMOVED 2026-10-08: memory now lives in the
-  # shared Hindsight server named by HINDSIGHT_API_URL (tenant-key auth) — one
-  # instance serves local spawns, ottr, and the future NAS ottr port. The old
-  # hindsight-data volume can be dropped once no longer needed.
+  # Memory lives in the shared Hindsight server named by HINDSIGHT_API_URL
+  # (tenant-key auth); set the URL in the compose env file or in Settings.
 
 volumes:
   workspace:

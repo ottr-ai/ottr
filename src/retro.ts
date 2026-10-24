@@ -269,7 +269,7 @@ function sumUsage(u: Usage[]): RetroFacts["cost"] {
 
 /** The token and cost facts one turn owns: the summed usage of the assistant messages
  * whose record timestamp falls inside the turn's `[from, to]` window (inclusive, the
- * turn-ownership rule in docs/specs/overview.md). A record without a parseable
+ * turn-ownership rule). A record without a parseable
  * timestamp belongs to no window. */
 export interface UsageSum {
 	tokensIn: number;

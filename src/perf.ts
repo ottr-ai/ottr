@@ -1,4 +1,4 @@
-// Pure Overview performance metrics (docs/specs/overview.md): windows, buckets, and the
+// Pure Overview performance metrics: windows, buckets, and the
 // metric table over plain facts. No store or I/O here — the store shapes the facts
 // (ProjectStore.perfFacts) and the route aligns the fleet and per-project layouts.
 import type { PerfMetrics, PerfRange, PerfStat } from "./types.ts";

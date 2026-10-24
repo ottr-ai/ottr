@@ -2900,7 +2900,7 @@ function ProjectBoard({
 	);
 }
 
-/** Triage block (Option A, docs/specs/overview.md): every waiting card across projects, oldest
+/** Triage block (Option A): every waiting card across projects, oldest
  * wait first, then each project's warnings. A row opens what it names: the card through the same
  * openTask the alarm bell popover uses, a warning through the project's board hash. */
 function Triage({
@@ -2986,7 +2986,7 @@ function Triage({
 }
 
 /** Every project in one table (the plant overview); clicking a row opens that project.
- * Option A order (docs/specs/overview.md): triage, fleet KPIs, live table, per-project table. */
+ * Option A order: triage, fleet KPIs, live table, per-project table. */
 function Overview({
 	projects,
 	tasks,
@@ -3209,13 +3209,13 @@ const PERF_RANGE_LABELS: Record<PerfRange, string> = {
 	all: "all time",
 };
 
-/** Null-safe value formatters; a metric without input renders "–" (docs/specs/overview.md). */
+/** Null-safe value formatters; a metric without input renders "–". */
 const pctFmt = (v: number | null) =>
 	v === null ? "–" : `${Math.round(v * 100)}%`;
 const usdFmt = (v: number | null) => (v === null ? "–" : `$${v.toFixed(2)}`);
 const durFmt = (v: number | null) => (v === null ? "–" : duration(v));
 
-/** The five fleet tiles (docs/specs/overview.md): grey everywhere, an amber edge only on a
+/** The five fleet tiles: grey everywhere, an amber edge only on a
  * failure rate past the 0.10 alarm line. */
 function KpiStrip({ fleet: f }: { fleet: PerfMetrics }) {
 	const ptsFmt = (v: number) => `${Math.round(v * 100)} pts`;

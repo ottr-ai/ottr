@@ -91,7 +91,7 @@ async function serviceManifest(
  * Whether a service's build differs from the image its container runs, or the docker
  * output of the step that failed. Under the containerd image store each build gets a new
  * index id, because its provenance attestation records the build, so the platform
- * manifests compare, not the image ids, or every rebuild would count as new (2026-10-13).
+ * manifests compare, not the image ids, or every rebuild would count as new.
  */
 async function imageChanged(
 	d: Deps,

@@ -1530,7 +1530,7 @@ export class ProjectStore {
 	}
 
 	/**
-	 * The Overview performance facts of this project (docs/specs/overview.md): flat task
+	 * The Overview performance facts of this project: flat task
 	 * and turn rows for the pure perfMetrics. A few aggregates, no N+1: a task's done
 	 * time is its latest stage→done event, the first-pass penalty any needs_you state
 	 * event, and a turn fails on a real error or a non-zero exit (SQL semantics: a NULL

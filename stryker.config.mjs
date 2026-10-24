@@ -62,7 +62,7 @@ export default {
     "!src/release.ts",
     // mutated by stryker.turn.config.mjs, the only run that pays for its store-backed suite
     "!src/turn.ts",
-    // ponytail: no unit seam, Bun.serve starts on import; covered by the live proofs in PLAN.md.
+    // ponytail: no unit seam, Bun.serve starts on import; covered by scripts/boot-smoke.ts (bun run check).
     // Upgrade: start the server only under `import.meta.main`, then test the handlers.
     "!src/server.ts",
     // Prose for the model; killing its mutants would take tests that pin wording.

@@ -1,5 +1,4 @@
-/* Ottr: ISA-101 high-performance HMI, dark by default; [data-theme="light"] flips the neutrals.
-   Direction contract: .impeccable/surfaces/src-ui-app-tsx.md */
+/* Ottr: ISA-101 high-performance HMI, dark by default; [data-theme="light"] flips the neutrals. */
 
 :root {
 	color-scheme: dark;
@@ -4792,7 +4791,7 @@ button.diff-path {
 /* --- Web Push (end) --- */
 /* ---- Touch targets ---- */
 
-/* Coarse pointers (phones on the tailnet) get the 44px hit-area floor; desktop keeps its
+/* Coarse pointers (phones) get the 44px hit-area floor; desktop keeps its
    dense 28px chrome. Selectors restate the compact overrides above so specificity holds. */
 @media (pointer: coarse) {
 	button,

@@ -19,7 +19,7 @@ export function markKind(t: Pick<Task, "state" | "asked">): TaskMark {
 	return "done";
 }
 
-/** Split a live Stryker or clipshelf mutate.py progress line into its parts; format produced by src/stryker.ts.
+/** Split a live Stryker or Python mutate.py progress line into its parts; format produced by src/stryker.ts.
  * Returns null for text with no numbers (including "mutate.py running"). `rest` is the tail after `n/total`. */
 export function strykerProgress(text: string | null | undefined): {
 	tool: string;

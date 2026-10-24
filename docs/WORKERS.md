@@ -1,7 +1,7 @@
 # Workers
 
 Work turns run inside disposable containers built from `Dockerfile.worker`
-(decision D1): omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, Chrome for Testing, Godot and
+omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, Chrome for Testing, Godot and
 the language servers for omp's `lsp` tool (TypeScript 7's `tsc`, typescript-language-server, pyright)
 are pinned at build time, so a turn's toolchain is a property of the image, not the host.
 Chrome sits at `/opt/google/chrome/chrome`, where the agent layer's chrome-devtools MCP
@@ -49,7 +49,7 @@ zero-auth access.
 
 omp is the main tool and gets a new release almost every day, so the image follows the
 newest omp that is 7 or more days old: workers run about one week behind npm, so a
-broken or yanked release has a week to surface before we ship it. The server and the
+broken or yanked release has a week to surface before it ships. The server and the
 workers run this one image, so the board, merge
 turns and work turns all get the new omp. Two parts do the work:
 
@@ -171,8 +171,8 @@ with apt's error. The packages stay until the container is recreated.
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default and
   fallback; `runner.startRun` stays the reference implementation).
 - Provider keys pass through from the host shell, and so do the keys a project's
-  MCP servers read (`PIXELLAB_API_KEY` for mystic-realms, whose committed
-  `.omp/mcp.json` adds its servers only to its own turns). OAuth credentials come from
+  MCP servers read from its committed `.omp/mcp.json` (the file adds its servers
+  only to that project's turns). OAuth credentials come from
   the host omp oauth dir, mounted read-only into every container via
   `OTTR_OAUTH_DIR` (required; for example `C:/Users/<you>/.omp/oauth`). omp's provider credentials live in `agent.db`
   (`auth_credentials`). The server and the workers share one such file, bind-mounted
@@ -200,8 +200,8 @@ to the host.
 
 ## Fleet memory (Hindsight)
 
-Compose turns run omp with `memory.backend: hindsight` against the shared Hindsight server
-(it replaced the embedded `hindsight` service on 2026-10-08). The server's address travels
+Compose turns run omp with `memory.backend: hindsight` against the shared Hindsight server.
+The server's address travels
 as `HINDSIGHT_API_URL`: docker-compose.yml interpolates it from the environment
 (`${HINDSIGHT_API_URL:-}`), so set it in the compose env file (the `--env-file` that
 `scripts/update-image.ts` passes) or in the shell that runs compose, for example
@@ -225,29 +225,20 @@ the server at the effective address accepts it (`GET
 env the board forwards. `HINDSIGHT_API_TOKEN` in the env file only seeds the key until
 Settings holds one. Fact extraction runs on the server and needs LLM balance there.
 
-## Memory proof
+## Check memory
 
-Agent memory needs no image work: the backend ships inside the omp binary, the captured
-`config.yml` selects it (`memory.backend: mnemopi`, `scoping: global`), and the store lives
-on the mounted home volume — the user-layer capture excludes memories by design (decision
-doc, D7). The scripted, repeatable proof drives one worker turn over the real HTTP handoff
-(`POST /run`, worker token, tracker argv); the turn retains a fresh pass word and recalls
-the previous run's word from the memory backend:
+The memory backend ships inside omp, and its store lives on the home volume (mnemopi) or on
+the Hindsight server. To check that turns remember across runs, run this script twice:
 
 ```sh
 docker compose exec -T server bun - < scripts/compose-memory-proof.ts
 ```
 
-First run on a fresh volume only seeds (nothing to recall yet); every later run must recall
-the previous run's word or the script exits non-zero. The assertions read artifacts, not
-model prose: the retain must appear either in the local store's `working_memory`
-(mnemopi mode, queried read-only in the server container, which shares the workers' home
-volume) or in this turn's session files (hindsight mode), and the recalled word must appear
-in this turn's session files — the prompt carries a per-run round key, never the previous
-word, so only the memory backend can supply it. `PROOF_WORKER_URL`, `PROOF_CWD` and
+The first run on a fresh volume only stores a word. Every later run must recall the word of
+the run before, or the script exits non-zero. `PROOF_WORKER_URL`, `PROOF_CWD` and
 `OTTR_WORKER_TOKEN` override the defaults.
 
-## What stays server-side (D6)
+## What stays server-side
 
 Worktree create/remove, the merge turn, the release fast-forward and
 `git push origin main` all run in the server container. Workers execute turn
@@ -257,8 +248,8 @@ board's `GH_TOKEN` from the env it forwards to a worker.
 ### Non-GitHub hosts
 
 A project on a git host other than GitHub clones, fetches and pushes with the
-same rule: credentials stay on the server. Two credential kinds exist
-([docs/specs/git-hosts.md](specs/git-hosts.md)):
+same rule: credentials stay on the server. Two credential kinds exist (both
+configured under **Settings → Git hosts**):
 
 - HTTPS tokens: stored per host in the global config row. Server-side git
   reaches them through env-scoped credential helpers — `GIT_CONFIG_COUNT`,
@@ -271,13 +262,13 @@ same rule: credentials stay on the server. Two credential kinds exist
   `GIT_SSH_COMMAND` (key path, `UserKnownHostsFile`, `StrictHostKeyChecking=yes`,
   `BatchMode=yes`) for server-side git only. Every agent run, merge turns
   included, starts without `GIT_SSH_COMMAND` and every `GIT_CONFIG_*`/`OTTR_GIT_*`
-  name (D6).
+  name.
 
 Server-side git is the only holder of these credentials. Each network call also
 resets the repo-config credential helpers (then re-adds the global and system
 ones), disables `ext::` transport, signed pushes and askpass, and always sets
 `GIT_SSH_COMMAND`, so config that a turn plants in a main checkout's
-`.git/config` cannot run with the tokens. Residual (R5-1): a planted
+`.git/config` cannot run with the tokens. Residual limits: a planted
 `remote.<name>.uploadpack` or `receivepack` on a local-path remote still runs,
 because git keeps the first value it reads. A planted `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
@@ -291,7 +282,7 @@ worker's turn can only file cards. The board marks the check card in the project
 the button files it, so a card that an agent files with the same prompt still runs on a
 worker.
 
-### The config boundary (R5-1)
+### The config boundary
 
 Work turns share the `workspace` and `home` volumes with the board, so a turn can write
 `/root/.gitconfig`, `/root/.config/gh`, or a main checkout's `.git/config` — and the board
@@ -350,7 +341,7 @@ the reader in `src/runner.ts` must follow the writer; the board reads only file 
 there, never the request bodies, so a plant forges a name in one failure message at
 worst.
 
-## Crash story (D3)
+## Crash recovery
 
 A worker's lifetime is one turn and it owns no state: sessions, DB and logs
 live on the shared volume. If a worker dies, the server detects the lost

@@ -1,5 +1,4 @@
-// Provider side of the upstream update checks contract (docs/decisions/2026-10-13-upstream-update-checks.md
-// U3): validation of GET /api/updates responses, repo-to-project mapping, skip storage and the
+// Provider side of the upstream update checks contract: validation of GET /api/updates responses, repo-to-project mapping, skip storage and the
 // push throttle. Every provider field is untrusted input: one bad record is dropped and counted,
 // a bad envelope keeps the last good result.
 
@@ -133,7 +132,7 @@ export interface ValidatedUpdates {
 	updates: UpdateRecord[];
 	/** Records dropped by validation; the server logs the count. */
 	dropped: number;
-	/** Per-id provider decisions (docs/decisions/2026-10-16-update-decisions-in-the-data-repo.md); empty when the envelope has none. */
+	/** Per-id provider decisions; empty when the envelope has none. */
 	decisions: Record<string, ValidatedDecision>;
 	/** Decision entries dropped by validation; the server logs the count. */
 	droppedDecisions: number;
@@ -376,7 +375,7 @@ export function updatePrompt(items: UpdateRecord[], propose: boolean): string {
 		/^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/.exec(
 			origin,
 		)?.[1] ?? null;
-	// A release-tracked skill row carries a tag, never a 40-hex commit (docs/decisions U4).
+	// A release-tracked skill row carries a tag, never a 40-hex commit.
 	const tagged = skills.filter((r) => {
 		const v = r.target ?? r.latest;
 		return !/^[0-9a-f]{40}$/.test(v) && safeArg(v) && ghRepo(r.origin) !== null;

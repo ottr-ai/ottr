@@ -269,7 +269,7 @@ interface AppDeps {
 	board?: { url: string; token: string };
 	/** Orphan process snapshot source; injectable for tests. Defaults to platform.listProcesses. */
 	listProcesses?: () => ProcessInfo[];
-	/** Server-only ssh key + known_hosts dir (docs/specs/git-hosts.md); no worker mounts it. */
+	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** ssh-keyscan seam for the host-key check; defaults to realKeyscan. Tests inject a stub. */
 	keyscan?: Keyscan;
@@ -316,7 +316,7 @@ const defineRoutes = <R extends string>(
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
 	const prod = deps.prod === true;
-	// Server-only ssh material (docs/specs/git-hosts.md): a data dir outside every checkout.
+	// Server-only ssh material: a data dir outside every checkout.
 	const sshDir = deps.sshDir ?? defaultSshDir();
 	const keyscan = deps.keyscan ?? realKeyscan;
 	const ambientHelpers = readAmbientHelpers();
@@ -448,7 +448,7 @@ export function createApp(deps: AppDeps) {
 	/** GitHub token from onboarding or Settings; stored plaintext like apiKey (same trust level). */
 	let githubToken: string | null = null;
 	/**
-	 * Per-host HTTPS tokens for every git host (docs/specs/git-hosts.md); stored plaintext like
+	 * Per-host HTTPS tokens for every git host; stored plaintext like
 	 * githubToken (same trust level). One entry per host; the token is handed to git through a
 	 * credential helper env, never through a URL or .git/config.
 	 */
@@ -612,7 +612,7 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 
-	// Fork research watcher (docs/decisions/2026-10-14-fork-research.md): Entry already exposes
+	// Fork research watcher: Entry already exposes
 	// {name, path, store, github}; the factory re-iterates the live Map on every tick.
 	const forkWatcher = createForkWatcher({
 		projects: () => deps.projects.values(),
@@ -1791,7 +1791,7 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 
-	/** Shared save flow for a key (global or per project): pending selector, ssh testUrl, host-key confirm, ls-remote, promote (spec section 5: a key is stored only when the test exits 0). */
+	/** Shared save flow for a key (global or per project): pending selector, ssh testUrl, host-key confirm, ls-remote, promote (a key is stored only when the test exits 0). */
 	async function saveKeyFlow(
 		body: Record<string, unknown>,
 		to: string,
@@ -1836,7 +1836,7 @@ export function createApp(deps: AppDeps) {
 		return json(await keyInfo(to));
 	}
 
-	/** Host-agnostic clone (docs/specs/git-hosts.md); `{ p }` on success, `{ error, needsToken? }` for a 400, `{ trust }` for a 409. */
+	/** Host-agnostic clone; `{ p }` on success, `{ error, needsToken? }` for a 400, `{ trust }` for a 409. */
 	async function cloneGit(
 		url: string,
 		body: Record<string, unknown>,
@@ -1987,7 +1987,7 @@ export function createApp(deps: AppDeps) {
 		if (typeof body.url === "string") {
 			if (!existsSync(ws) || !statSync(ws).isDirectory())
 				return json({ error: "projects directory does not exist" }, 400);
-			// Trust boundary (spec section 1): parse before anything touches the disk, and git
+			// Trust boundary: parse before anything touches the disk, and git
 			// only ever sees the URL after "--".
 			const remote = parseGitUrl(body.url);
 			if ("error" in remote) return json({ error: GIT_URL_ERROR }, 400);
@@ -2529,8 +2529,8 @@ export function createApp(deps: AppDeps) {
 					return json({ tokenSet: true });
 				}),
 		},
-		// Git hosts other than GitHub (docs/specs/git-hosts.md). No answer ever holds a token
-		// or a private key; every saved credential passed a live test first (spec section 5).
+		// Git hosts other than GitHub. No answer ever holds a token
+		// or a private key; every saved credential passed a live test first.
 		"/api/git-hosts": {
 			GET: (req) => api(req, async () => json(await gitHostsView())),
 		},
@@ -2542,7 +2542,7 @@ export function createApp(deps: AppDeps) {
 					const cand = parseGitToken(r.body);
 					if ("error" in cand) return json({ error: cand.error }, 400);
 					// A token may only take effect for its own host: the test must be an https
-					// URL there, or the save stops here (spec section 5).
+					// URL there, or the save stops here.
 					const remote = parseGitUrl(r.body.testUrl);
 					if (
 						"error" in remote ||
@@ -2586,7 +2586,7 @@ export function createApp(deps: AppDeps) {
 				api(req, async () => {
 					const r = await readJson(req);
 					if ("error" in r) return r.error;
-					// Both ways land as a pending key first (spec section 3): generate or paste.
+					// Both ways land as a pending key first: generate or paste.
 					const gen =
 						typeof r.body.privateKey === "string"
 							? await importPendingKey(sshDir, r.body.privateKey)
@@ -2673,7 +2673,7 @@ export function createApp(deps: AppDeps) {
 				api(req, async () => {
 					const e = deps.projects.get(req.params.project);
 					if (e === undefined) return json({ error: "project not found" }, 404);
-					// Removal falls the project back to the global key (spec section 3).
+					// Removal falls the project back to the global key.
 					const f = projectKeyPath(e.name);
 					if (f !== "") removeKey(f);
 					return json({ own: null });
@@ -2921,8 +2921,8 @@ export function createApp(deps: AppDeps) {
 					const kind = (range ?? "all") as PerfRange;
 					const now = Date.now();
 					const stores = [...deps.projects.values()];
-					// Fleet first: its facts union fixes the series start every project
-					// series aligns with (docs/specs/overview.md).
+					// Fleet first: its facts union fixes the series start so every
+					// project's series aligns.
 					const facts = stores.map((e) => e.store.perfFacts());
 					const fleet = perfMetrics(
 						{
