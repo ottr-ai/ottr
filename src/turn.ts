@@ -265,12 +265,15 @@ export interface TurnOps {
 	startRun: typeof startRun;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
-	/** Tools install lines, the turn's PATH link dir, and the env values/missing names for local turns (src/tools.ts). */
+	/** The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every turn, worker dispatched or not. */
+	turnEnv?: (project: string) => {
+		env: Record<string, string>;
+		missing: string[];
+	};
+	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
 	prepareTurn?: (project: string) => Promise<{
 		lines: string[];
 		pathDir: string | null;
-		env: Record<string, string>;
-		missing: string[];
 	}>;
 	/** Override for tests: where findHttp400Rejection reads omp's HTTP-400 request log. */
 	http400Dir?: string;
@@ -1223,9 +1226,13 @@ export function createTurnLoop(
 			const prep =
 				!worker && ops.prepareTurn ? await ops.prepareTurn(name) : null;
 			for (const l of prep?.lines ?? []) log(l);
-			if (prep && prep.missing.length > 0)
+			// The env values ride the run env into a worker too (the runner forwards them with
+			// the rest of the child env), so every turn gets them and every card log names a
+			// listed name that has no value.
+			const turnEnv = ops.turnEnv?.(name) ?? { env: {}, missing: [] };
+			if (turnEnv.missing.length > 0)
 				log(
-					`env: no value for ${prep.missing.join(", ")} (set it under Settings, Env)`,
+					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
 				);
 
 			// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
@@ -1257,7 +1264,7 @@ export function createTurnLoop(
 				// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,
 				// and the findings are recorded, not filed — Ottr files them after the run.
 				env: {
-					...(prep?.env ?? {}),
+					...turnEnv.env,
 					...(retroCard
 						? { OTTR_RETRO: "1" }
 						: reviewCard

@@ -5093,15 +5093,10 @@ describe("package list", () => {
 });
 
 describe("prepareTurn", () => {
-	test("a local turn logs one env line naming listed-but-valueless names", async () => {
+	test("a turn logs one env line naming listed-but-valueless names", async () => {
 		const { store, loop } = setup({
 			maxTotalRuns: () => 0,
-			prepareTurn: async () => ({
-				lines: [],
-				pathDir: null,
-				env: {},
-				missing: ["FOO", "BAR"],
-			}),
+			turnEnv: () => ({ env: {}, missing: ["FOO", "BAR"] }),
 		});
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -5113,18 +5108,34 @@ describe("prepareTurn", () => {
 	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
-			prepareTurn: async () => ({
-				lines: [],
-				pathDir: "/tmp/x",
-				env: { FOO: "v" },
-				missing: [],
-			}),
+			turnEnv: () => ({ env: { FOO: "v" }, missing: [] }),
+			prepareTurn: async () => ({ lines: [], pathDir: "/tmp/x" }),
 		});
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const env = record.runs[0]!.env;
 		expect(env?.FOO).toBe("v");
 		expect(env?.PATH?.startsWith("/tmp/x:")).toBe(true);
+	});
+
+	test("a worker-dispatched turn still gets the env values and the missing line, but no tools prep", async () => {
+		let prepared = false;
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: () => ({ env: { FOO: "v" }, missing: ["BAR"] }),
+			prepareTurn: async () => {
+				prepared = true;
+				return { lines: [], pathDir: null };
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(prepared).toBe(false);
+		expect(logText(store, task.id)).toContain(
+			"env: no value for BAR (set it under Settings, Env)",
+		);
+		expect(record.runs[0]!.env?.FOO).toBe("v");
 	});
 
 	test("a worker-dispatched turn never calls prepareTurn", async () => {
@@ -5134,7 +5145,7 @@ describe("prepareTurn", () => {
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			prepareTurn: async () => {
 				called = true;
-				return { lines: [], pathDir: null, env: {}, missing: [] };
+				return { lines: [], pathDir: null };
 			},
 		});
 		const task = store.createTask("work please");

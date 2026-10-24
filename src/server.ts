@@ -390,14 +390,11 @@ const loop = createTurnLoop(projects, {
 	workerTarget: workerFromEnv(),
 	startRun,
 	ensurePackages: ensureProjectPackages,
-	prepareTurn: async (project) => {
-		const lines = await ensureProjectTools(project);
-		return {
-			lines,
-			pathDir: await buildToolsPath(project),
-			...turnEnvValues(project, shared.envValues),
-		};
-	},
+	turnEnv: (project) => turnEnvValues(project, shared.envValues),
+	prepareTurn: async (project) => ({
+		lines: await ensureProjectTools(project),
+		pathDir: await buildToolsPath(project),
+	}),
 	publishRelease,
 	runReleaseCommand,
 	archReviewDelta,
