@@ -623,6 +623,9 @@ export function adoptSharedProjectData(
 	mkdirSync(serverDataDir, { recursive: true });
 	writeFileSync(marker, `${new Date().toISOString()}\n`);
 	return results;
+}
+
+/**
  * The trusted root above a project's task data dir: `$OTTR_DATA_DIR` (a mount point no
  * worker can replace), or the project checkout. Server writes below it go through
  * src/confine.ts, so a symlink a worker plants under it is never followed (OTTR-172).
