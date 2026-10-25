@@ -181,15 +181,15 @@ export async function listBranchHeads(
 	return { heads, skipped };
 }
 
-/** Bare mirror cache for one fork, keyed by its stable GitHub id. */
+/** Bare mirror cache for one fork, keyed by its stable GitHub id, below the server-only state dir. */
 export async function ensureCache(
-	tasksDir: string,
+	stateDir: string,
 	fork: ForkInfo,
 	git: GitFn,
 ): Promise<string> {
-	const cachePath = join(tasksDir, "forks", `${fork.id}.git`);
+	const cachePath = join(stateDir, "forks", `${fork.id}.git`);
 	if (existsSync(cachePath)) return cachePath;
-	const res = await git(["init", "--bare", "-q", cachePath], tasksDir, 60_000);
+	const res = await git(["init", "--bare", "-q", cachePath], stateDir, 60_000);
 	if (res.code !== 0)
 		throw new Error(
 			`git init --bare failed (${res.code}): ${res.stderr.slice(0, 300)}`,
@@ -566,11 +566,11 @@ export function createForkWatcher(deps: {
 			}
 			const forkIds = forks.map((f) => f.id);
 			for (const fork of forks) {
-				// Neutral cwd (state dir): ls-remote carries GH_TOKEN via gitEnv, so it must not
-				// read the worker-writable checkout's repo config (planted credential.helper).
+				// Neutral cwd (server-only state dir, OTTR_SERVER_DATA_DIR): ls-remote carries GH_TOKEN
+				// via gitEnv, so it must not read a worker-writable repo config (planted credential.helper).
 				const { heads, skipped } = await listBranchHeads(
 					forkUrl(fork),
-					store.tasksDir,
+					store.serverDir,
 					runGit,
 				);
 				if (skipped > 0)
@@ -653,9 +653,10 @@ export function createForkWatcher(deps: {
 				}
 				store.recordForkRun(fork.id, now());
 				try {
-					// Server-only state dir (docker: ottr-state:/app/.tasks), never the worker-shared
-					// checkout: fork objects and the fetch config must stay out of workers' reach.
-					const cachePath = await ensureCache(store.tasksDir, fork, runGit);
+					// Server-only state dir (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the
+					// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
+					// out of workers' reach.
+					const cachePath = await ensureCache(store.serverDir, fork, runGit);
 					const refspecs = pending.map(
 						(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
 					);

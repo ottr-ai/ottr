@@ -25,7 +25,12 @@ import {
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, workerFromEnv } from "./runner.ts";
 import { lastReviewBase, reviewBlocked } from "./scheduler.ts";
-import { discoverProjects, ProjectStore } from "./store.ts";
+import {
+	type AdoptResult,
+	adoptSharedProjectData,
+	discoverProjects,
+	ProjectStore,
+} from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
 import {
 	appendLog,
@@ -218,6 +223,35 @@ const SELF_ROOT = resolve(import.meta.dir, "..");
 
 /** Shipped on every /api/state; stale tabs compare it against the first version they saw and reload once. */
 const serverVersion = await headVersion(SELF_ROOT);
+
+if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
+	let adopted: AdoptResult[] = [];
+	try {
+		adopted = adoptSharedProjectData(
+			process.env.OTTR_DATA_DIR,
+			process.env.OTTR_SERVER_DATA_DIR,
+		);
+	} catch (err) {
+		// Same as the open loop below: a live board holding an old DB must stop this boot.
+		if (err instanceof StoreLockedError) {
+			logError("refusing to start", err);
+			process.exit(1);
+		}
+		throw err;
+	}
+	for (const r of adopted) {
+		if (r.status === "adopted")
+			console.log(`moved project database ${r.name} to the server data dir`);
+		else
+			console.error(
+				`could not move project database ${r.name} to the server data dir (${r.error}); move it by hand, see docs/WORKERS.md`,
+			);
+	}
+} else if (process.env.OTTR_DATA_DIR) {
+	console.warn(
+		"OTTR_SERVER_DATA_DIR is not set: project databases stay on the worker-shared data dir (OTTR_DATA_DIR)",
+	);
+}
 
 for (const p of discoverProjects(
 	ROOTS,

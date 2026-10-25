@@ -471,6 +471,70 @@ describe("watcher", () => {
 		).toBe(1);
 	});
 
+	test("fork cache and ls-remote cwd live in the server-only dir, not OTTR_DATA_DIR", async () => {
+		const saved = {
+			OTTR_DATA_DIR: process.env.OTTR_DATA_DIR,
+			OTTR_SERVER_DATA_DIR: process.env.OTTR_SERVER_DATA_DIR,
+		};
+		const shared = mkdtempSync(join(tmpdir(), "ottr-forks-shared-"));
+		const server = mkdtempSync(join(tmpdir(), "ottr-forks-server-"));
+		process.env.OTTR_DATA_DIR = shared;
+		process.env.OTTR_SERVER_DATA_DIR = server;
+		try {
+			const name = "watch-serverdir";
+			const main = await initUpstream(name);
+			const store = ProjectStore.init(main);
+			store.setSettings({ forkResearch: true });
+			await makeFork(`${name}-fork`, main);
+			const calls: { args: string[]; cwd: string }[] = [];
+			const inner = localFileGit(join(root, `${name}-fork`));
+			const watcher = createForkWatcher({
+				projects: () => [
+					{ name, path: main, store, github: "o/main" } satisfies ForkProject,
+				],
+				log: () => {},
+				gh: async () => ({
+					code: 0,
+					stdout: JSON.stringify([forkPageEntry(1)]),
+					stderr: "",
+				}),
+				git: (args, cwd, timeoutMs) => {
+					calls.push({ args: [...args], cwd });
+					return inner(args, cwd, timeoutMs);
+				},
+				analyze: async () =>
+					({
+						features: [],
+						proposals: [],
+						coverage: "",
+						commits: [],
+						deferred: [],
+					}) as never,
+				now: () => Date.now(),
+			});
+			await watcher.tick();
+			const below = (p: string, dir: string) => p.startsWith(`${dir}/`);
+			expect(below(store.serverDir, server)).toBe(true);
+			const lsRemote = calls.find((c) => c.args.includes("ls-remote"));
+			expect(lsRemote).toBeDefined();
+			expect(lsRemote!.cwd).toBe(store.serverDir);
+			expect(below(lsRemote!.cwd, shared)).toBe(false);
+			const init = calls.find(
+				(c) => c.args.includes("init") && c.args.includes("--bare"),
+			);
+			expect(init).toBeDefined();
+			const cachePath = init!.args[init!.args.length - 1]!;
+			expect(below(cachePath, store.serverDir)).toBe(true);
+			expect(below(cachePath, shared)).toBe(false);
+			expect(existsSync(cachePath)).toBe(true);
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+		}
+	});
+
 	test("analyze failure bumps retries and files no card", async () => {
 		const { main, store, watcher, calls } = await setup(
 			"watch-fail",

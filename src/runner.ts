@@ -49,8 +49,9 @@ interface BoardEnv {
  * coordinates and token the create_task extension tool reads. An operator-provided
  * OTTR_BOARD_URL (compose worker -> server address) wins over the tracker's own loopback URL;
  * an inherited token never does, since only this board's token opens it. Undefined
- * values are dropped so spawn never sees them. OTTR_DATA_DIR stays behind: a turn that runs
- * ottr's own test suite must not open the live board's task stores. The worker dispatch
+ * values are dropped so spawn never sees them. OTTR_DATA_DIR and OTTR_SERVER_DATA_DIR stay behind:
+ * a turn that runs ottr's own test suite must not open the live board's task stores, and a turn
+ * must not learn the server-only state path. The worker dispatch
  * credentials (OTTR_WORKER_URLS, OTTR_WORKER_TOKEN) are stripped too: a turn that held them
  * could drive any worker (WORKERS.md), so no local child ever inherits them.
  */
@@ -63,6 +64,7 @@ export function childEnv(o: {
 }): Record<string, string> {
 	const env = { ...(o.base ?? process.env) } as Record<string, string>;
 	delete env.OTTR_DATA_DIR;
+	delete env.OTTR_SERVER_DATA_DIR;
 	delete env.OTTR_WORKER_URLS;
 	delete env.OTTR_WORKER_TOKEN;
 	if (o.sessionName) env.OTTR_SESSION_NAME = o.sessionName;

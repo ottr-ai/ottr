@@ -1,8 +1,16 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import type { Dirent } from "node:fs";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { closeLocked, openLocked } from "./dblock.ts";
+import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import {
@@ -509,10 +517,11 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 };
 
 /**
- * A project's task data dir (tasks.db, logs, sessions, images, handoffs, quarantine):
+ * A project's task data dir (logs, sessions, images, handoffs, quarantine, release notes):
  * `<project>/.tasks`, or `$OTTR_DATA_DIR/<folder name>` when the board keeps its state
  * outside the checkouts (compose: one volume the server and the workers mount at the
- * same path). ponytail: keyed by folder name, which the board already uses as the
+ * same path). tasks.db lives here only when OTTR_SERVER_DATA_DIR is unset (serverDirFor).
+ * ponytail: keyed by folder name, which the board already uses as the
  * project id; renaming a project folder under OTTR_DATA_DIR needs its data dir renamed too.
  */
 export function tasksDirFor(projectPath: string): string {
@@ -520,6 +529,99 @@ export function tasksDirFor(projectPath: string): string {
 	return dataDir
 		? join(resolve(dataDir), basename(projectPath))
 		: join(projectPath, ".tasks");
+}
+
+/**
+ * The dir of the state the server trusts (tasks.db: settings incl. the releaseCommand it
+ * runs, worktree paths; the fork mirror cache). Workers mount OTTR_DATA_DIR read-write, so
+ * this state must not live there: `$OTTR_SERVER_DATA_DIR/<folder name>` on a volume only the
+ * server mounts. Unset (native start, tests): the tasks dir, as before.
+ */
+export function serverDirFor(projectPath: string): string {
+	const serverDataDir = process.env.OTTR_SERVER_DATA_DIR;
+	return serverDataDir
+		? join(resolve(serverDataDir), basename(projectPath))
+		: tasksDirFor(projectPath);
+}
+
+export type AdoptResult = {
+	name: string;
+	status: "adopted" | "failed";
+	error?: string;
+};
+
+/**
+ * One-time move of the task DBs that older boards kept on the worker-shared data dir into
+ * the server-only dir. The marker makes it one-time: a tasks.db a worker plants later is
+ * never adopted. A StoreLockedError (a live board holds the DB) goes up to stop the boot.
+ */
+export function adoptSharedProjectData(
+	dataDir: string,
+	serverDataDir: string,
+): AdoptResult[] {
+	const marker = join(serverDataDir, ".adopted");
+	if (existsSync(marker)) return [];
+	const results: AdoptResult[] = [];
+	const names = existsSync(dataDir) ? readdirSync(dataDir) : [];
+	for (const name of names) {
+		const oldDir = join(dataDir, name);
+		const oldDb = join(oldDir, "tasks.db");
+		try {
+			if (!lstatSync(oldDir).isDirectory()) continue;
+			if (!lstatSync(oldDb).isFile()) continue;
+		} catch {
+			continue; // no tasks.db in this dir
+		}
+		const newDir = join(serverDataDir, name);
+		const newDb = join(newDir, "tasks.db");
+		if (existsSync(newDb)) continue;
+		let db: Database;
+		try {
+			db = openLocked(oldDb);
+		} catch (err) {
+			if (err instanceof StoreLockedError) throw err;
+			results.push({
+				name,
+				status: "failed",
+				error: err instanceof Error ? err.message : String(err),
+			});
+			continue;
+		}
+		let open = true;
+		try {
+			mkdirSync(newDir, { recursive: true });
+			const tmp = join(newDir, "tasks.db.adopting");
+			rmSync(tmp, { force: true });
+			db.query("VACUUM INTO ?").run(tmp);
+			const copy = new Database(tmp);
+			try {
+				for (const table of ["tasks", "turns"]) {
+					const sql = `SELECT COUNT(*) AS n FROM ${table}`;
+					const a = db.query<{ n: number }, []>(sql).get()?.n;
+					const b = copy.query<{ n: number }, []>(sql).get()?.n;
+					if (a !== b)
+						throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);
+				}
+			} finally {
+				copy.close();
+			}
+			renameSync(tmp, newDb);
+			open = false;
+			closeLocked(db);
+			renameSync(oldDb, join(oldDir, "tasks.db.moved-to-server"));
+			results.push({ name, status: "adopted" });
+		} catch (err) {
+			if (open) closeLocked(db);
+			results.push({
+				name,
+				status: "failed",
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	mkdirSync(serverDataDir, { recursive: true });
+	writeFileSync(marker, `${new Date().toISOString()}\n`);
+	return results;
 }
 
 export function discoverProjects(
@@ -536,7 +638,7 @@ export function discoverProjects(
 	const add = (dir: string): void => {
 		const abs = resolve(dir);
 		if (removed.some((r) => platform.samePath(r, abs))) return;
-		if (!existsSync(join(tasksDirFor(abs), "tasks.db"))) return;
+		if (!existsSync(join(serverDirFor(abs), "tasks.db"))) return;
 		const name = basename(abs);
 		if (!byName.has(name)) byName.set(name, abs);
 	};
@@ -687,6 +789,8 @@ export class ProjectStore {
 	readonly path: string;
 	readonly name: string;
 	readonly tasksDir: string;
+	/** Server-only dir (serverDirFor): tasks.db and the fork cache. */
+	readonly serverDir: string;
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
 	private readonly db: Database;
@@ -697,6 +801,7 @@ export class ProjectStore {
 		this.path = projectPath;
 		this.name = basename(projectPath);
 		this.tasksDir = tasksDirFor(projectPath);
+		this.serverDir = serverDirFor(projectPath);
 		this.sessionsDir = join(this.tasksDir, "sessions");
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
@@ -719,7 +824,9 @@ export class ProjectStore {
 		const root = resolve(projectPath);
 		const tasksDir = tasksDirFor(root);
 		mkdirSync(tasksDir, { recursive: true });
-		const dbPath = join(tasksDir, "tasks.db");
+		const serverDir = serverDirFor(root);
+		mkdirSync(serverDir, { recursive: true });
+		const dbPath = join(serverDir, "tasks.db");
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
 		const db = openLocked(dbPath);

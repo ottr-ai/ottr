@@ -123,6 +123,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Public hostnames | none | env `OMP_TRACKER_PUBLIC_HOSTS`; requests under these hosts need a login or the API key |
 | Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
+| Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |
 | GitHub token | none | asked at onboarding; **Settings → GitHub** replaces it; stored in `.tasks/tracker.db` |
 | Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Git hosts**: per-host HTTPS tokens (optional username) and a global SSH key; a project can set its own key in its **Settings**. Projects on other hosts clone with any `https://…`, `git@host:…` or `ssh://host[:port]/…` URL and work with plain git; the GitHub extras stay GitHub-only. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. |
 | Running agents | 3 total, 2 per project | **Settings**; empty = no cap |

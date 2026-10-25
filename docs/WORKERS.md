@@ -154,11 +154,15 @@ with apt's error. The packages stay until the container is recreated.
   `OTTR_WORKER_TOKEN` (required, a random secret) authenticates workers. A
   worker strips it from every turn's env, since turns could otherwise drive
   any worker.
-- Server: `OTTR_DATA_DIR=/data` keeps every project's task data (DB,
-  sessions, logs, images, handoffs) on the `ottr-data` volume instead of in
+- Server: `OTTR_DATA_DIR=/data` keeps the task data that workers need
+  (sessions, logs, images, handoffs) on the `ottr-data` volume instead of in
   the clones. Server and workers mount it at `/data`, and the clones at
   `/workspace`, so the absolute paths in a run request resolve the same in
-  every container.
+  every container. The task DB is not there.
+- Server: `OTTR_SERVER_DATA_DIR=/app/.tasks/projects` keeps the server-only
+  project state (each `tasks.db` and the fork mirror caches) on the
+  `ottr-state` volume. No worker mounts this volume. Refer to "The data
+  boundary" below.
 - `OTTR_BOARD_URL` is the address task sessions' `create_task` tool POSTs to;
   the default is `http://127.0.0.1:<port>`, which in a worker container is the
   worker itself, so compose sets `http://ottr:<port>` (`ottr` is the server's
@@ -349,10 +353,52 @@ the reader in `src/runner.ts` must follow the writer; the board reads only file 
 there, never the request bodies, so a plant forges a name in one failure message at
 worst.
 
+### The data boundary
+
+The spec is `docs/specs/server-only-project-state.md`.
+
+Server-only, in `/app/.tasks/projects/<project>/` on the `ottr-state` volume:
+
+- `tasks.db`. It holds the project settings, for example `releaseCommand`, and the task rows, for example worktree paths.
+- The fork mirror caches (`forks/<id>.git`).
+- The cwd of the fork `ls-remote` call.
+
+Shared, in `/data/<project>/` on the `ottr-data` volume: sessions, logs, images,
+handoffs, quarantine, release notes and the project icon.
+
+Why: a worker can write each file on `/data`. With this split, such a worker cannot change
+the release command or other settings that the server runs. It cannot change the trusted
+paths of a task or the git config of a fork cache.
+
+Project discovery counts only a `tasks.db` in the server dir. A `tasks.db` that a worker
+writes below `/data` makes no project.
+
+Upgrade: at the first boot with both `OTTR_DATA_DIR` and `OTTR_SERVER_DATA_DIR`, the board
+copies each old `/data/<project>/tasks.db` to the server dir one time:
+
+- After the copy, the board writes the marker `/app/.tasks/projects/.adopted`. It does not copy again.
+- The board renames each old file to `tasks.db.moved-to-server`. You can delete it.
+- When a copy fails, the boot log names the project. The project stays off the board.
+- To move a failed project by hand, do these steps. The image has no `sqlite3`, so use bun:
+  1. Repair the cause that the boot log names, for example a corrupt file.
+  2. Run `docker compose exec server mkdir -p /app/.tasks/projects/<project>`.
+  3. Run `docker compose exec server bun -e 'new (require("bun:sqlite").Database)("/data/<project>/tasks.db").run("VACUUM INTO ?", ["/app/.tasks/projects/<project>/tasks.db"])'`.
+  4. Rename the old file to `tasks.db.moved-to-server`.
+  5. Restart the board (`docker compose restart server`).
+
+The copy keeps all values as they are. A worker could write a value before the upgrade.
+Thus, after the upgrade, examine the Release command setting of each project.
+
+The old caches in `/data/<project>/forks/` stay unused. You can delete them. The next fork
+run makes a new cache in the server dir.
+
+Residual risk: session files stay worker-written, and later turns resume them. This is by
+design. Without `OTTR_SERVER_DATA_DIR`, the board logs a warning and keeps the old layout.
+
 ## Crash recovery
 
-A worker's lifetime is one turn and it owns no state: sessions, DB and logs
-live on the shared volume. If a worker dies, the server detects the lost
+A worker's lifetime is one turn and it owns no state: sessions and logs
+live on the shared volume, and the DB lives on the server's `ottr-state` volume. If a worker dies, the server detects the lost
 connection (`workerLost`) and the card auto-resumes by starting a new turn —
 the same recovery path as a tracker restart. `restart: always` revives a
 crashed or OOM-killed worker container; note Docker suppresses that policy

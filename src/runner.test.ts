@@ -106,7 +106,12 @@ describe("childEnv", () => {
 	test("drops the board's data dir; a local turn keeps GH_TOKEN for its merge push", () => {
 		expect(
 			childEnv({
-				base: { PATH: "/bin", OTTR_DATA_DIR: "/data", GH_TOKEN: "ghp_x" },
+				base: {
+					PATH: "/bin",
+					OTTR_DATA_DIR: "/data",
+					OTTR_SERVER_DATA_DIR: "/app/.tasks/projects",
+					GH_TOKEN: "ghp_x",
+				},
 			}),
 		).toEqual({ PATH: "/bin", GH_TOKEN: "ghp_x" });
 	});
@@ -2204,10 +2209,12 @@ process.exit(0);`,
 		const saved = {
 			GH_TOKEN: process.env.GH_TOKEN,
 			OTTR_DATA_DIR: process.env.OTTR_DATA_DIR,
+			OTTR_SERVER_DATA_DIR: process.env.OTTR_SERVER_DATA_DIR,
 			OTTR_PROBE_KEPT: process.env.OTTR_PROBE_KEPT,
 		};
 		process.env.GH_TOKEN = "ghp_board_token";
 		process.env.OTTR_DATA_DIR = join(dir, "data");
+		process.env.OTTR_SERVER_DATA_DIR = join(dir, "state");
 		process.env.OTTR_PROBE_KEPT = "kept"; // stands in for provider keys, which must travel
 		try {
 			const fake = new FakeOmp();
@@ -2224,6 +2231,7 @@ process.exit(0);`,
 			expect(forwarded).not.toBeNull();
 			expect(forwarded).not.toHaveProperty("GH_TOKEN");
 			expect(forwarded).not.toHaveProperty("OTTR_DATA_DIR");
+			expect(forwarded).not.toHaveProperty("OTTR_SERVER_DATA_DIR");
 			expect(forwarded).toHaveProperty("OTTR_PROBE_KEPT", "kept");
 		} finally {
 			for (const [k, v] of Object.entries(saved)) {
