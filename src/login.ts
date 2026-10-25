@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { type Subprocess, stripANSI } from "bun";
 
 interface LoginView {
@@ -167,6 +167,7 @@ export function providerLogin({
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			env: boardOmpEnv(),
 			windowsHide: true,
 		});
 		const l: Login = {
@@ -248,12 +249,33 @@ export function providerLogin({
 }
 
 /**
- * The board's own omp agent dir: config.yml, agent.db, skills, extensions, plugins. omp resolves
- * it from PI_CODING_AGENT_DIR and falls back to ~/.omp/agent (R5-1: compose pins the board's
- * copy to the container filesystem, which no worker mounts).
+ * HOME for the board's own omp spawns. omp resolves its plugins dir ($HOME/.omp/plugins) and the
+ * user-level skills and context files (~/.agents, ~/.claude, …) from HOME, never from
+ * PI_CODING_AGENT_DIR. R5-1: compose sets OTTR_BOARD_OMP_HOME to a server-only directory, so a
+ * plugin or skill a turn plants in the worker-writable shared home never loads into the board's
+ * privileged turns. Unset (a direct install): the process's own home.
+ */
+export const boardOmpHome = (): string => {
+	const set = process.env.OTTR_BOARD_OMP_HOME?.trim();
+	return set ? resolve(set) : homedir();
+};
+
+/**
+ * Env for every omp the board spawns for itself (merge, release review and release turns,
+ * `omp models`, `omp usage`, `omp login`, the fork-analysis gateway): `base` with HOME moved to
+ * boardOmpHome(). Worker turns and their local fallback keep the shared home.
+ */
+export const boardOmpEnv = (
+	base: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> => ({ ...base, HOME: boardOmpHome() });
+
+/**
+ * The board's own omp agent dir: config.yml, agent.db, skills, extensions. omp resolves it from
+ * PI_CODING_AGENT_DIR and falls back to ~/.omp/agent under the HOME it runs with — boardOmpHome()
+ * (R5-1: compose pins the board's copy to a directory no worker mounts).
  */
 export const agentDir = (): string =>
-	process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
+	process.env.PI_CODING_AGENT_DIR ?? join(boardOmpHome(), ".omp", "agent");
 
 const agentDb = (): string => join(agentDir(), "agent.db");
 

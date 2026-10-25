@@ -7,6 +7,7 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { mkdirBelow, writeBelow } from "./confine.ts";
+import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
@@ -295,13 +296,21 @@ const BACKGROUND_WAIT =
 export const WORKER_LOST = "the worker running this turn died";
 
 /**
- * omp writes one JSON file per rejected HTTP 400 request here: <millis>-<id>.json.
- * R5-1: this path is omp's state root and stays under $HOME/.omp even when
- * PI_CODING_AGENT_DIR pins the agent dir — omp skips the XDG state-root probe under the
- * override — so the reader must follow the writer. Worker-writable, but only the file
- * name (never the body) is read; a plant can forge a file name at worst.
+ * omp writes one JSON file per rejected HTTP 400 request under its state root:
+ * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
+ * runs with even when PI_CODING_AGENT_DIR pins the agent dir — omp skips the XDG state-root probe
+ * under the override. Worker turns (and their local fallback) write to the shared home, the
+ * board's own turns to boardOmpHome(), so the reader scans both. The shared one is
+ * worker-writable, but only the file name (never the body) is read; a plant can forge a file
+ * name at worst.
  */
-const HTTP400_DIR = join(homedir(), ".omp", "logs", "http-400-requests");
+const http400Dirs = (): string[] => [
+	...new Set(
+		[homedir(), boardOmpHome()].map((h) =>
+			join(h, ".omp", "logs", "http-400-requests"),
+		),
+	),
+];
 
 /** Newest omp HTTP-400 log entry whose timestamp falls inside [from, to], as the file name,
  * or null. Best-effort: a missing or unreadable log is no evidence, the caller falls back to
@@ -310,12 +319,18 @@ const HTTP400_DIR = join(homedir(), ".omp", "logs", "http-400-requests");
 export function findHttp400Rejection(o: {
 	from: number;
 	to: number;
-	/** Override for tests; defaults to ~/.omp/logs/http-400-requests. */
+	/** Override for tests; defaults to http400Dirs(). */
 	dir?: string;
 }): string | null {
-	try {
-		let best: { ts: number; file: string } | null = null;
-		for (const name of readdirSync(o.dir ?? HTTP400_DIR)) {
+	let best: { ts: number; file: string } | null = null;
+	for (const dir of o.dir ? [o.dir] : http400Dirs()) {
+		let names: string[];
+		try {
+			names = readdirSync(dir);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
 			const ts = Number(/^(\d+)-[A-Za-z0-9_-]+\.json$/.exec(name)?.[1]);
 			if (
 				Number.isFinite(ts) &&
@@ -325,10 +340,8 @@ export function findHttp400Rejection(o: {
 			)
 				best = { ts, file: name };
 		}
-		return best?.file ?? null;
-	} catch {
-		return null;
 	}
+	return best?.file ?? null;
 }
 
 /**
@@ -1006,8 +1019,9 @@ export function startRun(o: {
 					sessionName: o.sessionName,
 					board: o.board ?? null,
 					// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
-					// replacing it would strip PATH and the provider auth the child needs.
-					base: withoutGitAuth({ ...process.env, ...o.env }),
+					// replacing it would strip PATH and the provider auth the child needs. HOME moves
+					// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
+					base: boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env })),
 					stripBoard: o.stripBoard,
 				}),
 		});
@@ -1072,9 +1086,10 @@ export function startRun(o: {
 	// credentials do not (childEnv strips them), and neither does the board's GitHub
 	// token: work turns only commit locally, push credentials never leave the server (D6).
 	// serveWorker also strips every git host token from the worker container's own env.
-	// The pinned PI_CODING_AGENT_DIR stays out too (R5-1): a turn that ran the board's
-	// own agent dir could rewrite the config and skills the board's privileged turns
-	// execute, and a worker without its own shared store would find no credentials.
+	// The pinned PI_CODING_AGENT_DIR and OTTR_BOARD_OMP_HOME stay out too (R5-1): a turn that
+	// ran the board's own agent dir or home could rewrite the config, skills and plugins the
+	// board's privileged turns execute, and a worker without its own shared store would find
+	// no credentials. The worker turn and its local fallback keep the shared HOME.
 	const env = childEnv({
 		sessionName: o.sessionName,
 		board: o.board ?? null,
@@ -1083,6 +1098,7 @@ export function startRun(o: {
 			...o.env,
 			GH_TOKEN: undefined,
 			PI_CODING_AGENT_DIR: undefined,
+			OTTR_BOARD_OMP_HOME: undefined,
 		}),
 		stripBoard: o.stripBoard,
 	});

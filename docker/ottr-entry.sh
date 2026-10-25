@@ -3,10 +3,10 @@
 # (default /root); alate provisions it there, the image carries none.
 set -e
 # R5-1: workers share the home volume read-write, so a turn can plant anything the board
-# reads from it. The board pins its git config, gh config and omp agent dir
-# (GIT_CONFIG_GLOBAL / GH_CONFIG_DIR / PI_CODING_AGENT_DIR) to the server-only
-# `board-config` volume at /etc/ottr. A pin inside the shared home defeats that: refuse to
-# start before anything is written.
+# reads from it. The board pins its git config, gh config, omp agent dir and the HOME of
+# its own omp spawns (GIT_CONFIG_GLOBAL / GH_CONFIG_DIR / PI_CODING_AGENT_DIR /
+# OTTR_BOARD_OMP_HOME) to the server-only `board-config` volume at /etc/ottr. A pin inside
+# the shared home defeats that: refuse to start before anything is written.
 refuse_home_pin() {
 	if [ -n "$2" ] && [ -n "$HOME" ]; then
 		case "$2" in
@@ -20,6 +20,7 @@ refuse_home_pin() {
 refuse_home_pin GIT_CONFIG_GLOBAL "$GIT_CONFIG_GLOBAL"
 refuse_home_pin GH_CONFIG_DIR "$GH_CONFIG_DIR"
 refuse_home_pin PI_CODING_AGENT_DIR "$PI_CODING_AGENT_DIR"
+refuse_home_pin OTTR_BOARD_OMP_HOME "$OTTR_BOARD_OMP_HOME"
 # R5-1: this script never copies from $HOME. A missing pinned git config gets the fixed
 # Ottr identity (the one src/app.ts commits with). gh starts empty: its config can name
 # commands (browser, pager). The omp agent dir only gets content from the trusted seed,
@@ -33,6 +34,11 @@ if [ -n "$GIT_CONFIG_GLOBAL" ] && [ ! -e "$GIT_CONFIG_GLOBAL" ]; then
 fi
 if [ -n "$GH_CONFIG_DIR" ]; then
 	mkdir -p "$GH_CONFIG_DIR"
+fi
+# R5-1: the HOME of the board's own omp spawns, which omp reads plugins and user skills
+# from. Nothing is copied from the shared home: only the board-seed one-off fills it.
+if [ -n "$OTTR_BOARD_OMP_HOME" ]; then
+	mkdir -p "$OTTR_BOARD_OMP_HOME"
 fi
 if [ -n "$PI_CODING_AGENT_DIR" ]; then
 	mkdir -p "$PI_CODING_AGENT_DIR"

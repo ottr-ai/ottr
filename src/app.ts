@@ -70,6 +70,7 @@ import {
 } from "./images.ts";
 import {
 	agentDir,
+	boardOmpEnv,
 	type DeadSignIn,
 	deadSignIns,
 	loginProviders,
@@ -2365,7 +2366,7 @@ export function createApp(deps: AppDeps) {
 			!refreshingQuota
 		) {
 			refreshingQuota = true;
-			void fetchQuota()
+			void fetchQuota(boardOmpEnv())
 				.then((q) => {
 					quota = q;
 					publishState();

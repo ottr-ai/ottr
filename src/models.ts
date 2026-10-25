@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { agentDir } from "./login.ts";
+import { agentDir, boardOmpEnv } from "./login.ts";
 
 export interface ModelOption {
 	id: string;
@@ -25,6 +25,7 @@ export function modelList(
 	modelsCache = promise;
 	const child = spawnFn("omp", ["models", "--json"], {
 		stdio: ["ignore", "pipe", "ignore"],
+		env: boardOmpEnv(),
 		windowsHide: true,
 	});
 	let out = "";

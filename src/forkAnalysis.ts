@@ -1,5 +1,6 @@
 // Pure fork-analysis prompt/parse layer. Untrusted fork content: never instructions, always data.
 
+import { boardOmpEnv } from "./login.ts";
 import type {
 	ForkAnalysisResult,
 	ForkCommit,
@@ -202,7 +203,7 @@ const defaultSpawn: SpawnFn = async (argv, o) => {
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
-		env: { ...process.env, GH_TOKEN: undefined, GITHUB_TOKEN: undefined },
+		env: o.env,
 		timeout: o.timeoutMs,
 		windowsHide: true,
 	});
@@ -228,7 +229,11 @@ export async function runGateway(
 	};
 	const result = await spawn(["omp", "auth-gateway", "stdio"], {
 		stdin: JSON.stringify(body) + "\n",
-		env: { ...process.env, GH_TOKEN: undefined, GITHUB_TOKEN: undefined },
+		env: boardOmpEnv({
+			...process.env,
+			GH_TOKEN: undefined,
+			GITHUB_TOKEN: undefined,
+		}),
 		timeoutMs,
 	});
 	if (result.code !== 0) {

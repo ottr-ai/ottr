@@ -105,14 +105,19 @@ export function forModel(
 	return [...best.values(), ...solo];
 }
 
-/** Runs `omp usage --json`; a failure is a value (error set, no limits), never a throw. */
-export async function fetchQuota(): Promise<QuotaState> {
+/** Runs `omp usage --json` with `env` (the board's own omp env, login.ts boardOmpEnv: this
+ * module stays free of server imports, the UI bundles it); a failure is a value (error set,
+ * no limits), never a throw. */
+export async function fetchQuota(
+	env: Record<string, string | undefined>,
+): Promise<QuotaState> {
 	const at = Date.now();
 	try {
 		// omp caches each account's report for 5 min, so this rarely hits the providers.
 		const p = Bun.spawn(["omp", "usage", "--json"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			env,
 			windowsHide: true,
 			timeout: 30_000,
 		});

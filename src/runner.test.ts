@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
+	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -11,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { agentDir } from "./login.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import type { EventState, RunLauncher } from "./runner.ts";
 import {
@@ -568,6 +571,25 @@ describe("findHttp400Rejection", () => {
 				dir: join(tmpdir(), "http400-missing-xyz"),
 			}),
 		).toBeNull();
+	});
+
+	test("finds the board's own turns' entries under the board omp home (R5-1)", () => {
+		const board = mkdtempSync(join(tmpdir(), "http400-board-"));
+		const logs = join(board, ".omp", "logs", "http-400-requests");
+		mkdirSync(logs, { recursive: true });
+		// Far future: no real entry of the developer's own ~/.omp falls in this window.
+		writeFileSync(join(logs, "9791198198684-board.json"), "{}");
+		const saved = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = board;
+		try {
+			expect(
+				findHttp400Rejection({ from: 9791198198000, to: 9791198199000 }),
+			).toBe("9791198198684-board.json");
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = saved;
+			rmSync(board, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -2140,6 +2162,64 @@ process.exit(0);`,
 			const log = readFileSync(logPath, "utf8");
 			expect(log).toContain("worker: dispatching to");
 			expect(log).toContain("falling back to local spawn");
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("R5-1: a plugin or skill planted in the shared home never reaches the board's own omp", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-board-home-"));
+		const shared = join(dir, "shared");
+		const board = join(dir, "board");
+		// A work turn's plants. omp loads plugins from <HOME>/.omp/plugins and user skills from
+		// <HOME>/.agents/skills, whatever PI_CODING_AGENT_DIR says.
+		const plants = [
+			[".omp", "plugins", "node_modules", "planted"],
+			[".agents", "skills", "planted"],
+		];
+		for (const p of plants) mkdirSync(join(shared, ...p), { recursive: true });
+		mkdirSync(board);
+		const reachable = (env: NodeJS.ProcessEnv | undefined): number =>
+			plants.filter((p) => existsSync(join(env?.HOME ?? "", ...p))).length;
+		const saved = {
+			OTTR_BOARD_OMP_HOME: process.env.OTTR_BOARD_OMP_HOME,
+			PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+		};
+		process.env.OTTR_BOARD_OMP_HOME = board;
+		delete process.env.PI_CODING_AGENT_DIR;
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			// The board process's HOME is the shared home; the run's env carries it here so the
+			// test never moves the process-wide HOME other suites read.
+			const opts = { env: { HOME: shared }, launcher };
+			// A board-side turn (merge, release review, release): no worker target.
+			await startRun({ ...baseOpts(dir, join(dir, "board.log")), ...opts })
+				.done;
+			// A work turn whose worker is down runs locally and keeps the shared home.
+			const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
+			const deadUrl = `http://127.0.0.1:${dead.port}`;
+			dead.stop(true);
+			await startRun({
+				...baseOpts(dir, join(dir, "work.log")),
+				...opts,
+				worker: { urls: [deadUrl] },
+			}).done;
+			expect(seen.map((s) => s.env?.HOME)).toEqual([board, shared]);
+			expect(reachable(seen[0]!.env)).toBe(0);
+			expect(reachable(seen[1]!.env)).toBe(plants.length);
+			expect(seen[1]!.env).not.toHaveProperty("OTTR_BOARD_OMP_HOME");
+			// The board's own config readers (model roles, sign-in store) follow its omp.
+			expect(agentDir()).toBe(join(board, ".omp", "agent"));
 		} finally {
 			for (const [k, v] of Object.entries(saved)) {
 				if (v === undefined) delete process.env[k];

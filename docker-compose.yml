@@ -144,6 +144,13 @@ services:
       # credential store and copies the provider's rows through to the shared worker
       # store (src/login.ts shareProviderCredentials).
       PI_CODING_AGENT_DIR: /etc/ottr/home/.omp/agent
+      # R5-1: omp reads its plugins ($HOME/.omp/plugins) and the user skills and context
+      # files (~/.agents, ~/.claude, ...) from HOME, never from PI_CODING_AGENT_DIR, and HOME
+      # here is the worker-writable shared home. The board's own omp spawns (merge, release
+      # review, release, models, usage, sign-in) run with this server-only HOME instead,
+      # the one board-seed installs into; the board's own reads of the shared home (apt
+      # lists, shared store) keep /root.
+      OTTR_BOARD_OMP_HOME: /etc/ottr/home
       # One shared home volume carries one agent config: with the entry script's
       # backend switch, the whole compose topology runs memory.backend: hindsight
       # — server-side merge turns included. Mnemopi stays the default for
@@ -175,9 +182,9 @@ services:
   #   docker compose run --rm board-seed --repo <owner/name>
   #   docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data
   # then `docker compose restart server` (the entry script flips the memory backend).
-  # --force: the data repo wins over board-local edits. --skip-plugins: omp resolves
-  # plugins from $HOME/.omp/plugins whatever PI_CODING_AGENT_DIR says, so plugins on this
-  # volume would never load.
+  # --force: the data repo wins over board-local edits. Plugins install into
+  # /etc/ottr/home/.omp/plugins: the server's OTTR_BOARD_OMP_HOME, the HOME that the
+  # board's own omp reads plugins and user skills from.
   board-seed:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [seed]
@@ -188,7 +195,7 @@ services:
     entrypoint:
       - sh
       - -c
-      - node install-user.mjs --home /etc/ottr/home --force --skip-plugins "$$@" && node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"
+      - node install-user.mjs --home /etc/ottr/home --force "$$@" && node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"
       - board-seed
 
   # Memory lives in the shared Hindsight server named by HINDSIGHT_API_URL

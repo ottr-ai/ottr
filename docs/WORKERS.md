@@ -321,8 +321,8 @@ github.com when `GH_TOKEN` is set.
 
 The same boundary covers the board's own omp agent layer. A worker-plantable
 `~/.omp/agent/config.yml` could reassign the `modelRoles` the release review runs on, and
-planted skills or extensions would load into the board's privileged turns (merge, release
-review, release). The compose file pins the board's `PI_CODING_AGENT_DIR` to
+planted skills, extensions or plugins would load into the board's privileged turns (merge,
+release review, release). The compose file pins the board's `PI_CODING_AGENT_DIR` to
 `/etc/ottr/home/.omp/agent` on the `board-config` volume. omp resolves its agent dir
 (config.yml, agent.db, skills, extensions, sessions) from that variable. The entry script
 creates this directory empty and logs an `ottr-entry: R5-1:` line while it is unseeded.
@@ -334,6 +334,19 @@ script flips `memory.backend` in the seeded `config.yml`. The board's own config
 turn env: a worker keeps its shared home, and a turn that ran locally would otherwise hold
 the directory the board executes. The board's layer does not follow Alate provisions of
 the shared home. After a data-repo change, run `board-seed` again.
+
+omp does not resolve every user path from that variable. It reads plugins from
+`$HOME/.omp/plugins` and user skills and context files (`~/.agents`, `~/.claude`, and the
+other tool dirs) from `$HOME`. The board's `$HOME` is the shared home. So the compose file
+also sets `OTTR_BOARD_OMP_HOME=/etc/ottr/home`, and every omp that the board starts for
+itself gets that directory as its `HOME`: merge, release review and release turns, `omp
+models`, `omp usage`, `omp login`, and the fork-analysis gateway (`src/login.ts`
+`boardOmpEnv`). The agent dir above lies in this directory. The entry script creates the
+directory and copies nothing into it, and refuses to start when the variable points into
+the shared home. A worker dispatch removes the variable from the turn env, so a work turn
+and its local fallback keep the shared home. The board's own reads of the shared home keep
+`/root`: the apt lists, the shared credential store, and the shared `config.yml` of the
+hindsight flip.
 
 #### Seed the board config
 
@@ -350,8 +363,10 @@ needs them: an existing stack starts with an empty `board-config` volume.
    keys (`ANTHROPIC_API_KEY`, ...) in the env.
 
 The seed uses the same SkillSpector scan as worker provisioning, and a failed scan stops
-it. `--force` lets the data repo win over board-local edits. The seed skips plugins,
-because omp reads plugins from `$HOME/.omp/plugins` and not from the pinned agent dir.
+it. `--force` lets the data repo win over board-local edits. The seed installs the whole
+user layer under `/etc/ottr/home`, which is the board's omp home (`OTTR_BOARD_OMP_HOME`,
+see above). This includes the plugins in `/etc/ottr/home/.omp/plugins` and the user skills
+in `/etc/ottr/home/.agents/skills`.
 
 To verify the seed:
 
@@ -359,6 +374,8 @@ To verify the seed:
   dir.
 - `docker compose exec server ls /etc/ottr/home/.omp/agent` lists `config.yml`, `rules`
   and `skills`.
+- `docker compose exec server env HOME=/etc/ottr/home omp plugin list` lists the data
+  repo's plugins.
 
 #### Credentials
 
@@ -382,14 +399,13 @@ inside the worktrees, and projects are onboarded at run time, so compose cannot 
 each config. The board's network subcommands still read `credential.helper`,
 `core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
 whatever the turn's env holds. Closing the board's repo-config reads fully is code-side
-work in `src/worktree.ts` (per-call `-c` overrides), not topology. omp reads plugins from
-`$HOME/.omp/plugins` and user skills from `$HOME/.agents/skills` (and `~/.agent/skills`),
-whatever `PI_CODING_AGENT_DIR` says. Thus, on the board, these still come from the shared
-home. A separate card tracks this residual. On the omp side, the http-400 dump directory
-stays under `$HOME/.omp/logs`: omp's state root does not follow `PI_CODING_AGENT_DIR`, so
-the reader in `src/runner.ts` must follow the writer; the board reads only file names
-there, never the request bodies, so a plant forges a name in one failure message at
-worst.
+work in `src/worktree.ts` (per-call `-c` overrides), not topology. On the omp side, omp
+writes the http-400 dump directory under `$HOME/.omp/logs` of the HOME it runs with,
+because its state root does not follow `PI_CODING_AGENT_DIR`. The reader in
+`src/runner.ts` thus scans the shared home and the board's omp home. The board reads only
+file names there, never the request bodies, so a plant forges a name in one failure message
+at worst. Project skills and context files (`.agents/skills`, `AGENTS.md` in the checkout
+and its parents) stay worker-writable, the same as the main checkout's `.git/config`.
 
 ### The data boundary
 
