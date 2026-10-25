@@ -395,6 +395,26 @@ run makes a new cache in the server dir.
 Residual risk: session files stay worker-written, and later turns resume them. This is by
 design. Without `OTTR_SERVER_DATA_DIR`, the board logs a warning and keeps the old layout.
 
+### Writes on the shared volumes
+
+Workers mount the `ottr-data` volume and the `workspace` volume read-write. Thus a turn can
+put a symlink at any path on them, for example at `/data/<project>/quarantine/<task>`. The
+board must not follow such a symlink, because the symlink can point into the server
+container filesystem, for example to `/app/src` or `/etc/ottr`.
+
+Every board write below a task data dir goes through `src/confine.ts`: task logs, images,
+the project icon, handoffs, release notes, the image quarantine, and the quarantine of
+untracked worktree files. These helpers start at a trusted anchor (`OTTR_DATA_DIR`, or the
+project checkout outside compose) and open one path component at a time with `O_NOFOLLOW`
+through `/proc/self/fd`. A symlink at the file or at a parent below the anchor stops the
+write with a `refusing <path>` error. There is no check-then-write race. The quarantine
+also reads each source this way from the worktree, so a symlink cannot make the board copy
+or delete a server file. The guard works only on Linux. The compose server always runs on
+Linux.
+
+Limits: omp writes its own session files in `sessions/` for turns that the board runs. This
+guard does not cover them.
+
 ## Crash recovery
 
 A worker's lifetime is one turn and it owns no state: sessions and logs

@@ -16,6 +16,7 @@ import {
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -3116,6 +3117,23 @@ describe("project icon", () => {
 		for (const ext of ["png", "jpg", "gif", "webp"])
 			expect(existsSync(join(store.tasksDir, `icon.${ext}`))).toBe(false);
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"POST does not write through a symlinked icon file",
+		async () => {
+			const outDir = mkdtempSync(join(tmpdir(), "app-icon-out-"));
+			try {
+				const outside = join(outDir, "target");
+				writeFileSync(outside, "keep me");
+				symlinkSync(outside, join(store.tasksDir, "icon.png"));
+				await rawPost("/api/projects/p1/icon", png);
+				expect(readFileSync(outside, "utf8")).toBe("keep me");
+			} finally {
+				rmSync(outDir, { recursive: true, force: true });
+				rmSync(join(store.tasksDir, "icon.png"), { force: true });
+			}
+		},
+	);
 
 	test("unknown project", async () => {
 		const res = await get("/api/projects/nope/icon");

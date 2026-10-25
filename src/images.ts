@@ -1,5 +1,5 @@
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { withDir, writeBelow } from "./confine.ts";
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -54,12 +54,17 @@ export function decodeImages(
 	return { images };
 }
 
-/** Sync. Writes images into dir as <n>.<ext>, continuing after the highest existing number; creates dir; returns the file names in order. */
-export function saveImages(dir: string, images: DecodedImage[]): string[] {
+/** Sync. Writes images into dir as <n>.<ext>, continuing after the highest existing number; creates dir; returns the file names in order.
+ * root is the trusted anchor: a symlink at or below it refuses the write (see src/confine.ts). */
+export function saveImages(
+	root: string,
+	dir: string,
+	images: DecodedImage[],
+): string[] {
 	if (images.length === 0) return [];
-	mkdirSync(dir, { recursive: true });
+	const existing = withDir(root, dir, { create: true }, (d) => d.list());
 	let n = 0;
-	for (const name of readdirSync(dir)) {
+	for (const name of existing) {
 		const m = /^(\d+)\.(png|jpg|gif|webp)$/.exec(name);
 		if (m) n = Math.max(n, Number(m[1]));
 	}
@@ -67,7 +72,7 @@ export function saveImages(dir: string, images: DecodedImage[]): string[] {
 	for (const img of images) {
 		n += 1;
 		const name = `${n}.${img.ext}`;
-		writeFileSync(join(dir, name), img.bytes, { flag: "wx" });
+		writeBelow(root, join(dir, name), img.bytes, "exclusive");
 		names.push(name);
 	}
 	return names;

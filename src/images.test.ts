@@ -1,5 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -130,7 +138,8 @@ describe("decodeImages", () => {
 });
 
 describe("saveImages", () => {
-	const dir = mkdtempSync(join(tmpdir(), "ott-images-test-"));
+	const root = mkdtempSync(join(tmpdir(), "ott-images-test-"));
+	const dir = join(root, "tasks", "images");
 	const png: DecodedImage = {
 		bytes: Buffer.concat([PNG_SIG, Buffer.alloc(4)]),
 		ext: "png",
@@ -145,12 +154,12 @@ describe("saveImages", () => {
 	};
 
 	afterAll(() => {
-		rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 
 	test("continues numbering and returns names only", () => {
-		expect(saveImages(dir, [png, jpg])).toEqual(["1.png", "2.jpg"]);
-		expect(saveImages(dir, [gif])).toEqual(["3.gif"]);
+		expect(saveImages(root, dir, [png, jpg])).toEqual(["1.png", "2.jpg"]);
+		expect(saveImages(root, dir, [gif])).toEqual(["3.gif"]);
 		expect(readFileSync(join(dir, "1.png")).equals(png.bytes)).toBe(true);
 		expect(readFileSync(join(dir, "2.jpg")).equals(jpg.bytes)).toBe(true);
 		expect(readFileSync(join(dir, "3.gif")).equals(gif.bytes)).toBe(true);
@@ -158,13 +167,33 @@ describe("saveImages", () => {
 
 	test("ignores non-image files", () => {
 		writeFileSync(join(dir, "notes.txt"), "ignore me");
-		expect(saveImages(dir, [png])).toEqual(["4.png"]);
+		expect(saveImages(root, dir, [png])).toEqual(["4.png"]);
 		expect(readFileSync(join(dir, "4.png")).equals(png.bytes)).toBe(true);
 	});
 
 	test("empty list touches nothing", () => {
-		expect(saveImages(dir, [])).toEqual([]);
+		expect(saveImages(root, dir, [])).toEqual([]);
 	});
+
+	for (const [label, link] of [
+		["images dir", ["linked", "images"]],
+		["parent dir", ["linked"]],
+	] as const) {
+		test.skipIf(process.platform !== "linux")(
+			`refuses a symlinked ${label} and leaves the target empty`,
+			() => {
+				const outside = join(root, "outside", label.replace(" ", "-"));
+				mkdirSync(outside, { recursive: true });
+				const base = join(root, "data", label.replace(" ", "-"));
+				mkdirSync(join(base, ...link.slice(0, -1)), { recursive: true });
+				symlinkSync(outside, join(base, ...link));
+				expect(() =>
+					saveImages(base, join(base, "linked", "images"), [png]),
+				).toThrow(/refusing/);
+				expect(readdirSync(outside)).toEqual([]);
+			},
+		);
+	}
 });
 
 describe("arch-review changed-line coverage", () => {

@@ -3,9 +3,10 @@ import {
 	type SpawnOptions,
 	spawn,
 } from "node:child_process";
-import { appendFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { mkdirBelow, writeBelow } from "./confine.ts";
 import { platform } from "./platform/index.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
@@ -793,6 +794,8 @@ export interface RunSink {
 
 export function createRunSink(o: {
 	logPath: string;
+	/** Anchor for the log write (src/confine.ts). */
+	dataRoot: string;
 	onLog?: () => void;
 	onSession?: (sessionId: string) => void;
 	/** A progress event (stryker.ts): never logged; null text clears the card's progress. */
@@ -801,8 +804,8 @@ export function createRunSink(o: {
 	const es = newEventState();
 	let stderrTail = "";
 
-	// Log: appendFileSync, capped at LOG_CAP_BYTES counted in UTF-8 bytes.
-	mkdirSync(dirname(o.logPath), { recursive: true });
+	// Log: appended below dataRoot, capped at LOG_CAP_BYTES counted in UTF-8 bytes.
+	mkdirBelow(o.dataRoot, dirname(o.logPath));
 	let bytes = 0;
 	try {
 		bytes = statSync(o.logPath).size;
@@ -815,14 +818,16 @@ export function createRunSink(o: {
 		const size = Buffer.byteLength(s, "utf8");
 		if (bytes + size > LOG_CAP_BYTES) {
 			truncated = true;
-			appendFileSync(
+			writeBelow(
+				o.dataRoot,
 				o.logPath,
 				"\n[log truncated at 2 MiB; the full transcript is in the omp session]\n",
+				"append",
 			);
 			o.onLog?.();
 			return;
 		}
-		appendFileSync(o.logPath, s);
+		writeBelow(o.dataRoot, o.logPath, s, "append");
 		bytes += size;
 		o.onLog?.();
 	};
@@ -948,6 +953,8 @@ export function startRun(o: {
 	/** Set: the run's session can file cards via its create_task tool; injected as OTTR_BOARD_URL/OTTR_BOARD_TOKEN/OTTR_PROJECT/OTTR_TASK_ID. */
 	board?: BoardEnv | null;
 	logPath: string;
+	/** Anchor for the log write (src/confine.ts). */
+	dataRoot: string;
 	/** Called after every append to the log file; the server turns it into a throttled `log` push. */
 	onLog?: () => void;
 	onSession?: (sessionId: string) => void;
@@ -971,6 +978,7 @@ export function startRun(o: {
 }): RunHandle {
 	const sink = createRunSink({
 		logPath: o.logPath,
+		dataRoot: o.dataRoot,
 		onLog: o.onLog,
 		onSession: o.onSession,
 		onProgress: o.onProgress,

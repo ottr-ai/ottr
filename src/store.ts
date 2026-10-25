@@ -10,6 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { mkdirBelow, writeBelow } from "./confine.ts";
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
@@ -622,6 +623,22 @@ export function adoptSharedProjectData(
 	mkdirSync(serverDataDir, { recursive: true });
 	writeFileSync(marker, `${new Date().toISOString()}\n`);
 	return results;
+ * The trusted root above a project's task data dir: `$OTTR_DATA_DIR` (a mount point no
+ * worker can replace), or the project checkout. Server writes below it go through
+ * src/confine.ts, so a symlink a worker plants under it is never followed (OTTR-172).
+ */
+export function dataRootFor(projectPath: string): string {
+	const dataDir = process.env.OTTR_DATA_DIR;
+	return dataDir ? resolve(dataDir) : resolve(projectPath);
+}
+
+/** Writes an ignore-everything .gitignore (and its parents) below anchor unless one exists. */
+function writeIgnoreAll(anchor: string, file: string): void {
+	try {
+		writeBelow(anchor, file, "*\n", "exclusive");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+	}
 }
 
 export function discoverProjects(
@@ -791,6 +808,8 @@ export class ProjectStore {
 	readonly tasksDir: string;
 	/** Server-only dir (serverDirFor): tasks.db and the fork cache. */
 	readonly serverDir: string;
+	/** Anchor for confined writes below tasksDir (dataRootFor). */
+	readonly dataRoot: string;
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
 	private readonly db: Database;
@@ -802,6 +821,7 @@ export class ProjectStore {
 		this.name = basename(projectPath);
 		this.tasksDir = tasksDirFor(projectPath);
 		this.serverDir = serverDirFor(projectPath);
+		this.dataRoot = dataRootFor(projectPath);
 		this.sessionsDir = join(this.tasksDir, "sessions");
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
@@ -810,20 +830,18 @@ export class ProjectStore {
 	static init(projectPath: string): ProjectStore {
 		const root = resolve(projectPath);
 		const tasksDir = tasksDirFor(root);
-		mkdirSync(join(tasksDir, "logs"), { recursive: true });
-		mkdirSync(join(tasksDir, "sessions"), { recursive: true });
-		const taskIgnore = join(tasksDir, ".gitignore");
-		if (!existsSync(taskIgnore)) writeFileSync(taskIgnore, "*\n");
-		mkdirSync(join(root, ".worktrees"), { recursive: true });
-		const wtIgnore = join(root, ".worktrees", ".gitignore");
-		if (!existsSync(wtIgnore)) writeFileSync(wtIgnore, "*\n");
+		const dataRoot = dataRootFor(root);
+		mkdirBelow(dataRoot, join(tasksDir, "logs"));
+		mkdirBelow(dataRoot, join(tasksDir, "sessions"));
+		writeIgnoreAll(dataRoot, join(tasksDir, ".gitignore"));
+		writeIgnoreAll(root, join(root, ".worktrees", ".gitignore"));
 		return ProjectStore.open(root);
 	}
 
 	static open(projectPath: string): ProjectStore {
 		const root = resolve(projectPath);
 		const tasksDir = tasksDirFor(root);
-		mkdirSync(tasksDir, { recursive: true });
+		mkdirBelow(dataRootFor(root), tasksDir);
 		const serverDir = serverDirFor(root);
 		mkdirSync(serverDir, { recursive: true });
 		const dbPath = join(serverDir, "tasks.db");

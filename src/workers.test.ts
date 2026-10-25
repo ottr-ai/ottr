@@ -68,7 +68,10 @@ function start(opts: Parameters<typeof serveWorker>[0] = {}) {
 /** Real sink plumbing with a recording wrapper; log files land in the temp dir. */
 let sinkN = 0;
 function fakeSink(): RunSink & { lines: string[] } {
-	const base = createRunSink({ logPath: join(dir, `sink-${sinkN++}.log`) });
+	const base = createRunSink({
+		logPath: join(dir, `sink-${sinkN++}.log`),
+		dataRoot: dir,
+	});
 	const lines: string[] = [];
 	return {
 		...base,

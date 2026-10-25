@@ -3,10 +3,12 @@ import {
 	appendFileSync,
 	chmodSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -1266,7 +1268,7 @@ describe("quarantineUntracked", () => {
 		mkdirSync(join(main, "sub", "dir"), { recursive: true });
 		writeFileSync(join(main, "sub", "dir", "x.txt"), "x");
 
-		const moved = await quarantineUntracked(main, q);
+		const moved = await quarantineUntracked(main, q, main);
 		expect(moved.sort()).toEqual([
 			".smoke-22.png",
 			"file0",
@@ -1290,7 +1292,7 @@ describe("quarantineUntracked", () => {
 		await must(main, "add", ".gitignore");
 		await must(main, "commit", "-q", "-m", "gitignore");
 		const q = join(main, ".tasks", "quarantine", "t2");
-		expect(await quarantineUntracked(main, q)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual([]);
 		expect(existsSync(join(main, "ignored.log"))).toBe(true);
 		expect(existsSync(q)).toBe(false);
 	}, 60_000);
@@ -1299,7 +1301,7 @@ describe("quarantineUntracked", () => {
 		const main = await seeded();
 		writeFileSync(join(main, "tracked.txt"), "dirty");
 		const q = join(main, ".tasks", "quarantine", "t3");
-		expect(await quarantineUntracked(main, q)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual([]);
 		expect(readFileSync(join(main, "tracked.txt"), "utf8")).toBe("dirty");
 		expect(await statusFiles(main)).toEqual(["tracked.txt"]);
 	}, 60_000);
@@ -1307,7 +1309,7 @@ describe("quarantineUntracked", () => {
 	test("clean worktree: [] and no quarantine dir created", async () => {
 		const main = await seeded();
 		const q = join(main, ".tasks", "quarantine", "t4");
-		expect(await quarantineUntracked(main, q)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual([]);
 		expect(existsSync(q)).toBe(false);
 	}, 60_000);
 
@@ -1319,9 +1321,70 @@ describe("quarantineUntracked", () => {
 		const before = readFileSync(join(main, "tracked.txt"));
 		writeFileSync(join(main, "scratch.md"), "s");
 		const q = join(main, ".tasks", "quarantine", "t5");
-		await quarantineUntracked(main, q);
+		await quarantineUntracked(main, q, main);
 		expect(readFileSync(join(main, "tracked.txt")).equals(before)).toBe(true);
 	}, 60_000);
+
+	test.skipIf(process.platform !== "linux")(
+		"refuses a quarantine dir planted as a symlink; outside dir stays empty",
+		async () => {
+			const main = await seeded();
+			const outside = mkdtempSync(join(tmpdir(), "ottr-q-out-"));
+			mkdirSync(join(main, ".tasks"), { recursive: true });
+			symlinkSync(outside, join(main, ".tasks", "quarantine"));
+			writeFileSync(join(main, "scratch.md"), "s");
+			const q = join(main, ".tasks", "quarantine", "t6");
+			await expect(quarantineUntracked(main, q, main)).rejects.toThrow(
+				/refusing/,
+			);
+			expect(readdirSync(outside)).toEqual([]);
+			expect(readFileSync(join(main, "scratch.md"), "utf8")).toBe("s");
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"moves an untracked symlink as a link; its target stays untouched",
+		async () => {
+			const main = await seeded();
+			const outside = join(mkdtempSync(join(tmpdir(), "ottr-q-tgt-")), "f");
+			writeFileSync(outside, "keep");
+			symlinkSync(outside, join(main, "link"));
+			const q = join(main, ".tasks", "quarantine", "t7");
+			expect(await quarantineUntracked(main, q, main)).toEqual(["link"]);
+			expect(lstatSync(join(q, "link")).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(join(q, "link"))).toBe(outside);
+			expect(readFileSync(outside, "utf8")).toBe("keep");
+			expect(() => lstatSync(join(main, "link"))).toThrow();
+		},
+		60_000,
+	);
+
+	const crossMount =
+		existsSync("/dev/shm") &&
+		statSync("/dev/shm").dev !== statSync(tmpdir()).dev;
+	test.skipIf(!crossMount)(
+		"copies across mounts into the data root and removes the sources",
+		async () => {
+			const main = await seeded();
+			const root = mkdtempSync(join("/dev/shm", "ottr-q-"));
+			try {
+				writeFileSync(join(main, "a.txt"), "a");
+				mkdirSync(join(main, "sub"));
+				writeFileSync(join(main, "sub", "b.txt"), "b");
+				const q = join(root, "quarantine", "t8");
+				const moved = await quarantineUntracked(main, q, root);
+				expect(moved.sort()).toEqual(["a.txt", "sub/b.txt"]);
+				expect(readFileSync(join(q, "a.txt"), "utf8")).toBe("a");
+				expect(readFileSync(join(q, "sub", "b.txt"), "utf8")).toBe("b");
+				expect(existsSync(join(main, "a.txt"))).toBe(false);
+				expect(existsSync(join(main, "sub", "b.txt"))).toBe(false);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+		60_000,
+	);
 });
 
 describe("trackedFiles", () => {

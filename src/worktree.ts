@@ -1,17 +1,16 @@
 import {
 	appendFileSync,
 	copyFileSync,
-	cpSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
-	renameSync,
 	rmSync,
 	statSync,
 } from "node:fs";
 import * as path from "node:path";
+import { moveBelow } from "./confine.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -1000,11 +999,14 @@ export async function commitSubjects(
 /**
  * Moves every non-ignored untracked file in the worktree into `quarantineDir`, preserving repo-relative
  * paths; returns the moved paths (repo-relative, forward slashes). Ignored files and tracked files stay
- * untouched. [] when there is nothing to move. Throws when git fails.
+ * untouched. [] when there is nothing to move. Throws when git fails. No symlink below the worktree or
+ * below `dataRoot` is followed: an untracked symlink moves as a link, and a symlinked parent on either
+ * side throws ("refusing ...").
  */
 export async function quarantineUntracked(
 	worktreePath: string,
 	quarantineDir: string,
+	dataRoot: string,
 ): Promise<string[]> {
 	const r = await git(
 		["ls-files", "-z", "--others", "--exclude-standard"],
@@ -1014,17 +1016,10 @@ export async function quarantineUntracked(
 	const moved: string[] = [];
 	for (const rel of r.stdout.split("\0")) {
 		if (rel === "") continue;
-		const dest = path.join(quarantineDir, rel);
-		mkdirSync(path.dirname(dest), { recursive: true });
-		const src = path.join(worktreePath, rel);
-		try {
-			renameSync(src, dest);
-		} catch (err) {
-			// OTTR_DATA_DIR keeps the quarantine on another volume than the worktree.
-			if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
-			cpSync(src, dest);
-			rmSync(src);
-		}
+		moveBelow(
+			{ anchor: worktreePath, file: path.join(worktreePath, rel) },
+			{ anchor: dataRoot, file: path.join(quarantineDir, rel) },
+		);
 		moved.push(rel.replaceAll("\\", "/"));
 	}
 	return moved;

@@ -7,6 +7,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1234,6 +1235,25 @@ describe("turn helpers", () => {
 		expect(readFileSync(store.logPath(task.id), "utf8")).toBe("hello\n");
 		expect(record.notifyLog).toContainEqual([store.name, task.id]);
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"appendLog refuses a log file planted as a symlink and leaves its target unchanged",
+		() => {
+			const { store } = setup();
+			const task = store.createTask("log me");
+			const outside = mkdtempSync(join(tmpdir(), "ottr-outside-"));
+			try {
+				const target = join(outside, "victim.txt");
+				writeFileSync(target, "original\n");
+				mkdirSync(dirname(store.logPath(task.id)), { recursive: true });
+				symlinkSync(target, store.logPath(task.id));
+				expect(() => appendLog(store, task.id, "planted")).toThrow(/refusing/);
+				expect(readFileSync(target, "utf8")).toBe("original\n");
+			} finally {
+				rmSync(outside, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("turn quarantine", () => {
@@ -2215,6 +2235,47 @@ describe("turn sessions, steering and images", () => {
 		expect(after.needsReason).toBeNull();
 	});
 
+	test.skipIf(process.platform !== "linux")(
+		"image quarantine refuses a symlinked quarantine dir",
+		async () => {
+			const outside = mkdtempSync(join(tmpdir(), "turn-quarantine-out-"));
+			dirs.push(outside);
+			const { store, record, loop } = setup({
+				maxTotalRuns: () => 0,
+				commitsAhead: async () => 0,
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					return {
+						pid: 4242,
+						done: Promise.resolve(
+							runResult({
+								exitCode: 1,
+								sessionId: null,
+								sawTerminalEnd: false,
+								finalText: "",
+							}),
+						),
+						kill: async () => {
+							record.killed = true;
+						},
+					};
+				},
+			});
+			const task = store.createTask("work please");
+			setImage(store, task.id, "1.png", "rejected-bytes");
+			store.updateTask(task.id, { images: ["1.png"] });
+			symlinkSync(outside, join(store.tasksDir, "quarantine"));
+
+			await loop.runTurn(store.name, task.id);
+
+			expect(readdirSync(outside)).toEqual([]);
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toContain("Image quarantine failed");
+			expect(after.needsReason).toContain("refusing");
+		},
+	);
+
 	test("the text-only retry failing too still lands in needs_you", async () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0, // assert the settle instant; each turn runs via a direct runTurn
@@ -3108,6 +3169,36 @@ describe("turn release cards", () => {
 			readFileSync(join(store.tasksDir, `release-${task.id}.md`), "utf8"),
 		).toBe("notes body");
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"a release notes file planted as a symlink is refused and its target stays unchanged",
+		async () => {
+			const record = baseRecord();
+			const { store, projects, loop } = setupWith(record, {
+				isIntegrated: async () => true,
+				startRun: integratedRun(record),
+				runReleaseCommand: async (o: unknown) => {
+					record.runReleaseCommand.push(o);
+					return "published v1.0.0";
+				},
+			});
+			const outside = mkdtempSync(join(tmpdir(), "ottr-outside-"));
+			try {
+				const target = join(outside, "victim.txt");
+				writeFileSync(target, "original\n");
+				projects.get(store.name)!.target = "origin/main";
+				store.setSettings({ releaseCommand: "bin release" });
+				const task = releaseTask(store);
+				symlinkSync(target, join(store.tasksDir, `release-${task.id}.md`));
+				await loop.runTurn(store.name, task.id);
+				expect(store.getTask(task.id)!.needsReason).toContain("refusing");
+				expect(record.runReleaseCommand).toHaveLength(0);
+				expect(readFileSync(target, "utf8")).toBe("original\n");
+			} finally {
+				rmSync(outside, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test("a release command frees its scheduler slot when it settles", async () => {
 		const record = baseRecord();

@@ -9,11 +9,10 @@ import {
 	readFileSync,
 	readSync,
 	statSync,
-	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { cpus, freemem, homedir, totalmem } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import {
@@ -30,6 +29,7 @@ import {
 	verifyAdminLogin,
 	verifySession,
 } from "./auth.ts";
+import { unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import {
 	createForkWatcher,
@@ -202,12 +202,13 @@ function iconFile(tasksDir: string): string | null {
 }
 
 /** Deletes every icon.<ext> variant; missing files are fine. */
-function removeIcons(tasksDir: string): void {
+function removeIcons(root: string, tasksDir: string): void {
 	for (const ext of ICON_EXTS) {
 		try {
-			unlinkSync(join(tasksDir, `icon.${ext}`));
-		} catch {
+			unlinkBelow(root, join(tasksDir, `icon.${ext}`));
+		} catch (err) {
 			// Missing file: nothing to remove.
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 		}
 	}
 }
@@ -3382,15 +3383,19 @@ export function createApp(deps: AppDeps) {
 							{ error: "icon must be a PNG, JPEG, GIF or WebP file" },
 							400,
 						);
-					removeIcons(e.store.tasksDir);
-					writeFileSync(join(e.store.tasksDir, `icon.${ext}`), r.bytes);
+					removeIcons(e.store.dataRoot, e.store.tasksDir);
+					writeBelow(
+						e.store.dataRoot,
+						join(e.store.tasksDir, `icon.${ext}`),
+						r.bytes,
+					);
 					return json(projectView(e));
 				}),
 			DELETE: (req) =>
 				api(req, async () => {
 					const e = deps.projects.get(req.params.project);
 					if (!e) return json({ error: "unknown project" }, 404);
-					removeIcons(e.store.tasksDir);
+					removeIcons(e.store.dataRoot, e.store.tasksDir);
 					return json(projectView(e));
 				}),
 		},
@@ -3734,7 +3739,11 @@ export function createApp(deps: AppDeps) {
 					const t = e.store.createTask(trimmed, model);
 					try {
 						if (decoded.images.length > 0) {
-							const names = saveImages(e.store.imagesDir(t.id), decoded.images);
+							const names = saveImages(
+								e.store.dataRoot,
+								e.store.imagesDir(t.id),
+								decoded.images,
+							);
 							// Synchronous with createTask so the 5 s schedule timer never sees the task without its images.
 							e.store.updateTask(t.id, { images: names });
 						}
@@ -4035,7 +4044,11 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "text must be 1-20000 characters" }, 400);
 					const names =
 						decoded.images.length > 0
-							? saveImages(e.store.imagesDir(task.id), decoded.images)
+							? saveImages(
+									e.store.dataRoot,
+									e.store.imagesDir(task.id),
+									decoded.images,
+								)
 							: [];
 					// U7: a reply on a parked update card approves its merge hold (undefined keeps the column).
 					// Same for a fork-born card parked by the fork merge hold.
@@ -4145,7 +4158,11 @@ export function createApp(deps: AppDeps) {
 					try {
 						names =
 							decoded.images.length > 0
-								? saveImages(e.store.imagesDir(t.id), decoded.images)
+								? saveImages(
+										e.store.dataRoot,
+										e.store.imagesDir(t.id),
+										decoded.images,
+									)
 								: [];
 					} catch (err) {
 						e.store.updateTask(t.id, {
@@ -4163,8 +4180,8 @@ export function createApp(deps: AppDeps) {
 							"handoffs",
 							`${t.id}.md`,
 						);
-						mkdirSync(dirname(handoffPath), { recursive: true });
-						writeFileSync(
+						writeBelow(
+							e.store.dataRoot,
 							handoffPath,
 							handoffMarkdown({
 								task,
@@ -4231,7 +4248,11 @@ export function createApp(deps: AppDeps) {
 					const prompt = text.trim() || ".";
 					let names: string[];
 					try {
-						names = saveImages(e.store.imagesDir(task.id), decoded.images);
+						names = saveImages(
+							e.store.dataRoot,
+							e.store.imagesDir(task.id),
+							decoded.images,
+						);
 					} catch (err) {
 						return json(
 							{ error: `could not save images: ${errmsg(err)}` },

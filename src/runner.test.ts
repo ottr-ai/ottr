@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { LOST_SESSION } from "./prompts.ts";
 import type { EventState, RunLauncher } from "./runner.ts";
 import {
@@ -1810,6 +1817,7 @@ function fakeStart(o: {
 		extensionPath: "/unused.ts",
 		resumeId: null,
 		logPath: o.logPath,
+		dataRoot: dirname(o.logPath),
 		onSession: o.onSession,
 		launcher,
 	});
@@ -1840,6 +1848,7 @@ describe("startRun", () => {
 				extensionPath: "/unused.ts",
 				resumeId: null,
 				logPath: join(dir, "run.log"),
+				dataRoot: dir,
 				launcher,
 			};
 			const pinned = startRun({ ...base, sessionName: "Architecture review" });
@@ -2046,6 +2055,7 @@ process.exit(0);`,
 			extensionPath: join(dir, "ext.ts"),
 			resumeId: null,
 			logPath,
+			dataRoot: dir,
 		};
 	}
 
@@ -2355,7 +2365,7 @@ describe("arch-review changed-line coverage", () => {
 		setGitSecrets([secret]);
 		try {
 			const logPath = join(dir, "run.log");
-			const sink = createRunSink({ logPath });
+			const sink = createRunSink({ logPath, dataRoot: dir });
 			sink.stderr(`remote: denied for ${secret}\n`);
 			sink.stdout(`not json ${secret}\n`);
 			const log = readFileSync(logPath, "utf8");
@@ -2374,7 +2384,7 @@ describe("arch-review changed-line coverage", () => {
 		setGitSecrets([secret]);
 		try {
 			const logPath = join(dir, "run.log");
-			const sink = createRunSink({ logPath });
+			const sink = createRunSink({ logPath, dataRoot: dir });
 			sink.logMark(`push to ${secret.slice(0, 9)}`);
 			sink.logMark(`${secret.slice(9)} failed\n`);
 			sink.stderr(`remote: ${secret.slice(0, 5)}`);
@@ -2411,6 +2421,7 @@ describe("arch-review changed-line coverage", () => {
 				extensionPath: join(dir, "ext.ts"),
 				resumeId: null,
 				logPath: join(dir, "run.log"),
+				dataRoot: dir,
 				launcher: (_c, _a, options) => {
 					seen.push(options);
 					queueMicrotask(() => fake.emit("close", 0));
@@ -2431,7 +2442,7 @@ describe("arch-review changed-line coverage", () => {
 		setGitSecrets([old]);
 		try {
 			const logPath = join(dir, "run.log");
-			const sink = createRunSink({ logPath });
+			const sink = createRunSink({ logPath, dataRoot: dir });
 			setGitSecrets(["glpat-new-token-00000"]);
 			sink.stderr(`push failed for ${old}\n`);
 			sink.flush();
@@ -2446,7 +2457,10 @@ describe("arch-review changed-line coverage", () => {
 	test("createRunSink().result() merges the event-state snapshot with the caller's settle fields", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
 		try {
-			const sink = createRunSink({ logPath: join(dir, "run.log") });
+			const sink = createRunSink({
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+			});
 			sink.line(JSON.stringify({ type: "session", id: "sess-sink" }));
 			sink.line(
 				JSON.stringify({
@@ -2508,7 +2522,10 @@ describe("arch-review changed-line coverage", () => {
 	test("result(): caller-provided fields override the snapshot fields", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
 		try {
-			const sink = createRunSink({ logPath: join(dir, "run.log") });
+			const sink = createRunSink({
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+			});
 			sink.line(JSON.stringify({ type: "session", id: "sess-a" }));
 			const r = sink.result({
 				exitCode: 0,
@@ -2522,4 +2539,48 @@ describe("arch-review changed-line coverage", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"createRunSink() refuses a log dir planted as a symlink and writes nothing outside",
+		() => {
+			const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
+			const outside = mkdtempSync(join(tmpdir(), "ottr-outside-"));
+			try {
+				symlinkSync(outside, join(dir, "logs"));
+				expect(() =>
+					createRunSink({
+						logPath: join(dir, "logs", "run.log"),
+						dataRoot: dir,
+					}),
+				).toThrow(/refusing/);
+				expect(readdirSync(outside)).toEqual([]);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"createRunSink() refuses a log file planted as a symlink and leaves its target unchanged",
+		() => {
+			const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
+			const outside = mkdtempSync(join(tmpdir(), "ottr-outside-"));
+			try {
+				const target = join(outside, "victim.txt");
+				writeFileSync(target, "original\n");
+				const logPath = join(dir, "run.log");
+				symlinkSync(target, logPath);
+				const sink = createRunSink({ logPath, dataRoot: dir });
+				expect(() => {
+					sink.logMark("planted\n");
+					sink.flush();
+				}).toThrow(/refusing/);
+				expect(readFileSync(target, "utf8")).toBe("original\n");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(outside, { recursive: true, force: true });
+			}
+		},
+	);
 });

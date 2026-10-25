@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { writeBelow } from "./confine.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
 import { ownerRepo } from "./release.ts";
 import { collectRetroFacts, factsMarkdown, frictionFilter } from "./retro.ts";
@@ -370,6 +371,7 @@ export function createSupervisor(
 				const moved = await ops.quarantineUntracked(
 					t.worktree,
 					join(e.store.tasksDir, "quarantine", t.id),
+					e.store.dataRoot,
 				);
 				// Same line as turn.ts's quarantine: the card's log names every moved file.
 				if (moved.length > 0)
@@ -524,6 +526,7 @@ export function createSupervisor(
 			moved = await ops.quarantineUntracked(
 				wt,
 				join(e.store.tasksDir, "quarantine", t.id),
+				e.store.dataRoot,
 			);
 		} catch (err) {
 			if (!hygieneLogged.has(key)) {
@@ -916,8 +919,8 @@ export function createSupervisor(
 		let prompt = text;
 		try {
 			const handoffPath = join(e.store.tasksDir, "handoffs", `${child.id}.md`);
-			mkdirSync(dirname(handoffPath), { recursive: true });
-			writeFileSync(
+			writeBelow(
+				e.store.dataRoot,
 				handoffPath,
 				handoffMarkdown({
 					task: t,

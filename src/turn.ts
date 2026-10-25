@@ -3,18 +3,16 @@
 
 import { createHash } from "node:crypto";
 import {
-	appendFileSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
-	renameSync,
 	statSync,
-	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
+import { renameBelow, writeBelow } from "./confine.ts";
 import type { pidAlive } from "./dblock.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
@@ -284,9 +282,7 @@ export interface TurnOps {
 let notifyHook: (project: string, id: string) => void = () => {};
 
 export function appendLog(store: ProjectStore, id: string, line: string): void {
-	const file = store.logPath(id);
-	mkdirSync(dirname(file), { recursive: true });
-	appendFileSync(file, `${line}\n`);
+	writeBelow(store.dataRoot, store.logPath(id), `${line}\n`, "append");
 	notifyHook(store.name, id);
 }
 
@@ -333,19 +329,21 @@ export function isKeptReason(reason: string | null): boolean {
 }
 
 /** Moves the named files from a task's images dir into quarantineDir (never deletes); returns the
- * moved names. Per-file rename assumes the store dirs share a device — same assumption as
- * quarantineUntracked. */
+ * moved names. root is the trusted anchor for both dirs (see src/confine.ts). */
 function quarantineImageFiles(
+	root: string,
 	imagesDir: string,
 	quarantineDir: string,
 	names: readonly string[],
 ): string[] {
 	const moved: string[] = [];
 	for (const name of names) {
-		const src = join(imagesDir, name);
-		if (!existsSync(src)) continue;
-		mkdirSync(quarantineDir, { recursive: true });
-		renameSync(src, join(quarantineDir, name));
+		try {
+			renameBelow(root, join(imagesDir, name), join(quarantineDir, name));
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw err;
+		}
 		moved.push(name);
 	}
 	return moved;
@@ -851,7 +849,7 @@ export function createTurnLoop(
 			} else {
 				// Outside the worktree: the command may refuse a dirty tree.
 				const notesFile = join(store.tasksDir, `release-${task.id}.md`);
-				writeFileSync(notesFile, task.releaseNotes ?? "");
+				writeBelow(store.dataRoot, notesFile, task.releaseNotes ?? "");
 				log(`$ ${settings.releaseCommand}`);
 				if (!claimPublish()) return null;
 				const key = `${store.name}/${task.id}`;
@@ -1260,6 +1258,7 @@ export function createTurnLoop(
 					? join(dirname(ops.extensionPath), "retro.yml")
 					: undefined,
 				skills: retroCard ? "retro" : undefined,
+				dataRoot: store.dataRoot,
 				logPath: store.logPath(id),
 				onLog: () => ops.notifyLog(name, id),
 				onProgress: (text) => {
@@ -1474,7 +1473,7 @@ export function createTurnLoop(
 					}
 				}
 				if (copied.length > 0) {
-					const names = saveImages(store.imagesDir(id), copied);
+					const names = saveImages(store.dataRoot, store.imagesDir(id), copied);
 					shots = [...task.shots, ...names].slice(-8); // cap 8, keep newest
 				}
 			}
@@ -1490,6 +1489,7 @@ export function createTurnLoop(
 					const moved = await ops.quarantineUntracked(
 						wt,
 						join(store.tasksDir, "quarantine", id),
+						store.dataRoot,
 					);
 					if (moved.length > 0)
 						appendLog(
@@ -1608,6 +1608,7 @@ export function createTurnLoop(
 			if (next.quarantineImages) {
 				try {
 					const moved = quarantineImageFiles(
+						store.dataRoot,
 						store.imagesDir(id),
 						join(store.tasksDir, "quarantine", id),
 						turnImages,
@@ -1933,8 +1934,8 @@ export function createTurnLoop(
 						handoffPath,
 					});
 					try {
-						mkdirSync(dirname(handoffPath), { recursive: true });
-						writeFileSync(
+						writeBelow(
+							store.dataRoot,
 							handoffPath,
 							handoffMarkdown({
 								task: store.getTask(id) ?? task,
@@ -2035,6 +2036,7 @@ export function createTurnLoop(
 							tools: "read,grep,glob",
 							config: join(dirname(ops.extensionPath), "check.yml"),
 							maxTime: "1800",
+							dataRoot: store.dataRoot,
 							// The check's transcript lands in the review card's log, next to the run it checks.
 							logPath: store.logPath(id),
 							onLog: () => ops.notifyLog(name, id),
@@ -2256,6 +2258,7 @@ export function createTurnLoop(
 								tools: "read,grep,glob",
 								config: join(dirname(ops.extensionPath), "check.yml"),
 								maxTime: "1800",
+								dataRoot: store.dataRoot,
 								// The check's transcript lands in the card's log, next to the run it checks.
 								logPath: store.logPath(id),
 								onLog: () => ops.notifyLog(name, id),
