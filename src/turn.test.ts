@@ -3046,6 +3046,39 @@ describe("turn release cards", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
+	test("a cancel landing during a release turn's publish is refused and the release lands", async () => {
+		const record = baseRecord();
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const { store, projects, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: async (o: unknown) => {
+				record.publishRelease.push(o);
+				reached.resolve();
+				await gate.promise;
+				return "tagged";
+			},
+		});
+		const e = projects.get(store.name)!;
+		e.target = "origin/main";
+		const task = releaseTask(store);
+		const turn = loop.runTurn(store.name, task.id);
+		await reached.promise;
+		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
+			error: "release already publishing",
+			status: 409,
+		});
+		expect(store.getTask(task.id)!.cancelledAt).toBe(null);
+		expect(record.removeWorktree).toHaveLength(0);
+		gate.resolve();
+		await turn;
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v1.0.0");
+		expect(record.publishRelease).toHaveLength(1);
+	});
+
 	test("a release command gets a notes file and its output logged", async () => {
 		const record = baseRecord();
 		const { store, projects, loop } = setupWith(record, {
@@ -3150,6 +3183,67 @@ describe("turn settleReviews", () => {
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v2.0.0");
 		expect(after.needsReason).toBe(null);
+		expect(record.publishRelease).toHaveLength(1);
+	});
+
+	test("a cancel landing before a parked release's publish skips the publish and keeps the cancel", async () => {
+		const record = baseRecord();
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const { store, projects, loop } = setupWith(record, {
+			archReviewDelta: async () => {
+				reached.resolve();
+				await gate.promise;
+				return { delta: 0, reviewed: true, anchor: "a" };
+			},
+			publishRelease: publishingRelease(record),
+		});
+		const e = projects.get(store.name)!;
+		e.target = "origin/main";
+		const task = parkedCard(store);
+		loop.schedule();
+		await reached.promise;
+		await loop.cancel(e, task.id, false);
+		gate.resolve();
+		await flushPromises();
+		const after = store.getTask(task.id)!;
+		expect(record.publishRelease).toHaveLength(0);
+		expect(after.cancelledAt).not.toBe(null);
+		expect(after.stage).not.toBe("done");
+		expect(after.summary).not.toBe("Released v2.0.0");
+		expect(logText(store, task.id)).toContain(
+			"release skipped: the card was cancelled",
+		);
+	});
+
+	test("a cancel landing during a parked release's publish is refused and the release lands", async () => {
+		const record = baseRecord();
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: async (o: unknown) => {
+				record.publishRelease.push(o);
+				reached.resolve();
+				await gate.promise;
+				return "tagged";
+			},
+		});
+		const e = projects.get(store.name)!;
+		e.target = "origin/main";
+		const task = parkedCard(store);
+		loop.schedule();
+		await reached.promise;
+		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
+			error: "release already publishing",
+			status: 409,
+		});
+		expect(store.getTask(task.id)!.cancelledAt).toBe(null);
+		expect(record.removeWorktree).toHaveLength(0);
+		gate.resolve();
+		await flushPromises();
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v2.0.0");
 		expect(record.publishRelease).toHaveLength(1);
 	});
 

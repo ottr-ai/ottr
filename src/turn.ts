@@ -411,7 +411,10 @@ export function getSettingsLogged(e: TurnProject): ProjectSettings {
 	}
 }
 
-export type CancelOutcome = { kept: string } | { removed: true };
+export type CancelOutcome =
+	| { kept: string }
+	| { removed: true }
+	| { error: string; status: 409 };
 export type StopOutcome = { ok: true } | { error: string; status: 404 | 409 };
 export type FinishKeptOutcome =
 	| { ok: true }
@@ -448,6 +451,10 @@ export function createTurnLoop(
 	/** Keys a stop-turn request marked: runTurn consumes the mark at settle, so a kill from
 	 * stopTurn settles the card as stopped instead of leaving it to cancelTask. */
 	const stopping = new Set<string>();
+	/** Release cards whose irreversible publish has begun, from the fresh no-cancel check in
+	 * publishReleaseCard to the caller's final card write: cancel refuses these keys, so a
+	 * cancel can neither lose to the tag/push nor be overwritten by "Released". */
+	const publishing = new Set<string>();
 
 	/** Shared settle-and-requeue for the lost-run sweep and the boot restart sweep: end the open
 	 * row (null turnId: the crash landed before the row existed, or the last row is already
@@ -794,7 +801,10 @@ export function createTurnLoop(
 
 	/** Publish one approved release card: Ottr's tag/push/GitHub release, or the project's release
 	 * command. Returns null on success, else a needs_you reason. Runs at the end of the review turn
-	 * (runTurn) or later from settleReviews once the review's findings have landed. */
+	 * (runTurn) or later from settleReviews once the review's findings have landed. A cancel that
+	 * lands before the publish step skips it and also returns null: the cancel owns the card, so
+	 * callers re-read the card before they write. On publish, the card's key enters `publishing`;
+	 * the caller deletes it after its final card write. */
 	async function publishReleaseCard(
 		e: TurnProject,
 		task: Task,
@@ -804,6 +814,16 @@ export function createTurnLoop(
 	): Promise<string | null> {
 		const store = e.store;
 		const log = (line: string) => appendLog(store, task.id, line);
+		// Synchronous with the publish call after it: a cancel either lands first (and the publish
+		// skips) or finds the claim (and refuses).
+		const claimPublish = (): boolean => {
+			if (store.getTask(task.id)?.cancelledAt !== null) {
+				log("release skipped: the card was cancelled");
+				return false;
+			}
+			publishing.add(`${store.name}/${task.id}`);
+			return true;
+		};
 		try {
 			// Read fresh: the settings may have changed during a long review.
 			const settings = store.getSettings();
@@ -818,6 +838,7 @@ export function createTurnLoop(
 				// settleReviews waited for them. publishRelease refuses a head without that commit.
 				const head = await ops.resolveTarget(e.path, true);
 				if (head.warning !== null) log(head.warning);
+				if (!claimPublish()) return null;
 				line = await ops.publishRelease({
 					mainPath: e.path,
 					reviewed: base,
@@ -832,6 +853,7 @@ export function createTurnLoop(
 				const notesFile = join(store.tasksDir, `release-${task.id}.md`);
 				writeFileSync(notesFile, task.releaseNotes ?? "");
 				log(`$ ${settings.releaseCommand}`);
+				if (!claimPublish()) return null;
 				const key = `${store.name}/${task.id}`;
 				let releaseEntry: RunEntry | null = null;
 				try {
@@ -907,15 +929,20 @@ export function createTurnLoop(
 				// A release command's process takes a global cap slot: claim it before the first
 				// await, or every project in the same schedule() tick sees the slot free (R3-5).
 				preparing.add(key);
+				// `tasks` is this tick's snapshot and every await below may let a cancel in: re-read
+				// before each write, and leave a cancelled card to cancel.
+				const cancelled = () => e.store.getTask(t.id)?.cancelledAt !== null;
 				try {
 					if (findingsHold(e.store.listTasks(), t) !== null) continue;
 					if (t.releaseVersion === null) {
 						// The Review button's card has nothing to publish.
+						const commits = await ops.targetCommits(e.path, target);
+						if (cancelled()) continue;
 						e.store.updateTask(t.id, {
 							stage: "done",
 							state: "idle",
 							needsReason: null,
-							commits: await ops.targetCommits(e.path, target),
+							commits,
 						});
 						continue;
 					}
@@ -928,6 +955,7 @@ export function createTurnLoop(
 						t.worktree,
 						target,
 					);
+					if (cancelled()) continue;
 					if (err !== null) {
 						e.store.updateTask(t.id, {
 							stage: "in_progress",
@@ -936,16 +964,19 @@ export function createTurnLoop(
 						});
 						continue;
 					}
+					const commits = await ops.targetCommits(e.path, target);
+					if (cancelled()) continue;
 					e.store.updateTask(t.id, {
 						stage: "done",
 						state: "idle",
 						needsReason: null,
 						summary: `Released ${t.releaseVersion}`,
-						commits: await ops.targetCommits(e.path, target),
+						commits,
 					});
 				} finally {
 					settling.delete(key);
 					preparing.delete(key);
+					publishing.delete(key);
 				}
 			}
 		} catch (err) {
@@ -1678,7 +1709,8 @@ export function createTurnLoop(
 							needsReason: err,
 						};
 				}
-				// (A cancel landing inside publishReleaseCard is caught by the settle recheck below.)
+				// A cancel before the publish step skips it and is caught by the settle recheck below;
+				// from the publish step to the final write, the `publishing` claim refuses a cancel.
 			}
 			// UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
 			// screenshot warns — the board would otherwise show UI work without visual proof. On a
@@ -2429,6 +2461,7 @@ export function createTurnLoop(
 			// resumed replacement now; deleting it here would free the replacement's cap slot.
 			// A taken-over check is the same case: the sweep deleted this run's claim.
 			if (!entry?.abandoned && !checkTakenOver) preparing.delete(key);
+			publishing.delete(key);
 			schedule();
 		}
 	}
@@ -2463,6 +2496,9 @@ export function createTurnLoop(
 		force: boolean,
 	): Promise<CancelOutcome> {
 		const store = e.store;
+		// The tag and push cannot be taken back: a cancel must not claim a card it cannot stop.
+		if (publishing.has(`${store.name}/${id}`))
+			return { error: "release already publishing", status: 409 };
 		store.updateTask(id, { cancelledAt: Date.now() });
 		const handle = running.get(`${store.name}/${id}`);
 		if (handle) {

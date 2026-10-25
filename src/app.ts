@@ -4458,6 +4458,7 @@ export function createApp(deps: AppDeps) {
 						found.task.id,
 						r.body.force === true,
 					);
+					if ("error" in out) return json({ error: out.error }, out.status);
 					return "kept" in out
 						? json({ ok: false, kept: out.kept })
 						: json({ ok: true });
