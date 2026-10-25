@@ -306,48 +306,86 @@ on the command line (command-line config outranks repo and global config), and `
 reaches only the network subcommands (`clone`, `fetch`, `ls-remote`, `pull`, `push`);
 local subcommands such as `status` run without it.
 
-Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` and
-`GH_CONFIG_DIR` to the container filesystem (`/etc/ottr/…`), which no worker mounts. The
-entry script seeds the global git config from the provisioned home at every board start
-(skipped when something is mounted at that path on purpose), and gh starts empty on
-purpose, because gh config can name commands. A config planted in the shared home never
-reaches the board's git or gh while the stack runs; re-provisioning plus a board restart
-refreshes the seed. The system-level credential helper is baked into the image, outside
-every volume, and answers only for github.com when `GH_TOKEN` is set.
+Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` to
+`/etc/ottr/gitconfig` and `GH_CONFIG_DIR` to `/etc/ottr/gh`. These paths are on the
+`board-config` volume. Only the `server` service mounts this volume, and no worker mounts
+it. The volume survives each container recreate, for example the hourly auto-deploy.
+The entry script never copies from the shared home (`/root`). When the git config is
+absent, the entry script writes only the fixed Ottr identity (`user.name = Ottr`,
+`user.email = ottr@localhost`). gh starts empty on purpose, because gh config can name
+commands. When a pinned path is inside `$HOME`, the entry script refuses to start. It
+writes each refusal and warning to stderr as a line that starts with `ottr-entry: R5-1:`.
+A config planted in the shared home never reaches the board's git or gh. The system-level
+credential helper is baked into the image, outside every volume. It answers only for
+github.com when `GH_TOKEN` is set.
 
 The same boundary covers the board's own omp agent layer. A worker-plantable
 `~/.omp/agent/config.yml` could reassign the `modelRoles` the release review runs on, and
-planted skills, extensions or plugins would load into the board's privileged turns (merge,
-release review, release). The compose file pins the board's `PI_CODING_AGENT_DIR` to
-`/etc/ottr/omp-agent` — omp resolves its whole agent dir (config.yml, agent.db, skills,
-extensions, plugins, sessions) from that variable. The entry script seeds the directory
-once from the provisioned home at board start, after the memory-backend flip, so the seed
-carries the flipped `memory.backend`. The board's own config readers (`src/models.ts`
-model roles, the Settings hindsight flip, the sign-in store in `src/login.ts`) resolve the
-same variable, and a worker dispatch strips the variable from the turn env: a worker keeps
-its shared home, and a turn that ran locally would otherwise hold the directory the board
-executes. A plant made in the shared home after board start reaches neither.
+planted skills or extensions would load into the board's privileged turns (merge, release
+review, release). The compose file pins the board's `PI_CODING_AGENT_DIR` to
+`/etc/ottr/home/.omp/agent` on the `board-config` volume. omp resolves its agent dir
+(config.yml, agent.db, skills, extensions, sessions) from that variable. The entry script
+creates this directory empty and logs an `ottr-entry: R5-1:` line while it is unseeded.
+The agent layer comes only from the trusted `board-seed` service, a one-off of the Alate
+image (see [Seed the board config](#seed-the-board-config)). At the next start, the entry
+script flips `memory.backend` in the seeded `config.yml`. The board's own config readers
+(`src/models.ts` model roles, the Settings hindsight flip, the sign-in store in
+`src/login.ts`) resolve the same variable. A worker dispatch strips the variable from the
+turn env: a worker keeps its shared home, and a turn that ran locally would otherwise hold
+the directory the board executes. The board's layer does not follow Alate provisions of
+the shared home. After a data-repo change, run `board-seed` again.
+
+#### Seed the board config
+
+Do these steps once after the first `docker compose up`. Do them again after each
+data-repo change that the board's own turns need. The first deploy of this change also
+needs them: an existing stack starts with an empty `board-config` volume.
+
+1. Run the seed. For a private data repo, export `GH_TOKEN` first:
+   `docker compose run --rm board-seed --repo <owner/name>`.
+   To use a local checkout of the data repo, run
+   `docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data`.
+2. Restart the board: `docker compose restart server`.
+3. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
+   keys (`ANTHROPIC_API_KEY`, ...) in the env.
+
+The seed uses the same SkillSpector scan as worker provisioning, and a failed scan stops
+it. `--force` lets the data repo win over board-local edits. The seed skips plugins,
+because omp reads plugins from `$HOME/.omp/plugins` and not from the pinned agent dir.
+
+To verify the seed:
+
+- `docker compose logs server` shows no `ottr-entry: R5-1:` line about an unseeded agent
+  dir.
+- `docker compose exec server ls /etc/ottr/home/.omp/agent` lists `config.yml`, `rules`
+  and `skills`.
+
+#### Credentials
 
 Credentials split with the directory: Settings sign-in runs `omp login` against the
 pinned store, then `src/login.ts shareProviderCredentials` copies the provider's rows
 through to the shared store the workers read; sign-out copies the same rows with omp's
-"deleted by user" tombstones. Two consequences live with this design. Refresh-token
-rotation happens in whichever copy refreshes first, so the other copy's row can go stale
-until the next sign-in or the next board restart (the seed re-snapshots the shared file);
-omp then marks the row inactive after a failed refresh and Settings shows the provider as
-needing sign-in. And the write-through is surfaced, never silent: a failed copy reaches
-the sign-in view and the logout response as `syncError`.
+"deleted by user" tombstones. The entry script does not copy the shared `agent.db` into
+the pinned store. The board signs in under **Settings → Provider sign-in**, and its store
+stays on the `board-config` volume. Refresh-token rotation happens in whichever copy
+refreshes first, so the other copy's row can go stale until the next sign-in. omp then
+marks the row inactive after a failed refresh, and Settings shows the provider as
+needing sign-in. The write-through is never silent: a failed copy reaches the sign-in
+view and the logout response as `syncError`.
+
+#### Residuals
 
 What still trusts what: a main checkout's `.git/config` stays worker-writable, by
 construction of linked worktrees — worktrees share the common gitdir (per-worktree index
 writes, ref updates), so no read-only mount can wall the config off without breaking git
 inside the worktrees, and projects are onboarded at run time, so compose cannot pre-mount
 each config. The board's network subcommands still read `credential.helper`,
-`core.sshCommand` and `url.*.insteadOf` from that file, and the seed is a snapshot: a
-config written to the shared home before the board started rides along until the next
-re-provision and restart. Turn processes run shell git with whatever the turn's env
-holds. Closing the board's repo-config reads fully is code-side work in `src/worktree.ts`
-(per-call `-c` overrides), not topology. On the omp side, the http-400 dump directory
+`core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
+whatever the turn's env holds. Closing the board's repo-config reads fully is code-side
+work in `src/worktree.ts` (per-call `-c` overrides), not topology. omp reads plugins from
+`$HOME/.omp/plugins` and user skills from `$HOME/.agents/skills` (and `~/.agent/skills`),
+whatever `PI_CODING_AGENT_DIR` says. Thus, on the board, these still come from the shared
+home. A separate card tracks this residual. On the omp side, the http-400 dump directory
 stays under `$HOME/.omp/logs`: omp's state root does not follow `PI_CODING_AGENT_DIR`, so
 the reader in `src/runner.ts` must follow the writer; the board reads only file names
 there, never the request bodies, so a plant forges a name in one failure message at

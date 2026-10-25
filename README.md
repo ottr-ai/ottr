@@ -95,6 +95,13 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
+The board never takes its config from the worker-writable home volume. Seed the board's own agent layer from your data repo once, then restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)):
+
+```sh
+docker compose run --rm board-seed --repo <owner/name>
+docker compose restart server
+```
+
 The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_API_URL` for fleet memory, and provider keys pass through from the host shell. [docs/WORKERS.md](docs/WORKERS.md) has the full topology, updates and crash story.
 
 Hindsight is the preferred way to share memory between workers. Without `HINDSIGHT_API_URL`, omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only containers on the same host see it. Set the URL to a [Hindsight](https://github.com/vectorize-io/hindsight) server, and every worker on every machine reads and writes the same memory. See [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
