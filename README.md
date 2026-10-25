@@ -78,10 +78,14 @@ git clone git@github.com:ottr-ai/ottr.git ottr
 cd ottr
 export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
-export OTTR_AGENT_DB=~/.omp/agent/agent.db         # omp auth snapshot for the stack
+export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose build
 docker compose up -d
 ```
+
+The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
 
 Each GitHub release also publishes the image as `ghcr.io/ottr-ai/ottr` (amd64). To use it instead of a local build, replace the last two lines with:
 
