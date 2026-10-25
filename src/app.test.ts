@@ -1200,16 +1200,17 @@ describe("alate routes", () => {
 		await post("/api/alate", { url: alateUrl });
 	});
 
-	test("a provision outliving the board's wait is 202 running, not 502 failed", async () => {
-		// The mapping under test is the catch: AbortSignal.timeout rejects with a
-		// TimeoutError when the bound fires while alate is still provisioning.
-		// Reject like that directly instead of waiting 110 s.
+	// AbortSignal.timeout rejects with a TimeoutError when the 110 s bound fires.
+	// Reject like that directly instead of waiting 110 s. The follow-up `/health`
+	// probe reaches the fake, unless `healthDown` times it out too.
+	async function provisionAfterTimeout(healthDown = false): Promise<Response> {
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
 		) => {
-			if (new URL(String(input)).pathname === "/provision") {
+			const path = new URL(String(input)).pathname;
+			if (path === "/provision" || (healthDown && path === "/health")) {
 				const err = new Error("The operation was aborted due to timeout");
 				err.name = "TimeoutError";
 				throw err;
@@ -1217,11 +1218,38 @@ describe("alate routes", () => {
 			return realFetch(input, init);
 		}) as typeof fetch;
 		try {
-			const res = await post("/api/alate/provision", {});
+			return await post("/api/alate/provision", {});
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	}
+
+	test("a timed-out provision that alate's health reports running is 202 running", async () => {
+		const prev = alateBody;
+		alateBody = { ok: true, running: true };
+		try {
+			const res = await provisionAfterTimeout();
 			expect(res.status).toBe(202);
 			expect(await res.json()).toEqual({ running: true });
 		} finally {
-			globalThis.fetch = realFetch;
+			alateBody = prev;
+		}
+	});
+
+	test("a timeout before any response is 504, never running", async () => {
+		// A black-holed host times out in connect: nothing proves alate got the POST.
+		const down = await provisionAfterTimeout(true);
+		expect(down.status).toBe(504);
+		expect(await errorOf(down)).toContain("alate did not answer");
+		// alate answers health but runs no provision: the POST never started a run.
+		const prev = alateBody;
+		alateBody = { ok: true, running: false };
+		try {
+			const idle = await provisionAfterTimeout();
+			expect(idle.status).toBe(504);
+			expect(await errorOf(idle)).toContain("reports no running provision");
+		} finally {
+			alateBody = prev;
 		}
 	});
 
@@ -2034,13 +2062,15 @@ describe("alate provision trigger (U9)", () => {
 
 	test("the trigger's own provision outliving the wait records no failure or backoff", async () => {
 		// Same mapping as the manual route: the TimeoutError from the transport bound
-		// means delivered and accepted, so neither an error nor the hour backoff applies.
+		// plus a health report of the running provision means alate accepted it, so
+		// neither an error nor the hour backoff applies.
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
 		) => {
 			if (new URL(String(input)).pathname === "/provision") {
+				running = true; // alate took the POST and still runs the scripts
 				const err = new Error("The operation was aborted due to timeout");
 				err.name = "TimeoutError";
 				throw err;
@@ -2051,6 +2081,7 @@ describe("alate provision trigger (U9)", () => {
 			await m.app.alateProvisionTick();
 		} finally {
 			globalThis.fetch = realFetch;
+			running = false;
 		}
 		const v = (await (await m.call("/api/alate")).json()) as {
 			lastProvisionError: string | null;

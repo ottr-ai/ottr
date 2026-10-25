@@ -846,9 +846,32 @@ export function createApp(deps: AppDeps) {
 			};
 		return { ok: true, body };
 	}
+	/** Maps the provision POST's transport timeout. A TimeoutError alone does not prove
+	 *  delivery: a hung DNS lookup, TCP connect or TLS handshake rejects the same way.
+	 *  So ask alate once; only a health report of a running provision means "still running". */
+	async function provisionTimedOut(): Promise<{
+		ok: false;
+		status: number;
+		error: string;
+		running?: true;
+	}> {
+		const h = await alateHealth();
+		if (h.ok && h.body.running === true)
+			return {
+				ok: false,
+				status: 202,
+				error: "provision still running on alate",
+				running: true,
+			};
+		return {
+			ok: false,
+			status: 504,
+			error: `alate did not answer the provision request within 110 s${h.ok ? " and reports no running provision" : `: ${h.error}`}`,
+		};
+	}
 	/** POST <alate.url>/provision shared by the route and the U9 trigger, with its in-flight guard.
-	 *  `running: true` marks a delivered provision that outlived the transport bound: accepted
-	 *  by alate's single-flight guard and still executing there — never a failure. */
+	 *  `running: true` marks a provision that outlived the transport bound and that alate's
+	 *  health still reports as running — never a failure. */
 	async function provisionNow(): Promise<
 		| { ok: true; body: unknown }
 		| { ok: false; status: number; error: string; running?: true }
@@ -874,22 +897,15 @@ export function createApp(deps: AppDeps) {
 				res = await noRedirectFetch(alate.url + "/provision", {
 					method: "POST",
 					headers: { authorization: "Bearer " + alate.key },
-					// Bounded under serveOptions.idleTimeout: a hung alate must fail the
+					// Bounded under serveOptions.idleTimeout (120 s) together with the 5 s
+					// health probe in provisionTimedOut: a hung alate must fail the
 					// request, not hold the connection until the idle cut kills it.
 					signal: AbortSignal.timeout(110_000),
 				});
 			} catch (err) {
-				// AbortSignal.timeout rejects with TimeoutError: the POST was delivered
-				// and alate accepted it (single-flight), so the scripts are running —
-				// only this client's wait ended. Report that, never failure. A fast
-				// connect failure still lands in the 502 below.
+				// Awaited so the in-flight guard holds until the probe answers.
 				if ((err as Error).name === "TimeoutError")
-					return {
-						ok: false,
-						status: 202,
-						error: "provision still running on alate",
-						running: true,
-					};
+					return await provisionTimedOut();
 				return {
 					ok: false,
 					status: 502,
@@ -951,7 +967,7 @@ export function createApp(deps: AppDeps) {
 		// of recording its 409 as a failure.
 		if (h.body.running === true) return;
 		const r = await provisionNow();
-		if (!r.ok && r.running) return; // delivered and accepted; the outcome arrives via health
+		if (!r.ok && r.running) return; // still running on alate; the outcome arrives via health
 		alateProvisionError = r.ok ? null : r.error;
 		if (!r.ok) alateBackoffUntil = Date.now() + 60 * 60_000;
 	}
@@ -3174,8 +3190,8 @@ export function createApp(deps: AppDeps) {
 					// A manual success means the provider no longer holds the import, so a
 					// recorded trigger failure is stale.
 					if (r.ok) alateProvisionError = null;
-					// Delivered past the transport bound: 202 Accepted, not an error — the
-					// health poll delivers the outcome.
+					// Past the transport bound with alate's health reporting the run: 202
+					// Accepted, not an error — the health poll delivers the outcome.
 					if (!r.ok && r.running) return json({ running: true }, 202);
 					return r.ok ? json(r.body, 200) : json({ error: r.error }, r.status);
 				}),

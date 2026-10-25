@@ -21,6 +21,9 @@ const {
 	sourceIconUrl,
 	AskBlock,
 	triageWait,
+	provisionWatchStep,
+	ALATE_WATCH_MAX_DOWN,
+	ALATE_WATCH_DEADLINE_MS,
 } = await import("./app.tsx");
 
 describe("monogram", () => {
@@ -333,6 +336,49 @@ describe("alateHint", () => {
 				running: true,
 			}),
 		).toBe("provision running");
+	});
+});
+
+describe("provisionWatchStep", () => {
+	const running = {
+		state: "ok",
+		version: null,
+		behind: false,
+		pending: true,
+		running: true,
+	} as const;
+	const down = { state: "down" } as const;
+
+	test("a provision alate no longer reports as running has finished", () => {
+		expect(provisionWatchStep({ ...running, running: false }, 0, 0)).toBe(
+			"finished",
+		);
+		// Even past the deadline, a converged run is reported as finished.
+		expect(
+			provisionWatchStep(
+				{ ...running, running: false },
+				0,
+				ALATE_WATCH_DEADLINE_MS,
+			),
+		).toBe("finished");
+	});
+
+	test("the watch gives up once alate stops answering for enough probes", () => {
+		expect(provisionWatchStep(down, ALATE_WATCH_MAX_DOWN - 1, 0)).toBe("wait");
+		expect(provisionWatchStep(down, ALATE_WATCH_MAX_DOWN, 0)).toBe("lost");
+	});
+
+	test("a run that alate keeps reporting stops being followed at the deadline", () => {
+		expect(provisionWatchStep(running, 0, ALATE_WATCH_DEADLINE_MS - 1)).toBe(
+			"wait",
+		);
+		expect(provisionWatchStep(running, 0, ALATE_WATCH_DEADLINE_MS)).toBe(
+			"expired",
+		);
+		// A down probe short of the limit still ends at the deadline.
+		expect(provisionWatchStep(down, 1, ALATE_WATCH_DEADLINE_MS)).toBe(
+			"expired",
+		);
 	});
 });
 

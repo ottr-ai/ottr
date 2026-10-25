@@ -9157,6 +9157,24 @@ export function alateHint(h: AlateHealthState): string {
 	return flags.length > 0 ? flags.join(" · ") : "up to date";
 }
 
+/** Consecutive `down` health probes (15 s apart) after which Settings stops following a provision. */
+export const ALATE_WATCH_MAX_DOWN = 4;
+/** Longest time Settings follows a provision that alate keeps reporting as running. */
+export const ALATE_WATCH_DEADLINE_MS = 30 * 60_000;
+
+/** Next step of the Settings watch on a provision that outlived the board's wait: keep
+ *  waiting, or stop because the run finished, alate stopped answering (`downs` counts the
+ *  consecutive `down` probes including this one), or the deadline passed. */
+export function provisionWatchStep(
+	h: AlateHealthState,
+	downs: number,
+	elapsedMs: number,
+): "wait" | "finished" | "lost" | "expired" {
+	if (h.state === "ok" && h.running !== true) return "finished";
+	if (h.state === "down" && downs >= ALATE_WATCH_MAX_DOWN) return "lost";
+	return elapsedMs >= ALATE_WATCH_DEADLINE_MS ? "expired" : "wait";
+}
+
 /** Opens Settings and scrolls to the given section; the page remounts on the hash change, so the
  *  poll waits out the mount instead of racing it, and a second pass re-scrolls after the async
  *  sections above finish loading. Advisory link only — it never runs provisioning. */
@@ -9193,9 +9211,13 @@ function AlateSection() {
 	>([]);
 	const save = useBusy();
 	const prov = useBusy();
-	// True while a provision is known to run on alate (the board's HTTP wait ended at
-	// its transport bound); the health probe below, not the abandoned wait, reports it.
-	const [awaiting, setAwaiting] = useState(false);
+	// Start time of the watch on a provision that alate reported running when the board's
+	// HTTP wait ended at its transport bound; the health probe below, not the abandoned
+	// wait, reports the outcome. `null` while no watch runs.
+	const [watchSince, setWatchSince] = useState<number | null>(null);
+	const awaiting = watchSince !== null;
+	// Consecutive `down` probes during the watch.
+	const watchDowns = useRef(0);
 	const loadHealth = useCallback(
 		(u: string, isLive: () => boolean = () => true) => {
 			if (u === "") {
@@ -9227,15 +9249,30 @@ function AlateSection() {
 		return () => clearInterval(iv);
 	}, [awaiting, conn, loadHealth]);
 	useEffect(() => {
-		if (!awaiting || health === null || health.state !== "ok") return;
-		if (health.running) return;
-		setAwaiting(false);
-		setStatus(
-			health.pending
-				? "Provisioning ended, but alate still holds an unprovisioned import — check the alate dashboard for script output."
-				: "Provisioning finished successfully.",
+		if (watchSince === null || health === null) return;
+		watchDowns.current = health.state === "down" ? watchDowns.current + 1 : 0;
+		const step = provisionWatchStep(
+			health,
+			watchDowns.current,
+			Date.now() - watchSince,
 		);
-	}, [awaiting, health]);
+		if (step === "wait") return;
+		setWatchSince(null);
+		if (step === "finished") {
+			setStatus(
+				health.state === "ok" && health.pending
+					? "Provisioning ended, but alate still holds an unprovisioned import — check the alate dashboard for script output."
+					: "Provisioning finished successfully.",
+			);
+			return;
+		}
+		setStatus("Provisioning state unknown.");
+		setError(
+			step === "lost"
+				? "The alate server stopped answering while it provisioned. Check the alate dashboard, then provision again."
+				: `alate still reports a running provision after ${ALATE_WATCH_DEADLINE_MS / 60_000} minutes. Check the alate dashboard.`,
+		);
+	}, [watchSince, health]);
 	useEffect(() => {
 		let live = true;
 		fetch("/api/alate")
@@ -9304,16 +9341,18 @@ function AlateSection() {
 					}>;
 				}>("/api/alate/provision", {});
 				if (res.running === true) {
-					// 202 from the board: the POST was delivered and alate accepted it,
-					// but the board's wait hit its transport bound. Not a failure — the
-					// health probe follows the run until it converges. Drop the probe
-					// snapshot taken before the click: it predates the run, so the
-					// convergence effect must wait for the fresh read below.
+					// 202 from the board: its wait hit the transport bound, and alate's
+					// health reported the run as still running. Not a failure — the
+					// health probe follows the run until it converges, alate stops
+					// answering, or the deadline passes. Drop the probe snapshot taken
+					// before the click: it predates the run, so the convergence effect
+					// must wait for the fresh read below.
 					setHealth(null);
 					setStatus(
 						"Provisioning is still running on the alate server; the hint above follows it.",
 					);
-					setAwaiting(true);
+					watchDowns.current = 0;
+					setWatchSince(Date.now());
 					loadHealth(conn);
 					return true;
 				}
