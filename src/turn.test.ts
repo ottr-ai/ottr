@@ -2475,6 +2475,27 @@ describe("turn sessions, steering and images", () => {
 		expect(after.pendingImages).toEqual(["a", "b"]);
 	});
 
+	test("a new steer that only starts with the sent text stays whole", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		saveSession(store, "s9");
+		store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "one" });
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				// During the prepare window the user cancels the steer "one" and sends a new one.
+				ensurePackages: async () => {
+					store.updateTask(task.id, { pendingPrompt: "one more thing" });
+					return [];
+				},
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.pendingPrompt).toBe("one more thing");
+	});
+
 	test("onSession upgrades preparing to running once, then ignores repeats", async () => {
 		const store = freshStore();
 		const record = baseRecord();

@@ -1284,15 +1284,15 @@ export function createTurnLoop(
 			// Consume only what this turn sends; steering that landed since the build stays queued for the next one.
 			// The column holds the raw parked text (raw, e.g. the dep-hold marker); pending may be the
 			// dispatcher's swap of it, so strip by raw — a mismatched strip would re-steer forever.
+			// The steer route appends with "\n\n", so only raw itself or raw plus that separator is
+			// this turn's text: a cancelled steer replaced by one that merely starts with raw stays whole.
 			const fresh = store.getTask(id);
 			let rest = fresh?.pendingPrompt ?? null;
-			if (
-				raw !== null &&
-				pending !== null &&
-				rest !== null &&
-				rest.startsWith(raw)
-			)
-				rest = rest.slice(raw.length).replace(/^\n\n/, "") || null;
+			if (raw !== null && pending !== null && rest !== null) {
+				if (rest === raw) rest = null;
+				else if (rest.startsWith(`${raw}\n\n`))
+					rest = rest.slice(raw.length + 2) || null;
+			}
 			// Same prefix rule for images: a steer landing since the build appends, so drop only what this turn sends.
 			let restImages = fresh?.pendingImages ?? [];
 			if (
