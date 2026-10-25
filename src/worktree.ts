@@ -1,16 +1,18 @@
 import {
-	appendFileSync,
-	copyFileSync,
 	existsSync,
-	mkdirSync,
+	lstatSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
-	rmSync,
 	statSync,
 } from "node:fs";
 import * as path from "node:path";
-import { moveBelow } from "./confine.ts";
+import {
+	appendLineBelow,
+	copyBelow,
+	moveBelow,
+	removeBelow,
+} from "./confine.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -557,7 +559,7 @@ export async function createWorktree(o: {
 	} else {
 		if (onDisk)
 			// scratch dir from an interrupted add; the tracker owns .worktrees/<id>
-			rmSync(o.worktreePath, { recursive: true, force: true });
+			removeBelow(worktreeAnchor(o.mainPath, o.worktreePath), o.worktreePath);
 		else await git(["worktree", "prune"], o.mainPath); // stale admin entry
 		const branchExists =
 			(await git(["rev-parse", "--quiet", "--verify", o.branch], o.mainPath))
@@ -593,39 +595,27 @@ export async function createWorktree(o: {
 				if (rel === "") continue;
 				if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
 					continue;
-				const src = path.join(o.mainPath, rel);
-				const dest = path.join(o.worktreePath, rel);
-				mkdirSync(path.dirname(dest), { recursive: true });
-				copyFileSync(src, dest);
+				copyBelow(
+					{ anchor: o.mainPath, file: path.join(o.mainPath, rel) },
+					{
+						anchor: worktreeAnchor(o.mainPath, o.worktreePath),
+						file: path.join(o.worktreePath, rel),
+					},
+				);
 				copied.push(rel);
-				o.log(`copied ${rel} (${statSync(src).size} bytes)`);
+				o.log(
+					`copied ${rel} (${lstatSync(path.join(o.worktreePath, rel)).size} bytes)`,
+				);
 			}
 		}
 
 		if (copied.length > 0) {
-			const common = await git(["rev-parse", "--git-common-dir"], o.mainPath);
-			if (common.code !== 0)
-				throw new Error(
-					`git rev-parse --git-common-dir failed: ${common.stderr.trim()}`,
-				);
-			const excludePath = path.join(
-				path.resolve(o.mainPath, common.stdout.trim()),
-				"info",
-				"exclude",
-			);
+			const exclude = await excludeFile(o.mainPath);
 			for (const rel of copied) {
 				const relFwd = rel.replaceAll("\\", "/");
 				const ci = await git(["check-ignore", "-q", "--", rel], o.worktreePath);
 				if (ci.code === 1) {
-					mkdirSync(path.dirname(excludePath), { recursive: true });
-					let cur = "";
-					try {
-						cur = readFileSync(excludePath, "utf8");
-					} catch {
-						// missing file starts empty
-					}
-					const sep = cur === "" || cur.endsWith("\n") ? "" : "\n";
-					appendFileSync(excludePath, `${sep}/${relFwd}\n`);
+					appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
 					o.log(`added /${relFwd} to .git/info/exclude`);
 				} else if (ci.code > 1) {
 					throw new Error(
@@ -668,9 +658,10 @@ export async function removeWorktree(o: {
 }): Promise<void> {
 	await git(["worktree", "remove", "--force", o.worktreePath], o.mainPath); // best effort
 	if (existsSync(o.worktreePath)) {
+		const anchor = worktreeAnchor(o.mainPath, o.worktreePath);
 		for (let attempt = 0; ; attempt++) {
 			try {
-				rmSync(o.worktreePath, { recursive: true, force: true });
+				removeBelow(anchor, o.worktreePath);
 				break;
 			} catch (e) {
 				const code = (e as { code?: string }).code;
@@ -1092,24 +1083,46 @@ export async function ignoreInMain(
 	if (ci.code === 0) return;
 	if (ci.code > 1)
 		throw new Error(`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`);
+	const exclude = await excludeFile(mainPath);
+	appendLineBelow(
+		exclude.anchor,
+		exclude.file,
+		`/${rel.replaceAll("\\", "/")}`,
+	);
+}
+
+function isBelow(root: string, p: string): boolean {
+	const rel = path.relative(path.resolve(root), path.resolve(p));
+	return (
+		rel !== "" &&
+		rel !== ".." &&
+		!rel.startsWith(`..${path.sep}`) &&
+		!path.isAbsolute(rel)
+	);
+}
+
+/**
+ * The trusted anchor for server writes into a worktree: the main checkout when the worktree
+ * lies below it (the tracker's .worktrees/<id>), so a symlink planted at .worktrees is caught.
+ */
+export function worktreeAnchor(mainPath: string, worktreePath: string): string {
+	return isBelow(mainPath, worktreePath)
+		? mainPath
+		: path.dirname(path.resolve(worktreePath));
+}
+
+/** The main checkout's .git/info/exclude, anchored at the checkout when the git dir is inside it. */
+async function excludeFile(
+	mainPath: string,
+): Promise<{ anchor: string; file: string }> {
 	const common = await git(["rev-parse", "--git-common-dir"], mainPath);
 	if (common.code !== 0)
 		throw new Error(
 			`git rev-parse --git-common-dir failed: ${common.stderr.trim()}`,
 		);
-	const excludePath = path.join(
-		path.resolve(mainPath, common.stdout.trim()),
-		"info",
-		"exclude",
-	);
-	mkdirSync(path.dirname(excludePath), { recursive: true });
-	let cur = "";
-	try {
-		cur = readFileSync(excludePath, "utf8");
-	} catch {
-		// missing file starts empty
-	}
-	const relFwd = rel.replaceAll("\\", "/");
-	const sep = cur === "" || cur.endsWith("\n") ? "" : "\n";
-	appendFileSync(excludePath, `${sep}/${relFwd}\n`);
+	const dir = path.resolve(mainPath, common.stdout.trim());
+	return {
+		anchor: isBelow(mainPath, dir) ? mainPath : dir,
+		file: path.join(dir, "info", "exclude"),
+	};
 }

@@ -18,9 +18,12 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import {
+	appendLineBelow,
+	copyBelow,
 	mkdirBelow,
 	moveBelow,
 	openDir,
+	removeBelow,
 	renameBelow,
 	unlinkBelow,
 	type WriteMode,
@@ -312,5 +315,229 @@ describe("writeBelow property", () => {
 			}),
 		);
 		expect(readdirSync(outside)).toEqual([]);
+	});
+});
+
+describe("copyBelow", () => {
+	test("copies a regular file into new nested dirs and keeps its mode", () => {
+		const { anchor, outside } = fixture();
+		const from = join(anchor, "f");
+		writeFileSync(from, "data");
+		chmodSync(from, 0o750);
+		const to = join(outside, "x", "y", "f");
+		copyBelow({ anchor, file: from }, { anchor: outside, file: to });
+		expect(readFileSync(to, "utf8")).toBe("data");
+		expect(statSync(to).mode & 0o777).toBe(0o750);
+		expect(readFileSync(from, "utf8")).toBe("data");
+	});
+
+	test.skipIf(!linux)("copies a source symlink as a link", () => {
+		const { root, anchor, outside } = fixture();
+		const target = join(outside, "t");
+		writeFileSync(target, "keep");
+		const from = join(anchor, "ln");
+		symlinkSync(target, from);
+		const dst = join(root, "dst");
+		mkdirSync(dst);
+		const to = join(dst, "ln");
+		writeFileSync(to, "old");
+		copyBelow({ anchor, file: from }, { anchor: dst, file: to });
+		expect(lstatSync(to).isSymbolicLink()).toBe(true);
+		expect(readlinkSync(to)).toBe(target);
+		expect(readFileSync(target, "utf8")).toBe("keep");
+	});
+
+	test.skipIf(!linux)("refuses a symlinked destination parent", () => {
+		const { root, anchor, outside } = fixture();
+		const from = join(root, "src");
+		writeFileSync(from, "data");
+		symlinkSync(outside, join(anchor, "ln"));
+		expect(() =>
+			copyBelow(
+				{ anchor: root, file: from },
+				{ anchor, file: join(anchor, "ln", "f") },
+			),
+		).toThrow(/refusing/);
+		expect(readdirSync(outside)).toEqual([]);
+	});
+
+	test.skipIf(!linux)("refuses a symlinked source parent", () => {
+		const { root, anchor, outside } = fixture();
+		writeFileSync(join(outside, "secret"), "s");
+		symlinkSync(outside, join(anchor, "ln"));
+		const dst = join(root, "dst");
+		mkdirSync(dst);
+		expect(() =>
+			copyBelow(
+				{ anchor, file: join(anchor, "ln", "secret") },
+				{ anchor: dst, file: join(dst, "secret") },
+			),
+		).toThrow(/refusing/);
+		expect(existsSync(join(dst, "secret"))).toBe(false);
+	});
+});
+
+describe("appendLineBelow", () => {
+	const fifoOk =
+		linux && spawnSync("sh", ["-c", "command -v mkfifo"]).status === 0;
+
+	test("creates the file and its parents", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "a", "b", "f");
+		appendLineBelow(anchor, f, "one");
+		appendLineBelow(anchor, f, "two");
+		expect(readFileSync(f, "utf8")).toBe("one\ntwo\n");
+	});
+
+	test("adds a separator when the file lacks a trailing newline", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "a");
+		appendLineBelow(anchor, f, "b");
+		expect(readFileSync(f, "utf8")).toBe("a\nb\n");
+	});
+
+	test.skipIf(!linux)("refuses a symlink at the file", () => {
+		const { anchor, outside } = fixture();
+		const target = join(outside, "t");
+		writeFileSync(target, "keep");
+		const f = join(anchor, "f");
+		symlinkSync(target, f);
+		expect(() => appendLineBelow(anchor, f, "x")).toThrow(/refusing/);
+		expect(readFileSync(target, "utf8")).toBe("keep");
+	});
+
+	test.skipIf(!linux)("refuses a symlinked parent dir", () => {
+		const { anchor, outside } = fixture();
+		const target = join(outside, "f");
+		writeFileSync(target, "keep");
+		symlinkSync(outside, join(anchor, "ln"));
+		expect(() => appendLineBelow(anchor, join(anchor, "ln", "f"), "x")).toThrow(
+			/refusing/,
+		);
+		expect(readFileSync(target, "utf8")).toBe("keep");
+		expect(readdirSync(outside)).toEqual(["f"]);
+	});
+
+	test.skipIf(!fifoOk)("refuses a FIFO without hanging", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "fifo");
+		expect(spawnSync("mkfifo", [f]).status).toBe(0);
+		expect(() => appendLineBelow(anchor, f, "x")).toThrow(/not a regular file/);
+		expect(lstatSync(f).isFIFO()).toBe(true);
+	});
+});
+
+describe("removeBelow", () => {
+	/** An outside dir holding `f` with "keep". */
+	function sentinel(outside: string): string {
+		const f = join(outside, "f");
+		writeFileSync(f, "keep");
+		return f;
+	}
+
+	test("removes a nested tree", () => {
+		const { anchor } = fixture();
+		const t = join(anchor, "t");
+		mkdirSync(join(t, "a", "b"), { recursive: true });
+		writeFileSync(join(t, "a", "b", "f"), "x");
+		writeFileSync(join(t, "g"), "y");
+		writeFileSync(join(anchor, "other"), "z");
+		removeBelow(anchor, t);
+		expect(existsSync(t)).toBe(false);
+		expect(readdirSync(anchor)).toEqual(["other"]);
+	});
+
+	test("treats a missing target as no error", () => {
+		const { anchor } = fixture();
+		removeBelow(anchor, join(anchor, "nope", "deeper"));
+		expect(readdirSync(anchor)).toEqual([]);
+	});
+
+	test("refuses to remove the anchor itself", () => {
+		const { anchor } = fixture();
+		writeFileSync(join(anchor, "f"), "x");
+		expect(() => removeBelow(anchor, anchor)).toThrow(/refusing/);
+		expect(readdirSync(anchor)).toEqual(["f"]);
+	});
+
+	test.skipIf(!linux)(
+		"unlinks a symlink inside the tree, not its target",
+		() => {
+			const { anchor, outside } = fixture();
+			const f = sentinel(outside);
+			const t = join(anchor, "t");
+			mkdirSync(join(t, "sub"), { recursive: true });
+			symlinkSync(outside, join(t, "sub", "ln"));
+			removeBelow(anchor, t);
+			expect(existsSync(t)).toBe(false);
+			expect(readFileSync(f, "utf8")).toBe("keep");
+			expect(readdirSync(outside)).toEqual(["f"]);
+		},
+	);
+
+	test.skipIf(!linux)(
+		"refuses a symlinked parent between anchor and target",
+		() => {
+			const { anchor, outside } = fixture();
+			const f = sentinel(outside);
+			mkdirSync(join(outside, "t"));
+			writeFileSync(join(outside, "t", "g"), "keep");
+			symlinkSync(outside, join(anchor, "ln"));
+			expect(() => removeBelow(anchor, join(anchor, "ln", "t"))).toThrow(
+				/refusing/,
+			);
+			expect(readFileSync(f, "utf8")).toBe("keep");
+			expect(readFileSync(join(outside, "t", "g"), "utf8")).toBe("keep");
+		},
+	);
+
+	test.skipIf(!linux)("removes a symlink target as the link only", () => {
+		const { anchor, outside } = fixture();
+		const f = sentinel(outside);
+		const ln = join(anchor, "ln");
+		symlinkSync(outside, ln);
+		removeBelow(anchor, ln);
+		expect(lstatSync(ln, { throwIfNoEntry: false })).toBeUndefined();
+		expect(readFileSync(f, "utf8")).toBe("keep");
+		expect(readdirSync(outside)).toEqual(["f"]);
+	});
+});
+
+describe("removeBelow property", () => {
+	test.skipIf(!linux)("never removes anything outside the anchor", () => {
+		const { root, anchor, outside } = fixture();
+		mkdirSync(join(outside, "d"));
+		writeFileSync(join(outside, "d", "f"), "keep");
+		writeFileSync(join(root, "beside"), "keep");
+		// "d" and "f" name real entries behind the links: ln/d/f is outside/d/f
+		const seg = fc.constantFrom("..", ".", "a", "b", "ln", "d", "f");
+		fc.assert(
+			fc.property(fc.array(seg, { minLength: 1, maxLength: 4 }), (segs) => {
+				// rebuild the tree each run; rmSync does not follow symlinks
+				rmSync(anchor, { recursive: true, force: true });
+				mkdirSync(join(anchor, "a", "b"), { recursive: true });
+				writeFileSync(join(anchor, "a", "b", "f"), "x");
+				symlinkSync(outside, join(anchor, "ln"));
+				symlinkSync(outside, join(anchor, "a", "ln"));
+				symlinkSync(join(outside, "d"), join(anchor, "a", "b", "ln"));
+				try {
+					removeBelow(anchor, join(anchor, ...segs));
+				} catch {
+					// refusals are fine; the check below is what matters
+				}
+				expect(readFileSync(join(outside, "d", "f"), "utf8")).toBe("keep");
+				expect(readFileSync(join(root, "beside"), "utf8")).toBe("keep");
+				expect(existsSync(anchor)).toBe(true);
+			}),
+			{
+				examples: [
+					[["ln", "d"]],
+					[["ln", "d", "f"]],
+					[["a", "ln", "d"]],
+					[["a", "b", "ln", "f"]],
+				],
+			},
+		);
 	});
 });

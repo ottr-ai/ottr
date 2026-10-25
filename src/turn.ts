@@ -2,17 +2,10 @@
 // operation (process/git/release) injected so tests can drive the flows with fakes.
 
 import { createHash } from "node:crypto";
-import {
-	copyFileSync,
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	statSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
-import { renameBelow, writeBelow } from "./confine.ts";
+import { copyBelow, renameBelow, writeBelow } from "./confine.ts";
 import type { pidAlive } from "./dblock.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
@@ -106,6 +99,7 @@ import {
 	planKeptFinish,
 	type quarantineUntracked,
 	slugify,
+	worktreeAnchor,
 } from "./worktree.ts";
 
 /**
@@ -2602,9 +2596,14 @@ export function createTurnLoop(
 		for (const rel of planned.moves) {
 			if (wt === null || !existsSync(join(wt, rel)))
 				return { error: `file missing in the worktree: ${rel}`, status: 409 };
-			const dest = join(e.path, rel);
-			mkdirSync(dirname(dest), { recursive: true });
-			copyFileSync(join(wt, rel), dest);
+			try {
+				copyBelow(
+					{ anchor: worktreeAnchor(e.path, wt), file: join(wt, rel) },
+					{ anchor: e.path, file: join(e.path, rel) },
+				);
+			} catch (err) {
+				return { error: `cannot move ${rel}: ${errmsg(err)}`, status: 409 };
+			}
 		}
 		for (const rel of planned.ignores) await ops.ignoreInMain(e.path, rel);
 		appendLog(

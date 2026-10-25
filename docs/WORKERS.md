@@ -466,6 +466,20 @@ also reads each source this way from the worktree, so a symlink cannot make the 
 or delete a server file. The guard works only on Linux. The compose server always runs on
 Linux.
 
+The board writes on the `workspace` volume go through `src/confine.ts` too. The anchor is
+the project checkout. When the git dir or a worktree is outside the checkout, the anchor is
+that git dir or the parent dir of that worktree. These writes are:
+
+- The copy of `AGENTS.md`, `.omp` and the copy paths into a new worktree (`createWorktree`).
+- The entries that the board adds to `.git/info/exclude` (`createWorktree`, `ignoreInMain`).
+- The copy of kept files from a worktree into the main checkout (kept files finish).
+- The removal of a worktree directory (`removeWorktree`, and the scratch directory that an
+  interrupted `git worktree add` leaves).
+
+A copy writes a symlink as a link and never reads its target. A removal deletes a symlink
+itself and never the target. A symlink at a parent below the anchor, for example at
+`.worktrees` or `.git/info`, stops the operation with a `refusing <path>` error.
+
 Limits: omp writes its own session files in `sessions/` for turns that the board runs. This
 guard does not cover them.
 

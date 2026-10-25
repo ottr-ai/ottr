@@ -10,6 +10,8 @@ import {
 	readlinkSync,
 	readSync,
 	renameSync,
+	rmdirSync,
+	rmSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
@@ -48,7 +50,8 @@ const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 // A FIFO planted as a "file" would block a plain read open until a writer appears.
 const O_NONBLOCK = constants.O_NONBLOCK ?? 0;
-const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } = constants;
+const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } =
+	constants;
 
 export type WriteMode = "truncate" | "exclusive" | "append";
 const FLAGS: Record<WriteMode, number> = {
@@ -290,4 +293,114 @@ export function moveBelow(
 			unlinkSync(s);
 		}),
 	);
+}
+
+/**
+ * Copies one entry from below one anchor to below another, creating the destination's
+ * parents and replacing an entry already there. A regular file is copied by content with
+ * its mode, a symlink entry as a link that is never followed. A symlinked parent on either
+ * side, or any other entry type, fails the copy with "refusing <path>".
+ */
+export function copyBelow(
+	from: { anchor: string; file: string },
+	to: { anchor: string; file: string },
+): void {
+	withDir(from.anchor, dirname(from.file), {}, (src) =>
+		withDir(to.anchor, dirname(to.file), { create: true }, (dst) =>
+			copyEntry(
+				src.at(basename(from.file)),
+				dst.at(basename(to.file)),
+				from.file,
+			),
+		),
+	);
+}
+
+/**
+ * Appends `line` and a newline to `file` below `anchor`, creating the file and its parents.
+ * A newline goes first when the file does not end with one. A symlink at the file or at a
+ * parent below the anchor, or an entry that is not a regular file, fails with "refusing".
+ */
+export function appendLineBelow(
+	anchor: string,
+	file: string,
+	line: string,
+): void {
+	withDir(anchor, dirname(file), { create: true }, (d) => {
+		let fd: number;
+		try {
+			fd = openSync(
+				d.at(basename(file)),
+				O_RDWR | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK,
+				0o666,
+			);
+		} catch (err) {
+			if (errCode(err) === "ELOOP")
+				throw new Error(`refusing ${file}: a symlink`);
+			throw err;
+		}
+		try {
+			const st = fstatSync(fd);
+			if (!st.isFile()) throw new Error(`refusing ${file}: not a regular file`);
+			let lead = "";
+			if (st.size > 0) {
+				const last = Buffer.alloc(1);
+				readSync(fd, last, 0, 1, st.size - 1);
+				if (last[0] !== 0x0a) lead = "\n";
+			}
+			writeSync(fd, `${lead}${line}\n`);
+		} finally {
+			closeSync(fd);
+		}
+	});
+}
+
+/**
+ * Removes the entry at `p`, a path that resolves no parent again (a Dir.at result or a
+ * /proc/self/fd path); recurses into real directories only.
+ */
+function removeEntry(p: string): void {
+	let child: number;
+	try {
+		child = openSync(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		const code = errCode(err);
+		if (code === "ENOENT") return;
+		if (code !== "ELOOP" && code !== "ENOTDIR") throw err;
+		// a file or a symlink: remove the entry itself, never a symlink's target
+		try {
+			unlinkSync(p);
+		} catch (e) {
+			if (errCode(e) !== "ENOENT") throw e;
+		}
+		return;
+	}
+	try {
+		for (const n of readdirSync(`${FD_DIR}/${child}`))
+			removeEntry(`${FD_DIR}/${child}/${n}`);
+	} finally {
+		closeSync(child);
+	}
+	rmdirSync(p);
+}
+
+/**
+ * rm -rf for `target` below `anchor`. A symlink at the target or inside the tree is removed
+ * itself, never followed; a symlinked parent between anchor and target fails with
+ * "refusing <path>". A missing target or parent is no error.
+ */
+export function removeBelow(anchor: string, target: string): void {
+	if (parts(anchor, target).length === 0)
+		throw new Error(`refusing to remove the anchor ${anchor}`);
+	if (!guarded) {
+		rmSync(target, { recursive: true, force: true });
+		return;
+	}
+	try {
+		withDir(anchor, dirname(target), {}, (d) =>
+			removeEntry(d.at(basename(target))),
+		);
+	} catch (err) {
+		if (errCode(err) !== "ENOENT") throw err;
+	}
 }

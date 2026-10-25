@@ -9,10 +9,12 @@ import {
 import { execSync } from "node:child_process";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -7255,6 +7257,50 @@ describe("arch-review survivor kills", () => {
 			status: 409,
 		});
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"finish-kept moves a symlinked kept file as a link, not the target's content",
+		async () => {
+			const { store, loop, task, e } = await finishKeptCase();
+			const outside = mkdtempSync(join(tmpdir(), "turn-kept-secret-"));
+			dirs.push(outside);
+			const secret = join(outside, "secret.txt");
+			writeFileSync(secret, "top secret");
+			symlinkSync(secret, join(store.worktreesDir, task.id, "a.txt"));
+
+			await expect(
+				loop.finishKept(e, task.id, { "a.txt": "move" }),
+			).resolves.toEqual({ ok: true });
+
+			const moved = join(store.path, "a.txt");
+			expect(lstatSync(moved).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(moved)).toBe(secret);
+			expect(readFileSync(secret, "utf8")).toBe("top secret");
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"finish-kept refuses a move through a symlinked main-checkout dir",
+		async () => {
+			const { store, loop, task, e } = await finishKeptCase({
+				keptFiles: ["sub/f.txt"],
+			});
+			const outside = mkdtempSync(join(tmpdir(), "turn-kept-outside-"));
+			dirs.push(outside);
+			mkdirSync(join(store.worktreesDir, task.id, "sub"), { recursive: true });
+			writeFileSync(join(store.worktreesDir, task.id, "sub", "f.txt"), "x");
+			symlinkSync(outside, join(store.path, "sub"));
+
+			const res = (await loop.finishKept(e, task.id, {
+				"sub/f.txt": "move",
+			})) as { error: string; status: number };
+
+			expect(res.status).toBe(409);
+			expect(res.error).toMatch(/cannot move sub\/f.txt/);
+			expect(res.error).toMatch(/refusing/);
+			expect(readdirSync(outside)).toEqual([]);
+		},
+	);
 
 	test("finish-kept refuses a move when the worktree is gone", async () => {
 		const { loop, task, e } = await finishKeptCase(

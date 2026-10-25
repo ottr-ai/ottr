@@ -44,6 +44,7 @@ import {
 	redact,
 	redactingWriter,
 	remoteUrl,
+	removeWorktree,
 	resolveTarget,
 	serverMergePush,
 	setGitSecrets,
@@ -1601,6 +1602,130 @@ describe("ignoreInMain", () => {
 				.filter((l) => l === "/debug.log"),
 		).toHaveLength(0);
 	}, 60_000);
+});
+
+describe("server writes never follow planted symlinks", () => {
+	/** A main checkout with one commit; returns it and its HEAD. */
+	async function checkout(): Promise<{ main: string; base: string }> {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "init");
+		return { main, base: await must(main, "rev-parse", "HEAD") };
+	}
+
+	test("ignoreInMain adds a newline before /rel when exclude lacks a trailing one", async () => {
+		const { main } = await checkout();
+		const excludePath = join(main, ".git", "info", "exclude");
+		mkdirSync(join(main, ".git", "info"), { recursive: true });
+		writeFileSync(excludePath, "*.tmp");
+		await ignoreInMain(main, "out/report.md");
+		expect(readFileSync(excludePath, "utf8")).toBe("*.tmp\n/out/report.md\n");
+	}, 60_000);
+
+	test.skipIf(process.platform !== "linux")(
+		"ignoreInMain refuses a .git/info symlinked outside the checkout",
+		async () => {
+			const { main } = await checkout();
+			const outside = repo();
+			rmSync(join(main, ".git", "info"), { recursive: true, force: true });
+			symlinkSync(outside, join(main, ".git", "info"));
+			await expect(ignoreInMain(main, "debug.out")).rejects.toThrow(/refusing/);
+			expect(readdirSync(outside)).toEqual([]);
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"createWorktree copies a symlinked AGENTS.md as a link, never the target's content",
+		async () => {
+			const { main, base } = await checkout();
+			const secret = join(repo(), "secret.txt");
+			writeFileSync(secret, "top secret\n");
+			symlinkSync(secret, join(main, "AGENTS.md"));
+			const wt = join(repo(), "wt");
+			await createWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/link",
+				base,
+				copyExtra: [],
+				log: () => {},
+			});
+			const copy = lstatSync(join(wt, "AGENTS.md"));
+			expect(copy.isSymbolicLink()).toBe(true);
+			expect(readlinkSync(join(wt, "AGENTS.md"))).toBe(secret);
+			expect(readFileSync(secret, "utf8")).toBe("top secret\n");
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"createWorktree refuses a symlinked .git/info/exclude and rolls back",
+		async () => {
+			const { main, base } = await checkout();
+			const outside = join(repo(), "exclude");
+			writeFileSync(outside, "# outside\n");
+			const excludePath = join(main, ".git", "info", "exclude");
+			mkdirSync(join(main, ".git", "info"), { recursive: true });
+			rmSync(excludePath, { force: true });
+			symlinkSync(outside, excludePath);
+			writeFileSync(join(main, "AGENTS.md"), "rules\n");
+			const wt = join(repo(), "wt");
+			await expect(
+				createWorktree({
+					mainPath: main,
+					worktreePath: wt,
+					branch: "ott/excl",
+					base,
+					copyExtra: [],
+					log: () => {},
+				}),
+			).rejects.toThrow(/refusing/);
+			expect(readFileSync(outside, "utf8")).toBe("# outside\n");
+			expect(existsSync(wt)).toBe(false);
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"removeWorktree refuses a .worktrees dir symlinked outside the checkout",
+		async () => {
+			const { main } = await checkout();
+			const outside = repo();
+			mkdirSync(join(outside, "OTTR-1"));
+			writeFileSync(join(outside, "OTTR-1", "keep.txt"), "keep\n");
+			symlinkSync(outside, join(main, ".worktrees"));
+			await expect(
+				removeWorktree({
+					mainPath: main,
+					worktreePath: join(main, ".worktrees", "OTTR-1"),
+					branch: null,
+				}),
+			).rejects.toThrow(/refusing/);
+			expect(readFileSync(join(outside, "OTTR-1", "keep.txt"), "utf8")).toBe(
+				"keep\n",
+			);
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"removeWorktree unlinks a symlink inside the worktree without emptying its target",
+		async () => {
+			const { main } = await checkout();
+			const outside = repo();
+			writeFileSync(join(outside, "keep.txt"), "keep\n");
+			// An unregistered dir, so git's own remove fails and removeBelow does the work.
+			const wt = join(main, ".worktrees", "OTTR-2");
+			mkdirSync(wt, { recursive: true });
+			writeFileSync(join(wt, "file.txt"), "x");
+			symlinkSync(outside, join(wt, "escape"));
+			await removeWorktree({ mainPath: main, worktreePath: wt, branch: null });
+			expect(existsSync(wt)).toBe(false);
+			expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep\n");
+		},
+		60_000,
+	);
 });
 
 describe("arch-review survivor kills", () => {
