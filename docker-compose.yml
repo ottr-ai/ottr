@@ -49,11 +49,9 @@ x-worker: &worker
     # seeds it (and serves omp run by hand in a container).
     HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
     HINDSIGHT_API_TOKEN:
-    # GitHub token for worker-side git and gh (clone, fetch, push, release
-    # checks). Passes through from the host shell or the compose env file; the
-    # host already holds it in the gh keyring, so export GH_TOKEN there before
-    # `docker compose up`. Never baked into the image.
-    GH_TOKEN: ${GH_TOKEN:-}
+    # No GitHub token here: workers run turns only, and push credentials stay on the
+    # server (D6). The worker daemon strips GH_TOKEN and every git host credential from
+    # each turn's env, so a token set here would never reach a turn.
     # Keys that a project's MCP servers read pass through from the host env, like
     # an image-generation API key that a project's .omp/mcp.json reads.
     PIXELLAB_API_KEY:

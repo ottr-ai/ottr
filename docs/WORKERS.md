@@ -242,8 +242,16 @@ the run before, or the script exits non-zero. `PROOF_WORKER_URL`, `PROOF_CWD` an
 
 Worktree create/remove, the merge turn, the release fast-forward and
 `git push origin main` all run in the server container. Workers execute turn
-processes only; push credentials never leave the server: `startRun` strips the
-board's `GH_TOKEN` from the env it forwards to a worker.
+processes only. Push credentials never leave the server:
+
+- `startRun` removes the board's `GH_TOKEN` from the env that it forwards to a worker.
+- The worker daemon (`serveWorker`) removes `GH_TOKEN`, `GITHUB_TOKEN` and every git
+  host credential name (`GIT_AUTH_ENV_NAME`) from the env of each turn. This covers
+  a value in the container env and a value in the request.
+- The `x-worker` anchor in `docker-compose.yml` sets no GitHub token.
+
+A local turn (in the server container) keeps `GH_TOKEN`. A merge turn needs it for
+its push.
 
 ### Non-GitHub hosts
 

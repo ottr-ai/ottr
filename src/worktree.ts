@@ -116,8 +116,11 @@ export function networkGitAuth(cwd: string): Record<string, string> {
 	return networkAuthResolver(cwd);
 }
 
-function stripGitAuthEnv(env: Record<string, string | undefined>): void {
+/** Deletes every git host credential name in place: GH_TOKEN, GITHUB_TOKEN and the
+ * `GIT_AUTH_ENV_NAME` set. Local board git and every worker turn run without them. */
+export function stripGitAuthEnv(env: Record<string, string | undefined>): void {
 	delete env.GH_TOKEN;
+	delete env.GITHUB_TOKEN;
 	for (const k of Object.keys(env)) {
 		if (GIT_AUTH_ENV_NAME.test(k)) delete env[k];
 	}

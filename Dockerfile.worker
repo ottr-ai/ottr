@@ -178,8 +178,9 @@ RUN bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
 # git-lfs and Godot above are the two exceptions.
 
 # Runtime GitHub auth: the board keeps the token from onboarding/Settings and exports it as
-# GH_TOKEN to server-side git, gh and merge turns only (D6). This helper hands it to git for
-# github.com remotes, and names the cause instead of git's bare prompt failure without it.
+# GH_TOKEN to server-side git, gh and merge turns only (D6); the worker daemon strips it
+# from every work turn's env. This helper hands it to git for github.com remotes, and names
+# the cause instead of git's bare prompt failure without it.
 RUN git config --system credential.https://github.com.helper \
       '!f() { test "$1" = get || exit 0; if [ -z "$GH_TOKEN" ]; then echo "ottr: no GH_TOKEN here; the board passes its GitHub token (Settings) to server-side git only" >&2; exit 0; fi; echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
 

@@ -458,7 +458,7 @@ export function createApp(deps: AppDeps) {
 	/**
 	 * Server-side git, gh and merge turns read the token from GH_TOKEN; the worker image's git
 	 * credential helper hands it to git. Work turns never get it: runner strips it from the env
-	 * it forwards to workers (D6).
+	 * it forwards to workers, and serveWorker strips it from the worker's own env (D6).
 	 */
 	function applyGithubToken(): void {
 		if (githubToken !== null) process.env.GH_TOKEN = githubToken;

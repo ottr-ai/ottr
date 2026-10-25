@@ -6,6 +6,7 @@ import { platform } from "./platform/index.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
 import type { RunResult } from "./types.ts";
+import { stripGitAuthEnv } from "./worktree.ts";
 
 /**
  * Sentinel key of the final response line: the daemon streams omp stdout lines
@@ -91,12 +92,20 @@ export function serveWorker(opts: {
 					return new Response("aborted", { status: 499 });
 			}
 
+			// The worker's own token drives every worker, and the container env can hold a git
+			// host token (an operator's GH_TOKEN): a turn inherits neither, from the container
+			// or the request. Push credentials stay on the server (D6).
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				...body.env,
+			};
+			stripGitAuthEnv(env);
+			delete env.OTTR_WORKER_TOKEN;
 			let child: ChildProcess;
 			try {
 				child = spawn(opts.ompPath ?? "omp", body.argv, {
 					cwd: body.cwd,
-					// The worker's own token drives every worker: a turn must not inherit it.
-					env: { ...process.env, ...body.env, OTTR_WORKER_TOKEN: undefined },
+					env,
 					stdio: ["pipe", "pipe", "pipe"],
 					windowsHide: true,
 				});

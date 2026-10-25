@@ -26,6 +26,13 @@ writeFileSync(
 process.exit(3);`,
 );
 
+// Env-dump omp: echoes its whole env as one JSON line.
+const envDumpPath = join(dir, "env-omp.js");
+writeFileSync(
+	envDumpPath,
+	`process.stdout.write(JSON.stringify(process.env) + "\\n");`,
+);
+
 // Sleeper omp: emits a JSON event, then stays alive until killed.
 const sleepPath = join(dir, "sleep-omp.js");
 writeFileSync(
@@ -216,6 +223,54 @@ describe("serveWorker", () => {
 		} finally {
 			if (saved === undefined) delete process.env.OTTR_WORKER_TOKEN;
 			else process.env.OTTR_WORKER_TOKEN = saved;
+		}
+	});
+
+	test("omp never inherits a git host token, from the container env or the request", async () => {
+		const planted: Record<string, string> = {
+			GH_TOKEN: "ghp_operator",
+			GITHUB_TOKEN: "ghp_operator2",
+			GIT_ASKPASS: "/bin/askpass",
+			GIT_SSH_COMMAND: "ssh -i /key",
+			GIT_CONFIG_COUNT: "1",
+			GIT_CONFIG_KEY_0: "credential.helper",
+			GIT_CONFIG_VALUE_0: "!echo",
+			OTTR_GIT_TOKEN_0: "glpat_x",
+			OTTR_GIT_USER_0: "oauth2",
+		};
+		const saved = Object.fromEntries(
+			[...Object.keys(planted), "OTTR_PROBE_KEPT"].map((k) => [
+				k,
+				process.env[k],
+			]),
+		);
+		Object.assign(process.env, planted, { OTTR_PROBE_KEPT: "kept" });
+		try {
+			const url = start({ ompPath: process.execPath });
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "r-git-auth",
+					argv: [envDumpPath],
+					cwd: dir,
+					stdin: "",
+					env: { FOO: "bar", GH_TOKEN: "ghp_forwarded" },
+				}),
+			});
+			const env = JSON.parse((await readLines(res))[0] ?? "") as Record<
+				string,
+				string
+			>;
+			for (const k of Object.keys(planted)) expect(env).not.toHaveProperty(k);
+			// The strip is by name: the rest of the container env and the request still travel.
+			expect(env).toHaveProperty("OTTR_PROBE_KEPT", "kept");
+			expect(env).toHaveProperty("FOO", "bar");
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 		}
 	});
 

@@ -919,8 +919,10 @@ export function createRunSink(o: {
 	};
 }
 
-/** D6: no agent run, local or on a worker, merge turns included, ever holds a git host token,
- * Ottr's ssh command or the env-scoped credential helper; the server alone runs that git. */
+/** D6: no agent run holds Ottr's ssh command, the env-scoped credential helper or the
+ * per-host tokens; the server alone runs that git. GH_TOKEN is not in this set: a local run
+ * (a merge turn in the server container) keeps it for its push. Worker turns never get it:
+ * startRun drops it from the forwarded env, and serveWorker strips it from its own env. */
 function withoutGitAuth(
 	env: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
@@ -1059,6 +1061,7 @@ export function startRun(o: {
 	// name and the board coordinates still reach the extension, but the worker's own
 	// credentials do not (childEnv strips them), and neither does the board's GitHub
 	// token: work turns only commit locally, push credentials never leave the server (D6).
+	// serveWorker also strips every git host token from the worker container's own env.
 	// The pinned PI_CODING_AGENT_DIR stays out too (R5-1): a turn that ran the board's
 	// own agent dir could rewrite the config and skills the board's privileged turns
 	// execute, and a worker without its own shared store would find no credentials.
