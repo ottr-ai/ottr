@@ -164,7 +164,7 @@ RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
 # omp is the main tool and follows its npm releases: .github/workflows/omp-bump.yml moves this
 # pin (docs/WORKERS.md, "Updates"). It is declared here, not with the other pins: a changed ARG
 # invalidates every later RUN, so a bump rebuilds only the layers below.
-ARG OMP_VERSION=18.12.0
+ARG OMP_VERSION=18.12.1
 # toon CLI (npm @toon-format/cli) for the bundled toon-json skill — must match
 # the host's toon so workers and host produce identical output.
 ARG TOON_VERSION=4.4.0
