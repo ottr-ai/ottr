@@ -5,7 +5,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
-import { copyBelow, renameBelow, writeBelow } from "./confine.ts";
+import {
+	copyBelow,
+	renameBelow,
+	trustedAnchor,
+	writeBelow,
+} from "./confine.ts";
 import type { pidAlive } from "./dblock.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
@@ -2599,7 +2604,8 @@ export function createTurnLoop(
 			try {
 				copyBelow(
 					{ anchor: worktreeAnchor(e.path, wt), file: join(wt, rel) },
-					{ anchor: e.path, file: join(e.path, rel) },
+					{ anchor: trustedAnchor(e.path), file: join(e.path, rel) },
+					wt,
 				);
 			} catch (err) {
 				return { error: `cannot move ${rel}: ${errmsg(err)}`, status: 409 };

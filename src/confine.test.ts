@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { delimiter, join, relative, sep } from "node:path";
 import {
 	appendLineBelow,
 	copyBelow,
@@ -25,6 +25,7 @@ import {
 	openDir,
 	removeBelow,
 	renameBelow,
+	trustedAnchor,
 	unlinkBelow,
 	type WriteMode,
 	writeBelow,
@@ -347,6 +348,37 @@ describe("copyBelow", () => {
 		expect(readFileSync(target, "utf8")).toBe("keep");
 	});
 
+	test.skipIf(!linux)(
+		"with a source tree, rewrites only relative link targets that leave the tree",
+		() => {
+			// The source tree is anchor/src; the copy lands at the same relative path in anchor/dst/wt.
+			const { anchor } = fixture();
+			const tree = join(anchor, "src");
+			const copy = join(anchor, "dst", "wt");
+			mkdirSync(join(tree, "a"), { recursive: true });
+			writeFileSync(join(anchor, "shared.md"), "shared");
+			writeFileSync(join(tree, "a", "run-3"), "run");
+			symlinkSync(join("..", "..", "shared.md"), join(tree, "a", "out"));
+			symlinkSync("run-3", join(tree, "a", "in"));
+			for (const name of ["out", "in"])
+				copyBelow(
+					{ anchor, file: join(tree, "a", name) },
+					{ anchor, file: join(copy, "a", name) },
+					tree,
+				);
+			expect(readlinkSync(join(copy, "a", "in"))).toBe("run-3");
+			expect(readlinkSync(join(copy, "a", "out"))).toBe(
+				join("..", "..", "..", "shared.md"),
+			);
+			expect(realpathSync(join(copy, "a", "out"))).toBe(
+				realpathSync(join(anchor, "shared.md")),
+			);
+			expect(readlinkSync(join(tree, "a", "out"))).toBe(
+				join("..", "..", "shared.md"),
+			);
+		},
+	);
+
 	test.skipIf(!linux)("refuses a symlinked destination parent", () => {
 		const { root, anchor, outside } = fixture();
 		const from = join(root, "src");
@@ -539,5 +571,25 @@ describe("removeBelow property", () => {
 				],
 			},
 		);
+	});
+});
+
+describe("trustedAnchor", () => {
+	test("returns the OMP_TRACKER_ROOTS entry that holds the path, else the path", () => {
+		const saved = process.env.OMP_TRACKER_ROOTS;
+		const { root, anchor, outside } = fixture();
+		const other = mkdtempSync(join(tmpdir(), "confine-other-"));
+		roots.push(other);
+		process.env.OMP_TRACKER_ROOTS = ` ${other} ${delimiter}${root}`;
+		try {
+			expect(trustedAnchor(join(anchor, "p"))).toBe(root);
+			expect(trustedAnchor(root)).toBe(root);
+			expect(trustedAnchor(`${root}-sibling`)).toBe(`${root}-sibling`);
+			delete process.env.OMP_TRACKER_ROOTS;
+			expect(trustedAnchor(outside)).toBe(outside);
+		} finally {
+			if (saved === undefined) delete process.env.OMP_TRACKER_ROOTS;
+			else process.env.OMP_TRACKER_ROOTS = saved;
+		}
 	});
 });

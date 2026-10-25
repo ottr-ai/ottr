@@ -1726,6 +1726,51 @@ describe("server writes never follow planted symlinks", () => {
 		},
 		60_000,
 	);
+
+	test("ignoreInMain refuses a git dir outside the checkout; that exclude stays unchanged", async () => {
+		const main = repo();
+		const gitDir = join(repo(), "g");
+		await must(
+			main,
+			"init",
+			"-q",
+			"-b",
+			"main",
+			`--separate-git-dir=${gitDir}`,
+		);
+		const excludePath = join(gitDir, "info", "exclude");
+		const before = readFileSync(excludePath, "utf8");
+		await expect(ignoreInMain(main, "debug.out")).rejects.toThrow(
+			/refusing .*outside/,
+		);
+		expect(readFileSync(excludePath, "utf8")).toBe(before);
+	}, 60_000);
+
+	test.skipIf(process.platform !== "linux")(
+		"a project checkout swapped for a symlink below OMP_TRACKER_ROOTS is refused",
+		async () => {
+			const { main } = await checkout();
+			const root = repo();
+			const project = join(root, "p");
+			symlinkSync(main, project);
+			const excludePath = join(main, ".git", "info", "exclude");
+			const before = readFileSync(excludePath, "utf8");
+			const saved = process.env.OMP_TRACKER_ROOTS;
+			process.env.OMP_TRACKER_ROOTS = root;
+			try {
+				await expect(ignoreInMain(project, "debug.out")).rejects.toThrow(
+					/refusing/,
+				);
+			} finally {
+				if (saved === undefined) delete process.env.OMP_TRACKER_ROOTS;
+				else process.env.OMP_TRACKER_ROOTS = saved;
+			}
+			expect(readFileSync(excludePath, "utf8")).toBe(before);
+			await ignoreInMain(main, "debug.out");
+			expect(readFileSync(excludePath, "utf8")).toContain("/debug.out\n");
+		},
+		60_000,
+	);
 });
 
 describe("arch-review survivor kills", () => {

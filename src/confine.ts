@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import {
 	basename,
+	delimiter,
 	dirname,
 	isAbsolute,
 	join,
@@ -75,13 +76,30 @@ function errCode(err: unknown): string | undefined {
 	return (err as NodeJS.ErrnoException).code;
 }
 
+function inside(anchor: string, target: string): boolean {
+	const rel = relative(resolve(anchor), resolve(target));
+	return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+}
+
 /** The path components from anchor down to target; throws when target is not below anchor. */
 function parts(anchor: string, target: string): string[] {
-	const rel = relative(resolve(anchor), resolve(target));
-	if (rel === "") return [];
-	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+	if (!inside(anchor, target))
 		throw new Error(`${target} is outside ${anchor}`);
-	return rel.split(sep);
+	const rel = relative(resolve(anchor), resolve(target));
+	return rel === "" ? [] : rel.split(sep);
+}
+
+/**
+ * The trusted anchor for path `p` on a shared volume: the OMP_TRACKER_ROOTS entry that holds
+ * it (in compose the /workspace mount, which no worker can replace), so the walk also refuses
+ * a project checkout that a worker swapped for a symlink. `p` itself when no root holds it.
+ */
+export function trustedAnchor(p: string): string {
+	for (const root of (process.env.OMP_TRACKER_ROOTS ?? "").split(delimiter)) {
+		const r = root.trim();
+		if (r !== "" && inside(r, p)) return resolve(r);
+	}
+	return p;
 }
 
 function entryName(name: string): string {
@@ -231,15 +249,42 @@ export function renameBelow(anchor: string, from: string, to: string): void {
 	);
 }
 
-/** Copies one entry across mounts: a symlink as a link, a regular file by content. */
-function copyEntry(src: string, dst: string, label: string): void {
+/** Where a copy goes: the lexical paths of source and destination, and the tree holding the source. */
+interface Relink {
+	from: string;
+	to: string;
+	fromTree: string;
+}
+
+/**
+ * Copies one entry across mounts: a symlink as a link, a regular file by content. With
+ * `relink`, a relative link target that leaves `relink.fromTree` is rewritten so the copy at
+ * `relink.to` names the same path; a target inside the tree stays verbatim, so it names the
+ * same relative entry in the destination tree.
+ */
+function copyEntry(
+	src: string,
+	dst: string,
+	label: string,
+	relink?: Relink,
+): void {
 	try {
 		unlinkSync(dst); // replace, like rename would; an exclusive create follows
 	} catch (err) {
 		if (errCode(err) !== "ENOENT") throw err;
 	}
 	if (lstatSync(src).isSymbolicLink()) {
-		symlinkSync(readlinkSync(src), dst);
+		const target = readlinkSync(src);
+		const named =
+			relink && !isAbsolute(target)
+				? resolve(dirname(resolve(relink.from)), target)
+				: null;
+		symlinkSync(
+			relink && named !== null && !inside(relink.fromTree, named)
+				? relative(dirname(resolve(relink.to)), named)
+				: target,
+			dst,
+		);
 		return;
 	}
 	let sfd: number;
@@ -300,10 +345,16 @@ export function moveBelow(
  * parents and replacing an entry already there. A regular file is copied by content with
  * its mode, a symlink entry as a link that is never followed. A symlinked parent on either
  * side, or any other entry type, fails the copy with "refusing <path>".
+ *
+ * `sourceTree` names the tree that holds the source, when the destination sits at the same
+ * relative path in its own tree (a main checkout and its worktree). A relative link target
+ * inside the source tree then stays verbatim; one that leaves it is rewritten so the copy
+ * names the same path. Without `sourceTree`, every link target stays verbatim.
  */
 export function copyBelow(
 	from: { anchor: string; file: string },
 	to: { anchor: string; file: string },
+	sourceTree?: string,
 ): void {
 	withDir(from.anchor, dirname(from.file), {}, (src) =>
 		withDir(to.anchor, dirname(to.file), { create: true }, (dst) =>
@@ -311,6 +362,9 @@ export function copyBelow(
 				src.at(basename(from.file)),
 				dst.at(basename(to.file)),
 				from.file,
+				sourceTree === undefined
+					? undefined
+					: { from: from.file, to: to.file, fromTree: sourceTree },
 			),
 		),
 	);

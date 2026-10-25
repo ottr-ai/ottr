@@ -467,8 +467,10 @@ or delete a server file. The guard works only on Linux. The compose server alway
 Linux.
 
 The board writes on the `workspace` volume go through `src/confine.ts` too. The anchor is
-the project checkout. When the git dir or a worktree is outside the checkout, the anchor is
-that git dir or the parent dir of that worktree. These writes are:
+the `OMP_TRACKER_ROOTS` entry that holds the project checkout (in compose, the `/workspace`
+mount). Thus the board also refuses a project checkout that a worker replaced with a
+symlink. Without such a root, the anchor is the project checkout. When a worktree is outside
+the checkout, the anchor is the parent dir of that worktree. These writes are:
 
 - The copy of `AGENTS.md`, `.omp` and the copy paths into a new worktree (`createWorktree`).
 - The entries that the board adds to `.git/info/exclude` (`createWorktree`, `ignoreInMain`).
@@ -476,9 +478,12 @@ that git dir or the parent dir of that worktree. These writes are:
 - The removal of a worktree directory (`removeWorktree`, and the scratch directory that an
   interrupted `git worktree add` leaves).
 
-A copy writes a symlink as a link and never reads its target. A removal deletes a symlink
-itself and never the target. A symlink at a parent below the anchor, for example at
-`.worktrees` or `.git/info`, stops the operation with a `refusing <path>` error.
+A copy writes a symlink as a link and never reads its target. When a relative link target
+is outside the source tree, the copy changes it so that the new link names the same path.
+A removal deletes a symlink itself and never the target. A symlink at a parent below the
+anchor, for example at `.worktrees` or `.git/info`, stops the operation with a
+`refusing <path>` error. A git dir outside the project checkout gets no exclude entry: the
+board refuses it, because a worker can point `.git` at any dir.
 
 Limits: omp writes its own session files in `sessions/` for turns that the board runs. This
 guard does not cover them.

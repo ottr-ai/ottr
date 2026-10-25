@@ -7280,6 +7280,30 @@ describe("arch-review survivor kills", () => {
 	);
 
 	test.skipIf(process.platform !== "linux")(
+		"finish-kept keeps a relative link inside the worktree pointing at the moved sibling",
+		async () => {
+			const { store, loop, task, e } = await finishKeptCase({
+				keptFiles: ["out/latest", "out/run-3"],
+			});
+			const out = join(store.worktreesDir, task.id, "out");
+			mkdirSync(out, { recursive: true });
+			writeFileSync(join(out, "run-3"), "run");
+			symlinkSync("run-3", join(out, "latest"));
+
+			await expect(
+				loop.finishKept(e, task.id, {
+					"out/latest": "move",
+					"out/run-3": "move",
+				}),
+			).resolves.toEqual({ ok: true });
+
+			const moved = join(store.path, "out", "latest");
+			expect(readlinkSync(moved)).toBe("run-3");
+			expect(readFileSync(moved, "utf8")).toBe("run");
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
 		"finish-kept refuses a move through a symlinked main-checkout dir",
 		async () => {
 			const { store, loop, task, e } = await finishKeptCase({

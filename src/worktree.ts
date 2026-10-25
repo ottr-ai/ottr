@@ -1,6 +1,5 @@
 import {
 	existsSync,
-	lstatSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -12,6 +11,7 @@ import {
 	copyBelow,
 	moveBelow,
 	removeBelow,
+	trustedAnchor,
 } from "./confine.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
@@ -596,16 +596,18 @@ export async function createWorktree(o: {
 				if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
 					continue;
 				copyBelow(
-					{ anchor: o.mainPath, file: path.join(o.mainPath, rel) },
+					{
+						anchor: trustedAnchor(o.mainPath),
+						file: path.join(o.mainPath, rel),
+					},
 					{
 						anchor: worktreeAnchor(o.mainPath, o.worktreePath),
 						file: path.join(o.worktreePath, rel),
 					},
+					o.mainPath,
 				);
 				copied.push(rel);
-				o.log(
-					`copied ${rel} (${lstatSync(path.join(o.worktreePath, rel)).size} bytes)`,
-				);
+				o.log(`copied ${rel}`);
 			}
 		}
 
@@ -1008,7 +1010,10 @@ export async function quarantineUntracked(
 	for (const rel of r.stdout.split("\0")) {
 		if (rel === "") continue;
 		moveBelow(
-			{ anchor: worktreePath, file: path.join(worktreePath, rel) },
+			{
+				anchor: trustedAnchor(worktreePath),
+				file: path.join(worktreePath, rel),
+			},
 			{ anchor: dataRoot, file: path.join(quarantineDir, rel) },
 		);
 		moved.push(rel.replaceAll("\\", "/"));
@@ -1103,15 +1108,21 @@ function isBelow(root: string, p: string): boolean {
 
 /**
  * The trusted anchor for server writes into a worktree: the main checkout when the worktree
- * lies below it (the tracker's .worktrees/<id>), so a symlink planted at .worktrees is caught.
+ * lies below it (the tracker's .worktrees/<id>), so a symlink planted at .worktrees is caught;
+ * widened to the OMP_TRACKER_ROOTS mount that holds it (trustedAnchor).
  */
 export function worktreeAnchor(mainPath: string, worktreePath: string): string {
-	return isBelow(mainPath, worktreePath)
-		? mainPath
-		: path.dirname(path.resolve(worktreePath));
+	return trustedAnchor(
+		isBelow(mainPath, worktreePath)
+			? mainPath
+			: path.dirname(path.resolve(worktreePath)),
+	);
 }
 
-/** The main checkout's .git/info/exclude, anchored at the checkout when the git dir is inside it. */
+/**
+ * The main checkout's .git/info/exclude. A worker can point .git at any git dir, so a git dir
+ * outside the checkout is refused: no anchor would keep the append on the shared volume.
+ */
 async function excludeFile(
 	mainPath: string,
 ): Promise<{ anchor: string; file: string }> {
@@ -1121,8 +1132,10 @@ async function excludeFile(
 			`git rev-parse --git-common-dir failed: ${common.stderr.trim()}`,
 		);
 	const dir = path.resolve(mainPath, common.stdout.trim());
+	if (!isBelow(mainPath, dir))
+		throw new Error(`refusing ${dir}: the git dir is outside ${mainPath}`);
 	return {
-		anchor: isBelow(mainPath, dir) ? mainPath : dir,
+		anchor: trustedAnchor(mainPath),
 		file: path.join(dir, "info", "exclude"),
 	};
 }
