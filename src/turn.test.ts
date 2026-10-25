@@ -1,4 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import {
+	afterEach,
+	describe,
+	expect,
+	jest,
+	setSystemTime,
+	test,
+} from "bun:test";
 import { execSync } from "node:child_process";
 import {
 	existsSync,
@@ -45,6 +52,7 @@ import {
 	createTurnLoop,
 	errmsg,
 	FORK_HOLD_REASON,
+	generateTitle,
 	getSettingsLogged,
 	isKeptReason,
 	keptReason,
@@ -56,7 +64,12 @@ import {
 	UPDATE_HOLD_REASON,
 	uiFiles,
 } from "./turn.ts";
-import type { Outcome, RecordedFinding, RunResult } from "./types.ts";
+import type {
+	Outcome,
+	RecordedFinding,
+	RunResult,
+	WorkCheckRun,
+} from "./types.ts";
 import {
 	isClean as gitIsClean,
 	statusFiles as realStatusFiles,
@@ -6531,7 +6544,12 @@ describe("arch-review survivor kills", () => {
 	});
 
 	test("a needs_you parked shape never publishes", async () => {
-		const { store, record, projects, loop } = setup();
+		// The recording fake: the default publishRelease records nothing, so a publish would
+		// pass unnoticed.
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
 		projects.get(store.name)!.target = "origin/main";
 		const task = parkedCard(store);
 		store.updateTask(task.id, { state: "needs_you" });
@@ -6540,6 +6558,7 @@ describe("arch-review survivor kills", () => {
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
+		expect(store.getTask(task.id)!.stage).toBe("merging");
 	});
 
 	test("overlapping ticks settle the same release card once", async () => {
@@ -9225,5 +9244,4437 @@ describe("card state while a second-model check runs", () => {
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
 		expect(record.publishRelease).toHaveLength(0);
+	});
+});
+
+describe("turn survivor round 5 — helpers", () => {
+	type TitleSpawn = NonNullable<Parameters<typeof generateTitle>[1]>;
+	/** Fake `omp auth-gateway stdio`: records each request body and answers with `reply`. */
+	function gateway(reply: string, code = 0) {
+		const requests: {
+			body: { messages: { role: string; content: string }[] };
+		}[] = [];
+		const spawn: TitleSpawn = async (_argv, o) => {
+			requests.push(JSON.parse(o.stdin));
+			return {
+				code,
+				stdout: `${JSON.stringify({ ready: true })}\n${JSON.stringify({
+					id: 1,
+					status: 200,
+					body: { choices: [{ message: { content: reply } }] },
+				})}\n`,
+				stderr: code === 0 ? "" : "gateway down",
+			};
+		};
+		return { spawn, requests };
+	}
+
+	test("generateTitle sends a system instruction and the prompt's first 1000 chars", async () => {
+		const g = gateway("Fix login");
+		const prompt = `fix the login ${"x".repeat(1500)}`;
+		expect(await generateTitle(prompt, g.spawn)).toBe("Fix login");
+		expect(g.requests).toHaveLength(1);
+		const messages = g.requests[0]!.body.messages;
+		expect(messages.map((m) => m.role)).toEqual(["system", "user"]);
+		expect(messages[0]!.content).toContain("title");
+		expect(messages[1]!.content).toBe(prompt.slice(0, 1000));
+	});
+
+	test("generateTitle: a blank prompt asks no model and gets no title", async () => {
+		const g = gateway("Should not be asked");
+		expect(await generateTitle("   \n\t", g.spawn)).toBeNull();
+		expect(g.requests).toHaveLength(0);
+	});
+
+	test("generateTitle normalizes the reply: first line, collapsed spaces, outer quotes, 80 chars", async () => {
+		const cases: [string, string][] = [
+			["  Fix   the\tlogin  \nsecond line", "Fix the login"],
+			[`""Fix login""`, "Fix login"],
+			[`"Don't break 'quoted' words"`, "Don't break 'quoted' words"],
+			["Plain title", "Plain title"],
+			[`  'Spaced quote'  `, "Spaced quote"],
+		];
+		for (const [reply, title] of cases)
+			expect(await generateTitle("name me", gateway(reply).spawn)).toBe(title);
+		const long = await generateTitle("name me", gateway("w".repeat(100)).spawn);
+		expect(long).toBe("w".repeat(80));
+	});
+
+	test("generateTitle: an empty or all-quote reply and a gateway failure give null", async () => {
+		expect(await generateTitle("name me", gateway(`""`).spawn)).toBeNull();
+		expect(await generateTitle("name me", gateway("   ").spawn)).toBeNull();
+		expect(await generateTitle("name me", gateway("x", 1).spawn)).toBeNull();
+	});
+
+	test("uiFiles: test/ folders, extra suffixes and root ui/ code", () => {
+		expect(
+			uiFiles([
+				"test/Board.tsx",
+				"docs/page.html.md",
+				"web/foo.test.bak/page.html",
+				"src/ui/app.js.map",
+				"ui/app.ts",
+			]),
+		).toEqual(["web/foo.test.bak/page.html", "ui/app.ts"]);
+	});
+
+	test("ui-shot re-prompt lists five files, then an ellipsis", async () => {
+		const six = ["a", "b", "c", "d", "e", "f"].map((n) => `${n}.css`);
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			changedFiles: async () => six,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const prompt = store.getTask(task.id)!.pendingPrompt ?? "";
+		expect(prompt).toContain("(a.css, b.css, c.css, d.css, e.css, …)");
+		expect(prompt).not.toContain("f.css");
+	});
+
+	test("ui-shot re-prompt with exactly five files has no ellipsis", async () => {
+		const five = ["a", "b", "c", "d", "e"].map((n) => `${n}.css`);
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			changedFiles: async () => five,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const prompt = store.getTask(task.id)!.pendingPrompt ?? "";
+		expect(prompt).toContain("(a.css, b.css, c.css, d.css, e.css)");
+		expect(prompt).not.toContain("…");
+	});
+
+	test("checkRunError: a non-zero exit with no stderr names only the code", () => {
+		expect(checkRunError(runResult({ exitCode: 2, stderrTail: "  \n" }))).toBe(
+			"the check run exited with code 2",
+		);
+	});
+
+	test("image quarantine moves only the files that exist and counts them", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							exitCode: 1,
+							sessionId: null,
+							sawTerminalEnd: false,
+							finalText: "",
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		setImage(store, task.id, "1.png", "rejected-bytes");
+		store.updateTask(task.id, { images: ["1.png", "gone.png"] });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.images).toEqual(["gone.png"]);
+		expect(
+			existsSync(join(store.tasksDir, "quarantine", task.id, "1.png")),
+		).toBe(true);
+		expect(logText(store, task.id)).toContain(
+			`quarantined 1 image(s) to .tasks/quarantine/${task.id}: 1.png `,
+		);
+	});
+
+	test("parseReleaseVersion keeps every prerelease part", () => {
+		expect(parseReleaseVersion("shipped v1.2.3-rc.10 today")).toBe(
+			"v1.2.3-rc.10",
+		);
+		expect(parseReleaseVersion("shipped v1.2.3-rc.1.2 today")).toBe(
+			"v1.2.3-rc.1.2",
+		);
+		expect(parseReleaseVersion("shipped v1.2.3-beta today")).toBe(
+			"v1.2.3-beta",
+		);
+	});
+
+	test("parseTopicReport: no space after the colon, inner dots, cut at a space", () => {
+		expect(parseTopicReport("topic:v2 rollout")).toBe("v2 rollout");
+		expect(parseTopicReport("topic: v1.2 rollout.")).toBe("v1.2 rollout");
+		expect(parseTopicReport(`topic: ${"a".repeat(39)} bcd`)).toBe(
+			"a".repeat(39),
+		);
+	});
+
+	test("turnModel: a selector without a level keeps the transcript's own level", () => {
+		expect(turnModel("zai/glm-5.3-flash:high", "zai/glm-5.3-flash")).toBe(
+			"zai/glm-5.3-flash:high",
+		);
+	});
+
+	test("logStoreError: the window ends at exactly 10 minutes", () => {
+		const name = `edge-${Math.random()}`;
+		const seen: string[] = [];
+		const origError = console.error;
+		const origNow = Date.now;
+		let now = 1_000_000_000_000;
+		console.error = (_: string, err: unknown) => seen.push(String(err));
+		Date.now = () => now;
+		try {
+			logStoreError(name, new Error("first"));
+			now += 599_999;
+			logStoreError(name, new Error("inside"));
+			now += 1; // exactly 600_000 ms after the first line
+			logStoreError(name, new Error("again"));
+		} finally {
+			console.error = origError;
+			Date.now = origNow;
+		}
+		expect(seen).toEqual(["Error: first", "Error: again"]);
+	});
+
+	test("getSettingsLogged: a sick store logs its error", () => {
+		const seen: string[] = [];
+		const orig = console.error;
+		console.error = (_: string, err: unknown) => seen.push(String(err));
+		try {
+			const sick = {
+				name: `sick-${Math.random()}`,
+				getSettings() {
+					throw new Error("database is locked");
+				},
+			} as unknown as ProjectStore;
+			getSettingsLogged({ store: sick } as TurnProject);
+		} finally {
+			console.error = orig;
+		}
+		expect(seen).toEqual(["Error: database is locked"]);
+	});
+
+	test("held update and fork-born cards tell the user to approve the merge", async () => {
+		const u = setup();
+		const update = u.store.createTask("update pins");
+		u.store.updateTask(update.id, { updateIds: ["a@1"] });
+		u.store.setSettings({ holdUpdateMerges: true });
+		await u.loop.runTurn(u.store.name, update.id);
+		expect(u.store.getTask(update.id)!.needsReason).toContain("approve");
+
+		const f = setup({ commitsAhead: async () => 0 });
+		const parent = f.store.createTask("fork research: weekly digest");
+		f.store.updateTask(parent.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const fork = f.store.createTask("adopt fork idea");
+		f.store.updateTask(fork.id, { followUpOf: parent.id });
+		await f.loop.runTurn(f.store.name, fork.id);
+		const held = f.store.getTask(fork.id)!;
+		expect(held.state).toBe("needs_you");
+		expect(held.needsReason).toContain("approve");
+	});
+});
+
+describe("turn survivor round 5 — sweep, schedule, release publish, reviews", () => {
+	/** Store view with selected methods overridden; the rest resolves through the prototype. */
+	function proxyStore(
+		store: ProjectStore,
+		over: Record<string, unknown>,
+	): ProjectStore {
+		const p = Object.create(store) as ProjectStore & Record<string, unknown>;
+		for (const [k, v] of Object.entries(over)) p[k] = v;
+		return p as ProjectStore;
+	}
+
+	/** Runs fn with console.error captured; returns the logged error values. */
+	async function withErrors(fn: () => Promise<void> | void): Promise<string[]> {
+		const seen: string[] = [];
+		const orig = console.error;
+		console.error = (_: unknown, err: unknown) => {
+			seen.push(String(err));
+		};
+		try {
+			await fn();
+		} finally {
+			console.error = orig;
+		}
+		return seen;
+	}
+
+	/** The stale-row fixture: pid 4344 is dead, cap 0 keeps the requeued card from restarting. */
+	function sweepSetup() {
+		return setup({
+			maxTotalRuns: () => 0,
+			pidAlive: (pid: number) => pid !== 4344,
+		});
+	}
+
+	/** A review run whose findings check hangs on `checkPid` (the review run itself ends). */
+	function checkCase(
+		checkPid: number | null,
+		overrides: Partial<TurnOps> = {},
+		wrap: (s: ProjectStore) => ProjectStore = (s) => s,
+	) {
+		const store = freshStore();
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(wrap(store))]]),
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				commitsAhead: async () => 0,
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess");
+					const isReview = record.runs.length === 1;
+					return {
+						pid: isReview ? 4242 : checkPid,
+						done: isReview
+							? Promise.resolve(
+									runResult({
+										outcome: { status: "answered", summary: "review done" },
+										recorded: record.recorded,
+									}),
+								)
+							: new Promise<RunResult>(() => {}),
+						kill: async () => {},
+					};
+				},
+				...overrides,
+			}),
+		);
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		const checkKey = `${store.name}/${review.id}:check`;
+		return { store, record, loop, review, checkKey };
+	}
+
+	function parkedRelease(store: ProjectStore, version = "v4.0.0") {
+		const task = store.createTask(`release ${version}`);
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			releaseVersion: version,
+			base: "shaR",
+			worktree: "wt",
+		});
+		return task;
+	}
+
+	// ---- settleLostTurn ---------------------------------------------------------
+
+	test("a lost row re-sends its own prompt, not an earlier row's", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("two turns");
+		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		saveSession(store, "sess-9"); // saved, but it never recorded the prompt
+		const first = store.startTurn(task.id, "work", "first prompt", 4343);
+		store.finishTurn(first.id, { endedAt: 1 });
+		store.startTurn(task.id, "work", "second prompt", 4344);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(store.getTask(task.id)!.pendingPrompt).toBe("second prompt\n\n.");
+	});
+
+	test("a restart with a saved session and no open row requeues with the plain continue", async () => {
+		const { store, loop } = setup();
+		const task = store.createTask("restart me");
+		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		saveSession(store, "sess-9");
+
+		await loop.recoverRestarted();
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe(".");
+	});
+
+	// ---- sweepLostTurns -----------------------------------------------------------
+
+	test("the lost sweep settles a preparing card's dead row without re-sending an unsaved prompt", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("left preparing");
+		// The session id is known, but omp never wrote its file.
+		store.updateTask(task.id, { state: "preparing", sessionId: "sess-9" });
+		store.startTurn(task.id, "work", "old prompt", 4344);
+
+		loop.schedule();
+		await flushPromises();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe("lost agent process (pid 4344)");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe(".");
+	});
+
+	test("the lost sweep leaves a parked card's open row alone", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("parked with an open row");
+		store.updateTask(task.id, {
+			state: "needs_you",
+			needsReason: "which colour?",
+		});
+		store.startTurn(task.id, "work", "old prompt", 4344);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("which colour?");
+		expect(after.pendingPrompt).toBeNull();
+	});
+
+	test("a running card whose last row already ended is not settled again", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("between run and check");
+		store.updateTask(task.id, { state: "running" });
+		const row = store.startTurn(task.id, "work", "old prompt", 4344);
+		store.finishTurn(row.id, { endedAt: 1, exitCode: 0 });
+
+		loop.schedule();
+		await flushPromises();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).toBe(1);
+		expect(turn.error).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+	});
+
+	test("a pid-less open row whose worker stream is live is left alone", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("worker run");
+		store.updateTask(task.id, { state: "running" });
+		store.startTurn(task.id, "work", "old prompt", null);
+		const entry = {
+			pid: null,
+			done: new Promise<void>(() => {}),
+			kill: async () => {},
+		};
+		loop.running.set(`${store.name}/${task.id}`, entry);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+		expect(loop.running.get(`${store.name}/${task.id}`)).toBe(entry);
+	});
+
+	test("the sweep keeps a live entry whose pid is not the dead row's pid", async () => {
+		const { store, loop } = sweepSetup();
+		const task = store.createTask("dead row, other live process");
+		store.updateTask(task.id, { state: "running" });
+		store.startTurn(task.id, "work", "old prompt", 4344);
+		const key = `${store.name}/${task.id}`;
+		const entry = {
+			pid: 777,
+			done: new Promise<void>(() => {}),
+			kill: async () => {},
+		};
+		loop.running.set(key, entry);
+
+		loop.schedule();
+		await flushPromises();
+
+		// The dead row settles, but only the entry holding pid 4344 could be abandoned.
+		expect(store.listTurns(task.id)[0]!.error).toBe(
+			"lost agent process (pid 4344)",
+		);
+		expect(loop.running.get(key)).toBe(entry);
+	});
+
+	test("a store whose first listing fails is logged by the sweep", async () => {
+		const store = freshStore();
+		let calls = 0;
+		const loop = createTurnLoop(
+			new Map([
+				[
+					store.name,
+					fakeProject(
+						proxyStore(store, {
+							listTasks() {
+								calls += 1;
+								if (calls === 1) throw new Error("sweep listing failed");
+								return store.listTasks();
+							},
+						}),
+					),
+				],
+			]),
+			fakeOps(baseRecord()),
+		);
+
+		const seen = await withErrors(() => {
+			loop.schedule();
+			return flushPromises();
+		});
+
+		expect(calls).toBeGreaterThan(1); // the schedule's own listing succeeded
+		expect(seen.join("\n")).toContain("sweep listing failed");
+	});
+
+	// ---- sweepLostTurns: lost second-model checks ---------------------------------
+
+	test("a lost pid-less review check parks the card with the review reason", async () => {
+		const { store, loop, review, checkKey } = checkCase(null, {
+			pidAlive: () => true,
+		});
+		void loop.runTurn(store.name, review.id);
+		await flushPromises();
+		expect([...loop.running.keys()]).toContain(checkKey);
+
+		loop.schedule();
+		await flushPromises();
+
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"The review check was lost: lost check agent process. Reply to re-run the review, or cancel the card.",
+		);
+		expect(after.workCheckLog).toEqual([]); // a review check is not a work-check run
+		expect(logText(store, review.id)).toContain("lost check agent process");
+		expect([...loop.running.keys()]).not.toContain(checkKey);
+	});
+
+	test("a lost check on a cancelled card leaves the card to the cancel", async () => {
+		const { store, loop, review, checkKey } = checkCase(4242, {
+			pidAlive: () => false,
+		});
+		void loop.runTurn(store.name, review.id);
+		await flushPromises();
+		expect([...loop.running.keys()]).toContain(checkKey);
+		store.updateTask(review.id, { cancelledAt: Date.now() });
+
+		loop.schedule();
+		await flushPromises();
+
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("running");
+		expect(after.needsReason).toBeNull();
+		expect(logText(store, review.id)).toContain(
+			"lost check agent process (pid 4242)",
+		);
+		expect([...loop.running.keys()]).not.toContain(checkKey);
+	});
+
+	test("a check whose card vanished before the settle is skipped quietly", async () => {
+		let gone = false;
+		const { store, loop, review, checkKey } = checkCase(
+			4242,
+			{ pidAlive: () => false },
+			(s) =>
+				proxyStore(s, {
+					getTask: (id: string) => (gone ? null : s.getTask(id)),
+				}),
+		);
+		void loop.runTurn(store.name, review.id);
+		await flushPromises();
+		expect([...loop.running.keys()]).toContain(checkKey);
+		gone = true;
+
+		const seen = await withErrors(() => {
+			loop.schedule();
+			return flushPromises();
+		});
+
+		expect(seen).toEqual([]);
+		expect([...loop.running.keys()]).not.toContain(checkKey);
+		expect(store.getTask(review.id)!.state).toBe("running");
+	});
+
+	test("a lost-check settle that cannot write is logged", async () => {
+		let fail = false;
+		const { store, loop, review, checkKey } = checkCase(
+			4242,
+			{ pidAlive: () => false },
+			(s) =>
+				proxyStore(s, {
+					updateTask: (
+						id: string,
+						patch: Parameters<ProjectStore["updateTask"]>[1],
+					) => {
+						if (fail) throw new Error("check park failed");
+						return s.updateTask(id, patch);
+					},
+				}),
+		);
+		void loop.runTurn(store.name, review.id);
+		await flushPromises();
+		expect([...loop.running.keys()]).toContain(checkKey);
+		fail = true;
+
+		const seen = await withErrors(() => {
+			loop.schedule();
+			return flushPromises();
+		});
+
+		expect(seen.join("\n")).toContain("check park failed");
+		expect(store.getTask(review.id)!.state).toBe("running");
+	});
+
+	test("a lost work check records an error run with no blockers and no notes", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => "sha1",
+			workCheck: () => true,
+			pidAlive: () => false,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done:
+						record.runs.length === 1
+							? Promise.resolve(
+									runResult({
+										outcome: {
+											status: "ready",
+											summary: "did it",
+										} satisfies Outcome,
+									}),
+								)
+							: new Promise<RunResult>(() => {}),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		void loop.runTurn(store.name, task.id);
+		await flushPromises();
+		expect([...loop.running.keys()]).toContain(
+			`${store.name}/${task.id}:workcheck`,
+		);
+
+		loop.schedule();
+		await flushPromises();
+
+		const entry = store.getTask(task.id)!.workCheckLog[0]!;
+		expect(entry.outcome).toBe("error");
+		expect(entry.blockers).toEqual([]);
+		expect(entry.notes).toEqual([]);
+		expect(entry.model).toBeNull();
+		expect(entry.durationMs).toBe(0);
+	});
+
+	// ---- schedule -------------------------------------------------------------------
+
+	test("a schedule step that throws for a project is logged", async () => {
+		const { store, loop } = setup({
+			hasRules: () => {
+				throw new Error("rules unreadable");
+			},
+		});
+		store.createTask("start me");
+
+		const seen = await withErrors(() => {
+			loop.schedule();
+			return flushPromises();
+		});
+
+		expect(seen.join("\n")).toContain("rules unreadable");
+	});
+
+	test("an unlimited cap still settles a parked release", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			maxTotalRuns: () => null,
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(1);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	// ---- publishReleaseCard -----------------------------------------------------------
+
+	test("a parked release tags the freshly fetched head with empty notes when none were written", async () => {
+		const record = baseRecord();
+		const resolves: unknown[][] = [];
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+			resolveTarget: async (mainPath: string, fetch?: boolean) => {
+				resolves.push([mainPath, fetch]);
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(resolves).toEqual([[store.path, true]]);
+		expect(record.publishRelease[0]).toMatchObject({ sha: "sha0", notes: "" });
+		// No target warning: the card log carries no stray line for it.
+		expect(logText(store, task.id).split("\n")).not.toContain("null");
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a target warning at publish reaches the release card's log", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+			resolveTarget: async () => ({
+				target: "origin/trunk",
+				sha: "sha0",
+				warning: "origin/main is gone; tagging origin/trunk",
+			}),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(logText(store, task.id)).toContain(
+			"origin/main is gone; tagging origin/trunk",
+		);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a failed review-delta read publishes without the review range", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+			archReviewDelta: async () => {
+				throw new Error("git log failed");
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(1);
+		expect(record.publishRelease[0]).toMatchObject({ archReview: null });
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v4.0.0");
+	});
+
+	test("a release command without notes gets an empty notes file, shows its output and holds the card's live slot", async () => {
+		const record = baseRecord();
+		const handle = {
+			pid: 4545,
+			done: Promise.resolve(),
+			kill: async () => {},
+		};
+		let key = "";
+		let liveEntry: unknown = "unset";
+		const { store, projects, loop } = setupWith(record, {
+			runReleaseCommand: async (
+				o: Parameters<TurnOps["runReleaseCommand"]>[0],
+			) => {
+				record.runReleaseCommand.push(o);
+				o.onSpawn?.(handle);
+				// The board's progress and pid views read the card's live entry.
+				liveEntry = loop.running.get(key);
+				o.log("building assets");
+				return "released v4.0.0";
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		store.setSettings({ releaseCommand: "bin release" });
+		const task = parkedRelease(store);
+		key = `${store.name}/${task.id}`;
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.runReleaseCommand).toHaveLength(1);
+		expect(liveEntry).toBe(handle);
+		expect(logText(store, task.id)).toContain("| building assets");
+		expect(
+			readFileSync(join(store.tasksDir, `release-${task.id}.md`), "utf8"),
+		).toBe("");
+		expect(loop.running.size).toBe(0);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	// ---- settleReviews ------------------------------------------------------------------
+
+	test("a cancelled merge card still marked running does not hold the publish", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+		const merger = store.createTask("cancelled mid-merge");
+		store.updateTask(merger.id, {
+			stage: "merging",
+			state: "running",
+			cancelledAt: Date.now(),
+		});
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(1);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a merge in preparing holds the publish", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+		const merger = store.createTask("merge starting");
+		store.updateTask(merger.id, { stage: "merging", state: "preparing" });
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(0);
+		expect(store.getTask(task.id)!.stage).toBe("merging");
+	});
+
+	test("a parked shape in needs_you never publishes", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+		store.updateTask(task.id, { state: "needs_you" });
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+	});
+
+	test("parked releases in two projects both publish in one tick", async () => {
+		const record = baseRecord();
+		const a = freshStore();
+		const b = freshStore();
+		const loop = createTurnLoop(
+			new Map([
+				[a.name, { ...fakeProject(a), target: "origin/main" }],
+				[b.name, { ...fakeProject(b), target: "origin/main" }],
+			]),
+			fakeOps(record, { publishRelease: publishingRelease(record) }),
+		);
+		const ta = parkedRelease(a, "v5.0.0");
+		const tb = parkedRelease(b, "v6.0.0");
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(2);
+		expect(a.getTask(ta.id)!.stage).toBe("done");
+		expect(b.getTask(tb.id)!.stage).toBe("done");
+	});
+
+	test("a Review-button card with a worktree finishes without a publish", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+			worktree: "wt",
+		});
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(0);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBeNull(); // no "Released …" summary
+		expect(after.commits).toBe(3);
+	});
+
+	test("a Review-button settle whose commit count fails is logged and stays parked", async () => {
+		const { store, projects, loop } = setup({
+			targetCommits: async () => {
+				throw new Error("rev-list failed");
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+		});
+
+		const seen = await withErrors(() => {
+			loop.schedule();
+			return flushPromises();
+		});
+
+		expect(seen.join("\n")).toContain("rev-list failed");
+		expect(store.getTask(review.id)!.stage).toBe("merging");
+	});
+});
+
+// Round 5, runTurn setup (claim to turn start): every test checks an observable fact —
+// a recorded ops call, a store field, a turns row, a log fact or the running card's progress.
+describe("turn survivor round 5 — run setup", () => {
+	const answeredRun = () => ({
+		pid: 4242,
+		done: Promise.resolve(
+			runResult({ outcome: { status: "answered", summary: "did it" } }),
+		),
+		kill: async () => {},
+	});
+
+	function loopFor(
+		store: ProjectStore,
+		record: Recorded,
+		overrides: Partial<TurnOps>,
+	) {
+		return createTurnLoop(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, overrides),
+		);
+	}
+
+	function mergeCard(store: ProjectStore) {
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, {
+			stage: "merging",
+			branch: "ott/x",
+			base: "sha0",
+			worktree: "wt-x",
+		});
+		return task;
+	}
+
+	/** A card waiting for a reply turn on a saved session. */
+	function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
+		const task = store.createTask(prompt, null, kind);
+		store.updateTask(task.id, {
+			stage: "in_progress",
+			sessionId: "s1",
+			pendingPrompt: "just finish it",
+		});
+		saveSession(store, "s1");
+		return task;
+	}
+
+	const noTrackerError = (store: ProjectStore, id: string) =>
+		expect(store.getTask(id)!.needsReason ?? "").not.toContain("Tracker error");
+
+	test("resolveTarget fetches fresh only when the card lacks its worktree or branch", async () => {
+		const calls: [string, boolean | undefined][] = [];
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			resolveTarget: async (path: string, fresh?: boolean) => {
+				calls.push([path, fresh]);
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		const fresh = store.createTask("fresh card");
+		const kept = store.createTask("kept card");
+		store.updateTask(kept.id, {
+			stage: "in_progress",
+			worktree: "wt-k",
+			branch: "ott/k",
+			base: "sha0",
+		});
+		const noBranch = store.createTask("worktree without branch");
+		store.updateTask(noBranch.id, {
+			stage: "in_progress",
+			worktree: "wt-n",
+			base: "sha0",
+		});
+		const noWorktree = store.createTask("branch without worktree");
+		store.updateTask(noWorktree.id, {
+			stage: "in_progress",
+			branch: "ott/w",
+			base: "sha0",
+		});
+		for (const t of [fresh, kept, noBranch, noWorktree])
+			await loop.runTurn(store.name, t.id);
+		expect(calls).toEqual([
+			[store.path, true],
+			[store.path, false],
+			[store.path, true],
+			[store.path, true],
+		]);
+	});
+
+	test("a fresh work card's prepare log: turn header, worktree line, no empty warning", async () => {
+		const { store, record, loop } = setup();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const branch = store.getTask(task.id)!.branch!;
+		const log = logText(store, task.id);
+		expect(log).toContain("== work turn ");
+		expect(log).toContain(`+ worktree ${branch} from origin/main at sha0\n`);
+		// resolveTarget's null warning must not leave a "! null" line on the card.
+		expect(log).not.toContain("! null");
+		// The only card on the board lists no sibling, never itself.
+		expect(record.runs[0]!.prompt).toContain(
+			"Other tasks in flight for this project:\n- none\n",
+		);
+	});
+
+	test("a resolveTarget warning reaches the card log", async () => {
+		const { store, loop } = setup({
+			resolveTarget: async () => ({
+				target: "origin/main",
+				sha: "sha0",
+				warning: "fetch failed: offline",
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(logText(store, task.id)).toContain("! fetch failed: offline\n");
+	});
+
+	test("a merge turn's log names the merge kind", async () => {
+		const { store, loop } = setup({ commitsAhead: async () => 0 });
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(logText(store, task.id)).toContain("== merge turn ");
+	});
+
+	test("prepare names an unnamed card from the generated title and logs it", async () => {
+		const { store, record, loop } = setup({
+			genTitle: async () => "Fix the header",
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBe("Fix the header");
+		expect(logText(store, task.id)).toContain("+ title: Fix the header\n");
+	});
+
+	test("a failed title generation logs the fallback and names nothing", async () => {
+		const { store, record, loop } = setup();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBeNull();
+		const log = logText(store, task.id);
+		expect(log).toContain("title generation failed");
+		expect(log).not.toContain("+ title:");
+	});
+
+	test("a release card keeps its fixed session name and never generates a title", async () => {
+		let generated = 0;
+		const { store, record, loop } = setup({
+			genTitle: async () => {
+				generated += 1;
+				return "Generated";
+			},
+		});
+		const task = store.createTask("release v1.0.0");
+		store.updateTask(task.id, {
+			stage: "merging",
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-x",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBe("Release review");
+		expect(generated).toBe(0);
+	});
+
+	test("a release version without a frozen base is no release review: it gets a generated title", async () => {
+		const { store, record, loop } = setup({
+			genTitle: async () => "Generated",
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { releaseVersion: "v2.0.0" });
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBe("Generated");
+	});
+
+	test("a Review-button review run gets OTTR_REVIEW=1", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs[0]!.env).toEqual({ OTTR_REVIEW: "1" });
+	});
+
+	test("a cancel during worktree creation removes exactly that worktree and starts nothing", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		const loop = loopFor(store, record, {
+			createWorktree: async (o: { worktreePath: string }) => {
+				record.createWorktree.push(o);
+				store.updateTask(task.id, { cancelledAt: Date.now() });
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const branch = store.getTask(task.id)!.branch;
+		expect(record.removeWorktree).toEqual([
+			{
+				mainPath: store.path,
+				worktreePath: join(store.worktreesDir, task.id),
+				branch,
+			},
+		]);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a failed cleanup of a cancelled fresh worktree is logged with its error", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		const loop = loopFor(store, record, {
+			createWorktree: async (o: { worktreePath: string }) => {
+				record.createWorktree.push(o);
+				store.updateTask(task.id, { cancelledAt: Date.now() });
+			},
+			removeWorktree: async () => {
+				throw new Error("worktree busy");
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(logText(store, task.id)).toContain(
+			"! removeWorktree: worktree busy\n",
+		);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a failed diff stat skips the capture and the merge turn still runs", async () => {
+		const { store, record, loop } = setup({
+			diffStat: async () => {
+				throw new Error("git gone");
+			},
+			diffText: async () => "diff text",
+		});
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.diffFiles).toBeNull();
+		noTrackerError(store, task.id);
+	});
+
+	test("a failed raw diff keeps the stat, stores no text, and logs the file count", async () => {
+		const { store, record, loop } = setup({
+			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
+			diffText: async () => {
+				throw new Error("git gone");
+			},
+		});
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.diffFiles).toEqual([{ file: "src/a.ts", plus: 2, minus: 1 }]);
+		expect(after.diffText).toBeNull();
+		expect(logText(store, task.id)).toContain("- captured diff: 1 file(s)\n");
+		expect(record.runs).toHaveLength(1);
+		noTrackerError(store, task.id);
+	});
+
+	test("a raw diff over 200 KB is cut at 200 KB with the truncation note", async () => {
+		const text = `${"a".repeat(200_000)}b`;
+		const { store, loop } = setup({
+			diffStat: async () => [{ file: "big.txt", plus: 1, minus: 0 }],
+			diffText: async () => text,
+		});
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.diffText).toBe(
+			`${"a".repeat(200_000)}\n… diff truncated at 200 KB`,
+		);
+	});
+
+	test("a raw diff of exactly 200 KB is stored whole", async () => {
+		const text = "a".repeat(200_000);
+		const { store, loop } = setup({
+			diffStat: async () => [{ file: "big.txt", plus: 1, minus: 0 }],
+			diffText: async () => text,
+		});
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.diffText).toBe(text);
+	});
+
+	test("a steer that lands during prepare rides this turn's prompt", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		const loop = loopFor(store, record, {
+			resolveTarget: async () => {
+				store.updateTask(task.id, { pendingPrompt: "use the blue theme" });
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.prompt).toContain(
+			"Note from the user: use the blue theme",
+		);
+	});
+
+	test("a dep-held card whose dependency left the project names it as done", async () => {
+		const { store, record, loop } = setup();
+		const task = replyCard(store, "work please");
+		store.updateTask(task.id, {
+			pendingPrompt: DEP_HELD_PROMPT,
+			dependsOn: ["OTTR-404"],
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.prompt).toContain("- #OTTR-404 OTTR-404: done");
+		noTrackerError(store, task.id);
+	});
+
+	test("a reply after the only, rejected turn carries the rejection", async () => {
+		const { store, record, loop } = setup();
+		const task = replyCard(store, "work please");
+		const prior = store.startTurn(task.id, "work", "p", null);
+		store.finishTurn(prior.id, {
+			endedAt: Date.now(),
+			outcome: "ready",
+			error: "no commits on the branch",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.prompt).toContain(
+			"The tracker rejected your last report_outcome: no commits on the branch",
+		);
+	});
+
+	test("a retro reply after the only, rejected turn carries the rejection", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const retro = replyCard(store, `${RETRO_MARKER}the retro`, "retro");
+		const prior = store.startTurn(retro.id, "work", "p", null);
+		store.finishTurn(prior.id, {
+			endedAt: Date.now(),
+			outcome: "answered",
+			error: "the retro report is empty",
+		});
+		await loop.runTurn(store.name, retro.id);
+		const prompt = record.runs[0]!.prompt;
+		expect(prompt).toContain("Continue the retro.");
+		expect(prompt).toContain(
+			"The tracker rejected your last report_outcome: the retro report is empty",
+		);
+	});
+
+	test("a reply turn sends only the reply's images, not the original prompt's", async () => {
+		const { store, record, loop } = setup();
+		const task = replyCard(store, "work please");
+		store.updateTask(task.id, {
+			images: ["a.png"],
+			pendingImages: ["b.png"],
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.images).toEqual([
+			join(store.imagesDir(task.id), "b.png"),
+		]);
+	});
+
+	test("run log and progress events: progress shows only once the run is registered", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		let progress: ((text: string | null) => void) | undefined;
+		let logNotes: [string, string][] = [];
+		const { promise: gate, resolve: releaseDone } =
+			Promise.withResolvers<RunResult>();
+		const { promise: started, resolve: markStarted } =
+			Promise.withResolvers<void>();
+		const loop = loopFor(store, record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o as never);
+				o.onSession?.("s1");
+				progress = o.onProgress;
+				markStarted();
+				// Before startRun returns there is no running entry: the event shows nothing.
+				o.onProgress?.("early");
+				const before = record.notifyLog.length;
+				o.onLog?.();
+				logNotes = record.notifyLog.slice(before);
+				return { pid: 4242, done: gate, kill: async () => {} };
+			},
+		});
+		const running = loop.runTurn(store.name, task.id);
+		await started;
+		const key = `${store.name}/${task.id}`;
+		expect(logNotes).toEqual([[store.name, task.id]]);
+		expect(loop.running.get(key)?.progress).toBeUndefined();
+		const published = record.publishSoon;
+		progress?.("Stryker 40%");
+		expect(loop.running.get(key)?.progress).toBe("Stryker 40%");
+		expect(record.publishSoon).toBe(published + 1);
+		progress?.(null);
+		expect(loop.running.get(key)?.progress).toBeUndefined();
+		expect(record.publishSoon).toBe(published + 2);
+		releaseDone(
+			runResult({ outcome: { status: "answered", summary: "did it" } }),
+		);
+		await running;
+		noTrackerError(store, task.id);
+	});
+
+	test("a repeated session report while running keeps the first session id", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		let seen: string | null | undefined;
+		const loop = loopFor(store, record, {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				o.onSession?.("s1");
+				o.onSession?.("s2");
+				seen = store.getTask(task.id)!.sessionId;
+				return answeredRun();
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(seen).toBe("s1");
+	});
+
+	test("a session report after a cancel in the spawn window leaves the card untouched", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		let seen: { state: string; sessionId: string | null } | undefined;
+		const loop = loopFor(store, record, {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				store.updateTask(task.id, { cancelledAt: Date.now() });
+				o.onSession?.("s1");
+				const cur = store.getTask(task.id)!;
+				seen = { state: cur.state, sessionId: cur.sessionId };
+				return answeredRun();
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(seen).toEqual({ state: "preparing", sessionId: null });
+	});
+
+	test("a merge turn's session report never moves the card to in progress", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = mergeCard(store);
+		let stage: string | undefined;
+		const loop = loopFor(store, record, {
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				// The card sits at todo when the merge session starts.
+				store.updateTask(task.id, { stage: "todo" });
+				o.onSession?.("s1");
+				stage = store.getTask(task.id)!.stage;
+				return answeredRun();
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(stage).toBe("todo");
+	});
+
+	test("a grill turn's session report keeps the card in the backlog", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("grill me");
+		store.updateTask(task.id, { stage: "backlog" });
+		let seen: { stage: string; state: string } | undefined;
+		const loop = loopFor(store, record, {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				o.onSession?.("s1");
+				const cur = store.getTask(task.id)!;
+				seen = { stage: cur.stage, state: cur.state };
+				return answeredRun();
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(seen).toEqual({ stage: "backlog", state: "running" });
+	});
+
+	test("a steer landing during package install on a card without pending text stays queued", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		const loop = loopFor(store, record, {
+			maxTotalRuns: () => 0,
+			ensurePackages: async () => {
+				// The steer text starts with "null": no stale prefix may be stripped from it.
+				store.updateTask(task.id, { pendingPrompt: "null check the parser" });
+				return [];
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.pendingPrompt).toBe("null check the parser");
+		const turns = store.listTurns(task.id);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]!.prompt).not.toContain("null check the parser");
+		noTrackerError(store, task.id);
+	});
+
+	test("a steer cancelled during package install: the turn still starts and records the reply", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = replyCard(store, "work please");
+		store.updateTask(task.id, {
+			pendingPrompt: "one",
+			pendingImages: ["a.png"],
+		});
+		const loop = loopFor(store, record, {
+			maxTotalRuns: () => 0,
+			ensurePackages: async () => {
+				store.updateTask(task.id, { pendingPrompt: null, pendingImages: [] });
+				return [];
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const turns = store.listTurns(task.id);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]!.input).toBe("one");
+		expect(store.getTask(task.id)!.pendingPrompt).toBeNull();
+		noTrackerError(store, task.id);
+	});
+
+	test("pending images that no longer start with the sent ones stay queued", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = replyCard(store, "work please");
+		store.updateTask(task.id, {
+			pendingPrompt: "one",
+			pendingImages: ["a", "b"],
+		});
+		const loop = loopFor(store, record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				o.onSession?.("s1");
+				store.updateTask(task.id, {
+					pendingPrompt: "one\n\ntwo",
+					pendingImages: ["a", "c"],
+				});
+				return answeredRun();
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.pendingPrompt).toBe("two");
+		expect(after.pendingImages).toEqual(["a", "c"]);
+	});
+});
+
+describe("turn survivor round 5 — run result and merge push", () => {
+	const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+	/** startRun override whose run resolves with runResult(p). */
+	function finishing(record: Recorded, p: Partial<RunResult>) {
+		return (o: Parameters<TurnOps["startRun"]>[0]) => {
+			record.runs.push(o);
+			o.onSession?.("sess-1");
+			return {
+				pid: 4242,
+				done: Promise.resolve(runResult(p)),
+				kill: async () => {
+					record.killed = true;
+				},
+			};
+		};
+	}
+
+	/** setupWith plus a run that resolves with runResult(p); chained turns are held. */
+	function withRun(p: Partial<RunResult>, overrides: Partial<TurnOps> = {}) {
+		const record = baseRecord();
+		return setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: finishing(record, p),
+			...overrides,
+		});
+	}
+
+	function mergeCard(store: ProjectStore, worktree = "wt-m") {
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, {
+			stage: "merging",
+			worktree,
+			branch: "ott/m",
+		});
+		return task;
+	}
+
+	function researchCard(store: ProjectStore) {
+		const task = store.createTask("research something");
+		store.updateTask(task.id, { research: true });
+		return task;
+	}
+
+	/** createWorktree override that also writes the research report file. */
+	function withReport(record: Recorded) {
+		return async (o: { worktreePath: string }) => {
+			record.createWorktree.push(o);
+			mkdirSync(o.worktreePath, { recursive: true });
+			writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# findings");
+		};
+	}
+
+	function workTree(store: ProjectStore, id: string): string {
+		const wt = join(store.worktreesDir, id);
+		mkdirSync(wt, { recursive: true });
+		return wt;
+	}
+
+	function lastTurn(store: ProjectStore, id: string) {
+		return store.listTurns(id).at(-1)!;
+	}
+
+	test("a merge turn never reads a research report left in its worktree", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "integrated", summary: "landed" },
+		});
+		const wt = join(store.worktreesDir, "merge-wt");
+		mkdirSync(wt, { recursive: true });
+		writeFileSync(join(wt, RESEARCH_REPORT), "# stray notes");
+		const task = mergeCard(store, wt);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.research).toBe(false);
+		expect(after.report).toBeNull();
+	});
+
+	test("a release card with a report file is never flagged research", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "answered", summary: "reviewed" },
+		});
+		const task = store.createTask("release v1.0.0");
+		const wt = workTree(store, task.id);
+		writeFileSync(join(wt, RESEARCH_REPORT), "# review notes");
+		store.updateTask(task.id, {
+			stage: "in_progress",
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: wt,
+			branch: "ott/rel",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.research).toBe(false);
+	});
+
+	test("a plain work card without a report stays a work card: ready goes to merging", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "ready", summary: "did it" },
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.research).toBe(false);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+	});
+
+	test("a research card whose report is still there keeps its mark on a ready report with commits", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			createWorktree: withReport(record),
+			startRun: finishing(record, {
+				outcome: { status: "ready", summary: "researched" },
+			}),
+		});
+		const task = researchCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.research).toBe(true);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("1 commit(s)");
+	});
+
+	test("a research card without its report keeps its mark on an answered report with commits", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "answered", summary: "researched" },
+		});
+		const task = researchCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.research).toBe(true);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("1 commit(s)");
+	});
+
+	test("a research card's ready report without commits stays research and asks for the report", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "ready", summary: "researched" } },
+			{ commitsAhead: async () => 0 },
+		);
+		const task = researchCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.research).toBe(true);
+		expect(after.stage).toBe("in_progress");
+		expect(after.needsReason).toContain(RESEARCH_REPORT);
+	});
+
+	test("a killed run that no stop request owns leaves the card as the cancel wrote it", async () => {
+		const record = baseRecord();
+		const held = Promise.withResolvers<RunResult>();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return { pid: 4242, done: held.promise, kill: async () => {} };
+			},
+		});
+		const task = store.createTask("work please");
+		const key = `${store.name}/${task.id}`;
+		const run = loop.runTurn(store.name, task.id);
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		expect(loop.running.has(key)).toBe(true);
+		// A cancel whose kill wait timed out kept the worktree and handed the card back.
+		const kept = cancelKeptReason("uncommitted changes to a.txt");
+		store.updateTask(task.id, { state: "needs_you", needsReason: kept });
+		held.resolve(runResult({ killed: true, sawTerminalEnd: false }));
+		await run;
+		expect(lastTurn(store, task.id).error).toBe("cancelled");
+		const after = store.getTask(task.id)!;
+		expect(after.needsReason).toBe(kept);
+		expect(after.cancelledAt).toBeNull();
+	});
+
+	test("a cancel that lands during a stop owns the card", async () => {
+		const record = baseRecord();
+		const held = Promise.withResolvers<RunResult>();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: held.promise,
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const key = `${store.name}/${task.id}`;
+		const e = fakeProject(store);
+		const run = loop.runTurn(store.name, task.id);
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		expect(loop.running.has(key)).toBe(true);
+		const stop = loop.stopTurn(e, task.id);
+		await flushPromises();
+		const cancel = loop.cancel(e, task.id, true);
+		await flushPromises();
+		held.resolve(runResult({ killed: true, sawTerminalEnd: false }));
+		await run;
+		await expect(stop).resolves.toEqual({ ok: true });
+		await expect(cancel).resolves.toEqual({ removed: true });
+		expect(lastTurn(store, task.id).error).toBe("stopped");
+		const after = store.getTask(task.id)!;
+		expect(after.cancelledAt).not.toBeNull();
+		expect(after.state).toBe("idle");
+		expect(after.needsReason ?? "").not.toContain("Turn stopped");
+	});
+
+	test("an interview turn reads integration from its checkout, never the main-repo branch proof", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "rules set" } },
+			{
+				worktreeHusk: async () => true,
+				worktreeLinked: async () => false,
+				isIntegrated: async () => false,
+				branchMergedOrGone: async () => true,
+			},
+		);
+		const task = store.createTask(
+			`${RULES_INTERVIEW_MARKER}${store.name}`,
+			null,
+			"interview",
+		);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported integrated, but HEAD is not on origin/main.",
+		);
+	});
+
+	test("a husk check that fails counts as no husk: the worktree decides integration", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "landed" } },
+			{
+				worktreeHusk: async () => {
+					throw new Error("git missing");
+				},
+				isIntegrated: async () => false,
+				branchMergedOrGone: async () => true,
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.needsReason).toBe(
+			"Reported integrated, but HEAD is not on origin/main.",
+		);
+	});
+
+	test("a link check that fails counts as unlinked: the main repo proves integration", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "landed" } },
+			{
+				worktreeLinked: async () => {
+					throw new Error("git missing");
+				},
+				isIntegrated: async () => false,
+				branchMergedOrGone: async () => true,
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+	});
+
+	test("a needs_you turn leaves untracked files alone", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: finishing(record, {
+				outcome: { status: "needs_you", summary: "stuck", question: "Which?" },
+			}),
+			quarantineUntracked: async (
+				worktreePath: string,
+				quarantineDir: string,
+			) => {
+				record.quarantine.push({ worktreePath, quarantineDir });
+				return ["junk.txt"];
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.quarantine).toHaveLength(0);
+		expect(logText(store, task.id)).not.toContain("junk.txt");
+		expect(store.getTask(task.id)!.state).toBe("needs_you");
+	});
+
+	test("an outcome without shots and no shots/ dir adopts nothing and warns about no shot", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "ready", summary: "did it" },
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.shots).toEqual([]);
+		expect(logText(store, task.id)).not.toContain("! shot");
+	});
+
+	test("a non-image under shots/ is skipped and named by its shots/ path", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "ready", summary: "did it" },
+		});
+		const task = store.createTask("work please");
+		const wt = workTree(store, task.id);
+		mkdirSync(join(wt, "shots"), { recursive: true });
+		writeFileSync(join(wt, "shots", "notes.txt"), "not a picture");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.shots).toEqual([]);
+		expect(existsSync(store.imagesDir(task.id))).toBe(false);
+		expect(logText(store, task.id)).toContain(
+			"! shot shots/notes.txt: not a recognized image",
+		);
+	});
+
+	test("a reported shot outside the worktree is refused", async () => {
+		const { store, loop } = withRun({
+			outcome: {
+				status: "ready",
+				summary: "did it",
+				shots: ["../escape.png"],
+			},
+		});
+		const task = store.createTask("work please");
+		const wt = workTree(store, task.id);
+		writeFileSync(join(dirname(wt), "escape.png"), PNG);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.shots).toEqual([]);
+		expect(logText(store, task.id)).toContain(
+			"! shot ../escape.png: path escapes the worktree",
+		);
+	});
+
+	test("the card keeps the newest 8 shots", async () => {
+		const { store, loop } = withRun({
+			outcome: { status: "ready", summary: "did it", shots: ["ui.png"] },
+		});
+		const task = store.createTask("work please");
+		const old = ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"].map(
+			(n) => `${n}.png`,
+		);
+		store.updateTask(task.id, { shots: old });
+		const wt = workTree(store, task.id);
+		writeFileSync(join(wt, "ui.png"), PNG);
+		await loop.runTurn(store.name, task.id);
+		const shots = store.getTask(task.id)!.shots;
+		expect(shots).toHaveLength(8);
+		expect(shots.slice(0, 7)).toEqual(old.slice(1));
+		expect(shots[7]).toMatch(/^\d+\.png$/);
+	});
+
+	test("a clean turn with nothing untracked writes no quarantine line", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: finishing(record, {
+				outcome: { status: "ready", summary: "did it" },
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.quarantine).toHaveLength(1);
+		expect(logText(store, task.id)).not.toContain("quarantined");
+	});
+
+	test("exactly 20 quarantined files are all listed without a truncation mark", async () => {
+		const names = Array.from(
+			{ length: 20 },
+			(_, i) => `f${String(i + 1).padStart(2, "0")}`,
+		);
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: finishing(record, {
+				outcome: { status: "ready", summary: "did it" },
+			}),
+			quarantineUntracked: async () => names,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const line = logText(store, task.id)
+			.split("\n")
+			.find((l) => l.includes("quarantined 20 untracked file(s)"));
+		expect(line).toBeDefined();
+		expect(line!.endsWith(`${names.join(", ")}`)).toBe(true);
+	});
+
+	test("a work turn never takes the server merge push", async () => {
+		const pushes: string[] = [];
+		const { store, loop } = withRun(
+			{ outcome: { status: "ready", summary: "did it" } },
+			{
+				serverMergePush: async (_m: string, _w: string, target: string) => {
+					pushes.push(target);
+					return { status: "failed" as const, error: "fatal: denied" };
+				},
+			},
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		expect(pushes).toEqual([]);
+	});
+
+	test("a server push that throws keeps the merge card with git's reason", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "landed" } },
+			{
+				serverMergePush: async () => {
+					throw new Error("ssh: connect refused");
+				},
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Server push to origin failed: ssh: connect refused",
+		);
+		expect(logText(store, task.id)).toContain(
+			"server push of origin/main failed: ssh: connect refused",
+		);
+	});
+
+	test("a skipped server push neither logs a push nor resolves an auth failure", async () => {
+		const { store, loop } = withRun({
+			outcome: {
+				status: "needs_you",
+				summary: "push blocked",
+				details: "fatal: Authentication failed for 'https://h/r.git/'",
+			},
+		});
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(lastTurn(store, task.id).outcome).toBe("needs_you");
+		expect(logText(store, task.id)).not.toContain("from the server");
+	});
+
+	test("an auth failure named only in the summary resolves once the server pushed", async () => {
+		let pushed = false;
+		const { store, loop } = withRun(
+			{
+				outcome: {
+					status: "needs_you",
+					summary: "fatal: Authentication failed for origin",
+				},
+			},
+			{
+				isIntegrated: async () => pushed,
+				serverMergePush: async () => {
+					pushed = true;
+					return { status: "pushed" as const, output: "" };
+				},
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		const turn = lastTurn(store, task.id);
+		expect(turn.outcome).toBe("integrated");
+		expect(
+			turn.details!.startsWith("fatal: Authentication failed for origin"),
+		).toBe(true);
+		expect(turn.details).toContain("Server push of origin/main:\n(no output)");
+		expect(logText(store, task.id)).toContain(
+			"needs_you on a push authentication failure resolved",
+		);
+	});
+
+	test("an auth failure named only in the question resolves and keeps the agent's details", async () => {
+		let pushed = false;
+		const { store, loop } = withRun(
+			{
+				outcome: {
+					status: "needs_you",
+					summary: "push blocked",
+					details: "the remote said no",
+					question: "git: Permission denied (publickey). Can you push?",
+				},
+			},
+			{
+				isIntegrated: async () => pushed,
+				serverMergePush: async () => {
+					pushed = true;
+					return { status: "pushed" as const, output: "main -> main" };
+				},
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		const turn = lastTurn(store, task.id);
+		expect(turn.outcome).toBe("integrated");
+		expect(turn.details!.startsWith("the remote said no")).toBe(true);
+		expect(turn.details).toContain("main -> main");
+	});
+
+	test("a merge turn without an outcome still takes the server push and lands from git", async () => {
+		const { store, loop } = withRun(
+			{ outcome: null },
+			{
+				serverMergePush: async () => ({
+					status: "pushed" as const,
+					output: "main -> main",
+				}),
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(logText(store, task.id)).toContain(
+			"pushed origin/main from the server",
+		);
+	});
+
+	test("an answered merge report naming an auth failure is not rewritten by the push", async () => {
+		const { store, loop } = withRun(
+			{
+				outcome: {
+					status: "answered",
+					summary: "Authentication failed, but merged locally",
+				},
+			},
+			{
+				serverMergePush: async () => ({
+					status: "pushed" as const,
+					output: "",
+				}),
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.needsReason).toBe(
+			'Unexpected outcome "answered" in a merge turn.',
+		);
+		expect(lastTurn(store, task.id).outcome).toBe("answered");
+	});
+
+	test("a husk work card's ready report names no uncommitted changes", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "ready", summary: "did it" } },
+			{
+				worktreeHusk: async () => true,
+				branchMergedOrGone: async () => false,
+			},
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.needsReason).toBe(
+			"Reported ready, but git shows 0 commit(s) ahead of the base.",
+		);
+	});
+
+	test("a tree whose clean check fails counts as dirty", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "ready", summary: "did it" } },
+			{
+				isClean: async () => {
+					throw new Error("git status failed");
+				},
+			},
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.needsReason).toBe(
+			"Reported ready, but git shows 1 commit(s) ahead of the base and uncommitted changes.",
+		);
+	});
+
+	test("a husk merge whose branch proof fails is not integrated", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "landed" } },
+			{
+				worktreeHusk: async () => true,
+				branchMergedOrGone: async () => {
+					throw new Error("git missing");
+				},
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.needsReason).toBe(
+			"worktree link lost and branch has unreached commits",
+		);
+	});
+
+	test("a merge whose integration check fails is not integrated", async () => {
+		const { store, loop } = withRun(
+			{ outcome: { status: "integrated", summary: "landed" } },
+			{
+				isIntegrated: async () => {
+					throw new Error("git missing");
+				},
+			},
+		);
+		const task = mergeCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.needsReason).toBe(
+			"Reported integrated, but HEAD is not on origin/main.",
+		);
+	});
+});
+
+describe("turn survivor round 5 — classify wiring", () => {
+	/** startRun override resolving every run with `p` (session announced unless p says otherwise). */
+	const runWith =
+		(record: Recorded, p: Partial<RunResult>, during?: () => void) =>
+		(o: Parameters<TurnOps["startRun"]>[0]) => {
+			record.runs.push(o);
+			if (p.sessionId !== null) o.onSession?.("sess-1");
+			during?.();
+			return {
+				pid: 4242,
+				done: Promise.resolve(runResult(p)),
+				kill: async () => {},
+			};
+		};
+	/** The provider-rejection shape: died before any output, no session, no stderr. */
+	const diedBeforeOutput: Partial<RunResult> = {
+		exitCode: 1,
+		sessionId: null,
+		sawTerminalEnd: false,
+		finalText: "",
+	};
+	const NO_REPORT = "The agent finished without calling report_outcome.";
+
+	test("a research card without its report file and no receipt asks for the receipt", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: runWith(record, {}),
+		});
+		const task = store.createTask("research please");
+		store.updateTask(task.id, { research: true });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		// No report file: classify must not take the report-present done rule.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(NO_REPORT);
+	});
+
+	test("a husk worktree keeps a non-integrated reason that is not the integrated bounce", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			worktreeHusk: async () => true,
+			branchMergedOrGone: async () => false,
+			startRun: runWith(record, {}),
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(NO_REPORT);
+	});
+
+	test("a husk worktree with an answered report and an unmerged branch settles done", async () => {
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			worktreeHusk: async () => true,
+			branchMergedOrGone: async () => false,
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		// answered with 0 commits ahead (the husk reads 0) is done; the null reason must not crash.
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a needs_you reason that mentions a dispatch is not copied into the run log", async () => {
+		const reason = "Blocked on infra (dispatch q7) for now";
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: runWith(record, {
+				outcome: { status: "needs_you", summary: "s", question: reason },
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.needsReason).toBe(reason);
+		expect(logText(store, task.id)).not.toContain(reason);
+	});
+
+	test("an exit without dispatch context is not copied into the run log", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runWith(record, { exitCode: 1 }),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const reason = "omp exited with code 1 before finishing.";
+		expect(store.getTask(task.id)!.needsReason).toBe(reason);
+		expect(logText(store, task.id)).not.toContain(reason);
+	});
+
+	test("image quarantine keeps the card's images it did not move", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runWith(record, diedBeforeOutput),
+		});
+		const task = store.createTask("work please");
+		setImage(store, task.id, "a.png", "bytes-a");
+		setImage(store, task.id, "b.png", "bytes-b");
+		// gone.png has no file: nothing moves for it, so it stays on the card.
+		store.updateTask(task.id, { images: ["a.png", "gone.png", "b.png"] });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.images).toEqual(["gone.png"]);
+		const line = logText(store, task.id)
+			.split("\n")
+			.find((l) => l.includes("provider rejected the attached images"));
+		expect(line).toContain(
+			`quarantined 2 image(s) to .tasks/quarantine/${task.id}: a.png, b.png — `,
+		);
+	});
+
+	test("the image quarantine note lists at most 20 names", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runWith(record, diedBeforeOutput),
+		});
+		const task = store.createTask("work please");
+		const names = Array.from(
+			{ length: 21 },
+			(_, i) => `img${String(i + 1).padStart(2, "0")}.png`,
+		);
+		for (const n of names) setImage(store, task.id, n, n);
+		store.updateTask(task.id, { images: names });
+		await loop.runTurn(store.name, task.id);
+		const line = logText(store, task.id)
+			.split("\n")
+			.find((l) => l.includes("provider rejected the attached images"));
+		expect(line).toContain(
+			`quarantined 21 image(s) to .tasks/quarantine/${task.id}: ${names.slice(0, 20).join(", ")} — `,
+		);
+		expect(line).not.toContain("img21.png");
+	});
+
+	test("a merge reply whose image quarantine fails parks at merging", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runWith(record, diedBeforeOutput),
+		});
+		const task = store.createTask("merge please");
+		saveSession(store, "s9");
+		setImage(store, task.id, "1.png", "rejected-bytes");
+		// A file where the quarantine dir must be: the move fails.
+		mkdirSync(join(store.tasksDir, "quarantine"), { recursive: true });
+		writeFileSync(join(store.tasksDir, "quarantine", task.id), "blocked");
+		store.updateTask(task.id, {
+			stage: "merging",
+			branch: "ott/x",
+			worktree: "wt-x",
+			sessionId: "s9",
+			pendingPrompt: "see the shot",
+			pendingImages: ["1.png"],
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.images).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toMatch(/^Image quarantine failed: /);
+	});
+
+	test("steering on a merge turn requeues it at merging", async () => {
+		const record = baseRecord();
+		let id = "";
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runWith(
+				record,
+				{ outcome: { status: "integrated", summary: "merged" } },
+				() => store.updateTask(id, { pendingPrompt: "steer mid-run" }),
+			),
+		});
+		const task = store.createTask("merge please");
+		id = task.id;
+		store.updateTask(task.id, {
+			stage: "merging",
+			branch: "ott/x",
+			worktree: "wt-x",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("steer mid-run");
+	});
+
+	test("an empty reported dependsOn is no hold: needs_you stays needs_you", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: runWith(record, {
+				outcome: {
+					status: "needs_you",
+					summary: "stuck",
+					question: "which db?",
+					dependsOn: [],
+				},
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("which db?");
+		expect(after.pendingPrompt).toBeNull();
+	});
+
+	test("a bad dependsOn id gets the reason for its own kind of mistake", async () => {
+		let deps: string[] = [];
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+				runWith(record, {
+					outcome: { status: "needs_you", summary: "hold", dependsOn: deps },
+				})(o),
+		});
+		const self = store.createTask("self hold");
+		deps = [self.id];
+		await loop.runTurn(store.name, self.id);
+		expect(store.getTask(self.id)!.needsReason).toBe(
+			`report_outcome's dependsOn names #${self.id}, which is this card itself. Reply to continue, or cancel the card.`,
+		);
+
+		const other = store.createTask("unknown hold");
+		deps = ["nope"];
+		await loop.runTurn(store.name, other.id);
+		expect(store.getTask(other.id)!.needsReason).toBe(
+			"report_outcome's dependsOn names #nope, which is not a card in this project. Reply to continue, or cancel the card.",
+		);
+	});
+
+	test("a reported hold rewrites a stored dependsOn that holds a duplicate", async () => {
+		let depId = "";
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+				runWith(record, {
+					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
+				})(o),
+		});
+		const dep = store.createTask("the blocker");
+		depId = dep.id;
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { dependsOn: [dep.id, dep.id] });
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.dependsOn).toEqual([dep.id]);
+	});
+
+	test("a reported hold on a non-needs_you outcome records the ids but never requeues", async () => {
+		let depId = "";
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			isIntegrated: async () => false,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+				runWith(record, {
+					outcome: { status: "ready", summary: "done", dependsOn: [depId] },
+				})(o),
+		});
+		const dep = store.createTask("the blocker");
+		depId = dep.id;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.dependsOn).toEqual([dep.id]);
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported ready, but git shows 0 commit(s) ahead of the base.",
+		);
+		expect(after.pendingPrompt).toBeNull();
+	});
+
+	test("a reported hold never replaces mid-run steering", async () => {
+		let depId = "";
+		let id = "";
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+				runWith(
+					record,
+					{
+						outcome: {
+							status: "needs_you",
+							summary: "hold",
+							dependsOn: [depId],
+						},
+					},
+					() => store.updateTask(id, { pendingPrompt: "steer mid-run" }),
+				)(o),
+		});
+		const dep = store.createTask("the blocker");
+		depId = dep.id;
+		const task = store.createTask("work please");
+		id = task.id;
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("steer mid-run");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a reported hold with an open ask keeps the question", async () => {
+		let depId = "";
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+				runWith(record, {
+					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
+					asked: [
+						{ question: "pick one?", choices: [{ label: "a" }] },
+					] as never,
+				})(o),
+		});
+		const dep = store.createTask("the blocker");
+		depId = dep.id;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Wants your answer: pick one?");
+		expect(after.dependsOn).toEqual([dep.id]);
+	});
+
+	test("a non-review card with recorded findings still lands done", async () => {
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a review that parks needs_you is not held for its recorded findings", async () => {
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: runWith(record, {
+				outcome: { status: "needs_you", summary: "s", question: "scope?" },
+				recorded: record.recorded,
+			}),
+		});
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		await loop.runTurn(store.name, review.id);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("scope?");
+	});
+
+	test("a plain review landing done never calls the release publish", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			publishRelease: publishingRelease(record),
+		});
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		await loop.runTurn(store.name, review.id);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.publishRelease).toHaveLength(0);
+	});
+
+	test("a merge turn with UI files in its diff never asks for a screenshot", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			changedFiles: async () => ["src/ui/app.tsx"],
+			startRun: integratedRun(record),
+		});
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, {
+			stage: "merging",
+			branch: "ott/x",
+			worktree: "wt-x",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pendingPrompt).toBeNull();
+		expect(logText(store, task.id)).not.toContain(UI_SHOT_WARNING);
+	});
+});
+
+// Survivor round 5 (2026-10-25), slice F: runTurn's finish (report archive, unsaved
+// check, U7 and fork holds, finishTurn, work-check gate, final write, retro proposal).
+describe("turn survivor round 5 — run finish", () => {
+	// A startRun fake that resolves `done` with `r`; `during` runs while the agent is live
+	// (a mid-run steer lands there, as POST /steer does).
+	const runReturning =
+		(record: Recorded, r: Partial<RunResult>, during?: () => void) =>
+		(o: Parameters<TurnOps["startRun"]>[0]) => {
+			record.runs.push(o);
+			o.onSession?.("sess-1");
+			during?.();
+			return {
+				pid: 4242,
+				done: Promise.resolve(runResult(r)),
+				kill: async () => {},
+			};
+		};
+	const askOutcome = (question: string): Partial<RunResult> => ({
+		outcome: { status: "needs_you", summary: "blocked", question },
+	});
+	const forkChild = (store: ProjectStore, prompt: string) => {
+		const parent = store.createTask("fork research: weekly digest");
+		store.updateTask(parent.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const task = store.createTask(prompt);
+		store.updateTask(task.id, { followUpOf: parent.id });
+		return task;
+	};
+	const kidsOf = (store: ProjectStore, id: string) =>
+		store.listTasks().filter((t) => t.followUpOf === id);
+
+	test("a steered research turn keeps the archived report until the turn settles", async () => {
+		const record = baseRecord();
+		let taskId = "";
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			createWorktree: async (o: { worktreePath: string }) => {
+				record.createWorktree.push(o);
+				mkdirSync(o.worktreePath, { recursive: true });
+				writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# half-written");
+			},
+			startRun: runReturning(record, {}, () =>
+				store.updateTask(taskId, { pendingPrompt: "also cover pricing" }),
+			),
+		});
+		const task = store.createTask("research something");
+		taskId = task.id;
+		store.updateTask(task.id, { research: true, report: "# first answer" });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.report).toBe("# first answer");
+	});
+
+	test("unsaved work on a finished work card keeps it in progress, not merging", async () => {
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			unsavedWork: async () => "uncommitted changes",
+			statusFiles: async () => ["src/a.ts"],
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(keptReason("uncommitted changes"));
+		expect(after.keptFiles).toEqual(["src/a.ts"]);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("the update-merge hold never stalls a merge turn that integrated", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			startRun: integratedRun(record),
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, { stage: "merging", updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("the update-merge hold keeps an update card's own question", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			startRun: runReturning(record, askOutcome("pin a@2 or a@3?")),
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, { updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("pin a@2 or a@3?");
+	});
+
+	test("the fork hold never stalls a fork-born card's merge turn that integrated", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			startRun: integratedRun(record),
+		});
+		const task = forkChild(store, "adopt fork idea");
+		store.updateTask(task.id, { stage: "merging" });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("the fork hold keeps a fork-born card's own question", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			startRun: runReturning(record, askOutcome("which digest day?")),
+		});
+		const task = forkChild(store, "adopt fork idea");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.needsReason).toBe("which digest day?");
+	});
+
+	test("a fork-born card with commits to merge parks for approval instead of merging", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			startRun: runReturning(record, {
+				outcome: { status: "ready", summary: "did it" },
+			}),
+		});
+		const task = forkChild(store, "adopt fork idea");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(after.commits).toBeNull();
+	});
+
+	test("an empty ask list records no question and the card settles normally", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			startRun: runReturning(record, {
+				asked: [],
+				outcome: { status: "answered", summary: "did it" },
+			}),
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.question).toBeNull();
+		expect(turn.error).toBeNull();
+	});
+
+	test("a merge card parked at merging never gets the work check", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			workCheck: () => true,
+			startRun: runReturning(record, askOutcome("force-push the tag?")),
+		});
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, { stage: "merging" });
+
+		await loop.runTurn(store.name, task.id);
+
+		// Only the merge run itself: no second-model check run started.
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("force-push the tag?");
+		expect(after.workCheckLog).toHaveLength(0);
+	});
+
+	test("a steered turn re-enters the queue with a fresh queuedAt", async () => {
+		const record = baseRecord();
+		let taskId = "";
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: runReturning(record, {}, () =>
+				store.updateTask(taskId, { pendingPrompt: "also fix the docs" }),
+			),
+		});
+		const task = store.createTask("work please");
+		taskId = task.id;
+		store.updateTask(task.id, { queuedAt: 5 });
+		const t0 = Date.now();
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.queuedAt).toBeGreaterThanOrEqual(t0);
+	});
+
+	test("a done work card shows the run's own summary", async () => {
+		const { store, loop } = setup({ commitsAhead: async () => 0 });
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("did it");
+	});
+
+	test("a release card bounced to needs_you keeps the run summary, not Released", async () => {
+		const { store, loop } = setup({ isIntegrated: async () => false });
+		const task = store.createTask("release v1.0.0");
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "queued",
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-x",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.summary).toBe("did it");
+	});
+
+	test("a plain work card's proposal is never filed as a card", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		record.proposal = { prompt: "not a retro idea", model: null };
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect(store.listTasks()).toHaveLength(1);
+	});
+
+	test("a done retro without a proposal settles done and files nothing", async () => {
+		const { store, loop } = setup({ commitsAhead: async () => 0 });
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		const after = store.getTask(retro.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(store.listTasks()).toHaveLength(1);
+	});
+
+	test("a retro that ends on a question files no proposal", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			startRun: runReturning(record, {
+				...askOutcome("which week?"),
+				proposed: { prompt: "premature idea", model: null },
+			}),
+		});
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		const after = store.getTask(retro.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("which week?");
+		expect(kidsOf(store, retro.id)).toHaveLength(0);
+	});
+
+	test("proposals that are no longer held do not count against the cap", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		for (let i = 0; i < 3; i++) {
+			const p = store.createTask(`proposal ${i}`);
+			store.updateTask(p.id, {
+				state: "idle",
+				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
+			});
+		}
+		record.proposal = { prompt: "fits under the cap", model: null };
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kids = kidsOf(store, retro.id);
+		expect(kids).toHaveLength(1);
+		expect(kids[0]!.prompt).toContain("fits under the cap");
+	});
+
+	test("held proposals that already ran a turn do not count against the cap", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		for (let i = 0; i < 3; i++) {
+			const p = store.createTask(`proposal ${i}`);
+			store.updateTask(p.id, {
+				state: "needs_you",
+				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
+			});
+			const t = store.startTurn(p.id, "work", "p", null);
+			store.finishTurn(t.id, { endedAt: Date.now() });
+		}
+		record.proposal = { prompt: "fits under the cap", model: null };
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kids = kidsOf(store, retro.id);
+		expect(kids).toHaveLength(1);
+		expect(kids[0]!.prompt).toContain("fits under the cap");
+	});
+
+	test("a proposal filed when the handoffs folder already exists still gets its handoff", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
+		record.proposal = { prompt: "second idea", model: null };
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kid = kidsOf(store, retro.id)[0]!;
+		const handoffPath = join(store.tasksDir, "handoffs", `${kid.id}.md`);
+		expect(kid.prompt).toContain(`@${handoffPath}`);
+		expect(existsSync(handoffPath)).toBe(true);
+	});
+
+	test("the proposal handoff describes the settled retro: its summary and session", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		record.proposal = { prompt: "an idea", model: null };
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kid = kidsOf(store, retro.id)[0]!;
+		const handoff = readFileSync(
+			join(store.tasksDir, "handoffs", `${kid.id}.md`),
+			"utf8",
+		);
+		expect(handoff).toContain("did it");
+		expect(handoff).toContain("`sess-1`");
+	});
+
+	test("a failed handoff write files the proposal with its bare prompt and logs why", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		mkdirSync(store.tasksDir, { recursive: true });
+		// A plain file where the handoffs folder belongs: mkdir fails.
+		writeFileSync(join(store.tasksDir, "handoffs"), "not a folder");
+		record.proposal = { prompt: "bare idea", model: null };
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kid = kidsOf(store, retro.id)[0]!;
+		expect(kid.prompt).toBe("bare idea");
+		expect(kid.state).toBe("needs_you");
+		expect(logText(store, retro.id)).toContain("handoff write failed");
+	});
+});
+
+describe("turn survivor round 5 — post-finish branch", () => {
+	type StartOpts = Parameters<TurnOps["startRun"]>[0];
+	type CheckStep = RunResult | ((o: StartOpts) => RunResult);
+	const finding = (
+		prompt: string,
+		rank: number | null = null,
+		security: "critical" | "high" | null = null,
+	): RecordedFinding => ({ prompt, model: null, rank, security });
+	const reviewCard = (store: ProjectStore) => {
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		return review;
+	};
+	const verdicts = (...v: [number, boolean, string][]) =>
+		runResult({
+			finalText: JSON.stringify(
+				v.map(([id, keep, reason]) => ({ id, keep, reason })),
+			),
+		});
+	/** The first run is the review (its result patched by `review`); every later run is a check
+	 * served from `checks` in order. Cap 0: filed cards never start mid-assertion. */
+	function reviewSetup(
+		record: Recorded,
+		review: Partial<RunResult>,
+		checks: CheckStep[],
+		overrides: Partial<TurnOps> = {},
+	) {
+		const checkRuns: StartOpts[] = [];
+		const s = setupWith(record, {
+			commitsAhead: async () => 0,
+			maxTotalRuns: () => 0,
+			startRun: (o: StartOpts) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				let result: RunResult;
+				if (record.runs.length === 1)
+					result = runResult({
+						outcome: { status: "answered", summary: "review done" },
+						recorded: record.recorded,
+						...review,
+					});
+				else {
+					checkRuns.push(o);
+					const step = checks.shift() ?? runResult({ finalText: "[]" });
+					result = typeof step === "function" ? step(o) : step;
+				}
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+			...overrides,
+		});
+		return { ...s, checkRuns };
+	}
+	const kidsOf = (store: ProjectStore, id: string) =>
+		store.listTasks().filter((t) => t.followUpOf === id);
+	/** Freezes Date.now so a check run can advance it by a known amount. */
+	async function withClock(
+		fn: (advance: (ms: number) => void) => Promise<void>,
+	) {
+		const realNow = Date.now;
+		let now = realNow();
+		Date.now = () => now;
+		try {
+			await fn((ms) => {
+				now += ms;
+			});
+		} finally {
+			Date.now = realNow;
+		}
+	}
+
+	test("a review that parks needs_you with recorded findings runs no check and files nothing", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const { store, loop } = reviewSetup(
+			record,
+			{
+				outcome: {
+					status: "needs_you",
+					summary: "need input",
+					question: "which branch?",
+				},
+			},
+			[verdicts([1, true, ""])],
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(1);
+		expect(kidsOf(store, review.id)).toEqual([]);
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.summary).toBe("need input");
+	});
+
+	test("a review that records no findings runs no check and settles done", async () => {
+		const record = baseRecord();
+		const { store, loop } = reviewSetup(record, {}, []);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.summary).toBe("review done");
+	});
+
+	test("the check input lists only the other live cards, numbers findings from 1 and keeps their security", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1, "high"), finding("Bug B", 2)];
+		let logPings: [string, string][] = [];
+		const { store, loop, checkRuns } = reviewSetup(record, {}, [
+			(o) => {
+				const before = record.notifyLog.length;
+				o.onLog?.();
+				logPings = record.notifyLog.slice(before);
+				return verdicts([1, true, ""], [2, true, ""]);
+			},
+		]);
+		const review = reviewCard(store);
+		const open = store.createTask("Open sibling card");
+		const cancelled = store.createTask("Cancelled sibling card");
+		store.updateTask(cancelled.id, { cancelledAt: Date.now() });
+		const finished = store.createTask("Finished sibling card");
+		store.updateTask(finished.id, { stage: "done" });
+		await loop.runTurn(store.name, review.id);
+		expect(checkRuns).toHaveLength(1);
+		const check = checkRuns[0]!;
+		const cards = check.prompt
+			.split("Open cards of the project:\n")[1]!
+			.split("\n\nCommits on main")[0]!;
+		expect(cards).toBe(`- #${open.id} ${store.getTask(open.id)!.title}`);
+		const findings = JSON.parse(
+			check.prompt
+				.split("Findings:\n")[1]!
+				.split("\n\nOpen cards of the project:")[0]!,
+		) as { id: number; security: string; prompt: string }[];
+		expect(findings.map((f) => [f.id, f.prompt, f.security])).toEqual([
+			[1, "Bug A", "high"],
+			[2, "Bug B", ""],
+		]);
+		expect(check.maxTime).toBe("1800");
+		// The check's transcript lines notify the review card's log viewers.
+		expect(logPings).toEqual([[store.name, review.id]]);
+		expect(
+			kidsOf(store, review.id)
+				.map((k) => k.prompt)
+				.sort(),
+		).toEqual(["Bug A", "Bug B"]);
+	});
+
+	test("with the check off: long heads cut at 120, below-cap lines and counts on the card", async () => {
+		const record = baseRecord();
+		const long = `${"L".repeat(130)}\nbody of the long finding`;
+		record.recorded = [
+			...Array.from({ length: 10 }, (_, i) => finding(`Bug ${i + 1}`, i + 1)),
+			finding("Bug 11", 11),
+			finding(long, 12),
+		];
+		const { store, loop } = reviewSetup(
+			record,
+			{
+				outcome: {
+					status: "answered",
+					summary: "review done",
+					details: "Review body",
+				},
+			},
+			[],
+			{ reviewCheck: () => false },
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(review.id)!;
+		const cut = "L".repeat(120);
+		expect(after.summary).toBe(
+			"review done\nFindings: 12 recorded, 10 filed, 2 not filed.",
+		);
+		expect(after.details!.startsWith("Review body\n\n## Findings\n")).toBe(
+			true,
+		);
+		expect(after.details).toMatch(/- filed as card #\S+\n- filed as card #/);
+		expect(after.details).toContain(
+			`- below the cap of 10: Bug 11\n- below the cap of 10: ${cut}`,
+		);
+		expect(after.details).not.toContain("L".repeat(121));
+		const log = logText(store, review.id);
+		expect(log).toContain("below the cap of 10, not filed: Bug 11");
+		expect(log).toContain(`below the cap of 10, not filed: ${cut}\n`);
+		expect(log).toContain(
+			"review findings: 12 recorded, 10 filed, 2 not filed, check off",
+		);
+	});
+
+	test("a check that drops every finding: reasons, counts and the check time land in log and card", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1), finding("Bug B", 2)];
+		await withClock(async (advance) => {
+			const { store, loop } = reviewSetup(record, {}, [
+				() => {
+					advance(4000);
+					return verdicts(
+						[1, false, "dup of #7"],
+						[2, false, "handled at src/x.ts:42"],
+					);
+				},
+			]);
+			const review = reviewCard(store);
+			await loop.runTurn(store.name, review.id);
+			expect(kidsOf(store, review.id)).toEqual([]);
+			const after = store.getTask(review.id)!;
+			expect(after.summary).toBe(
+				"review done\nFindings: 2 recorded, 0 filed, 2 not filed (check 4s).",
+			);
+			expect(after.details).toContain(
+				"## Findings\n- none filed\n- dropped: Bug A — dup of #7\n- dropped: Bug B — handled at src/x.ts:42",
+			);
+			const log = logText(store, review.id);
+			expect(log).toContain("dropped finding 1: dup of #7");
+			expect(log).toContain("dropped finding 2: handled at src/x.ts:42");
+			expect(log).toContain(
+				"review findings: 2 recorded, 0 filed, 2 not filed, check 4s",
+			);
+		});
+	});
+
+	test("a failed check run is retried even when its final text holds verdicts", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const { store, loop } = reviewSetup(record, {}, [
+			runResult({
+				exitCode: 1,
+				stderrTail: "boom\n",
+				finalText: '[{"id":1,"keep":true,"reason":""}]',
+			}),
+			verdicts([1, false, "stale finding"]),
+		]);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(3);
+		expect(kidsOf(store, review.id)).toEqual([]);
+		expect(store.getTask(review.id)!.details).toContain("stale finding");
+		expect(logText(store, review.id)).toContain(
+			"attempt 1 failed: the check run exited with code 1: boom",
+		);
+	});
+
+	test("a check without a JSON verdict twice parks the review with that reason and writes no findings report", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const { store, loop } = reviewSetup(record, {}, [
+			runResult({ finalText: "no verdict here" }),
+			runResult({ finalText: "still no verdict" }),
+		]);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(3);
+		expect(kidsOf(store, review.id)).toEqual([]);
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"failed twice: the check verdict was not valid JSON",
+		);
+		expect(after.summary).toBe("review done");
+		expect(after.details ?? "").not.toContain("## Findings");
+		const log = logText(store, review.id);
+		expect(log).toContain(
+			"attempt 1 failed: the check verdict was not valid JSON",
+		);
+		expect(log).toContain(
+			"attempt 2 failed: the check verdict was not valid JSON",
+		);
+		expect(log).toContain(
+			"gave up after a retry: the check verdict was not valid JSON",
+		);
+	});
+
+	test("a review cancelled during a failing check is not parked needs_you", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		let reviewId = "";
+		const { store, loop } = reviewSetup(record, {}, [
+			runResult({ finalText: "no verdict here" }),
+			() => {
+				store.updateTask(reviewId, { cancelledAt: Date.now() });
+				return runResult({ finalText: "still no verdict" });
+			},
+		]);
+		const review = reviewCard(store);
+		reviewId = review.id;
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(3);
+		const after = store.getTask(review.id)!;
+		expect(after.needsReason ?? "").not.toContain("failed twice");
+		expect(after.state).not.toBe("needs_you");
+	});
+
+	test("a review cancelled during a passing check files nothing and gets no findings report", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		let reviewId = "";
+		const { store, loop } = reviewSetup(record, {}, [
+			() => {
+				store.updateTask(reviewId, { cancelledAt: Date.now() });
+				return verdicts([1, true, ""]);
+			},
+		]);
+		const review = reviewCard(store);
+		reviewId = review.id;
+		await loop.runTurn(store.name, review.id);
+		expect(kidsOf(store, review.id)).toEqual([]);
+		const after = store.getTask(review.id)!;
+		expect(after.summary ?? "").not.toContain("Findings:");
+		expect(after.details ?? "").not.toContain("## Findings");
+	});
+
+	test("a review settled from the merge stage without a report: the summary falls back, details start empty", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const { store, loop } = reviewSetup(
+			record,
+			{ outcome: null, finalText: "" },
+			[verdicts([1, true, ""])],
+		);
+		const review = reviewCard(store);
+		store.updateTask(review.id, { stage: "merging", state: "queued" });
+		await loop.runTurn(store.name, review.id);
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
+		const after = store.getTask(review.id)!;
+		expect(
+			after.summary!.startsWith(
+				"Review finished\nFindings: 1 recorded, 1 filed",
+			),
+		).toBe(true);
+		expect(after.details).toBe(
+			`\n\n## Findings\n- filed as card #${kids[0]!.id}\n`,
+		);
+	});
+
+	test("a check taken over by the lost sweep leaves the replacement turn's cap claim alone", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		let releaseCheck: (r: RunResult) => void = () => {};
+		const checkDone = new Promise<RunResult>((resolve) => {
+			releaseCheck = resolve;
+		});
+		let releasePrepare: () => void = () => {};
+		const prepareHeld = new Promise<void>((resolve) => {
+			releasePrepare = resolve;
+		});
+		let targets = 0;
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 1,
+			commitsAhead: async () => 0,
+			pidAlive: () => false,
+			// The second turn of the review (the replacement) holds in its prepare phase.
+			resolveTarget: async () => {
+				targets += 1;
+				if (targets === 2) await prepareHeld;
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+			startRun: (o: StartOpts) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done:
+						record.runs.length === 1
+							? Promise.resolve(
+									runResult({
+										outcome: { status: "answered", summary: "review done" },
+										recorded: record.recorded,
+									}),
+								)
+							: record.runs.length === 2
+								? checkDone
+								: Promise.resolve(
+										runResult({
+											outcome: { status: "answered", summary: "again" },
+										}),
+									),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewCard(store);
+		const first = loop.runTurn(store.name, review.id);
+		await flushPromises();
+		loop.schedule(); // the check pid is dead: the sweep takes the check over
+		await flushPromises();
+		expect(store.getTask(review.id)!.state).toBe("needs_you");
+		// A reply re-queues the review: its replacement turn claims the card's one cap unit.
+		store.updateTask(review.id, { state: "queued" });
+		const replacement = loop.runTurn(store.name, review.id);
+		await flushPromises();
+		const other = store.createTask("other card waits for the cap");
+		// The old check's late end must not free the replacement's claim.
+		releaseCheck(
+			runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' }),
+		);
+		await first;
+		await flushPromises();
+		expect(record.runs.some((r) => r.prompt.includes(other.prompt!))).toBe(
+			false,
+		);
+		expect(store.getTask(other.id)!.state).toBe("queued");
+		releasePrepare();
+		await replacement;
+	});
+});
+
+// Round 5, slice H: runTurn's work card → merging hand-off (the second-model work check):
+// switch default, head read, reply window, check range, transcript evidence, prior-blocker
+// resolution, the failed-check record and the lost-check takeover.
+describe("turn survivor round 5 — work card to merging", () => {
+	const CHECK_OPENING =
+		"You are the second model checking a finished work card";
+	const ready = () =>
+		runResult({
+			outcome: { status: "ready", summary: "did it" } satisfies Outcome,
+		});
+	const verdict = (v: {
+		blockers?: { finding: string; quote: string }[];
+		fixed?: { id: number; reason: string }[];
+		notes?: string[];
+	}) =>
+		runResult({
+			finalText: JSON.stringify({
+				blockers: v.blockers ?? [],
+				fixed: v.fixed ?? [],
+				notes: v.notes ?? [],
+			}),
+		});
+	/** A stored check run at `at`: a pass without blockers, else a blockers run. */
+	const storedRun = (
+		at: number,
+		blockers: WorkCheckRun["blockers"] = [],
+	): WorkCheckRun => ({
+		at,
+		model: null,
+		outcome: blockers.length > 0 ? "blockers" : "pass",
+		blockers,
+		notes: [],
+		durationMs: 0,
+	});
+	/** startRun fake: work runs report ready; check runs take `checks` in order. */
+	function checkRuns(
+		record: Recorded,
+		checks: RunResult[],
+		onCheck: (o: Parameters<TurnOps["startRun"]>[0]) => void = () => {},
+	) {
+		let next = 0;
+		return (o: Parameters<TurnOps["startRun"]>[0]) => {
+			record.runs.push(o);
+			o.onSession?.(`sess-${record.runs.length}`);
+			const isCheck = o.prompt.startsWith(CHECK_OPENING);
+			if (isCheck) onCheck(o);
+			return {
+				pid: 4242,
+				done: Promise.resolve(
+					isCheck ? (checks[next++] ?? runResult({})) : ready(),
+				),
+				kill: async () => {},
+			};
+		};
+	}
+	/** A ready work card with one commit ahead at head sha1; maxTotalRuns 0 holds the merge turn. */
+	function checkCase(checks: RunResult[], overrides: Partial<TurnOps> = {}) {
+		const record = baseRecord();
+		return setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => "sha1",
+			diffText: async () => "const x = 1;\n",
+			workCheck: () => true,
+			startRun: checkRuns(record, checks),
+			...overrides,
+		});
+	}
+	const checkPrompts = (record: Recorded) =>
+		record.runs.filter((r) => r.prompt.startsWith(CHECK_OPENING));
+	/** A finished turn row that delivered a human message; returns its start time. */
+	function humanTurn(store: ProjectStore, id: string, text: string): number {
+		const t = store.startTurn(id, "work", "p", null, text);
+		store.finishTurn(t.id, { endedAt: t.startedAt, exitCode: 0 });
+		return t.startedAt;
+	}
+
+	test("a pass checks the worktree HEAD against the target and logs its model and duration", async () => {
+		const record = baseRecord();
+		const diffs: [string, string][] = [];
+		let checkNotified: [string, string][] = [];
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			workCheck: () => true,
+			modelRoles: () => ({ adversary: "zai/check-model" }),
+			// Only the worktree HEAD has a sha; any other ref reads as unknown.
+			targetSha: async (_wt: string, ref: string) =>
+				ref === "HEAD" ? "sha1" : null,
+			diffText: async (_wt: string, from: string, to: string) => {
+				diffs.push([from, to]);
+				return to === "HEAD" ? "const x = 1;\n" : null;
+			},
+			// The test clock stands still; the check alone moves it 5 s, and writes to the card log.
+			startRun: checkRuns(record, [verdict({ notes: ["small nit"] })], (o) => {
+				setSystemTime(new Date(Date.now() + 5000));
+				const before = record.notifyLog.length;
+				o.onLog?.();
+				checkNotified = record.notifyLog.slice(before);
+			}),
+		});
+		const task = store.createTask("work please");
+		setSystemTime(new Date(Date.now()));
+		try {
+			await loop.runTurn(store.name, task.id);
+		} finally {
+			setSystemTime();
+		}
+
+		const check = checkPrompts(record)[0]!;
+		expect(check.maxTime).toBe("1800");
+		expect(check.prompt).toContain(", branch origin/main..sha1:");
+		expect(check.prompt).toContain("const x = 1;");
+		expect(diffs).toEqual([["origin/main", "HEAD"]]);
+		// The check's log output notifies the board like the work run's.
+		expect(checkNotified).toEqual([[store.name, task.id]]);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.workCheckHead).toBe("sha1");
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.model).toBe("zai/check-model");
+		expect(after.workCheckLog[0]!.durationMs).toBe(5000);
+		expect(logText(store, task.id)).toContain(
+			"work check: 0 blocker(s), 1 note(s), 5s",
+		);
+	});
+
+	test("an unknown head with no stored head still runs the check", async () => {
+		const { store, record, loop } = checkCase([verdict({})], {
+			targetSha: async () => null,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(checkPrompts(record)).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckHead).toBeNull();
+	});
+
+	test("an absent work-check switch counts as on", async () => {
+		const { store, record, loop } = checkCase([verdict({})], {
+			workCheck: undefined,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(checkPrompts(record)).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("pass");
+		expect(after.workCheckHead).toBe("sha1");
+	});
+
+	test("a work card that ends needs_you gets no check", async () => {
+		const record = baseRecord();
+		const { store, loop } = checkCase([verdict({})], {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "needs_you",
+								summary: "which database?",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckLog).toEqual([]);
+		expect(after.workCheckHead).toBeNull();
+	});
+
+	test("a review card parked at merging gets no work check", async () => {
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+			commitsAhead: async () => 0,
+			workCheck: () => true,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									outcome: { status: "answered", summary: "review done" },
+									recorded: record.recorded,
+								})
+							: runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' }),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		await loop.runTurn(store.name, review.id);
+
+		expect(record.runs).toHaveLength(2); // the review and its findings check only
+		expect(checkPrompts(record)).toHaveLength(0);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.workCheckLog).toEqual([]);
+	});
+
+	test("a card the store no longer returns after the head read gets no check and no tracker error", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		let gone = false;
+		const vanishing = new Proxy(store, {
+			get(target, prop) {
+				if (prop === "getTask" && gone) return () => null;
+				const value = Reflect.get(target, prop);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(vanishing)]]),
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				commitsAhead: async () => 1,
+				workCheck: () => true,
+				targetSha: async () => {
+					gone = true;
+					return "sha1";
+				},
+				startRun: checkRuns(record, [verdict({})]),
+			}),
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		gone = false;
+
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.needsReason).toBeNull();
+		expect(after.workCheckLog).toEqual([]);
+	});
+
+	test("a card cancelled during the head read gets no check", async () => {
+		let cancel = () => {};
+		const { store, record, loop } = checkCase([verdict({})], {
+			targetSha: async () => {
+				cancel();
+				return "sha1";
+			},
+		});
+		const task = store.createTask("work please");
+		cancel = () => store.updateTask(task.id, { cancelledAt: Date.now() });
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.workCheckLog).toEqual([]);
+	});
+
+	test("an unreadable head checks the full diff against HEAD and clears the stored head", async () => {
+		const { store, record, loop } = checkCase([verdict({})], {
+			targetSha: async () => {
+				throw new Error("not a git repository");
+			},
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, {
+			workCheckLog: [storedRun(1)],
+			workCheckHead: "old",
+		});
+		await loop.runTurn(store.name, task.id);
+
+		const check = checkPrompts(record)[0]!;
+		expect(check.prompt).toContain(", branch origin/main..HEAD:");
+		expect(check.prompt).toContain("Diff of the branch");
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckHead).toBeNull();
+	});
+
+	test("a stored head without any check run still checks the full branch diff", async () => {
+		const froms: string[] = [];
+		const { store, record, loop } = checkCase([verdict({})], {
+			diffText: async (_wt: string, from: string) => {
+				froms.push(from);
+				return "const x = 1;\n";
+			},
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { workCheckHead: "old" });
+		await loop.runTurn(store.name, task.id);
+
+		expect(froms).toEqual(["origin/main"]);
+		expect(checkPrompts(record)[0]!.prompt).toContain("Diff of the branch");
+		expect(store.getTask(task.id)!.workCheckHead).toBe("sha1");
+	});
+
+	test("after an errored check, a new check sees the full diff and resolves only the open blockers", async () => {
+		const { store, record, loop } = checkCase([verdict({})]);
+		const task = store.createTask("work please");
+		const settled = {
+			finding: "old naming",
+			quote: "let y",
+			status: "fixed" as const,
+			statusReason: "earlier fix",
+		};
+		const open = { finding: "weak tests", quote: "const x = 1;" };
+		store.updateTask(task.id, {
+			workCheckLog: [
+				storedRun(1, [settled, open]),
+				{
+					at: 2,
+					model: null,
+					outcome: "error",
+					blockers: [],
+					notes: [],
+					durationMs: 0,
+					error: "quota exceeded",
+				},
+			],
+			workCheckHead: null,
+			workCheckSendbacks: 1,
+		});
+		await loop.runTurn(store.name, task.id);
+
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).toContain("Diff of the branch");
+		expect(prompt).toContain("\n1. weak tests\n   quote: const x = 1;");
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.workCheckLog).toHaveLength(3);
+		expect(after.workCheckLog[0]!.blockers).toEqual([
+			settled,
+			{
+				...open,
+				status: "fixed",
+				statusReason: "not re-cited by the re-check",
+			},
+		]);
+		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+	});
+
+	test("a human message from the last check's start instant does not re-open it", async () => {
+		const { store, record, loop } = checkCase([verdict({})]);
+		const task = store.createTask("work please");
+		const said = humanTurn(store, task.id, "looks fine to me");
+		store.updateTask(task.id, {
+			workCheckLog: [
+				storedRun(said, [{ finding: "weak tests", quote: "const x = 1;" }]),
+			],
+			workCheckHead: "sha1",
+		});
+		await loop.runTurn(store.name, task.id);
+
+		// No check run: the open blocker goes back once more.
+		expect(checkPrompts(record)).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckSendbacks).toBe(1);
+		expect(after.pendingPrompt).toContain("weak tests");
+	});
+
+	test("a human reply after a passed check at the same head starts no check", async () => {
+		const { store, record, loop } = checkCase([verdict({})]);
+		const task = store.createTask("work please");
+		const said = humanTurn(store, task.id, "also add a changelog line");
+		store.updateTask(task.id, {
+			workCheckLog: [storedRun(said - 1)],
+			workCheckHead: "sha1",
+		});
+		await loop.runTurn(store.name, task.id);
+
+		expect(checkPrompts(record)).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckLog).toHaveLength(1);
+	});
+
+	test("a reply-driven re-check at an unchanged head sees the whole branch diff", async () => {
+		const { store, record, loop } = checkCase([verdict({})]);
+		const task = store.createTask("work please");
+		const said = humanTurn(store, task.id, "I approve the auth change");
+		store.updateTask(task.id, {
+			workCheckLog: [
+				storedRun(said - 1, [
+					{ finding: "auth touched", quote: "const x = 1;" },
+				]),
+			],
+			workCheckHead: "sha1",
+			workCheckSendbacks: 1,
+		});
+		await loop.runTurn(store.name, task.id);
+
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).toContain("I approve the auth change");
+		expect(prompt).toContain("Diff of the branch");
+		expect(prompt).not.toContain("Diff of only the new commits");
+		expect(store.getTask(task.id)!.stage).toBe("merging");
+	});
+
+	test("a re-check at a new head reads the new-commits diff up to HEAD", async () => {
+		const { store, record, loop } = checkCase([verdict({})], {
+			targetSha: async () => "sha2",
+			diffText: async (_wt: string, from: string, to: string) =>
+				to !== "HEAD"
+					? null
+					: from === "sha1"
+						? "const y = 2;\n"
+						: "const x = 1;\nconst y = 2;\n",
+		});
+		const task = store.createTask("work please");
+		store.updateTask(task.id, {
+			workCheckLog: [
+				storedRun(1, [{ finding: "weak", quote: "const x = 1;" }]),
+			],
+			workCheckHead: "sha1",
+			workCheckSendbacks: 1,
+		});
+		await loop.runTurn(store.name, task.id);
+
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).toContain("Diff of only the new commits");
+		expect(prompt).toContain("\n\nconst y = 2;\n\n");
+		expect(prompt).not.toContain("const x = 1;\nconst y = 2;");
+	});
+
+	test("a blocker sent back names attempt 1 of 2 in the prompt and the log", async () => {
+		const { store, loop } = checkCase([
+			verdict({ blockers: [{ finding: "weak tests", quote: "const x = 1;" }] }),
+		]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckSendbacks).toBe(1);
+		expect(after.pendingPrompt).toContain("Send-back 1 of 2");
+		expect(logText(store, task.id)).toContain(
+			"sent back to the work agent (1 of 2)",
+		);
+	});
+
+	test("the third block numbers every finding in the needs_you reason", async () => {
+		const { store, loop } = checkCase(
+			[
+				verdict({
+					blockers: [
+						{ finding: "first finding", quote: "const x = 1;" },
+						{ finding: "second finding", quote: "const y = 2;" },
+					],
+				}),
+			],
+			{ diffText: async () => "const x = 1;\nconst y = 2;\n" },
+		);
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { workCheckSendbacks: 2 });
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("1. first finding 2. second finding.");
+	});
+
+	test("a transcript quote blocks: the check gets the session file and reads it", async () => {
+		const { store, record, loop } = checkCase([
+			verdict({
+				blockers: [{ finding: "claims tests ran", quote: "bun test: 12 pass" }],
+			}),
+		]);
+		mkdirSync(store.sessionsDir, { recursive: true });
+		const transcript = join(store.sessionsDir, "1_sess-1.jsonl");
+		writeFileSync(transcript, '{"text":"bun test: 12 pass"}\n');
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(checkPrompts(record)[0]!.prompt.endsWith(`): ${transcript}`)).toBe(
+			true,
+		);
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckLog[0]!.outcome).toBe("blockers");
+		expect(after.workCheckLog[0]!.blockers[0]!.quote).toBe("bun test: 12 pass");
+		expect(after.workCheckSendbacks).toBe(1);
+	});
+
+	test("with no diff and no transcript every quote demotes and the prompt holds neither", async () => {
+		const { store, record, loop } = checkCase(
+			[verdict({ blockers: [{ finding: "looks wrong", quote: "here" }] })],
+			{ diffText: async () => null },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).toContain(
+			"read files in the worktree for the rest):\n\n\n\n",
+		);
+		expect(prompt.endsWith("read it in ranges): ")).toBe(true);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.workCheckLog[0]!.outcome).toBe("pass");
+		expect(after.workCheckLog[0]!.notes[0]).toContain("looks wrong");
+	});
+
+	test("a check that answers no JSON twice parks the card with an error run", async () => {
+		const { store, loop } = checkCase(
+			[
+				runResult({ finalText: "no verdict" }),
+				runResult({ finalText: "still none" }),
+			],
+			{ modelRoles: () => ({ adversary: "zai/check-model" }) },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const reason = "the work check verdict was not valid JSON";
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(`failed twice: ${reason}.`);
+		const run = after.workCheckLog[0]!;
+		expect(run.model).toBe("zai/check-model");
+		expect(run.outcome).toBe("error");
+		expect(run.blockers).toEqual([]);
+		expect(run.notes).toEqual([]);
+		expect(run.error).toBe(reason);
+		const text = logText(store, task.id);
+		expect(text).toContain(`work check attempt 1 failed: ${reason}`);
+		expect(text).toContain(`work check attempt 2 failed: ${reason}`);
+		expect(text).toContain(`work check failed: ${reason}`);
+	});
+
+	test("a late check result after the lost sweep leaves the stored error run alone", async () => {
+		const record = baseRecord();
+		let releaseCheck: (r: RunResult) => void = () => {};
+		const checkDone = new Promise<RunResult>((resolve) => {
+			releaseCheck = resolve;
+		});
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => "sha1",
+			workCheck: () => true,
+			pidAlive: () => false,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done: record.runs.length === 1 ? Promise.resolve(ready()) : checkDone,
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await flushPromises();
+		loop.schedule(); // the check pid is dead: the sweep parks the card
+		await flushPromises();
+		expect(store.getTask(task.id)!.workCheckLog[0]!.outcome).toBe("error");
+
+		releaseCheck(verdict({}));
+		await run;
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("error");
+		expect(after.workCheckHead).toBeNull();
+	});
+
+	test("a late check result after the lost sweep keeps the replacement turn's cap slot", async () => {
+		const record = baseRecord();
+		let releaseCheck: (r: RunResult) => void = () => {};
+		const checkDone = new Promise<RunResult>((resolve) => {
+			releaseCheck = resolve;
+		});
+		let installs = 0;
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 1,
+			commitsAhead: async () => 1,
+			targetSha: async () => "sha1",
+			workCheck: () => true,
+			pidAlive: () => false,
+			// The replacement turn (the second install) hangs: it holds only its preparing claim.
+			ensurePackages: async () => {
+				installs++;
+				return installs === 2 ? new Promise<string[]>(() => {}) : [];
+			},
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done:
+						record.runs.length === 1
+							? Promise.resolve(ready())
+							: record.runs.length === 2
+								? checkDone
+								: new Promise<RunResult>(() => {}),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const first = loop.runTurn(store.name, task.id);
+		await flushPromises();
+		loop.schedule(); // the check pid is dead: the sweep parks the card
+		await flushPromises();
+		expect(store.getTask(task.id)!.state).toBe("needs_you");
+
+		// The user replies: a replacement turn claims the card's slot and hangs in its prepare.
+		store.updateTask(task.id, { state: "queued", pendingPrompt: "re-run it" });
+		void loop.runTurn(store.name, task.id);
+		await flushPromises();
+		expect(installs).toBe(2);
+		const other = store.createTask("another card");
+
+		releaseCheck(verdict({}));
+		await first;
+		await flushPromises();
+		// The cap of 1 is still held by the replacement: the other card waits.
+		expect(store.getTask(other.id)!.state).toBe("queued");
+		expect(installs).toBe(2);
+		expect(record.runs).toHaveLength(2);
+	});
+});
+
+describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
+	type StartArgs = Parameters<TurnOps["startRun"]>[0];
+	const answered = (summary = "did it") =>
+		runResult({ outcome: { status: "answered", summary } satisfies Outcome });
+
+	/** Microtask-only drain: safe under fake timers (no setImmediate). */
+	async function drainMicrotasks(n = 50) {
+		for (let i = 0; i < n; i++) await Promise.resolve();
+	}
+
+	async function waitFor(cond: () => boolean) {
+		for (let i = 0; i < 100 && !cond(); i++) await flushPromises();
+		expect(cond()).toBe(true);
+	}
+
+	function reviewWith(store: ProjectStore) {
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		return review;
+	}
+
+	test("a cancel during the review check keeps the deferred park off the cancelled card", async () => {
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		// The cancel has marked the card and is still removing the worktree when the check ends:
+		// the card is cancelled but still in its running state.
+		const removing = Promise.withResolvers<void>();
+		const removeGate = Promise.withResolvers<void>();
+		let cancelling: Promise<unknown> = Promise.resolve();
+		let duringCheck: () => Promise<unknown> = async () => undefined;
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			removeWorktree: async (o: unknown) => {
+				record.removeWorktree.push(o);
+				removing.resolve();
+				await removeGate.promise;
+			},
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				const first = record.runs.length === 1;
+				const result = first
+					? runResult({
+							outcome: { status: "answered", summary: "review done" },
+							recorded: record.recorded,
+						})
+					: runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' });
+				return {
+					pid: 4242,
+					done: first
+						? Promise.resolve(result)
+						: duringCheck().then(() => result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewWith(store);
+		duringCheck = async () => {
+			cancelling = loop.cancel(fakeProject(store), review.id, false);
+			await removing.promise;
+			expect(store.getTask(review.id)!.state).toBe("running");
+		};
+		await loop.runTurn(store.name, review.id);
+		removeGate.resolve();
+		await expect(cancelling).resolves.toEqual({ removed: true });
+
+		const after = store.getTask(review.id)!;
+		expect(record.runs).toHaveLength(2); // the check did run
+		expect(after.cancelledAt).not.toBeNull();
+		// The findings park (merging/idle/FINDINGS_HOLD) never lands on the cancelled card.
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
+			[],
+		);
+	});
+
+	test("a run whose session was never announced still settles to merging/queued", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0, // keep the finally's schedule() from starting the merge turn
+			// No onSession call: the card never left preparing while the run went on.
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				return {
+					pid: 4242,
+					done: Promise.resolve(answered()),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect([after.stage, after.state]).toEqual(["merging", "queued"]);
+	});
+
+	test("a work card settling to merging/queued gets a fresh queue time", async () => {
+		// Cap 0 keeps the finally's schedule() from starting the merge turn.
+		const { store, loop } = setup({ maxTotalRuns: () => 0 });
+		const task = store.createTask("work please");
+		store.updateTask(task.id, { queuedAt: 1 });
+		const before = Date.now();
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect([after.stage, after.state]).toEqual(["merging", "queued"]);
+		expect(after.queuedAt).toBeGreaterThanOrEqual(before);
+	});
+
+	test("a review parked on its findings keeps its old queue time", async () => {
+		const record = baseRecord();
+		record.recorded = [
+			{ prompt: "Bug A", model: null, rank: 1, security: null },
+		];
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			reviewCheck: () => false,
+		});
+		const review = reviewWith(store);
+		store.updateTask(review.id, { queuedAt: 1 });
+		await loop.runTurn(store.name, review.id);
+		const after = store.getTask(review.id)!;
+		expect([after.stage, after.state, after.needsReason]).toEqual([
+			"merging",
+			"idle",
+			FINDINGS_HOLD,
+		]);
+		expect(after.queuedAt).toBe(1);
+	});
+
+	test("a merge proved by git without a receipt stamps no version from its prose", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					// No report_outcome: git proves the merge; the final text names a version.
+					done: Promise.resolve(
+						runResult({ outcome: null, finalText: "pushed v1.2.3 to main" }),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.releaseVersion).toBeNull();
+		expect(after.pushSha).toBe("sha-pushed");
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(logText(store, task.id)).toContain("worktree removed");
+	});
+
+	test("a work turn that reports integrated pins no CI push sha", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			startRun: integratedRun(record),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBeNull();
+		expect(logText(store, task.id)).not.toContain("CI watch skipped");
+	});
+
+	test("a target with origin/ inside its name reads its own remote-tracking ref", async () => {
+		const record = baseRecord();
+		const refs: string[] = [];
+		const { store, loop } = setupWith(record, {
+			resolveTarget: async () => ({
+				target: "mirror-origin/main",
+				sha: "sha0",
+				warning: null,
+			}),
+			isIntegrated: async () => true,
+			targetSha: async (_mainPath: string, ref: string) => {
+				refs.push(ref);
+				return ref === "mirror-origin/main" ||
+					ref === "refs/remotes/origin/mirror-origin/main"
+					? "sha-pushed"
+					: null;
+			},
+			startRun: integratedRun(record),
+		});
+		const task = store.createTask("merge please");
+		store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(refs).toContain("refs/remotes/origin/mirror-origin/main");
+		expect(store.getTask(task.id)!.pushSha).toBe("sha-pushed");
+	});
+
+	test("a run whose done rejects frees its slot: the requeued card runs again", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				calls += 1;
+				return {
+					pid: 4242,
+					done:
+						calls === 1
+							? Promise.reject(new Error("stream broke"))
+							: Promise.resolve(answered()),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const failed = store.getTask(task.id)!;
+		expect(failed.state).toBe("needs_you");
+		expect(failed.needsReason).toBe("Tracker error: stream broke");
+		expect(store.listTurns(task.id)[0]!.error).toBe("stream broke");
+		await expect(loop.stopTurn(fakeProject(store), task.id)).resolves.toEqual({
+			error: "no turn is running",
+			status: 409,
+		});
+
+		store.updateTask(task.id, { state: "queued" });
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(2);
+		expect(store.getTask(task.id)!.stage).toBe("merging");
+	});
+
+	/** First run hangs on dead pid 4242 until `release1`; later runs use pid 5050. */
+	function abandonFixture(overrides: Partial<TurnOps> = {}) {
+		const gate1 = Promise.withResolvers<RunResult>();
+		const gate2 = Promise.withResolvers<RunResult>();
+		const record = baseRecord();
+		const store = freshStore();
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				pidAlive: (pid: number) => pid !== 4242,
+				startRun: (o: StartArgs) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					if (record.runs.length === 1)
+						return { pid: 4242, done: gate1.promise, kill: async () => {} };
+					return {
+						pid: 5050,
+						done: gate2.promise,
+						kill: async () => {
+							record.killed = true;
+							gate2.resolve(runResult({ killed: true, sawTerminalEnd: false }));
+						},
+					};
+				},
+				...overrides,
+			}),
+		);
+		const task = store.createTask("work please");
+		const key = `${store.name}/${task.id}`;
+		return { record, store, projects, loop, task, key, gate1 };
+	}
+
+	test("a late done of an abandoned run leaves the resumed run's slot alone", async () => {
+		const { record, store, loop, task, key, gate1 } = abandonFixture();
+		const run1 = loop.runTurn(store.name, task.id);
+		await waitFor(() => loop.running.has(key));
+		// The sweep abandons the dead pid; a later tick starts the resumed run (pid 5050).
+		for (let i = 0; i < 10 && record.runs.length < 2; i++) {
+			loop.schedule();
+			await flushPromises();
+		}
+		expect(record.runs).toHaveLength(2);
+		expect(loop.running.get(key)?.pid).toBe(5050);
+
+		gate1.resolve(answered());
+		await run1;
+
+		// The resumed run still owns the slot: Esc reaches it.
+		await expect(loop.stopTurn(fakeProject(store), task.id)).resolves.toEqual({
+			ok: true,
+		});
+		expect(record.killed).toBe(true);
+	});
+
+	test("a late done of an abandoned run keeps the resumed run's cap claim", async () => {
+		let targets = 0;
+		const hold = Promise.withResolvers<void>();
+		const other = freshStore();
+		const { record, store, projects, loop, task, key, gate1 } = abandonFixture({
+			maxTotalRuns: () => 1,
+			resolveTarget: async () => {
+				targets += 1;
+				// The resumed run (second resolve) sits in its prepare phase.
+				if (targets === 2) await hold.promise;
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		projects.set(other.name, fakeProject(other));
+		const run1 = loop.runTurn(store.name, task.id);
+		await waitFor(() => loop.running.has(key));
+		for (let i = 0; i < 10 && targets < 2; i++) {
+			loop.schedule();
+			await flushPromises();
+		}
+		expect(targets).toBe(2);
+		expect(store.getTask(task.id)!.state).toBe("preparing");
+		// A card in another project waits for the one global slot.
+		const waiting = other.createTask("next in line");
+
+		gate1.resolve(answered());
+		await run1;
+		await flushPromises();
+
+		expect(other.getTask(waiting.id)!.state).toBe("queued");
+		expect(record.runs).toHaveLength(1);
+		hold.resolve();
+	});
+
+	test("a stop that raced a natural finish does not turn a later cancel into a stop", async () => {
+		const gate1 = Promise.withResolvers<RunResult>();
+		const gate2 = Promise.withResolvers<RunResult>();
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (record.runs.length === 1)
+					// The kill lands too late: the run finishes on its own.
+					return { pid: 4242, done: gate1.promise, kill: async () => {} };
+				return {
+					pid: 5050,
+					done: gate2.promise,
+					kill: async () => {
+						gate2.resolve(runResult({ killed: true, sawTerminalEnd: false }));
+					},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const key = `${store.name}/${task.id}`;
+		const run1 = loop.runTurn(store.name, task.id);
+		await waitFor(() => loop.running.has(key));
+		const stop = loop.stopTurn(fakeProject(store), task.id);
+		gate1.resolve(answered());
+		await expect(stop).resolves.toEqual({ ok: true });
+		await run1;
+		expect(store.listTurns(task.id)[0]!.error).toBeNull();
+
+		store.updateTask(task.id, { stage: "in_progress", state: "queued" });
+		const run2 = loop.runTurn(store.name, task.id);
+		await waitFor(() => loop.running.has(key));
+		await expect(
+			loop.cancel(fakeProject(store), task.id, true),
+		).resolves.toEqual({ removed: true });
+		await run2;
+
+		const second = store.listTurns(task.id).at(-1)!;
+		expect(second.error).toBe("cancelled");
+		expect(store.getTask(task.id)!.needsReason ?? "").not.toContain(
+			"Turn stopped",
+		);
+	});
+
+	test("stop returns after 15 s when the killed run never ends", async () => {
+		const { store, record, loop } = setup();
+		const task = store.createTask("hung");
+		loop.running.set(`${store.name}/${task.id}`, {
+			pid: 4242,
+			done: new Promise<unknown>(() => {}),
+			kill: async () => {
+				record.killed = true;
+			},
+		});
+		jest.useFakeTimers();
+		try {
+			let out: unknown = null;
+			void loop.stopTurn(fakeProject(store), task.id).then((r) => {
+				out = r;
+			});
+			await drainMicrotasks();
+			jest.advanceTimersByTime(14_999);
+			await drainMicrotasks();
+			expect(out).toBeNull();
+			jest.advanceTimersByTime(1);
+			await drainMicrotasks();
+			expect(out).toEqual({ ok: true });
+			expect(record.killed).toBe(true);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	test("cancel removes the worktree after 15 s when the killed run never ends", async () => {
+		const { store, record, loop } = setup();
+		const task = store.createTask("hung");
+		store.updateTask(task.id, {
+			state: "running",
+			stage: "in_progress",
+			worktree: join(store.worktreesDir, task.id),
+			branch: `ott/${task.id}`,
+			base: "abc",
+		});
+		loop.running.set(`${store.name}/${task.id}`, {
+			pid: 4242,
+			done: new Promise<unknown>(() => {}),
+			kill: async () => {
+				record.killed = true;
+			},
+		});
+		jest.useFakeTimers();
+		try {
+			let out: unknown = null;
+			void loop.cancel(fakeProject(store), task.id, false).then((r) => {
+				out = r;
+			});
+			await drainMicrotasks();
+			jest.advanceTimersByTime(15_000);
+			await drainMicrotasks();
+			expect(out).toEqual({ removed: true });
+			expect(record.removeWorktree).toHaveLength(1);
+			expect(store.getTask(task.id)!.state).toBe("idle");
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	test("finish-kept without a worktree refuses a branch with unreached commits", async () => {
+		let huskCalls = 0;
+		const { store, record, loop } = setup({
+			branchMergedOrGone: async () => false,
+			worktreeHusk: async () => {
+				huskCalls += 1;
+				return false;
+			},
+		});
+		const task = store.createTask("kept work");
+		store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: keptReason("uncommitted changes"),
+			worktree: null,
+			branch: "ott/x",
+			base: "abc",
+		});
+		await expect(
+			loop.finishKept(fakeProject(store), task.id, {}),
+		).resolves.toEqual({
+			error: "branch ott/x has commits that never reached abc",
+			status: 409,
+		});
+		expect(huskCalls).toBe(0);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(store.getTask(task.id)!.state).toBe("needs_you");
 	});
 });

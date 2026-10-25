@@ -19,9 +19,11 @@ export default {
   // in the cold sandbox under parallel runners.
   timeoutMS: 60000,
   timeoutFactor: 2,
-  // break = measured score rounded down (84.10%, 2026-10-14 clean run on this worker, after the
-  // round-4 behavior tests in turn.test.ts; the 2026-10-13 82.07 came from the shared-host run
-  // whose base score did not reproduce here, and the 2026-10-12 76.30 from the same polluted
-  // review run as base's 86.83); raise it when the score rises.
-  thresholds: { ...base.thresholds, break: 84 },
+  // break = killed-only score rounded down (2118 killed of 2446 = 86.59%, 2026-10-25 run after
+  // the round-5 behavior tests). That run reported 99.02, but it counted 304 timeouts as
+  // detected: the host ran other cards' Stryker runs at a load average of ~25, so most of those
+  // are slow runs, not hangs. The 24 survivors are all equivalent mutants (OTTR-175 report).
+  // Raise the break when a clean run on a quiet host measures more. History: 84.10 (2026-10-14
+  // clean run), 77.51 (2026-10-25 release review, before round 5).
+  thresholds: { ...base.thresholds, break: 86 },
 };

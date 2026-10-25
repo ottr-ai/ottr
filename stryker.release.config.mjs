@@ -21,9 +21,10 @@ export default {
   // the slow state: survivors pay the full suite and must not time out.
   timeoutMS: 120000,
   timeoutFactor: 3,
-  // break = the 2026-10-14 clean measured score (75.49%) rounded down; raise it when the score
-  // rises. The 2026-10-13 73.57 came from the shared-host run whose base score did not reproduce
-  // on this worker (see stryker.config.mjs); the 2026-10-12 72.10 came from the same polluted
-  // review run as base's 86.83.
-  thresholds: { ...base.thresholds, break: 75 },
+  // break = measured score rounded down (76.79%, 2026-10-25 release review run at f0e3416);
+  // raise it when the score rises. Earlier: 75.49 (2026-10-14 clean run on this worker). The
+  // 2026-10-13 73.57 came from the shared-host run whose base score did not reproduce on this
+  // worker (see stryker.config.mjs); the 2026-10-12 72.10 came from the same polluted review
+  // run as base's 86.83.
+  thresholds: { ...base.thresholds, break: 76 },
 };

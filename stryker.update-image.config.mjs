@@ -15,9 +15,10 @@ export default {
   // Sandbox outside any git repo: the test clones/inspects repos, a sandbox inside this repo
   // would nest them.
   tempDirName: base.tempDirName,
-  // break = measured score rounded down (76.96%, 2026-10-14 clean run on this worker); raise it
-  // when the score rises. The 2026-10-13 73.43 came from the shared-host run whose base score did
-  // not reproduce here. The script-side caps are defense in depth: the /api/drain route
-  // re-sanitizes, so a surviving cap mutant cannot change what the notice shows.
-  thresholds: { ...base.thresholds, break: 76 },
+  // break = measured score rounded down (83.08%, 2026-10-25 release review run at f0e3416;
+  // earlier 76.96, 2026-10-14); raise it when the score rises. The 2026-10-13 73.43 came from
+  // the shared-host run whose base score did not reproduce here. The script-side caps are
+  // defense in depth: the /api/drain route re-sanitizes, so a surviving cap mutant cannot
+  // change what the notice shows.
+  thresholds: { ...base.thresholds, break: 83 },
 };
