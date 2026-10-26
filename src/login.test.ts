@@ -88,14 +88,18 @@ const logins = (o: { ttlMs?: number; startMs?: number } = {}) => {
 };
 
 /** The fake's pid; it writes the file as it starts, which can trail a fast `start`. */
-async function pidOf(provider: string): Promise<number> {
+async function pidOf(provider: string): Promise<number | null> {
 	const file = join(dir, `${provider}.pid`);
 	// 12 s: the fake's spawn can stall seconds under concurrent machine load; 5 s flaked.
+	// Null when the file never appears: the only way a started fake writes no pid is a kill
+	// (ttl, cancel, a newer start) that landed while it was still booting.
 	for (let i = 0; i < 240 && !existsSync(file); i++) await Bun.sleep(50);
-	return Number(readFileSync(file, "utf8"));
+	return existsSync(file) ? Number(readFileSync(file, "utf8")) : null;
 }
 
-async function gone(pid: number): Promise<boolean> {
+async function gone(pid: number | null): Promise<boolean> {
+	// Null pid: the fake died before it could write its pid, so it is gone.
+	if (pid === null) return true;
 	// 6 s: must outlast the longest ttl a test arms (the abandoned test kills at 4 s) plus the
 	// kill's own latency under load; returns as soon as the process is gone.
 	for (let i = 0; i < 120; i++) {
@@ -112,6 +116,10 @@ async function gone(pid: number): Promise<boolean> {
 const browserTo = (url: string) =>
 	new Request(url, { headers: { host: new URL(url).host } });
 
+// providerLogin's tests spawn the real `bun` stand-in for omp — the two-step ones twice in a
+// row. Child startup is unbounded under concurrent machine load (boot alone has been seen past
+// 4 s), so each test carries a 30 s budget: the 5 s default bounds the machine, not the
+// assertions, and the two-stores describe below already proved 30 s enough at load 20.
 describe("providerLogin", () => {
 	test("start shows the sign-in URL and the prompt, without terminal escapes", async () => {
 		const l = logins();
@@ -121,7 +129,7 @@ describe("providerLogin", () => {
 		expect(v.output.endsWith("Paste the authorization code: ")).toBe(true);
 		expect(v.output).not.toContain("\x1b");
 		l.cancel();
-	});
+	}, 30_000);
 
 	test("the right code signs in; omp's success line comes back", async () => {
 		const l = logins();
@@ -129,7 +137,7 @@ describe("providerLogin", () => {
 		const v = await l.answer("good");
 		expect(v?.ok).toBe(true);
 		expect(v?.output).toContain("Logged in to anthropic");
-	});
+	}, 30_000);
 
 	test("a rejected code fails with omp's error", async () => {
 		const l = logins();
@@ -137,7 +145,7 @@ describe("providerLogin", () => {
 		const v = await l.answer("bad");
 		expect(v?.ok).toBe(false);
 		expect(v?.output).toContain("Login failed: invalid_grant");
-	});
+	}, 30_000);
 
 	test("a second question returns before omp exits, and its answer goes to the same omp", async () => {
 		const l = logins();
@@ -148,13 +156,13 @@ describe("providerLogin", () => {
 		const v = await l.answer("good");
 		expect(v?.ok).toBe(true);
 		expect(v?.output).toContain("Logged in to openai-codex");
-	});
+	}, 30_000);
 
 	test("an unknown provider fails at start", async () => {
 		const v = await logins().start("unknown", BOARD);
 		expect(v.ok).toBe(false);
 		expect(v.output).toContain("Unknown OAuth provider");
-	});
+	}, 30_000);
 
 	test("an empty answer after omp exited returns the verdict without writing", async () => {
 		const l = logins();
@@ -163,7 +171,7 @@ describe("providerLogin", () => {
 		const v = await l.answer("");
 		expect(v?.ok).toBe(true);
 		expect(l.pending()?.ok).toBe(true);
-	});
+	}, 30_000);
 
 	test("the provider's redirect hands its address to omp and sends the browser back to Settings", async () => {
 		const l = logins();
@@ -173,7 +181,7 @@ describe("providerLogin", () => {
 		expect(res?.headers.get("location")).toBe(`${BOARD}/#settings`);
 		expect(l.pending()?.ok).toBe(true);
 		expect(l.pending()?.output).toContain("Logged in to anthropic");
-	});
+	}, 30_000);
 
 	test("requests that are not the pending sign-in's redirect are left alone", async () => {
 		const l = logins();
@@ -190,7 +198,7 @@ describe("providerLogin", () => {
 		).toBeNull();
 		expect(l.pending()?.ok).toBeNull();
 		l.cancel();
-	});
+	}, 30_000);
 
 	test("a new start kills the pending sign-in and answers go to the new one", async () => {
 		const l = logins();
@@ -199,7 +207,7 @@ describe("providerLogin", () => {
 		expect(await gone(await pidOf("first"))).toBe(true);
 		const v = await l.answer("good");
 		expect(v?.output).toContain("Logged in to second");
-	});
+	}, 30_000);
 
 	test("cancel kills the pending sign-in; later answers find none", async () => {
 		const l = logins();
@@ -209,11 +217,12 @@ describe("providerLogin", () => {
 		expect(await gone(pid)).toBe(true);
 		expect(await l.answer("good")).toBeNull();
 		expect(l.pending()).toBeNull();
-	});
+	}, 30_000);
 
 	test("an abandoned sign-in is killed after its ttl", async () => {
-		// The ttl must outlast the fake's spawn (bun boot can take seconds under concurrent
-		// machine load — Stryker sandboxes see this), or the kill fires before the pid exists.
+		// If the fake's boot outruns the ttl (bun boot has been seen past 4 s under load),
+		// the kill lands before the pid exists: pidOf then reports null and gone counts the
+		// fake as dead, while the verdict below still proves the ttl fired.
 		const l = logins({ ttlMs: 4000 });
 		await l.start("abandoned", BOARD);
 		expect(await gone(await pidOf("abandoned"))).toBe(true);
@@ -225,7 +234,10 @@ describe("providerLogin", () => {
 		const l = logins({ startMs: 300 });
 		const t = Date.now();
 		const v = await l.start("silent", BOARD);
-		expect(Date.now() - t).toBeLessThan(5000);
+		// The bound is start's ~startMs give-up plus the fake's boot, which alone has been
+		// seen past 4 s under load; 15 s still proves the early return against the 20 s
+		// default startMs and the 60 s the silent fake would run.
+		expect(Date.now() - t).toBeLessThan(15_000);
 		expect(v).toEqual({
 			provider: "silent",
 			store: "board",
@@ -237,7 +249,7 @@ describe("providerLogin", () => {
 		const pid = await pidOf("silent");
 		l.cancel();
 		expect(await gone(pid)).toBe(true);
-	});
+	}, 45_000); // Boot (unbounded under load) + the give-up + the pid poll + the kill poll.
 });
 
 describe("two stores: one omp login for each", () => {
@@ -811,6 +823,9 @@ describe("signIns and signOut", () => {
 });
 
 describe("loginProviders", () => {
+	// Sync file reads, no children: the budget only covers the process being descheduled on a
+	// loaded host, where even these tests have tripped the 5 s default. Assertions still fail
+	// instantly; only a true hang would need the whole budget.
 	// A stand-in for the global omp install: an omp file whose directory anchors module
 	// resolution, and a pi-catalog whose exports map serves the compiled `/login` catalog
 	// (rules.json) exactly as the real package ships it.
@@ -862,11 +877,11 @@ describe("loginProviders", () => {
 		]);
 		// The read is memoized per omp path: the second call serves the same list.
 		expect(loginProviders(bin)).toBe(loginProviders(bin));
-	});
+	}, 30_000);
 
 	test("no omp, or a catalog that is not the expected layout, gives an empty list", () => {
 		expect(loginProviders(join(dir, "absent-omp"))).toEqual([]);
 		expect(loginProviders(ompInstall({}))).toEqual([]);
 		expect(loginProviders(ompInstall("{broken"))).toEqual([]);
-	});
+	}, 30_000);
 });

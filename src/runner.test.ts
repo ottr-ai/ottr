@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
@@ -64,6 +64,29 @@ const outcome = (over: Partial<Outcome> = {}): Outcome => ({
 	summary: "all good",
 	...over,
 });
+
+// A compiled stand-in for worker-dispatched omp. `bun build --compile` alone can take
+// seconds under concurrent machine load, so it runs once here, outside every test's
+// timeout budget; a compiled exe also boots without bun's per-spawn transpile cost.
+const workerOmpDir = mkdtempSync(join(tmpdir(), "ottr-worker-omp-"));
+const workerOmp = join(workerOmpDir, "fake-omp.exe");
+writeFileSync(
+	join(workerOmpDir, "fake-omp.js"),
+	`process.stdout.write(JSON.stringify({ type: "session", id: "sess-worker" }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
+process.exit(0);`,
+);
+Bun.spawnSync([
+	process.execPath,
+	"build",
+	"--compile",
+	join(workerOmpDir, "fake-omp.js"),
+	"--outfile",
+	workerOmp,
+]);
+afterAll(() =>
+	rmSync(workerOmpDir, { recursive: true, force: true, maxRetries: 5 }),
+);
 
 describe("childEnv", () => {
 	test("carries board coordinates and token; an operator-set OTTR_BOARD_URL wins, an inherited token never does", () => {
@@ -2075,27 +2098,7 @@ describe("workerFromEnv", () => {
 });
 
 describe("startRun worker dispatch", () => {
-	// Fake omp run by the real daemon: emits an omp event stream, then exits 0.
-	// buildOmpArgs controls argv, so the script must be a standalone executable.
-	function writeWorkerOmp(dir: string): string {
-		const src = join(dir, "fake-omp.js");
-		const exe = join(dir, "fake-omp.exe");
-		writeFileSync(
-			src,
-			`process.stdout.write(JSON.stringify({ type: "session", id: "sess-worker" }) + "\\n");
-process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
-process.exit(0);`,
-		);
-		Bun.spawnSync([
-			process.execPath,
-			"build",
-			"--compile",
-			src,
-			"--outfile",
-			exe,
-		]);
-		return exe;
-	}
+	// The compiled omp stand-in is built once at module scope (see the top of this file).
 
 	function baseOpts(dir: string, logPath: string) {
 		return {
@@ -2111,8 +2114,7 @@ process.exit(0);`,
 
 	test("a worker target runs the turn over HTTP, not the launcher", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
-		const fakeOmp = writeWorkerOmp(dir);
-		const server = serveWorker({ port: 0, ompPath: fakeOmp });
+		const server = serveWorker({ port: 0, ompPath: workerOmp });
 		try {
 			const logPath = join(dir, "run.log");
 			let launched = 0;
@@ -2137,7 +2139,7 @@ process.exit(0);`,
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000); // The dispatch runs the real daemon and a real child; the 5 s default is tighter than that under load.
 
 	test("a connect failure falls back to the local launcher", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));

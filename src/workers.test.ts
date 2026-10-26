@@ -51,6 +51,10 @@ const burst = '{"type":"tick"}\\n'.repeat(4096);
 setInterval(() => process.stdout.write(burst), 1);`,
 );
 
+// Every test below that runs one of these fakes through serveWorker or runWorker spawns a real
+// bun child, and child boot is unbounded under concurrent machine load (past 4 s observed).
+// Such tests carry a 30 s budget: the 5 s default bounds the machine, not the assertions.
+
 const servers: Bun.Server<never>[] = [];
 afterAll(() => {
 	for (const s of servers) s.stop(true);
@@ -106,19 +110,20 @@ describe("serveWorker", () => {
 
 	test("the daemon refuses to boot without OTTR_WORKER_TOKEN", () => {
 		// src/worker.ts exits 1 before binding the port; the timeout only bounds an old
-		// binary that would otherwise serve forever on 0.0.0.0:8787.
+		// binary that would otherwise serve forever on 0.0.0.0:8787. 15 s: it must also
+		// outlast a loaded boot, or it races this test's own budget.
 		const r = Bun.spawnSync(
 			[process.execPath, join(import.meta.dir, "worker.ts")],
 			{
 				env: { ...process.env, OTTR_WORKER_TOKEN: "" },
 				stdout: "pipe",
 				stderr: "pipe",
-				timeout: 5000,
+				timeout: 15_000,
 			},
 		);
 		expect(r.exitCode).toBe(1);
 		expect(r.stderr.toString()).toContain("OTTR_WORKER_TOKEN is required");
-	});
+	}, 30_000);
 
 	test("token mismatch is 401; matching token passes", async () => {
 		const url = start({ token: "sekrit", ompPath: process.execPath });
@@ -150,7 +155,7 @@ describe("serveWorker", () => {
 				})
 			).status,
 		).toBe(200);
-	});
+	}, 30_000);
 
 	test("bad argv/cwd is 400", async () => {
 		const url = start();
@@ -201,7 +206,7 @@ describe("serveWorker", () => {
 		};
 		expect(sentinel[WORKER_DONE].exitCode).toBe(3);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("");
-	});
+	}, 30_000);
 
 	test("omp never sees the worker's own token, from its env or the request", async () => {
 		const saved = process.env.OTTR_WORKER_TOKEN;
@@ -227,7 +232,7 @@ describe("serveWorker", () => {
 			if (saved === undefined) delete process.env.OTTR_WORKER_TOKEN;
 			else process.env.OTTR_WORKER_TOKEN = saved;
 		}
-	});
+	}, 30_000);
 
 	test("omp never inherits a git host token, from the container env or the request", async () => {
 		const planted: Record<string, string> = {
@@ -275,7 +280,7 @@ describe("serveWorker", () => {
 				else process.env[k] = v;
 			}
 		}
-	});
+	}, 30_000);
 
 	test("stderr accumulates into the sentinel tail", async () => {
 		const errPath = join(dir, "err-omp.js");
@@ -301,7 +306,7 @@ describe("serveWorker", () => {
 		};
 		expect(sentinel[WORKER_DONE].exitCode).toBe(1);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("boom one\nboom two\n");
-	});
+	}, 30_000);
 
 	test("the project's package list installs before omp; its notes ride stdout, not the stderr tail", async () => {
 		const asked: string[] = [];
@@ -337,7 +342,7 @@ describe("serveWorker", () => {
 		expect(JSON.parse(lines[1]!)).toHaveProperty("argv");
 		expect(lines).toHaveLength(3);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("");
-	});
+	}, 30_000);
 
 	test("a failed install ends the run with apt's error, and omp never starts", async () => {
 		const marker = join(dir, "omp-started");
@@ -449,7 +454,7 @@ describe("serveWorker", () => {
 			path: `${linkDir}:${containerPath}`,
 		});
 		expect(sentinel[WORKER_DONE].exitCode).toBe(0);
-	});
+	}, 30_000);
 
 	test("no OTTR_PROJECT: no tools install and no PATH prefix", async () => {
 		let toolsAsked = false;
@@ -489,7 +494,7 @@ describe("serveWorker", () => {
 			path: containerPath,
 		});
 		expect(lines).toHaveLength(2);
-	});
+	}, 30_000);
 
 	test("client abort kills the child: the response ends without a sentinel", async () => {
 		const url = start({ ompPath: process.execPath });
@@ -588,7 +593,7 @@ describe("runWorker", () => {
 		expect(result.workerLost).toBeUndefined();
 		// The worker's stderr tail is relayed to the log as "! ..." lines.
 		expect(sink.lines).toContain("! bad thing\n");
-	});
+	}, 30_000);
 
 	test("round-robins across urls", async () => {
 		const urls = [
