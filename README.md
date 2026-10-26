@@ -87,7 +87,7 @@ docker compose up -d
 
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
 
-Each GitHub release also publishes the image as `ghcr.io/ottr-ai/ottr` (amd64). To use it instead of a local build, replace the last two lines with:
+Each GitHub release also publishes the image as `ghcr.io/ottr-ai/ottr` (amd64). A release publishes the tags `<version>`, `v<version>` and `latest`. To use it instead of a local build, replace the last two lines with:
 
 ```sh
 export OTTR_IMAGE=ghcr.io/ottr-ai/ottr:latest
