@@ -34,6 +34,9 @@ import {
 export type { WorkerTarget };
 
 const LOG_CAP_BYTES = 2 * 1024 * 1024;
+/** Last line of a log that hit LOG_CAP_BYTES: the run goes on, but its log stops growing. */
+export const LOG_TRUNCATED =
+	"\n[log truncated at 2 MiB; the full transcript is in the omp session]\n";
 export const APPROVAL_REFUSAL =
 	"requires approval but no interactive UI available";
 
@@ -848,12 +851,7 @@ export function createRunSink(o: {
 		const size = Buffer.byteLength(s, "utf8");
 		if (bytes + size > LOG_CAP_BYTES) {
 			truncated = true;
-			writeBelow(
-				o.dataRoot,
-				o.logPath,
-				"\n[log truncated at 2 MiB; the full transcript is in the omp session]\n",
-				"append",
-			);
+			writeBelow(o.dataRoot, o.logPath, LOG_TRUNCATED, "append");
 			o.onLog?.();
 			return;
 		}

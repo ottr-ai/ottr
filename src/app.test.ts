@@ -40,6 +40,7 @@ import {
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
+import { LOG_TRUNCATED } from "./runner.ts";
 import { ProjectStore } from "./store.ts";
 import {
 	cancelKeptReason,
@@ -4035,18 +4036,22 @@ describe("silent live turns", () => {
 	test("a live card whose log stays silent past the limit warns until the log grows", async () => {
 		const now = Date.now();
 		/** Card log last written at `at`; whole seconds so the stored mtime reads back exactly. */
-		const logAt = (id: string, ago: number): number => {
+		const logAt = (id: string, ago: number, text: string): number => {
 			const at = Math.floor((now - ago) / 1000) * 1000;
 			const file = store.logPath(id);
 			mkdirSync(dirname(file), { recursive: true });
-			writeFileSync(file, "== work turn\n", { flag: "a" });
+			writeFileSync(file, text, { flag: "a" });
 			utimesSync(file, new Date(at), new Date(at));
 			return at;
 		};
-		const card = (state: Task["state"], ago: number) => {
+		const card = (
+			state: Task["state"],
+			ago: number,
+			text = "== work turn\n",
+		) => {
 			const t = store.createTask(`a ${state} card`);
 			store.updateTask(t.id, { stage: "in_progress", state });
-			return { id: t.id, at: logAt(t.id, ago) };
+			return { id: t.id, at: logAt(t.id, ago, text) };
 		};
 		const silentOf = async (): Promise<Map<string, number | undefined>> => {
 			const body = (await (await get("/api/state")).json()) as {
@@ -4060,12 +4065,19 @@ describe("silent live turns", () => {
 			const prep = card("preparing", SILENT_LOG_MS + 60_000);
 			const fresh = card("running", SILENT_LOG_MS - 60_000);
 			const parked = card("needs_you", SILENT_LOG_MS + 60_000);
+			// A log at the runner's 2 MiB cap stops growing while the run goes on.
+			const capped = card(
+				"running",
+				SILENT_LOG_MS + 60_000,
+				`== work turn${LOG_TRUNCATED}`,
+			);
 			const first = await silentOf();
 			expect(first.get(hung.id)).toBe(hung.at);
 			expect(first.get(prep.id)).toBe(prep.at);
 			expect(first.get(fresh.id)).toBeUndefined();
 			// Only a live turn can hang; a parked card's quiet log is normal.
 			expect(first.get(parked.id)).toBeUndefined();
+			expect(first.get(capped.id)).toBeUndefined();
 			// New output (a real write stamps the file now) clears the warning.
 			appendFileSync(store.logPath(hung.id), "tool output\n");
 			const after = await silentOf();
