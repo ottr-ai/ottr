@@ -6,11 +6,13 @@ import {
 	expect,
 	type Mock,
 	mock,
+	setSystemTime,
 	spyOn,
 	test,
 } from "bun:test";
 import { execSync } from "node:child_process";
 import {
+	appendFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -18,6 +20,7 @@ import {
 	rmSync,
 	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,7 +76,7 @@ mock.module("web-push", () => ({
 		return {};
 	},
 }));
-const { createApp } = await import("./app.ts");
+const { createApp, SILENT_LOG_MS } = await import("./app.ts");
 
 const root = mkdtempSync(join(tmpdir(), "app-routes-"));
 
@@ -4025,6 +4028,52 @@ describe("retro cards on the board", () => {
 		// Retro housekeeping must not fill the Unread block of the Done lane.
 		expect(byId.get(retro.id)?.answered).toBe(false);
 		expect(byId.get(plain.id)?.answered).toBe(true);
+	});
+});
+
+describe("silent live turns", () => {
+	test("a live card whose log stays silent past the limit warns until the log grows", async () => {
+		const now = Date.now();
+		/** Card log last written at `at`; whole seconds so the stored mtime reads back exactly. */
+		const logAt = (id: string, ago: number): number => {
+			const at = Math.floor((now - ago) / 1000) * 1000;
+			const file = store.logPath(id);
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, "== work turn\n", { flag: "a" });
+			utimesSync(file, new Date(at), new Date(at));
+			return at;
+		};
+		const card = (state: Task["state"], ago: number) => {
+			const t = store.createTask(`a ${state} card`);
+			store.updateTask(t.id, { stage: "in_progress", state });
+			return { id: t.id, at: logAt(t.id, ago) };
+		};
+		const silentOf = async (): Promise<Map<string, number | undefined>> => {
+			const body = (await (await get("/api/state")).json()) as {
+				tasks: Array<{ id: string; silentSince?: number }>;
+			};
+			return new Map(body.tasks.map((t) => [t.id, t.silentSince]));
+		};
+		setSystemTime(new Date(now));
+		try {
+			const hung = card("running", SILENT_LOG_MS + 60_000);
+			const prep = card("preparing", SILENT_LOG_MS + 60_000);
+			const fresh = card("running", SILENT_LOG_MS - 60_000);
+			const parked = card("needs_you", SILENT_LOG_MS + 60_000);
+			const first = await silentOf();
+			expect(first.get(hung.id)).toBe(hung.at);
+			expect(first.get(prep.id)).toBe(prep.at);
+			expect(first.get(fresh.id)).toBeUndefined();
+			// Only a live turn can hang; a parked card's quiet log is normal.
+			expect(first.get(parked.id)).toBeUndefined();
+			// New output (a real write stamps the file now) clears the warning.
+			appendFileSync(store.logPath(hung.id), "tool output\n");
+			const after = await silentOf();
+			expect(after.get(hung.id)).toBeUndefined();
+			expect(after.get(prep.id)).toBe(prep.at);
+		} finally {
+			setSystemTime();
+		}
 	});
 });
 

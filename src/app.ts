@@ -224,6 +224,19 @@ const LOG_CHUNK_BYTES = 256 * 1024;
  * at once: the script does that when its 1 h limit ends the wait. */
 const DRAIN_MS = 30 * 60_000;
 
+/** A live turn whose card log has not grown for this long may wait on a hung command (ALAT-23
+ * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
+export const SILENT_LOG_MS = 2 * 60 * 60_000;
+
+/** Last write of a preparing or running card's log once it has been silent past SILENT_LOG_MS;
+ * null for other states, a fresher log, or no log yet. Floored so the 1 s state diff stays still. */
+function silentSince(t: Task, logPath: string, now: number): number | null {
+	if (t.state !== "running" && t.state !== "preparing") return null;
+	const at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
+	if (at === undefined || now - at <= SILENT_LOG_MS) return null;
+	return Math.floor(at);
+}
+
 /** The New tab's folder-name rule (unchanged from before git hosts), shared with the clone
  * name: one path segment, never "." or "..". A leading "-" is safe because git clone gets the
  * destination after "--". */
@@ -1760,6 +1773,7 @@ export function createApp(deps: AppDeps) {
 							...card
 						} = t;
 						const progress = deps.progressOf?.(e.store.name, t.id);
+						const silent = silentSince(t, e.store.logPath(t.id), now);
 						tasks.push({
 							...card,
 							sessionTitle: e.store.frozenTitle(t),
@@ -1768,6 +1782,7 @@ export function createApp(deps: AppDeps) {
 								!isRetro(t) &&
 								answeredCard(e.store.listTurns(t.id)),
 							...(progress ? { progress } : {}),
+							...(silent !== null ? { silentSince: silent } : {}),
 						});
 					}
 				}

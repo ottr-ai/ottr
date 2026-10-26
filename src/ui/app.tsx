@@ -859,6 +859,10 @@ function Card({
 	const release = releaseOf(task);
 	const commits = task.stage === "done" ? task.commits : null;
 	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
+	const silent =
+		task.silentSince !== undefined
+			? `No log output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
+			: null;
 	return (
 		// A stretched button opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched button inside
@@ -909,12 +913,17 @@ function Card({
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
 				{/* Needs attention: the error takes the prompt line until the state clears; the
 				    card-open title also carries it. Ask rounds keep the prompt: their reason just
-				    echoes the first question the drawer's ask panel shows in full. */}
+				    echoes the first question the drawer's ask panel shows in full. A live turn
+				    whose log went silent past the board's limit takes the same line. */}
 				{task.state === "needs_you" &&
 				task.asked === null &&
 				task.needsReason !== null ? (
 					<span className="card-error" title={task.needsReason}>
 						{task.needsReason}
+					</span>
+				) : silent !== null ? (
+					<span className="card-error" title={silent}>
+						{silent}
 					</span>
 				) : (
 					task.sessionTitle !== task.title && (

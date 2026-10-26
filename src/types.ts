@@ -569,6 +569,9 @@ export type TaskCard = Omit<
 	answered: boolean;
 	/** Live progress of a long tool run in the card's running turn (a Stryker run today); absent otherwise. */
 	progress?: string;
+	/** Epoch ms of the last log write, present only while a preparing or running card's log has been
+	 * silent past the board's limit (SILENT_LOG_MS): the agent may wait on a hung command. */
+	silentSince?: number;
 };
 
 /** A done card is question-only when the last work turn reported `answered` (a later follow-up replaces it). */
