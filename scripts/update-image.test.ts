@@ -1108,12 +1108,14 @@ describe("board seed", () => {
 			ALATE_PS,
 			ALATE_INSPECT,
 			seedRun,
-			write,
 			...COMPARE,
 			HOLD,
 			COUNT,
 			UP,
 			RESTART,
+			// The record lands after the restart: a run that ends early leaves it
+			// unwritten, so the next run seeds again and retries.
+			write,
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -1203,6 +1205,7 @@ describe("board seed", () => {
 	test("a seed with a changed server image holds, and the recreate restarts it without another restart call", async () => {
 		const { main } = checkout();
 		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
 		const f = fakes({
 			newImage: true,
 			turns: ["1", "0"],
@@ -1217,7 +1220,50 @@ describe("board seed", () => {
 		).toBe(0);
 		expect(f.calls).not.toContain(RESTART);
 		expect(f.calls).toContain(HOLD);
-		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+		// The recreate counts as the board taking the seed, so the record follows up.
+		expect(f.calls.slice(-2)).toEqual([
+			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a seed whose restart waits for a later run seeds and restarts on the next run", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		// Run 1: the board never goes idle, so the hold lapses and the restart waits.
+		const busy = fakes({
+			turns: ["1"],
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], busy.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(busy.seedRuns).toHaveLength(1);
+		// The record stays unwritten: the next run must seed again and restart then.
+		expect(busy.seedWrites).toEqual([]);
+		expect(busy.calls).not.toContain(UP);
+		expect(busy.calls).not.toContain(RESTART);
+		// Run 2: an idle board — the retry seeds, restarts, and records the commit.
+		const idle = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], idle.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(idle.seedRuns).toHaveLength(1);
+		expect(idle.seedWrites).toEqual([
+			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+		]);
+		expect(idle.calls).toContain(RESTART);
 	}, 60_000);
 
 	test("an environment without a data source skips the seed entirely", async () => {

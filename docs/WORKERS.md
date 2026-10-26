@@ -410,8 +410,10 @@ To seed with no hand step, set one of these in the compose env file:
 
 At each hourly run, the updater reads the data repo's head commit and compares it with the
 commit recorded at `/etc/ottr/seed-commit` in the `board-config` volume. When they differ,
-it runs `board-seed` once, records the new commit, and restarts the board when no turn
-runs, with the same hold as an image update. A failed seed keeps the recorded commit, and
+it runs `board-seed` once and restarts the board when no turn runs, with the same hold as
+an image update. The record lands only after the board took the seed: when turns still run
+past the hold, the restart waits for a later run, and that run seeds again. A failed seed
+keeps the recorded commit, and
 the run exits non-zero. The updater takes the alate image from `ALATE_IMAGE` in the env
 file, or from the running alate container. Set `ALATE_IMAGE` when no alate container runs.
 

@@ -617,27 +617,7 @@ export async function updateImage(
 						seedFailed = true;
 					} else {
 						d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
-						if (serverWasRunning) {
-							const w = await d.docker(
-								"compose",
-								...compose,
-								"exec",
-								"-T",
-								"server",
-								"sh",
-								"-c",
-								`printf %s '${seed.wanted}' > /etc/ottr/seed-commit`,
-							);
-							if (w.code !== 0) {
-								d.log("board seed failed: the seed commit cannot be recorded");
-								seedFailed = true;
-							} else seeded = true;
-						} else {
-							d.log(
-								"the server is down, so the seed commit is not recorded; the next run seeds again",
-							);
-							seeded = true;
-						}
+						seeded = true;
 					}
 				} finally {
 					if (found.discovered) {
@@ -684,6 +664,27 @@ export async function updateImage(
 		const rs = await d.docker("compose", ...compose, "restart", "server");
 		if (rs.code !== 0)
 			return stop(`docker compose restart server failed: ${rs.out.trim()}`);
+	}
+	// The record lands only after the board took the seed (recreate or restart): a run
+	// that ends early — turns still run past the hold — leaves it unwritten, so the
+	// next run seeds again and retries the restart. up has the server running here.
+	if (seeded) {
+		const w = await d.docker(
+			"compose",
+			...compose,
+			"exec",
+			"-T",
+			"server",
+			"sh",
+			"-c",
+			`printf %s '${wantedSha}' > /etc/ottr/seed-commit`,
+		);
+		if (w.code !== 0) {
+			d.log(
+				"board seed failed: the seed commit cannot be recorded; the next run seeds again",
+			);
+			seedFailed = true;
+		}
 	}
 	await d.docker(
 		"image",
