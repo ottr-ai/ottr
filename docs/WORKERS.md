@@ -413,16 +413,26 @@ To verify the seed:
 
 #### Credentials
 
-Credentials split with the directory: Settings sign-in runs `omp login` against the
-pinned store, then `src/login.ts shareProviderCredentials` copies the provider's rows
-through to the shared store the workers read; sign-out copies the same rows with omp's
-"deleted by user" tombstones. The entry script does not copy the shared `agent.db` into
-the pinned store. The board signs in under **Settings → Provider sign-in**, and its store
-stays on the `board-config` volume. Refresh-token rotation happens in whichever copy
-refreshes first, so the other copy's row can go stale until the next sign-in. omp then
-marks the row inactive after a failed refresh, and Settings shows the provider as
-needing sign-in. The write-through is never silent: a failed copy reaches the sign-in
-view and the logout response as `syncError`.
+The board and the workers have separate credential stores, and each store has its own
+sign-in. The spec is `docs/specs/provider-credentials.md`.
+
+- The board store is `/etc/ottr/home/.omp/agent/agent.db` on the `board-config` volume.
+- The worker store is `/root/.omp/agent/agent.db` in the shared home.
+
+A sign-in under **Settings → Provider sign-in** runs two `omp login` processes, one after
+the other. You authorize the provider two times:
+
+1. The first login writes the board store.
+2. The second login runs against a new scratch agent dir next to the board agent dir
+   (`/etc/ottr/home/.omp/.ottr-login-*`, mode 0700). Then the board writes the new
+   credential row into the worker store, and removes the scratch dir.
+
+Each login gets its own refresh token, so a refresh in one store does not make the other
+store's token invalid. No credential row moves between the two stores. The board never runs
+omp with the shared home as its agent dir or its `HOME`, because a turn can plant config,
+extensions and `!command` keys there. Settings shows the state of each store for each
+provider. Sign-out marks the provider's rows in both stores with omp's "deleted by user"
+cause. The entry script does not copy the shared `agent.db` into the board store.
 
 #### Residuals
 

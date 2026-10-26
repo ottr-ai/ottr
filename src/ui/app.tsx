@@ -8835,19 +8835,47 @@ function EnvSection() {
 	);
 }
 
-/** A running or finished `omp login` as the server reports it; `ok` stays null until omp exits. */
-type LoginView = { provider: string; output: string; ok: boolean | null };
+/** Which omp store a sign-in step writes: the board's own, or the one the Docker workers mount. */
+type StoreName = "board" | "workers";
+/** A running or finished `omp login` step as the server reports it; `ok` stays null until omp exits. */
+type LoginView = {
+	provider: string;
+	store: StoreName;
+	step: number;
+	steps: number;
+	output: string;
+	ok: boolean | null;
+};
 /** One provider in omp's credential store; inactive: omp disabled it, e.g. after a failed refresh. */
 type SignIn = { provider: string; kind: string; active: boolean };
 /** One provider omp's `/login` picker offers, as the server reads it from the installed omp. */
 type LoginProvider = { id: string; name: string };
-type SignInState = {
+/** One omp store's sign-ins; `signIns` is null when the board cannot read that store. */
+type StoreSignIns = {
+	store: StoreName;
 	signIns: SignIn[] | null;
 	error: string | null;
+};
+type SignInState = {
+	/** The board first; the workers second only when they keep a separate store. */
+	stores: StoreSignIns[];
 	pending: LoginView | null;
 	/** Empty when the machine has no omp install to read; the field then takes typed ids. */
 	providers: LoginProvider[];
 };
+
+const storeLabel = (store: StoreName): string =>
+	store === "board" ? "Board" : "Workers";
+const storeAudience = (store: StoreName): string =>
+	store === "board" ? "the board" : "the workers";
+
+/** A provider's state in one store; absent counts as inactive, since turns there cannot use it. */
+const signInWords = (s: SignIn | undefined): string =>
+	s === undefined || !s.active
+		? "needs sign-in"
+		: s.kind === "oauth"
+			? "signed in"
+			: "API key stored";
 
 /** The provider's sign-in page: the first https URL omp prints; later ones are its local shortcuts. */
 const signInPage = (output: string): string | null =>
@@ -8928,10 +8956,14 @@ function ProviderLoginSection() {
 			await load();
 			return true;
 		});
+	const stores = state?.stores ?? [];
+	const twoStores = stores.length === 2;
 	const signOutOf = (id: string): void => {
 		if (
 			!window.confirm(
-				`Sign omp out of ${providerName(id)} on the board's machine? Turns that use it fail until you sign in again.`,
+				twoStores
+					? `Sign omp out of ${providerName(id)} for the board and the workers? Turns that use it fail until you sign in again.`
+					: `Sign omp out of ${providerName(id)} on the board's machine? Turns that use it fail until you sign in again.`,
 			)
 		)
 			return;
@@ -8942,38 +8974,62 @@ function ProviderLoginSection() {
 		});
 	};
 	const page = pending === null ? null : signInPage(pending.output);
+	const loaded = stores.filter(
+		(s): s is StoreSignIns & { signIns: SignIn[] } => s.signIns !== null,
+	);
+	const rowIds = [
+		...new Set(loaded.flatMap((s) => s.signIns.map((i) => i.provider))),
+	].sort();
 	return (
 		<section className="settings-sec providers" id="signin-section">
 			<div className="providers-head">
 				<h2>Provider sign-in</h2>
 				<p className="hint">
-					omp's sign-ins on the machine that runs this board. Docker workers
-					share them.
+					{twoStores
+						? "The board and the Docker workers each keep their own omp sign-in. A sign-in asks you to authorize two times: first for the board, then for the workers."
+						: "omp's sign-ins on the machine that runs this board. Docker workers share them."}
 				</p>
 			</div>
-			{state?.signIns != null && state.signIns.length > 0 && (
+			{rowIds.length > 0 && (
 				<div className="alate-def-rows">
-					{state.signIns.map((s) => {
-						const limits = forProvider(quota?.limits ?? [], s.provider);
+					{rowIds.map((id) => {
+						const limits = forProvider(quota?.limits ?? [], id);
 						const plan = limits.find((l) => l.plan !== null)?.plan ?? null;
-						const led = !s.active ? "crit" : s.kind === "oauth" ? "ok" : "";
+						const per = loaded.map((s) => ({
+							store: s.store,
+							signIn: s.signIns.find((i) => i.provider === id),
+						}));
+						const needs = per.some((p) => p.signIn?.active !== true);
+						const allOauth = per.every(
+							(p) => p.signIn?.active === true && p.signIn.kind === "oauth",
+						);
+						const led = needs ? "crit" : allOauth ? "ok" : "";
+						const only = per.length === 1 ? per[0]?.signIn : undefined;
+						const words =
+							per.length === 1
+								? only === undefined || !only.active
+									? "Sign-in expired: sign in again"
+									: only.kind === "oauth"
+										? "Signed in"
+										: "API key stored"
+								: per
+										.map(
+											(p) => `${storeLabel(p.store)}: ${signInWords(p.signIn)}`,
+										)
+										.join(" · ");
 						return (
-							<div className="alate-def-row providers-row" key={s.provider}>
+							<div className="alate-def-row providers-row" key={id}>
 								<div className="alate-def-name">
 									<b className="provider-name">
 										<i className={`status-dot ${led}`} aria-hidden="true" />
-										{providerName(s.provider)}
+										{providerName(id)}
 									</b>
 									<span>
-										{!s.active
-											? "Sign-in expired: sign in again"
-											: s.kind === "oauth"
-												? "Signed in"
-												: "API key stored"}
+										{words}
 										{plan !== null &&
 											` · ${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan`}
 									</span>
-									<code>{s.provider}</code>
+									<code>{id}</code>
 								</div>
 								<div className="providers-meters">
 									{limits.map((l) => (
@@ -8981,12 +9037,12 @@ function ProviderLoginSection() {
 									))}
 								</div>
 								<div className="alate-def-actions">
-									{!s.active && (
+									{needs && (
 										<button
 											type="button"
-											onClick={() => start(s.provider)}
+											onClick={() => start(id)}
 											disabled={act.busy || waiting}
-											aria-label={`Sign in again to ${providerName(s.provider)}`}
+											aria-label={`Sign in again to ${providerName(id)}`}
 										>
 											Sign in again
 										</button>
@@ -8994,9 +9050,9 @@ function ProviderLoginSection() {
 									<button
 										type="button"
 										className="danger"
-										onClick={() => signOutOf(s.provider)}
+										onClick={() => signOutOf(id)}
 										disabled={act.busy}
-										aria-label={`Sign out of ${providerName(s.provider)}`}
+										aria-label={`Sign out of ${providerName(id)}`}
 									>
 										Sign out
 									</button>
@@ -9006,13 +9062,16 @@ function ProviderLoginSection() {
 					})}
 				</div>
 			)}
-			{state?.signIns?.length === 0 && (
+			{loaded.length > 0 && rowIds.length === 0 && (
 				<p className="hint">omp has no sign-ins on this machine yet.</p>
 			)}
-			{state?.error != null && (
-				<p className="auth-error" role="alert">
-					{state.error}
-				</p>
+			{stores.map(
+				(s) =>
+					s.error !== null && (
+						<p className="auth-error" role="alert" key={s.store}>
+							{twoStores ? `${storeLabel(s.store)}: ${s.error}` : s.error}
+						</p>
+					),
 			)}
 			{waiting ? (
 				<form
@@ -9022,6 +9081,14 @@ function ProviderLoginSection() {
 						finish();
 					}}
 				>
+					{pending.steps === 2 && (
+						<p className="hint">
+							<b>
+								Step {pending.step} of 2: sign in for{" "}
+								{storeAudience(pending.store)}
+							</b>
+						</p>
+					)}
 					<p className="hint">
 						Finish the sign-in to {providerName(pending.provider)} on the
 						provider's page. When it returns to this board, this section updates
@@ -9125,7 +9192,11 @@ function ProviderLoginSection() {
 			{pending?.ok === false && (
 				<div role="alert">
 					<p className="auth-error">
-						Sign-in to {providerName(pending.provider)} failed. omp reported:
+						Sign-in to {providerName(pending.provider)}
+						{pending.steps === 2
+							? ` for ${storeAudience(pending.store)} (step ${pending.step} of 2)`
+							: ""}{" "}
+						failed. omp reported:
 					</p>
 					<pre className="log">{pending.output}</pre>
 				</div>

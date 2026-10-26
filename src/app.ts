@@ -76,10 +76,9 @@ import {
 	loginProviders,
 	PROVIDER_ID,
 	providerLogin,
-	type SignIn,
-	shareProviderCredentials,
 	signIns,
-	signOut,
+	signOutStores,
+	storeSignIns,
 } from "./login.ts";
 import { modelList, modelRoles } from "./models.ts";
 import { orphanCache } from "./orphans.ts";
@@ -3253,16 +3252,8 @@ export function createApp(deps: AppDeps) {
 		"/api/provider-login": {
 			GET: (req) =>
 				api(req, async () => {
-					let list: SignIn[] | null = null;
-					let error: string | null = null;
-					try {
-						list = signIns();
-					} catch (err) {
-						error = `cannot read omp's sign-ins: ${errmsg(err)}`;
-					}
 					return json({
-						signIns: list,
-						error,
+						stores: storeSignIns(),
 						pending: logins.pending(),
 						providers: loginProviders(),
 					});
@@ -3322,13 +3313,8 @@ export function createApp(deps: AppDeps) {
 							{ error: "provider must be an omp provider id, e.g. anthropic" },
 							400,
 						);
-					// The sign-out lands in the board's own store; the copy carries the tombstones to
-					// the shared worker store, whose rows a turn authenticates against (R5-1).
-					return json({
-						removed: signOut(provider),
-						signIns: signIns(),
-						syncError: shareProviderCredentials(provider),
-					});
+					// Each store holds its own sign-in: the board's and the workers'.
+					return json({ removed: signOutStores(provider) });
 				}),
 		},
 		"/api/update": {
