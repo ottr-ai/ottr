@@ -100,7 +100,9 @@ turns and work turns all get the new omp. Two parts do the work:
    fast-forwards to `origin/main` only when it is clean and on `main`. Else it stays as it
    is, with one log line.
 
-The deploy also brings new Ottr commits from `main`. The script's arguments go to
+The deploy also brings new Ottr commits from `main`. The run also seeds the board's agent
+layer when the env file sets `ALATE_DATA` or `ALATE_DATA_REPO`
+([Seed the board config](#seed-the-board-config)). The script's arguments go to
 every `docker compose` call. Run it every hour. On Windows:
 
 ```powershell
@@ -367,7 +369,10 @@ script flips `memory.backend` in the seeded `config.yml`. The board's own config
 `src/login.ts`) resolve the same variable. A worker dispatch strips the variable from the
 turn env: a worker keeps its shared home, and a turn that ran locally would otherwise hold
 the directory the board executes. The board's layer does not follow Alate provisions of
-the shared home. After a data-repo change, run `board-seed` again.
+the shared home. The hourly deploy seeds the layer again by itself when the env file names
+the data repo (see [Seed the board config](#seed-the-board-config)). The board shows a
+notice while the layer is not seeded, or while a model role's provider has no active
+sign-in in the board's store.
 
 omp does not resolve every user path from that variable. It reads plugins from
 `$HOME/.omp/plugins` and user skills and context files (`~/.agents`, `~/.claude`, and the
@@ -384,9 +389,9 @@ hindsight flip.
 
 #### Seed the board config
 
-Do these steps once after the first `docker compose up`. Do them again after each
-data-repo change that the board's own turns need. The first deploy of this change also
-needs them: an existing stack starts with an empty `board-config` volume.
+Do these steps once after the first `docker compose up`. The hourly deploy repeats the
+seed by itself when the env file names the data repo (below). The first deploy of this
+change also needs them: an existing stack starts with an empty `board-config` volume.
 
 1. Run the seed. For a private data repo, export `GH_TOKEN` first:
    `docker compose run --rm board-seed --repo <owner/name>`.
@@ -395,6 +400,20 @@ needs them: an existing stack starts with an empty `board-config` volume.
 2. Restart the board: `docker compose restart server`.
 3. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
    keys (`ANTHROPIC_API_KEY`, ...) in the env.
+
+To seed with no hand step, set one of these in the compose env file:
+
+- `ALATE_DATA=<host path>`: a local checkout of the data repo. The updater seeds from its
+  `HEAD`.
+- `ALATE_DATA_REPO=<owner/name[@ref]>`: a GitHub repo. The ref defaults to `main`. A
+  private repo needs `GH_TOKEN` in the env file.
+
+At each hourly run, the updater reads the data repo's head commit and compares it with the
+commit recorded at `/etc/ottr/seed-commit` in the `board-config` volume. When they differ,
+it runs `board-seed` once, records the new commit, and restarts the board when no turn
+runs, with the same hold as an image update. A failed seed keeps the recorded commit, and
+the run exits non-zero. The updater takes the alate image from `ALATE_IMAGE` in the env
+file, or from the running alate container. Set `ALATE_IMAGE` when no alate container runs.
 
 The seed uses the same SkillSpector scan as worker provisioning, and a failed scan stops
 it. `--force` lets the data repo win over board-local edits. The seed installs the whole

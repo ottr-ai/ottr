@@ -653,6 +653,9 @@ export interface StateResponse {
 	drainUntil: number | null;
 	/** Commit subjects the pending update brings (POST /api/drain), sanitized; null when no hold. */
 	drainCommits: string[] | null;
+	/** Advisory: the agent layer is unseeded, or a model role's provider has no active sign-in
+	 *  and no provider env key. Recomputed per poll; the UI shows them in the notice bar. */
+	warnings: string[];
 	/** Last good upstream update pull; null until a provider url and key are set and one pull succeeds. */
 	updates: UpdatesView | null;
 	/** Epoch ms when the connected alate server first reported pending true in this episode; null when

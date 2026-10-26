@@ -10473,6 +10473,22 @@ function AreasNav({
 	);
 }
 
+/** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
+ * No dismiss: state recomputes per poll, so a fixed condition drops its own line. */
+export function WarningLines({ warnings }: { warnings: string[] }) {
+	if (warnings.length === 0) return null;
+	return (
+		<>
+			{warnings.map((w, i) => (
+				<p className="notif-line" role="note" key={`warn:${i}`}>
+					<span aria-hidden="true">⚠</span>
+					<span>{w}</span>
+				</p>
+			))}
+		</>
+	);
+}
+
 function App() {
 	const [state, setState] = useState<StateResponse | null>(null);
 	const [view, setView] = useState(readHash);
@@ -10872,6 +10888,8 @@ function App() {
 	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
 	const draining = (state?.drainUntil ?? null) !== null;
 	const drainCommits = state?.drainCommits ?? [];
+	// Advisory from the server: unseeded agent layer, provider without an active sign-in.
+	const warnings = state?.warnings ?? [];
 	const orphanList = state?.orphans ?? [];
 	const orphansError = state?.orphansError ?? null;
 	const keptCount = state?.keptWorktrees ?? { held: 0, stale: 0 };
@@ -11034,8 +11052,10 @@ function App() {
 			keptCount.held === 0 &&
 			orphansError === null &&
 			alatePendingKey === null &&
-			signinAdvisories.length === 0) ? null : (
+			signinAdvisories.length === 0 &&
+			warnings.length === 0) ? null : (
 			<>
+				<WarningLines warnings={warnings} />
 				{orphansError !== null && (
 					<p className="notif-line">
 						<Icon name="info" size={16} />
@@ -11155,6 +11175,9 @@ function App() {
 	const infoCount = entries.filter((e) => e.level === "info").length;
 	const inboxSummary = [
 		error !== null ? "1 error" : null,
+		warnings.length > 0
+			? `${warnings.length} warning${warnings.length === 1 ? "" : "s"}`
+			: null,
 		alarmCount > 0 ? alarmLine : null,
 		infoCount > 0 ? `${infoCount} notice${infoCount === 1 ? "" : "s"}` : null,
 	]

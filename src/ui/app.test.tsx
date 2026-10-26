@@ -24,6 +24,7 @@ const {
 	provisionWatchStep,
 	ALATE_WATCH_MAX_DOWN,
 	ALATE_WATCH_DEADLINE_MS,
+	WarningLines,
 } = await import("./app.tsx");
 
 describe("monogram", () => {
@@ -460,5 +461,24 @@ describe("triageWait", () => {
 		// P1 first despite waiting least; P3 beats both unrated cards despite its age;
 		// the two unrated cards keep their updatedAt order.
 		expect(sorted.map((t) => t.id)).toEqual(["b", "c", "a", "d"]);
+	});
+});
+
+describe("WarningLines", () => {
+	const text =
+		"No active sign-in for anthropic (role default): sign in under Settings - Provider sign-in, or set its API key in the environment.";
+
+	test("each warning renders as its own note line in the notice bar", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines warnings={[text, "second warning"]} />,
+		);
+		expect(html).toContain('role="note"');
+		expect(html).toContain(text);
+		expect(html).toContain("second warning");
+		expect(html.match(/notif-line/g)?.length).toBe(2);
+	});
+
+	test("no warnings render nothing", () => {
+		expect(renderToStaticMarkup(<WarningLines warnings={[]} />)).toBe("");
 	});
 });

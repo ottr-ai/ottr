@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import {
 	afterAll,
 	beforeAll,
@@ -20,9 +21,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
-import type { Entry } from "./app.ts";
+import { boardWarnings, type Entry } from "./app.ts";
 import { hashPassword } from "./auth.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
@@ -4777,4 +4778,69 @@ describe("git-host ssh keys", () => {
 		expect(env.GIT_SSH_COMMAND).not.toContain(" -i ");
 		expect(env.GIT_SSH_COMMAND).toContain("StrictHostKeyChecking=yes");
 	});
+});
+
+describe("board warnings", () => {
+	// omp's auth_credentials as a seeded sign-in writes it (src/login.test.ts builds the same).
+	const SCHEMA = `CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY,
+		provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
+		disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`;
+
+	function credStore(path: string, list: Array<[string, string | null]>): void {
+		// A fresh store each call: a later list must not keep an earlier row.
+		rmSync(path, { force: true });
+		mkdirSync(dirname(path), { recursive: true });
+		const db = new Database(path);
+		db.exec(SCHEMA);
+		const add = db.prepare(
+			"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES (?, 'oauth', '{}', ?, 1, 1)",
+		);
+		for (const [provider, cause] of list) add.run(provider, cause);
+		add.finalize(); // an unfinalized statement keeps the file open on Windows
+		db.close();
+	}
+
+	function withAgentDir(
+		body: (dir: string) => Promise<void> | void,
+	): Promise<void> | void {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-warn-agent"));
+		const saved = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		const restore = () => {
+			if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = saved;
+			rmSync(dir, { recursive: true, force: true });
+		};
+		return Promise.resolve(body(dir)).finally(restore);
+	}
+
+	const UNSEEDED =
+		'The board\'s agent layer is not seeded: the board runs without rules and config.yml until a seed fills /etc/ottr/home (docs/WORKERS.md, "Seed the board config").';
+
+	test("an empty agent dir warns unseeded, in boardWarnings and in the state payload", async () =>
+		withAgentDir(async () => {
+			expect(boardWarnings()).toEqual([UNSEEDED]);
+			const state = (await (await get("/api/state")).json()) as {
+				warnings: string[];
+			};
+			expect(state.warnings).toEqual([UNSEEDED]);
+		}));
+
+	test("a seeded dir with a role but no sign-in warns for that provider; an active row silences it", async () =>
+		withAgentDir(async (dir) => {
+			writeFileSync(
+				join(dir, "config.yml"),
+				"modelRoles:\n  default: anthropic/claude-opus-5-5:high\n",
+			);
+			const expected = [
+				"No active sign-in for anthropic (role default): sign in under Settings - Provider sign-in, or set its API key in the environment.",
+			];
+			// A fixed env: the host shell may export the provider's key.
+			expect(boardWarnings({})).toEqual(expected);
+			credStore(join(dir, "agent.db"), [["anthropic", null]]);
+			expect(boardWarnings({})).toEqual([]);
+			// A disabled row counts as no active sign-in.
+			credStore(join(dir, "agent.db"), [["anthropic", "replaced by"]]);
+			expect(boardWarnings({})).toEqual(expected);
+		}));
 });

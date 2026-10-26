@@ -102,6 +102,8 @@ docker compose run --rm board-seed --repo <owner/name>
 docker compose restart server
 ```
 
+The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA` (a local data-repo checkout) or `ALATE_DATA_REPO` (`owner/name`). The board shows a notice while its agent layer is not seeded, or while a model role's provider has no active sign-in.
+
 The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_API_URL` for fleet memory, and provider keys pass through from the host shell. [docs/WORKERS.md](docs/WORKERS.md) has the full topology, updates and crash story.
 
 Hindsight is the preferred way to share memory between workers. Without `HINDSIGHT_API_URL`, omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only containers on the same host see it. Set the URL to a [Hindsight](https://github.com/vectorize-io/hindsight) server, and every worker on every machine reads and writes the same memory. See [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).

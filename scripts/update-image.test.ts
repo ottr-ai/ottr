@@ -17,7 +17,7 @@ const realGit = worktree.git;
 const realWorktree = { ...worktree };
 const { gitExe } = worktree;
 
-import { type Deps, updateImage } from "./update-image.ts";
+import { type Deps, envFileValues, updateImage } from "./update-image.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-update-image-"));
 afterAll(
@@ -87,6 +87,16 @@ function fakes(
 		sidecarUp?: number;
 		/** Exit code of `compose images` (the image comparison's first step). */
 		imagesCode?: number;
+		/** The seed commit the server volume records (the `cat` exec's output). */
+		seedRecord?: string;
+		/** Exit code of the board-seed run. */
+		seedCode?: number;
+		/** Output of `compose ps -q alate` (a container id when the project's alate runs). */
+		alatePs?: string;
+		/** The image the project's alate container runs (`inspect .Config.Image`). */
+		alateInspect?: string;
+		/** Output of `docker ps --filter name=alate` (any running alate's image). */
+		alateDockerPs?: string;
 		/** The containerd store's platform manifests: the one the server runs, the build's. */
 		manifest?: {
 			runs: string;
@@ -107,6 +117,8 @@ function fakes(
 ): FakeRun {
 	const calls: string[] = [];
 	const drains: string[] = [];
+	const seedRuns: string[] = [];
+	const seedWrites: string[] = [];
 	const logs: string[] = [];
 	const waits: number[] = [];
 	const built: FakeRun["built"] = [];
@@ -125,6 +137,26 @@ function fakes(
 			const drain = line.includes("/api/drain");
 			const free = drain && line.includes("'DELETE'");
 			if (drain) drains.push(line);
+			if (args.includes("board-seed")) {
+				seedRuns.push(line);
+				calls.push(line);
+				return {
+					code: o.seedCode ?? 0,
+					out: o.seedCode ? "the seed step failed\n" : "",
+				};
+			}
+			if (line.includes("seed-commit")) {
+				// The read is the `cat` exec, the write is the `printf` exec.
+				calls.push(line);
+				if (line.includes("cat "))
+					return { code: 0, out: `${o.seedRecord ?? ""}\n` };
+				seedWrites.push(line);
+				return { code: 0, out: "" };
+			}
+			if (line.includes("name=alate")) {
+				calls.push(line);
+				return { code: 0, out: `${o.alateDockerPs ?? ""}\n` };
+			}
 			calls.push(
 				line.replace(
 					/ -e .*/s,
@@ -159,7 +191,9 @@ function fakes(
 							code: 0,
 							out: args.includes("--services")
 								? `${o.running ?? "server"}\n`
-								: `${args.at(-1)}\n`,
+								: args.at(-1) === "alate"
+									? `${o.alatePs ?? ""}\n`
+									: `${args.at(-1)}\n`,
 						};
 			if (args.includes("images"))
 				return o.imagesCode
@@ -203,6 +237,8 @@ function fakes(
 				};
 			if (args.includes("--platform"))
 				return { code: 0, out: `${o.manifest?.built ?? ""}\n` };
+			if (line.includes("Config.Image"))
+				return { code: 0, out: `${o.alateInspect ?? ""}\n` };
 			if (args.includes("inspect")) {
 				const fresh = o.newImage ? "sha256:new\n" : "sha256:0ld\n";
 				return {
@@ -243,7 +279,7 @@ function fakes(
 		},
 		now: () => clock,
 	};
-	return { deps, calls, drains, logs, waits, built };
+	return { deps, calls, drains, logs, waits, built, seedRuns, seedWrites };
 }
 
 const BUILD = "compose -f c.yml build server";
@@ -289,6 +325,10 @@ interface FakeRun {
 	waits: number[];
 	/** The sidecar build contexts: the tree, its files (no .git), its Dockerfile.worker. */
 	built: { tree: string; files: string[]; dockerfile: string }[];
+	/** The board-seed run call lines, in order. */
+	seedRuns: string[];
+	/** The record writes (`printf %s <sha> > /etc/ottr/seed-commit`), in order. */
+	seedWrites: string[];
 }
 
 /** The JSON body of the first hold's POST, parsed out of the embedded bun -e code. */
@@ -1029,4 +1069,217 @@ describe("arch-review survivor kills", () => {
 			"docker compose up --wait failed: dependency failed to start",
 		);
 	}, 60_000);
+});
+
+describe("board seed", () => {
+	const DATA_READ =
+		"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit";
+	const ALATE_PS = "compose -f c.yml ps -q alate";
+	const ALATE_INSPECT = "inspect -f {{.Config.Image}} alate123";
+	const DOCKER_PS = "ps --filter name=alate --format {{.Image}}";
+	const RESTART = "compose -f c.yml restart server";
+	const unrecorded = "0".repeat(40);
+
+	test("an unrecorded data-repo head seeds the agent layer once and records the commit", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		expect(f.seedRuns).toEqual([seedRun]);
+		expect(f.seedWrites).toEqual([write]);
+		// A seeded layer joins the image change as a restart reason: the hold happens, and
+		// a server that keeps its image restarts after up.
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			DATA_READ,
+			ALATE_PS,
+			ALATE_INSPECT,
+			seedRun,
+			write,
+			...COMPARE,
+			HOLD,
+			COUNT,
+			UP,
+			RESTART,
+			PRUNE,
+		]);
+		expect(f.logs.join("\n")).toContain(
+			`board agent layer seeded at ${head.slice(0, 12)}`,
+		);
+		expect(drainBody(f)).toEqual({
+			commits: [`board agent layer seed ${head.slice(0, 12)}`],
+		});
+		// The discovered image reached only the compose child, not the run's environment.
+		expect(process.env.ALATE_IMAGE).toBeUndefined();
+	}, 60_000);
+
+	test("a recorded head the data repo already has seeds nothing", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({ seedRecord: head });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.seedWrites).toEqual([]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			DATA_READ,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+		expect(f.logs.join("\n")).toContain(
+			`board agent layer current at ${head.slice(0, 12)}`,
+		);
+	}, 60_000);
+
+	test("a failed seed run writes no record, but the deploy itself still completes", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			seedCode: 1,
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.seedWrites).toEqual([]);
+		const log = f.logs.join("\n");
+		expect(log).toContain("board seed failed: the seed step failed");
+		expect(log).toContain("the stack runs main at");
+		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+	}, 60_000);
+
+	test("a seed with no alate image anywhere fails and names the env file", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({ seedRecord: unrecorded });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.seedWrites).toEqual([]);
+		expect(f.logs.join("\n")).toContain("set ALATE_IMAGE in the env file");
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			DATA_READ,
+			ALATE_PS,
+			DOCKER_PS,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a seed with a changed server image holds, and the recreate restarts it without another restart call", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			turns: ["1", "0"],
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).toContain(HOLD);
+		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+	}, 60_000);
+
+	test("an environment without a data source skips the seed entirely", async () => {
+		const { main } = checkout();
+		const f = fakes();
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps, {})).toBe(0);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.seedWrites).toEqual([]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+		expect(f.logs.join("\n")).toContain(
+			"no ALATE_DATA or ALATE_DATA_REPO in the environment",
+		);
+	}, 60_000);
+
+	test("ALATE_DATA wins over ALATE_DATA_REPO, and the repo is never read", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({ seedRecord: head });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+				ALATE_DATA_REPO: "example/repo",
+			}),
+		).toBe(0);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			DATA_READ,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+		expect(f.logs.join("\n")).toContain("ALATE_DATA wins over ALATE_DATA_REPO");
+	}, 60_000);
+});
+
+describe("envFileValues", () => {
+	test("reads --env-file flags and the root .env, later files win", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-env-"));
+		writeFileSync(
+			join(dir, "a.env"),
+			"# comment\n\nKEY=a\nURL=http://x/?y=1\nBAD\n=none\n",
+		);
+		writeFileSync(join(dir, "b.env"), "KEY=b\n");
+		writeFileSync(join(dir, ".env"), "ROOT=yes\n");
+		const prev = process.cwd();
+		process.chdir(dir);
+		try {
+			expect(
+				envFileValues([
+					"--env-file",
+					join(dir, "a.env"),
+					`--env-file=${join(dir, "b.env")}`,
+				]),
+			).toEqual({ KEY: "b", URL: "http://x/?y=1", ROOT: "yes" });
+		} finally {
+			process.chdir(prev);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });

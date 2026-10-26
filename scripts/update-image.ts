@@ -2,10 +2,18 @@
 // Deploys main to a compose stack. Run it on a schedule from a clean `main` checkout
 // (docs/WORKERS.md, "Updates"): it fast-forwards main, builds the image, and restarts the
 // stack once no turn runs. While a new image waits, it holds new turns on the board for at
-// most 1 h, so the running turns finish. The omp pin moves on main only
+// most 1 h, so the running turns finish. With ALATE_DATA or ALATE_DATA_REPO in the env file
+// it also seeds the board's agent layer (docs/WORKERS.md, "Seed the board config"). The omp
+// pin moves on main only
 // (.github/workflows/omp-bump.yml), so a host needs read access and never pushes.
 // Its arguments go to every `docker compose` call, e.g. -f docker-compose.yml -f <override>.
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { $ } from "bun";
@@ -51,6 +59,39 @@ const HOLD_LIMIT_MS = 60 * 60_000;
 /** The real docker dep puts stderr first: compose warnings come before the answer's last line. */
 const lastLine = (out: string): string =>
 	out.trim().split("\n").at(-1)?.trim() ?? "";
+
+/**
+ * The env-file values a run passes as `--env-file`, plus the repo root's `.env` when it
+ * exists (cwd-relative). Later files win; blank and `#` lines are skipped, and a value
+ * may itself contain `=`. Pure: it reads, it never touches the environment.
+ */
+export function envFileValues(args: string[]): Record<string, string> {
+	const files: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i]!;
+		if (a === "--env-file") files.push(args[++i] ?? "");
+		else if (a.startsWith("--env-file="))
+			files.push(a.slice("--env-file=".length));
+	}
+	if (existsSync(".env")) files.push(".env");
+	const values: Record<string, string> = {};
+	for (const file of files) {
+		let text: string;
+		try {
+			text = readFileSync(file, "utf8");
+		} catch {
+			continue; // a named file that is gone must not fail the run
+		}
+		for (const line of text.split("\n")) {
+			const t = line.trim();
+			if (t === "" || t.startsWith("#")) continue;
+			const eq = t.indexOf("=");
+			if (eq <= 0) continue;
+			values[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+		}
+	}
+	return values;
+}
 
 /**
  * The platform manifest a compose service's container runs. Only the containerd image
@@ -306,26 +347,122 @@ async function preflightStop(g: (...args: string[]) => Promise<GitResult>) {
 }
 
 /**
+ * What seeds the board's agent layer, and the board-seed args for it: ALATE_DATA (a local
+ * checkout of the data repo, its HEAD is wanted) or ALATE_DATA_REPO (`owner/name[@ref]`
+ * on GitHub, with the token in the child env, never in argv). ALATE_DATA wins when both
+ * are set. Null means the environment names no data source; `{ failed }` means the wanted
+ * head could not be read.
+ */
+async function seedSource(
+	d: Deps,
+	env: Record<string, string | undefined>,
+	repo: string,
+): Promise<{ wanted: string; args: string[] } | { failed: string } | null> {
+	const { ALATE_DATA, ALATE_DATA_REPO, GH_TOKEN } = env;
+	if (ALATE_DATA === undefined) {
+		if (ALATE_DATA_REPO === undefined) {
+			d.log(
+				"board seed: no ALATE_DATA or ALATE_DATA_REPO in the environment; the board keeps its current agent layer",
+			);
+			return null;
+		}
+		const [name, ref = "main"] = ALATE_DATA_REPO.split("@");
+		const auth =
+			GH_TOKEN === undefined
+				? []
+				: [
+						"-c",
+						"credential.helper=!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f",
+					];
+		const r = await git(
+			[...auth, "ls-remote", `https://github.com/${name}`, `refs/heads/${ref}`],
+			repo,
+		);
+		const wanted = r.stdout.trim().split(/\s+/)[0] ?? "";
+		if (r.code !== 0 || wanted === "")
+			return { failed: `git ls-remote ${name} failed` };
+		return {
+			wanted,
+			args: [
+				"run",
+				"--rm",
+				"--no-deps",
+				"board-seed",
+				"--repo",
+				ALATE_DATA_REPO,
+			],
+		};
+	}
+	if (ALATE_DATA_REPO !== undefined)
+		d.log("board seed: ALATE_DATA wins over ALATE_DATA_REPO");
+	const r = await git(["rev-parse", "HEAD"], ALATE_DATA);
+	const wanted = r.stdout.trim();
+	if (r.code !== 0 || wanted === "")
+		return { failed: `git rev-parse HEAD failed in ${ALATE_DATA}` };
+	return {
+		wanted,
+		args: [
+			"run",
+			"--rm",
+			"--no-deps",
+			"-v",
+			`${ALATE_DATA}:/data:ro`,
+			"board-seed",
+			"--data",
+			"/data",
+		],
+	};
+}
+
+/**
+ * The alate image the board-seed service runs in: ALATE_IMAGE, else the running alate of
+ * this compose project, else any running alate container. `discovered` marks an image read
+ * from docker, which the compose child then needs as ALATE_IMAGE for `${ALATE_IMAGE:-...}`.
+ */
+async function alateImage(
+	d: Deps,
+	compose: string[],
+	env: Record<string, string | undefined>,
+): Promise<{ image: string; discovered: boolean } | null> {
+	if (env.ALATE_IMAGE !== undefined)
+		return { image: env.ALATE_IMAGE, discovered: false };
+	const ps = await d.docker("compose", ...compose, "ps", "-q", "alate");
+	if (ps.code === 0 && ps.out.trim() !== "") {
+		const r = await d.docker(
+			"inspect",
+			"-f",
+			"{{.Config.Image}}",
+			lastLine(ps.out),
+		);
+		if (r.code === 0 && r.out.trim() !== "")
+			return { image: lastLine(r.out), discovered: true };
+	}
+	const dps = await d.docker(
+		"ps",
+		"--filter",
+		"name=alate",
+		"--format",
+		"{{.Image}}",
+	);
+	const image = dps.out.split("\n")[0]?.trim() ?? "";
+	return image === "" ? null : { image, discovered: true };
+}
+
+/**
  * Waits out the running turns on the live board. Returns an early exit code
  * (1 via stop, 0 when the restart waits for a later run), or null to proceed
- * to `compose up`.
+ * to `compose up`. `pending` says what makes the coming restart worth the hold: a new
+ * image, a seeded agent layer, or both.
  */
 async function drainRunningBoard(
 	d: Deps,
 	compose: string[],
 	commits: string[],
+	pending: boolean,
 	stop: (why: string) => number,
 ): Promise<number | null> {
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
-	// The build tags the server's image name; a server on another image means that the
-	// restart brings a new image. imageChanged compares the platform manifests where
-	// the containerd image store reports them: the image ids differ on every build.
-	const r = await imageChanged(d, compose, "server");
-	if ("error" in r)
-		return stop(
-			`the server's image cannot be compared with the build: ${r.error}`,
-		);
 	// A new image holds new turns, so the running ones finish and the restart finds the board
 	// idle. The run waits while turns run, for at most HOLD_LIMIT_MS. Then it ends the hold
 	// (FREE_TURNS), so queued cards start at once instead of when the last renewal lapses.
@@ -337,7 +474,7 @@ async function drainRunningBoard(
 			d.log(`the board cannot hold new turns: ${lastLine(r.out)}`);
 		return r.code === 0;
 	};
-	let held = r.changed && (await hold());
+	let held = pending && (await hold());
 	const since = d.now();
 	let turns = "";
 	for (let i = 0; ; i++) {
@@ -375,6 +512,7 @@ export async function updateImage(
 	repo: string,
 	compose: string[],
 	d: Deps,
+	env: Record<string, string | undefined> = process.env,
 ): Promise<number> {
 	const stop = (why: string): number => {
 		d.log(`stopped: ${why}`);
@@ -425,10 +563,114 @@ export async function updateImage(
 	);
 	if (running.code !== 0)
 		return stop(`docker compose ps failed: ${running.out.trim()}`);
+	const serverWasRunning = running.out.trim().split("\n").includes("server");
+	// The board's agent layer comes from the data repo, and the board-seed service is its
+	// only writer (never the worker-writable shared home). A commit the volume has not
+	// recorded yet seeds once, before the drain. A failed seed never blocks the deploy;
+	// the run only exits 1 after the normal success line.
+	let seeded = false;
+	let seedFailed = false;
+	let wantedSha = "";
+	const seed = await seedSource(d, env, repo);
+	if (seed === null) {
+		// seedSource already logged the skip.
+	} else if ("failed" in seed) {
+		d.log(`board seed failed: ${seed.failed}`);
+		seedFailed = true;
+	} else {
+		wantedSha = seed.wanted;
+		let record: string | null = null;
+		if (serverWasRunning) {
+			const r = await d.docker(
+				"compose",
+				...compose,
+				"exec",
+				"-T",
+				"server",
+				"sh",
+				"-c",
+				"cat /etc/ottr/seed-commit",
+			);
+			const read = r.code === 0 ? r.out.trim() : "";
+			if (read !== "") record = read;
+		}
+		if (record === seed.wanted) {
+			d.log(`board agent layer current at ${seed.wanted.slice(0, 12)}`);
+		} else {
+			const found = await alateImage(d, compose, env);
+			if (found === null) {
+				d.log(
+					"board seed failed: no alate image found; set ALATE_IMAGE in the env file",
+				);
+				seedFailed = true;
+			} else {
+				// A discovered image must reach the compose child, or the board-seed service
+				// interpolates the ghcr default and pulls an image that may not exist.
+				const prev = process.env.ALATE_IMAGE;
+				if (found.discovered) process.env.ALATE_IMAGE = found.image;
+				try {
+					const run = await d.docker("compose", ...compose, ...seed.args);
+					if (run.code !== 0) {
+						d.log(
+							`board seed failed: ${run.out.trim().split("\n").slice(-3).join("\n")}`,
+						);
+						seedFailed = true;
+					} else {
+						d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
+						if (serverWasRunning) {
+							const w = await d.docker(
+								"compose",
+								...compose,
+								"exec",
+								"-T",
+								"server",
+								"sh",
+								"-c",
+								`printf %s '${seed.wanted}' > /etc/ottr/seed-commit`,
+							);
+							if (w.code !== 0) {
+								d.log("board seed failed: the seed commit cannot be recorded");
+								seedFailed = true;
+							} else seeded = true;
+						} else {
+							d.log(
+								"the server is down, so the seed commit is not recorded; the next run seeds again",
+							);
+							seeded = true;
+						}
+					}
+				} finally {
+					if (found.discovered) {
+						if (prev === undefined) delete process.env.ALATE_IMAGE;
+						else process.env.ALATE_IMAGE = prev;
+					}
+				}
+			}
+		}
+	}
 	// No running board, no turn can run: merge turns die with the board and workers
 	// kill a turn when the board's request drops. Skip counting and go straight to up.
-	if (running.out.trim().split("\n").includes("server")) {
-		const early = await drainRunningBoard(d, compose, commits, stop);
+	let serverImageChanged = false;
+	if (serverWasRunning) {
+		// The build tags the server's image name; a server on another image means that the
+		// restart brings a new image. imageChanged compares the platform manifests where
+		// the containerd image store reports them: the image ids differ on every build.
+		const r = await imageChanged(d, compose, "server");
+		if ("error" in r)
+			return stop(
+				`the server's image cannot be compared with the build: ${r.error}`,
+			);
+		serverImageChanged = r.changed;
+		const holdCommits = seeded
+			? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
+			: commits;
+		const early = await drainRunningBoard(
+			d,
+			compose,
+			holdCommits,
+			r.changed || seeded,
+			stop,
+		);
 		if (early !== null) return early;
 	} else d.log("no running board to count turns in; restarting anyway");
 	// --wait fails the run when the recreated board never turns healthy, so the script
@@ -436,6 +678,13 @@ export async function updateImage(
 	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
 	if (up.code !== 0)
 		return stop(`docker compose up --wait failed: ${up.out.trim()}`);
+	// The recreate already rebooted a server whose image changed, and up started a board
+	// that was down with the seed. Only a running board that keeps its image restarts.
+	if (seeded && serverWasRunning && !serverImageChanged) {
+		const rs = await d.docker("compose", ...compose, "restart", "server");
+		if (rs.code !== 0)
+			return stop(`docker compose restart server failed: ${rs.out.trim()}`);
+	}
 	await d.docker(
 		"image",
 		"prune",
@@ -444,11 +693,19 @@ export async function updateImage(
 		"label=ottr.image=worker",
 	);
 	d.log(`the stack runs main at ${head} with omp ${omp}`);
-	return 0;
+	// ponytail: a dirty ALATE_DATA checkout records HEAD, so uncommitted edits do not
+	// retrigger a seed; the next pushed commit does.
+	return seedFailed ? 1 : 0;
 }
 
 if (import.meta.main) {
 	const repo = resolve(import.meta.dir, "..");
+	// The shell env wins over --env-file values, matching compose's precedence.
+	for (const [key, value] of Object.entries(
+		envFileValues(process.argv.slice(2)),
+	)) {
+		if (process.env[key] === undefined) process.env[key] = value;
+	}
 	process.exitCode = await updateImage(repo, process.argv.slice(2), {
 		docker: async (...args) => {
 			const r = await $`docker ${args}`.cwd(repo).nothrow().quiet();

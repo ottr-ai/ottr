@@ -316,6 +316,52 @@ const defineRoutes = <R extends string>(
 	r: Serve.RoutesWithUpgrade<undefined, R>,
 ) => r;
 
+/**
+ * Warnings the board must show the user (not only log): an unseeded agent layer, and a model
+ * role whose provider has no active sign-in in the board store and no provider env key. Advisory
+ * only; the state recomputes them on every poll, so a warning disappears by itself once fixed.
+ */
+export function boardWarnings(
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	if (!existsSync(join(agentDir(), "config.yml")))
+		return [
+			'The board\'s agent layer is not seeded: the board runs without rules and config.yml until a seed fills /etc/ottr/home (docs/WORKERS.md, "Seed the board config").',
+		];
+	// Roles are unreadable without config.yml, so the unseeded warning replaces the rest.
+	let active = new Set<string>();
+	try {
+		active = new Set(
+			signIns(join(agentDir(), "agent.db"))
+				.filter((s) => s.active)
+				.map((s) => s.provider),
+		);
+	} catch {
+		// An unreadable or missing store counts as no active sign-in.
+	}
+	const named = new Set<string>();
+	const out: string[] = [];
+	for (const [role, selector] of Object.entries(modelRoles())) {
+		// Selectors without a provider prefix name no provider to check.
+		const i = selector.indexOf("/");
+		if (i <= 0) continue;
+		const provider = selector.slice(0, i).toLowerCase();
+		// Several roles may share a provider — the first role names it.
+		if (named.has(provider)) continue;
+		named.add(provider);
+		// openai-codex rides the OpenAI key.
+		const envKey =
+			env[`${provider.replaceAll("-", "_").toUpperCase()}_API_KEY`] ??
+			(provider.startsWith("openai") ? env.OPENAI_API_KEY : undefined);
+		if (active.has(provider) || (envKey !== undefined && envKey !== ""))
+			continue;
+		out.push(
+			`No active sign-in for ${provider} (role ${role}): sign in under Settings - Provider sign-in, or set its API key in the environment.`,
+		);
+	}
+	return out;
+}
+
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
 	const prod = deps.prod === true;
@@ -1462,6 +1508,7 @@ export function createApp(deps: AppDeps) {
 			keptWorktrees: { held: keptHeld, stale: keptStale },
 			drainUntil: drainUntil > now ? drainUntil : null,
 			drainCommits: drainUntil > now ? drainCommits : null,
+			warnings: boardWarnings(),
 			updates: updatesView(),
 			alatePendingSince,
 			deadSignIns: dead,
