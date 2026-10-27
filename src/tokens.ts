@@ -168,19 +168,16 @@ export async function lentProviderEnv(
 					"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'auth_credential_refresh_leases'",
 				)
 				.get();
+			// Our owner string while we hold the lease; null when we hold none.
+			let held: string | null = null;
 			if (hasLeases) {
 				// omp's rule: take over an expired lease, never a live one.
+				const owner = `ottr-board:${process.pid}`;
 				const taken = wdb
 					.query(
 						"INSERT INTO auth_credential_refresh_leases (credential_id, owner, expires_at_ms, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(credential_id) DO UPDATE SET owner = excluded.owner, expires_at_ms = excluded.expires_at_ms, updated_at = excluded.updated_at WHERE auth_credential_refresh_leases.expires_at_ms <= ?",
 					)
-					.run(
-						row.id,
-						`ottr-board:${process.pid}`,
-						now + marginMs,
-						Math.floor(now / 1000),
-						now,
-					);
+					.run(row.id, owner, now + marginMs, Math.floor(now / 1000), now);
 				if (Number(taken.changes) === 0) {
 					// Someone else is refreshing: lend the row only when it is fresh already.
 					const again = wdb
@@ -201,35 +198,53 @@ export async function lentProviderEnv(
 					}
 					return {};
 				}
+				held = owner;
 			}
-			let got: RefreshedToken | null;
 			try {
-				got = await postRefresh(spec, cred.refresh, fetchImpl);
-			} catch {
-				got = null;
-			}
-			if (!got) return {}; // The row stays untouched; the next turn retries.
-			wdb
-				.query(
-					"UPDATE auth_credentials SET data = ?, updated_at = ? WHERE id = ?",
+				let got: RefreshedToken | null;
+				try {
+					got = await postRefresh(spec, cred.refresh, fetchImpl);
+				} catch {
+					got = null;
+				}
+				// A failed refresh lends nothing; the row stays untouched and the
+				// finally below releases the lease, so the next turn can retry.
+				if (!got) return {};
+				// Still ours? A lease that changed hands while the request ran means
+				// the new owner is refreshing now: leave the row to it.
+				if (
+					held !== null &&
+					!wdb
+						.query(
+							"SELECT 1 FROM auth_credential_refresh_leases WHERE credential_id = ? AND owner = ? AND expires_at_ms > ?",
+						)
+						.get(row.id, held, now)
 				)
-				.run(
-					JSON.stringify({
-						...cred,
-						access: got.access,
-						refresh: got.refresh ?? cred.refresh,
-						expires: now + got.expiresIn * 1000 - (spec.skew ?? 0),
-					}),
-					Math.floor(now / 1000),
-					row.id,
-				);
-			if (hasLeases)
+					return {};
 				wdb
 					.query(
-						"DELETE FROM auth_credential_refresh_leases WHERE credential_id = ?",
+						"UPDATE auth_credentials SET data = ?, updated_at = ? WHERE id = ?",
 					)
-					.run(row.id);
-			return { [spec.env]: got.access };
+					.run(
+						JSON.stringify({
+							...cred,
+							access: got.access,
+							refresh: got.refresh ?? cred.refresh,
+							expires: now + got.expiresIn * 1000 - (spec.skew ?? 0),
+						}),
+						Math.floor(now / 1000),
+						row.id,
+					);
+				return { [spec.env]: got.access };
+			} finally {
+				// omp's release: only our own lease, in every outcome.
+				if (held !== null)
+					wdb
+						.query(
+							"DELETE FROM auth_credential_refresh_leases WHERE credential_id = ? AND owner = ?",
+						)
+						.run(row.id, held);
+			}
 		} finally {
 			wdb.close();
 		}

@@ -128,6 +128,23 @@ Legacy rows from the OTTR-183 era: they hold their own refresh token family
 and keep working until the next sign-in or sign-out of that provider. Nothing
 is deleted; rows only ever get a cause.
 
+### Provenance (the item-5 hard stop)
+
+The card's gate — "stop and ask the user before you write Ottr's own OAuth
+code or write rows into omp's store" — sits in item 5 and guards the mobile
+sign-in. The shipped sign-in is omp's own flow with the paste fallback: no
+Ottr authorize code, no rows beyond the login omp itself writes.
+
+The refresher is a separate mechanism, and decision 1 mandates it: "Before
+each worker turn, the board refreshes the credential when needed". omp offers
+no command that refreshes a store row, so the only mechanism is the refresh
+grant the provider's own rules define. The client ids are omp's public ids
+verbatim (anthropic.kdl stores its id base64 to quiet secret scanners; the
+codex id is plain in openai-codex-device.kdl). The refresher only renews rows
+omp's own login wrote, in omp's own JSON shape, and coordinates through omp's
+own lease table; it never writes a credential the board did not receive from
+omp's login. The supersede write is a `disabled_cause` string only.
+
 ### Logout
 
 Sign-out marks the provider's rows `deleted by user` in the board store and,
@@ -173,7 +190,10 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   model's provider, under omp's env name.
 - A test: a token below the margin gets refreshed before the turn, the board
   store row holds the new tokens, and the turn env carries the new access.
-- A test: a refresh failure lends nothing and leaves the row unchanged.
+- A test: a refresh failure lends nothing, leaves the row unchanged, and
+  releases the lease.
+- A test: a lease that changed hands mid-refresh leaves the row to the new
+  owner and lends nothing.
 - A test: a sign-in writes no credential row into the worker store and marks
   the provider's worker-store rows `replaced by newer credential`.
 - A test: the code-flow sign-in path completes by pasting the redirect address

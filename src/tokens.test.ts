@@ -41,6 +41,16 @@ function addRow(
 	return row.id;
 }
 
+/** The lease rows of a store, owner and expiry only. */
+function leases(path: string): Array<{ owner: string; expires_at_ms: number }> {
+	const db = new Database(path, { readonly: true });
+	const rows = db
+		.query("SELECT owner, expires_at_ms FROM auth_credential_refresh_leases")
+		.all() as Array<{ owner: string; expires_at_ms: number }>;
+	db.close();
+	return rows;
+}
+
 function rowData(path: string, id: number): Record<string, unknown> {
 	const db = new Database(path, { readonly: true });
 	const row = db
@@ -176,8 +186,8 @@ describe("lentProviderEnv", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	test("a failed refresh lends nothing and leaves the row untouched", async () => {
-		const path = store();
+	test("a failed refresh lends nothing, leaves the row untouched, and releases the lease", async () => {
+		const path = store({ leases: true });
 		const id = addRow(path, "anthropic", {
 			access: "access-1",
 			refresh: "refresh-1",
@@ -191,6 +201,51 @@ describe("lentProviderEnv", () => {
 			{},
 		);
 		expect(rowData(path, id)).toEqual(before);
+		// The lease is gone: a later turn can take it and refresh.
+		expect(leases(path)).toEqual([]);
+	});
+
+	test("a lease lost mid-refresh leaves the row to the new owner", async () => {
+		const path = store({ leases: true });
+		const id = addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 60_000,
+		});
+		const before = rowData(path, id);
+		const calls: { url: string; init: RequestInit }[] = [];
+		const taker = Object.assign(
+			async (url: unknown, init: RequestInit) => {
+				calls.push({ url: String(url), init: init ?? {} });
+				// Another refresher takes the lease while our request runs.
+				const db = new Database(path);
+				db.query(
+					"INSERT INTO auth_credential_refresh_leases (credential_id, owner, expires_at_ms, updated_at) VALUES (?, 'other', ?, 1) ON CONFLICT(credential_id) DO UPDATE SET owner = 'other', expires_at_ms = excluded.expires_at_ms",
+				).run(id, NOW + 600_000);
+				db.close();
+				return new Response(
+					JSON.stringify({
+						access_token: "access-new",
+						refresh_token: "refresh-new",
+						expires_in: 3600,
+					}),
+					{ status: 200 },
+				);
+			},
+			{ preconnect: () => {} },
+		) as typeof fetch;
+		expect(
+			await lentProviderEnv("anthropic/claude-opus-5-5", {
+				dbPath: path,
+				now: NOW,
+				fetchImpl: taker,
+			}),
+		).toEqual({});
+		// Our result is discarded: the new owner owns the row now.
+		expect(rowData(path, id)).toEqual(before);
+		expect(leases(path)).toEqual([
+			{ owner: "other", expires_at_ms: NOW + 600_000 },
+		]);
 	});
 
 	test("an unknown provider, or a missing db, lends nothing", async () => {
