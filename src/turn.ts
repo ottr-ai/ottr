@@ -267,10 +267,13 @@ export interface TurnOps {
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
 	/** The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every turn, worker dispatched or not. */
-	turnEnv?: (project: string) => {
+	turnEnv?: (
+		project: string,
+		model: string | null,
+	) => Promise<{
 		env: Record<string, string>;
 		missing: string[];
-	};
+	}>;
 	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
 	prepareTurn?: (project: string) => Promise<{
 		lines: string[];
@@ -1230,7 +1233,10 @@ export function createTurnLoop(
 			// The env values ride the run env into a worker too (the runner forwards them with
 			// the rest of the child env), so every turn gets them and every card log names a
 			// listed name that has no value.
-			const turnEnv = ops.turnEnv?.(name) ?? { env: {}, missing: [] };
+			const turnEnv = (await ops.turnEnv?.(name, live.model ?? null)) ?? {
+				env: {},
+				missing: [],
+			};
 			if (turnEnv.missing.length > 0)
 				log(
 					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,

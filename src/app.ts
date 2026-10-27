@@ -78,8 +78,7 @@ import {
 	PROVIDER_ID,
 	providerLogin,
 	signIns,
-	signOutStores,
-	storeSignIns,
+	signOutEverywhere,
 } from "./login.ts";
 import {
 	commitMessage,
@@ -3744,7 +3743,7 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, async () => {
 					return json({
-						stores: storeSignIns(),
+						signIns: signIns(),
 						pending: logins.pending(),
 						providers: loginProviders(),
 					});
@@ -3804,8 +3803,8 @@ export function createApp(deps: AppDeps) {
 							{ error: "provider must be an omp provider id, e.g. anthropic" },
 							400,
 						);
-					// Each store holds its own sign-in: the board's and the workers'.
-					return json({ removed: signOutStores(provider) });
+					// One sign-in serves the board and the workers; a logout removes it everywhere.
+					return json({ removed: signOutEverywhere(provider) });
 				}),
 		},
 		"/api/update": {

@@ -4,16 +4,13 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
-	readdirSync,
 	readFileSync,
 	rmSync,
-	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, sep } from "node:path";
+import { dirname, join } from "node:path";
 import {
-	adoptSignIn,
 	deadSignIns,
 	type LoginStores,
 	loginProviders,
@@ -21,8 +18,7 @@ import {
 	redirectUri,
 	signIns,
 	signOut,
-	signOutStores,
-	storeSignIns,
+	signOutEverywhere,
 } from "./login.ts";
 
 // A stand-in for `omp login <provider>`: the same output shape (sign-in URL with its loopback
@@ -217,11 +213,9 @@ describe("providerLogin", () => {
 		expect(Date.now() - t).toBeLessThan(5000);
 		expect(v).toEqual({
 			provider: "silent",
-			store: "board",
-			step: 1,
-			steps: 1,
 			output: "",
 			ok: null,
+			returnTo: BOARD,
 		});
 		const child = l.child();
 		l.cancel();
@@ -230,8 +224,8 @@ describe("providerLogin", () => {
 	}, 30_000);
 });
 
-describe("two stores: one omp login for each", () => {
-	// The columns of omp's auth_credentials a sign-in writes and the board adopts.
+describe("worker store: supersede on sign-in, sign-out everywhere", () => {
+	// The columns of omp's auth_credentials the board reads and writes.
 	const SCHEMA = `CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY,
 		provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
 		disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`;
@@ -261,16 +255,6 @@ describe("two stores: one omp login for each", () => {
 		db.close();
 	}
 
-	// The worker store as the workers left it: an older sign-in of the same account, another
-	// account, an API key a new OAuth sign-in replaces, and another provider.
-	const workerStore = (db: string) =>
-		credStore(db, [
-			["anthropic", "oauth", { access: "a1", refresh: "worker-r1" }, "acct-1"],
-			["anthropic", "oauth", { access: "a2", refresh: "worker-r2" }, "acct-2"],
-			["anthropic", "api_key", { key: "test-key" }, null],
-			["deepseek", "api_key", { key: "test-key-2" }, null],
-		]);
-
 	function rows(db: string): Row[] {
 		const d = new Database(db, { readonly: true });
 		try {
@@ -284,339 +268,128 @@ describe("two stores: one omp login for each", () => {
 		}
 	}
 
-	function refreshOf(r: Row): string | undefined {
-		const d: unknown = JSON.parse(r.data);
-		return typeof d === "object" &&
-			d !== null &&
-			"refresh" in d &&
-			typeof d.refresh === "string"
-			? d.refresh
-			: undefined;
-	}
-
-	/** The refresh tokens of the active rows of one provider and account. */
-	const activeRefresh = (db: string, identity: string) =>
-		rows(db)
-			.filter(
-				(r) =>
-					r.provider === "anthropic" &&
-					r.identity_key === identity &&
-					r.disabled_cause === null,
-			)
-			.map(refreshOf);
-
-	/** Simulates omp's token refresh: the active row of the account gets a new refresh token. */
-	function rotate(db: string, identity: string): void {
-		const d = new Database(db);
-		try {
-			d.query(
-				"UPDATE auth_credentials SET data = ? WHERE provider = 'anthropic' AND identity_key = ? AND disabled_cause IS NULL",
-			).run(
-				JSON.stringify({ access: "rotated", refresh: crypto.randomUUID() }),
-				identity,
-			);
-		} finally {
-			d.close();
-		}
-	}
-
-	const under = (p: string, d: string) => p === d || p.startsWith(`${d}${sep}`);
-
 	/**
-	 * A board store and a separate worker store under a fresh root, and a sign-in that writes
-	 * them. `boardInWorkerHome` puts the board agent dir inside the worker home.
+	 * A board store and a separate worker store under a fresh root, and a sign-in that runs once
+	 * against the board's. The worker store holds an older sign-in of the same account, another
+	 * account, an API key, and another provider.
 	 */
-	function setup(o: { workerDb?: boolean; boardInWorkerHome?: boolean } = {}) {
+	function setup(o: { workerDb?: boolean } = {}) {
 		const root = mkdtempSync(join(dir, "stores-"));
 		const home = join(root, "worker-home");
 		const workerDb = join(home, ".omp", "agent", "agent.db");
-		if (o.workerDb !== false) workerStore(workerDb);
-		const boardDir = o.boardInWorkerHome
-			? join(home, ".omp", "board-agent")
-			: join(root, "board-home", ".omp", "agent");
+		if (o.workerDb !== false)
+			credStore(workerDb, [
+				[
+					"anthropic",
+					"oauth",
+					{ access: "a1", refresh: "worker-r1" },
+					"acct-1",
+				],
+				[
+					"anthropic",
+					"oauth",
+					{ access: "a2", refresh: "worker-r2" },
+					"acct-2",
+				],
+				["anthropic", "api_key", { key: "test-key" }, null],
+				["deepseek", "api_key", { key: "test-key-2" }, null],
+			]);
+		const boardDir = join(root, "board-home", ".omp", "agent");
 		const stores: LoginStores = { boardDir, worker: { home, db: workerDb } };
 		const l = providerLogin({
 			command: [process.execPath, fake],
 			quietMs: 150,
 			stores: () => stores,
 		});
-		/** The fake's runs for this setup: agent dir and HOME of each, in order. */
-		const runs = (): Array<{ agentDir: string; home: string }> =>
-			(existsSync(RUNS) ? readFileSync(RUNS, "utf8") : "")
-				.split("\n")
-				.filter((line) => line !== "")
-				.map((line) => JSON.parse(line))
-				.filter((r) => under(r.agentDir, root));
-		/** Scratch dirs of step 2 left next to the board agent dir. */
-		const scratches = () =>
-			existsSync(dirname(boardDir))
-				? readdirSync(dirname(boardDir)).filter((n) =>
-						n.startsWith(".ottr-login-"),
-					)
-				: [];
-		/** Runs both steps with the right code; returns the final view. */
-		async function signInBoth() {
-			await l.start("anthropic", BOARD);
-			await l.answer("good"); // returns once step 2 printed its sign-in URL
-			return l.answer("good");
-		}
 		return {
 			l,
-			home,
+			stores,
 			boardDir,
 			boardDb: join(boardDir, "agent.db"),
 			workerDb,
-			runs,
-			scratches,
-			signInBoth,
 		};
 	}
 
-	test("a sign-in runs omp login once for each store, the second against a board-only scratch dir", async () => {
-		const t = setup();
-		const one = await t.l.start("anthropic", BOARD);
-		expect(one).toMatchObject({ store: "board", step: 1, steps: 2, ok: null });
-		const two = await t.l.answer("good");
-		expect(two).toMatchObject({
-			store: "workers",
-			step: 2,
-			steps: 2,
-			ok: null,
-		});
-		expect(two?.output).toContain("https://example.test/auth?p=anthropic");
-		expect(two?.output.endsWith("Paste the authorization code: ")).toBe(true);
-		// Step 2's agent dir exists while its omp waits, board-only (0700).
-		const [scratch] = t.scratches();
-		expect(scratch).toBeDefined();
-		if (process.platform !== "win32")
-			expect(
-				statSync(join(dirname(t.boardDir), scratch ?? "")).mode & 0o777,
-			).toBe(0o700);
-		const done = await t.l.answer("good");
-		expect(done?.ok).toBe(true);
-		expect(done?.output).toContain(`Signed the workers in: ${t.workerDb}`);
-
-		const runs = t.runs();
-		expect(runs).toHaveLength(2);
-		const [first, second] = runs;
-		expect(first?.agentDir).toBe(t.boardDir);
-		expect(second?.agentDir).not.toBe(t.boardDir);
-		expect(second?.agentDir).not.toBe(dirname(t.workerDb));
-		expect(under(second?.agentDir ?? t.home, t.home)).toBe(false);
-		expect(dirname(second?.agentDir ?? "")).toBe(dirname(t.boardDir));
-		for (const r of runs) {
-			expect(r.home).not.toBe(t.home);
-			expect(under(r.home, t.home)).toBe(false);
-		}
-	}, 30_000); // Two real omp stand-ins in a row; bun boot can take seconds under machine load.
-
-	test("the two stores then hold different refresh tokens; the worker store replaces the account's old rows", async () => {
-		const t = setup();
-		expect((await t.signInBoth())?.ok).toBe(true);
-		const [board] = activeRefresh(t.boardDb, "acct-1");
-		const [worker] = activeRefresh(t.workerDb, "acct-1");
-		expect(board).toBeString();
-		expect(worker).toBeString();
-		expect(worker).not.toBe(board);
-		expect(worker).not.toBe("worker-r1");
-		const inBoard = new Set(rows(t.boardDb).map(refreshOf));
-		const shared = rows(t.workerDb)
-			.map(refreshOf)
-			.filter((r) => r !== undefined && inBoard.has(r));
-		expect(shared).toEqual([]);
-
-		const causes = rows(t.workerDb).map((r) => [
-			r.provider,
-			r.credential_type,
-			r.identity_key,
-			r.disabled_cause,
-		]);
-		expect(causes).toEqual([
-			["anthropic", "oauth", "acct-1", "replaced by newer credential"],
-			["anthropic", "oauth", "acct-2", null],
-			["anthropic", "api_key", null, "replaced by newer credential"],
-			["deepseek", "api_key", null, null],
-			["anthropic", "oauth", "acct-1", null],
-		]);
-	}, 30_000);
-
-	test("a refresh that rotates the token in one store leaves the other store unchanged", async () => {
-		const t = setup();
-		expect((await t.signInBoth())?.ok).toBe(true);
-		const anthropic = (db: string) =>
-			rows(db)
-				.filter((r) => r.provider === "anthropic")
-				.map(({ id, data, disabled_cause }) => ({ id, data, disabled_cause }));
-		const [boardToken] = activeRefresh(t.boardDb, "acct-1");
-
-		const workerBefore = anthropic(t.workerDb);
-		rotate(t.boardDb, "acct-1");
-		expect(activeRefresh(t.boardDb, "acct-1")).not.toEqual([boardToken]);
-		expect(anthropic(t.workerDb)).toEqual(workerBefore);
-		// The token the board rotated away from (dead at the provider) is not the workers' one.
-		expect(activeRefresh(t.workerDb, "acct-1")).not.toContain(boardToken);
-
-		const boardBefore = anthropic(t.boardDb);
-		const [workerToken] = activeRefresh(t.workerDb, "acct-1");
-		rotate(t.workerDb, "acct-1");
-		expect(activeRefresh(t.workerDb, "acct-1")).not.toEqual([workerToken]);
-		expect(anthropic(t.boardDb)).toEqual(boardBefore);
-		expect(activeRefresh(t.boardDb, "acct-1")).not.toContain(workerToken);
-	}, 30_000);
-
-	test("the scratch dir is gone after a successful step 2", async () => {
-		const t = setup();
-		expect((await t.signInBoth())?.ok).toBe(true);
-		expect(t.runs()).toHaveLength(2);
-		expect(t.scratches()).toEqual([]);
-	}, 30_000);
-
-	test("a failed step 2 fails the flow, removes the scratch dir and leaves the worker store unchanged", async () => {
+	test("a successful sign-in marks the provider's worker-store rows replaced and inserts none", async () => {
 		const t = setup();
 		const before = rows(t.workerDb);
 		await t.l.start("anthropic", BOARD);
-		await t.l.answer("good");
-		expect(t.scratches()).toHaveLength(1);
-		const v = await t.l.answer("bad");
-		expect(v).toMatchObject({ store: "workers", step: 2, ok: false });
-		expect(v?.output).toContain("Login failed: invalid_grant");
-		expect(t.runs()).toHaveLength(2);
-		expect(t.scratches()).toEqual([]);
-		expect(rows(t.workerDb)).toEqual(before);
-	}, 30_000);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		expect(v?.output).not.toContain("Cannot mark");
 
-	test("the redirect of step 1 sends the browser to step 2's sign-in page, the one of step 2 back to Settings", async () => {
-		const t = setup();
-		await t.l.start("anthropic", BOARD);
-		const first = await t.l.callback(browserTo(CALLBACK));
-		expect(first?.status).toBe(303);
-		expect(first?.headers.get("location")).toStartWith(
-			"https://example.test/auth?p=anthropic",
+		const after = rows(t.workerDb);
+		expect(after).toHaveLength(before.length); // no row inserted
+		expect(
+			after
+				.filter((r) => r.provider === "anthropic")
+				.map((r) => r.disabled_cause),
+		).toEqual([
+			"replaced by newer credential",
+			"replaced by newer credential",
+			"replaced by newer credential",
+		]);
+		// The board never reads the worker store: the rows keep their own data.
+		expect(after.map((r) => r.data)).toEqual(before.map((r) => r.data));
+		// Another provider's rows are untouched.
+		expect(after.filter((r) => r.provider === "deepseek")).toEqual(
+			before.filter((r) => r.provider === "deepseek"),
 		);
-		expect(t.l.pending()).toMatchObject({ step: 2, ok: null });
-		const second = await t.l.callback(browserTo(CALLBACK));
-		expect(second?.status).toBe(303);
-		expect(second?.headers.get("location")).toBe(`${BOARD}/#settings`);
-		expect(t.l.pending()?.ok).toBe(true);
-		expect(t.runs()).toHaveLength(2);
+		// The credential itself went only into the board's store.
+		expect(
+			rows(t.boardDb).filter((r) => r.disabled_cause === null),
+		).toHaveLength(1);
 	}, 30_000);
 
-	test("a missing worker store fails the flow after step 1, names the path, and is not created", async () => {
+	test("a successful sign-in with no worker store file still succeeds and creates none", async () => {
 		const t = setup({ workerDb: false });
 		await t.l.start("anthropic", BOARD);
 		const v = await t.l.answer("good");
-		expect(v?.ok).toBe(false);
-		expect(v?.output).toContain(t.workerDb);
-		expect(t.runs()).toHaveLength(1);
+		expect(v?.ok).toBe(true);
 		expect(existsSync(t.workerDb)).toBe(false);
-		expect(t.scratches()).toEqual([]);
 	}, 30_000);
 
-	test("a board agent dir inside the worker home refuses step 2 and makes no scratch dir there", async () => {
-		const t = setup({ boardInWorkerHome: true });
-		const before = rows(t.workerDb);
-		await t.l.start("anthropic", BOARD);
-		const v = await t.l.answer("good");
-		expect(v?.ok).toBe(false);
-		expect(v?.output).toContain("worker home");
-		expect(t.runs()).toHaveLength(1);
-		expect(dirname(t.boardDir).startsWith(t.home)).toBe(true);
-		expect(t.scratches()).toEqual([]);
-		expect(rows(t.workerDb)).toEqual(before);
-	}, 30_000);
-
-	test("a failed step 1 never starts step 2", async () => {
+	test("signOutEverywhere marks both stores deleted by user; a missing worker store counts as none", () => {
 		const t = setup();
-		const before = rows(t.workerDb);
-		await t.l.start("anthropic", BOARD);
-		const v = await t.l.answer("bad");
-		expect(v).toMatchObject({ store: "board", step: 1, steps: 2, ok: false });
-		expect(t.runs()).toHaveLength(1);
-		expect(t.scratches()).toEqual([]);
-		expect(rows(t.workerDb)).toEqual(before);
-	}, 30_000);
-
-	test("signOutStores clears the provider in both stores; a missing worker store counts as none", () => {
-		const root = mkdtempSync(join(dir, "stores-"));
-		const boardDir = join(root, "board");
-		const home = join(root, "worker-home");
-		const db = join(home, ".omp", "agent", "agent.db");
-		credStore(join(boardDir, "agent.db"), [
+		credStore(join(t.boardDir, "agent.db"), [
 			["anthropic", "oauth", { refresh: "board-r" }, "acct-1"],
 			["deepseek", "api_key", { key: "test-key" }, null],
 		]);
-		workerStore(db);
-		const stores: LoginStores = { boardDir, worker: { home, db } };
-		expect(signOutStores("anthropic", stores)).toEqual({
+		expect(signOutEverywhere("anthropic", t.stores)).toEqual({
 			board: 1,
 			workers: 3,
 		});
-		for (const s of storeSignIns(stores))
-			expect(s.signIns?.map((x) => x.provider)).toEqual(["deepseek"]);
+		const causes = (db: string) =>
+			rows(db).map((r) => [r.provider, r.disabled_cause]);
+		expect(causes(t.workerDb)).toEqual([
+			["anthropic", "deleted by user"],
+			["anthropic", "deleted by user"],
+			["anthropic", "deleted by user"],
+			["deepseek", null],
+		]);
+		expect(causes(t.boardDb)).toEqual([
+			["anthropic", "deleted by user"],
+			["deepseek", null],
+		]);
 
-		const missing = join(root, "absent", "agent.db");
-		const noWorkers: LoginStores = { boardDir, worker: { home, db: missing } };
-		expect(signOutStores("deepseek", noWorkers)).toEqual({
-			board: 1,
-			workers: 0,
-		});
+		const missing = join(t.boardDir, "..", "absent", "agent.db");
+		expect(
+			signOutEverywhere("deepseek", {
+				boardDir: t.boardDir,
+				worker: { home: dirname(dirname(t.workerDb)), db: missing },
+			}),
+		).toEqual({ board: 1, workers: 0 });
 		expect(existsSync(missing)).toBe(false);
 	});
+});
 
-	test("storeSignIns lists the board, then the workers; a missing worker store is an error naming it", () => {
-		const root = mkdtempSync(join(dir, "stores-"));
-		const boardDir = join(root, "board");
-		const home = join(root, "worker-home");
-		credStore(join(boardDir, "agent.db"), [
-			["anthropic", "oauth", { refresh: "board-r" }, "acct-1"],
-		]);
-		const db = join(home, ".omp", "agent", "agent.db");
-		workerStore(db);
-		expect(storeSignIns({ boardDir, worker: { home, db } })).toEqual([
-			{
-				store: "board",
-				signIns: [
-					{ provider: "anthropic", kind: "oauth", active: true, cause: null },
-				],
-				error: null,
-			},
-			{
-				store: "workers",
-				signIns: [
-					{ provider: "anthropic", kind: "oauth", active: true, cause: null },
-					{ provider: "deepseek", kind: "api_key", active: true, cause: null },
-				],
-				error: null,
-			},
-		]);
-		const missing = join(root, "absent", "agent.db");
-		const list = storeSignIns({ boardDir, worker: { home, db: missing } });
-		expect(list.map((s) => s.store)).toEqual(["board", "workers"]);
-		expect(list[1]).toEqual({
-			store: "workers",
-			signIns: null,
-			error: `cannot read omp's sign-ins: ${missing} does not exist`,
-		});
-		expect(
-			storeSignIns({ boardDir, worker: null }).map((s) => s.store),
-		).toEqual(["board"]);
-	});
-
-	test("adoptSignIn with a missing or empty scratch store throws and leaves the worker store unchanged", () => {
-		const root = mkdtempSync(join(dir, "stores-"));
-		const db = join(root, "worker-home", ".omp", "agent", "agent.db");
-		workerStore(db);
-		const before = rows(db);
-		expect(() => adoptSignIn(join(root, "absent", "agent.db"), db)).toThrow(
-			"omp stored no credential",
-		);
-		const empty = join(root, "scratch", "agent.db");
-		credStore(empty, [["anthropic", "oauth", { refresh: "x" }, "acct-1"]]);
-		const d = new Database(empty);
-		d.exec("UPDATE auth_credentials SET disabled_cause = 'deleted by user'");
-		d.close();
-		expect(() => adoptSignIn(empty, db)).toThrow("omp stored no credential");
-		expect(rows(db)).toEqual(before);
+describe("code-flow paste path (the phone path)", () => {
+	test("pasting the full CALLBACK address completes the sign-in with no localhost listener", async () => {
+		const l = logins();
+		await l.start("anthropic", BOARD);
+		const v = await l.answer(CALLBACK);
+		expect(v?.ok).toBe(true);
+		expect(v?.output).toContain("Logged in to anthropic");
 	});
 });
 

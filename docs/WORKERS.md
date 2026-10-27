@@ -212,22 +212,27 @@ A listed name with no value does not stop the turn; the card log names it.
   fallback; `runner.startRun` stays the reference implementation).
 - Provider keys pass through from the host shell, and so do the keys a project's
   MCP servers read from its committed `.omp/mcp.json` (the file adds its servers
-  only to that project's turns). OAuth credentials come from
-  the host omp oauth dir, mounted read-only into every container via
-  `OTTR_OAUTH_DIR` (required; for example `C:/Users/<you>/.omp/oauth`). omp's provider credentials live in `agent.db`
-  (`auth_credentials`). The server and the workers share one such file, bind-mounted
-  at `/root/.omp/agent/agent.db` via `OTTR_AGENT_DB`: seed it once with a consistent
-  copy of the host's (`VACUUM INTO`, never the hot file), so nothing secret is baked.
-  Then log the stack in by itself, once per OAuth provider it uses: **Settings →
-  Provider sign-in** on the board, or `docker compose exec server omp login <provider>`.
-  The server publishes the sign-in callback ports of Anthropic (54545) and OpenAI
-  Codex (1455) on `127.0.0.1`, so the provider's redirect reaches the board, which
-  finishes the sign-in. Codex's port is fixed: while the stack runs, `omp login
+  only to that project's turns). The host omp oauth dir is mounted read-only
+  into every container via `OTTR_OAUTH_DIR` (required; for example
+  `C:/Users/<you>/.omp/oauth`). Provider sign-in is one sign-in per provider,
+  done once on the board: **Settings → Provider sign-in**, or
+  `docker compose exec server omp login <provider>`. The board store
+  (`agent.db`, bind-mounted via `OTTR_AGENT_DB`) holds the credential; seed it
+  once with a consistent copy of
+  the host's (`VACUUM INTO`, never the hot file). The server publishes
+  Anthropic's sign-in callback port 54545 and OpenAI Codex's port 1455 on
+  `127.0.0.1`, so the provider's redirect reaches the board, which finishes the
+  sign-in. Codex's port is fixed: while the stack runs, `omp login
   openai-codex` on the host cannot bind it.
-  Never copy the host's file over it again. A copied login shares its refresh token
-  with the host, and a provider that rotates refresh tokens (Anthropic does) accepts
-  only the side that refreshes first: omp disables the other side's login
-  (`invalid_grant`), on the host or in the stack.
+  Before each worker turn, the board puts the provider's short-lived access
+  token into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
+  `ZAI_API_KEY`). The worker store keeps no board-managed credential.
+  A sign-in marks the provider's worker-store rows `replaced by newer
+  credential`, and sign-out clears both stores.
+  Never copy the host's file over the board store again. A copied login shares
+  its refresh token with the host, and a provider that rotates refresh tokens
+  (Anthropic does) accepts only the side that refreshes first: omp disables the
+  other side's login (`invalid_grant`), on the host or in the stack.
 
 ## Scaling
 
@@ -434,26 +439,37 @@ To verify the seed:
 
 #### Credentials
 
-The board and the workers have separate credential stores, and each store has its own
-sign-in. The spec is `docs/specs/provider-credentials.md`.
+Provider sign-in is one sign-in per provider, done on the board. The spec is
+`docs/specs/provider-credentials.md`.
 
-- The board store is `/etc/ottr/home/.omp/agent/agent.db` on the `board-config` volume.
-- The worker store is `/root/.omp/agent/agent.db` in the shared home.
+- The board store is `/etc/ottr/home/.omp/agent/agent.db` on the `board-config`
+  volume. It holds the provider's credential and its refresh token.
+- The worker store is `/root/.omp/agent/agent.db` in the shared home. It keeps
+  no credential that the board manages.
 
-A sign-in under **Settings → Provider sign-in** runs two `omp login` processes, one after
-the other. You authorize the provider two times:
+A sign-in under **Settings → Provider sign-in** runs one `omp login` against
+the board store; you authorize the provider one time. Complete it from any
+device: when the provider's browser page cannot reach the board, paste the
+failed `http://localhost:...` address (or the code) into the Settings field.
+Before each worker turn, the board puts the provider's short-lived access token
+into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
+`ZAI_API_KEY`). It refreshes the token over HTTPS, with omp's lease protocol,
+when it is inside a 30-minute margin.
 
-1. The first login writes the board store.
-2. The second login runs against a new scratch agent dir next to the board agent dir
-   (`/etc/ottr/home/.omp/.ottr-login-*`, mode 0700). Then the board writes the new
-   credential row into the worker store, and removes the scratch dir.
-
-Each login gets its own refresh token, so a refresh in one store does not make the other
-store's token invalid. No credential row moves between the two stores. The board never runs
-omp with the shared home as its agent dir or its `HOME`, because a turn can plant config,
-extensions and `!command` keys there. Settings shows the state of each store for each
-provider. Sign-out marks the provider's rows in both stores with omp's "deleted by user"
-cause. The entry script does not copy the shared `agent.db` into the board store.
+- A sign-in marks the provider's worker-store rows `replaced by newer
+  credential`. Worker turns then resolve the lent env token. Rows of other
+  accounts stay.
+- Sign-out marks the provider's rows `deleted by user` in the board store and
+  in the worker store. That removes legacy rows in one step.
+- A failed refresh lends nothing for that turn; the row keeps its old tokens
+  and the next turn retries. A provider after `invalid_grant` needs a new
+  sign-in.
+- The board never runs omp with the shared home as its agent dir or its
+  `HOME`, because a turn can plant config, extensions and `!command` keys
+  there. The board never reads a credential value from the worker store and
+  never resolves or runs a key a worker could plant (R5-1, unchanged). The
+  only worker-store write is the cause string above.
+- The entry script does not copy the shared `agent.db` into the board store.
 
 #### Residuals
 

@@ -3468,10 +3468,10 @@ describe("GET /api/provider-login", () => {
 		const b: unknown = await res.json();
 		expect(typeof b === "object" && b !== null && "providers" in b).toBe(true);
 		if (typeof b !== "object" || b === null || !("providers" in b)) return;
-		// The machine's stores decide the sign-ins; the route only pins that the board's store leads.
-		expect("stores" in b && Array.isArray(b.stores)).toBe(true);
-		if (!("stores" in b) || !Array.isArray(b.stores)) return;
-		expect(b.stores[0]).toMatchObject({ store: "board" });
+		// The board's store decides the sign-ins; the route only pins the shape.
+		expect("signIns" in b && Array.isArray(b.signIns)).toBe(true);
+		if (!("signIns" in b) || !Array.isArray(b.signIns)) return;
+		expect("pending" in b).toBe(true);
 		const providers = b.providers;
 		// The machine's omp install decides the ids; the route only pins the shape.
 		expect(Array.isArray(providers)).toBe(true);

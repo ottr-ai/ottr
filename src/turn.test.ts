@@ -5145,7 +5145,7 @@ describe("prepareTurn", () => {
 	test("a turn logs one env line naming listed-but-valueless names", async () => {
 		const { store, loop } = setup({
 			maxTotalRuns: () => 0,
-			turnEnv: () => ({ env: {}, missing: ["FOO", "BAR"] }),
+			turnEnv: async () => ({ env: {}, missing: ["FOO", "BAR"] }),
 		});
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -5157,7 +5157,7 @@ describe("prepareTurn", () => {
 	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
-			turnEnv: () => ({ env: { FOO: "v" }, missing: [] }),
+			turnEnv: async () => ({ env: { FOO: "v" }, missing: [] }),
 			prepareTurn: async () => ({ lines: [], pathDir: "/tmp/x" }),
 		});
 		const task = store.createTask("work please");
@@ -5172,7 +5172,7 @@ describe("prepareTurn", () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			turnEnv: () => ({ env: { FOO: "v" }, missing: ["BAR"] }),
+			turnEnv: async () => ({ env: { FOO: "v" }, missing: ["BAR"] }),
 			prepareTurn: async () => {
 				prepared = true;
 				return { lines: [], pathDir: null };
@@ -5185,6 +5185,20 @@ describe("prepareTurn", () => {
 			"env: no value for BAR (set it under Settings, Env)",
 		);
 		expect(record.runs[0]!.env?.FOO).toBe("v");
+	});
+
+	test("a turn passes its model to turnEnv", async () => {
+		let seen: string | null | undefined;
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			turnEnv: async (_project, model) => {
+				seen = model;
+				return { env: {}, missing: [] };
+			},
+		});
+		const task = store.createTask("work please", "zai/glm-5.3-flash");
+		await loop.runTurn(store.name, task.id);
+		expect(seen).toBe("zai/glm-5.3-flash");
 	});
 
 	test("a worker-dispatched turn never calls prepareTurn", async () => {
