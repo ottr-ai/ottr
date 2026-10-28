@@ -62,7 +62,7 @@ import {
 	pickRunnable,
 	selectFindings,
 } from "./scheduler.ts";
-import { sessionFile, sessionHoldsPrompt } from "./session.ts";
+import { sessionFile, sessionHoldsPrompt, sessionModel } from "./session.ts";
 import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
 import type {
 	ArchReview,
@@ -266,14 +266,18 @@ export interface TurnOps {
 	startRun: typeof startRun;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
-	/** The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every turn, worker dispatched or not. `lines` go to the card log (e.g. why no sign-in token was lent). */
+	/**
+	 * The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every
+	 * turn, worker dispatched or not. `model` is the worker turn's execution model (null for a
+	 * local run): its provider's sign-in token is lent. A `credentialError` stops the turn.
+	 */
 	turnEnv?: (
 		project: string,
 		model: string | null,
 	) => Promise<{
 		env: Record<string, string>;
 		missing: string[];
-		lines?: string[];
+		credentialError?: string | null;
 	}>;
 	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
 	prepareTurn?: (project: string) => Promise<{
@@ -1231,20 +1235,39 @@ export function createTurnLoop(
 			const prep =
 				!worker && ops.prepareTurn ? await ops.prepareTurn(name) : null;
 			for (const l of prep?.lines ?? []) log(l);
+			// One rule for worker turns: the board lends a token for the model omp runs, and omp runs
+			// that model through an explicit --model, also on a resume. The execution model is the
+			// card's model; else, on a resume, the saved session's model; else the board's default
+			// role. A local run (merge, retro, board check) uses the board store itself: no lending,
+			// and the card's model as before.
+			const execModel =
+				worker === null
+					? null
+					: live.model?.trim() ||
+						(plan.resumeId !== null
+							? sessionModel(store.sessionsDir, plan.resumeId)
+							: null) ||
+						(ops.modelRoles ?? modelRoles)().default?.trim() ||
+						null;
+			// Parks the card with the cause instead of starting omp; a cancel that landed in the
+			// prepare awaits already owns the card (same rule as the preRun check below).
+			const stopBeforeRun = (reason: string): void => {
+				log(`! ${reason}`);
+				const cur = store.getTask(id);
+				if (!cur || cur.cancelledAt !== null || cur.state !== "preparing")
+					return;
+				store.updateTask(id, { state: "needs_you", needsReason: reason });
+			};
+			if (worker !== null && execModel === null) {
+				stopBeforeRun(
+					"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
+				);
+				return;
+			}
 			// The env values ride the run env into a worker too (the runner forwards them with
 			// the rest of the child env), so every turn gets them and every card log names a
-			// listed name that has no value. The sign-in token follows the turn's effective model:
-			// the card's model, else the default role of the board's config.yml, which omp runs
-			// when no --model is passed (no turn here selects another role).
-			const effectiveModel =
-				live.model?.trim() ||
-				(ops.modelRoles ?? modelRoles)().default?.trim() ||
-				null;
-			if (effectiveModel === null)
-				log(
-					"sign-in: this turn has no model (the card sets none, and the board's config.yml has no default role), so the board lends it no sign-in token; omp uses whatever credential the run finds",
-				);
-			const turnEnv = (await ops.turnEnv?.(name, effectiveModel)) ?? {
+			// listed name that has no value.
+			const turnEnv = (await ops.turnEnv?.(name, execModel)) ?? {
 				env: {},
 				missing: [],
 			};
@@ -1252,7 +1275,12 @@ export function createTurnLoop(
 				log(
 					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
 				);
-			for (const line of turnEnv.lines ?? []) log(line);
+			if (turnEnv.credentialError) {
+				stopBeforeRun(
+					`Sign-in: ${turnEnv.credentialError}. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.`,
+				);
+				return;
+			}
 
 			// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
 			// a merge turn) already owns the card: its kept path wrote the final state. Starting the
@@ -1273,9 +1301,14 @@ export function createTurnLoop(
 				worker === null &&
 				plan.resumeId !== null &&
 				store.listTurns(id).at(-1)?.error?.startsWith(MODEL_RESTORE) === true;
-			const runModel = restoreFailed
-				? ((ops.modelRoles ?? modelRoles)().default ?? null)
-				: live.model;
+			// The model that runs (and that the turn row records): a worker turn's execution model,
+			// else the restore fallback or the card's model of a local run.
+			const runModel =
+				worker !== null
+					? execModel
+					: restoreFailed
+						? ((ops.modelRoles ?? modelRoles)().default ?? null)
+						: live.model;
 			if (restoreFailed)
 				log(
 					runModel === null

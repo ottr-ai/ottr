@@ -197,19 +197,43 @@ every row marked "no".
 needs a sign-in in the worker store itself. The board leaves that store row
 alone, because it does not lend these providers.
 
-At the start of every turn, the board finds the turn's **effective model**:
-the card's model, else the `default` role of the board's `config.yml`
-(`modelRoles` in `src/models.ts`). omp runs that role when no `--model` is
-passed, and no turn kind that lends selects another role. A missing or empty
-card model therefore never skips the lending. When neither exists, the card
-log says so in one line ("sign-in: this turn has no model ..."), and the turn
-runs with whatever credential omp finds.
+### The rule: lend for the model that omp runs
 
-Then `ops.turnEnv` in `src/server.ts` runs with the effective model, for its
+The board lends a token for one model, and omp runs exactly that model. For
+each worker turn, the board resolves one **execution model**, in this order:
+
+1. the card's model (trimmed; empty counts as none);
+2. else, on a resume, the model of the saved session (the `model` of its last
+   `model_change` record, `sessionModel` in `src/session.ts`);
+3. else the `default` role of the board's `config.yml` (`modelRoles` in
+   `src/models.ts`).
+
+The board passes that model to omp as an explicit `--model` on every worker
+turn, also on a resume. So the worker's own `config.yml` cannot pick another
+model, and a resume runs the resolved model even after the card's model
+changed. The board lends the token for that model's provider only.
+
+A local run (merge, release, retro, board check) runs on the board with the
+board store itself. It lends nothing and keeps the card's model, as before.
+
+The turn does not start, and the card goes to `needs_you` with the cause in
+`needsReason` and in the card log, when:
+
+- no execution model resolves (no card model, no session model, no `default`
+  role);
+- the board holds the provider's OAuth sign-in but cannot lend a usable token
+  (omp did not refresh it; see step 5 below).
+
+A provider that the board does not lend, or that has no OAuth sign-in on the
+board, starts as before: the worker uses its own credential (its store row or
+the provider's key under Settings, Env). The board cannot see the worker
+store (R5-1), so it cannot check that credential.
+
+Then `ops.turnEnv` in `src/server.ts` runs with the execution model, for its
 provider (`provider` is the part before the first `/` in the model string):
 
 1. Find the provider's current credential in the board store (see "Login
-   moment"). None, or an `api_key` row: lend nothing.
+   moment"). None, or an `api_key` row: lend nothing, no error.
 2. Parse `data` (`{access, refresh, expires, ...}`, `expires` in ms since
    epoch; zai stores a far-future sentinel = never expires).
 3. When `expires - now` is above the margin (constant `TOKEN_REFRESH_MARGIN_MS`,
@@ -218,12 +242,9 @@ provider (`provider` is the part before the first `/` in the model string):
    again. When the new `expires - now` is above the margin, lend the new
    `access`.
 5. omp does not refresh (non-zero exit, time-out, or the row is still below
-   the margin): lend nothing. The turn starts without a lent token, and the
-   card log shows one line with the cause (omp's own error text). The board
-   never fakes a token. The next turn tries again.
-
-Merge, release and retro turns run on the board against the board store and
-need no lending; they get the env too, which is harmless.
+   the margin): lend nothing and return the cause as `error`
+   (`credentialError` of `turnEnv`). The turn does not start. The board never
+   fakes a token. A reply retries after a new sign-in.
 
 ### Refresh: omp refreshes, Ottr does not
 
@@ -309,8 +330,10 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   a new sign-in.
 - The turn's model names a provider without an active board-store row: no env;
   the turn's own resolution applies (worker store row or omp's auth error).
-- No effective model (no card model, no `default` role): no env, and the card
-  log names the cause.
+- No execution model (no card model, no session model, no `default` role):
+  the worker turn does not start; `needs_you` with the cause.
+- The board holds the provider's OAuth sign-in, and omp does not refresh it:
+  the worker turn does not start; `needs_you` with omp's cause.
 
 ## Security boundary (R5-1 unchanged)
 
@@ -342,9 +365,14 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   turn env lends the old OAuth token.
 - A test, with omp's real table layout: a same-account OAuth login that omp
   updates in place (same id) still supersedes the worker rows.
-- A test: a worker turn with no card model (and with an empty one) gets the
-  board credential of the `default` role's provider.
-- A test: a turn with no card model and no `default` role logs the cause.
+- A test: board and worker default roles differ: a worker turn with no card
+  model (and with an empty one) runs the board's `default` role as an
+  explicit `--model`, with that provider's board token.
+- A test: a resume after the card's model changed: a cleared card model runs
+  the saved session's model; a switched card model runs the new model. Each
+  gets its own provider's token.
+- A test: no execution model, or a credential the board cannot lend, stops
+  the worker turn with the cause on the card.
 - A test: the code-flow sign-in path completes by pasting the redirect address
   (no localhost listener involved) — the phone path.
 - `bun run check` and `bun test` pass.
@@ -361,11 +389,10 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
 
 ## Ceilings
 
-- The effective model comes from the board's `config.yml`. A worker runs omp
-  with the worker's own `config.yml`. When the two `default` roles name
-  different providers, the worker gets a token for the board's provider. Both
-  files come from the same data repo (Alate), so they match unless someone
-  edits one by hand. The board never reads the worker's file (R5-1).
+- The session model comes from the last `model_change` record of the saved
+  session. A worker turn always passes `--model`, so a resume also writes one.
+  An older session that omp saved without such a record (none seen in omp
+  18.12.3) falls back to the board's `default` role.
 - A turn that runs longer than the remaining token life fails with an auth
   error part-way through (anthropic tokens live hours; codex days). The board
   does nothing mid-turn. The next turn refreshes first and resumes the work.

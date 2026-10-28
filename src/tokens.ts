@@ -76,10 +76,15 @@ async function ompRefresh(
 	}
 }
 
-/** What a turn gets: the lent env, and a line for the card log when nothing could be lent. */
+/**
+ * What a turn gets: the lent env, and `error` when the board holds the provider's OAuth sign-in
+ * but cannot lend a usable token (omp did not refresh it). A turn with an error must not start.
+ * A provider the board does not lend, or holds no OAuth sign-in for, gets neither: the worker
+ * uses its own credential.
+ */
 export interface Lent {
 	env: Record<string, string>;
-	note: string | null;
+	error: string | null;
 }
 
 /** The lent env for the model's provider; `env` is empty when nothing can be lent this turn. */
@@ -99,7 +104,7 @@ export async function lentProviderEnv(
 			? LENT_ENV[provider]
 			: undefined;
 	if (provider === undefined || name === undefined)
-		return { env: {}, note: null };
+		return { env: {}, error: null };
 	const now = opts.now ?? Date.now();
 	const marginMs = opts.marginMs ?? TOKEN_REFRESH_MARGIN_MS;
 	const dbPath = opts.dbPath ?? join(agentDir(), "agent.db");
@@ -108,8 +113,8 @@ export async function lentProviderEnv(
 
 	const before = readToken(dbPath, provider);
 	// No board sign-in: the turn resolves its own credential, as without lending.
-	if (before === null) return { env: {}, note: null };
-	if (fresh(before)) return { env: { [name]: before.access }, note: null };
+	if (before === null) return { env: {}, error: null };
+	if (fresh(before)) return { env: { [name]: before.access }, error: null };
 
 	const cause = await ompRefresh(
 		provider,
@@ -117,9 +122,9 @@ export async function lentProviderEnv(
 		opts.command ?? ["omp", "token"],
 	);
 	const after = readToken(dbPath, provider);
-	if (fresh(after)) return { env: { [name]: after.access }, note: null };
+	if (fresh(after)) return { env: { [name]: after.access }, error: null };
 	return {
 		env: {},
-		note: `sign-in: omp did not refresh the ${provider} token, so this turn gets no lent token: ${cause ?? "the token is still near its expiry after omp ran"}`,
+		error: `omp did not refresh the board's ${provider} sign-in: ${cause ?? "the token is still near its expiry after omp ran"}`,
 	};
 }

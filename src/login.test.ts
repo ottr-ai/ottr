@@ -471,7 +471,7 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 			},
 		]);
 		expect(await lentProviderEnv("zai/glm-5.3", { dbPath: t.boardDb })).toEqual(
-			{ env: {}, note: null },
+			{ env: {}, error: null },
 		);
 	}, 30_000);
 

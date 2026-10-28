@@ -149,8 +149,9 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		board: { url: "http://127.0.0.1:4747", token: "boot-token" },
 		maxTotalRuns: () => 10,
 		drained: () => false,
-		// No role map unless a test sets one: the real modelRoles reads this machine's config.yml.
-		modelRoles: () => ({}),
+		// A neutral default role (no provider lends it) unless a test sets one: the real
+		// modelRoles reads this machine's config.yml, and a worker turn needs a model to run.
+		modelRoles: () => ({ default: "fake/default-model" }),
 		// The work-card check defaults off here: only the work-check tests switch it on, so a
 		// ready work turn settles to merging/queued exactly as before OTTR-28.
 		workCheck: () => false,
@@ -5158,16 +5159,25 @@ describe("prepareTurn", () => {
 		);
 	});
 
-	test("a turn logs the turnEnv lines, e.g. why no sign-in token was lent", async () => {
-		const note =
-			"sign-in: omp did not refresh the anthropic token, so this turn gets no lent token: invalid_grant";
-		const { store, loop } = setup({
+	test("a worker turn whose credential cannot be lent does not start, and the card shows the cause", async () => {
+		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
-			turnEnv: async () => ({ env: {}, missing: [], lines: [note] }),
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async () => ({
+				env: {},
+				missing: [],
+				credentialError:
+					"omp did not refresh the board's anthropic sign-in: invalid_grant",
+			}),
 		});
-		const task = store.createTask("work please");
+		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain(note);
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Sign-in: omp did not refresh the board's anthropic sign-in: invalid_grant. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
+		);
 	});
 
 	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
@@ -5203,22 +5213,8 @@ describe("prepareTurn", () => {
 		expect(record.runs[0]!.env?.FOO).toBe("v");
 	});
 
-	test("a turn passes its model to turnEnv", async () => {
-		let seen: string | null | undefined;
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
-			turnEnv: async (_project, model) => {
-				seen = model;
-				return { env: {}, missing: [] };
-			},
-		});
-		const task = store.createTask("work please", "zai/glm-5.3-flash");
-		await loop.runTurn(store.name, task.id);
-		expect(seen).toBe("zai/glm-5.3-flash");
-	});
-
-	test("a worker turn with no card model gets the board credential of the default role's provider", async () => {
-		// A board store in omp's layout with one fresh Anthropic sign-in.
+	/** A board store in omp's layout with one fresh OAuth sign-in per provider. */
+	function boardStore(tokens: Record<string, string>): string {
 		const dbPath = join(
 			mkdtempSync(join(tmpdir(), "ottr-turn-lend-")),
 			"agent.db",
@@ -5229,57 +5225,138 @@ describe("prepareTurn", () => {
 			disabled_cause TEXT DEFAULT NULL, identity_key TEXT DEFAULT NULL,
 			created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
 			updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)))`);
-		db.query(
-			"INSERT INTO auth_credentials (provider, credential_type, data, identity_key) VALUES ('anthropic', 'oauth', ?, 'acct-1')",
-		).run(
-			JSON.stringify({
-				access: "access-board",
-				refresh: "refresh-board",
-				expires: Date.now() + 8 * 3_600_000,
-				authorizedAt: Date.now() - 60_000,
-			}),
+		const add = db.query(
+			"INSERT INTO auth_credentials (provider, credential_type, data, identity_key) VALUES (?, 'oauth', ?, 'acct-1')",
 		);
+		for (const [provider, access] of Object.entries(tokens))
+			add.run(
+				provider,
+				JSON.stringify({
+					access,
+					refresh: `refresh-${provider}`,
+					expires: Date.now() + 8 * 3_600_000,
+					authorizedAt: Date.now() - 60_000,
+				}),
+			);
 		db.close();
-		const { store, record, loop } = setup({
+		return dbPath;
+	}
+
+	/** A worker loop whose turnEnv is the server's wiring against `dbPath`. */
+	function lendingSetup(dbPath: string, overrides: Partial<TurnOps> = {}) {
+		return setup({
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:high" }),
-			// The server's wiring, against this board store.
 			turnEnv: async (_project, model) => {
 				const lent = await lentProviderEnv(model, { dbPath });
-				return {
-					env: lent.env,
-					missing: [],
-					lines: lent.note === null ? [] : [lent.note],
-				};
+				return { env: lent.env, missing: [], credentialError: lent.error };
+			},
+			...overrides,
+		});
+	}
+
+	test("a worker turn runs the card's model as --model and lends its token; a local turn lends none", async () => {
+		const seen: Array<string | null> = [];
+		const worker = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async (_project, model) => {
+				seen.push(model);
+				return { env: {}, missing: [] };
 			},
 		});
-		// No card model, and an empty one: both fall back to the default role.
+		const w = worker.store.createTask("work please", "zai/glm-5.3-flash");
+		await worker.loop.runTurn(worker.store.name, w.id);
+		expect(worker.record.runs[0]!.model).toBe("zai/glm-5.3-flash");
+		const local = setup({
+			maxTotalRuns: () => 0,
+			turnEnv: async (_project, model) => {
+				seen.push(model);
+				return { env: {}, missing: [] };
+			},
+		});
+		const l = local.store.createTask("work please", "zai/glm-5.3-flash");
+		await local.loop.runTurn(local.store.name, l.id);
+		// A local run uses the board store itself: no model to lend for.
+		expect(seen).toEqual(["zai/glm-5.3-flash", null]);
+		expect(local.record.runs[0]!.model).toBe("zai/glm-5.3-flash");
+	});
+
+	test("board and worker default roles differ: the turn runs the board's default role explicitly, with its token", async () => {
+		// The worker's own config.yml may name another default; an explicit --model makes omp run
+		// the board's default, the model the token is lent for.
+		const dbPath = boardStore({
+			anthropic: "access-board",
+			zai: "zai-board",
+		});
+		const { store, record, loop } = lendingSetup(dbPath, {
+			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:high" }),
+		});
+		// No card model, and an empty one: both resolve to the board's default role.
 		const none = store.createTask("work please");
 		await loop.runTurn(store.name, none.id);
 		const empty = store.createTask("work please", "  ");
 		await loop.runTurn(store.name, empty.id);
-		expect(record.runs.map((r) => r.env?.ANTHROPIC_OAUTH_TOKEN)).toEqual([
-			"access-board",
-			"access-board",
+		expect(record.runs.map((r) => [r.model, r.env])).toEqual([
+			[
+				"anthropic/claude-opus-5-5:high",
+				{ ANTHROPIC_OAUTH_TOKEN: "access-board" },
+			],
+			[
+				"anthropic/claude-opus-5-5:high",
+				{ ANTHROPIC_OAUTH_TOKEN: "access-board" },
+			],
 		]);
 	});
 
-	test("a turn with no card model and no default role logs why nothing is lent", async () => {
-		let seen: string | null | undefined;
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+	test("a resume after the card's model changed runs and lends the resolved model", async () => {
+		const dbPath = boardStore({
+			anthropic: "access-board",
+			zai: "zai-board",
+		});
+		const { store, record, loop } = lendingSetup(dbPath, {
+			modelRoles: () => ({ default: "anthropic/claude-opus-5-5" }),
+		});
+		/** A card whose saved session ran zai, with a pending reply. */
+		const resumable = (sid: string) => {
+			const task = store.createTask("work please", "zai/glm-5.3-flash");
+			mkdirSync(store.sessionsDir, { recursive: true });
+			writeFileSync(
+				join(store.sessionsDir, `1_${sid}.jsonl`),
+				`${JSON.stringify({ type: "model_change", model: "zai/glm-5.3-flash" })}\n`,
+			);
+			store.updateTask(task.id, { sessionId: sid, pendingPrompt: "go on" });
+			return task;
+		};
+		// The card's model is cleared: the session's model wins over the default role.
+		const cleared = resumable("s-cleared");
+		store.updateTask(cleared.id, { model: null });
+		await loop.runTurn(store.name, cleared.id);
+		// The card switched to another model: the card wins, and omp switches with --model.
+		const switched = resumable("s-switched");
+		store.updateTask(switched.id, { model: "anthropic/claude-opus-5-5" });
+		await loop.runTurn(store.name, switched.id);
+		expect(record.runs.map((r) => [r.resumeId, r.model, r.env])).toEqual([
+			["s-cleared", "zai/glm-5.3-flash", { ZAI_API_KEY: "zai-board" }],
+			[
+				"s-switched",
+				"anthropic/claude-opus-5-5",
+				{ ANTHROPIC_OAUTH_TOKEN: "access-board" },
+			],
+		]);
+	});
+
+	test("a worker turn with no model anywhere does not start, and the card shows the cause", async () => {
+		const { store, record, loop } = lendingSetup(boardStore({}), {
 			modelRoles: () => ({ smol: "zai/glm-5.3-flash" }),
-			turnEnv: async (_project, model) => {
-				seen = model;
-				return { env: {}, missing: [] };
-			},
 		});
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(seen).toBeNull();
-		expect(logText(store, task.id)).toContain(
-			"sign-in: this turn has no model (the card sets none, and the board's config.yml has no default role), so the board lends it no sign-in token",
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
 		);
 	});
 

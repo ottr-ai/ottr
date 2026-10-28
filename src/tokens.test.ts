@@ -117,7 +117,7 @@ describe("lentProviderEnv", () => {
 		});
 		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
 			env: { ANTHROPIC_OAUTH_TOKEN: "access-1" },
-			note: null,
+			error: null,
 		});
 		expect(runs(path)).toEqual([]);
 	});
@@ -132,7 +132,7 @@ describe("lentProviderEnv", () => {
 		omp(path, "ok");
 		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
 			env: { ANTHROPIC_OAUTH_TOKEN: "access-new" },
-			note: null,
+			error: null,
 		});
 		// One omp run, against the board agent dir and the board's own omp home.
 		expect(runs(path)).toEqual([
@@ -154,7 +154,7 @@ describe("lentProviderEnv", () => {
 		omp(path, "ok");
 		expect(await lend("openai-codex/gpt-6", path)).toEqual({
 			env: { OPENAI_CODEX_OAUTH_TOKEN: "access-new" },
-			note: null,
+			error: null,
 		});
 		expect(runs(path).map((r) => r.args)).toEqual([
 			["openai-codex", "--force-refresh"],
@@ -172,8 +172,8 @@ describe("lentProviderEnv", () => {
 		omp(path, "fail");
 		const lent = await lend("anthropic/claude-opus-5-5", path);
 		expect(lent.env).toEqual({});
-		expect(lent.note).toBe(
-			"sign-in: omp did not refresh the anthropic token, so this turn gets no lent token: Error: token refresh failed: 400 invalid_grant",
+		expect(lent.error).toBe(
+			"omp did not refresh the board's anthropic sign-in: Error: token refresh failed: 400 invalid_grant",
 		);
 		expect(rowData(path, id)).toEqual(before);
 	});
@@ -188,7 +188,7 @@ describe("lentProviderEnv", () => {
 		omp(path, "stdout-only");
 		const lent = await lend("anthropic/claude-opus-5-5", path);
 		expect(lent.env).toEqual({});
-		expect(lent.note).toContain("still near its expiry after omp ran");
+		expect(lent.error).toContain("still near its expiry after omp ran");
 	});
 
 	test("a refresh that leaves too little life is not lent", async () => {
@@ -215,7 +215,7 @@ describe("lentProviderEnv", () => {
 			command: [join(dir, "no-such-omp")],
 		});
 		expect(lent.env).toEqual({});
-		expect(lent.note).toContain("cannot run omp token");
+		expect(lent.error).toContain("cannot run omp token");
 	});
 
 	test("an API key signed in after the OAuth row is the current credential: nothing is lent", async () => {
@@ -235,7 +235,7 @@ describe("lentProviderEnv", () => {
 			NOW / 1000,
 		);
 		db.close();
-		expect(await lend("zai/glm-5.3", path)).toEqual({ env: {}, note: null });
+		expect(await lend("zai/glm-5.3", path)).toEqual({ env: {}, error: null });
 		expect(runs(path)).toEqual([]);
 	});
 
@@ -244,14 +244,14 @@ describe("lentProviderEnv", () => {
 		addRow(path, "zai", { access: "access-1", expires: 8640000000000000 });
 		expect(await lend("zai/glm-5.3-flash:max", path)).toEqual({
 			env: { ZAI_API_KEY: "access-1" },
-			note: null,
+			error: null,
 		});
 		expect(runs(path)).toEqual([]);
 	});
 
 	test("an unknown provider, a missing store, or no board sign-in lends nothing, quietly", async () => {
 		const path = store();
-		const none = { env: {}, note: null };
+		const none = { env: {}, error: null };
 		expect(await lend("foo/bar", path)).toEqual(none);
 		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual(none);
 		const missing = join(dir, "absent", "agent.db");

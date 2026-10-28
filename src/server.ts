@@ -397,7 +397,7 @@ const loop = createTurnLoop(projects, {
 		return {
 			env: { ...base.env, ...lent.env },
 			missing: base.missing,
-			lines: lent.note === null ? [] : [lent.note],
+			credentialError: lent.error,
 		};
 	},
 	prepareTurn: async (project) => ({

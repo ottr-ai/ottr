@@ -30,6 +30,37 @@ export function sessionFile(
 }
 
 /**
+ * The model the saved session runs: the `model` of its last `model_change` record (omp writes
+ * one at the start and on each switch, as `provider/id`). Null when the session file is missing,
+ * unreadable, or names no model.
+ */
+export function sessionModel(
+	dir: string,
+	sessionId: string | null,
+): string | null {
+	const file = sessionFile(dir, sessionId);
+	if (file === null) return null;
+	let text: string;
+	try {
+		text = readFileSync(file, "utf8");
+	} catch {
+		return null; // unreadable file -> no model
+	}
+	let model: string | null = null;
+	for (const line of text.split("\n")) {
+		if (!line.startsWith('{"type":"model_change"')) continue;
+		try {
+			const rec: unknown = JSON.parse(line);
+			if (typeof rec !== "object" || rec === null || !("model" in rec))
+				continue;
+			if (typeof rec.model === "string" && rec.model.trim() !== "")
+				model = rec.model.trim();
+		} catch {}
+	}
+	return model;
+}
+
+/**
  * A session message's user text: the content string, or the text parts of a content
  * array. omp writes both shapes; other shapes carry no matchable text.
  */

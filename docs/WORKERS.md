@@ -451,10 +451,12 @@ A sign-in under **Settings → Provider sign-in** runs one `omp login` against
 the board store; you authorize the provider one time. Complete it from any
 device: when the provider's browser page cannot reach the board, paste the
 failed `http://localhost:...` address (or the code) into the Settings field.
-Before each worker turn, the board puts the provider's short-lived access token
-into the turn env. The provider comes from the turn's model: the card's model,
-else the `default` role of the board's `config.yml`. With neither, the card log
-says that nothing is lent. The env names are `ANTHROPIC_OAUTH_TOKEN`,
+Before each worker turn, the board resolves one model: the card's model, else
+(on a resume) the saved session's model, else the `default` role of the
+board's `config.yml`. It passes that model to omp as `--model`, and it puts the
+short-lived access token of that model's provider into the turn env. When no
+model resolves, or the board cannot lend its sign-in, the turn does not start,
+and the card shows the cause. The env names are `ANTHROPIC_OAUTH_TOKEN`,
 `OPENAI_CODEX_OAUTH_TOKEN` and `ZAI_API_KEY`. When the token has less than 30
 minutes left, the board runs
 `omp token <provider> --force-refresh` against the board agent dir first: omp
