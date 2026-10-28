@@ -6,7 +6,7 @@ import {
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { mkdirBelow, writeBelow } from "./confine.ts";
+import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { LOST_SESSION } from "./prompts.ts";
@@ -34,9 +34,6 @@ import {
 export type { WorkerTarget };
 
 const LOG_CAP_BYTES = 2 * 1024 * 1024;
-/** Last line of a log that hit LOG_CAP_BYTES: the run goes on, but its log stops growing. */
-export const LOG_TRUNCATED =
-	"\n[log truncated at 2 MiB; the full transcript is in the omp session]\n";
 export const APPROVAL_REFUSAL =
 	"requires approval but no interactive UI available";
 
@@ -847,11 +844,21 @@ export function createRunSink(o: {
 	}
 	let truncated = false;
 	const appendLog = (s: string): void => {
-		if (truncated) return;
+		// Past the cap the bytes are dropped, but the mtime still moves: the board reads it as
+		// the run's last output (SILENT_LOG_MS in app.ts), so a busy capped run never looks hung.
+		if (truncated) {
+			touchBelow(o.dataRoot, o.logPath);
+			return;
+		}
 		const size = Buffer.byteLength(s, "utf8");
 		if (bytes + size > LOG_CAP_BYTES) {
 			truncated = true;
-			writeBelow(o.dataRoot, o.logPath, LOG_TRUNCATED, "append");
+			writeBelow(
+				o.dataRoot,
+				o.logPath,
+				"\n[log truncated at 2 MiB; the full transcript is in the omp session]\n",
+				"append",
+			);
 			o.onLog?.();
 			return;
 		}

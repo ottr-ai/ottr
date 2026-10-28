@@ -3,6 +3,7 @@ import {
 	constants,
 	existsSync,
 	fstatSync,
+	futimesSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -229,6 +230,20 @@ export function writeBelow(
 		const fd = openEntry(d.at(basename(file)), file, mode);
 		try {
 			writeFileSync(fd, data);
+		} finally {
+			closeSync(fd);
+		}
+	});
+}
+
+/** Sets `file`'s times below `anchor` to now without changing its bytes; same symlink refusal
+ * as writeBelow. A zero-byte append would not move the mtime. */
+export function touchBelow(anchor: string, file: string): void {
+	withDir(anchor, dirname(file), { create: true }, (d) => {
+		const fd = openEntry(d.at(basename(file)), file, "append");
+		try {
+			const now = new Date();
+			futimesSync(fd, now, now);
 		} finally {
 			closeSync(fd);
 		}

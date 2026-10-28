@@ -118,7 +118,6 @@ import {
 	originRefusal,
 	upgradeRefusal,
 } from "./requestGuards.ts";
-import { LOG_TRUNCATED } from "./runner.ts";
 import {
 	isRetro,
 	lastReviewBase,
@@ -230,31 +229,14 @@ const DRAIN_MS = 30 * 60_000;
 export const SILENT_LOG_MS = 2 * 60 * 60_000;
 
 /** Last write of a preparing or running card's log once it has been silent past SILENT_LOG_MS;
- * null for other states, a fresher log, no log yet, or a log that ends at the runner's 2 MiB cap
- * (the run may still be busy). Floored so the 1 s state diff stays still.
- * ponytail: a capped log never warns, even on a real hang; stamp capped writes if that matters. */
+ * null for other states, a fresher log, or no log yet. A log past the runner's 2 MiB cap keeps
+ * its mtime current while output arrives (createRunSink), so the same rule covers it.
+ * Floored so the 1 s state diff stays still. */
 function silentSince(t: Task, logPath: string, now: number): number | null {
 	if (t.state !== "running" && t.state !== "preparing") return null;
 	const at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
 	if (at === undefined || now - at <= SILENT_LOG_MS) return null;
-	return endsWithTruncation(logPath) ? null : Math.floor(at);
-}
-
-function endsWithTruncation(logPath: string): boolean {
-	const fd = openSync(logPath, "r");
-	try {
-		const tail = Buffer.alloc(Buffer.byteLength(LOG_TRUNCATED));
-		const n = readSync(
-			fd,
-			tail,
-			0,
-			tail.length,
-			Math.max(0, fstatSync(fd).size - tail.length),
-		);
-		return tail.toString("utf8", 0, n) === LOG_TRUNCATED;
-	} finally {
-		closeSync(fd);
-	}
+	return Math.floor(at);
 }
 
 /** The New tab's folder-name rule (unchanged from before git hosts), shared with the clone

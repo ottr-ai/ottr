@@ -40,7 +40,7 @@ import {
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
-import { LOG_TRUNCATED } from "./runner.ts";
+import { createRunSink } from "./runner.ts";
 import { ProjectStore } from "./store.ts";
 import {
 	cancelKeptReason,
@@ -4036,22 +4036,18 @@ describe("silent live turns", () => {
 	test("a live card whose log stays silent past the limit warns until the log grows", async () => {
 		const now = Date.now();
 		/** Card log last written at `at`; whole seconds so the stored mtime reads back exactly. */
-		const logAt = (id: string, ago: number, text: string): number => {
+		const logAt = (id: string, ago: number): number => {
 			const at = Math.floor((now - ago) / 1000) * 1000;
 			const file = store.logPath(id);
 			mkdirSync(dirname(file), { recursive: true });
-			writeFileSync(file, text, { flag: "a" });
+			writeFileSync(file, "== work turn\n", { flag: "a" });
 			utimesSync(file, new Date(at), new Date(at));
 			return at;
 		};
-		const card = (
-			state: Task["state"],
-			ago: number,
-			text = "== work turn\n",
-		) => {
+		const card = (state: Task["state"], ago: number) => {
 			const t = store.createTask(`a ${state} card`);
 			store.updateTask(t.id, { stage: "in_progress", state });
-			return { id: t.id, at: logAt(t.id, ago, text) };
+			return { id: t.id, at: logAt(t.id, ago) };
 		};
 		const silentOf = async (): Promise<Map<string, number | undefined>> => {
 			const body = (await (await get("/api/state")).json()) as {
@@ -4065,19 +4061,12 @@ describe("silent live turns", () => {
 			const prep = card("preparing", SILENT_LOG_MS + 60_000);
 			const fresh = card("running", SILENT_LOG_MS - 60_000);
 			const parked = card("needs_you", SILENT_LOG_MS + 60_000);
-			// A log at the runner's 2 MiB cap stops growing while the run goes on.
-			const capped = card(
-				"running",
-				SILENT_LOG_MS + 60_000,
-				`== work turn${LOG_TRUNCATED}`,
-			);
 			const first = await silentOf();
 			expect(first.get(hung.id)).toBe(hung.at);
 			expect(first.get(prep.id)).toBe(prep.at);
 			expect(first.get(fresh.id)).toBeUndefined();
 			// Only a live turn can hang; a parked card's quiet log is normal.
 			expect(first.get(parked.id)).toBeUndefined();
-			expect(first.get(capped.id)).toBeUndefined();
 			// New output (a real write stamps the file now) clears the warning.
 			appendFileSync(store.logPath(hung.id), "tool output\n");
 			const after = await silentOf();
@@ -4086,6 +4075,41 @@ describe("silent live turns", () => {
 		} finally {
 			setSystemTime();
 		}
+	});
+
+	/** A running card whose real run sink wrote past the 2 MiB cap, its log then aged past the limit. */
+	const cappedCard = () => {
+		const t = store.createTask("a capped running card");
+		store.updateTask(t.id, { stage: "in_progress", state: "running" });
+		const logPath = store.logPath(t.id);
+		const sink = createRunSink({ logPath, dataRoot: store.dataRoot });
+		sink.logMark("x".repeat(2 * 1024 * 1024 + 1));
+		sink.flush();
+		expect(readFileSync(logPath, "utf8")).toContain("[log truncated at 2 MiB");
+		const at = Math.floor((Date.now() - SILENT_LOG_MS - 60_000) / 1000) * 1000;
+		utimesSync(logPath, new Date(at), new Date(at));
+		return { id: t.id, at, sink };
+	};
+	const silentSinceOf = async (id: string): Promise<number | undefined> => {
+		const body = (await (await get("/api/state")).json()) as {
+			tasks: Array<{ id: string; silentSince?: number }>;
+		};
+		return body.tasks.find((t) => t.id === id)?.silentSince;
+	};
+
+	test("a capped log that stays silent past the limit still warns", async () => {
+		const c = cappedCard();
+		expect(await silentSinceOf(c.id)).toBe(c.at);
+	});
+
+	test("output after the cap clears the warning, though the log keeps no new bytes", async () => {
+		const c = cappedCard();
+		expect(await silentSinceOf(c.id)).toBe(c.at);
+		const size = statSync(store.logPath(c.id)).size;
+		c.sink.logMark("tool output\n");
+		c.sink.flush();
+		expect(statSync(store.logPath(c.id)).size).toBe(size);
+		expect(await silentSinceOf(c.id)).toBeUndefined();
 	});
 });
 
