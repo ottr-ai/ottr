@@ -3,9 +3,11 @@
 # 20 random characters; these fixtures are lowercase words with an all-zero
 # suffix, so this pattern cannot match a real token. The WebSocket upgrade test
 # sends the published RFC 6455 sample key ("the sample nonce" in base64).
+# Commit 45d34b8 (src/tokens.ts) held omp's public Anthropic OAuth client id.
+# A public OAuth client id is no secret: omp ships it in its own source.
 [extend]
 useDefault = true
 
 [allowlist]
-description = "fake token fixtures and the RFC 6455 sample key in tests"
-regexes = ['''\bglpat-[a-z-]+-0{3,}\b''', '''dGhlIHNhbXBsZSBub25jZQ==''']
+description = "fake token fixtures, the RFC 6455 sample key, and a public OAuth client id"
+regexes = ['''\bglpat-[a-z-]+-0{3,}\b''', '''dGhlIHNhbXBsZSBub25jZQ==''', '''9d1c250a-e61b-44d9-88ed-594fedd48592''']
