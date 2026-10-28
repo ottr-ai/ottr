@@ -1,254 +1,142 @@
 // Lends a model provider's access token from the board store into a turn's env. Only the board
 // store holds a credential; workers get the short-lived access token through the env, never the
-// refresh token (docs/specs/provider-credentials.md, "Token lending").
+// refresh token. Ottr has no OAuth refresh code: when the token runs low, omp refreshes it
+// (docs/specs/provider-credentials.md, "Token lending").
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { agentDir } from "./login.ts";
+import { dirname, join } from "node:path";
+import { stripANSI } from "bun";
+import { agentDir, boardOmpEnv } from "./login.ts";
 
 export const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
+const REFRESH_TIMEOUT_MS = 60_000;
 
-const ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-594fedd48592";
-const OPENAI_CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-
-interface ProviderSpec {
-	env: string;
-	/** The refresh endpoint, absent when the provider's tokens never expire. */
-	refresh?: string;
-	/** Seconds subtracted from the refreshed expiry, so we refresh before omp does. */
-	skew?: number;
-}
-
-const PROVIDERS: Record<string, ProviderSpec> = {
-	anthropic: {
-		env: "ANTHROPIC_OAUTH_TOKEN",
-		refresh: "https://api.anthropic.com/v1/oauth/token",
-		skew: 300_000,
-	},
-	"openai-codex": {
-		env: "OPENAI_CODEX_OAUTH_TOKEN",
-		refresh: "https://auth.openai.com/oauth/token",
-	},
-	zai: { env: "ZAI_API_KEY" },
+/** The env name omp reads each provider's access token from (pi-catalog provider rules). */
+const ENV_NAME: Record<string, string> = {
+	anthropic: "ANTHROPIC_OAUTH_TOKEN",
+	"openai-codex": "OPENAI_CODEX_OAUTH_TOKEN",
+	// The zai OAuth token never expires; the provider's bearer slot takes it.
+	zai: "ZAI_API_KEY",
 };
 
-interface Credential {
-	access?: unknown;
-	refresh?: unknown;
-	expires?: unknown;
-}
-
-interface RefreshResponse {
-	access_token?: unknown;
-	refresh_token?: unknown;
-	expires_in?: unknown;
-}
-
-interface RefreshedToken {
-	access: string;
-	refresh?: string;
-	expiresIn: number;
-}
-
-async function postRefresh(
-	spec: ProviderSpec,
-	refreshToken: string,
-	fetchImpl: typeof fetch,
-): Promise<RefreshedToken | null> {
-	const anthropic = spec.refresh === "https://api.anthropic.com/v1/oauth/token";
-	const res = await fetchImpl(
-		spec.refresh!,
-		anthropic
-			? {
-					method: "POST",
-					headers: {
-						"content-type": "application/json",
-						"anthropic-beta": "oauth-2025-04-20",
-						"user-agent": "anthropic-sdk-typescript/2.30.0 userOAuthProvider",
-					},
-					body: JSON.stringify({
-						grant_type: "refresh_token",
-						client_id: ANTHROPIC_OAUTH_CLIENT_ID,
-						refresh_token: refreshToken,
-					}),
-				}
-			: {
-					method: "POST",
-					headers: { "content-type": "application/x-www-form-urlencoded" },
-					body: new URLSearchParams({
-						grant_type: "refresh_token",
-						refresh_token: refreshToken,
-						client_id: OPENAI_CODEX_OAUTH_CLIENT_ID,
-					}),
-				},
-	);
-	if (!res.ok) return null;
-	const body: RefreshResponse = await res.json();
-	if (
-		typeof body.access_token !== "string" ||
-		typeof body.expires_in !== "number"
-	)
-		return null;
-	return {
-		access: body.access_token,
-		refresh:
-			typeof body.refresh_token === "string" ? body.refresh_token : undefined,
-		expiresIn: body.expires_in,
-	};
-}
-
 const ACTIVE_ROW =
-	"SELECT id, data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id DESC LIMIT 1";
+	"SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id DESC LIMIT 1";
 
-function freshEnough(cred: Credential, now: number, marginMs: number): boolean {
-	return (
-		typeof cred.expires !== "number" ||
-		!Number.isFinite(cred.expires) ||
-		cred.expires - now > marginMs
-	);
+interface Token {
+	access: string;
+	expires: number;
 }
 
-/** The env for the model's provider, or `{}` when nothing can be lent this turn. */
+/** The provider's newest active OAuth token in the store; null when there is none or it is junk. */
+function readToken(dbPath: string, provider: string): Token | null {
+	// A readonly open of a missing path fails with a message that names no file (login.ts).
+	if (!existsSync(dbPath)) return null;
+	try {
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			const row = db.query(ACTIVE_ROW).get(provider) as {
+				data: string;
+			} | null;
+			if (!row) return null;
+			const cred: unknown = JSON.parse(row.data);
+			// omp writes an object; junk from a damaged store must degrade, not throw.
+			if (cred === null || typeof cred !== "object") return null;
+			const { access, expires } = cred as {
+				access?: unknown;
+				expires?: unknown;
+			};
+			if (typeof access !== "string") return null;
+			return {
+				access,
+				// No finite expiry (zai's sentinel included) counts as never expiring.
+				expires:
+					typeof expires === "number" && Number.isFinite(expires)
+						? expires
+						: Number.POSITIVE_INFINITY,
+			};
+		} finally {
+			db.close();
+		}
+	} catch {
+		return null; // Not an omp store, or a JSON parse error.
+	}
+}
+
+/**
+ * Makes omp re-mint the provider's token in the board store: `omp token <provider>
+ * --force-refresh` is one call to the provider's token endpoint and no model request. omp runs
+ * against the board agent dir only (R5-1). stdout holds the token and is ignored: the caller reads
+ * the store. Returns null on exit 0, else the cause.
+ */
+async function ompRefresh(
+	provider: string,
+	dir: string,
+	command: string[],
+): Promise<string | null> {
+	try {
+		const child = Bun.spawn([...command, provider, "--force-refresh"], {
+			env: { ...boardOmpEnv(), PI_CODING_AGENT_DIR: dir },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			timeout: REFRESH_TIMEOUT_MS,
+			windowsHide: true,
+		});
+		const [code, err] = await Promise.all([
+			child.exited,
+			new Response(child.stderr).text(),
+		]);
+		if (code === 0) return null;
+		const last = stripANSI(err).trim().split("\n").at(-1)?.trim();
+		return child.signalCode !== null
+			? `omp token did not finish in ${REFRESH_TIMEOUT_MS / 1000} s`
+			: (last || `omp token exited with code ${code}`).slice(0, 300);
+	} catch (err) {
+		return `cannot run omp token: ${err instanceof Error ? err.message : String(err)}`;
+	}
+}
+
+/** What a turn gets: the lent env, and a line for the card log when nothing could be lent. */
+export interface Lent {
+	env: Record<string, string>;
+	note: string | null;
+}
+
+/** The lent env for the model's provider; `env` is empty when nothing can be lent this turn. */
 export async function lentProviderEnv(
 	model: string | null | undefined,
 	opts: {
 		dbPath?: string;
 		now?: number;
-		fetchImpl?: typeof fetch;
 		marginMs?: number;
+		/** Only for tests: the command that gets `<provider> --force-refresh` appended. */
+		command?: string[];
 	} = {},
-): Promise<Record<string, string>> {
+): Promise<Lent> {
 	const provider = model?.split("/", 1)[0];
-	if (provider === undefined) return {};
-	const spec = PROVIDERS[provider];
-	if (!spec) return {};
+	const name = provider === undefined ? undefined : ENV_NAME[provider];
+	if (provider === undefined || name === undefined)
+		return { env: {}, note: null };
 	const now = opts.now ?? Date.now();
 	const marginMs = opts.marginMs ?? TOKEN_REFRESH_MARGIN_MS;
-	const fetchImpl = opts.fetchImpl ?? fetch;
 	const dbPath = opts.dbPath ?? join(agentDir(), "agent.db");
-	if (!existsSync(dbPath)) return {};
+	const fresh = (t: Token | null): t is Token =>
+		t !== null && t.expires - now > marginMs;
 
-	let db: Database;
-	try {
-		// A readonly open of a missing path fails with a message that names no file (login.ts).
-		db = new Database(dbPath, { readonly: true });
-	} catch {
-		return {};
-	}
-	try {
-		let row: { id: number; data: string } | null;
-		try {
-			row =
-				(db.query(ACTIVE_ROW).get(provider) as {
-					id: number;
-					data: string;
-				} | null) ?? null;
-		} catch {
-			return {}; // No auth_credentials table: the store is not an omp one.
-		}
-		if (!row) return {};
-		let cred: Credential;
-		try {
-			cred = JSON.parse(row.data);
-		} catch {
-			return {};
-		}
-		// omp writes an object; junk from a damaged store must degrade, not throw.
-		if (cred === null || typeof cred !== "object") return {};
-		if (typeof cred.access !== "string") return {};
-		if (freshEnough(cred, now, marginMs)) return { [spec.env]: cred.access };
-		if (!spec.refresh || typeof cred.refresh !== "string") return {};
+	const before = readToken(dbPath, provider);
+	// No board sign-in: the turn resolves its own credential, as without lending.
+	if (before === null) return { env: {}, note: null };
+	if (fresh(before)) return { env: { [name]: before.access }, note: null };
 
-		// ponytail: the lease is best-effort — a missing table means no other refresher to
-		// coordinate with, so refresh without it.
-		const wdb = new Database(dbPath);
-		try {
-			const hasLeases = wdb
-				.query(
-					"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'auth_credential_refresh_leases'",
-				)
-				.get();
-			// Our owner string while we hold the lease; null when we hold none.
-			let held: string | null = null;
-			if (hasLeases) {
-				// omp's rule: take over an expired lease, never a live one.
-				const owner = `ottr-board:${process.pid}`;
-				const taken = wdb
-					.query(
-						"INSERT INTO auth_credential_refresh_leases (credential_id, owner, expires_at_ms, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(credential_id) DO UPDATE SET owner = excluded.owner, expires_at_ms = excluded.expires_at_ms, updated_at = excluded.updated_at WHERE auth_credential_refresh_leases.expires_at_ms <= ?",
-					)
-					.run(row.id, owner, now + marginMs, Math.floor(now / 1000), now);
-				if (Number(taken.changes) === 0) {
-					// Someone else is refreshing: lend the row only when it is fresh already.
-					const again = wdb
-						.query("SELECT data FROM auth_credentials WHERE id = ?")
-						.get(row.id);
-					if (
-						again &&
-						typeof again === "object" &&
-						"data" in again &&
-						typeof again.data === "string"
-					) {
-						const newer = JSON.parse(again.data) as Credential;
-						if (
-							freshEnough(newer, now, marginMs) &&
-							typeof newer.access === "string"
-						)
-							return { [spec.env]: newer.access };
-					}
-					return {};
-				}
-				held = owner;
-			}
-			try {
-				let got: RefreshedToken | null;
-				try {
-					got = await postRefresh(spec, cred.refresh, fetchImpl);
-				} catch {
-					got = null;
-				}
-				// A failed refresh lends nothing; the row stays untouched and the
-				// finally below releases the lease, so the next turn can retry.
-				if (!got) return {};
-				// Still ours? A lease that changed hands while the request ran means
-				// the new owner is refreshing now: leave the row to it.
-				if (
-					held !== null &&
-					!wdb
-						.query(
-							"SELECT 1 FROM auth_credential_refresh_leases WHERE credential_id = ? AND owner = ? AND expires_at_ms > ?",
-						)
-						.get(row.id, held, now)
-				)
-					return {};
-				wdb
-					.query(
-						"UPDATE auth_credentials SET data = ?, updated_at = ? WHERE id = ?",
-					)
-					.run(
-						JSON.stringify({
-							...cred,
-							access: got.access,
-							refresh: got.refresh ?? cred.refresh,
-							expires: now + got.expiresIn * 1000 - (spec.skew ?? 0),
-						}),
-						Math.floor(now / 1000),
-						row.id,
-					);
-				return { [spec.env]: got.access };
-			} finally {
-				// omp's release: only our own lease, in every outcome.
-				if (held !== null)
-					wdb
-						.query(
-							"DELETE FROM auth_credential_refresh_leases WHERE credential_id = ? AND owner = ?",
-						)
-						.run(row.id, held);
-			}
-		} finally {
-			wdb.close();
-		}
-	} finally {
-		db.close();
-	}
+	const cause = await ompRefresh(
+		provider,
+		dirname(dbPath),
+		opts.command ?? ["omp", "token"],
+	);
+	const after = readToken(dbPath, provider);
+	if (fresh(after)) return { env: { [name]: after.access }, note: null };
+	return {
+		env: {},
+		note: `sign-in: omp did not refresh the ${provider} token, so this turn gets no lent token: ${cause ?? "the token is still near its expiry after omp ran"}`,
+	};
 }

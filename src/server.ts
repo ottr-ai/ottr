@@ -394,7 +394,11 @@ const loop = createTurnLoop(projects, {
 	turnEnv: async (project, model) => {
 		const base = turnEnvValues(project, shared.envValues);
 		const lent = await lentProviderEnv(model);
-		return { env: { ...base.env, ...lent }, missing: base.missing };
+		return {
+			env: { ...base.env, ...lent.env },
+			missing: base.missing,
+			lines: lent.note === null ? [] : [lent.note],
+		};
 	},
 	prepareTurn: async (project) => ({
 		lines: await ensureProjectTools(project),

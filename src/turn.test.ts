@@ -5154,6 +5154,18 @@ describe("prepareTurn", () => {
 		);
 	});
 
+	test("a turn logs the turnEnv lines, e.g. why no sign-in token was lent", async () => {
+		const note =
+			"sign-in: omp did not refresh the anthropic token, so this turn gets no lent token: invalid_grant";
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			turnEnv: async () => ({ env: {}, missing: [], lines: [note] }),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(logText(store, task.id)).toContain(note);
+	});
+
 	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,

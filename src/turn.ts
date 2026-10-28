@@ -266,13 +266,14 @@ export interface TurnOps {
 	startRun: typeof startRun;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
-	/** The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every turn, worker dispatched or not. */
+	/** The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every turn, worker dispatched or not. `lines` go to the card log (e.g. why no sign-in token was lent). */
 	turnEnv?: (
 		project: string,
 		model: string | null,
 	) => Promise<{
 		env: Record<string, string>;
 		missing: string[];
+		lines?: string[];
 	}>;
 	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
 	prepareTurn?: (project: string) => Promise<{
@@ -1241,6 +1242,7 @@ export function createTurnLoop(
 				log(
 					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
 				);
+			for (const line of turnEnv.lines ?? []) log(line);
 
 			// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
 			// a merge turn) already owns the card: its kept path wrote the final state. Starting the

@@ -77,41 +77,44 @@ first `/` in the model string):
    epoch; zai stores a far-future sentinel = never expires).
 3. When `expires - now` is above the margin (constant `TOKEN_REFRESH_MARGIN_MS`,
    30 minutes), lend `access` under the provider's env name.
-4. Below the margin or expired: refresh first (see below), then lend the new
+4. Below the margin or expired: let omp refresh (see below), then read the row
+   again. When the new `expires - now` is above the margin, lend the new
    `access`.
-5. Refresh failure: lend nothing. The turn starts without the token; the turn
-   log shows omp's auth error. The row stays untouched. The next turn retries.
+5. omp does not refresh (non-zero exit, time-out, or the row is still below
+   the margin): lend nothing. The turn starts without a lent token, and the
+   card log shows one line with the cause (omp's own error text). The board
+   never fakes a token. The next turn tries again.
 
 Merge, release and retro turns run on the board against the board store and
 need no lending; they get the env too, which is harmless.
 
-### Refresh request
+### Refresh: omp refreshes, Ottr does not
 
-The board refreshes itself over HTTPS and writes the new tokens back into the
-board store row (same JSON shape, `updated_at` set). No omp process runs. The
-requests follow omp's own rules verbatim:
+Ottr has no OAuth refresh code: no request to a provider token endpoint, no
+client id, no write to `auth_credentials` or to the lease table. omp owns the
+refresh.
 
-- anthropic: `POST https://api.anthropic.com/v1/oauth/token`, JSON body
-  `{grant_type: "refresh_token", client_id: "9d1c250a-e61b-44d9-88ed-594fedd48592", refresh_token}`,
-  headers `anthropic-beta: oauth-2025-04-20`,
-  `User-Agent: anthropic-sdk-typescript/<version> userOAuthProvider` (constant),
-  `Content-Type: application/json`. Response: `access_token`, optional
-  `refresh_token` (keep the old one when absent), `expires_in` seconds, minus a
-  5-minute skew.
-- openai-codex: `POST https://auth.openai.com/oauth/token`, form body
-  `grant_type=refresh_token&refresh_token=...&client_id=app_EMoamEEZ73f0CkXaXp7hrann`.
-  Response: same fields, no skew.
-- zai: never refreshed (tokens do not expire).
+The board runs `omp token <provider> --force-refresh` with:
 
-### Refresh lease
+- `PI_CODING_AGENT_DIR` = the board agent dir (the directory of the board
+  store), never a worker-writable directory (R5-1);
+- `HOME` = `boardOmpHome()` (`boardOmpEnv`), as for every omp the board runs;
+- stdout ignored (the command prints the token; the board does not take it
+  from there), stderr kept for the cause;
+- a time-out of 60 seconds.
 
-omp coordinates refreshes between processes with the
-`auth_credential_refresh_leases` table (owner, `expires_at_ms`; takeover only
-when the current lease expired). The board's refresher takes the same lease
-(insert-or-takeover with `expires_at_ms <= now`), releases it after the write.
-A lease held by someone else: re-read the row; if it is now fresh enough, lend
-it; else lend nothing this turn. This prevents two concurrent refreshes from
-rotating the refresh token twice.
+Why this command: it costs no model request. omp makes one call to the
+provider's token endpoint and writes the new tokens into the board store with
+its own lease and refresh-token rotation. `--force-refresh` is necessary
+because omp itself refreshes only 60 seconds before the expiry
+(`OAUTH_REFRESH_SKEW_MS`), and the board wants more life than that for a turn.
+The other candidates refresh later or cost more: `omp usage` refreshes only
+inside the 60-second window and can answer from its cache; a print-mode turn
+(`omp -p`) costs a model request.
+
+The board reads the token only from the store row after the command. The
+command can print an env API key when the refresh fails (omp's key cascade
+falls through to env), so its stdout is not proof of a refresh.
 
 ### Precedence: why sign-in supersedes worker rows
 
@@ -131,19 +134,10 @@ is deleted; rows only ever get a cause.
 ### Provenance (the item-5 hard stop)
 
 The card's gate — "stop and ask the user before you write Ottr's own OAuth
-code or write rows into omp's store" — sits in item 5 and guards the mobile
-sign-in. The shipped sign-in is omp's own flow with the paste fallback: no
-Ottr authorize code, no rows beyond the login omp itself writes.
-
-The refresher is a separate mechanism, and decision 1 mandates it: "Before
-each worker turn, the board refreshes the credential when needed". omp offers
-no command that refreshes a store row, so the only mechanism is the refresh
-grant the provider's own rules define. The client ids are omp's public ids
-verbatim (anthropic.kdl stores its id base64 to quiet secret scanners; the
-codex id is plain in openai-codex-device.kdl). The refresher only renews rows
-omp's own login wrote, in omp's own JSON shape, and coordinates through omp's
-own lease table; it never writes a credential the board did not receive from
-omp's login. The supersede write is a `disabled_cause` string only.
+code or write rows into omp's store" — was asked on 2026-10-28. The user
+chose: no Ottr OAuth code, omp refreshes. The sign-in is omp's own flow with
+the paste fallback. The only board writes to an omp store are the
+`disabled_cause` strings of supersede and sign-out.
 
 ### Logout
 
@@ -167,10 +161,10 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   from OTTR-183).
 - The board store is missing or unreadable: the sign-in fails with omp's error;
   lending lends nothing; `GET` reports what it can read.
-- Refresh request fails (network, `invalid_grant`, 5xx): lend nothing for this
-  turn, log nothing to the store; the row keeps its old tokens. A provider
-  after `invalid_grant` needs a new sign-in (omp marks the row disabled on its
-  own next attempt).
+- omp does not refresh (`invalid_grant`, network, 5xx, time-out, a missing
+  `omp`): lend nothing for this turn. The card log names the cause. omp keeps
+  or disables the row by its own rules. A provider after `invalid_grant` needs
+  a new sign-in.
 - The turn's model names a provider without an active board-store row: no env;
   the turn's own resolution applies (worker store row or omp's auth error).
 
@@ -188,12 +182,11 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
 
 - A test: a worker turn's env carries the board's current access token for the
   model's provider, under omp's env name.
-- A test: a token below the margin gets refreshed before the turn, the board
-  store row holds the new tokens, and the turn env carries the new access.
-- A test: a refresh failure lends nothing, leaves the row unchanged, and
-  releases the lease.
-- A test: a lease that changed hands mid-refresh leaves the row to the new
-  owner and lends nothing.
+- A test: a token below the margin makes the board run
+  `omp token <provider> --force-refresh` against the board agent dir, then the
+  turn env carries the new access from the store.
+- A test: when omp fails, or omp exits 0 but the row is still below the
+  margin, nothing is lent and the cause comes back for the card log.
 - A test: a sign-in writes no credential row into the worker store and marks
   the provider's worker-store rows `replaced by newer credential`.
 - A test: the code-flow sign-in path completes by pasting the redirect address
@@ -217,9 +210,10 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   does nothing mid-turn. The next turn refreshes first and resumes the work.
 - The board refreshes only when it dispatches a turn that needs the provider.
   A token can sit expired between turns; nothing pre-warms it.
-- Two refreshers racing (a board-side omp process and the board's lender) are
-  safe by the lease, but a provider that rotates the refresh token on every
-  refresh and invalidates the older family on a second concurrent grant could
-  still break one side; omp's lease protocol is the mitigation, not a proof.
-- The anthropic `User-Agent` constant pins a claude-code version string; if
-  Anthropic ever validates it, the constant needs a bump.
+- With two or more OAuth accounts of one provider, `--force-refresh`
+  re-mints omp's first candidate. When that is not the board's newest row,
+  the row stays stale and the turn gets no lent token (the card log says so).
+  Upgrade path: `omp token <provider> --account <n>` once the board maps rows
+  to omp's account order.
+- Each refresh starts one omp process (about one second). It runs only when
+  the token has less than 30 minutes left, so at most a few times a day.

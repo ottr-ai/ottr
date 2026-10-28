@@ -384,7 +384,7 @@ omp does not resolve every user path from that variable. It reads plugins from
 other tool dirs) from `$HOME`. The board's `$HOME` is the shared home. So the compose file
 also sets `OTTR_BOARD_OMP_HOME=/etc/ottr/home`, and every omp that the board starts for
 itself gets that directory as its `HOME`: merge, release review and release turns, `omp
-models`, `omp usage`, `omp login`, and the fork-analysis gateway (`src/login.ts`
+models`, `omp usage`, `omp login`, `omp token` (the token refresh), and the fork-analysis gateway (`src/login.ts`
 `boardOmpEnv`). The agent dir above lies in this directory. The entry script creates the
 directory and copies nothing into it, and refuses to start when the variable points into
 the shared home. A worker dispatch removes the variable from the turn env, so a work turn
@@ -453,17 +453,20 @@ device: when the provider's browser page cannot reach the board, paste the
 failed `http://localhost:...` address (or the code) into the Settings field.
 Before each worker turn, the board puts the provider's short-lived access token
 into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
-`ZAI_API_KEY`). It refreshes the token over HTTPS, with omp's lease protocol,
-when it is inside a 30-minute margin.
+`ZAI_API_KEY`). When the token has less than 30 minutes left, the board runs
+`omp token <provider> --force-refresh` against the board agent dir first: omp
+refreshes the token itself, with no model request. Then the board reads the new
+token from the board store. Ottr has no OAuth refresh code of its own.
 
 - A sign-in marks the provider's worker-store rows `replaced by newer
   credential`. Worker turns then resolve the lent env token. Rows of other
   accounts stay.
 - Sign-out marks the provider's rows `deleted by user` in the board store and
   in the worker store. That removes legacy rows in one step.
-- A failed refresh lends nothing for that turn; the row keeps its old tokens
-  and the next turn retries. A provider after `invalid_grant` needs a new
-  sign-in.
+- When omp does not refresh, the board lends nothing for that turn, and the card
+  log names omp's cause. The board never lends a token from the command's
+  output. The next turn tries again. A provider after `invalid_grant` needs a
+  new sign-in.
 - The board never runs omp with the shared home as its agent dir or its
   `HOME`, because a turn can plant config, extensions and `!command` keys
   there. The board never reads a credential value from the worker store and
