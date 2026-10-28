@@ -197,9 +197,16 @@ every row marked "no".
 needs a sign-in in the worker store itself. The board leaves that store row
 alone, because it does not lend these providers.
 
-At the start of every turn (`ops.turnEnv` in `src/server.ts`, called with the
-turn's model), for the model's provider (`provider` is the part before the
-first `/` in the model string):
+At the start of every turn, the board finds the turn's **effective model**:
+the card's model, else the `default` role of the board's `config.yml`
+(`modelRoles` in `src/models.ts`). omp runs that role when no `--model` is
+passed, and no turn kind that lends selects another role. A missing or empty
+card model therefore never skips the lending. When neither exists, the card
+log says so in one line ("sign-in: this turn has no model ..."), and the turn
+runs with whatever credential omp finds.
+
+Then `ops.turnEnv` in `src/server.ts` runs with the effective model, for its
+provider (`provider` is the part before the first `/` in the model string):
 
 1. Find the provider's current credential in the board store (see "Login
    moment"). None, or an `api_key` row: lend nothing.
@@ -302,6 +309,8 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   a new sign-in.
 - The turn's model names a provider without an active board-store row: no env;
   the turn's own resolution applies (worker store row or omp's auth error).
+- No effective model (no card model, no `default` role): no env, and the card
+  log names the cause.
 
 ## Security boundary (R5-1 unchanged)
 
@@ -333,6 +342,9 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   turn env lends the old OAuth token.
 - A test, with omp's real table layout: a same-account OAuth login that omp
   updates in place (same id) still supersedes the worker rows.
+- A test: a worker turn with no card model (and with an empty one) gets the
+  board credential of the `default` role's provider.
+- A test: a turn with no card model and no `default` role logs the cause.
 - A test: the code-flow sign-in path completes by pasting the redirect address
   (no localhost listener involved) — the phone path.
 - `bun run check` and `bun test` pass.
@@ -349,6 +361,11 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
 
 ## Ceilings
 
+- The effective model comes from the board's `config.yml`. A worker runs omp
+  with the worker's own `config.yml`. When the two `default` roles name
+  different providers, the worker gets a token for the board's provider. Both
+  files come from the same data repo (Alate), so they match unless someone
+  edits one by hand. The board never reads the worker's file (R5-1).
 - A turn that runs longer than the remaining token life fails with an auth
   error part-way through (anthropic tokens live hours; codex days). The board
   does nothing mid-turn. The next turn refreshes first and resumes the work.

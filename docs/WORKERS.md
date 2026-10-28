@@ -452,8 +452,11 @@ the board store; you authorize the provider one time. Complete it from any
 device: when the provider's browser page cannot reach the board, paste the
 failed `http://localhost:...` address (or the code) into the Settings field.
 Before each worker turn, the board puts the provider's short-lived access token
-into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
-`ZAI_API_KEY`). When the token has less than 30 minutes left, the board runs
+into the turn env. The provider comes from the turn's model: the card's model,
+else the `default` role of the board's `config.yml`. With neither, the card log
+says that nothing is lent. The env names are `ANTHROPIC_OAUTH_TOKEN`,
+`OPENAI_CODEX_OAUTH_TOKEN` and `ZAI_API_KEY`. When the token has less than 30
+minutes left, the board runs
 `omp token <provider> --force-refresh` against the board agent dir first: omp
 refreshes the token itself, with no model request. Then the board reads the new
 token from the board store. Ottr has no OAuth refresh code of its own.

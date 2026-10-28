@@ -1233,8 +1233,18 @@ export function createTurnLoop(
 			for (const l of prep?.lines ?? []) log(l);
 			// The env values ride the run env into a worker too (the runner forwards them with
 			// the rest of the child env), so every turn gets them and every card log names a
-			// listed name that has no value.
-			const turnEnv = (await ops.turnEnv?.(name, live.model ?? null)) ?? {
+			// listed name that has no value. The sign-in token follows the turn's effective model:
+			// the card's model, else the default role of the board's config.yml, which omp runs
+			// when no --model is passed (no turn here selects another role).
+			const effectiveModel =
+				live.model?.trim() ||
+				(ops.modelRoles ?? modelRoles)().default?.trim() ||
+				null;
+			if (effectiveModel === null)
+				log(
+					"sign-in: this turn has no model (the card sets none, and the board's config.yml has no default role), so the board lends it no sign-in token; omp uses whatever credential the run finds",
+				);
+			const turnEnv = (await ops.turnEnv?.(name, effectiveModel)) ?? {
 				env: {},
 				missing: [],
 			};
