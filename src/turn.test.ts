@@ -5075,6 +5075,55 @@ describe("package list", () => {
 		expect(record.runs).toHaveLength(2);
 	});
 
+	test("a merge turn whose session model cannot load reruns with the board's default role", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0, // each turn runs via a direct runTurn
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:medium" }),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				return {
+					pid: 4242,
+					// omp restores the saved model only without --model.
+					done: Promise.resolve(
+						o.model
+							? runResult({ outcome: { status: "integrated", summary: "ok" } })
+							: runResult({
+									exitCode: 1,
+									sawTerminalEnd: false,
+									finalText: "",
+									stderrTail:
+										"error: Could not restore model zai/glm-5.3-flash.\n",
+								}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		saveSession(store, "sess-1");
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "queued",
+			sessionId: "sess-1",
+			pendingPrompt: "please merge",
+		});
+		await loop.runTurn(store.name, task.id);
+		const mid = store.getTask(task.id)!;
+		expect(mid.state).toBe("queued");
+		expect(mid.pendingPrompt).toBe("please merge"); // the reply never reached the session
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs.map((r) => r.model)).toEqual([
+			null,
+			"anthropic/claude-opus-5-5:medium",
+		]);
+		expect(record.runs[1]!.resumeId).toBe("sess-1");
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.stage).toBe("done");
+		expect(after.model).toBeNull(); // the card keeps the default role
+	});
+
 	test("a failed install stops the turn before omp starts and names apt's error", async () => {
 		const { store, record, loop } = setup({
 			ensurePackages: async () => {

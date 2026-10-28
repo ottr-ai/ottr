@@ -41,6 +41,7 @@ import {
 	classify,
 	deathLine,
 	findHttp400Rejection,
+	MODEL_RESTORE,
 	rejectedReport,
 	resumePlan,
 } from "./runner.ts";
@@ -1246,6 +1247,24 @@ export function createTurnLoop(
 			)
 				return;
 
+			// The previous turn died because omp could not restore the session's saved model (its
+			// provider has no sign-in on the board): an explicit --model skips that restore, so a
+			// board turn on the default role reruns with the board's default role. The card's model stays.
+			const restoreFailed =
+				live.model === null &&
+				worker === null &&
+				plan.resumeId !== null &&
+				store.listTurns(id).at(-1)?.error?.startsWith(MODEL_RESTORE) === true;
+			const runModel = restoreFailed
+				? ((ops.modelRoles ?? modelRoles)().default ?? null)
+				: live.model;
+			if (restoreFailed)
+				log(
+					runModel === null
+						? "! the board has no default model role to replace the session's model"
+						: `- model ${runModel}: the board's default role replaces the session's model`,
+				);
+
 			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
 			const runStartedAt = Date.now();
 			const handle = ops.startRun({
@@ -1256,7 +1275,7 @@ export function createTurnLoop(
 				extensionPath: ops.extensionPath,
 				board: retroCard ? null : { ...ops.board, project: name, taskId: id },
 				resumeId: plan.resumeId,
-				model: live.model,
+				model: runModel,
 				sessionName,
 				worker,
 				// Retro flags: the retro.yml config sits next to the tracker extension, the
@@ -1657,10 +1676,24 @@ export function createTurnLoop(
 					};
 				}
 			}
+			// A run that could not restore its model never delivered this turn's reply: the retry
+			// sends it again, with any steering that landed meanwhile.
+			const restoreRetry =
+				next.state === "queued" &&
+				next.needsReason?.startsWith(MODEL_RESTORE) === true;
+			if (restoreRetry) {
+				const sent = [raw, store.getTask(id)?.pendingPrompt ?? null].filter(
+					(p): p is string => p !== null && p !== ".",
+				);
+				next = {
+					...next,
+					pendingPrompt: sent.join("\n\n") || (raw ?? undefined),
+				};
+			}
 			// Steering queued while the turn ran: deliver it as the next turn instead of settling
 			// (a pendingPrompt at turn end can only have arrived via /steer mid-run).
 			const steered = (store.getTask(id)?.pendingPrompt ?? null) !== null;
-			if (steered)
+			if (steered && !restoreRetry)
 				next = {
 					stage: kind === "work" ? "in_progress" : "merging",
 					state: "queued",
@@ -1875,7 +1908,7 @@ export function createTurnLoop(
 				endedAt: now,
 				exitCode: result.exitCode,
 				// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
-				model: turnModel(result.model, live.model),
+				model: turnModel(result.model, runModel),
 				outcome: result.outcome?.status ?? null,
 				summary: result.outcome?.summary ?? null,
 				details: result.outcome?.details ?? (result.finalText || null),

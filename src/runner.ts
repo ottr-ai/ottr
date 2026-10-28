@@ -295,6 +295,9 @@ const BACKGROUND_WAIT =
 /** Opens the worker-lost reason; classify matches it in the previous turn's error. */
 export const WORKER_LOST = "the worker running this turn died";
 
+/** Opens the model-restore reason; classify and runTurn match it in the previous turn's error. */
+export const MODEL_RESTORE = "This board cannot load the session's model";
+
 /**
  * omp writes one JSON file per rejected HTTP 400 request under its state root:
  * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
@@ -464,6 +467,20 @@ export function classify(o: {
 		}
 		// Prefer stderr, then the provider's structured error, then dispatch context.
 		const last = deathLine(result.stderrTail) ?? result.providerError;
+		// omp restores a resumed session's saved model unless --model is given; a model whose
+		// provider has no sign-in here kills the run. runTurn retries once with the board's
+		// default role. A failure after that retry needs a human.
+		if (o.previousError?.startsWith(MODEL_RESTORE))
+			return needs(
+				`${MODEL_RESTORE}, and the retry with the board's default model role failed too${last ? `: ${last}` : ""}. Sign in to a provider under Settings, set a default model role, or switch the card's model, then reply.`,
+			);
+		const lost = last && /Could not restore model (\S+)/.exec(last)?.[1];
+		if (lost)
+			return {
+				stage,
+				state: "queued",
+				needsReason: `${MODEL_RESTORE} ${lost} (no sign-in for its provider here) - retrying with the board's default model role. Cancel to stop it instead.`,
+			};
 		const ctx = last
 			? `: ${last}`
 			: result.dispatch

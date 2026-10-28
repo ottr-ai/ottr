@@ -858,6 +858,34 @@ describe("classify", () => {
 		});
 	});
 
+	test("2h. a model restore failure retries once, then names the cause in plain words", () => {
+		const stderrTail = "error: Could not restore model zai/glm-5.3-flash.\n";
+		const retry = run("merge", result({ exitCode: 1, stderrTail }));
+		expect(retry).toEqual({
+			stage: "merging",
+			state: "queued",
+			needsReason:
+				"This board cannot load the session's model zai/glm-5.3-flash (no sign-in for its provider here) - retrying with the board's default model role. Cancel to stop it instead.",
+		});
+		expect(
+			run(
+				"merge",
+				result({
+					exitCode: 1,
+					stderrTail: "error: No API key found for anthropic.\n",
+				}),
+				git(),
+				"origin/main",
+				retry.needsReason,
+			),
+		).toEqual({
+			stage: "merging",
+			state: "needs_you",
+			needsReason:
+				"This board cannot load the session's model, and the retry with the board's default model role failed too: No API key found for anthropic. Sign in to a provider under Settings, set a default model role, or switch the card's model, then reply.",
+		});
+	});
+
 	test("2c. exit 0 without a terminal end (background wait) continues once, then asks", () => {
 		const resumed: Next = {
 			stage: "in_progress",
