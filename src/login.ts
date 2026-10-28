@@ -392,7 +392,10 @@ export function providerLogin({
 		return Response.redirect(page ?? `${l.returnTo}/#settings`, 303);
 	}
 
-	return { start, answer, cancel, pending, callback };
+	/** The latest sign-in's running or last omp child: its exit and signal prove a kill. */
+	const child = (): Subprocess | null => current?.step.child ?? null;
+
+	return { start, answer, cancel, pending, callback, child };
 }
 
 const XDG_DIRS = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"];

@@ -41,7 +41,6 @@ import { appendFileSync, mkdirSync } from "node:fs";
 const provider = process.argv.at(-1);
 const agentDir = process.env.PI_CODING_AGENT_DIR;
 appendFileSync(${JSON.stringify(RUNS)}, JSON.stringify({ agentDir, home: process.env.HOME }) + "\\n");
-await Bun.write(${JSON.stringify(dir)} + "/" + provider + ".pid", String(process.pid));
 if (provider === "unknown") {
 	console.error("Login failed: Unknown OAuth provider 'unknown'.");
 	process.exit(1);
@@ -86,32 +85,6 @@ const logins = (o: { ttlMs?: number; startMs?: number } = {}) => {
 		...o,
 	});
 };
-
-/** The fake's pid; it writes the file as it starts, which can trail a fast `start`. */
-async function pidOf(provider: string): Promise<number | null> {
-	const file = join(dir, `${provider}.pid`);
-	// 12 s: the fake's spawn can stall seconds under concurrent machine load; 5 s flaked.
-	// Null when the file never appears: the only way a started fake writes no pid is a kill
-	// (ttl, cancel, a newer start) that landed while it was still booting.
-	for (let i = 0; i < 240 && !existsSync(file); i++) await Bun.sleep(50);
-	return existsSync(file) ? Number(readFileSync(file, "utf8")) : null;
-}
-
-async function gone(pid: number | null): Promise<boolean> {
-	// Null pid: the fake died before it could write its pid, so it is gone.
-	if (pid === null) return true;
-	// 6 s: must outlast the longest ttl a test arms (the abandoned test kills at 4 s) plus the
-	// kill's own latency under load; returns as soon as the process is gone.
-	for (let i = 0; i < 120; i++) {
-		try {
-			process.kill(pid, 0);
-		} catch {
-			return true;
-		}
-		await Bun.sleep(50);
-	}
-	return false;
-}
 
 const browserTo = (url: string) =>
 	new Request(url, { headers: { host: new URL(url).host } });
@@ -203,8 +176,11 @@ describe("providerLogin", () => {
 	test("a new start kills the pending sign-in and answers go to the new one", async () => {
 		const l = logins();
 		await l.start("first", BOARD);
+		const first = l.child();
 		await l.start("second", BOARD);
-		expect(await gone(await pidOf("first"))).toBe(true);
+		// The awaited exit is the event: no pid file, no poll, and a signal proves a kill.
+		await first?.exited;
+		expect(first?.signalCode).toBe("SIGTERM");
 		const v = await l.answer("good");
 		expect(v?.output).toContain("Logged in to second");
 	}, 30_000);
@@ -212,32 +188,33 @@ describe("providerLogin", () => {
 	test("cancel kills the pending sign-in; later answers find none", async () => {
 		const l = logins();
 		await l.start("cancelled", BOARD);
-		const pid = await pidOf("cancelled");
+		const child = l.child();
 		l.cancel();
-		expect(await gone(pid)).toBe(true);
+		await child?.exited;
+		expect(child?.signalCode).toBe("SIGTERM");
 		expect(await l.answer("good")).toBeNull();
 		expect(l.pending()).toBeNull();
 	}, 30_000);
 
 	test("an abandoned sign-in is killed after its ttl", async () => {
-		// If the fake's boot outruns the ttl (bun boot has been seen past 4 s under load),
-		// the kill lands before the pid exists: pidOf then reports null and gone counts the
-		// fake as dead, while the verdict below still proves the ttl fired.
+		// The child handle exists from the spawn on, so the ttl kill is seen even when it lands
+		// while bun still boots. SIGTERM tells the kill apart from an early crash of the fake.
 		const l = logins({ ttlMs: 4000 });
 		await l.start("abandoned", BOARD);
-		expect(await gone(await pidOf("abandoned"))).toBe(true);
+		const child = l.child();
+		await child?.exited;
+		expect(child?.signalCode).toBe("SIGTERM");
 		const v = await l.answer("");
 		expect(v?.ok).toBe(false);
-	}, 30_000); // The test waits out the ttl plus the kill poll; the 5 s default is tighter than the test itself.
+	}, 30_000); // The test waits out the ttl; the 5 s default is tighter than the test itself.
 
 	test("start stops waiting when omp stays silent", async () => {
 		const l = logins({ startMs: 300 });
 		const t = Date.now();
 		const v = await l.start("silent", BOARD);
-		// The bound is start's ~startMs give-up plus the fake's boot, which alone has been
-		// seen past 4 s under load; 15 s still proves the early return against the 20 s
-		// default startMs and the 60 s the silent fake would run.
-		expect(Date.now() - t).toBeLessThan(15_000);
+		// start's wait begins at the spawn, not at the fake's first output, so this bound
+		// measures only the give-up after startMs, never the fake's boot.
+		expect(Date.now() - t).toBeLessThan(5000);
 		expect(v).toEqual({
 			provider: "silent",
 			store: "board",
@@ -246,10 +223,11 @@ describe("providerLogin", () => {
 			output: "",
 			ok: null,
 		});
-		const pid = await pidOf("silent");
+		const child = l.child();
 		l.cancel();
-		expect(await gone(pid)).toBe(true);
-	}, 45_000); // Boot (unbounded under load) + the give-up + the pid poll + the kill poll.
+		await child?.exited;
+		expect(child?.signalCode).toBe("SIGTERM");
+	}, 30_000);
 });
 
 describe("two stores: one omp login for each", () => {
