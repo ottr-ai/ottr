@@ -30,13 +30,13 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
   "base": "<data repo commit of Alate's snapshot, or null for a path source>",
   "hash": "<sha256 hex of config.yml>",
   "roles": { "default": "zai/glm-5.3-flash:max", "slow": "anthropic/claude-opus-5-5:medium" },
-  "signIns": [{ "store": "board", "active": ["anthropic", "zai"] }, { "store": "workers", "active": null }],
+  "signIns": [{ "store": "board", "active": ["anthropic", "zai"] }],
   "seed": { "needed": true, "commit": "<sha or null>", "roles": { "default": "..." } }
 }
 ```
 
 - `roles` keeps the file order. Only nonempty string values count.
-- `signIns`: one entry for each store that `storeSignIns()` reads (the board, then the workers when they have a separate store). `active` lists the providers with an active sign-in. `active` is null when the store cannot be read.
+- `signIns`: one entry, the board store (`signIns()`): one sign-in serves the board and the workers (docs/specs/provider-credentials.md). `active` lists the providers with an active sign-in. `active` is null when the store cannot be read.
 - `base` comes from `GET /api/state` (no re-import, so the read stays fast). When Alate's snapshot is behind the branch head, the first save gets a conflict and then shows the current values.
 - `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent. `seed.roles` is the board copy's `modelRoles` (`{}` when the board copy is not seeded). Both are null without `seed.needed`.
 
@@ -81,7 +81,7 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - One row for each role: the role name, a model `<select>` with the `/api/models` catalog, and a thinking `<select>` (Default, then each level). A current value that is not in the catalog shows as an extra option "<value> (not in the catalog)".
 - A remove button for each row. An add form with a role name, then the new row takes the first catalog model.
 - **Save** is off while nothing changed or a save runs. A 400 shows each `fields` message at its row (`aria-describedby`, `aria-invalid`). A 409 with `roles` loads the current values and shows the conflict message. Other errors show in an alert.
-- A row warns when its provider (the selector text before `/`) has no active sign-in in a store: "No active sign-in for <provider> on the board" or "on the workers". A store with `active: null` gives no warning.
+- A row warns when its provider (the selector text before `/`) has no active sign-in on the board: "No active sign-in for <provider> on the board". A store with `active: null` gives no warning.
 - After a commit, the section shows each step and its result:
   1. "Committed <short sha> to the data repo."
   2. The provision: running, then success, or the failed scripts and their error. A failure keeps the commit and says so.

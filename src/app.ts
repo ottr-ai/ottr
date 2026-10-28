@@ -3562,12 +3562,22 @@ export function createApp(deps: AppDeps) {
 							base: f.body.base,
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
-							signIns: storeSignIns().map((s) => ({
-								store: s.store,
-								active:
-									s.signIns?.filter((a) => a.active).map((a) => a.provider) ??
-									null,
-							})),
+							// One sign-in, on the board (docs/specs/provider-credentials.md): the
+							// board store is the only store to warn about; null when it cannot be read.
+							signIns: [
+								{
+									store: "board",
+									active: (() => {
+										try {
+											return signIns()
+												.filter((a) => a.active)
+												.map((a) => a.provider);
+										} catch {
+											return null;
+										}
+									})(),
+								},
+							],
 							seed: seedView(),
 						});
 					}),
