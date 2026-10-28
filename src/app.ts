@@ -1012,7 +1012,9 @@ export function createApp(deps: AppDeps) {
 		return { ok: true, body: { content, hash } };
 	}
 	/** Re-imports alate's current data source, so its snapshot sits on the repo head. */
-	async function refreshAlateSnapshot(): Promise<AlateOut<unknown>> {
+	async function refreshAlateSnapshot(): Promise<
+		AlateOut<Record<string, unknown>>
+	> {
 		const h = await alateHealth();
 		if (!h.ok) return h;
 		const kind =
@@ -1028,19 +1030,45 @@ export function createApp(deps: AppDeps) {
 			body: { source: h.body[kind], kind },
 		});
 	}
-	/** Compose seeds the board's omp copy hourly and records the commit next to its home. */
-	function seedView(): { needed: boolean; commit: string | null } {
+	/** config.yml plus `base`, the data repo commit of alate's snapshot (null for a path
+	 *  source). `refresh` re-imports first, so `base` is the branch head. */
+	async function loadConfigYml(
+		refresh: boolean,
+	): Promise<AlateOut<{ content: string; hash: string; base: string | null }>> {
+		const s = refresh
+			? await refreshAlateSnapshot()
+			: await alateApi("/api/state", 10_000);
+		if (!s.ok) return s;
+		const state = (refresh ? s.body.state : s.body) as {
+			source?: { importedSha?: unknown };
+		} | null;
+		const sha = state?.source?.importedSha;
+		const f = await readConfigYml();
+		if (!f.ok) return f;
+		return {
+			ok: true,
+			body: { ...f.body, base: typeof sha === "string" && sha ? sha : null },
+		};
+	}
+	/** Compose seeds the board's omp copy hourly and records the commit next to its home.
+	 *  `roles` is the board copy's modelRoles: the UI compares them with the saved roles. */
+	function seedView(): {
+		needed: boolean;
+		commit: string | null;
+		roles: Record<string, string> | null;
+	} {
 		const needed = !!process.env.OTTR_BOARD_OMP_HOME?.trim();
-		if (!needed) return { needed, commit: null };
+		if (!needed) return { needed, commit: null, roles: null };
+		const roles = modelRoles();
 		try {
 			const commit = readFileSync(
 				join(dirname(boardOmpHome()), "seed-commit"),
 				"utf8",
 			).trim();
-			return { needed, commit: commit || null };
+			return { needed, commit: commit || null, roles };
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			return { needed, commit: null };
+			return { needed, commit: null, roles };
 		}
 	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
@@ -3385,9 +3413,10 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, () =>
 					layout422(async () => {
-						const f = await readConfigYml();
+						const f = await loadConfigYml(false);
 						if (!f.ok) return json({ error: f.error }, f.status);
 						return json({
+							base: f.body.base,
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
 							signIns: storeSignIns().map((s) => ({
@@ -3405,20 +3434,38 @@ export function createApp(deps: AppDeps) {
 					layout422(async () => {
 						const r = await readJson(req);
 						if ("error" in r) return r.error;
-						const { hash, roles } = r.body;
+						const { base, hash, roles } = r.body;
 						if (
+							(typeof base !== "string" && base !== null) ||
 							typeof hash !== "string" ||
 							typeof roles !== "object" ||
 							roles === null ||
 							Array.isArray(roles)
 						)
 							return json(
-								{ error: "body must be { hash: string, roles: object }" },
+								{
+									error:
+										"body must be { base: string | null, hash: string, roles: object }",
+								},
 								400,
 							);
-						const f = await readConfigYml();
+						// Re-import first: `base` must be the branch head, so any commit on main
+						// since the read is a conflict. The check runs before validation, so a
+						// stale form sees the current roles even when they already hold its values.
+						const f = await loadConfigYml(true);
 						if (!f.ok) return json({ error: f.error }, f.status);
 						const current = readRoles(f.body.content);
+						if (f.body.base !== base || f.body.hash !== hash)
+							return json(
+								{
+									error:
+										"the data repo changed since you loaded the roles; check the current roles and save again",
+									base: f.body.base,
+									hash: f.body.hash,
+									roles: current,
+								},
+								409,
+							);
 						const catalog = new Set(
 							(await (deps.models ?? modelList)()).map((m) => m.selector),
 						);
@@ -3428,18 +3475,12 @@ export function createApp(deps: AppDeps) {
 							catalog,
 						);
 						if (bad !== null) return json(bad, 400);
-						if (f.body.hash !== hash)
-							return json(
-								{
-									error:
-										"config.yml changed in the data repo since you loaded it; check the current roles and save again",
-									hash: f.body.hash,
-									roles: current,
-								},
-								409,
-							);
 						const next = roles as Record<string, string>;
 						const content = editModelRoles(f.body.content, next);
+						// ponytail: alate's write checks a file hash, not a parent commit, so a commit
+						// that lands on main between the re-import above and alate's own clone
+						// (seconds) still gets this save on top. Closing that needs a base-commit
+						// check in alate's PUT /api/file.
 						// Never retried: a write that alate refuses goes back to the user.
 						const w = await alateApi("/api/file", 110_000, {
 							method: "PUT",
@@ -3457,13 +3498,12 @@ export function createApp(deps: AppDeps) {
 							)
 								return json({ error: w.error }, w.status);
 							// The data repo moved: show the user its current roles.
-							const ref = await refreshAlateSnapshot();
-							if (!ref.ok) return json({ error: ref.error }, ref.status);
-							const again = await readConfigYml();
+							const again = await loadConfigYml(true);
 							if (!again.ok) return json({ error: again.error }, again.status);
 							return json(
 								{
 									error: w.error,
+									base: again.body.base,
 									hash: again.body.hash,
 									roles: readRoles(again.body.content),
 								},
@@ -3477,6 +3517,7 @@ export function createApp(deps: AppDeps) {
 							);
 						return json({
 							commit: w.body.commit,
+							base: w.body.commit,
 							hash: new Bun.CryptoHasher("sha256")
 								.update(content)
 								.digest("hex"),

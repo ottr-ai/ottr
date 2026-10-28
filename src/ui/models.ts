@@ -68,6 +68,26 @@ export function roleWarnings(
 		);
 }
 
+/** Board seed state after a save, from the board copy's roles: "copy" when the board reads the
+    provisioned copy (no seed), "done" when it holds the saved roles, "wait" while it holds the
+    roles from before the save (or none yet: unseeded), "replaced" when a later change gave it
+    other roles. */
+export function seedStep(
+	seed: { needed: boolean; roles: Record<string, string> | null },
+	before: Record<string, string>,
+	after: Record<string, string>,
+): "copy" | "done" | "wait" | "replaced" {
+	if (!seed.needed) return "copy";
+	const board = seed.roles;
+	const same = (a: Record<string, string>) =>
+		board !== null &&
+		Object.keys(a).length === Object.keys(board).length &&
+		Object.entries(a).every(([r, v]) => board[r] === v);
+	if (same(after)) return "done";
+	const unseeded = board === null || Object.keys(board).length === 0;
+	return unseeded || same(before) ? "wait" : "replaced";
+}
+
 /** Case-insensitive quick search over the selector and the display name. */
 export function modelMatches(m: ModelOption, query: string): boolean {
 	const q = query.trim().toLowerCase();

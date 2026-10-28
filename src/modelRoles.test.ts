@@ -86,6 +86,17 @@ describe("editModelRoles", () => {
 		);
 	});
 
+	test("a file without a final newline keeps it open after its last line goes", () => {
+		const open = "a: 1\nmodelRoles:\n  default: x/y\n  slow: a/b";
+		expect(editModelRoles(open, { default: "x/y" })).toBe(
+			"a: 1\nmodelRoles:\n  default: x/y",
+		);
+		const crlf = "modelRoles:\r\n  default: x/y\r\n  slow: a/b";
+		expect(editModelRoles(crlf, { default: "x/y" })).toBe(
+			"modelRoles:\r\n  default: x/y",
+		);
+	});
+
 	test.each([
 		["a flow map", "modelRoles: {default: x/y}\n"],
 		["a nested key", "modelRoles:\n  default:\n    model: x/y\n"],
@@ -120,6 +131,7 @@ describe("validateRoles", () => {
 		).toEqual({
 			error: "some model roles are not valid",
 			fields: {
+				default: "unknown model gone/model",
 				slow: "unknown model nope/model",
 				smol: "unknown thinking level (use one of off, minimal, low, medium, high, xhigh, max, auto)",
 				"9bad":
@@ -128,21 +140,36 @@ describe("validateRoles", () => {
 		});
 	});
 
-	test("accepts catalog selectors with a level; an unchanged unknown value passes", () => {
+	test("accepts catalog selectors with a level", () => {
 		expect(
 			validateRoles(
-				{ default: "gone/model:max", slow: "anthropic/claude-opus-5-5:medium" },
+				{
+					default: "zai/glm-5.3-flash",
+					slow: "anthropic/claude-opus-5-5:medium",
+				},
 				current,
 				catalog,
 			),
 		).toBeNull();
 	});
 
+	test("an unchanged unknown model or level is refused too", () => {
+		const old = { default: "gone/model:max", smol: "zai/glm-5.3-flash:turbo" };
+		expect(
+			validateRoles({ ...old, slow: "anthropic/claude-opus-5-5" }, old, catalog)
+				?.fields,
+		).toEqual({
+			default: "unknown model gone/model",
+			smol: "unknown thinking level (use one of off, minimal, low, medium, high, xhigh, max, auto)",
+		});
+	});
+
 	test("an empty map and an unchanged map are refused", () => {
 		expect(validateRoles({}, current, catalog)?.error).toBe(
 			"roles must hold at least one role",
 		);
-		expect(validateRoles({ ...current }, current, catalog)?.error).toBe(
+		const ok = { default: "zai/glm-5.3-flash" };
+		expect(validateRoles({ ...ok }, ok, catalog)?.error).toBe(
 			"nothing to save",
 		);
 	});

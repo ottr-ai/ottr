@@ -9,6 +9,7 @@ import {
 	resetCatalogCache,
 	reviewModel,
 	roleWarnings,
+	seedStep,
 	splitLevel,
 } from "./models.ts";
 
@@ -287,4 +288,21 @@ test("roleWarnings names each readable store without an active sign-in for the p
 		roleWarnings("openai/gpt", [{ store: "board", active: null }]),
 	).toEqual([]);
 	expect(roleWarnings("bare-model", signIns)).toEqual([]);
+});
+
+test("seedStep: a later seed that holds the save ends the wait; a replaced save is not stuck", () => {
+	const before = { default: "a/b" };
+	const after = { default: "c/d:max" };
+	const seed = (roles: Record<string, string> | null) => ({
+		needed: true,
+		roles,
+	});
+	expect(seedStep({ needed: false, roles: null }, before, after)).toBe("copy");
+	expect(seedStep(seed({}), before, after)).toBe("wait");
+	expect(seedStep(seed({ ...before }), before, after)).toBe("wait");
+	expect(seedStep(seed({ ...after }), before, after)).toBe("done");
+	expect(seedStep(seed({ default: "e/f" }), before, after)).toBe("replaced");
+	expect(seedStep(seed({ ...after, plan: "e/f" }), before, after)).toBe(
+		"replaced",
+	);
 });

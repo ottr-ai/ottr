@@ -66,6 +66,7 @@ import {
 	reviewModel,
 	roleWarnings,
 	type StoreActive,
+	seedStep,
 	splitLevel,
 	THINKING_LEVELS,
 	useModels,
@@ -9214,10 +9215,17 @@ function ProviderLoginSection() {
 
 /** GET /api/model-roles: omp's modelRoles in the data repo, the sign-ins, and the board seed state. */
 type RolesState = {
+	/** The data repo commit the roles come from; a save sends it back as its base. */
+	base: string | null;
 	hash: string;
 	roles: Record<string, string>;
 	signIns: StoreActive[];
-	seed: { needed: boolean; commit: string | null };
+	/** `roles`: the board copy's roles, which tell whether the seed holds a save. */
+	seed: {
+		needed: boolean;
+		commit: string | null;
+		roles: Record<string, string> | null;
+	};
 };
 /** One script result of POST /api/alate/provision. */
 type ProvisionResult = {
@@ -9250,6 +9258,11 @@ function ModelRolesSection() {
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
+	// The roles before and after the last save: the board seed step compares the board copy with both.
+	const [saved, setSaved] = useState<{
+		before: Record<string, string>;
+		after: Record<string, string>;
+	} | null>(null);
 	const [prov, setProv] = useState<ProvisionStep | null>(null);
 	const save = useBusy();
 	const uid = useId();
@@ -9275,9 +9288,12 @@ function ModelRolesSection() {
 		};
 	}, [load]);
 	const seed = state?.seed ?? null;
-	const seedWaits =
-		commit !== null && seed?.needed === true && seed.commit !== commit;
-	// The hourly deploy seeds the board copy: read the seed state each minute until it has the commit.
+	const step =
+		seed === null || saved === null
+			? null
+			: seedStep(seed, saved.before, saved.after);
+	const seedWaits = commit !== null && step === "wait";
+	// The hourly deploy seeds the board copy: read the seed state each minute until it holds the save.
 	useEffect(() => {
 		if (!seedWaits) return;
 		const t = setInterval(() => {
@@ -9348,12 +9364,14 @@ function ModelRolesSection() {
 			setError(null);
 			setFields({});
 			setCommit(null);
+			setSaved(null);
 			setProv(null);
 			try {
 				const res = await fetch("/api/model-roles", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
+						base: state.base,
 						hash: state.hash,
 						roles: Object.fromEntries(rows),
 					}),
@@ -9367,8 +9385,11 @@ function ModelRolesSection() {
 				};
 				const { commit: sha, hash, roles, seed: next } = body;
 				if (res.ok && sha && hash && roles && next) {
-					setState((old) => old && { ...old, hash, roles, seed: next });
+					setState(
+						(old) => old && { ...old, base: sha, hash, roles, seed: next },
+					);
 					setRows(Object.entries(roles));
+					setSaved({ before: state.roles, after: roles });
 					setCommit(sha);
 					// The commit stands even when the provision fails; the steps list says so.
 					await provision();
@@ -9376,7 +9397,8 @@ function ModelRolesSection() {
 				}
 				if (res.status === 409 && hash && roles) {
 					// The data repo moved: load its current values, so the next save starts from them.
-					setState((old) => old && { ...old, hash, roles });
+					const base = body.base ?? null;
+					setState((old) => old && { ...old, base, hash, roles });
 					setRows(Object.entries(roles));
 					setError(
 						`${body.error ?? "The model roles changed in the data repo."} The rows now show the current values. Make your change again.`,
@@ -9585,15 +9607,28 @@ function ModelRolesSection() {
 							)}
 						</li>
 						<li>
-							{seed === null || !seed.needed ? (
+							{step === null || step === "copy" ? (
 								<>
 									<Mark kind="done" />
 									The board reads the provisioned copy.
 								</>
-							) : seed.commit === commit ? (
+							) : step === "done" ? (
 								<>
 									<Mark kind="done" />
-									The board copy has <code>{shortSha(commit)}</code>.
+									The board copy has the saved roles
+									{seed?.commit ? (
+										<>
+											{" "}
+											(seed <code>{shortSha(seed.commit)}</code>)
+										</>
+									) : null}
+									.
+								</>
+							) : step === "replaced" ? (
+								<>
+									<Mark kind="done" />
+									The board copy has other roles: a later change replaced this
+									save.
 								</>
 							) : (
 								<>

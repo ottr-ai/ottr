@@ -152,10 +152,12 @@ export function editModelRoles(
 		(added.at(-1) as Line).eol = "";
 	}
 	lines.splice(at + 1, 0, ...added);
-	const out = lines
+	const joined = lines
 		.filter((_, i) => !drop.has(i) || i > at)
 		.map((l) => l.body + l.eol)
 		.join("");
+	// A dropped last line leaves its predecessor's line end last: keep the file's open end.
+	const out = text.endsWith("\n") ? joined : joined.replace(/\r?\n$/, "");
 	const { modelRoles: got, ...rest } = parse(out);
 	const { modelRoles: _, ...restBefore } = before;
 	if (!Bun.deepEquals(got, next) || !Bun.deepEquals(rest, restBefore))
@@ -180,7 +182,7 @@ export function validateRoles(
 				"a role name starts with a letter and holds only letters, digits, _ and - (max 64)";
 		else if (typeof v !== "string" || v === "")
 			fields[role] = "the value must be a model selector";
-		else if (current[role] !== v && !catalog.has(v)) {
+		else if (!catalog.has(v)) {
 			const [base, level] = splitLevel(v);
 			const i = v.lastIndexOf(":");
 			if (level !== "" && catalog.has(base)) continue;
