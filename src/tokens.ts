@@ -2,56 +2,44 @@
 // store holds a credential; workers get the short-lived access token through the env, never the
 // refresh token. Ottr has no OAuth refresh code: when the token runs low, omp refreshes it
 // (docs/specs/provider-credentials.md, "Token lending").
-import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
-import { agentDir, boardOmpEnv, LENT_ENV } from "./login.ts";
+import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
 
 export const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
 const REFRESH_TIMEOUT_MS = 60_000;
-
-const ACTIVE_ROW =
-	"SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id DESC LIMIT 1";
 
 interface Token {
 	access: string;
 	expires: number;
 }
 
-/** The provider's newest active OAuth token in the store; null when there is none or it is junk. */
+/**
+ * The access token of the provider's current credential (its newest login), when that is OAuth;
+ * null when it is an API key, missing, or junk. An older OAuth row next to a newer API key is
+ * never lent.
+ */
 function readToken(dbPath: string, provider: string): Token | null {
-	// A readonly open of a missing path fails with a message that names no file (login.ts).
-	if (!existsSync(dbPath)) return null;
+	let cred: unknown;
 	try {
-		const db = new Database(dbPath, { readonly: true });
-		try {
-			const row = db.query(ACTIVE_ROW).get(provider) as {
-				data: string;
-			} | null;
-			if (!row) return null;
-			const cred: unknown = JSON.parse(row.data);
-			// omp writes an object; junk from a damaged store must degrade, not throw.
-			if (cred === null || typeof cred !== "object") return null;
-			const { access, expires } = cred as {
-				access?: unknown;
-				expires?: unknown;
-			};
-			if (typeof access !== "string") return null;
-			return {
-				access,
-				// No finite expiry (zai's sentinel included) counts as never expiring.
-				expires:
-					typeof expires === "number" && Number.isFinite(expires)
-						? expires
-						: Number.POSITIVE_INFINITY,
-			};
-		} finally {
-			db.close();
-		}
+		const row = currentCredential(dbPath, provider);
+		if (row?.credential_type !== "oauth") return null;
+		cred = JSON.parse(row.data);
 	} catch {
 		return null; // Not an omp store, or a JSON parse error.
 	}
+	// omp writes an object; junk from a damaged store must degrade, not throw.
+	if (cred === null || typeof cred !== "object") return null;
+	const { access, expires } = cred as { access?: unknown; expires?: unknown };
+	if (typeof access !== "string") return null;
+	return {
+		access,
+		// No finite expiry (zai's sentinel included) counts as never expiring.
+		expires:
+			typeof expires === "number" && Number.isFinite(expires)
+				? expires
+				: Number.POSITIVE_INFINITY,
+	};
 }
 
 /**

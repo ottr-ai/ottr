@@ -20,12 +20,27 @@ import {
 	signOut,
 	signOutEverywhere,
 } from "./login.ts";
+import { lentProviderEnv } from "./tokens.ts";
 
 // A stand-in for `omp login <provider>`: the same output shape (sign-in URL with its loopback
 // redirect_uri, then a prompt without a newline), one line of input per question, omp's error
 // lines on stderr. It accepts the code itself or the full redirect address, as omp does. On
-// success it stores a credential with a fresh refresh token in its agent dir, as each real
-// authorization does. Every run logs its agent dir and HOME, so tests can count the runs.
+// success it stores the credential the way omp's upsertAuthCredential does (pi-ai
+// sqlite-credential-store.ts), in omp's real table layout: an OAuth login stamps authorizedAt,
+// marks the provider's API-key rows "replaced by oauth login", and updates the same account's
+// active OAuth row in place (the id stays) or inserts one; an API-key login inserts a row beside
+// any OAuth row. Every run logs its agent dir and HOME, so tests can count the runs.
+// omp's own auth_credentials layout (pi-ai sqlite-credential-store.ts #createAuthCredentialsTable).
+const OMP_DDL = `CREATE TABLE IF NOT EXISTS auth_credentials (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	provider TEXT NOT NULL,
+	credential_type TEXT NOT NULL,
+	data TEXT NOT NULL,
+	disabled_cause TEXT DEFAULT NULL,
+	identity_key TEXT DEFAULT NULL,
+	created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+	updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+)`;
 const dir = mkdtempSync(join(tmpdir(), "ottr-login-"));
 const fake = join(dir, "fake-omp.ts");
 const RUNS = join(dir, "runs.log");
@@ -51,13 +66,19 @@ for await (const line of console) {
 	if (line === "good" || line === ${JSON.stringify(CALLBACK)}) {
 		mkdirSync(agentDir, { recursive: true });
 		const db = new Database(agentDir + "/agent.db");
-		db.exec("CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)");
+		db.exec(${JSON.stringify(OMP_DDL)});
 		// As omp's rules do: zai's login is an API key; openai-codex-device stores as openai-codex.
 		const stored = provider === "openai-codex-device" ? "openai-codex" : provider;
-		const add = db.prepare("INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, ?, ?, 'acct-1', 1, 1)");
-		if (provider === "zai") add.run(stored, "api_key", JSON.stringify({ key: "key-" + crypto.randomUUID(), source: "login" }));
-		else add.run(stored, "oauth", JSON.stringify({ access: "access-" + crypto.randomUUID(), refresh: crypto.randomUUID() }));
-		add.finalize();
+		const NOW = "CAST(strftime('%s','now') AS INTEGER)";
+		if (provider === "zai") {
+			db.query("INSERT INTO auth_credentials (provider, credential_type, data) VALUES (?, 'api_key', ?)").run(stored, JSON.stringify({ key: "key-" + crypto.randomUUID(), source: "login" }));
+		} else {
+			const data = JSON.stringify({ access: "access-" + crypto.randomUUID(), refresh: crypto.randomUUID(), expires: Date.now() + 8 * 3600_000, authorizedAt: Date.now() });
+			db.query("UPDATE auth_credentials SET disabled_cause = 'replaced by oauth login', updated_at = " + NOW + " WHERE provider = ? AND credential_type = 'api_key' AND disabled_cause IS NULL").run(stored);
+			const same = db.query("SELECT id FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND identity_key = 'acct-1' AND disabled_cause IS NULL ORDER BY id LIMIT 1").get(stored);
+			if (same) db.query("UPDATE auth_credentials SET data = ?, updated_at = " + NOW + " WHERE id = ?").run(data, same.id);
+			else db.query("INSERT INTO auth_credentials (provider, credential_type, data, identity_key) VALUES (?, 'oauth', ?, 'acct-1')").run(stored, data);
+		}
 		db.close();
 		console.log("Logged in to " + provider);
 		process.exit(0);
@@ -228,11 +249,6 @@ describe("providerLogin", () => {
 });
 
 describe("worker store: supersede on sign-in, sign-out everywhere", () => {
-	// The columns of omp's auth_credentials the board reads and writes.
-	const SCHEMA = `CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY,
-		provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
-		disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`;
-
 	interface Row {
 		id: number;
 		provider: string;
@@ -248,7 +264,7 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 	): void {
 		mkdirSync(dirname(path), { recursive: true });
 		const db = new Database(path);
-		db.exec(SCHEMA);
+		db.exec(OMP_DDL);
 		const add = db.prepare(
 			"INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 1)",
 		);
@@ -415,6 +431,80 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 		).toEqual(["openai-codex"]);
 	}, 30_000);
 
+	test("an API-key login beside an older active OAuth row keeps the worker key and lends nothing", async () => {
+		const t = setup();
+		// The board already holds a zai OAuth sign-in from yesterday; omp keeps it active when an
+		// API key comes in (only an OAuth login replaces the other type).
+		credStore(t.boardDb, [
+			[
+				"zai",
+				"oauth",
+				{
+					access: "zai-old-oauth",
+					expires: 8640000000000000,
+					authorizedAt: Date.now() - 86_400_000,
+				},
+				"acct-1",
+			],
+		]);
+		const before = rows(t.workerDb);
+		await t.l.start("zai", BOARD);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		// Both board rows stay active, as in omp's store.
+		expect(
+			rows(t.boardDb)
+				.filter((r) => r.disabled_cause === null)
+				.map((r) => r.credential_type),
+		).toEqual(["oauth", "api_key"]);
+		// The login wrote an API key: no worker row changes, the worker key stays usable.
+		expect(rows(t.workerDb)).toEqual(before);
+		expect(v?.output).toContain("Worker turns do not get zai from the board");
+		// The current zai credential is the API key: not lent, and the old OAuth token is not lent.
+		expect(signIns(t.boardDb)).toEqual([
+			{
+				provider: "zai",
+				kind: "api_key",
+				active: true,
+				cause: null,
+				lent: false,
+			},
+		]);
+		expect(await lentProviderEnv("zai/glm-5.3", { dbPath: t.boardDb })).toEqual(
+			{ env: {}, note: null },
+		);
+	}, 30_000);
+
+	test("a same-account OAuth login that omp updates in place still replaces the worker copy", async () => {
+		const t = setup();
+		credStore(t.boardDb, [
+			[
+				"anthropic",
+				"oauth",
+				{ access: "old", refresh: "old-r", authorizedAt: 1 },
+				"acct-1",
+			],
+		]);
+		const [old] = rows(t.boardDb);
+		await t.l.start("anthropic", BOARD);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		// omp updated the account's row in place: same id, new tokens, no new row.
+		const board = rows(t.boardDb);
+		expect(board.map((r) => r.id)).toEqual([old!.id]);
+		expect(board[0]!.data).not.toBe(old!.data);
+		// The worker copies of the provider are replaced; other providers stay.
+		expect(
+			rows(t.workerDb)
+				.filter((r) => r.disabled_cause !== null)
+				.map((r) => [r.provider, r.disabled_cause]),
+		).toEqual([
+			["anthropic", "replaced by newer credential"],
+			["anthropic", "replaced by newer credential"],
+			["anthropic", "replaced by newer credential"],
+		]);
+	}, 30_000);
+
 	test("signOutEverywhere marks both stores deleted by user; a missing worker store counts as none", () => {
 		const t = setup();
 		credStore(join(t.boardDir, "agent.db"), [
@@ -485,12 +575,11 @@ describe("redirectUri", () => {
 });
 
 describe("signIns and signOut", () => {
-	// The columns of omp's auth_credentials that the board reads and writes.
+	// omp's real auth_credentials layout; the board reads and writes some of its columns.
 	function store(): string {
 		const path = join(dir, `agent-${crypto.randomUUID()}.db`);
 		const db = new Database(path);
-		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
-			credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT, updated_at INTEGER)`);
+		db.exec(OMP_DDL);
 		const add = db.prepare(
 			"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, updated_at) VALUES (?, ?, '{}', ?, 1)",
 		);

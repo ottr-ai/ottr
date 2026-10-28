@@ -218,6 +218,27 @@ describe("lentProviderEnv", () => {
 		expect(lent.note).toContain("cannot run omp token");
 	});
 
+	test("an API key signed in after the OAuth row is the current credential: nothing is lent", async () => {
+		const path = store();
+		addRow(path, "zai", {
+			access: "zai-old-oauth",
+			expires: 8640000000000000,
+			authorizedAt: NOW - HOUR,
+		});
+		// omp's API-key login: a new row beside the OAuth one, stamped with the login's second.
+		const db = new Database(path);
+		db.query(
+			"INSERT INTO auth_credentials (provider, credential_type, data, created_at, updated_at) VALUES ('zai', 'api_key', ?, ?, ?)",
+		).run(
+			JSON.stringify({ key: "key-1", source: "login" }),
+			NOW / 1000,
+			NOW / 1000,
+		);
+		db.close();
+		expect(await lend("zai/glm-5.3", path)).toEqual({ env: {}, note: null });
+		expect(runs(path)).toEqual([]);
+	});
+
 	test("a zai row with the sentinel expiry lends the key without running omp", async () => {
 		const path = store();
 		addRow(path, "zai", { access: "access-1", expires: 8640000000000000 });

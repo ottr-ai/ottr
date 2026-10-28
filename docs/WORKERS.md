@@ -463,8 +463,10 @@ token from the board store. Ottr has no OAuth refresh code of its own.
   credential`, and worker turns then resolve the lent env token. Any other
   sign-in (an API key, or another OAuth provider) changes no worker row: the
   workers keep their own credential, or set the provider's key under
-  **Settings → Env**. Settings shows "Lent to workers" or "Not lent to
-  workers" on each row. The spec lists every provider.
+  **Settings → Env**. The newest login of a provider decides: an API key
+  signed in after an OAuth sign-in stops the lending, also while omp keeps the
+  OAuth row. Settings shows "Lent to workers" or "Not lent to workers" on each
+  row. The spec lists every provider.
 - Sign-out marks the provider's rows `deleted by user` in the board store and
   in the worker store. That removes legacy rows in one step.
 - When omp does not refresh, the board lends nothing for that turn, and the card

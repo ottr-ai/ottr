@@ -64,18 +64,38 @@ omp reads the OAuth access token from:
 - `zai` → `ZAI_API_KEY` (the zai OAuth access token never expires; the same
   bearer slot takes it, `env "ZAI_API_KEY"` in the provider rule)
 
-The lend rule: the board lends a sign-in only when it is an active `oauth` row
-of a provider in `LENT_ENV`. `GET /api/provider-login` gives each sign-in a
+**Login moment.** omp keeps more than one active row per provider: an
+API-key login inserts its row beside an active OAuth row, and only an OAuth
+login marks the provider's API-key rows `replaced by oauth login` (pi-ai
+`upsertAuthCredential`). So the board dates each active row by the moment the
+user signed it in:
+
+- an `oauth` row: `authorizedAt` in its data (omp stamps it at login, and a
+  refresh keeps it); a row without it: `created_at`;
+- an `api_key` row: `updated_at` (only a login changes such a row), taken as
+  the end of its second.
+
+**Current credential.** The provider's active row with the newest login
+moment (ties: the higher id). The lend rule: the board lends a provider only
+when its current credential is an `oauth` row of a provider in `LENT_ENV`.
+An older OAuth row beside a newer API key is never lent.
+`GET /api/provider-login` shows each provider's current credential with a
 `lent` flag, and Settings shows "Lent to workers" or "Not lent to workers" on
 each active row.
 
-A sign-in that the board does not lend never changes the worker store. This
-covers an API key (for example the `zai` login, which stores an `api_key` row)
-and an OAuth provider outside `LENT_ENV` (for example `cursor` or
-`github-copilot`). The workers keep their own credential for it: their own
-store row, or the provider's env key under Settings, Env. The sign-in output
-says so in one line. Only a lent sign-in supersedes worker rows (see
-"Precedence").
+**What a sign-in does to the workers** follows the credential this login
+wrote, never the provider's combined state. The rows this login wrote are the
+active rows whose login moment is at or after the start of the sign-in. This
+finds a new row and also a row that omp updated in place (the same account
+signs in again; the id stays). For each such row:
+
+- `oauth` of a `LENT_ENV` provider: the board marks the provider's worker rows
+  superseded (see "Precedence").
+- anything else (an API key, for example the `zai` login, or an OAuth
+  provider outside `LENT_ENV`, for example `cursor` or `github-copilot`): the
+  worker store does not change. The workers keep their own credential: their
+  own store row, or the provider's env key under Settings, Env. The sign-in
+  output says so in one line.
 
 ### Provider matrix
 
@@ -181,8 +201,8 @@ At the start of every turn (`ops.turnEnv` in `src/server.ts`, called with the
 turn's model), for the model's provider (`provider` is the part before the
 first `/` in the model string):
 
-1. Read the provider's active `oauth` row from the board store
-   (`auth_credentials`, `disabled_cause IS NULL`). No row: lend nothing.
+1. Find the provider's current credential in the board store (see "Login
+   moment"). None, or an `api_key` row: lend nothing.
 2. Parse `data` (`{access, refresh, expires, ...}`, `expires` in ms since
    epoch; zai stores a far-future sentinel = never expires).
 3. When `expires - now` is above the margin (constant `TOKEN_REFRESH_MARGIN_MS`,
@@ -238,9 +258,9 @@ worker store). Worker turns then resolve the lent env token. A sign-in the
 board does not lend changes no worker row.
 
 The provider is omp's stored id, not the login id: `openai-codex-device`
-stores as `openai-codex`, `zai-coding-plan` as `zai`. The board reads the
-stored ids from the rows that the login wrote (ids above the store's highest id
-before the login) and decides from those rows.
+stores as `openai-codex`, `zai-coding-plan` as `zai`. The board takes the
+stored id from the rows that the login wrote (login moment at or after the
+start of the sign-in) and decides from those rows.
 
 Legacy rows from the OTTR-183 era: they hold their own refresh token family
 and keep working until the next sign-in or sign-out of that provider. Nothing
@@ -308,6 +328,11 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   `LENT_ENV` (`cursor`) change no worker row and say so in the output.
 - A test: a login id that stores under another id (`openai-codex-device`)
   supersedes the rows of the stored id.
+- A test, with omp's real table layout: an API-key login beside an older
+  active OAuth row changes no worker row, and neither the `lent` flag nor the
+  turn env lends the old OAuth token.
+- A test, with omp's real table layout: a same-account OAuth login that omp
+  updates in place (same id) still supersedes the worker rows.
 - A test: the code-flow sign-in path completes by pasting the redirect address
   (no localhost listener involved) — the phone path.
 - `bun run check` and `bun test` pass.
@@ -336,3 +361,7 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   to omp's account order.
 - Each refresh starts one omp process (about one second). It runs only when
   the token has less than 30 minutes left, so at most a few times a day.
+- An `api_key` row carries only whole seconds (`updated_at`). Two logins of
+  one provider inside the same second can order wrong, and an API key that
+  another omp process saves while a Settings sign-in runs counts as written
+  by that sign-in. Both cases need a person to act twice within seconds.

@@ -229,28 +229,28 @@ export function providerLogin({
 	}
 
 	/**
-	 * After a sign-in: the board lends some of the rows omp just wrote (ids above `since`) to worker
-	 * turns. For those providers only, it marks the workers' active rows superseded, so omp on a
-	 * worker resolves the lent env token instead of its stale store row (any active row would beat
-	 * it). Every other sign-in leaves the worker store alone: the workers keep their own credential.
-	 * The board writes only the cause string and reads nothing from the worker store; a failure
-	 * cannot fail the sign-in.
+	 * After a sign-in: what the workers get follows the credential this login wrote (each active
+	 * row of the board store whose login moment is at or after `startedAt`; omp inserts a new row or
+	 * updates the same account's row in place). A lent one (OAuth, LENT_ENV provider) marks the
+	 * workers' active rows of that provider superseded, so omp on a worker resolves the lent env
+	 * token instead of its stale store row (any active row would beat it). Any other credential
+	 * leaves the worker store alone: the workers keep their own. The board writes only the cause
+	 * string and reads nothing from the worker store; a failure cannot fail the sign-in.
 	 */
 	function supersedeWorkers(
 		l: Login,
 		boardDb: string,
-		since: number,
+		startedAt: number,
 		worker: LoginStores["worker"],
 	): void {
 		if (worker === null) return;
 		try {
-			const written = new Set(providersSince(boardDb, since));
-			for (const s of signIns(boardDb)) {
-				if (!written.has(s.provider)) continue;
-				if (!s.lent)
-					l.step.raw += `\nWorker turns do not get ${s.provider} from the board: they keep their own sign-in, or set its env key under Settings, Env.\n`;
+			for (const r of activeCredentials(boardDb)) {
+				if (r.loginAt < startedAt) continue;
+				if (!lendable(r))
+					l.step.raw += `\nWorker turns do not get ${r.provider} from the board: they keep their own sign-in, or set its env key under Settings, Env.\n`;
 				else if (existsSync(worker.db))
-					signOut(s.provider, worker.db, "replaced by newer credential");
+					signOut(r.provider, worker.db, "replaced by newer credential");
 			}
 		} catch (err) {
 			l.step.raw += `\nCannot mark the workers' rows replaced in ${worker.db}: ${errmsg(err)}\n`;
@@ -261,14 +261,14 @@ export function providerLogin({
 		cancel();
 		const { boardDir, worker } = stores();
 		const boardDb = join(boardDir, "agent.db");
-		const since = lastCredentialId(boardDb);
+		const startedAt = Date.now();
 		const l: Login = {
 			provider,
 			step: launch(provider, boardDir, (code) => {
 				if (code !== 0 || l.stopped) finish(l, false);
 				else {
 					finish(l, true);
-					supersedeWorkers(l, boardDb, since, worker);
+					supersedeWorkers(l, boardDb, startedAt, worker);
 				}
 			}),
 			ok: null,
@@ -427,83 +427,138 @@ export interface SignIn {
 	active: boolean;
 	/** omp's own disabled_cause of the kept row; null when the sign-in is active. */
 	cause: string | null;
-	/** Worker turns get this sign-in as a lent env token: an active OAuth row of a LENT_ENV provider. */
+	/** Worker turns get this sign-in as a lent env token: the provider's current credential is OAuth and the provider is in LENT_ENV. */
 	lent: boolean;
 }
 
 // The causes omp itself hides (pi-coding-agent usage-cli): a logout or a newer login of the account.
 const GONE = /^(replaced by|deleted by user)/i;
 
-/** omp's stored sign-ins, one per provider; an active one wins over a failed one. */
+/** omp's stored sign-ins, one per provider: its current credential (see currentCredential); a failed one only when none is active. */
 export function signIns(dbPath = agentDb()): SignIn[] {
 	const db = new Database(dbPath, { readonly: true });
+	const by = new Map<string, SignIn>();
 	try {
-		const rows = db
+		const failed = db
 			.query(
-				"SELECT provider, credential_type, disabled_cause FROM auth_credentials ORDER BY id",
+				"SELECT provider, credential_type, disabled_cause FROM auth_credentials WHERE disabled_cause IS NOT NULL ORDER BY id",
 			)
 			.all() as Array<{
 			provider: string;
 			credential_type: string;
-			disabled_cause: string | null;
+			disabled_cause: string;
 		}>;
-		const by = new Map<string, SignIn>();
-		for (const r of rows) {
-			if (r.disabled_cause !== null && GONE.test(r.disabled_cause)) continue;
-			const active = r.disabled_cause === null;
-			const s = {
+		for (const r of failed) {
+			if (GONE.test(r.disabled_cause)) continue;
+			by.set(r.provider, {
 				provider: r.provider,
 				kind: r.credential_type,
-				active,
+				active: false,
 				cause: r.disabled_cause,
-				lent:
-					active &&
-					r.credential_type === "oauth" &&
-					Object.hasOwn(LENT_ENV, r.provider),
-			};
-			if (!by.get(r.provider)?.active) by.set(r.provider, s);
+				lent: false,
+			});
 		}
-		return [...by.values()].sort((a, b) =>
-			a.provider.localeCompare(b.provider),
-		);
 	} finally {
 		db.close();
 	}
+	for (const r of currentCredentials(dbPath).values())
+		by.set(r.provider, {
+			provider: r.provider,
+			kind: r.credential_type,
+			active: true,
+			cause: null,
+			lent: lendable(r),
+		});
+	return [...by.values()].sort((a, b) => a.provider.localeCompare(b.provider));
 }
 
-/** The highest auth_credentials id of the store; 0 when the store or its table is missing. */
-function lastCredentialId(dbPath: string): number {
-	if (!existsSync(dbPath)) return 0;
-	try {
-		const db = new Database(dbPath, { readonly: true });
-		try {
-			const row = db
-				.query("SELECT MAX(id) AS id FROM auth_credentials")
-				.get() as { id: number | null };
-			return row.id ?? 0;
-		} finally {
-			db.close();
-		}
-	} catch {
-		return 0;
-	}
+/** An active auth_credentials row and the moment the user signed it in. */
+export interface ActiveCredential {
+	id: number;
+	provider: string;
+	credential_type: string;
+	data: string;
+	/**
+	 * When the user signed it in, in ms. omp stamps an OAuth login with `authorizedAt` in the data,
+	 * and a refresh keeps it (pi-ai auth/oauth.ts, auth/refresh.ts). An API-key row changes only on
+	 * a login, so its `updated_at` is that moment. ponytail: `updated_at` has whole seconds, so an
+	 * API key counts as the end of its second; two logins inside one second can tie wrong.
+	 */
+	loginAt: number;
 }
 
-/** omp's stored provider ids of the active rows above `since`: what one login wrote. */
-function providersSince(dbPath: string, since: number): string[] {
+/** The store's active rows with their login moments; empty when the store or its table is missing. */
+function activeCredentials(dbPath: string): ActiveCredential[] {
+	// A readonly open of a missing path fails with a message that names no file.
+	if (!existsSync(dbPath)) return [];
 	const db = new Database(dbPath, { readonly: true });
 	try {
-		return (
-			db
-				.query(
-					"SELECT DISTINCT provider FROM auth_credentials WHERE id > ? AND disabled_cause IS NULL",
-				)
-				.all(since) as Array<{ provider: string }>
-		).map((r) => r.provider);
+		const rows = db
+			.query(
+				"SELECT id, provider, credential_type, data, created_at, updated_at FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id",
+			)
+			.all() as Array<{
+			id: number;
+			provider: string;
+			credential_type: string;
+			data: string;
+			created_at: number | null;
+			updated_at: number | null;
+		}>;
+		return rows.map((r) => {
+			let authorizedAt: unknown;
+			try {
+				authorizedAt = (JSON.parse(r.data) as { authorizedAt?: unknown } | null)
+					?.authorizedAt;
+			} catch {
+				authorizedAt = undefined; // junk data: fall back to the row's own time
+			}
+			const loginAt =
+				r.credential_type === "oauth"
+					? typeof authorizedAt === "number" && Number.isFinite(authorizedAt)
+						? authorizedAt
+						: (r.created_at ?? 0) * 1000
+					: (r.updated_at ?? 0) * 1000 + 999;
+			return {
+				id: r.id,
+				provider: r.provider,
+				credential_type: r.credential_type,
+				data: r.data,
+				loginAt,
+			};
+		});
+	} catch (err) {
+		// No auth_credentials table: not an omp store. Anything else (a locked store) surfaces.
+		if (errmsg(err).includes("no such table")) return [];
+		throw err;
 	} finally {
 		db.close();
 	}
 }
+
+/** Each provider's current credential: the active row of its newest login (ties: the higher id). */
+function currentCredentials(dbPath: string): Map<string, ActiveCredential> {
+	const by = new Map<string, ActiveCredential>();
+	for (const r of activeCredentials(dbPath)) {
+		const prev = by.get(r.provider);
+		if (prev === undefined || r.loginAt >= prev.loginAt) by.set(r.provider, r);
+	}
+	return by;
+}
+
+/**
+ * The provider's current credential in the store, or null. An API key that the user signed in
+ * after an OAuth login is current even while the OAuth row stays active, so the board lends
+ * nothing for it.
+ */
+export const currentCredential = (
+	dbPath: string,
+	provider: string,
+): ActiveCredential | null => currentCredentials(dbPath).get(provider) ?? null;
+
+/** The board lends this credential to worker turns: OAuth, of a LENT_ENV provider. */
+const lendable = (r: ActiveCredential): boolean =>
+	r.credential_type === "oauth" && Object.hasOwn(LENT_ENV, r.provider);
 
 export interface DeadSignIn {
 	provider: string;
