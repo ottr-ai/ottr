@@ -5737,10 +5737,10 @@ function AskPanel({
 }
 
 /** Pages the lightbox by delta, wrapping at both ends. */
-function turnPage(
-	v: { list: string[]; index: number },
+function turnPage<T extends { list: string[]; index: number }>(
+	v: T,
 	delta: number,
-): { list: string[]; index: number } {
+): T {
 	return { ...v, index: (v.index + delta + v.list.length) % v.list.length };
 }
 
@@ -5838,10 +5838,11 @@ function Drawer({
 	const [cmdCopyError, setCmdCopyError] = useState<string | null>(null);
 	/** The one turn whose log is expanded; the log is per task, so only one copy shows at a time. */
 	const [openTurn, setOpenTurn] = useState<number | null>(null);
-	/** Open lightbox: the full-size list and the page shown; null while closed. Task inputs, reply and steer drafts each page their own list. */
+	/** Open lightbox: the full-size list, the page shown and, for screenshots, the file names to caption; null while closed. Task inputs, reply and steer drafts each page their own list. */
 	const [viewing, setViewing] = useState<{
 		list: string[];
 		index: number;
+		names?: string[];
 	} | null>(null);
 	/** Open diff view: null shows the whole diff, an array the named files' sections; undefined while closed. */
 	const [diffView, setDiffView] = useState<string[] | null | undefined>(
@@ -6738,7 +6739,13 @@ function Drawer({
 											type="button"
 											className="thumb shot"
 											title="Open full size"
-											onClick={() => setViewing({ list: shotUrls, index: i })}
+											onClick={() =>
+												setViewing({
+													list: shotUrls,
+													index: i,
+													names: task.shots,
+												})
+											}
 										>
 											<img src={url} alt={name} loading="lazy" />
 											<span className="shot-name">{name}</span>
@@ -7391,6 +7398,9 @@ function Drawer({
 							src={viewing.list[viewing.index]}
 							alt="Attachment, full size"
 						/>
+						{viewing.names?.[viewing.index] !== undefined && (
+							<span className="caption">{viewing.names[viewing.index]}</span>
+						)}
 						{viewing.list.length > 1 && (
 							<>
 								<button
