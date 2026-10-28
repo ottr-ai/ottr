@@ -454,9 +454,11 @@ failed `http://localhost:...` address (or the code) into the Settings field.
 Before each worker turn, the board resolves one model: the card's model, else
 (on a resume) the saved session's model, else the `default` role of the
 board's `config.yml`. It passes that model to omp as `--model`, and it puts the
-short-lived access token of that model's provider into the turn env. When no
-model resolves, or the board cannot lend its sign-in, the turn does not start,
-and the card shows the cause. The env names are `ANTHROPIC_OAUTH_TOKEN`,
+short-lived access token of that model's provider into the turn env. Lending
+fails closed: when no model resolves, or the board has no usable sign-in for an
+Anthropic, Codex or Z.AI model (missing, disabled, unreadable, an empty token,
+or no valid expiry), the turn does not start, and the card shows the cause.
+The env names are `ANTHROPIC_OAUTH_TOKEN`,
 `OPENAI_CODEX_OAUTH_TOKEN` and `ZAI_API_KEY`. When the token has less than 30
 minutes left, the board runs
 `omp token <provider> --force-refresh` against the board agent dir first: omp
@@ -474,10 +476,9 @@ token from the board store. Ottr has no OAuth refresh code of its own.
   row. The spec lists every provider.
 - Sign-out marks the provider's rows `deleted by user` in the board store and
   in the worker store. That removes legacy rows in one step.
-- When omp does not refresh, the board lends nothing for that turn, and the card
-  log names omp's cause. The board never lends a token from the command's
-  output. The next turn tries again. A provider after `invalid_grant` needs a
-  new sign-in.
+- When omp does not refresh, the turn does not start, and the card shows omp's
+  cause. The board never lends a token from the command's output. Reply to the
+  card to retry. A provider after `invalid_grant` needs a new sign-in.
 - The board never runs omp with the shared home as its agent dir or its
   `HOME`, because a turn can plant config, extensions and `!command` keys
   there. The board never reads a credential value from the worker store and

@@ -5360,6 +5360,32 @@ describe("prepareTurn", () => {
 		);
 	});
 
+	test("a worker turn whose provider has no board sign-in does not start, and the card shows the cause", async () => {
+		const { store, record, loop } = lendingSetup(boardStore({}));
+		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Sign-in: the board has no anthropic sign-in. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
+		);
+	});
+
+	test("an empty credential error still stops the worker turn", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async () => ({ env: {}, missing: [], credentialError: "" }),
+		});
+		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)!.needsReason).toBe(
+			"Sign-in: the board cannot lend a credential. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
+		);
+	});
+
 	test("a worker-dispatched turn never calls prepareTurn", async () => {
 		let called = false;
 		const { store, loop } = setup({

@@ -1,44 +1,93 @@
 // Lends a model provider's access token from the board store into a turn's env. Only the board
 // store holds a credential; workers get the short-lived access token through the env, never the
 // refresh token. Ottr has no OAuth refresh code: when the token runs low, omp refreshes it
-// (docs/specs/provider-credentials.md, "Token lending").
+// (docs/specs/provider-credentials.md, "Token lending"). Lending fails closed: for a provider
+// the board lends, anything short of a usable token is an error that stops the worker turn.
+import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
 import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
 
 export const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
 const REFRESH_TIMEOUT_MS = 60_000;
+/** omp's "never" for a zai token (`expires "never"` in zai-coding-plan.kdl): the largest Date. */
+const ZAI_NO_EXPIRY = 8_640_000_000_000_000;
 
-interface Token {
-	access: string;
-	expires: number;
+/** What the board store holds for a provider: a lendable token, an API key (never lent), or why neither. */
+type Read =
+	| { kind: "token"; access: string; expires: number }
+	| { kind: "api_key" }
+	| { kind: "error"; cause: string };
+
+const errmsg = (err: unknown): string =>
+	err instanceof Error ? err.message : String(err);
+
+/** Why the provider has no active credential: never signed in, or omp disabled its row. */
+function noCredential(dbPath: string, provider: string): string {
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		const row = db
+			.query(
+				"SELECT disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id DESC LIMIT 1",
+			)
+			.get(provider) as { disabled_cause: string | null } | null;
+		return row === null
+			? `the board has no ${provider} sign-in`
+			: `the board's ${provider} sign-in is disabled (${row.disabled_cause ?? "no cause"})`;
+	} finally {
+		db.close();
+	}
 }
 
 /**
- * The access token of the provider's current credential (its newest login), when that is OAuth;
- * null when it is an API key, missing, or junk. An older OAuth row next to a newer API key is
- * never lent.
+ * The provider's current credential (its newest login) in the board store. An OAuth row must hold
+ * a non-empty access token and a finite expiry; only zai's "never" sentinel means no expiry. An
+ * API key is reported as such: the board never lends one. Everything else is an error with its
+ * cause: a missing or unreadable store, no sign-in, a disabled sign-in, or a damaged row.
  */
-function readToken(dbPath: string, provider: string): Token | null {
-	let cred: unknown;
+function readToken(dbPath: string, provider: string): Read {
+	// A readonly open of a missing path fails with a message that names no file (login.ts).
+	if (!existsSync(dbPath))
+		return { kind: "error", cause: `the board store ${dbPath} does not exist` };
+	let data: string;
 	try {
 		const row = currentCredential(dbPath, provider);
-		if (row?.credential_type !== "oauth") return null;
-		cred = JSON.parse(row.data);
-	} catch {
-		return null; // Not an omp store, or a JSON parse error.
+		if (row === null)
+			return { kind: "error", cause: noCredential(dbPath, provider) };
+		if (row.credential_type !== "oauth") return { kind: "api_key" };
+		data = row.data;
+	} catch (err) {
+		return {
+			kind: "error",
+			cause: `cannot read the board store ${dbPath}: ${errmsg(err)}`,
+		};
 	}
-	// omp writes an object; junk from a damaged store must degrade, not throw.
-	if (cred === null || typeof cred !== "object") return null;
-	const { access, expires } = cred as { access?: unknown; expires?: unknown };
-	if (typeof access !== "string") return null;
+	const damaged = (what: string): Read => ({
+		kind: "error",
+		cause: `the board's ${provider} sign-in ${what}`,
+	});
+	let cred: unknown;
+	try {
+		cred = JSON.parse(data);
+	} catch {
+		return damaged("holds unreadable data");
+	}
+	if (cred === null || typeof cred !== "object")
+		return damaged("holds unreadable data");
+	const access = "access" in cred ? cred.access : undefined;
+	const expires = "expires" in cred ? cred.expires : undefined;
+	if (typeof access !== "string" || access.trim() === "")
+		return damaged("has no access token");
+	if (typeof expires !== "number" || !Number.isFinite(expires) || expires <= 0)
+		return damaged("has no valid expiry");
 	return {
+		kind: "token",
 		access,
-		// No finite expiry (zai's sentinel included) counts as never expiring.
 		expires:
-			typeof expires === "number" && Number.isFinite(expires)
-				? expires
-				: Number.POSITIVE_INFINITY,
+			provider === "zai" && expires === ZAI_NO_EXPIRY
+				? Number.POSITIVE_INFINITY
+				: expires,
 	};
 }
 
@@ -72,22 +121,22 @@ async function ompRefresh(
 			? `omp token did not finish in ${REFRESH_TIMEOUT_MS / 1000} s`
 			: (last || `omp token exited with code ${code}`).slice(0, 300);
 	} catch (err) {
-		return `cannot run omp token: ${err instanceof Error ? err.message : String(err)}`;
+		return `cannot run omp token: ${errmsg(err)}`;
 	}
 }
 
 /**
- * What a turn gets: the lent env, and `error` when the board holds the provider's OAuth sign-in
- * but cannot lend a usable token (omp did not refresh it). A turn with an error must not start.
- * A provider the board does not lend, or holds no OAuth sign-in for, gets neither: the worker
- * uses its own credential.
+ * What a turn gets: the lent env, and `error` when nothing usable can be lent for a provider the
+ * board lends (or for a model that names no provider). A turn with an error must not start. A
+ * provider outside LENT_ENV, and a provider whose current board credential is an API key, get
+ * neither: the worker uses its own credential.
  */
 export interface Lent {
 	env: Record<string, string>;
 	error: string | null;
 }
 
-/** The lent env for the model's provider; `env` is empty when nothing can be lent this turn. */
+/** The lent env for the model's provider; a null model (a local run) lends nothing. */
 export async function lentProviderEnv(
 	model: string | null | undefined,
 	opts: {
@@ -98,23 +147,28 @@ export async function lentProviderEnv(
 		command?: string[];
 	} = {},
 ): Promise<Lent> {
-	const provider = model?.split("/", 1)[0];
-	const name =
-		provider !== undefined && Object.hasOwn(LENT_ENV, provider)
-			? LENT_ENV[provider]
-			: undefined;
-	if (provider === undefined || name === undefined)
+	if (model === null || model === undefined || model.trim() === "")
 		return { env: {}, error: null };
+	const slash = model.indexOf("/");
+	if (slash <= 0)
+		return {
+			env: {},
+			error: `the model ${model} names no provider (expected provider/model)`,
+		};
+	const provider = model.slice(0, slash);
+	const name = Object.hasOwn(LENT_ENV, provider)
+		? LENT_ENV[provider]
+		: undefined;
+	if (name === undefined) return { env: {}, error: null };
 	const now = opts.now ?? Date.now();
 	const marginMs = opts.marginMs ?? TOKEN_REFRESH_MARGIN_MS;
 	const dbPath = opts.dbPath ?? join(agentDir(), "agent.db");
-	const fresh = (t: Token | null): t is Token =>
-		t !== null && t.expires - now > marginMs;
 
 	const before = readToken(dbPath, provider);
-	// No board sign-in: the turn resolves its own credential, as without lending.
-	if (before === null) return { env: {}, error: null };
-	if (fresh(before)) return { env: { [name]: before.access }, error: null };
+	if (before.kind === "api_key") return { env: {}, error: null };
+	if (before.kind === "error") return { env: {}, error: before.cause };
+	if (before.expires - now > marginMs)
+		return { env: { [name]: before.access }, error: null };
 
 	const cause = await ompRefresh(
 		provider,
@@ -122,9 +176,17 @@ export async function lentProviderEnv(
 		opts.command ?? ["omp", "token"],
 	);
 	const after = readToken(dbPath, provider);
-	if (fresh(after)) return { env: { [name]: after.access }, error: null };
+	if (after.kind === "token" && after.expires - now > marginMs)
+		return { env: { [name]: after.access }, error: null };
+	const why =
+		cause ??
+		(after.kind === "error"
+			? after.cause
+			: after.kind === "api_key"
+				? "its newest login is now an API key"
+				: "the token is still near its expiry after omp ran");
 	return {
 		env: {},
-		error: `omp did not refresh the board's ${provider} sign-in: ${cause ?? "the token is still near its expiry after omp ran"}`,
+		error: `omp did not refresh the board's ${provider} sign-in: ${why}`,
 	};
 }

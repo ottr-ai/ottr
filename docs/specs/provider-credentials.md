@@ -216,35 +216,51 @@ changed. The board lends the token for that model's provider only.
 A local run (merge, release, retro, board check) runs on the board with the
 board store itself. It lends nothing and keeps the card's model, as before.
 
-The turn does not start, and the card goes to `needs_you` with the cause in
-`needsReason` and in the card log, when:
+**Lending fails closed.** For a provider in `LENT_ENV`, anything short of a
+usable token is an error with its cause. The worker turn does not start, and
+the card goes to `needs_you` with the cause in `needsReason` and in the card
+log. The turn also stops when no execution model resolves (no card model, no
+session model, no `default` role), when the model names no provider (no
+`provider/` prefix), and when `turnEnv` returns any error value, an empty one
+included.
 
-- no execution model resolves (no card model, no session model, no `default`
-  role);
-- the board holds the provider's OAuth sign-in but cannot lend a usable token
-  (omp did not refresh it; see step 5 below).
+Two cases are not errors, and the turn starts without a lent token:
 
-A provider that the board does not lend, or that has no OAuth sign-in on the
-board, starts as before: the worker uses its own credential (its store row or
-the provider's key under Settings, Env). The board cannot see the worker
-store (R5-1), so it cannot check that credential.
+- a provider outside `LENT_ENV`: the board does not lend it, and the worker
+  uses its own credential (its store row, or the provider's key under
+  Settings, Env);
+- a `LENT_ENV` provider whose current board credential is an API key: the
+  board never lends a key, and the worker keeps its own (see "Login moment").
+
+The board cannot see the worker store (R5-1), so it cannot check the worker's
+own credential in these two cases.
 
 Then `ops.turnEnv` in `src/server.ts` runs with the execution model, for its
 provider (`provider` is the part before the first `/` in the model string):
 
 1. Find the provider's current credential in the board store (see "Login
-   moment"). None, or an `api_key` row: lend nothing, no error.
-2. Parse `data` (`{access, refresh, expires, ...}`, `expires` in ms since
-   epoch; zai stores a far-future sentinel = never expires).
+   moment"). Errors:
+   - the store file does not exist, or the board cannot read it;
+   - the provider has no row: "the board has no `<provider>` sign-in";
+   - its newest row is disabled: "the board's `<provider>` sign-in is
+     disabled (`<omp's cause>`)", which covers a sign-out too.
+
+   An `api_key` row: lend nothing, no error.
+2. Parse `data` (`{access, refresh, expires, ...}`). Errors: the data is no
+   JSON object; `access` is not a non-empty string ("has no access token");
+   `expires` is not a finite positive number in ms since epoch ("has no
+   valid expiry"). A missing or non-number expiry is never an endless token.
+   Only zai's documented sentinel `8640000000000000` (omp's `expires
+   "never"`, the largest Date) means no expiry, and only for `zai`.
 3. When `expires - now` is above the margin (constant `TOKEN_REFRESH_MARGIN_MS`,
    30 minutes), lend `access` under the provider's env name.
 4. Below the margin or expired: let omp refresh (see below), then read the row
-   again. When the new `expires - now` is above the margin, lend the new
-   `access`.
-5. omp does not refresh (non-zero exit, time-out, or the row is still below
-   the margin): lend nothing and return the cause as `error`
-   (`credentialError` of `turnEnv`). The turn does not start. The board never
-   fakes a token. A reply retries after a new sign-in.
+   again with the same checks. When the new `expires - now` is above the
+   margin, lend the new `access`.
+5. omp does not refresh (non-zero exit, time-out, the row is still below the
+   margin, or the new row fails a check): lend nothing and return the cause as
+   `error` (`credentialError` of `turnEnv`). The turn does not start. The
+   board never fakes a token. A reply retries after a new sign-in.
 
 ### Refresh: omp refreshes, Ottr does not
 
@@ -328,8 +344,12 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   `omp`): lend nothing for this turn. The card log names the cause. omp keeps
   or disables the row by its own rules. A provider after `invalid_grant` needs
   a new sign-in.
-- The turn's model names a provider without an active board-store row: no env;
-  the turn's own resolution applies (worker store row or omp's auth error).
+- The execution model names a `LENT_ENV` provider, and the board store is
+  missing or unreadable, or holds no row, a disabled row, an empty access
+  token, or no valid expiry for it: the worker turn does not start;
+  `needs_you` with the cause.
+- The execution model names no provider (no `provider/` prefix): the worker
+  turn does not start; `needs_you` with the cause.
 - No execution model (no card model, no session model, no `default` role):
   the worker turn does not start; `needs_you` with the cause.
 - The board holds the provider's OAuth sign-in, and omp does not refresh it:
@@ -372,7 +392,14 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   the saved session's model; a switched card model runs the new model. Each
   gets its own provider's token.
 - A test: no execution model, or a credential the board cannot lend, stops
-  the worker turn with the cause on the card.
+  the worker turn with the cause on the card; an empty error value stops it
+  too.
+- One test for each fail-closed case of a `LENT_ENV` provider: a missing
+  sign-in (and a missing store), a disabled sign-in, an empty access token,
+  an absent expiry, a string expiry, and a model with no provider. A test
+  keeps zai's sentinel working.
+- A property: any junk in the data column lends a non-empty string token or
+  returns an error, never neither.
 - A test: the code-flow sign-in path completes by pasting the redirect address
   (no localhost listener involved) — the phone path.
 - `bun run check` and `bun test` pass.

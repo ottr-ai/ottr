@@ -1275,9 +1275,13 @@ export function createTurnLoop(
 				log(
 					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
 				);
-			if (turnEnv.credentialError) {
+			// Fail closed: any error value stops the turn, an empty message included.
+			if (
+				turnEnv.credentialError !== undefined &&
+				turnEnv.credentialError !== null
+			) {
 				stopBeforeRun(
-					`Sign-in: ${turnEnv.credentialError}. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.`,
+					`Sign-in: ${turnEnv.credentialError || "the board cannot lend a credential"}. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.`,
 				);
 				return;
 			}

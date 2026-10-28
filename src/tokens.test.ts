@@ -249,21 +249,98 @@ describe("lentProviderEnv", () => {
 		expect(runs(path)).toEqual([]);
 	});
 
-	test("an unknown provider, a missing store, or no board sign-in lends nothing, quietly", async () => {
+	test("a provider the board does not lend, or a local run, lends nothing and is no error", async () => {
 		const path = store();
 		const none = { env: {}, error: null };
 		expect(await lend("foo/bar", path)).toEqual(none);
-		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual(none);
-		const missing = join(dir, "absent", "agent.db");
-		expect(await lend("anthropic/claude-opus-5-5", missing)).toEqual(none);
-		expect(existsSync(missing)).toBe(false);
 		expect(await lentProviderEnv(null, { dbPath: path })).toEqual(none);
 		expect(runs(path)).toEqual([]);
 	});
 
-	// The data column is omp's; any junk in it must degrade to a shaped result, never throw
-	// into the turn's env seeding, and never lend anything but a string token.
-	test("any junk in the data column lends a shaped result or nothing", async () => {
+	// Fail closed: for a provider the board lends, anything short of a usable token is an error
+	// with its cause, and the worker turn does not start.
+	test("a missing board sign-in is an error", async () => {
+		const path = store();
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: {},
+			error: "the board has no anthropic sign-in",
+		});
+		const missing = join(dir, "absent", "agent.db");
+		expect((await lend("anthropic/claude-opus-5-5", missing)).error).toBe(
+			`the board store ${missing} does not exist`,
+		);
+		expect(existsSync(missing)).toBe(false);
+		expect(runs(path)).toEqual([]);
+	});
+
+	test("a disabled board sign-in is an error that names omp's cause", async () => {
+		const path = store();
+		const db = new Database(path);
+		db.query(
+			"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES ('anthropic', 'oauth', ?, 'oauth refresh failed: invalid_grant', 1, 1)",
+		).run(
+			JSON.stringify({
+				access: "access-1",
+				refresh: "refresh-1",
+				expires: NOW + 8 * HOUR,
+			}),
+		);
+		db.close();
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: {},
+			error:
+				"the board's anthropic sign-in is disabled (oauth refresh failed: invalid_grant)",
+		});
+		expect(runs(path)).toEqual([]);
+	});
+
+	test("an empty access token is an error, never a lent token", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: {},
+			error: "the board's anthropic sign-in has no access token",
+		});
+	});
+
+	test("an absent expiry is an error, not an endless token", async () => {
+		const path = store();
+		addRow(path, "anthropic", { access: "access-1", refresh: "refresh-1" });
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: {},
+			error: "the board's anthropic sign-in has no valid expiry",
+		});
+	});
+
+	test("a string expiry is an error, not an endless token", async () => {
+		const path = store();
+		addRow(path, "openai-codex", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: String(NOW + 8 * HOUR),
+		});
+		expect(await lend("openai-codex/gpt-6", path)).toEqual({
+			env: {},
+			error: "the board's openai-codex sign-in has no valid expiry",
+		});
+	});
+
+	test("a model that names no provider is an error", async () => {
+		const path = store();
+		expect(await lend("claude-opus-5-5", path)).toEqual({
+			env: {},
+			error:
+				"the model claude-opus-5-5 names no provider (expected provider/model)",
+		});
+	});
+
+	// The data column is omp's; any junk in it must never throw into the turn's env seeding, never
+	// lend anything but a non-empty string token, and fail closed: no token means an error.
+	test("any junk in the data column lends a usable token or returns an error", async () => {
 		const path = store();
 		const id = addRow(path, "anthropic", { access: "access-1" });
 		const db = new Database(path);
@@ -280,8 +357,10 @@ describe("lentProviderEnv", () => {
 				expect(keys.length <= 1).toBe(true);
 				if (keys.length === 1) {
 					expect(keys[0]).toBe("ANTHROPIC_OAUTH_TOKEN");
-					expect(typeof lent.env.ANTHROPIC_OAUTH_TOKEN).toBe("string");
-				}
+					expect(lent.env.ANTHROPIC_OAUTH_TOKEN).toBeString();
+					expect(lent.env.ANTHROPIC_OAUTH_TOKEN!.trim()).not.toBe("");
+					expect(lent.error).toBeNull();
+				} else expect(lent.error).toBeString();
 			}),
 		);
 		db.close();
