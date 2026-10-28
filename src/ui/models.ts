@@ -52,6 +52,15 @@ export type StoreActive = {
 	active: string[] | null;
 };
 
+/** A role's field error from the save's 400 body: own keys only, so a role named "__proto__" or
+    "constructor" never reads an inherited Object member as its message. */
+export function ownField(
+	fields: Readonly<Record<string, string>>,
+	role: string,
+): string | undefined {
+	return Object.hasOwn(fields, role) ? fields[role] : undefined;
+}
+
 /** Warnings for a role selector whose provider (the text before "/") has no active sign-in in a readable store. */
 export function roleWarnings(
 	selector: string,

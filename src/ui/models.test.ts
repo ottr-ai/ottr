@@ -6,6 +6,7 @@ import {
 	loadCatalog,
 	modelMatches,
 	modelRows,
+	ownField,
 	resetCatalogCache,
 	reviewModel,
 	roleWarnings,
@@ -305,4 +306,14 @@ test("seedStep: a later seed that holds the save ends the wait; a replaced save 
 	expect(seedStep(seed({ ...after, plan: "e/f" }), before, after)).toBe(
 		"replaced",
 	);
+});
+
+test("ownField reads only own keys: __proto__ and constructor never get an inherited message", () => {
+	const none: Record<string, string> = {};
+	expect(ownField(none, "constructor")).toBeUndefined();
+	expect(ownField(none, "__proto__")).toBeUndefined();
+	expect(ownField(none, "toString")).toBeUndefined();
+	// A 400 body names the bad role: JSON.parse makes "__proto__" an own key.
+	const sent = JSON.parse('{"__proto__":"bad name"}') as Record<string, string>;
+	expect(ownField(sent, "__proto__")).toBe("bad name");
 });

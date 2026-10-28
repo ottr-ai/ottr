@@ -5,12 +5,18 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
 ## Data path
 
 - The source is the data repo file `user/omp/agent/config.yml`. Ottr never edits a local copy (`/etc/ottr/home/.omp/agent/config.yml` or `/root/.omp/agent/config.yml`): Alate refuses to overwrite a file that differs from what it installed last.
-- Ottr reaches the data repo only through the Alate server that Settings → Alate configures. Alate's file editor API does the work, with the stored Alate API key as a Bearer token:
+- Ottr reads through the Alate server that Settings → Alate configures, with the stored Alate API key as a Bearer token:
   - `GET /api/file?path=user/omp/agent/config.yml` gives `{ content, hash }` from Alate's last import (`hash` is the sha256 of the bytes).
-  - `PUT /api/file { path, content, base, message }` clones the repo fresh, checks `base` against the file on the cloned branch head, commits, and runs a normal `git push`. A changed file gives 409 (`changed since it was loaded`). A rejected push gives 502. Alate never force-pushes.
-  - `POST /api/import { source, kind }` refreshes Alate's snapshot from the branch head and returns `{ state }`, where `state.source.importedSha` is the head commit. `source` and `kind` come from Alate's `/health` (`repo` or `path`).
-  - `GET /api/state` returns the snapshot state. `source.importedSha` is the commit of the last import.
-- After a commit, the existing `POST /api/alate/provision` provisions the workers.
+  - `POST /api/import { source, kind }` refreshes Alate's snapshot from the branch head and returns `{ state }`. `state.source` holds `kind`, `name` (`owner/name`), `ref` (the branch, empty for the default branch) and `importedSha` (the head commit). `source` and `kind` come from Alate's `/health` (`repo` or `path`).
+  - `GET /api/state` returns the same snapshot state without a new import.
+- Ottr writes with the board's GitHub token (Settings → GitHub, through `gh api`), to the repo and branch of Alate's source. Alate's own `PUT /api/file` checks only a file hash, so it cannot hold a save to its loaded parent commit. The write:
+  1. `GET repos/<name>/git/commits/<base>` gives the tree of the loaded commit.
+  2. `POST repos/<name>/git/trees` with `base_tree` and the new `config.yml` content.
+  3. `POST repos/<name>/git/commits` with `parents: [<base>]`.
+  4. `PATCH repos/<name>/git/refs/heads/<branch>` with `force: false`. GitHub moves the branch only as a fast-forward. A branch that moved since `<base>` gives "Update is not a fast forward", and Ottr answers 409. Nothing ever force-pushes.
+- `name` must match `owner/name`, `base` must be a 40-character hex commit, and the branch must be a plain ref name. Alate's values reach `gh api` paths only after these checks.
+- A path source (a local data repo in Alate) cannot be saved: the route returns 400.
+- After a commit, Ottr asks Alate to import it (`POST /api/import`), so the provision installs the new commit. The UI then calls the existing `POST /api/alate/provision`.
 - The board copy: on compose (`OTTR_BOARD_OMP_HOME` is set), the hourly deploy seeds it (OTTR-188) and records the seeded commit in `<dirname(OTTR_BOARD_OMP_HOME)>/seed-commit` (`/etc/ottr/seed-commit`). Without `OTTR_BOARD_OMP_HOME`, the board reads the copy that the provision installs, and no seed step applies.
 
 ## API
@@ -46,12 +52,10 @@ Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles"
    - `roles` must hold at least one role.
    - Each value must be `<catalog selector>` or `<catalog selector>:<level>`. This applies to every value, also to an unchanged value. The catalog is `omp models --json` (the `/api/models` list). The level is one of `THINKING_LEVELS` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`). A value with a known model and an unknown suffix gets "unknown thinking level".
    - A save that changes nothing gives 400 `nothing to save`.
-3. Ottr writes the new text (see "Text edit") and sends `PUT /api/file` with `base` = the hash.
-4. When Alate answers 409 `changed since it was loaded`, the data repo moved after the re-import. Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles }`. Ottr never retries the write by itself. Another Alate 409 (a provision or a file write is running) returns 409 `{ error }` with no `roles`. When the refresh fails, the route returns the refresh error.
-5. When Alate does not answer the write in 110 s, the route returns 504: the commit can still land, so the user reads again.
-6. Success: 200 `{ commit, base, hash, roles, seed }`. `base` is the new commit.
-
-Known limit: Alate's `PUT /api/file` checks a file hash, not a parent commit. A commit that lands on main in the seconds between Ottr's re-import and Alate's own clone still gets the save on top (a normal push, never a force push). To close this window, Alate's write must accept a base commit.
+3. Ottr writes the new text (see "Text edit") as a GitHub commit with the loaded `base` as its parent (see "Data path").
+4. When GitHub refuses the fast-forward, the data repo moved after the re-import. Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles }`. Ottr never retries the write by itself. When the refresh fails, the route returns the refresh error. Other GitHub errors (no write access, no token, gh missing) return 502 with GitHub's message.
+5. When Alate cannot import the new commit, the route returns 502 with an error that names the commit. The commit stays in the data repo.
+6. Success: 200 `{ commit, base, hash, roles, seed }` from the import after the commit.
 
 The commit message is a Conventional Commit of at most 500 characters:
 
@@ -99,7 +103,8 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 ## Non-goals
 
 - Other `config.yml` keys, and edits of a local `config.yml` copy.
-- A direct GitHub API path or a board-side git clone: Alate owns the data repo access.
+- A board-side git clone of the data repo: Alate reads it, and the GitHub API writes it.
+- Saves to a path source in Alate: these need a GitHub repo source.
 - A board-triggered seed: the board container cannot run `board-seed`. The hourly deploy does it.
 - Provider API keys in the env do not clear the sign-in warning.
 - A seed state from git history: the board has no clone of the data repo, so the seed step compares roles, not commits.

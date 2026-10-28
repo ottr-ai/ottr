@@ -34,7 +34,8 @@ function parse(text: string): Doc {
 export function readRoles(text: string): Record<string, string> {
 	scan(text);
 	const roles = parse(text).modelRoles;
-	const out: Record<string, string> = {};
+	// Null prototype: a "__proto__" role in the file stays a role, not the map's prototype.
+	const out: Record<string, string> = Object.create(null);
 	if (typeof roles === "object" && roles !== null)
 		for (const [name, v] of Object.entries(roles))
 			if (typeof v === "string" && v !== "") out[name] = v;

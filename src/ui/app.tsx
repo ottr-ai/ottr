@@ -63,6 +63,7 @@ import {
 	type ModelCatalog,
 	modelMatches,
 	modelRows,
+	ownField,
 	reviewModel,
 	roleWarnings,
 	type StoreActive,
@@ -9420,8 +9421,8 @@ function ModelRolesSection() {
 			<h2>Model roles</h2>
 			<p className="hint">
 				omp runs each role with its model. Save commits{" "}
-				<code>user/omp/agent/config.yml</code> to the data repo through Alate,
-				then provisions the workers.
+				<code>user/omp/agent/config.yml</code> to Alate's data repo with the
+				board's GitHub token, then Alate provisions the workers.
 			</p>
 			{loadErr !== null ? (
 				<p className="hint" role="status">
@@ -9444,7 +9445,7 @@ function ModelRolesSection() {
 					<div className="alate-def-rows">
 						{rows.map(([name, value], i) => {
 							const [base, level] = splitLevel(value);
-							const field = fields[name];
+							const field = ownField(fields, name);
 							const warnings = roleWarnings(value, state.signIns);
 							const notesId =
 								field !== undefined || warnings.length > 0

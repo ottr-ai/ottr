@@ -2000,80 +2000,100 @@ extensions:
 `;
 	const sha = (s: string) =>
 		new Bun.CryptoHasher("sha256").update(s).digest("hex");
-	// Fake alate file editor: `snapshot` is its last import (commit `snapSha`), `head` the
-	// data repo branch head (commit `headSha`). `afterImport` moves main once an import ends.
-	let snapshot = ORIGINAL;
+	const BASE = "a".repeat(40);
+	const OTHER = "b".repeat(40);
+	const NEW = "c".repeat(40);
+	// The data repo's branch head: content and commit. Alate's snapshot (`snapshot`/`snapSha`)
+	// follows it on each import. `afterImport` moves main once, right after an import.
 	let head = ORIGINAL;
-	let snapSha = "base0";
-	let headSha = "base0";
+	let headSha = BASE;
+	let snapshot = ORIGINAL;
+	let snapSha = BASE;
 	let afterImport: (() => void) | null = null;
-	let reqs: {
-		method: string;
-		url: string;
-		auth: string | null;
-		body?: unknown;
-	}[] = [];
+	let alateReqs: { method: string; url: string; auth: string | null }[] = [];
+	// gh api calls; `pending` holds the tree content until the ref moves.
+	let ghCalls: string[][] = [];
+	let pending: { content: string; parent: string } | null = null;
 	const reset = () => {
-		snapshot = ORIGINAL;
-		head = ORIGINAL;
-		snapSha = headSha = "base0";
+		head = snapshot = ORIGINAL;
+		headSha = snapSha = BASE;
 		afterImport = null;
-		reqs = [];
+		alateReqs = [];
+		ghCalls = [];
+		pending = null;
 	};
+	const source = () => ({
+		kind: "repo",
+		spec: "o/data",
+		name: "o/data",
+		ref: "main",
+		importedSha: snapSha,
+	});
 	const fake = Bun.serve({
 		port: 0,
-		fetch: async (req) => {
+		fetch: (req) => {
 			const u = new URL(req.url);
-			const body = await req.json().catch(() => undefined);
-			reqs.push({
+			alateReqs.push({
 				method: req.method,
 				url: u.pathname + u.search,
 				auth: req.headers.get("authorization"),
-				...(body === undefined ? {} : { body }),
 			});
 			if (u.pathname === "/health")
-				return Response.json({
-					ok: true,
-					running: false,
-					repo: "o/data",
-					path: null,
-				});
+				return Response.json({ ok: true, running: false, repo: "o/data" });
 			if (u.pathname === "/api/state")
-				return Response.json({ source: { importedSha: snapSha } });
+				return Response.json({ source: source() });
 			if (u.pathname === "/api/import") {
 				snapshot = head;
 				snapSha = headSha;
 				const moved = afterImport;
 				afterImport = null;
 				moved?.();
-				return Response.json({
-					ok: true,
-					state: { source: { importedSha: snapSha } },
-				});
+				return Response.json({ ok: true, state: { source: source() } });
 			}
-			if (req.method === "GET")
-				return Response.json({
-					path: u.searchParams.get("path"),
-					content: snapshot,
-					hash: sha(snapshot),
-				});
-			const b = body as { content: string; base: string };
-			if (b.base !== sha(head))
-				return Response.json(
-					{
-						error:
-							"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
-					},
-					{ status: 409 },
-				);
-			head = snapshot = b.content;
-			headSha = snapSha = "c0ffee1234";
-			return Response.json({ ok: true, commit: "c0ffee1234", pushed: true });
+			return Response.json({
+				path: u.searchParams.get("path"),
+				content: snapshot,
+				hash: sha(snapshot),
+			});
 		},
 	});
 	afterAll(() => {
 		fake.stop(true);
 	});
+	const field = (args: string[], key: string) =>
+		args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1) as string;
+	// Fake GitHub: the ref moves only as a fast-forward, like `force: false` on GitHub.
+	const gh = async (args: string[]) => {
+		ghCalls.push(args);
+		const ok = (body: unknown) => ({
+			code: 0,
+			stdout: JSON.stringify(body),
+			stderr: "",
+		});
+		const path = args.find((a) => a.startsWith("repos/")) ?? "";
+		if (path.startsWith("repos/o/data/git/commits/"))
+			return ok({ sha: path.split("/").at(-1), tree: { sha: "t0" } });
+		if (path === "repos/o/data/git/trees") {
+			pending = { content: field(args, "tree[][content]"), parent: "" };
+			return ok({ sha: "t1" });
+		}
+		if (path === "repos/o/data/git/commits") {
+			if (pending) pending.parent = field(args, "parents[]");
+			return ok({ sha: NEW });
+		}
+		if (path === "repos/o/data/git/refs/heads/main") {
+			if (pending === null || pending.parent !== headSha)
+				return {
+					code: 1,
+					stdout: JSON.stringify({ message: "Update is not a fast forward" }),
+					stderr: "gh: Update is not a fast forward (HTTP 422)",
+				};
+			head = pending.content;
+			headSha = NEW;
+			return ok({ object: { sha: NEW } });
+		}
+		return { code: 1, stdout: "", stderr: `unexpected gh call: ${path}` };
+	};
 	const model = (selector: string) => ({
 		id: selector,
 		selector,
@@ -2081,6 +2101,7 @@ extensions:
 		contextWindow: null,
 	});
 	const m = mount({
+		gh,
 		models: async () => [
 			model("zai/glm-5.3-flash"),
 			model("anthropic/claude-opus-5-5"),
@@ -2093,9 +2114,11 @@ extensions:
 		});
 		expect(res.status).toBe(200);
 	});
-	const puts = () => reqs.filter((r) => r.method === "PUT");
+	const refMoves = () =>
+		ghCalls.filter((a) => a.includes("repos/o/data/git/refs/heads/main"));
+	const imports = () => alateReqs.filter((r) => r.url === "/api/import");
 
-	test("GET returns the roles in file order, the hash, sign-ins and the seed", async () => {
+	test("GET returns the roles in file order, the base commit, the hash, sign-ins and the seed", async () => {
 		reset();
 		const res = await m.call("/api/model-roles");
 		expect(res.status).toBe(200);
@@ -2106,7 +2129,7 @@ extensions:
 			signIns: unknown[];
 			seed: { needed: boolean };
 		};
-		expect(b.base).toBe("base0");
+		expect(b.base).toBe(BASE);
 		expect(b.hash).toBe(sha(ORIGINAL));
 		expect(Object.entries(b.roles)).toEqual([
 			["default", "zai/glm-5.3-flash:max"],
@@ -2114,16 +2137,16 @@ extensions:
 		]);
 		expect(Array.isArray(b.signIns)).toBe(true);
 		expect(typeof b.seed.needed).toBe("boolean");
-		expect(reqs.map((r) => `${r.method} ${r.url} ${r.auth}`)).toEqual([
+		expect(alateReqs.map((r) => `${r.method} ${r.url} ${r.auth}`)).toEqual([
 			"GET /api/state Bearer roles_secret",
 			"GET /api/file?path=user%2Fomp%2Fagent%2Fconfig.yml Bearer roles_secret",
 		]);
 	});
 
-	test("an unknown model or level is refused and never reaches PUT /api/file", async () => {
+	test("an unknown model or level is refused and nothing is committed", async () => {
 		reset();
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: sha(ORIGINAL),
 			roles: {
 				default: "nope/model",
@@ -2134,13 +2157,13 @@ extensions:
 		const b = (await res.json()) as { fields: Record<string, string> };
 		expect(b.fields.default).toBe("unknown model nope/model");
 		expect(b.fields.slow).toStartWith("unknown thinking level");
-		expect(puts()).toEqual([]);
+		expect(ghCalls).toEqual([]);
 	});
 
-	test("a save commits only the changed value line", async () => {
+	test("a save commits only the changed value line on top of the loaded commit", async () => {
 		reset();
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: sha(ORIGINAL),
 			roles: {
 				default: "anthropic/claude-opus-5-5:high",
@@ -2153,42 +2176,68 @@ extensions:
 			"default: anthropic/claude-opus-5-5:high",
 		);
 		expect(await res.json()).toMatchObject({
-			commit: "c0ffee1234",
-			base: "c0ffee1234",
+			commit: NEW,
+			base: NEW,
 			hash: sha(want),
 			roles: {
 				default: "anthropic/claude-opus-5-5:high",
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
 		});
-		expect(puts()).toEqual([
-			{
-				method: "PUT",
-				url: "/api/file",
-				auth: "Bearer roles_secret",
-				body: {
-					path: "user/omp/agent/config.yml",
-					content: want,
-					base: sha(ORIGINAL),
-					message:
-						"chore: set the default model role to anthropic/claude-opus-5-5:high",
-				},
-			},
+		expect(head).toBe(want);
+		expect(ghCalls).toEqual([
+			["api", `repos/o/data/git/commits/${BASE}`],
+			[
+				"api",
+				"-X",
+				"POST",
+				"repos/o/data/git/trees",
+				"-f",
+				"base_tree=t0",
+				"-f",
+				"tree[][path]=user/omp/agent/config.yml",
+				"-f",
+				"tree[][mode]=100644",
+				"-f",
+				"tree[][type]=blob",
+				"-f",
+				`tree[][content]=${want}`,
+			],
+			[
+				"api",
+				"-X",
+				"POST",
+				"repos/o/data/git/commits",
+				"-f",
+				"message=chore: set the default model role to anthropic/claude-opus-5-5:high",
+				"-f",
+				"tree=t1",
+				"-f",
+				`parents[]=${BASE}`,
+			],
+			[
+				"api",
+				"-X",
+				"PATCH",
+				"repos/o/data/git/refs/heads/main",
+				"-f",
+				`sha=${NEW}`,
+				"-F",
+				"force=false",
+			],
 		]);
+		// One import for the conflict check, one so the provision installs the new commit.
+		expect(imports()).toHaveLength(2);
 	});
 
-	test("main moving between the re-import and alate's write gives 409 and no second write", async () => {
+	test("an unrelated commit on main between the check and the write gives 409, not a commit on top", async () => {
 		reset();
-		const moved = ORIGINAL.replace(
-			"anthropic/claude-opus-5-5:medium",
-			"zai/glm-5.3-flash",
-		);
+		// config.yml stays the same: only the loaded parent commit can catch this move.
 		afterImport = () => {
-			head = moved;
-			headSha = "moved1";
+			headSha = OTHER;
 		};
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: sha(ORIGINAL),
 			roles: {
 				default: "anthropic/claude-opus-5-5",
@@ -2198,27 +2247,26 @@ extensions:
 		expect(res.status).toBe(409);
 		expect(await res.json()).toEqual({
 			error:
-				"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
-			base: "moved1",
-			hash: sha(moved),
-			roles: { default: "zai/glm-5.3-flash:max", slow: "zai/glm-5.3-flash" },
+				"the data repo changed while the roles saved; check the current roles and save again",
+			base: OTHER,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
 		});
-		expect(puts()).toHaveLength(1);
-		expect(reqs.filter((r) => r.url === "/api/import")).toEqual(
-			Array(2).fill({
-				method: "POST",
-				url: "/api/import",
-				auth: "Bearer roles_secret",
-				body: { source: "o/data", kind: "repo" },
-			}),
-		);
+		expect(head).toBe(ORIGINAL);
+		expect(headSha).toBe(OTHER);
+		// One refused fast-forward, never retried and never forced.
+		expect(refMoves()).toHaveLength(1);
+		expect(refMoves()[0]).toContain("force=false");
 	});
 
-	test("a commit on main that leaves config.yml alone still gives 409 and no write", async () => {
+	test("a commit on main before the save leaves config.yml alone and still gives 409 and no write", async () => {
 		reset();
-		headSha = "other1";
+		headSha = OTHER;
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: sha(ORIGINAL),
 			roles: {
 				default: "anthropic/claude-opus-5-5",
@@ -2227,14 +2275,14 @@ extensions:
 		});
 		expect(res.status).toBe(409);
 		expect(await res.json()).toMatchObject({
-			base: "other1",
+			base: OTHER,
 			hash: sha(ORIGINAL),
 			roles: {
 				default: "zai/glm-5.3-flash:max",
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
 		});
-		expect(puts()).toEqual([]);
+		expect(ghCalls).toEqual([]);
 	});
 
 	test("a stale form whose values another save already set gets 409, not 'nothing to save'", async () => {
@@ -2244,25 +2292,25 @@ extensions:
 			slow: "anthropic/claude-opus-5-5:medium",
 		};
 		head = ORIGINAL.replace("zai/glm-5.3-flash:max", wanted.default);
-		headSha = "other2";
+		headSha = OTHER;
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: sha(ORIGINAL),
 			roles: wanted,
 		});
 		expect(res.status).toBe(409);
 		expect(await res.json()).toMatchObject({
-			base: "other2",
+			base: OTHER,
 			hash: sha(head),
 			roles: wanted,
 		});
-		expect(puts()).toEqual([]);
+		expect(ghCalls).toEqual([]);
 	});
 
 	test("a stale body hash gives 409 with the current roles and no write", async () => {
 		reset();
 		const res = await m.call("/api/model-roles", {
-			base: "base0",
+			base: BASE,
 			hash: "stale",
 			roles: { default: "anthropic/claude-opus-5-5" },
 		});
@@ -2274,7 +2322,7 @@ extensions:
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
 		});
-		expect(puts()).toEqual([]);
+		expect(ghCalls).toEqual([]);
 	});
 });
 
