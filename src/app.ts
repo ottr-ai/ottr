@@ -3640,7 +3640,7 @@ export function createApp(deps: AppDeps) {
 						}
 						const sha = w.body.commit;
 						// The provision installs alate's snapshot, so alate must import the new commit.
-						const imported = await loadConfigYml(true);
+						const imported = await refreshAlateSnapshot();
 						if (!imported.ok)
 							return json(
 								{
@@ -3648,11 +3648,16 @@ export function createApp(deps: AppDeps) {
 								},
 								502,
 							);
+						// The answer describes the commit this save created, never the imported head:
+						// a commit that lands on main after ours must reach the user as a conflict
+						// on the next save, not as roles and a base that this save never wrote.
 						return json({
 							commit: sha,
-							base: imported.body.base,
-							hash: imported.body.hash,
-							roles: readRoles(imported.body.content),
+							base: sha,
+							hash: new Bun.CryptoHasher("sha256")
+								.update(content)
+								.digest("hex"),
+							roles: readRoles(content),
 							seed: seedView(),
 						});
 					}),

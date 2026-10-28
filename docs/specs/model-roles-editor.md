@@ -55,7 +55,7 @@ Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles"
 3. Ottr writes the new text (see "Text edit") as a GitHub commit with the loaded `base` as its parent (see "Data path").
 4. When GitHub refuses the fast-forward, the data repo moved after the re-import. Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles }`. Ottr never retries the write by itself. When the refresh fails, the route returns the refresh error. Other GitHub errors (no write access, no token, gh missing) return 502 with GitHub's message.
 5. When Alate cannot import the new commit, the route returns 502 with an error that names the commit. The commit stays in the data repo.
-6. Success: 200 `{ commit, base, hash, roles, seed }` from the import after the commit.
+6. Success: 200 `{ commit, base, hash, roles, seed }`. `commit` and `base` are the created commit, `hash` is the sha256 of the written content, and `roles` are the written roles. The answer never takes values from Alate's import after the commit: another commit can land on main in that time. The next save then meets that commit as a 409 conflict. The UI keeps these values for the rows. Its 60 s seed poll takes only `seed`.
 
 The commit message is a Conventional Commit of at most 500 characters:
 

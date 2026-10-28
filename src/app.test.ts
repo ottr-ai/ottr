@@ -2010,6 +2010,8 @@ extensions:
 	let snapshot = ORIGINAL;
 	let snapSha = BASE;
 	let afterImport: (() => void) | null = null;
+	// Another writer's commit that lands on main right after the save's own ref move.
+	let afterRefMove: (() => void) | null = null;
 	let alateReqs: { method: string; url: string; auth: string | null }[] = [];
 	// gh api calls; `pending` holds the tree content until the ref moves.
 	let ghCalls: string[][] = [];
@@ -2018,6 +2020,7 @@ extensions:
 		head = snapshot = ORIGINAL;
 		headSha = snapSha = BASE;
 		afterImport = null;
+		afterRefMove = null;
 		alateReqs = [];
 		ghCalls = [];
 		pending = null;
@@ -2090,6 +2093,9 @@ extensions:
 				};
 			head = pending.content;
 			headSha = NEW;
+			const next = afterRefMove;
+			afterRefMove = null;
+			next?.();
 			return ok({ object: { sha: NEW } });
 		}
 		return { code: 1, stdout: "", stderr: `unexpected gh call: ${path}` };
@@ -2228,6 +2234,67 @@ extensions:
 		]);
 		// One import for the conflict check, one so the provision installs the new commit.
 		expect(imports()).toHaveLength(2);
+		// The answer's base and hash are the next save's starting point: no false conflict.
+		const b = (await (await m.call("/api/model-roles")).json()) as {
+			base: string;
+		};
+		expect(b.base).toBe(NEW);
+		const again = await m.call("/api/model-roles", {
+			base: NEW,
+			hash: sha(want),
+			roles: {
+				default: "anthropic/claude-opus-5-5:low",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(again.status).toBe(200);
+	});
+
+	test("a commit that lands on main right after the save does not leak into the save's answer", async () => {
+		reset();
+		const theirs = ORIGINAL.replace(
+			"anthropic/claude-opus-5-5:medium",
+			"zai/glm-5.3-flash",
+		);
+		afterRefMove = () => {
+			head = theirs;
+			headSha = OTHER;
+		};
+		const roles = {
+			default: "anthropic/claude-opus-5-5:high",
+			slow: "anthropic/claude-opus-5-5:medium",
+		};
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: sha(ORIGINAL),
+			roles,
+		});
+		expect(res.status).toBe(200);
+		const want = ORIGINAL.replace(
+			"default: zai/glm-5.3-flash:max",
+			"default: anthropic/claude-opus-5-5:high",
+		);
+		const b = (await res.json()) as {
+			commit: string;
+			base: string;
+			hash: string;
+			roles: Record<string, string>;
+		};
+		// The created commit, its content hash and its roles: not the head alate imported after it.
+		expect(snapSha).toBe(OTHER);
+		expect(b).toMatchObject({ commit: NEW, base: NEW, hash: sha(want), roles });
+		// The next save from that answer meets the other commit as a real conflict.
+		const next = await m.call("/api/model-roles", {
+			base: b.base,
+			hash: b.hash,
+			roles: { ...roles, default: "anthropic/claude-opus-5-5:low" },
+		});
+		expect(next.status).toBe(409);
+		expect(await next.json()).toMatchObject({
+			base: OTHER,
+			hash: sha(theirs),
+			roles: { default: "zai/glm-5.3-flash:max", slow: "zai/glm-5.3-flash" },
+		});
 	});
 
 	test("an unrelated commit on main between the check and the write gives 409, not a commit on top", async () => {

@@ -9298,7 +9298,9 @@ function ModelRolesSection() {
 	useEffect(() => {
 		if (!seedWaits) return;
 		const t = setInterval(() => {
-			// A failed read keeps the line waiting; the next tick reads again.
+			// A failed read keeps the line waiting; the next tick reads again. Only the seed
+			// state is taken: the rows, base and hash stay the saved commit's, so a later
+			// commit on main reaches the next save as a conflict, not as silently swapped rows.
 			load().then(
 				(s) => setState((old) => old && { ...old, seed: s.seed }),
 				() => {},
