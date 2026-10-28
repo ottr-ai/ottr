@@ -281,6 +281,7 @@ function mount(
 		gh?: GhFn;
 		sshDir?: string;
 		keyscan?: Keyscan;
+		models?: Parameters<typeof createApp>[0]["models"];
 	} = {},
 ) {
 	const g =
@@ -323,6 +324,7 @@ function mount(
 		gh: input.gh,
 		sshDir: input.sshDir,
 		keyscan: input.keyscan,
+		models: input.models,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -1985,6 +1987,222 @@ describe("alate provision trigger (U9)", () => {
 			lastProvisionError: string | null;
 		};
 		expect(after.lastProvisionError).toBe(null);
+	});
+});
+
+describe("model roles routes", () => {
+	const ORIGINAL = `theme: dark
+modelRoles:
+  default: zai/glm-5.3-flash:max
+  slow: anthropic/claude-opus-5-5:medium  # planner
+extensions:
+  - ./check.yml
+`;
+	const sha = (s: string) =>
+		new Bun.CryptoHasher("sha256").update(s).digest("hex");
+	// Fake alate file editor: `snapshot` is its last import, `head` the data repo branch head.
+	let snapshot = ORIGINAL;
+	let head = ORIGINAL;
+	let reqs: {
+		method: string;
+		url: string;
+		auth: string | null;
+		body?: unknown;
+	}[] = [];
+	const reset = () => {
+		snapshot = ORIGINAL;
+		head = ORIGINAL;
+		reqs = [];
+	};
+	const fake = Bun.serve({
+		port: 0,
+		fetch: async (req) => {
+			const u = new URL(req.url);
+			const body = await req.json().catch(() => undefined);
+			reqs.push({
+				method: req.method,
+				url: u.pathname + u.search,
+				auth: req.headers.get("authorization"),
+				...(body === undefined ? {} : { body }),
+			});
+			if (u.pathname === "/health")
+				return Response.json({
+					ok: true,
+					running: false,
+					repo: "o/data",
+					path: null,
+				});
+			if (u.pathname === "/api/import") {
+				snapshot = head;
+				return Response.json({ ok: true });
+			}
+			if (req.method === "GET")
+				return Response.json({
+					path: u.searchParams.get("path"),
+					content: snapshot,
+					hash: sha(snapshot),
+				});
+			const b = body as { content: string; base: string };
+			if (b.base !== sha(head))
+				return Response.json(
+					{
+						error:
+							"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
+					},
+					{ status: 409 },
+				);
+			head = snapshot = b.content;
+			return Response.json({ ok: true, commit: "c0ffee1234", pushed: true });
+		},
+	});
+	afterAll(() => {
+		fake.stop(true);
+	});
+	const model = (selector: string) => ({
+		id: selector,
+		selector,
+		name: selector,
+		contextWindow: null,
+	});
+	const m = mount({
+		models: async () => [
+			model("zai/glm-5.3-flash"),
+			model("anthropic/claude-opus-5-5"),
+		],
+	});
+	beforeAll(async () => {
+		const res = await m.call("/api/alate", {
+			url: fake.url.origin,
+			key: "roles_secret",
+		});
+		expect(res.status).toBe(200);
+	});
+	const puts = () => reqs.filter((r) => r.method === "PUT");
+
+	test("GET returns the roles in file order, the hash, sign-ins and the seed", async () => {
+		reset();
+		const res = await m.call("/api/model-roles");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			hash: string;
+			roles: Record<string, string>;
+			signIns: unknown[];
+			seed: { needed: boolean };
+		};
+		expect(b.hash).toBe(sha(ORIGINAL));
+		expect(Object.entries(b.roles)).toEqual([
+			["default", "zai/glm-5.3-flash:max"],
+			["slow", "anthropic/claude-opus-5-5:medium"],
+		]);
+		expect(Array.isArray(b.signIns)).toBe(true);
+		expect(typeof b.seed.needed).toBe("boolean");
+		expect(reqs[0]).toEqual({
+			method: "GET",
+			url: "/api/file?path=user%2Fomp%2Fagent%2Fconfig.yml",
+			auth: "Bearer roles_secret",
+		});
+	});
+
+	test("an unknown model or level is refused and never reaches PUT /api/file", async () => {
+		reset();
+		const res = await m.call("/api/model-roles", {
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "nope/model",
+				slow: "anthropic/claude-opus-5-5:turbo",
+			},
+		});
+		expect(res.status).toBe(400);
+		const b = (await res.json()) as { fields: Record<string, string> };
+		expect(b.fields.default).toBe("unknown model nope/model");
+		expect(b.fields.slow).toStartWith("unknown thinking level");
+		expect(puts()).toEqual([]);
+	});
+
+	test("a save commits only the changed value line", async () => {
+		reset();
+		const res = await m.call("/api/model-roles", {
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "anthropic/claude-opus-5-5:high",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(res.status).toBe(200);
+		const want = ORIGINAL.replace(
+			"default: zai/glm-5.3-flash:max",
+			"default: anthropic/claude-opus-5-5:high",
+		);
+		expect(await res.json()).toMatchObject({
+			commit: "c0ffee1234",
+			hash: sha(want),
+			roles: {
+				default: "anthropic/claude-opus-5-5:high",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(puts()).toEqual([
+			{
+				method: "PUT",
+				url: "/api/file",
+				auth: "Bearer roles_secret",
+				body: {
+					path: "user/omp/agent/config.yml",
+					content: want,
+					base: sha(ORIGINAL),
+					message:
+						"chore: set the default model role to anthropic/claude-opus-5-5:high",
+				},
+			},
+		]);
+	});
+
+	test("a moved data repo gives 409 with the current roles and no second write", async () => {
+		reset();
+		head = ORIGINAL.replace(
+			"anthropic/claude-opus-5-5:medium",
+			"zai/glm-5.3-flash",
+		);
+		const res = await m.call("/api/model-roles", {
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "anthropic/claude-opus-5-5",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(res.status).toBe(409);
+		expect(await res.json()).toEqual({
+			error:
+				"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
+			hash: sha(head),
+			roles: { default: "zai/glm-5.3-flash:max", slow: "zai/glm-5.3-flash" },
+		});
+		expect(puts()).toHaveLength(1);
+		expect(reqs.filter((r) => r.url === "/api/import")).toEqual([
+			{
+				method: "POST",
+				url: "/api/import",
+				auth: "Bearer roles_secret",
+				body: { source: "o/data", kind: "repo" },
+			},
+		]);
+	});
+
+	test("a stale body hash gives 409 with the current roles and no write", async () => {
+		reset();
+		const res = await m.call("/api/model-roles", {
+			hash: "stale",
+			roles: { default: "anthropic/claude-opus-5-5" },
+		});
+		expect(res.status).toBe(409);
+		expect(await res.json()).toMatchObject({
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(puts()).toEqual([]);
 	});
 });
 

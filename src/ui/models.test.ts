@@ -8,6 +8,7 @@ import {
 	modelRows,
 	resetCatalogCache,
 	reviewModel,
+	roleWarnings,
 	splitLevel,
 } from "./models.ts";
 
@@ -268,4 +269,22 @@ test("an empty catalog is not cached: the next mount retries", async () => {
 	expect(good.calls()).toBe(1);
 	expect(again).toBe(c);
 	resetCatalogCache();
+});
+
+test("roleWarnings names each readable store without an active sign-in for the provider", () => {
+	const signIns = [
+		{ store: "board" as const, active: ["anthropic"] },
+		{ store: "workers" as const, active: ["zai"] },
+	];
+	expect(roleWarnings("zai/glm-5.3-flash:max", signIns)).toEqual([
+		"No active sign-in for zai on the board",
+	]);
+	expect(roleWarnings("anthropic/claude-opus-5-5", signIns)).toEqual([
+		"No active sign-in for anthropic on the workers",
+	]);
+	// An unreadable store and a selector without a provider give no warning.
+	expect(
+		roleWarnings("openai/gpt", [{ store: "board", active: null }]),
+	).toEqual([]);
+	expect(roleWarnings("bare-model", signIns)).toEqual([]);
 });

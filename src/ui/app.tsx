@@ -64,6 +64,8 @@ import {
 	modelMatches,
 	modelRows,
 	reviewModel,
+	roleWarnings,
+	type StoreActive,
 	splitLevel,
 	THINKING_LEVELS,
 	useModels,
@@ -9210,6 +9212,412 @@ function ProviderLoginSection() {
 	);
 }
 
+/** GET /api/model-roles: omp's modelRoles in the data repo, the sign-ins, and the board seed state. */
+type RolesState = {
+	hash: string;
+	roles: Record<string, string>;
+	signIns: StoreActive[];
+	seed: { needed: boolean; commit: string | null };
+};
+/** One script result of POST /api/alate/provision. */
+type ProvisionResult = {
+	script: string;
+	code: number;
+	output: string;
+	truncated: boolean;
+};
+/** The provision after a commit: running, still running on Alate (202), or its result. */
+type ProvisionStep =
+	| { state: "running" }
+	| { state: "still" }
+	| {
+			state: "done";
+			ok: boolean;
+			results: ProvisionResult[];
+			error: string | null;
+	  };
+
+const shortSha = (sha: string): string => sha.slice(0, 7);
+
+/** Settings "Model roles" section: edits omp's modelRoles in the data repo through Alate, then provisions. */
+function ModelRolesSection() {
+	const catalog = useModels();
+	const [state, setState] = useState<RolesState | null>(null);
+	const [loadErr, setLoadErr] = useState<string | null>(null);
+	const [rows, setRows] = useState<Array<[string, string]>>([]);
+	const [fields, setFields] = useState<Record<string, string>>({});
+	const [error, setError] = useState<string | null>(null);
+	const [newName, setNewName] = useState("");
+	const [addErr, setAddErr] = useState<string | null>(null);
+	const [commit, setCommit] = useState<string | null>(null);
+	const [prov, setProv] = useState<ProvisionStep | null>(null);
+	const save = useBusy();
+	const uid = useId();
+	const load = useCallback(
+		async (): Promise<RolesState> =>
+			unwrap<RolesState>(await fetch("/api/model-roles")),
+		[],
+	);
+	useEffect(() => {
+		let live = true;
+		load().then(
+			(s) => {
+				if (!live) return;
+				setState(s);
+				setRows(Object.entries(s.roles));
+			},
+			(err: unknown) => {
+				if (live) setLoadErr(err instanceof Error ? err.message : String(err));
+			},
+		);
+		return () => {
+			live = false;
+		};
+	}, [load]);
+	const seed = state?.seed ?? null;
+	const seedWaits =
+		commit !== null && seed?.needed === true && seed.commit !== commit;
+	// The hourly deploy seeds the board copy: read the seed state each minute until it has the commit.
+	useEffect(() => {
+		if (!seedWaits) return;
+		const t = setInterval(() => {
+			// A failed read keeps the line waiting; the next tick reads again.
+			load().then(
+				(s) => setState((old) => old && { ...old, seed: s.seed }),
+				() => {},
+			);
+		}, 60_000);
+		return () => clearInterval(t);
+	}, [seedWaits, load]);
+	const models = [...(catalog?.models ?? [])].sort((a, b) =>
+		a.name.localeCompare(b.name),
+	);
+	const dirty =
+		state !== null &&
+		JSON.stringify(rows) !== JSON.stringify(Object.entries(state.roles));
+	const setValue = (name: string, value: string): void => {
+		setRows((rs) => rs.map((r) => (r[0] === name ? [name, value] : r)));
+		setFields((f) =>
+			Object.fromEntries(Object.entries(f).filter(([k]) => k !== name)),
+		);
+	};
+	const add = (): void => {
+		const name = newName.trim();
+		const first = models[0]?.selector;
+		if (name === "") setAddErr("Type a role name.");
+		else if (rows.some(([n]) => n === name))
+			setAddErr(`The ${name} role exists already.`);
+		else if (first === undefined)
+			setAddErr("The model list is empty, so a new role has no model.");
+		else {
+			setRows((rs) => [...rs, [name, first]]);
+			setNewName("");
+			setAddErr(null);
+		}
+	};
+	const provision = async (): Promise<void> => {
+		setProv({ state: "running" });
+		try {
+			const res = await post<{
+				ok: boolean;
+				running?: boolean;
+				results?: ProvisionResult[];
+			}>("/api/alate/provision", {});
+			setProv(
+				res.running === true
+					? { state: "still" }
+					: {
+							state: "done",
+							ok: res.ok,
+							results: res.results ?? [],
+							error: null,
+						},
+			);
+		} catch (err) {
+			setProv({
+				state: "done",
+				ok: false,
+				results: [],
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	};
+	const submit = (): void =>
+		save.start(async () => {
+			if (state === null) return false;
+			setError(null);
+			setFields({});
+			setCommit(null);
+			setProv(null);
+			try {
+				const res = await fetch("/api/model-roles", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						hash: state.hash,
+						roles: Object.fromEntries(rows),
+					}),
+				});
+				const body = (await res.json().catch(() => ({}))) as Partial<
+					Omit<RolesState, "signIns">
+				> & {
+					error?: string;
+					fields?: Record<string, string>;
+					commit?: string;
+				};
+				const { commit: sha, hash, roles, seed: next } = body;
+				if (res.ok && sha && hash && roles && next) {
+					setState((old) => old && { ...old, hash, roles, seed: next });
+					setRows(Object.entries(roles));
+					setCommit(sha);
+					// The commit stands even when the provision fails; the steps list says so.
+					await provision();
+					return true;
+				}
+				if (res.status === 409 && hash && roles) {
+					// The data repo moved: load its current values, so the next save starts from them.
+					setState((old) => old && { ...old, hash, roles });
+					setRows(Object.entries(roles));
+					setError(
+						`${body.error ?? "The model roles changed in the data repo."} The rows now show the current values. Make your change again.`,
+					);
+					return false;
+				}
+				setFields(body.fields ?? {});
+				setError(body.error ?? `HTTP ${res.status}`);
+				return false;
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	const failed =
+		prov?.state === "done" ? prov.results.filter((r) => r.code !== 0) : [];
+	return (
+		<section className="settings-sec model-roles" id="model-roles-section">
+			<h2>Model roles</h2>
+			<p className="hint">
+				omp runs each role with its model. Save commits{" "}
+				<code>user/omp/agent/config.yml</code> to the data repo through Alate,
+				then provisions the workers.
+			</p>
+			{loadErr !== null ? (
+				<p className="hint" role="status">
+					Cannot load the model roles: {loadErr}.{" "}
+					<button
+						type="button"
+						className="notif-link"
+						onClick={() => openSettingsSection("alate-section")}
+					>
+						Open the Alate settings
+					</button>
+				</p>
+			) : state === null || catalog === null ? (
+				<p className="hint" role="status">
+					<span className="spinner" aria-hidden="true" />
+					Loading the model roles…
+				</p>
+			) : (
+				<>
+					<div className="alate-def-rows">
+						{rows.map(([name, value], i) => {
+							const [base, level] = splitLevel(value);
+							const field = fields[name];
+							const warnings = roleWarnings(value, state.signIns);
+							const notesId =
+								field !== undefined || warnings.length > 0
+									? `${uid}-${i}`
+									: undefined;
+							return (
+								<div className="alate-def-row role-row" key={name}>
+									<b className="role-name">{name}</b>
+									<select
+										value={base}
+										onChange={(e) =>
+											setValue(name, joinLevel(e.target.value, level))
+										}
+										aria-label={`Model for ${name}`}
+										aria-invalid={field !== undefined}
+										aria-describedby={notesId}
+										disabled={save.busy}
+									>
+										{!models.some((m) => m.selector === base) && (
+											<option value={base}>{base} (not in the catalog)</option>
+										)}
+										{models.map((m) => (
+											<option key={m.selector} value={m.selector}>
+												{m.name} ({m.id})
+											</option>
+										))}
+									</select>
+									<select
+										value={level}
+										onChange={(e) =>
+											setValue(name, joinLevel(base, e.target.value))
+										}
+										aria-label={`Thinking for ${name}`}
+										aria-invalid={field !== undefined}
+										aria-describedby={notesId}
+										disabled={save.busy}
+									>
+										<option value="">Default</option>
+										{THINKING_LEVELS.map((l) => (
+											<option key={l} value={l}>
+												{l}
+											</option>
+										))}
+									</select>
+									<button
+										type="button"
+										className="icon role-remove"
+										aria-label={`Remove role ${name}`}
+										title="Remove role"
+										onClick={() =>
+											setRows((rs) => rs.filter(([n]) => n !== name))
+										}
+										disabled={save.busy}
+									>
+										<Icon name="x" />
+									</button>
+									{notesId !== undefined && (
+										<div className="role-notes" id={notesId}>
+											{field !== undefined && (
+												<p className="auth-error">{field}</p>
+											)}
+											{warnings.map((w) => (
+												<p className="hint" key={w}>
+													<Mark kind="warn" />
+													{w}
+												</p>
+											))}
+										</div>
+									)}
+								</div>
+							);
+						})}
+					</div>
+					<form
+						className="role-add"
+						onSubmit={(e) => {
+							e.preventDefault();
+							add();
+						}}
+					>
+						<label className="field">
+							New role name
+							<input
+								type="text"
+								value={newName}
+								onChange={(e) => {
+									setNewName(e.target.value);
+									setAddErr(null);
+								}}
+								spellCheck={false}
+								autoComplete="off"
+								aria-invalid={addErr !== null}
+								aria-describedby={addErr !== null ? `${uid}-add` : undefined}
+								disabled={save.busy}
+							/>
+						</label>
+						<button type="submit" disabled={save.busy}>
+							Add
+						</button>
+					</form>
+					{addErr !== null && (
+						<p className="auth-error" id={`${uid}-add`} role="alert">
+							{addErr}
+						</p>
+					)}
+					<div className="alate-def-actions">
+						<button
+							type="button"
+							className={`primary${save.failed ? " failed" : ""}`}
+							onClick={submit}
+							disabled={!dirty || save.busy}
+						>
+							{save.busy && <span className="spinner" aria-hidden="true" />}
+							Save
+						</button>
+					</div>
+				</>
+			)}
+			{error !== null && (
+				<p className="auth-error" role="alert">
+					{error}
+				</p>
+			)}
+			<div aria-live="polite">
+				{commit !== null && (
+					<ol className="hint role-steps">
+						<li>
+							<Mark kind="done" />
+							Committed <code>{shortSha(commit)}</code> to the data repo.
+						</li>
+						<li>
+							{prov === null || prov.state === "running" ? (
+								<>
+									<span className="spinner" aria-hidden="true" />
+									Provisioning the workers…
+								</>
+							) : prov.state === "still" ? (
+								<>
+									<Mark kind="queued" />
+									The provision still runs on the Alate server. The Alate
+									dashboard shows its result.
+								</>
+							) : prov.ok && failed.length === 0 ? (
+								<>
+									<Mark kind="done" />
+									Provisioned the workers.
+								</>
+							) : (
+								<>
+									<Mark kind="crit" />
+									The provision failed
+									{prov.error !== null
+										? `: ${prov.error}`
+										: failed.length > 0
+											? `: ${failed.length} of ${prov.results.length} scripts failed`
+											: ""}
+									. The commit stays in the data repo. Use Provision now in the
+									Alate section to try again.
+								</>
+							)}
+						</li>
+						<li>
+							{seed === null || !seed.needed ? (
+								<>
+									<Mark kind="done" />
+									The board reads the provisioned copy.
+								</>
+							) : seed.commit === commit ? (
+								<>
+									<Mark kind="done" />
+									The board copy has <code>{shortSha(commit)}</code>.
+								</>
+							) : (
+								<>
+									<Mark kind="queued" />
+									Waiting for the hourly deploy to seed{" "}
+									<code>{shortSha(commit)}</code>.
+								</>
+							)}
+						</li>
+					</ol>
+				)}
+			</div>
+			{failed.map((r) => (
+				<div key={r.script}>
+					<p className="auth-error">
+						{r.script} — exit {r.code}
+					</p>
+					<pre className="log">{r.output}</pre>
+				</div>
+			))}
+		</section>
+	);
+}
+
 /** The board's Hindsight server and whether a key is in effect; the key itself is write-only. */
 type HindsightView = { url: string | null; tokenSet: boolean };
 
@@ -9875,6 +10283,7 @@ function SettingsPage({
 						<EnvSection />
 						<GitHostsSection />
 						<ProviderLoginSection />
+						<ModelRolesSection />
 						<HindsightSection />
 						<AlateSection />
 						<PushSection />

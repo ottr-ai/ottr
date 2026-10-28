@@ -139,6 +139,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Extra paths per worktree | none | **Settings** |
 | Alate provisioning | off | **Settings → Alate** (see [Alate](#alate)) |
 | Provider sign-in | omp's existing sign-ins | **Settings → Provider sign-in**: omp's sign-ins and the full provider list its `omp login` offers; sign-ins and quota live on the machine that runs the board. On compose, the board and the workers each keep their own sign-in: you authorize two times, and Settings shows the state of each store |
+| Model roles | the data repo's `user/omp/agent/config.yml` | **Settings → Model roles**: set the model and the thinking level of each omp role, or add and remove a role. A save commits `config.yml` to the data repo through Alate, then provisions the workers. On compose, the board copy changes at the next hourly seed. Needs **Settings → Alate**. Spec: [docs/specs/model-roles-editor.md](docs/specs/model-roles-editor.md) |
 | Retro | off | **Settings**, per project: files one retro card after each Done card |
 | Fork research | off | **Settings**, per project: hourly watch of the project's GitHub forks; findings arrive as proposals you accept |
 | Hindsight server | env on compose | **Settings → Hindsight**: URL and API key for omp's memory backend |

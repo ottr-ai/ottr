@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { cpus, freemem, homedir, totalmem } from "node:os";
-import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import {
@@ -71,6 +71,7 @@ import {
 import {
 	agentDir,
 	boardOmpEnv,
+	boardOmpHome,
 	type DeadSignIn,
 	deadSignIns,
 	loginProviders,
@@ -80,7 +81,14 @@ import {
 	signOutStores,
 	storeSignIns,
 } from "./login.ts";
-import { modelList, modelRoles } from "./models.ts";
+import {
+	commitMessage,
+	editModelRoles,
+	RolesLayoutError,
+	readRoles,
+	validateRoles,
+} from "./modelRoles.ts";
+import { type ModelOption, modelList, modelRoles } from "./models.ts";
 import { orphanCache } from "./orphans.ts";
 import { perfMetrics } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
@@ -276,6 +284,8 @@ interface AppDeps {
 	workersHome?: string;
 	/** ssh-keyscan seam for the host-key check; defaults to realKeyscan. Tests inject a stub. */
 	keyscan?: Keyscan;
+	/** Model catalog seam for the model roles editor; defaults to modelList. */
+	models?: () => Promise<ModelOption[]>;
 }
 
 /** The persisted removed/added project paths; boot discovery needs them before createApp runs. */
@@ -906,6 +916,141 @@ export function createApp(deps: AppDeps) {
 			return { ok: true, body };
 		} finally {
 			provisioning = false;
+		}
+	}
+	type AlateOut<T> =
+		| { ok: true; body: T }
+		| { ok: false; status: number; error: string };
+	/** One bearer call to alate's file editor API. 404 and 409 keep their status; any other
+	 *  alate failure is 502 (docs/specs/model-roles-editor.md). */
+	async function alateApi(
+		path: string,
+		timeoutMs: number,
+		init: { method: string; body: unknown } | null = null,
+	): Promise<AlateOut<Record<string, unknown>>> {
+		if (alate.url === null)
+			return {
+				ok: false,
+				status: 400,
+				error: "alate server url is not configured",
+			};
+		if (alate.key === null)
+			return {
+				ok: false,
+				status: 400,
+				error: "alate api key is not configured",
+			};
+		let res: Response;
+		try {
+			res = await noRedirectFetch(alate.url + path, {
+				method: init?.method ?? "GET",
+				headers: {
+					authorization: "Bearer " + alate.key,
+					...(init ? { "content-type": "application/json" } : {}),
+				},
+				...(init ? { body: JSON.stringify(init.body) } : {}),
+				signal: AbortSignal.timeout(timeoutMs),
+			});
+		} catch (err) {
+			// A timed-out write may still land on alate: say so instead of "cannot reach".
+			if ((err as Error).name === "TimeoutError")
+				return {
+					ok: false,
+					status: 504,
+					error: `alate did not answer ${path.split("?")[0]} within ${timeoutMs / 1000} s`,
+				};
+			return {
+				ok: false,
+				status: 502,
+				error: `cannot reach alate server: ${(err as Error).message}`,
+			};
+		}
+		const body = (await res.json().catch(() => null)) as Record<
+			string,
+			unknown
+		> | null;
+		if (!res.ok)
+			return {
+				ok: false,
+				status: res.status === 404 || res.status === 409 ? res.status : 502,
+				error:
+					typeof body?.error === "string"
+						? body.error
+						: `alate returned ${res.status}`,
+			};
+		if (body === null || typeof body !== "object")
+			return {
+				ok: false,
+				status: 502,
+				error: "alate returned an invalid response",
+			};
+		return { ok: true, body };
+	}
+	const CONFIG_YML = "user/omp/agent/config.yml";
+	/** The data repo's omp config.yml from alate's last import. */
+	async function readConfigYml(): Promise<
+		AlateOut<{ content: string; hash: string }>
+	> {
+		const r = await alateApi(
+			`/api/file?path=${encodeURIComponent(CONFIG_YML)}`,
+			10_000,
+		);
+		if (!r.ok) return r;
+		const { content, hash } = r.body;
+		if (typeof hash !== "string")
+			return {
+				ok: false,
+				status: 502,
+				error: "alate returned an invalid file response",
+			};
+		if (typeof content !== "string")
+			return {
+				ok: false,
+				status: 422,
+				error: `${CONFIG_YML} in the data repo is not UTF-8 text`,
+			};
+		return { ok: true, body: { content, hash } };
+	}
+	/** Re-imports alate's current data source, so its snapshot sits on the repo head. */
+	async function refreshAlateSnapshot(): Promise<AlateOut<unknown>> {
+		const h = await alateHealth();
+		if (!h.ok) return h;
+		const kind =
+			typeof h.body.repo === "string" && h.body.repo !== ""
+				? "repo"
+				: typeof h.body.path === "string" && h.body.path !== ""
+					? "path"
+					: null;
+		if (kind === null)
+			return { ok: false, status: 502, error: "alate has no data source" };
+		return alateApi("/api/import", 110_000, {
+			method: "POST",
+			body: { source: h.body[kind], kind },
+		});
+	}
+	/** Compose seeds the board's omp copy hourly and records the commit next to its home. */
+	function seedView(): { needed: boolean; commit: string | null } {
+		const needed = !!process.env.OTTR_BOARD_OMP_HOME?.trim();
+		if (!needed) return { needed, commit: null };
+		try {
+			const commit = readFileSync(
+				join(dirname(boardOmpHome()), "seed-commit"),
+				"utf8",
+			).trim();
+			return { needed, commit: commit || null };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			return { needed, commit: null };
+		}
+	}
+	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
+	async function layout422(fn: () => Promise<Response>): Promise<Response> {
+		try {
+			return await fn();
+		} catch (err) {
+			if (err instanceof RolesLayoutError)
+				return json({ error: err.message }, 422);
+			throw err;
 		}
 	}
 	/** Same idle gate scripts/update-image.ts deploys behind: a preparing or running turn anywhere. */
@@ -3235,6 +3380,111 @@ export function createApp(deps: AppDeps) {
 					if (!r.ok && r.running) return json({ running: true }, 202);
 					return r.ok ? json(r.body, 200) : json({ error: r.error }, r.status);
 				}),
+		},
+		"/api/model-roles": {
+			GET: (req) =>
+				api(req, () =>
+					layout422(async () => {
+						const f = await readConfigYml();
+						if (!f.ok) return json({ error: f.error }, f.status);
+						return json({
+							hash: f.body.hash,
+							roles: readRoles(f.body.content),
+							signIns: storeSignIns().map((s) => ({
+								store: s.store,
+								active:
+									s.signIns?.filter((a) => a.active).map((a) => a.provider) ??
+									null,
+							})),
+							seed: seedView(),
+						});
+					}),
+				),
+			POST: (req) =>
+				api(req, () =>
+					layout422(async () => {
+						const r = await readJson(req);
+						if ("error" in r) return r.error;
+						const { hash, roles } = r.body;
+						if (
+							typeof hash !== "string" ||
+							typeof roles !== "object" ||
+							roles === null ||
+							Array.isArray(roles)
+						)
+							return json(
+								{ error: "body must be { hash: string, roles: object }" },
+								400,
+							);
+						const f = await readConfigYml();
+						if (!f.ok) return json({ error: f.error }, f.status);
+						const current = readRoles(f.body.content);
+						const catalog = new Set(
+							(await (deps.models ?? modelList)()).map((m) => m.selector),
+						);
+						const bad = validateRoles(
+							roles as Record<string, unknown>,
+							current,
+							catalog,
+						);
+						if (bad !== null) return json(bad, 400);
+						if (f.body.hash !== hash)
+							return json(
+								{
+									error:
+										"config.yml changed in the data repo since you loaded it; check the current roles and save again",
+									hash: f.body.hash,
+									roles: current,
+								},
+								409,
+							);
+						const next = roles as Record<string, string>;
+						const content = editModelRoles(f.body.content, next);
+						// Never retried: a write that alate refuses goes back to the user.
+						const w = await alateApi("/api/file", 110_000, {
+							method: "PUT",
+							body: {
+								path: CONFIG_YML,
+								content,
+								base: hash,
+								message: commitMessage(current, next),
+							},
+						});
+						if (!w.ok) {
+							if (
+								w.status !== 409 ||
+								!w.error.includes("changed since it was loaded")
+							)
+								return json({ error: w.error }, w.status);
+							// The data repo moved: show the user its current roles.
+							const ref = await refreshAlateSnapshot();
+							if (!ref.ok) return json({ error: ref.error }, ref.status);
+							const again = await readConfigYml();
+							if (!again.ok) return json({ error: again.error }, again.status);
+							return json(
+								{
+									error: w.error,
+									hash: again.body.hash,
+									roles: readRoles(again.body.content),
+								},
+								409,
+							);
+						}
+						if (typeof w.body.commit !== "string")
+							return json(
+								{ error: "alate returned no commit for the write" },
+								502,
+							);
+						return json({
+							commit: w.body.commit,
+							hash: new Bun.CryptoHasher("sha256")
+								.update(content)
+								.digest("hex"),
+							roles: readRoles(content),
+							seed: seedView(),
+						});
+					}),
+				),
 		},
 		"/api/updates/refresh": {
 			POST: (req) =>

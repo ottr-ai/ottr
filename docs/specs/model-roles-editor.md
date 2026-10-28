@@ -1,0 +1,96 @@
+# Model roles editor
+
+Settings gets a **Model roles** section. The user edits the omp `modelRoles` map from a desktop or a phone. A save commits the data repo's `user/omp/agent/config.yml`. Alate provisions the workers, and the board seed brings the change to the board's own copy.
+
+## Data path
+
+- The source is the data repo file `user/omp/agent/config.yml`. Ottr never edits a local copy (`/etc/ottr/home/.omp/agent/config.yml` or `/root/.omp/agent/config.yml`): Alate refuses to overwrite a file that differs from what it installed last.
+- Ottr reaches the data repo only through the Alate server that Settings → Alate configures. Alate's file editor API does the work, with the stored Alate API key as a Bearer token:
+  - `GET /api/file?path=user/omp/agent/config.yml` gives `{ content, hash }` from Alate's last import (`hash` is the sha256 of the bytes).
+  - `PUT /api/file { path, content, base, message }` clones the repo fresh, checks `base` against the file on the cloned branch head, commits, and runs a normal `git push`. A changed file gives 409 (`changed since it was loaded`). A rejected push gives 502. Alate never force-pushes.
+  - `POST /api/import { source, kind }` refreshes Alate's snapshot. `source` and `kind` come from Alate's `/health` (`repo` or `path`).
+- After a commit, the existing `POST /api/alate/provision` provisions the workers.
+- The board copy: on compose (`OTTR_BOARD_OMP_HOME` is set), the hourly deploy seeds it (OTTR-188) and records the seeded commit in `<dirname(OTTR_BOARD_OMP_HOME)>/seed-commit` (`/etc/ottr/seed-commit`). Without `OTTR_BOARD_OMP_HOME`, the board reads the copy that the provision installs, and no seed step applies.
+
+## API
+
+### `GET /api/model-roles`
+
+200:
+
+```json
+{
+  "hash": "<sha256 hex of config.yml>",
+  "roles": { "default": "zai/glm-5.3-flash:max", "slow": "anthropic/claude-opus-5-5:medium" },
+  "signIns": [{ "store": "board", "active": ["anthropic", "zai"] }, { "store": "workers", "active": null }],
+  "seed": { "needed": true, "commit": "<sha or null>" }
+}
+```
+
+- `roles` keeps the file order. Only nonempty string values count.
+- `signIns`: one entry for each store that `storeSignIns()` reads (the board, then the workers when they have a separate store). `active` lists the providers with an active sign-in. `active` is null when the store cannot be read.
+- `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent.
+
+Errors (`{ error }`): 400 when the Alate URL or key is not set. 404 when the data repo has no `user/omp/agent/config.yml`. 502 when Alate cannot be reached or gives an error. 422 when the file has a `modelRoles` layout that the editor does not support.
+
+### `POST /api/model-roles`
+
+Body: `{ "hash": "<hash from the read>", "roles": { "<role>": "<selector>" } }`. The object order is the order for new roles.
+
+1. Validation. On a failure the route returns 400 `{ error, fields }` and commits nothing. `fields` maps a role name to its message.
+   - A new role name must match `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. A name that the file already holds stays editable.
+   - `roles` must hold at least one role.
+   - Each value that the save adds or changes must be `<catalog selector>` or `<catalog selector>:<level>`. The catalog is `omp models --json` (the `/api/models` list). The level is one of `THINKING_LEVELS` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`). A value with a known model and an unknown suffix gets "unknown thinking level". An unchanged value is not checked: it stays byte for byte, also when the board's catalog does not list it.
+   - A save that changes nothing gives 400 `nothing to save`.
+2. Ottr reads the file from Alate again. When its hash differs from the body `hash`, the route returns 409 `{ error, hash, roles }` with the current values, and commits nothing.
+3. Ottr writes the new text (see "Text edit") and sends `PUT /api/file` with `base` = the hash.
+4. When Alate answers 409 `changed since it was loaded`, the data repo moved. Ottr refreshes Alate's snapshot (`POST /api/import`), reads the file again, and returns 409 `{ error, hash, roles }`. Ottr never retries the write by itself. Another Alate 409 (a provision or a file write is running) returns 409 `{ error }` with no `roles`. When the refresh fails, the route returns the refresh error.
+5. When Alate does not answer the write in 110 s, the route returns 504: the commit can still land, so the user reads again.
+6. Success: 200 `{ commit, hash, roles, seed }`.
+
+The commit message is a Conventional Commit of at most 500 characters:
+
+- One role added or changed: `chore: set the <role> model role to <value>`.
+- One role removed: `chore: remove the <role> model role`.
+- Other cases: `chore: update the <role>, <role> model roles`. A long list ends in `…` before the 500-character cap.
+
+## Text edit
+
+The edit changes only the `modelRoles` block. Every other byte stays: other keys, comments, order, blank lines, line ends, and the final newline.
+
+- The block starts at a column-0 line `modelRoles:` (a trailing comment is allowed). It ends before the next column-0 line that is not blank and not a comment.
+- Each entry is one line `<indent><role>: <value>` with an optional trailing ` # comment`. The value is a plain scalar or a single-quoted or double-quoted string. All entries share one indent.
+- A changed value replaces only the value text. An unchanged entry keeps its line exactly. A removed role loses its line. A new role gets a new line after the last entry, with the block's indent and line end.
+- A new value is written plain when it matches `^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$` and holds a `/`. Else it is written as a JSON string (a valid YAML double-quoted string).
+- When the file has no `modelRoles` key, the edit appends a block at the end.
+- Any other layout (a flow map, a multi-line value, an anchor, a nested key) gives the 422 error. Ottr then edits nothing.
+- A check after the edit parses both texts. The new `modelRoles` must equal the requested map, and every other key must equal its old value. A failed check is an error, and nothing is committed.
+
+## UI
+
+- The General Settings page shows **Model roles** after **Provider sign-in**.
+- One row for each role: the role name, a model `<select>` with the `/api/models` catalog, and a thinking `<select>` (Default, then each level). A current value that is not in the catalog shows as an extra option "<value> (not in the catalog)".
+- A remove button for each row. An add form with a role name, then the new row takes the first catalog model.
+- **Save** is off while nothing changed or a save runs. A 400 shows each `fields` message at its row (`aria-describedby`, `aria-invalid`). A 409 with `roles` loads the current values and shows the conflict message. Other errors show in an alert.
+- A row warns when its provider (the selector text before `/`) has no active sign-in in a store: "No active sign-in for <provider> on the board" or "on the workers". A store with `active: null` gives no warning.
+- After a commit, the section shows each step and its result:
+  1. "Committed <short sha> to the data repo."
+  2. The provision: running, then success, or the failed scripts and their error. A failure keeps the commit and says so.
+  3. The board copy: with `seed.needed`, "Waiting for the hourly deploy to seed <short sha>" until `seed.commit` equals the commit (the section reads again each 60 s while it waits), then "The board copy has <short sha>". Without `seed.needed`, "The board reads the provisioned copy."
+- The section works at 360 px width and keeps WCAG 2.1 AA (DESIGN.md "Accessibility").
+
+## Acceptance
+
+- A test: a save changes only the `modelRoles` values and keeps every other byte of `config.yml`.
+- A test: an unknown model or level is refused, and nothing reaches Alate's `PUT /api/file`.
+- A test: a moved data repo (Alate 409) gives a 409 conflict with the current roles. Ottr sends no second write.
+- Screenshots of the section at desktop width and at phone width.
+- `bun run check` and `bun test` pass.
+
+## Non-goals
+
+- Other `config.yml` keys, and edits of a local `config.yml` copy.
+- A direct GitHub API path or a board-side git clone: Alate owns the data repo access.
+- A board-triggered seed: the board container cannot run `board-seed`. The hourly deploy does it.
+- Provider API keys in the env do not clear the sign-in warning.
+- The seed line compares only the exact saved commit. When a later commit lands before the seed, the line keeps waiting.

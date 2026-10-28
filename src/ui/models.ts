@@ -46,6 +46,28 @@ export function joinLevel(base: string, level: string): string {
 	return level === "" || clean === "" ? clean : `${clean}:${level}`;
 }
 
+/** One omp store's active sign-ins from /api/model-roles; `active` is null when the store cannot be read. */
+export type StoreActive = {
+	store: "board" | "workers";
+	active: string[] | null;
+};
+
+/** Warnings for a role selector whose provider (the text before "/") has no active sign-in in a readable store. */
+export function roleWarnings(
+	selector: string,
+	signIns: readonly StoreActive[],
+): string[] {
+	const i = selector.indexOf("/");
+	if (i <= 0) return [];
+	const provider = selector.slice(0, i);
+	return signIns
+		.filter((s) => s.active !== null && !s.active.includes(provider))
+		.map(
+			(s) =>
+				`No active sign-in for ${provider} ${s.store === "board" ? "on the board" : "on the workers"}`,
+		);
+}
+
 /** Case-insensitive quick search over the selector and the display name. */
 export function modelMatches(m: ModelOption, query: string): boolean {
 	const q = query.trim().toLowerCase();

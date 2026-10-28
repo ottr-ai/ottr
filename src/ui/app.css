@@ -5032,6 +5032,68 @@ button.diff-path {
 		grid-template-columns: 1fr;
 	}
 }
+/* Model roles: name, model, thinking and remove on one line; the notes span the row below.
+   At 480px the name and the remove button share the first line, each select takes a full line. */
+.settings-sec.model-roles {
+	width: 100%;
+	align-items: stretch;
+}
+.settings-sec .alate-def-row.role-row {
+	grid-template-columns: minmax(90px, 180px) minmax(0, 1fr) minmax(100px, 140px) auto;
+	gap: 8px 12px;
+}
+.role-row select {
+	width: 100%;
+	min-width: 0;
+}
+.role-name {
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.role-notes {
+	grid-column: 1 / -1;
+	display: grid;
+	gap: 4px;
+}
+.role-notes .hint {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.role-add {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-end;
+	gap: 8px;
+}
+.role-steps {
+	display: grid;
+	gap: 6px;
+	padding: 0;
+	list-style: none;
+	overflow-wrap: anywhere;
+}
+.role-steps .mark {
+	vertical-align: -2px;
+	margin-right: 6px;
+}
+@media (pointer: coarse) {
+	.role-add input {
+		min-height: 44px;
+	}
+}
+@media (max-width: 480px) {
+	.settings-sec .alate-def-row.role-row {
+		grid-template-columns: minmax(0, 1fr) auto;
+	}
+	.role-row select {
+		grid-column: 1 / -1;
+	}
+	.role-row .role-remove {
+		grid-row: 1;
+		grid-column: 2;
+	}
+}
 
 /* ---- Upstream updates panel (U5) ---- */
 /* Head and actions stay put; only the repo list scrolls. */
