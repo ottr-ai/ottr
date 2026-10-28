@@ -6,18 +6,10 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
-import { agentDir, boardOmpEnv } from "./login.ts";
+import { agentDir, boardOmpEnv, LENT_ENV } from "./login.ts";
 
 export const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
 const REFRESH_TIMEOUT_MS = 60_000;
-
-/** The env name omp reads each provider's access token from (pi-catalog provider rules). */
-const ENV_NAME: Record<string, string> = {
-	anthropic: "ANTHROPIC_OAUTH_TOKEN",
-	"openai-codex": "OPENAI_CODEX_OAUTH_TOKEN",
-	// The zai OAuth token never expires; the provider's bearer slot takes it.
-	zai: "ZAI_API_KEY",
-};
 
 const ACTIVE_ROW =
 	"SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id DESC LIMIT 1";
@@ -114,7 +106,10 @@ export async function lentProviderEnv(
 	} = {},
 ): Promise<Lent> {
 	const provider = model?.split("/", 1)[0];
-	const name = provider === undefined ? undefined : ENV_NAME[provider];
+	const name =
+		provider !== undefined && Object.hasOwn(LENT_ENV, provider)
+			? LENT_ENV[provider]
+			: undefined;
 	if (provider === undefined || name === undefined)
 		return { env: {}, note: null };
 	const now = opts.now ?? Date.now();

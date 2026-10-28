@@ -458,9 +458,13 @@ into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
 refreshes the token itself, with no model request. Then the board reads the new
 token from the board store. Ottr has no OAuth refresh code of its own.
 
-- A sign-in marks the provider's worker-store rows `replaced by newer
-  credential`. Worker turns then resolve the lent env token. Rows of other
-  accounts stay.
+- The board lends only OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI.
+  Such a sign-in marks the provider's worker-store rows `replaced by newer
+  credential`, and worker turns then resolve the lent env token. Any other
+  sign-in (an API key, or another OAuth provider) changes no worker row: the
+  workers keep their own credential, or set the provider's key under
+  **Settings → Env**. Settings shows "Lent to workers" or "Not lent to
+  workers" on each row. The spec lists every provider.
 - Sign-out marks the provider's rows `deleted by user` in the board store and
   in the worker store. That removes legacy rows in one step.
 - When omp does not refresh, the board lends nothing for that turn, and the card

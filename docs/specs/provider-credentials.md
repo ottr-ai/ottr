@@ -56,16 +56,126 @@ machinery are gone.
 
 ## Token lending
 
-`src/tokens.ts` maps provider id to the env name omp reads:
+`LENT_ENV` in `src/login.ts` maps omp's stored provider id to the env name
+omp reads the OAuth access token from:
 
 - `anthropic` → `ANTHROPIC_OAUTH_TOKEN` (wins over `ANTHROPIC_API_KEY`)
 - `openai-codex` → `OPENAI_CODEX_OAUTH_TOKEN`
 - `zai` → `ZAI_API_KEY` (the zai OAuth access token never expires; the same
   bearer slot takes it, `env "ZAI_API_KEY"` in the provider rule)
 
-Providers not in the map get no lent env. The spec lists none today among the
-providers Settings pushes (the three above are wired); a future provider needs
-one constant.
+The lend rule: the board lends a sign-in only when it is an active `oauth` row
+of a provider in `LENT_ENV`. `GET /api/provider-login` gives each sign-in a
+`lent` flag, and Settings shows "Lent to workers" or "Not lent to workers" on
+each active row.
+
+A sign-in that the board does not lend never changes the worker store. This
+covers an API key (for example the `zai` login, which stores an `api_key` row)
+and an OAuth provider outside `LENT_ENV` (for example `cursor` or
+`github-copilot`). The workers keep their own credential for it: their own
+store row, or the provider's env key under Settings, Env. The sign-in output
+says so in one line. Only a lent sign-in supersedes worker rows (see
+"Precedence").
+
+### Provider matrix
+
+Every provider that Settings offers (omp 18.12.3 `/login` list, generated from
+the `pi-catalog` rules `auth/<id>.kdl` and `providers/<stored id>.kdl`). "Env
+names omp reads" are the names a worker turn can get from Settings, Env when
+the board does not lend the provider. Settings shows "Not lent to workers" for
+every row marked "no".
+
+| Login id (Settings) | Stored as | Login flow | Env names omp reads | Lent to worker turns |
+|---|---|---|---|---|
+| `openai-codex` | `openai-codex` | oauth-code | `OPENAI_CODEX_OAUTH_TOKEN` | yes, as `OPENAI_CODEX_OAUTH_TOKEN` |
+| `anthropic` | `anthropic` | oauth-code | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` (env hook) | yes, as `ANTHROPIC_OAUTH_TOKEN` |
+| `zai` | `zai` | api-key | `ZAI_API_KEY` | no |
+| `zai-coding-plan` | `zai` | oauth-code | `ZAI_API_KEY` | yes, as `ZAI_API_KEY` |
+| `kimi-code` | `kimi-code` | device-code | `KIMI_API_KEY` | no |
+| `openrouter` | `openrouter` | oauth-code | `OPENROUTER_API_KEY` | no |
+| `github-copilot` | `github-copilot` | custom | `COPILOT_GITHUB_TOKEN` | no |
+| `cursor` | `cursor` | custom | `CURSOR_ACCESS_TOKEN`, `CURSOR_API_KEY` | no |
+| `devin` | `devin` | oauth-code | `DEVIN_API_KEY` | no |
+| `google-antigravity` | `google-antigravity` | oauth-code | none | no |
+| `google-gemini-cli` | `google-gemini-cli` | oauth-code | none | no |
+| `openai-codex-device` | `openai-codex` | custom | `OPENAI_CODEX_OAUTH_TOKEN` | yes, as `OPENAI_CODEX_OAUTH_TOKEN` |
+| `xai` | `xai` | api-key | `XAI_API_KEY` | no |
+| `xai-oauth` | `xai-oauth` | device-code | `XAI_OAUTH_TOKEN`, `XAI_API_KEY` | no |
+| `gitlab-duo` | `gitlab-duo` | oauth-code | `GITLAB_TOKEN` | no |
+| `gitlab-duo-agent` | `gitlab-duo-agent` | oauth-code | `GITLAB_TOKEN` | no |
+| `alibaba-coding-plan` | `alibaba-coding-plan` | custom | `ALIBABA_CODING_PLAN_API_KEY` | no |
+| `alibaba-token-plan` | `alibaba-token-plan` | custom | `ALIBABA_TOKEN_PLAN_API_KEY`, `BAILIAN_TOKEN_PLAN_API_KEY` | no |
+| `aiand` | `aiand` | api-key | `AIAND_API_KEY` | no |
+| `abliteration` | `abliteration` | api-key | `ABLITERATION_API_KEY`, `ABLIT_KEY` | no |
+| `zhipu-coding-plan` | `zhipu-coding-plan` | api-key | `ZHIPU_API_KEY` | no |
+| `umans` | `umans` | api-key | `UMANS_AI_CODING_PLAN_API_KEY` | no |
+| `qwen-portal` | `qwen-portal` | api-key | `QWEN_OAUTH_TOKEN`, `QWEN_PORTAL_API_KEY` | no |
+| `sakana` | `sakana` | api-key | `SAKANA_API_KEY`, `FUGU_API_KEY` | no |
+| `sambanova` | `sambanova` | api-key | `SAMBANOVA_API_KEY` | no |
+| `minimax-code` | `minimax-code` | api-key | `MINIMAX_CODE_API_KEY` | no |
+| `minimax-code-cn` | `minimax-code-cn` | api-key | `MINIMAX_CODE_CN_API_KEY` | no |
+| `xiaomi` | `xiaomi` | custom | `XIAOMI_API_KEY` | no |
+| `xiaomi-token-plan-sgp` | `xiaomi-token-plan-sgp` | api-key | `XIAOMI_TOKEN_PLAN_SGP_API_KEY` | no |
+| `xiaomi-token-plan-ams` | `xiaomi-token-plan-ams` | api-key | `XIAOMI_TOKEN_PLAN_AMS_API_KEY` | no |
+| `xiaomi-token-plan-cn` | `xiaomi-token-plan-cn` | api-key | `XIAOMI_TOKEN_PLAN_CN_API_KEY` | no |
+| `firepass` | `firepass` | api-key | `FIREPASS_API_KEY` | no |
+| `cline-pass` | `cline-pass` | api-key | `CLINE_API_KEY` | no |
+| `factory-droid` | `factory-droid` | device-code | none | no |
+| `commandcode` | `commandcode` | api-key | `COMMAND_CODE_API_KEY`, `COMMANDCODE_API_KEY` | no |
+| `charm-hyper` | `charm-hyper` | api-key | `CHARM_HYPER_API_KEY`, `HYPER_API_KEY` | no |
+| `deepseek` | `deepseek` | api-key | `DEEPSEEK_API_KEY` | no |
+| `stepfun` | `stepfun` | api-key | `STEPFUN_API_KEY` | no |
+| `muse-code` | `muse-code` | device-code | none | no |
+| `meta` | `meta` | api-key | `MODEL_API_KEY`, `META_API_KEY` | no |
+| `moonshot` | `moonshot` | api-key | `MOONSHOT_API_KEY`, `KIMI_API_KEY` | no |
+| `inception` | `inception` | api-key | `INCEPTION_API_KEY` | no |
+| `cerebras` | `cerebras` | api-key | `CEREBRAS_API_KEY` | no |
+| `baseten` | `baseten` | api-key | `BASETEN_API_KEY` | no |
+| `helmcode` | `helmcode` | api-key | `HELMCODE_API_KEY` | no |
+| `fireworks` | `fireworks` | api-key | `FIREWORKS_API_KEY` | no |
+| `together` | `together` | api-key | `TOGETHER_API_KEY` | no |
+| `nvidia` | `nvidia` | api-key | `NVIDIA_API_KEY` | no |
+| `novita` | `novita` | api-key | `NOVITA_API_KEY` | no |
+| `deepinfra` | `deepinfra` | api-key | `DEEPINFRA_API_KEY` | no |
+| `huggingface` | `huggingface` | api-key | `HUGGINGFACE_HUB_TOKEN`, `HF_TOKEN` | no |
+| `perplexity` | `perplexity` | custom | `PERPLEXITY_API_KEY` | no |
+| `qianfan` | `qianfan` | api-key | `QIANFAN_API_KEY` | no |
+| `venice` | `venice` | api-key | `VENICE_API_KEY` | no |
+| `siliconflow` | `siliconflow` | api-key | `SILICONFLOW_API_KEY` | no |
+| `siliconflow-cn` | `siliconflow-cn` | api-key | `SILICONFLOW_CN_API_KEY` | no |
+| `synthetic` | `synthetic` | api-key | `SYNTHETIC_API_KEY` | no |
+| `nanogpt` | `nanogpt` | api-key | `NANO_GPT_API_KEY` | no |
+| `wafer-serverless` | `wafer-serverless` | api-key | `WAFER_SERVERLESS_API_KEY` | no |
+| `coreweave` | `coreweave` | api-key | `COREWEAVE_API_KEY`, `WANDB_API_KEY` | no |
+| `vercel-ai-gateway` | `vercel-ai-gateway` | api-key | `AI_GATEWAY_API_KEY`, `VERCEL_AI_GATEWAY_API_KEY` | no |
+| `cloudflare-ai-gateway` | `cloudflare-ai-gateway` | custom | `CLOUDFLARE_AI_GATEWAY_API_KEY` | no |
+| `cloudflare-workers-ai` | `cloudflare-workers-ai` | custom | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_AUTH_TOKEN` | no |
+| `snowflake` | `snowflake` | custom | `SNOWFLAKE_PAT` | no |
+| `litellm` | `litellm` | api-key | `LITELLM_API_KEY` | no |
+| `kilo` | `kilo` | custom | `KILO_API_KEY` | no |
+| `zenmux` | `zenmux` | api-key | `ZENMUX_API_KEY` | no |
+| `opencode-zen` | `opencode-zen` | api-key | `OPENCODE_API_KEY` | no |
+| `opencode-go` | `opencode-go` | api-key | `OPENCODE_API_KEY` | no |
+| `yolo-auto` | `yolo-auto` | api-key | `YOLO_AUTO_API_KEY` | no |
+| `tavily` | `tavily` | api-key | `TAVILY_API_KEY` | no |
+| `kagi` | `kagi` | api-key | `KAGI_API_KEY` | no |
+| `exa` | `exa` | api-key | `EXA_API_KEY` | no |
+| `parallel` | `parallel` | api-key | `PARALLEL_API_KEY` | no |
+| `typesafe` | `typesafe` | api-key | `TYPESAFE_API_KEY` | no |
+| `ollama` | `ollama` | api-key | `OLLAMA_API_KEY` | no |
+| `ollama-cloud` | `ollama-cloud` | api-key | `OLLAMA_CLOUD_API_KEY` | no |
+| `lm-studio` | `lm-studio` | api-key | `LM_STUDIO_API_KEY` | no |
+| `llama.cpp` | `llama.cpp` | api-key | `LLAMA_CPP_API_KEY` | no |
+| `vllm` | `vllm` | api-key | `VLLM_API_KEY` | no |
+| `gmi-cloud` | `gmi-cloud` | api-key | `GMI_API_KEY` | no |
+| `stencil` | `stencil` | oauth-code | `STENCIL_API_KEY` | no |
+| `singularityapi-dev` | `singularityapi-dev` | api-key | `SINGULARITYAPI_DEV_API_KEY` | no |
+| `singularityapi-tech` | `singularityapi-tech` | api-key | `SINGULARITYAPI_TECH_API_KEY` | no |
+| `coralbricks` | `coralbricks` | api-key | `CORAL_API_KEY`, `CORALBRICKS_API_KEY` | no |
+
+"none" in the env column: omp reads no env for the provider. A worker turn then
+needs a sign-in in the worker store itself. The board leaves that store row
+alone, because it does not lend these providers.
 
 At the start of every turn (`ops.turnEnv` in `src/server.ts`, called with the
 turn's model), for the model's provider (`provider` is the part before the
@@ -121,11 +231,16 @@ falls through to env), so its stdout is not proof of a refresh.
 omp resolves a provider's credential in this order: runtime/config override,
 stored OAuth (with its own refresh ladder), stored login API key, then env
 variables, then stored static API keys. A stored OAuth row therefore beats a
-lent env token. So when a sign-in succeeds, the board marks the worker store's
-active rows of that provider `replaced by newer credential` (omp's own cause;
-the board writes only this cause string, it reads no value from the worker
-store). Worker turns then resolve the lent env token. Rows of other accounts
-stay.
+lent env token. So when a lent sign-in succeeds, the board marks the worker
+store's active rows of that provider `replaced by newer credential` (omp's own
+cause; the board writes only this cause string, it reads no value from the
+worker store). Worker turns then resolve the lent env token. A sign-in the
+board does not lend changes no worker row.
+
+The provider is omp's stored id, not the login id: `openai-codex-device`
+stores as `openai-codex`, `zai-coding-plan` as `zai`. The board reads the
+stored ids from the rows that the login wrote (ids above the store's highest id
+before the login) and decides from those rows.
 
 Legacy rows from the OTTR-183 era: they hold their own refresh token family
 and keep working until the next sign-in or sign-out of that provider. Nothing
@@ -148,8 +263,8 @@ That removes the provider's legacy rows with one user step.
 ## Status and API shape
 
 `GET /api/provider-login` returns `{signIns, pending, providers}` — the board
-store's sign-ins, the current sign-in flow (single step), and omp's provider
-list. No `stores` array.
+store's sign-ins (`{provider, kind, active, cause, lent}`), the current sign-in
+flow (single step), and omp's provider list. No `stores` array.
 
 `POST /api/provider-login` starts the single sign-in. `.../answer` sends the
 pasted line (address or code). `.../cancel` stops. `.../logout` returns
@@ -187,8 +302,12 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   turn env carries the new access from the store.
 - A test: when omp fails, or omp exits 0 but the row is still below the
   margin, nothing is lent and the cause comes back for the card log.
-- A test: a sign-in writes no credential row into the worker store and marks
-  the provider's worker-store rows `replaced by newer credential`.
+- A test: a lent sign-in writes no credential row into the worker store and
+  marks the provider's worker-store rows `replaced by newer credential`.
+- A test: an API-key sign-in (the `zai` login) and an OAuth sign-in outside
+  `LENT_ENV` (`cursor`) change no worker row and say so in the output.
+- A test: a login id that stores under another id (`openai-codex-device`)
+  supersedes the rows of the stored id.
 - A test: the code-flow sign-in path completes by pasting the redirect address
   (no localhost listener involved) — the phone path.
 - `bun run check` and `bun test` pass.

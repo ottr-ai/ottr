@@ -52,8 +52,11 @@ for await (const line of console) {
 		mkdirSync(agentDir, { recursive: true });
 		const db = new Database(agentDir + "/agent.db");
 		db.exec("CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)");
-		const add = db.prepare("INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, 'oauth', ?, 'acct-1', 1, 1)");
-		add.run(provider, JSON.stringify({ access: "access-" + crypto.randomUUID(), refresh: crypto.randomUUID() }));
+		// As omp's rules do: zai's login is an API key; openai-codex-device stores as openai-codex.
+		const stored = provider === "openai-codex-device" ? "openai-codex" : provider;
+		const add = db.prepare("INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, ?, ?, 'acct-1', 1, 1)");
+		if (provider === "zai") add.run(stored, "api_key", JSON.stringify({ key: "key-" + crypto.randomUUID(), source: "login" }));
+		else add.run(stored, "oauth", JSON.stringify({ access: "access-" + crypto.randomUUID(), refresh: crypto.randomUUID() }));
 		add.finalize();
 		db.close();
 		console.log("Logged in to " + provider);
@@ -271,7 +274,8 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 	/**
 	 * A board store and a separate worker store under a fresh root, and a sign-in that runs once
 	 * against the board's. The worker store holds an older sign-in of the same account, another
-	 * account, an API key, and another provider.
+	 * account, an API key, another provider, a zai API key, a Codex sign-in, and a Cursor sign-in
+	 * (an OAuth provider the board does not lend).
 	 */
 	function setup(o: { workerDb?: boolean } = {}) {
 		const root = mkdtempSync(join(dir, "stores-"));
@@ -293,6 +297,14 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 				],
 				["anthropic", "api_key", { key: "test-key" }, null],
 				["deepseek", "api_key", { key: "test-key-2" }, null],
+				["zai", "api_key", { key: "worker-zai-key" }, null],
+				[
+					"openai-codex",
+					"oauth",
+					{ access: "c1", refresh: "worker-c1" },
+					"acct-1",
+				],
+				["cursor", "oauth", { access: "u1", refresh: "worker-u1" }, "acct-1"],
 			]);
 		const boardDir = join(root, "board-home", ".omp", "agent");
 		const stores: LoginStores = { boardDir, worker: { home, db: workerDb } };
@@ -349,6 +361,60 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 		expect(existsSync(t.workerDb)).toBe(false);
 	}, 30_000);
 
+	test("an API-key sign-in is not lent, so the workers keep their own credential", async () => {
+		const t = setup();
+		const before = rows(t.workerDb);
+		await t.l.start("zai", BOARD);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		// No worker row changes: a zai API key on the board reaches no worker turn.
+		expect(rows(t.workerDb)).toEqual(before);
+		expect(v?.output).toContain(
+			"Worker turns do not get zai from the board: they keep their own sign-in, or set its env key under Settings, Env.",
+		);
+		expect(signIns(t.boardDb)).toEqual([
+			{
+				provider: "zai",
+				kind: "api_key",
+				active: true,
+				cause: null,
+				lent: false,
+			},
+		]);
+	}, 30_000);
+
+	test("an OAuth sign-in of a provider the board does not lend leaves the workers alone", async () => {
+		const t = setup();
+		const before = rows(t.workerDb);
+		await t.l.start("cursor", BOARD);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		expect(rows(t.workerDb)).toEqual(before);
+		expect(v?.output).toContain(
+			"Worker turns do not get cursor from the board",
+		);
+		expect(signIns(t.boardDb).map((s) => [s.provider, s.lent])).toEqual([
+			["cursor", false],
+		]);
+	}, 30_000);
+
+	test("a login id that stores under another id supersedes the stored provider's worker rows", async () => {
+		const t = setup();
+		await t.l.start("openai-codex-device", BOARD);
+		const v = await t.l.answer("good");
+		expect(v?.ok).toBe(true);
+		expect(v?.output).not.toContain("Worker turns do not get");
+		const causes = rows(t.workerDb).map((r) => [r.provider, r.disabled_cause]);
+		expect(causes).toContainEqual([
+			"openai-codex",
+			"replaced by newer credential",
+		]);
+		// Only the stored provider: the other providers' rows stay active.
+		expect(
+			causes.filter(([, cause]) => cause !== null).map(([p]) => p),
+		).toEqual(["openai-codex"]);
+	}, 30_000);
+
 	test("signOutEverywhere marks both stores deleted by user; a missing worker store counts as none", () => {
 		const t = setup();
 		credStore(join(t.boardDir, "agent.db"), [
@@ -366,6 +432,9 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 			["anthropic", "deleted by user"],
 			["anthropic", "deleted by user"],
 			["deepseek", null],
+			["zai", null],
+			["openai-codex", null],
+			["cursor", null],
 		]);
 		expect(causes(t.boardDb)).toEqual([
 			["anthropic", "deleted by user"],
@@ -437,14 +506,28 @@ describe("signIns and signOut", () => {
 	}
 
 	test("one entry per provider: active wins, failed shows as inactive, logged-out and replaced stay hidden", () => {
+		// Only an active OAuth row of a LENT_ENV provider is lent; an API key and a failed row are not.
 		expect(signIns(store())).toEqual([
-			{ provider: "anthropic", kind: "oauth", active: true, cause: null },
-			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
+			{
+				provider: "anthropic",
+				kind: "oauth",
+				active: true,
+				cause: null,
+				lent: true,
+			},
+			{
+				provider: "deepseek",
+				kind: "api_key",
+				active: true,
+				cause: null,
+				lent: false,
+			},
 			{
 				provider: "kimi-code",
 				kind: "oauth",
 				active: false,
 				cause: "oauth refresh failed: invalid_grant",
+				lent: false,
 			},
 		]);
 	});
@@ -454,7 +537,13 @@ describe("signIns and signOut", () => {
 		expect(signOut("anthropic", path)).toBe(2);
 		expect(signOut("kimi-code", path)).toBe(1);
 		expect(signIns(path)).toEqual([
-			{ provider: "deepseek", kind: "api_key", active: true, cause: null },
+			{
+				provider: "deepseek",
+				kind: "api_key",
+				active: true,
+				cause: null,
+				lent: false,
+			},
 		]);
 		// Already gone: nothing changes, and the stamp is omp's own cause.
 		expect(signOut("anthropic", path)).toBe(0);
@@ -483,6 +572,7 @@ describe("signIns and signOut", () => {
 					kind: "oauth",
 					active: false,
 					cause: "oauth refresh failed: invalid_grant",
+					lent: false,
 				},
 			],
 			{ work: "kimi-code/kimi-k2", review: "anthropic/claude-opus-5-5" },
@@ -504,6 +594,7 @@ describe("signIns and signOut", () => {
 					kind: "oauth",
 					active: false,
 					cause: "oauth refresh failed: invalid_grant",
+					lent: false,
 				},
 			],
 			{ work: "kimi-code/kimi-k2", review: "kimi-code/kimi-vision" },
@@ -526,6 +617,7 @@ describe("signIns and signOut", () => {
 						kind: "oauth",
 						active: true,
 						cause: null,
+						lent: true,
 					},
 				],
 				{ work: "anthropic/claude-opus-5-5" },
@@ -542,12 +634,14 @@ describe("signIns and signOut", () => {
 						kind: "oauth",
 						active: false,
 						cause: "oauth refresh failed: invalid_grant",
+						lent: false,
 					},
 					{
 						provider: "anthropic",
 						kind: "oauth",
 						active: true,
 						cause: null,
+						lent: true,
 					},
 				],
 				{ work: "anthropic/claude-opus-5-5" },
@@ -565,6 +659,7 @@ describe("signIns and signOut", () => {
 						kind: "oauth",
 						active: false,
 						cause: "oauth refresh failed: invalid_grant",
+						lent: false,
 					},
 				],
 				{},

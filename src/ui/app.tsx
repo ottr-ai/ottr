@@ -8866,6 +8866,8 @@ type SignIn = {
 	kind: string;
 	active: boolean;
 	cause: string | null;
+	/** Worker turns get this sign-in as a lent env token; else they use their own credential. */
+	lent: boolean;
 };
 /** One provider omp's `/login` picker offers, as the server reads it from the installed omp. */
 type LoginProvider = { id: string; name: string };
@@ -8977,10 +8979,13 @@ function ProviderLoginSection() {
 			<div className="providers-head">
 				<h2>Provider sign-in</h2>
 				<p className="hint">
-					One sign-in per provider, stored on the board's machine. Worker turns
-					get a short-lived token in their env. A sign-in works the same from a
-					phone or another machine: finish the provider's page there, copy the
-					address it ends on, or the code it shows, and paste it below.
+					One sign-in per provider, stored on the board's machine. For OAuth
+					sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a
+					short-lived token in their env. Other providers are not lent: workers
+					use their own sign-in, or the provider's key under Settings, Env. A
+					sign-in works the same from a phone or another machine: finish the
+					provider's page there, copy the address it ends on, or the code it
+					shows, and paste it below.
 				</p>
 			</div>
 			{rowIds.length > 0 && (
@@ -9006,6 +9011,10 @@ function ProviderLoginSection() {
 									</b>
 									<span>
 										{words}
+										{signIn?.active === true &&
+											(signIn.lent
+												? " · Lent to workers"
+												: " · Not lent to workers")}
 										{plan !== null &&
 											` · ${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan`}
 									</span>

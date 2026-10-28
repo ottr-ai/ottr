@@ -229,15 +229,29 @@ export function providerLogin({
 	}
 
 	/**
-	 * Marks the workers' active rows of the provider superseded, so omp on a worker resolves the
-	 * lent env token instead of its stale store row (any active row would beat it). The board
-	 * writes only the cause string and reads nothing from the store; a failure cannot fail the
-	 * sign-in.
+	 * After a sign-in: the board lends some of the rows omp just wrote (ids above `since`) to worker
+	 * turns. For those providers only, it marks the workers' active rows superseded, so omp on a
+	 * worker resolves the lent env token instead of its stale store row (any active row would beat
+	 * it). Every other sign-in leaves the worker store alone: the workers keep their own credential.
+	 * The board writes only the cause string and reads nothing from the worker store; a failure
+	 * cannot fail the sign-in.
 	 */
-	function supersedeWorkers(l: Login, worker: LoginStores["worker"]): void {
-		if (worker === null || !existsSync(worker.db)) return;
+	function supersedeWorkers(
+		l: Login,
+		boardDb: string,
+		since: number,
+		worker: LoginStores["worker"],
+	): void {
+		if (worker === null) return;
 		try {
-			signOut(l.provider, worker.db, "replaced by newer credential");
+			const written = new Set(providersSince(boardDb, since));
+			for (const s of signIns(boardDb)) {
+				if (!written.has(s.provider)) continue;
+				if (!s.lent)
+					l.step.raw += `\nWorker turns do not get ${s.provider} from the board: they keep their own sign-in, or set its env key under Settings, Env.\n`;
+				else if (existsSync(worker.db))
+					signOut(s.provider, worker.db, "replaced by newer credential");
+			}
 		} catch (err) {
 			l.step.raw += `\nCannot mark the workers' rows replaced in ${worker.db}: ${errmsg(err)}\n`;
 		}
@@ -246,13 +260,15 @@ export function providerLogin({
 	async function start(provider: string, returnTo: string): Promise<LoginView> {
 		cancel();
 		const { boardDir, worker } = stores();
+		const boardDb = join(boardDir, "agent.db");
+		const since = lastCredentialId(boardDb);
 		const l: Login = {
 			provider,
 			step: launch(provider, boardDir, (code) => {
 				if (code !== 0 || l.stopped) finish(l, false);
 				else {
 					finish(l, true);
-					supersedeWorkers(l, worker);
+					supersedeWorkers(l, boardDb, since, worker);
 				}
 			}),
 			ok: null,
@@ -391,6 +407,18 @@ export function signOutEverywhere(
 	return removed;
 }
 
+/**
+ * The env name omp reads each provider's OAuth access token from (pi-catalog provider rules), for
+ * the providers the board lends to worker turns. Keys are omp's stored provider ids:
+ * `openai-codex-device` stores as `openai-codex`, `zai-coding-plan` as `zai`.
+ */
+export const LENT_ENV: Readonly<Record<string, string>> = {
+	anthropic: "ANTHROPIC_OAUTH_TOKEN",
+	"openai-codex": "OPENAI_CODEX_OAUTH_TOKEN",
+	// The zai OAuth token never expires; the provider's bearer slot takes it.
+	zai: "ZAI_API_KEY",
+};
+
 export interface SignIn {
 	provider: string;
 	/** omp's credential type: "oauth" for a sign-in, "api_key" for a stored key. */
@@ -399,6 +427,8 @@ export interface SignIn {
 	active: boolean;
 	/** omp's own disabled_cause of the kept row; null when the sign-in is active. */
 	cause: string | null;
+	/** Worker turns get this sign-in as a lent env token: an active OAuth row of a LENT_ENV provider. */
+	lent: boolean;
 }
 
 // The causes omp itself hides (pi-coding-agent usage-cli): a logout or a newer login of the account.
@@ -420,17 +450,56 @@ export function signIns(dbPath = agentDb()): SignIn[] {
 		const by = new Map<string, SignIn>();
 		for (const r of rows) {
 			if (r.disabled_cause !== null && GONE.test(r.disabled_cause)) continue;
+			const active = r.disabled_cause === null;
 			const s = {
 				provider: r.provider,
 				kind: r.credential_type,
-				active: r.disabled_cause === null,
+				active,
 				cause: r.disabled_cause,
+				lent:
+					active &&
+					r.credential_type === "oauth" &&
+					Object.hasOwn(LENT_ENV, r.provider),
 			};
 			if (!by.get(r.provider)?.active) by.set(r.provider, s);
 		}
 		return [...by.values()].sort((a, b) =>
 			a.provider.localeCompare(b.provider),
 		);
+	} finally {
+		db.close();
+	}
+}
+
+/** The highest auth_credentials id of the store; 0 when the store or its table is missing. */
+function lastCredentialId(dbPath: string): number {
+	if (!existsSync(dbPath)) return 0;
+	try {
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			const row = db
+				.query("SELECT MAX(id) AS id FROM auth_credentials")
+				.get() as { id: number | null };
+			return row.id ?? 0;
+		} finally {
+			db.close();
+		}
+	} catch {
+		return 0;
+	}
+}
+
+/** omp's stored provider ids of the active rows above `since`: what one login wrote. */
+function providersSince(dbPath: string, since: number): string[] {
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		return (
+			db
+				.query(
+					"SELECT DISTINCT provider FROM auth_credentials WHERE id > ? AND disabled_cause IS NULL",
+				)
+				.all(since) as Array<{ provider: string }>
+		).map((r) => r.provider);
 	} finally {
 		db.close();
 	}
