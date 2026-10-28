@@ -217,9 +217,10 @@ A listed name with no value does not stop the turn; the card log names it.
   `C:/Users/<you>/.omp/oauth`). Provider sign-in is one sign-in per provider,
   done once on the board: **Settings → Provider sign-in**, or
   `docker compose exec server omp login <provider>`. The board store
-  (`agent.db`, bind-mounted via `OTTR_AGENT_DB`) holds the credential; seed it
-  once with a consistent copy of
-  the host's (`VACUUM INTO`, never the hot file). The server publishes
+  (`/etc/ottr/home/.omp/agent/agent.db` on the `board-config` volume) holds the
+  credential. `OTTR_AGENT_DB` is the worker store: a file bind-mounted at
+  `/root/.omp/agent/agent.db`. Seed it once with a consistent copy of the
+  host's (`VACUUM INTO`, never the hot file). The server publishes
   Anthropic's sign-in callback port 54545 and OpenAI Codex's port 1455 on
   `127.0.0.1`, so the provider's redirect reaches the board, which finishes the
   sign-in. Codex's port is fixed: while the stack runs, `omp login
