@@ -25,6 +25,8 @@ const {
 	ALATE_WATCH_MAX_DOWN,
 	ALATE_WATCH_DEADLINE_MS,
 	WarningLines,
+	SETTINGS_TOC,
+	SettingsPage,
 } = await import("./app.tsx");
 
 describe("monogram", () => {
@@ -480,5 +482,52 @@ describe("WarningLines", () => {
 
 	test("no warnings render nothing", () => {
 		expect(renderToStaticMarkup(<WarningLines warnings={[]} />)).toBe("");
+	});
+});
+
+describe("settings TOC", () => {
+	test("groups and sections follow the contract order", () => {
+		expect(SETTINGS_TOC.map((g) => g.label)).toEqual([
+			"Board",
+			"Access",
+			"Git and secrets",
+			"Agents",
+		]);
+		expect(SETTINGS_TOC.map((g) => g.sections.map((s) => s.label))).toEqual([
+			["Runners", "Push"],
+			["API key", "Session"],
+			["Git hosts", "Env"],
+			["Provider sign-in", "Model roles", "Alate", "Hindsight"],
+		]);
+	});
+	test("General page renders each id once, one h1, TOC in order, no GitHub card title", () => {
+		const html = renderToStaticMarkup(
+			<SettingsPage
+				projects={[]}
+				tasks={[]}
+				maxTotal={null}
+				reviewCheck={false}
+				workCheck={false}
+				act={async () => true}
+				view="settings"
+			/>,
+		);
+		const ids = SETTINGS_TOC.flatMap((g) => [
+			g.id,
+			...g.sections.map((s) => s.id),
+		]);
+		for (const id of ids) expect(html.split(`id="${id}"`).length - 1).toBe(1);
+		for (const id of ["signin-section", "model-roles-section", "alate-section"])
+			expect(html).toContain(`id="${id}"`);
+		expect(html.split("<h1").length - 1).toBe(1);
+		const nav =
+			html.match(/<nav[^>]*class="[^"]*settings-nav[\s\S]*?<\/nav>/)?.[0] ?? "";
+		const tocLabels = [
+			...nav.matchAll(/class="toc-(?:group|item)"[^>]*>([^<]*)<\/button>/g),
+		].map((m) => m[1]);
+		expect(tocLabels).toEqual(
+			SETTINGS_TOC.flatMap((g) => [g.label, ...g.sections.map((s) => s.label)]),
+		);
+		expect(html).not.toMatch(/<h[23][^>]*>GitHub<\/h[23]>/);
 	});
 });

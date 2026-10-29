@@ -3018,12 +3018,146 @@ dialog.diff-view {
 	border: 1px solid var(--line-soft);
 	border-radius: 6px;
 }
-.settings-sec > h2,
-.settings-sec > h3 {
+.settings-nav {
+	max-height: 100vh;
+	overflow-y: auto;
+}
+/* Card anatomy: head (title row + hint), body, optional foot. */
+.settings-sec {
+	min-width: 0;
+}
+.sec-head,
+.sec-block {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	align-self: stretch;
+	min-width: 0;
+}
+.sec-head .hint {
+	margin: 0;
+}
+.sec-title {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+.sec-title h3 {
 	margin: 0;
 	font-size: 13.5px;
 	font-weight: 600;
 	color: var(--text-strong);
+}
+.state-chip {
+	padding: 1px 8px;
+	font-size: 11.5px;
+	line-height: 1.5;
+	white-space: nowrap;
+	border: 1px solid var(--line);
+	border-radius: 999px;
+	color: var(--dim);
+}
+.state-chip.ok {
+	color: var(--accent);
+	background: var(--accent-bg);
+	border-color: var(--accent-line);
+}
+.state-chip.warn {
+	color: var(--alarm);
+	background: var(--alarm-bg);
+	border-color: var(--alarm-line);
+}
+.sec-block {
+	gap: 8px;
+}
+.sec-block + .sec-block {
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.sec-block > h4 {
+	margin: 0;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.sec-foot {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 10px;
+	align-self: stretch;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.settings-sec code {
+	overflow-wrap: anywhere;
+}
+.settings-group {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+.settings-group + .settings-group {
+	margin-top: 8px;
+}
+.settings-group-title {
+	margin: 0;
+	font-size: 12.5px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+/* TOC under the General link: text buttons, same steel-edge grammar as .snb. */
+.settings-toc,
+.settings-toc ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.settings-nav .settings-toc {
+	padding-left: 12px;
+}
+.settings-toc ul {
+	padding-left: 12px;
+}
+.toc-group,
+.toc-item {
+	display: block;
+	width: 100%;
+	min-height: 24px;
+	padding: 3px 8px;
+	font: inherit;
+	font-size: 12.5px;
+	text-align: left;
+	color: var(--dim);
+	background: none;
+	border: 0;
+	border-left: 1px solid transparent;
+	border-radius: 0;
+	cursor: pointer;
+}
+.toc-group {
+	font-weight: 500;
+	color: var(--text);
+}
+.toc-group:hover,
+.toc-item:hover,
+.toc-item[aria-current="location"] {
+	color: var(--text-strong);
+}
+.toc-item[aria-current="location"] {
+	border-left-color: var(--accent);
+}
+.toc-group:focus-visible,
+.toc-item:focus-visible,
+.settings-toc-mobile > summary:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
+}
+.settings-toc-mobile {
+	display: none;
 }
 .settings-sec > .hint {
 	margin: 0;
@@ -3056,7 +3190,8 @@ dialog.diff-view {
 .settings-danger {
 	border-color: var(--crit-line);
 }
-.settings-danger > h3 {
+.settings-danger > h3,
+.settings-danger .sec-title h3 {
 	color: var(--crit);
 }
 @media (max-width: 720px) {
@@ -3068,7 +3203,30 @@ dialog.diff-view {
 		position: static;
 		flex-flow: row wrap;
 		gap: 4px 12px;
+		max-height: none;
 		overflow-x: auto;
+	}
+	.settings-nav .settings-toc {
+		display: none;
+	}
+	.settings-toc-mobile {
+		display: block;
+		padding: 0 12px;
+		border: 1px solid var(--line-soft);
+		border-radius: 6px;
+	}
+	.settings-toc-mobile > summary {
+		display: flex;
+		align-items: center;
+		min-height: 44px;
+		cursor: pointer;
+	}
+	.settings-toc-mobile > .settings-toc {
+		padding-bottom: 8px;
+	}
+	.settings-toc-mobile .toc-group,
+	.settings-toc-mobile .toc-item {
+		min-height: 44px;
 	}
 	.snb {
 		padding: 11px 2px;
@@ -3089,11 +3247,6 @@ dialog.diff-view {
 	min-width: 72px;
 }
 /* The save-state contract: dim when settled, accent while waiting on you, crit on failure. */
-.settings-sec .settings-head h2 {
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
 .save-chip {
 	display: inline-flex;
 	align-items: center;
@@ -4921,16 +5074,6 @@ button.diff-path {
 .settings-sec.providers {
 	width: 100%;
 	align-items: stretch;
-}
-.providers-head {
-	display: flex;
-	align-items: baseline;
-	gap: 14px;
-	flex-wrap: wrap;
-}
-.providers-head .hint {
-	margin: 0 0 0 auto;
-	text-align: right;
 }
 .settings-sec.providers .alate-def-row.providers-row {
 	grid-template-columns: 260px minmax(0, 1fr) auto;

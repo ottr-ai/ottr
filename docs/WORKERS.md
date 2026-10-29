@@ -31,7 +31,7 @@ turn is preparing or running, it calls the same provisioning API as
 again; the error shows in the Alate settings section.
 
 At run time git authenticates with the board's GitHub token (asked for at
-onboarding, replaced under **Settings → GitHub**): the server exports it as
+onboarding, replaced under **Settings → Git hosts → GitHub token**): the server exports it as
 `GH_TOKEN`, and the image's git credential helper hands it to git for
 github.com remotes.
 

@@ -7581,13 +7581,37 @@ function TotalRunnersForm({
 		return () => clearTimeout(t);
 	}, [n, maxTotal, chk, reviewCheck, wchk, workCheck]);
 	return (
-		<section className="settings-sec">
-			<h2>Runners</h2>
-			<p className="hint">
-				{maxTotal === null
+		<SettingsCard
+			id="runners-section"
+			title="Runners"
+			hint={
+				maxTotal === null
 					? "No cap: agents start whenever projects need them."
-					: `At most ${maxTotal} agents run at once across all projects; configured slots beyond the cap wait.`}
-			</p>
+					: `At most ${maxTotal} agents run at once across all projects; configured slots beyond the cap wait.`
+			}
+			footer={
+				<>
+					<SaveStateChip
+						dirty={dirty}
+						saving={save.busy}
+						failed={save.failed}
+						saved={saved}
+						dirtyNote="Autosaves in a moment"
+					/>
+					<button
+						type="button"
+						className={`settings-save${save.failed ? " failed" : ""}`}
+						disabled={save.busy || !dirty}
+						onClick={() => {
+							void doSave();
+						}}
+					>
+						{save.busy && <span className="spinner" aria-hidden="true" />}
+						<SaveLabel saved={saved} />
+					</button>
+				</>
+			}
+		>
 			<form
 				className="settings-form"
 				onSubmit={(e) => {
@@ -7647,26 +7671,6 @@ function TotalRunnersForm({
 						</label>
 					</div>
 				</div>
-				<div className="alate-def-actions">
-					<SaveStateChip
-						dirty={dirty}
-						saving={save.busy}
-						failed={save.failed}
-						saved={saved}
-						dirtyNote="Autosaves in a moment"
-					/>
-					<button
-						type="button"
-						className={`settings-save${save.failed ? " failed" : ""}`}
-						disabled={save.busy || !dirty}
-						onClick={() => {
-							void doSave();
-						}}
-					>
-						{save.busy && <span className="spinner" aria-hidden="true" />}
-						<SaveLabel saved={saved} />
-					</button>
-				</div>
 			</form>
 			{/* ponytail: configured slots is informational, so the meter stays grey even when over cap — the cap binds, it is not an alarm */}
 			<Meter
@@ -7679,7 +7683,7 @@ function TotalRunnersForm({
 				value={`${maxTotal === null ? "no cap" : `cap ${maxTotal}`} · ${allocated} configured`}
 				band={false}
 			/>
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -7865,12 +7869,14 @@ function PushSection() {
 			}
 		});
 	return (
-		<section className="settings-sec">
-			<h2>Push</h2>
-			<p className="hint">
-				Get a phone notification when a task needs you, even when the app is
-				closed. Works over HTTPS (e.g. tailscale serve).
-			</p>
+		<SettingsCard
+			id="push-section"
+			title="Push"
+			status={
+				enabled ? { label: "On", tone: "ok" } : { label: "Off", tone: "off" }
+			}
+			hint="Get a phone notification when a task needs you, even when the app is closed. Works over HTTPS (e.g. tailscale serve)."
+		>
 			<button type="button" onClick={enable} disabled={busy.busy || enabled}>
 				{busy.busy && <span className="spinner" aria-hidden="true" />}
 				{enabled ? "Push enabled" : "Enable push notifications"}
@@ -7884,7 +7890,7 @@ function PushSection() {
 					{error}
 				</p>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -7963,12 +7969,11 @@ function ApiKeySection() {
 		});
 	};
 	return (
-		<section className="settings-sec">
-			<h2>API key</h2>
-			<p className="hint">
-				A public host or a board in Docker needs this API key or your login
-				session. Direct local access needs neither.
-			</p>
+		<SettingsCard
+			id="api-key-section"
+			title="API key"
+			hint="A public host or a board in Docker needs this API key or your login session. Direct local access needs neither."
+		>
 			<div className="access-row">
 				<div className="access-key">
 					<code>{reveal && key !== null ? key : "••••••••••••"}</code>
@@ -8017,7 +8022,7 @@ function ApiKeySection() {
 					{error}
 				</p>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -8043,13 +8048,11 @@ function SessionSection() {
 		});
 	};
 	return (
-		<section className="settings-sec">
-			<h2>Session</h2>
-			<p className="hint">
-				Logout in the top bar signs out only this browser. If a device is lost
-				or a cookie escaped, sign out everywhere: every login session is
-				revoked.
-			</p>
+		<SettingsCard
+			id="session-section"
+			title="Session"
+			hint="Logout in the top bar signs out only this browser. If a device is lost or a cookie escaped, sign out everywhere: every login session is revoked."
+		>
 			<button
 				type="button"
 				className="icon danger"
@@ -8064,7 +8067,7 @@ function SessionSection() {
 					<Icon name="log-out" />
 				)}
 			</button>
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -8486,165 +8489,184 @@ function GitHostsSection() {
 			return true;
 		});
 	return (
-		<section className="settings-sec">
-			<h2>Git hosts</h2>
-			<p className="hint">
-				HTTPS tokens and the server-side SSH key for clones, fetches and pushes
-				on any git host. Agents on workers never receive them.
-			</p>
-			{state !== null && state.tokens.length > 0 && (
-				<table>
-					<tbody>
-						{state.tokens.map((t) => (
-							<tr key={t.host}>
-								<td>
-									<code>{t.host}</code>
-								</td>
-								<td>{t.username}</td>
-								<td>
-									<button
-										type="button"
-										onClick={() => {
-											setTHost(t.host);
-											setTUser(t.username);
-										}}
-									>
-										Replace
-									</button>{" "}
-									<BusyButton
-										className="danger"
-										run={() => removeToken(t.host)}
-									>
-										Remove
-									</BusyButton>
-								</td>
-							</tr>
-						))}
-					</tbody>
-				</table>
-			)}
-			<form
-				onSubmit={(e) => {
-					e.preventDefault();
-					saveToken();
-				}}
-			>
-				<label className="settings-field">
-					Host
-					<input
-						value={tHost}
-						onChange={(e) => setTHost(e.target.value)}
-						placeholder="gitlab.com"
-						required
-					/>
-				</label>
-				<label className="settings-field">
-					Username
-					<input
-						value={tUser}
-						onChange={(e) => setTUser(e.target.value)}
-						placeholder="oauth2"
-					/>
-				</label>
-				<label className="settings-field">
-					Token
-					<input
-						type="password"
-						value={tToken}
-						onChange={(e) => setTToken(e.target.value)}
-						autoComplete="off"
-						spellCheck={false}
-						required
-					/>
-				</label>
-				<label className="settings-field">
-					Test URL (a repository the token can read)
-					<input
-						value={tUrl}
-						onChange={(e) => setTUrl(e.target.value)}
-						placeholder="https://gitlab.com/group/repo.git"
-						required
-					/>
-				</label>
-				<button
-					type="submit"
-					disabled={tBusy.busy}
-					className={`primary${tBusy.failed ? " failed" : ""}`}
+		<SettingsCard
+			id="git-hosts-section"
+			title="Git hosts"
+			hint="The GitHub token serves the board's own git and releases. Other HTTPS tokens and the server-side SSH key serve clones, fetches and pushes on any git host. Agents on workers never receive them."
+		>
+			<div className="sec-block">
+				<h4>GitHub token</h4>
+				<p className="hint">
+					The board's git fetches, pushes and publishes releases with this
+					token. Agents on workers never receive it.
+				</p>
+				<SecretTokenForm
+					endpoint="/api/settings/github-token"
+					title="GitHub token"
+					label="GitHub token"
+					captionSet="Set. Paste a new token to replace it"
+					captionUnset="Not set: fetch and push fail"
+					captionUnknown="Unknown: the check failed"
+				/>
+			</div>
+			<div className="sec-block">
+				<h4>Other host tokens</h4>
+				{state !== null && state.tokens.length > 0 && (
+					<table>
+						<tbody>
+							{state.tokens.map((t) => (
+								<tr key={t.host}>
+									<td>
+										<code>{t.host}</code>
+									</td>
+									<td>{t.username}</td>
+									<td>
+										<button
+											type="button"
+											onClick={() => {
+												setTHost(t.host);
+												setTUser(t.username);
+											}}
+										>
+											Replace
+										</button>{" "}
+										<BusyButton
+											className="danger"
+											run={() => removeToken(t.host)}
+										>
+											Remove
+										</BusyButton>
+									</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				)}
+				<form
+					onSubmit={(e) => {
+						e.preventDefault();
+						saveToken();
+					}}
 				>
-					{tBusy.busy && <span className="spinner" aria-hidden="true" />}
-					Save token
-				</button>
-			</form>
-			<h3>Global SSH key</h3>
-			{state !== null &&
-				(state.globalKey === null ? (
-					<p className="hint">No global key.</p>
-				) : (
-					<div>
-						<p className="hint">
-							Fingerprint <code>{state.globalKey.fingerprint}</code>
-						</p>
-						<label>
-							Public key
-							<textarea
-								readOnly
-								rows={3}
-								value={state.globalKey.publicKey}
-								spellCheck={false}
-								onFocus={(e) => e.currentTarget.select()}
-							/>
-						</label>{" "}
-						<button
-							type="button"
-							onClick={() => void copyText(state.globalKey?.publicKey ?? "")}
-						>
-							Copy
-						</button>{" "}
-						<BusyButton className="danger" run={removeGlobal}>
-							Remove
-						</BusyButton>
-					</div>
-				))}
-			<p className="hint">
-				Save replaces the global key: every project without its own key uses the
-				new one.
-			</p>
-			<PendingKeyRow pending={pending} onPending={setPending} />
-			<label className="settings-field">
-				Test URL (a repository the key can read)
-				<input
-					value={gUrl}
-					onChange={(e) => setGUrl(e.target.value)}
-					placeholder="git@gitlab.com:group/repo.git"
-				/>
-			</label>
-			{pending !== null && (
-				<SshTestRow
-					label="Save and test"
-					success="Global key saved"
-					send={(trust) =>
-						gitReq("PUT", "/api/git-hosts/ssh/global", {
-							pending: pending.id,
-							testUrl: gUrl.trim(),
-							trust,
-						}).then(({ status, data }) => {
-							if (status === 200) {
-								setPending(null);
-								void load();
-								return { ok: true } as const;
-							}
-							const t = asTrust(data);
-							return t !== null ? t : { error: asError(data, status) };
-						})
-					}
-				/>
-			)}
+					<label className="settings-field">
+						Host
+						<input
+							value={tHost}
+							onChange={(e) => setTHost(e.target.value)}
+							placeholder="gitlab.com"
+							required
+						/>
+					</label>
+					<label className="settings-field">
+						Username
+						<input
+							value={tUser}
+							onChange={(e) => setTUser(e.target.value)}
+							placeholder="oauth2"
+						/>
+					</label>
+					<label className="settings-field">
+						Token
+						<input
+							type="password"
+							value={tToken}
+							onChange={(e) => setTToken(e.target.value)}
+							autoComplete="off"
+							spellCheck={false}
+							required
+						/>
+					</label>
+					<label className="settings-field">
+						Test URL (a repository the token can read)
+						<input
+							value={tUrl}
+							onChange={(e) => setTUrl(e.target.value)}
+							placeholder="https://gitlab.com/group/repo.git"
+							required
+						/>
+					</label>
+					<button
+						type="submit"
+						disabled={tBusy.busy}
+						className={`primary${tBusy.failed ? " failed" : ""}`}
+					>
+						{tBusy.busy && <span className="spinner" aria-hidden="true" />}
+						Save token
+					</button>
+				</form>
+			</div>
+			<div className="sec-block">
+				<h4>Global SSH key</h4>
+				{state !== null &&
+					(state.globalKey === null ? (
+						<p className="hint">No global key.</p>
+					) : (
+						<div>
+							<p className="hint">
+								Fingerprint <code>{state.globalKey.fingerprint}</code>
+							</p>
+							<label>
+								Public key
+								<textarea
+									readOnly
+									rows={3}
+									value={state.globalKey.publicKey}
+									spellCheck={false}
+									onFocus={(e) => e.currentTarget.select()}
+								/>
+							</label>{" "}
+							<button
+								type="button"
+								onClick={() => void copyText(state.globalKey?.publicKey ?? "")}
+							>
+								Copy
+							</button>{" "}
+							<BusyButton className="danger" run={removeGlobal}>
+								Remove
+							</BusyButton>
+						</div>
+					))}
+				<p className="hint">
+					Save replaces the global key: every project without its own key uses
+					the new one.
+				</p>
+				<PendingKeyRow pending={pending} onPending={setPending} />
+				<label className="settings-field">
+					Test URL (a repository the key can read)
+					<input
+						value={gUrl}
+						onChange={(e) => setGUrl(e.target.value)}
+						placeholder="git@gitlab.com:group/repo.git"
+					/>
+				</label>
+				{pending !== null && (
+					<SshTestRow
+						label="Save and test"
+						success="Global key saved"
+						send={(trust) =>
+							gitReq("PUT", "/api/git-hosts/ssh/global", {
+								pending: pending.id,
+								testUrl: gUrl.trim(),
+								trust,
+							}).then(({ status, data }) => {
+								if (status === 200) {
+									setPending(null);
+									void load();
+									return { ok: true } as const;
+								}
+								const t = asTrust(data);
+								return t !== null ? t : { error: asError(data, status) };
+							})
+						}
+					/>
+				)}
+			</div>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
 				</p>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -8691,21 +8713,20 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			}
 		})();
 	return (
-		<section className="settings-sec">
-			<h3>SSH key</h3>
-			{own === undefined ? (
-				<p className="hint">Loading…</p>
-			) : (
-				<p className="hint">
-					{own === null ? (
-						"Global key"
-					) : (
-						<>
-							Own key, fingerprint <code>{own.fingerprint}</code>
-						</>
-					)}
-				</p>
-			)}
+		<SettingsCard
+			title="SSH key"
+			hint={
+				own === undefined ? (
+					"Loading…"
+				) : own === null ? (
+					"Global key"
+				) : (
+					<>
+						Own key, fingerprint <code>{own.fingerprint}</code>
+					</>
+				)
+			}
+		>
 			{own !== null && own !== undefined && (
 				<div>
 					<BusyButton className="danger" run={useGlobal}>
@@ -8749,28 +8770,7 @@ function SshKeySection({ project }: { project: ProjectView }) {
 					{error}
 				</p>
 			)}
-		</section>
-	);
-}
-
-/** Settings "GitHub" section: the write-only token the board's own git and merge turns use. */
-function GithubTokenSection() {
-	return (
-		<section className="settings-sec">
-			<h2>GitHub</h2>
-			<p className="hint">
-				The board's git fetches, pushes and publishes releases with this token.
-				Agents on workers never receive it.
-			</p>
-			<SecretTokenForm
-				endpoint="/api/settings/github-token"
-				title="GitHub token"
-				label="GitHub token"
-				captionSet="Set. Paste a new token to replace it"
-				captionUnset="Not set: fetch and push fail"
-				captionUnknown="Unknown: the check failed"
-			/>
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -8808,14 +8808,18 @@ function EnvSection() {
 			}
 		});
 	return (
-		<section className="settings-sec">
-			<h2>Env</h2>
-			<p className="hint">
-				Names come from the data repo's{" "}
-				<code>workers/&lt;project&gt;/env.txt</code> files (alate provisions
-				them into the home volume). One secret value per name serves every
-				project that lists it. Values are never shown after save.
-			</p>
+		<SettingsCard
+			id="env-section"
+			title="Env"
+			hint={
+				<>
+					Names come from the data repo's{" "}
+					<code>workers/&lt;project&gt;/env.txt</code> files (alate provisions
+					them into the home volume). One secret value per name serves every
+					project that lists it. Values are never shown after save.
+				</>
+			}
+		>
 			{rows !== null && rows.length === 0 && (
 				<p className="hint">No env.txt file declares a name yet.</p>
 			)}
@@ -8875,7 +8879,7 @@ function EnvSection() {
 					{error}
 				</p>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -8997,20 +9001,23 @@ function ProviderLoginSection() {
 	const page = pending === null ? null : signInPage(pending.output);
 	const signIns = state?.signIns ?? [];
 	const rowIds = [...new Set(signIns.map((i) => i.provider))].sort();
+	const signedIn = new Set(
+		signIns.filter((i) => i.active).map((i) => i.provider),
+	).size;
 	return (
-		<section className="settings-sec providers" id="signin-section">
-			<div className="providers-head">
-				<h2>Provider sign-in</h2>
-				<p className="hint">
-					One sign-in per provider, stored on the board's machine. For OAuth
-					sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a
-					short-lived token in their env. Other providers are not lent: workers
-					use their own sign-in, or the provider's key under Settings, Env. A
-					sign-in works the same from a phone or another machine: finish the
-					provider's page there, copy the address it ends on, or the code it
-					shows, and paste it below.
-				</p>
-			</div>
+		<SettingsCard
+			id="signin-section"
+			className="providers"
+			title="Provider sign-in"
+			status={
+				state === null
+					? undefined
+					: signedIn > 0
+						? { label: `${signedIn} signed in`, tone: "ok" }
+						: { label: "None signed in", tone: "warn" }
+			}
+			hint="One sign-in per provider, stored on the board's machine. For OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a short-lived token in their env. Other providers are not lent: workers use their own sign-in, or the provider's key under Settings, Env. A sign-in works the same from a phone or another machine: finish the provider's page there, copy the address it ends on, or the code it shows, and paste it below."
+		>
 			{rowIds.length > 0 && (
 				<div className="alate-def-rows">
 					{rowIds.map((id) => {
@@ -9200,7 +9207,7 @@ function ProviderLoginSection() {
 					{error}
 				</p>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -9409,13 +9416,18 @@ function ModelRolesSection() {
 	const failed =
 		prov?.state === "done" ? prov.results.filter((r) => r.code !== 0) : [];
 	return (
-		<section className="settings-sec model-roles" id="model-roles-section">
-			<h2>Model roles</h2>
-			<p className="hint">
-				omp runs each role with its model. Save commits{" "}
-				<code>user/omp/agent/config.yml</code> to Alate's data repo with the
-				board's GitHub token, then Alate provisions the workers.
-			</p>
+		<SettingsCard
+			id="model-roles-section"
+			className="model-roles"
+			title="Model roles"
+			hint={
+				<>
+					omp runs each role with its model. Save commits{" "}
+					<code>user/omp/agent/config.yml</code> to Alate's data repo with the
+					board's GitHub token, then Alate provisions the workers.
+				</>
+			}
+		>
 			{loadErr !== null ? (
 				<p className="hint" role="status">
 					Cannot load the model roles: {loadErr}.{" "}
@@ -9642,7 +9654,7 @@ function ModelRolesSection() {
 					<pre className="log">{r.output}</pre>
 				</div>
 			))}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -9673,23 +9685,34 @@ function HindsightSection() {
 			}
 		});
 	return (
-		<section className="settings-sec">
-			<h2>Hindsight</h2>
-			{view?.url === null && (
-				<p className="hint">
-					This board's turns use omp's own memory settings:{" "}
-					<code>HINDSIGHT_API_URL</code> is not set and no server URL is saved.
-				</p>
-			)}
-			{view !== null && view.url !== null && (
-				<p className="hint">
-					Every turn keeps its memory on the Hindsight server at{" "}
-					<code>{view.url}</code>. The board saves a new key only when that
-					server accepts it. Turns that start after the save use the new key and
-					URL. A saved URL beats the <code>HINDSIGHT_API_URL</code> env seed at
-					the next boot.
-				</p>
-			)}
+		<SettingsCard
+			id="hindsight-section"
+			title="Hindsight"
+			status={
+				view === null
+					? undefined
+					: view.url !== null
+						? { label: "On", tone: "ok" }
+						: { label: "Off", tone: "off" }
+			}
+			hint={
+				view === null ? undefined : view.url === null ? (
+					<>
+						This board's turns use omp's own memory settings:{" "}
+						<code>HINDSIGHT_API_URL</code> is not set and no server URL is
+						saved.
+					</>
+				) : (
+					<>
+						Every turn keeps its memory on the Hindsight server at{" "}
+						<code>{view.url}</code>. The board saves a new key only when that
+						server accepts it. Turns that start after the save use the new key
+						and URL. A saved URL beats the <code>HINDSIGHT_API_URL</code> env
+						seed at the next boot.
+					</>
+				)
+			}
+		>
 			<form
 				className="settings-form"
 				onSubmit={(e) => {
@@ -9750,7 +9773,7 @@ function HindsightSection() {
 					onLoaded={setView}
 				/>
 			)}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -10003,13 +10026,11 @@ function AlateSection() {
 			}
 		});
 	return (
-		<section className="settings-sec" id="alate-section">
-			<h2>Alate</h2>
-			<p className="hint">
-				alate provisions omp rules, settings, skills and plugins from the data
-				repo it is configured with; provisioning asks the alate server API, so
-				the server must be running.
-			</p>
+		<SettingsCard
+			id="alate-section"
+			title="Alate"
+			hint="alate provisions omp rules, settings, skills and plugins from the data repo it is configured with; provisioning asks the alate server API, so the server must be running."
+		>
 			{conn !== "" && (
 				<p className="hint">
 					<a href={conn} target="_blank" rel="noreferrer">
@@ -10104,7 +10125,7 @@ function AlateSection() {
 					<pre className="log">{r.output}</pre>
 				</div>
 			))}
-		</section>
+		</SettingsCard>
 	);
 }
 
@@ -10163,12 +10184,11 @@ function LearningsSection({
 		);
 	};
 	return (
-		<section className="settings-sec learnings-sec">
-			<h2>Review learnings</h2>
-			<span className="hint">
-				Standing review conventions, stated once. Every Review card's prompt
-				carries them, so a finding that only restates one is treated as noise.
-			</span>
+		<SettingsCard
+			className="learnings-sec"
+			title="Review learnings"
+			hint="Standing review conventions, stated once. Every Review card's prompt carries them, so a finding that only restates one is treated as noise."
+		>
 			{items !== null && items.length === 0 && (
 				<p className="dim">No learnings yet.</p>
 			)}
@@ -10241,11 +10261,138 @@ function LearningsSection({
 					{error}
 				</p>
 			)}
+		</SettingsCard>
+	);
+}
+
+type ChipTone = "ok" | "warn" | "off";
+
+/** One settings card: title, optional state chip and hint, body, optional Save footer. */
+function SettingsCard({
+	id,
+	title,
+	hint,
+	status,
+	footer,
+	className,
+	children,
+}: {
+	id?: string;
+	title: string;
+	hint?: ReactNode;
+	status?: { label: string; tone: ChipTone };
+	footer?: ReactNode;
+	className?: string;
+	children: ReactNode;
+}) {
+	const titleId = id === undefined ? undefined : `${id}-title`;
+	return (
+		<section
+			className={
+				className === undefined ? "settings-sec" : `settings-sec ${className}`
+			}
+			id={id}
+			aria-labelledby={titleId}
+		>
+			<div className="sec-head">
+				<div className="sec-title">
+					<h3 id={titleId}>{title}</h3>
+					{status !== undefined && (
+						<span className={`state-chip ${status.tone}`}>{status.label}</span>
+					)}
+				</div>
+				{hint != null && <p className="hint">{hint}</p>}
+			</div>
+			{children}
+			{footer != null && <div className="sec-foot">{footer}</div>}
 		</section>
 	);
 }
 
-function SettingsPage({
+/** General settings: topic groups and their cards, in page order; the TOC and scroll-spy read it. */
+export const SETTINGS_TOC = [
+	{
+		id: "board-group",
+		label: "Board",
+		sections: [
+			{ id: "runners-section", label: "Runners" },
+			{ id: "push-section", label: "Push" },
+		],
+	},
+	{
+		id: "access-group",
+		label: "Access",
+		sections: [
+			{ id: "api-key-section", label: "API key" },
+			{ id: "session-section", label: "Session" },
+		],
+	},
+	{
+		id: "git-group",
+		label: "Git and secrets",
+		sections: [
+			{ id: "git-hosts-section", label: "Git hosts" },
+			{ id: "env-section", label: "Env" },
+		],
+	},
+	{
+		id: "agents-group",
+		label: "Agents",
+		sections: [
+			{ id: "signin-section", label: "Provider sign-in" },
+			{ id: "model-roles-section", label: "Model roles" },
+			{ id: "alate-section", label: "Alate" },
+			{ id: "hindsight-section", label: "Hindsight" },
+		],
+	},
+] as const;
+
+/** The General page's table of contents; `active` is the card the scroll-spy sees. */
+function SettingsToc({
+	active,
+	onPick,
+}: {
+	active: string | null;
+	onPick: (id: string) => void;
+}) {
+	return (
+		<ul className="settings-toc" aria-label="On this page">
+			{SETTINGS_TOC.map((g) => (
+				<li key={g.id}>
+					<button
+						type="button"
+						className="toc-group"
+						onClick={() => {
+							onPick(g.sections[0].id);
+							openSettingsSection(g.id);
+						}}
+					>
+						{g.label}
+					</button>
+					<ul>
+						{g.sections.map((s) => (
+							<li key={s.id}>
+								<button
+									type="button"
+									className="toc-item"
+									aria-current={s.id === active ? "location" : undefined}
+									onClick={() => {
+										onPick(s.id);
+										openSettingsSection(s.id);
+									}}
+								>
+									{s.label}
+								</button>
+							</li>
+						))}
+					</ul>
+				</li>
+			))}
+		</ul>
+	);
+}
+
+export function SettingsPage({
 	projects,
 	tasks,
 	maxTotal,
@@ -10271,6 +10418,66 @@ function SettingsPage({
 		(sum, p) => sum + (p.settings.maxParallel ?? 0),
 		0,
 	);
+	const general = project === null;
+	const [active, setActive] = useState<string | null>(null);
+	// The clicked entry stays current until the user scrolls, because the end of the page can show several cards.
+	const pinned = useRef<string | null>(null);
+	const onPick = (id: string) => {
+		pinned.current = id;
+		setActive(id);
+	};
+	// Scroll-spy: the last card whose top passed a reading line near the scroll root's top is current; at the bottom, the last card.
+	// The line stays above the shortest card's height, so a short card scrolled to the top never hands over to the next one.
+	useEffect(() => {
+		if (!general) return;
+		pinned.current = null;
+		const ids: string[] = SETTINGS_TOC.flatMap((g) =>
+			g.sections.map((s) => s.id),
+		);
+		const pick = () => {
+			if (pinned.current !== null) return;
+			let root = document.getElementById(ids[0] ?? "")?.parentElement ?? null;
+			while (
+				root !== null &&
+				!/auto|scroll/.test(getComputedStyle(root).overflowY)
+			)
+				root = root.parentElement;
+			const r = root ?? document.documentElement;
+			const box = root?.getBoundingClientRect() ?? {
+				top: 0,
+				height: window.innerHeight,
+			};
+			if (
+				r.scrollTop > 0 &&
+				r.scrollTop + r.clientHeight >= r.scrollHeight - 2
+			) {
+				setActive(ids[ids.length - 1] ?? null);
+				return;
+			}
+			const line = box.top + Math.min(120, box.height * 0.3);
+			let cur = ids[0] ?? null;
+			for (const id of ids) {
+				const top = document.getElementById(id)?.getBoundingClientRect().top;
+				if (top !== undefined && top <= line) cur = id;
+			}
+			setActive(cur);
+		};
+		// ponytail: capture-phase scroll listener instead of an observer; it sees scrolls of any container and fires for tall cards crossing the line.
+		const unpin = () => {
+			pinned.current = null;
+			pick();
+		};
+		const opts = { capture: true, passive: true };
+		document.addEventListener("scroll", pick, opts);
+		for (const t of ["wheel", "touchstart", "keydown"])
+			document.addEventListener(t, unpin, opts);
+		pick();
+		return () => {
+			document.removeEventListener("scroll", pick, { capture: true });
+			for (const t of ["wheel", "touchstart", "keydown"])
+				document.removeEventListener(t, unpin, { capture: true });
+		};
+	}, [general]);
 	return (
 		<div className="settings-page">
 			<nav className="settings-nav" aria-label="Settings sections">
@@ -10282,6 +10489,7 @@ function SettingsPage({
 				>
 					General
 				</a>
+				{general && <SettingsToc active={active} onPick={onPick} />}
 				<p className="snb-label">Projects</p>
 				{projects.map((p) => (
 					<a
@@ -10298,23 +10506,62 @@ function SettingsPage({
 				<h1>Settings</h1>
 				{project === null ? (
 					<>
-						<TotalRunnersForm
-							maxTotal={maxTotal}
-							reviewCheck={reviewCheck}
-							workCheck={workCheck}
-							allocated={allocated}
-							act={act}
-						/>
-						<ApiKeySection />
-						<SessionSection />
-						<GithubTokenSection />
-						<EnvSection />
-						<GitHostsSection />
-						<ProviderLoginSection />
-						<ModelRolesSection />
-						<HindsightSection />
-						<AlateSection />
-						<PushSection />
+						<details className="settings-toc-mobile">
+							<summary>On this page</summary>
+							<SettingsToc active={active} onPick={onPick} />
+						</details>
+						<section
+							className="settings-group"
+							id="board-group"
+							aria-labelledby="board-group-title"
+						>
+							<h2 className="settings-group-title" id="board-group-title">
+								Board
+							</h2>
+							<TotalRunnersForm
+								maxTotal={maxTotal}
+								reviewCheck={reviewCheck}
+								workCheck={workCheck}
+								allocated={allocated}
+								act={act}
+							/>
+							<PushSection />
+						</section>
+						<section
+							className="settings-group"
+							id="access-group"
+							aria-labelledby="access-group-title"
+						>
+							<h2 className="settings-group-title" id="access-group-title">
+								Access
+							</h2>
+							<ApiKeySection />
+							<SessionSection />
+						</section>
+						<section
+							className="settings-group"
+							id="git-group"
+							aria-labelledby="git-group-title"
+						>
+							<h2 className="settings-group-title" id="git-group-title">
+								Git and secrets
+							</h2>
+							<GitHostsSection />
+							<EnvSection />
+						</section>
+						<section
+							className="settings-group"
+							id="agents-group"
+							aria-labelledby="agents-group-title"
+						>
+							<h2 className="settings-group-title" id="agents-group-title">
+								Agents
+							</h2>
+							<ProviderLoginSection />
+							<ModelRolesSection />
+							<AlateSection />
+							<HindsightSection />
+						</section>
 					</>
 				) : (
 					<ProjectSettingsForm
@@ -10446,8 +10693,7 @@ function ProjectSettingsForm({
 					);
 				}}
 			>
-				<section className="settings-sec">
-					<h3>Icon</h3>
+				<SettingsCard title="Icon">
 					<div className="icon-row">
 						<span className="icon-preview">
 							<ProjectTag project={project} />
@@ -10507,9 +10753,8 @@ function ProjectSettingsForm({
 							</button>
 						)}
 					</div>
-				</section>
-				<section className="settings-sec">
-					<h3>Identity</h3>
+				</SettingsCard>
+				<SettingsCard title="Identity">
 					<label className="settings-field">
 						Display name
 						<input
@@ -10537,9 +10782,8 @@ function ProjectSettingsForm({
 							</a>
 						</div>
 					)}
-				</section>
-				<section className="settings-sec">
-					<h3>Runners</h3>
+				</SettingsCard>
+				<SettingsCard title="Runners">
 					<label className="settings-field">
 						Max tasks of this project running at once (empty = no cap)
 						<input
@@ -10549,9 +10793,8 @@ function ProjectSettingsForm({
 							onChange={(e) => setMp(e.target.value)}
 						/>
 					</label>
-				</section>
-				<section className="settings-sec">
-					<h3>Worktrees</h3>
+				</SettingsCard>
+				<SettingsCard title="Worktrees">
 					<label className="settings-field">
 						Extra paths copied into new worktrees (one per line)
 						<textarea
@@ -10580,9 +10823,8 @@ function ProjectSettingsForm({
 							would be lost.
 						</span>
 					</label>
-				</section>
-				<section className="settings-sec">
-					<h3>Releases</h3>
+				</SettingsCard>
+				<SettingsCard title="Releases">
 					<label className="settings-field">
 						Release command
 						<input
@@ -10600,9 +10842,8 @@ function ProjectSettingsForm({
 							tags and publishes itself.
 						</span>
 					</label>
-				</section>
-				<section className="settings-sec">
-					<h3>Reviews</h3>
+				</SettingsCard>
+				<SettingsCard title="Reviews">
 					<div className="settings-numbers">
 						<label>
 							Review due after this many commits on the target
@@ -10616,9 +10857,8 @@ function ProjectSettingsForm({
 							/>
 						</label>
 					</div>
-				</section>
-				<section className="settings-sec">
-					<h3>Messages</h3>
+				</SettingsCard>
+				<SettingsCard title="Messages">
 					<label className="settings-field">
 						Max images per message
 						<input
@@ -10632,9 +10872,8 @@ function ProjectSettingsForm({
 							Applies to new tasks, replies, follow-ups, and steers.
 						</span>
 					</label>
-				</section>
-				<section className="settings-sec">
-					<h3>Updates</h3>
+				</SettingsCard>
+				<SettingsCard title="Updates">
 					{/* U7: hold update-card merges at needs_you until a reply approves them. */}
 					<label className="add-check">
 						<input
@@ -10686,7 +10925,7 @@ function ProjectSettingsForm({
 							proposals; fork-born merges need approval.
 						</span>
 					</label>
-				</section>
+				</SettingsCard>
 			</form>
 			<LearningsSection project={project} act={act} />
 			{setupOpen && (
@@ -10697,13 +10936,17 @@ function ProjectSettingsForm({
 				/>
 			)}
 			<SshKeySection project={project} />
-			<section className="settings-sec settings-danger">
-				<h3>Remove project</h3>
-				<span className="hint">
-					Removes the project {projectLabel(project)} from this Ottr board.
-					Nothing is deleted: its folder, repo, and task history stay on disk.
-					Adding the folder again brings the project back here.
-				</span>
+			<SettingsCard
+				className="settings-danger"
+				title="Remove project"
+				hint={
+					<>
+						Removes the project {projectLabel(project)} from this Ottr board.
+						Nothing is deleted: its folder, repo, and task history stay on disk.
+						Adding the folder again brings the project back here.
+					</>
+				}
+			>
 				<div>
 					<BusyButton
 						className="danger"
@@ -10726,7 +10969,7 @@ function ProjectSettingsForm({
 						Remove project
 					</BusyButton>
 				</div>
-			</section>
+			</SettingsCard>
 		</>
 	);
 }
