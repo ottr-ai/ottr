@@ -101,6 +101,8 @@ export function buildOmpArgs(o: {
 	skills?: string | null;
 	/** Non-empty caps the run's duration (`--max-time`); a hung check run must not hold a board slot forever. */
 	maxTime?: string | null;
+	/** True for runs over untrusted checkouts: no discovered extensions and no LSP servers. */
+	noDiscovery?: boolean;
 }): string[] {
 	return [
 		"-p",
@@ -125,6 +127,7 @@ export function buildOmpArgs(o: {
 		...(o.config ? ["--config", o.config] : []),
 		...(o.skills ? ["--skills", o.skills] : []),
 		...(o.maxTime ? ["--max-time", o.maxTime] : []),
+		...(o.noDiscovery ? ["--no-extensions", "--no-lsp"] : []),
 		...(o.images ?? []).map((p) => `@${p}`),
 	];
 }
@@ -1010,6 +1013,8 @@ export function startRun(o: {
 	/** Non-empty caps the run's duration (`--max-time`); a review check run sets it so a hung
 	 * check cannot hold a board slot forever. */
 	maxTime?: string | null;
+	/** Forwarded to buildOmpArgs: a run over an untrusted checkout (a PR review). */
+	noDiscovery?: boolean;
 }): RunHandle {
 	const sink = createRunSink({
 		logPath: o.logPath,

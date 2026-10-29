@@ -12,6 +12,7 @@ import {
 	moveBelow,
 	removeBelow,
 	trustedAnchor,
+	writeBelow,
 } from "./confine.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
@@ -595,29 +596,49 @@ export async function createWorktree(o: {
 }
 
 /** Agent config a PR could add to steer the review agent or run code in it (omp hooks,
- * extensions, MCP servers): a pr_review worktree never checks these out (gitignore syntax: a name without an inner slash matches at any depth). */
+ * extensions, MCP servers, other agents' config that omp also reads): a pr_review worktree
+ * never checks these out. Gitignore syntax: a name without an inner slash matches at any
+ * depth; no trailing slash, so a file or a symlink of that name is left out too. The run
+ * itself also turns off project MCP config, extension discovery and every write tool, so
+ * this list is one layer, not the only one. */
 export const PR_EXCLUDED_PATHS = [
 	"AGENTS.md",
 	"CLAUDE.md",
 	"GEMINI.md",
 	".cursorrules",
-	".omp/",
-	".claude/",
-	".agents/",
-	".cursor/",
-	".codex/",
-	".github/copilot-instructions.md",
+	".clinerules",
+	".windsurfrules",
+	".omp",
+	".claude",
+	".agents",
+	".agent",
+	".cursor",
+	".codex",
+	".gemini",
+	".opencode",
+	".windsurf",
+	".vscode",
+	"/.mcp.json",
+	"/mcp.json",
+	"/mcp_config.json",
+	"/opencode.json",
+	"/opencode.jsonc",
+	"/.github/copilot-instructions.md",
+	"/.github/skills",
 ];
 
 /** A branch-less worktree detached at `sha` (a pr_review card) without PR_EXCLUDED_PATHS: a
  * registered one moves to `sha`, a scratch dir from an interrupted add is replaced like
- * createWorktree does. The main checkout's trusted untracked AGENTS.md/.omp are copied in. */
+ * createWorktree does. The main checkout's trusted untracked AGENTS.md/.omp are copied in.
+ * The PR's commits and diff against `base` land in the worktree's private git dir (outside
+ * the tree, removed with the worktree); returns that file's path. */
 export async function createDetachedWorktree(o: {
 	mainPath: string;
 	worktreePath: string;
 	sha: string;
+	base: string;
 	log: (line: string) => void;
-}): Promise<void> {
+}): Promise<string> {
 	if (!/^[0-9a-f]{40}$/.test(o.sha)) throw new Error(`invalid sha: ${o.sha}`);
 	const onDisk = existsSync(o.worktreePath);
 	if (!(onDisk && (await worktreeLinked(o.worktreePath)))) {
@@ -653,6 +674,32 @@ export async function createDetachedWorktree(o: {
 			);
 	}
 	await copyRules({ ...o, copyExtra: [] });
+	const gitDir = await git(["rev-parse", "--absolute-git-dir"], o.worktreePath);
+	if (gitDir.code !== 0)
+		throw new Error(`git rev-parse failed: ${gitDir.stderr.trim()}`);
+	const parts: string[] = [];
+	for (const args of [
+		["log", "--no-decorate", "--no-color", `${o.base}..${o.sha}`],
+		[
+			"diff",
+			"--no-color",
+			"--no-ext-diff",
+			"--no-textconv",
+			`${o.base}...${o.sha}`,
+		],
+	]) {
+		const r = await git(["--no-pager", ...args], o.worktreePath);
+		if (r.code !== 0)
+			throw new Error(`git ${args[0]} failed: ${r.stderr.trim()}`);
+		parts.push(r.stdout);
+	}
+	const dir = gitDir.stdout.trim();
+	// A PR cannot move the git dir, but a worker could: keep the write below the main checkout.
+	if (!isBelow(o.mainPath, dir))
+		throw new Error(`refusing ${dir}: the git dir is outside ${o.mainPath}`);
+	const diffPath = path.join(dir, "ottr-pr.diff");
+	writeBelow(trustedAnchor(o.mainPath), diffPath, `${parts[0]}\n${parts[1]}`);
+	return diffPath;
 }
 
 /** Copies the main checkout's untracked AGENTS.md, .omp and `copyExtra` into the worktree,

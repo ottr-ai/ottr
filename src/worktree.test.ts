@@ -783,13 +783,23 @@ describe("against real repos", () => {
 		const m = join(root, "pr-main");
 		const wt = join(root, "wt-pr");
 		await must(root, "init", "-q", "-b", "main", m);
+		writeFileSync(join(m, "README.md"), "base\n");
+		await must(m, "add", "-A");
+		await must(m, "commit", "-q", "-m", "base");
+		const base = await must(m, "rev-parse", "HEAD");
 		mkdirSync(join(m, "sub"));
 		mkdirSync(join(m, ".omp"));
 		mkdirSync(join(m, "src"));
+		mkdirSync(join(m, "evil", "ext"), { recursive: true });
+		mkdirSync(join(m, ".vscode"));
 		writeFileSync(join(m, "AGENTS.md"), "pr rules\n");
 		writeFileSync(join(m, "sub", "AGENTS.md"), "pr sub rules\n");
 		writeFileSync(join(m, ".omp", "x.json"), "{}\n");
 		writeFileSync(join(m, "src", "a.ts"), "one\n");
+		// Project MCP config a PR could add to run a command at omp start.
+		writeFileSync(join(m, ".mcp.json"), '{"mcpServers":{}}\n');
+		writeFileSync(join(m, ".vscode", "mcp.json"), "{}\n");
+		writeFileSync(join(m, "evil", "ext", "x.ts"), "x\n");
 		await must(m, "add", "-A");
 		await must(m, "commit", "-q", "-m", "pr 1");
 		const c1 = await must(m, "rev-parse", "HEAD");
@@ -797,9 +807,17 @@ describe("against real repos", () => {
 		writeFileSync(join(m, "AGENTS.md"), "pr rules 2\n");
 		await must(m, "commit", "-q", "-am", "pr 2");
 		const c2 = await must(m, "rev-parse", "HEAD");
+		// A tracked symlink named like an excluded dir: a trailing-slash pattern would miss it.
+		await must(m, "rm", "-q", "-r", ".omp");
+		symlinkSync("evil/ext", join(m, ".omp"));
+		await must(m, "add", "-A");
+		await must(m, "commit", "-q", "-m", "pr 3");
+		const c3 = await must(m, "rev-parse", "HEAD");
+		// Back to the pr 2 tree in the main checkout (a .omp dir again).
+		await must(m, "reset", "-q", "--hard", c2);
 		// The main checkout's trusted local rules: untracked, so copied into the PR worktree.
 		writeFileSync(join(m, ".omp", "trusted.json"), "{}\n");
-		const opts = { mainPath: m, worktreePath: wt, log: () => {} };
+		const opts = { mainPath: m, worktreePath: wt, base, log: () => {} };
 
 		const check = async (sha: string, a: string) => {
 			expect(await must(wt, "rev-parse", "HEAD")).toBe(sha);
@@ -807,6 +825,8 @@ describe("against real repos", () => {
 			expect(existsSync(join(wt, "AGENTS.md"))).toBe(false);
 			expect(existsSync(join(wt, "sub", "AGENTS.md"))).toBe(false);
 			expect(existsSync(join(wt, ".omp", "x.json"))).toBe(false);
+			expect(existsSync(join(wt, ".mcp.json"))).toBe(false);
+			expect(existsSync(join(wt, ".vscode", "mcp.json"))).toBe(false);
 			expect(existsSync(join(wt, ".omp", "trusted.json"))).toBe(true);
 			expect(await must(wt, "status", "--porcelain")).toBe("");
 			// The main checkout keeps every file and never turns sparse.
@@ -816,11 +836,20 @@ describe("against real repos", () => {
 				(await git(["config", "--get", "core.sparseCheckout"], m)).code,
 			).not.toBe(0);
 		};
-		await createDetachedWorktree({ ...opts, sha: c1 });
+		const diff1 = await createDetachedWorktree({ ...opts, sha: c1 });
 		await check(c1, "one\n");
+		// The diff file sits in the worktree's private git dir, outside the tree.
+		expect(diff1.startsWith(join(m, ".git", "worktrees"))).toBe(true);
+		const text = readFileSync(diff1, "utf8");
+		expect(text).toContain("pr 1");
+		expect(text).toContain("+one");
 		// Re-review: the registered worktree moves to the new head and keeps the exclusion.
 		await createDetachedWorktree({ ...opts, sha: c2 });
 		await check(c2, "two\n");
+		await createDetachedWorktree({ ...opts, sha: c3 });
+		expect(lstatSync(join(wt, ".omp")).isSymbolicLink()).toBe(false);
+		expect(existsSync(join(wt, ".omp", "trusted.json"))).toBe(true);
+		expect(existsSync(join(wt, ".omp", "x.ts"))).toBe(false);
 	}, 60_000);
 });
 

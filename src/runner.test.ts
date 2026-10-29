@@ -234,6 +234,15 @@ describe("buildOmpArgs", () => {
 		]);
 	});
 
+	test("noDiscovery adds --no-extensions and --no-lsp; off by default", () => {
+		const base = { sessionDir: "S", resumeId: null };
+		expect(buildOmpArgs({ ...base, noDiscovery: true }).slice(-2)).toEqual([
+			"--no-extensions",
+			"--no-lsp",
+		]);
+		expect(buildOmpArgs(base)).not.toContain("--no-extensions");
+	});
+
 	test("retro flags emit run.yml, --tools, retro config and --skills in that order, before images", () => {
 		expect(
 			buildOmpArgs({

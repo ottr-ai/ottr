@@ -1164,10 +1164,13 @@ export function createTurnLoop(
 					);
 				wt = join(store.worktreesDir, id);
 				log(`+ worktree detached at ${head} (PR #${row.number})`);
-				await (ops.createDetachedWorktree ?? createDetachedWorktree)({
+				const diffPath = await (
+					ops.createDetachedWorktree ?? createDetachedWorktree
+				)({
 					mainPath: e.path,
 					worktreePath: wt,
 					sha: head,
+					base: sha,
 					log,
 				});
 				store.updateTask(id, { worktree: wt });
@@ -1188,6 +1191,7 @@ export function createTurnLoop(
 					title: row.title,
 					head,
 					base: target.replace(/^origin\//, ""),
+					diffPath,
 				});
 			} else if (!wt || !branch) {
 				branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
@@ -1469,13 +1473,20 @@ export function createTurnLoop(
 					// pushes non-GitHub merges itself after the turn.
 				},
 				stripBoard: retroCard,
+				// A PR review runs over untrusted code: read-only tools, no project MCP config, no
+				// discovered extensions or LSP, so nothing the PR adds can run as a command.
 				tools: retroCard
 					? "read,grep,glob,report_outcome,propose_task"
-					: undefined,
+					: prReview
+						? "read,grep,glob,report_outcome"
+						: undefined,
 				config: retroCard
 					? join(dirname(ops.extensionPath), "retro.yml")
-					: undefined,
+					: prReview
+						? join(dirname(ops.extensionPath), "pr-review.yml")
+						: undefined,
 				skills: retroCard ? "retro" : undefined,
+				noDiscovery: prReview,
 				dataRoot: store.dataRoot,
 				logPath: store.logPath(id),
 				onLog: () => ops.notifyLog(name, id),

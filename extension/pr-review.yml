@@ -1,0 +1,8 @@
+# Overlay for PR review runs (`--config extension/pr-review.yml`): the run's cwd is a checkout
+# of an untrusted pull request. omp must start no MCP server from the project's config files
+# (.mcp.json, .vscode/mcp.json and others), because a PR controls them. The run also gets no
+# learn tools, so PR text cannot reach the shared skill library.
+mcp:
+  enableProjectConfig: false
+autolearn:
+  enabled: false

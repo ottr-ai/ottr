@@ -102,6 +102,7 @@ interface Recorded {
 		extensionPath?: string | null;
 		model?: string | null;
 		maxTime?: string | null;
+		noDiscovery?: boolean;
 		worker?: unknown;
 		board?: {
 			url: string;
@@ -14092,6 +14093,7 @@ describe("pr_review cards", () => {
 			createDetachedWorktree: async (o) => {
 				detached.push(o);
 				mkdirSync(o.worktreePath, { recursive: true });
+				return "/git/worktrees/x/ottr-pr.diff";
 			},
 			targetSha: async (_p: string, ref: string) =>
 				ref === "refs/ottr/pr/7" ? state.fetched : null,
@@ -14161,7 +14163,13 @@ describe("pr_review cards", () => {
 		expect(run.prompt).toContain("pull request #7 of o/r");
 		expect(run.prompt).toContain(HEAD);
 		expect(run.prompt).toContain("origin/main");
+		expect(run.prompt).toContain("/git/worktrees/x/ottr-pr.diff");
 		expect(run.prompt).not.toContain("orchestrate this task");
+		// Untrusted checkout: read-only tools, the overlay that turns off project MCP config,
+		// and no discovered extensions or LSP servers.
+		expect(run.tools).toBe("read,grep,glob,report_outcome");
+		expect(run.config?.endsWith("pr-review.yml")).toBe(true);
+		expect(run.noDiscovery).toBe(true);
 		const after = store.getTask(task.id)!;
 		expect(after.branch).toBeNull();
 		expect(after.stage).toBe("done");
