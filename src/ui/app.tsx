@@ -10998,10 +10998,11 @@ function ProjectSettingsForm({
 							its retro.
 						</span>
 					</label>
-					<label className="add-check">
+					<label className="add-check setup-sub">
 						<input
 							type="checkbox"
 							checked={retroFilter}
+							disabled={!retro}
 							onChange={(e) => setRetroFilter(e.target.checked)}
 						/>
 						Friction filter

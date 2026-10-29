@@ -3371,7 +3371,8 @@ dialog.diff-view {
 	width: 100%;
 }
 /* Checkbox in column 1; the title and the hint share column 2, so a long title wraps beside the box. */
-.setup-sec label.add-check {
+.setup-sec label.add-check,
+.settings-sec label.add-check {
 	display: grid;
 	grid-template-columns: auto 1fr;
 	align-items: center;
@@ -3379,12 +3380,20 @@ dialog.diff-view {
 	font-size: 13px;
 	color: var(--text);
 }
-.setup-sec label.add-check .hint {
+.setup-sec label.add-check .hint,
+.settings-sec label.add-check .hint {
 	grid-column: 2;
 }
 /* The friction filter nests under Retro, aligned with the checkboxes' text. */
 label.add-check.setup-sub {
 	margin-left: 23px;
+}
+/* A sub-option whose parent is off reads as unavailable. */
+label.add-check:has(input:disabled) {
+	color: var(--dim);
+}
+.add-check input[type="checkbox"]:disabled {
+	cursor: not-allowed;
 }
 /* Fork facts: a well readout with tabular numbers, then the recent forks. */
 .setup-facts {
@@ -5472,16 +5481,4 @@ dialog.updates {
 }
 .updates-inprogress:hover {
 	color: var(--text-strong);
-}
-/* U7: the hold-merges hint wraps to its own line under the checkbox text. */
-.settings-sec label.add-check {
-	flex-direction: row;
-	flex-wrap: wrap;
-	gap: 8px;
-	font-size: 13px;
-	color: var(--text);
-}
-.settings-sec label.add-check .hint {
-	flex-basis: 100%;
-	margin-left: 23px;
 }
