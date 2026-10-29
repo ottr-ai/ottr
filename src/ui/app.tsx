@@ -2420,6 +2420,10 @@ function ArchReviewDialog({
 	);
 }
 
+/** Prompt behind the board header's "Explain project" button. */
+const EXPLAIN_PROJECT =
+	"Explain how this project works: load the explain-project skill and follow it. Write docs/how-it-works.md with Mermaid diagrams (architecture, the main use case, and the life cycle if the project has one). Map every node to its source path. If docs/how-it-works.md already exists, update it to match the code. Commit the file.";
+
 /** Done lane page size: the cards shown before "Show more", and the step each click adds. */
 const DONE_PAGE = 20;
 
@@ -2634,6 +2638,26 @@ function ProjectBoard({
 							>
 								<Icon name="tag" />
 								<span className="seg-label">Create release</span>
+							</button>
+						)}
+						{!project.gitless && (
+							<button
+								type="button"
+								className="ghost"
+								aria-label="Explain project"
+								onClick={() =>
+									act(async () => {
+										const t = await post<TaskView>(
+											`/api/projects/${encodeURIComponent(project.name)}/tasks`,
+											{ prompt: EXPLAIN_PROJECT },
+										);
+										open(t.id);
+									})
+								}
+								title="Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project"
+							>
+								<Icon name="grid" />
+								<span className="seg-label">Explain project</span>
 							</button>
 						)}
 					</div>

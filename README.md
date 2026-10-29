@@ -64,6 +64,8 @@ The project's **Review** button starts a read-only review card: full verificatio
 
 While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else.
 
+**Explain project** creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project. The skill comes from agent-data, so the host and the workers must have it.
+
 ## Requirements
 
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
