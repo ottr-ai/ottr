@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 # D1 pins are deliberate; a bump is a new image build.
-# oven/bun:1.4.3-debian pinned 2026-10-17 — must stay >= the bun the omp pin needs
-# (omp 18.6.0's dist fails to parse on bun 1.3.3; the host runs 1.4.2).
+# oven/bun:1.4.4-debian pinned 2026-10-29 — must stay >= the bun the omp pin needs
+# (omp 18.6.0's dist fails to parse on bun 1.3.3; the host runs 1.4.3).
 # Digest-pinned 2026-10-22: a moved tag would silently change the worker image on the
 # next build. To upgrade bun, read the new tag's digest with
 # `docker buildx imagetools inspect oven/bun:<tag>` and move tag and digest together.
-FROM oven/bun:1.4.3-debian@sha256:923bedb355f7746666659f71e724998159a5c8c54bd1cb1030e1975a0698415b
+FROM oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e
 # scripts/update-image.ts prunes superseded builds of this image by this label.
 LABEL ottr.image=worker
 
@@ -19,14 +19,14 @@ ARG RTK_VERSION=1.0.1
 ARG RTK_SHA256=5b919c3bccb799b67a61866d0e617410a4fcdf173e2614440e59de2fa2003436
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
-ARG RIPWIRE_VERSION=0.6.7
+ARG RIPWIRE_VERSION=0.6.8
 # sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
-ARG RIPWIRE_SHA256=9a1b44da5d17464518be25539354c931499d2b008ff94096384f211d18814755
+ARG RIPWIRE_SHA256=aa09e8c43acd2104db91a80f2824a36c314ea4a72fd565cd2e579e043e09b03b
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
 # GitHub token (D6). Host runs 2.102.0. A wrong pin 404s the download (fails the build loudly).
-ARG GH_VERSION=2.102.0
+ARG GH_VERSION=2.103.0
 # sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
-ARG GH_SHA256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+ARG GH_SHA256=fdd768eb70f6409f80fcfa9f3a1c0adf0fc98d827ab3ce0bed2ac22762c5d786
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).

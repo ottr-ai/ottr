@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.4.3 # Keep in step with Dockerfile.worker.
+          bun-version: 1.4.4 # Keep in step with Dockerfile.worker.
       - run: bun install --frozen-lockfile
       # Same lockfile, fresh advisory feed: finds new advisories in existing deps.
       - run: bun audit --audit-level=high
@@ -73,7 +73,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.4.3 # Keep in step with Dockerfile.worker.
+          bun-version: 1.4.4 # Keep in step with Dockerfile.worker.
       - run: bun install --frozen-lockfile
       - name: Start the board (scratch state, as scripts/boot-smoke.ts does)
         run: |
