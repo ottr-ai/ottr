@@ -146,7 +146,7 @@ export function createPrWatcher(deps: {
 			if (
 				row.state !== "open" ||
 				row.draft ||
-				row.head === row.reviewedHead ||
+				store.prHeadReviewed(row.number, row.head) ||
 				row.firstSeenAt > t - PR_GATES.QUIET_MS
 			)
 				continue;

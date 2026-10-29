@@ -14205,6 +14205,18 @@ describe("pr_review cards", () => {
 		expect(after.needsReason).toContain(HEAD);
 	});
 
+	test("a PR closed while its card waits in the queue starts no turn", async () => {
+		const { store, record, loop, task, fetches, detached } = prSetup();
+		store.savePrReview({ ...store.getPrReview(7)!, state: "merged" });
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(fetches).toHaveLength(0);
+		expect(detached).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+	});
+
 	test("a ready report parks the review instead of merging", async () => {
 		const { store, loop, task } = prSetup("ready");
 		await loop.runTurn(store.name, task.id);

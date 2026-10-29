@@ -23,7 +23,7 @@ A project can let Ottr review its open GitHub pull requests. Ottr files one revi
   4. A row with `state = 'open'` that is not in the list gets one `gh api repos/{repo}/pulls/N` call. `merged_at` set means `merged`, other values mean `closed`.
   5. Start a review turn for each row that passes all gates (`PR_GATES`):
      - The state is `open` and `draft` is false.
-     - `head !== reviewedHead` (one review for each head SHA).
+     - No `pr_review_runs` row of this PR has this head (one review for each head SHA, also after heads A, B, then A again).
      - `firstSeenAt <= now - QUIET_MS` (30 min).
      - The card, if it exists, is not cancelled and is not queued, preparing, or running.
      - Review starts in the last 24 h are fewer than `PROJECT_DAILY_RUNS` (5). The cap stops the tick for that project.
@@ -33,12 +33,16 @@ A project can let Ottr review its open GitHub pull requests. Ottr files one revi
 Each project has its own store, so the PR number is the key inside it.
 
 - Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
-- Table `pr_review_runs`: `number INTEGER NOT NULL, started_at INTEGER NOT NULL`.
+- Table `pr_review_runs`: `number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL`. It is the history of reviewed heads.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
 - `startPrReview({ number, head, prompt, title, at })` runs in one transaction:
   - No card yet: create a card with kind `pr_review`, title `PR review: #N <title>`, stage `in_progress`, state `queued`, topic `pr review`.
   - A card exists: set the new prompt, clear `sessionId`, set stage `in_progress` and state `queued`.
-  - Set `reviewed_head = head`, clear `post_error`, and insert a `pr_review_runs` row.
+  - Set `reviewed_head = head`, clear `post_error`, and insert a `pr_review_runs` row with the head.
+
+### Dispatch
+
+- Before the scheduler claims a queued `pr_review` card, it reads the live `pr_review` row. When the PR is `closed` or `merged`, no turn starts. The card goes to `done/idle`.
 
 ### Review turn
 

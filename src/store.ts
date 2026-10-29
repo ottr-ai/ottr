@@ -165,7 +165,8 @@ CREATE TABLE IF NOT EXISTS pr_review (
 );
 CREATE TABLE IF NOT EXISTS pr_review_runs (
   number INTEGER NOT NULL,
-  started_at INTEGER NOT NULL
+  started_at INTEGER NOT NULL,
+  head TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
 CREATE TABLE IF NOT EXISTS learnings (
@@ -1466,6 +1467,17 @@ export class ProjectStore {
 		);
 	}
 
+	/** One review per PR per head SHA: true once any run of this PR reviewed `head`. */
+	prHeadReviewed(number: number, head: string): boolean {
+		return (
+			this.db
+				.query<{ n: number }, [number, string]>(
+					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE number = ? AND head = ?",
+				)
+				.get(number, head)?.n !== 0
+		);
+	}
+
 	/**
 	 * Files the PR's review card, or requeues its existing card with a fresh session, then marks
 	 * the head reviewed and counts the run — one transaction, so a restart cannot start it twice.
@@ -1510,8 +1522,8 @@ export class ProjectStore {
 				postError: null,
 			});
 			this.db.run(
-				"INSERT INTO pr_review_runs (number, started_at) VALUES (?, ?)",
-				[o.number, o.at],
+				"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
+				[o.number, o.at, o.head],
 			);
 		});
 		tx();

@@ -159,6 +159,24 @@ describe("createPrWatcher", () => {
 		expect(s.store.prReviewRunsSince(0)).toBe(2);
 	});
 
+	test("a head reviewed before is never reviewed again (A, B, then A)", async () => {
+		const s = setup();
+		const review = async (head: string) => {
+			s.setOpen([pr(9, head)]);
+			await s.watcher.tick();
+			s.advance(PR_GATES.QUIET_MS);
+			await s.watcher.tick();
+			const card = s.cards()[0];
+			if (card) s.store.updateTask(card.id, { stage: "done", state: "idle" });
+		};
+		await review(sha("a"));
+		await review(sha("b"));
+		expect(s.store.prReviewRunsSince(0)).toBe(2);
+		await review(sha("a"));
+		expect(s.store.prReviewRunsSince(0)).toBe(2);
+		expect(s.store.getPrReview(9)!.reviewedHead).toBe(sha("b"));
+	});
+
 	test("a cancelled card never gets a new turn", async () => {
 		const s = setup();
 		s.setOpen([pr(5, sha("a"))]);

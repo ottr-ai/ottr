@@ -1026,6 +1026,20 @@ export function createTurnLoop(
 			running.has(key)
 		)
 			return;
+		if (task.kind === "pr_review") {
+			// The watcher may record a closed or merged PR while the card waits in the queue:
+			// read the live row here, before the claim, so no turn starts for a closed PR.
+			const pr = store.getPrReviewByTask(id);
+			if (pr !== null && pr.state !== "open") {
+				appendLog(
+					store,
+					id,
+					`- PR #${pr.number} is ${pr.state}: review skipped`,
+				);
+				store.updateTask(id, { stage: "done", state: "idle" });
+				return;
+			}
+		}
 		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
 		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
 		store.updateTask(id, {
