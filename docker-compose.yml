@@ -7,6 +7,11 @@
 # UI port is exposed, on loopback.
 name: ottr
 
+# json-file never rotates; `local` rotates and compresses. 3 x 10m caps each container at 30 MB.
+x-logging: &logging
+  driver: local
+  options: { max-size: "10m", max-file: "3" }
+
 x-worker: &worker
   image: ${OTTR_IMAGE:-ottr-worker:local}
   command: bun /app/src/worker.ts
@@ -14,6 +19,10 @@ x-worker: &worker
   # tini as PID 1 reaps the orphans that omp and test runs leave behind: with bun as
   # PID 1, worker-a held 5,434 zombies after 7 hours.
   init: true
+  logging: *logging
+  # ponytail: estimate (Chrome + bun test + agent turns), not a measured peak. Run
+  # `docker stats` under load and set about 2x the peak in the compose env file.
+  mem_limit: ${OTTR_WORKER_MEM_LIMIT:-4g}
   # Stateless: task data for workers (sessions, logs, images) lives on the ottr-data
   # volume, clones and worktrees on workspace. Both mount at the server's paths, so
   # the absolute paths in a run request resolve the same. A dead worker is replaced
@@ -63,6 +72,9 @@ services:
     image: ${OTTR_IMAGE:-ottr-worker:local}
     command: bun /app/src/server.ts
     init: true # reaps orphans as on the workers (148 zombies here after 7 hours, 2026-10-12)
+    logging: *logging
+    # Estimate: the board runs merge, release, and retro turns itself (bun test included).
+    mem_limit: ${OTTR_SERVER_MEM_LIMIT:-4g}
     networks:
       default:
         aliases: [ottr] # turns file cards at http://ottr:<port> (OTTR_BOARD_URL below)

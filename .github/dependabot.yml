@@ -30,3 +30,14 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+  # Moves the tag and the digest of `FROM oven/bun:…@sha256:…` in Dockerfile.worker together.
+  # Keep `bun-version` in the workflows in step by hand.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
