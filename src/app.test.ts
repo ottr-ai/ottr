@@ -4845,6 +4845,21 @@ describe("PR review routes", () => {
 		expect(row(6).postedHead).toBeNull();
 	});
 
+	test("a gh spawn error frees the claim, stores the error, and allows a retry", async () => {
+		const t = reviewed(13, H1);
+		ghHook = async () => {
+			throw new Error("gh: command not found");
+		};
+		const res = await postReview(t.id, { body: "x" });
+		expect(res.status).toBe(502);
+		expect(await errorOf(res)).toBe("gh: command not found");
+		expect(row(13).postedHead).toBeNull();
+		expect(row(13).postError).toBe("gh: command not found");
+		ghHook = null;
+		expect((await postReview(t.id, { body: "x" })).status).toBe(200);
+		expect(row(13).postedHead).toBe(H1);
+	});
+
 	test("two concurrent posts of one head send one GitHub review", async () => {
 		const t = reviewed(9, H1);
 		const entered = Promise.withResolvers<void>();

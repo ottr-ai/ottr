@@ -5096,18 +5096,24 @@ export function createApp(deps: AppDeps) {
 					const repo =
 						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
 					// argv array, no shell: body and head never reach a command line parser.
-					const res = await gh([
-						"api",
-						`repos/${repo}/pulls/${row.number}/reviews`,
-						"-X",
-						"POST",
-						"-f",
-						"event=COMMENT",
-						"-f",
-						`body=${body}`,
-						"-f",
-						`commit_id=${head}`,
-					]);
+					let res: { code: number; stderr: string };
+					try {
+						res = await gh([
+							"api",
+							`repos/${repo}/pulls/${row.number}/reviews`,
+							"-X",
+							"POST",
+							"-f",
+							"event=COMMENT",
+							"-f",
+							`body=${body}`,
+							"-f",
+							`commit_id=${head}`,
+						]);
+					} catch (err) {
+						// A spawn failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
+						res = { code: -1, stderr: errmsg(err) };
+					}
 					if (res.code !== 0) {
 						const error =
 							res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
