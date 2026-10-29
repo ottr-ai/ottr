@@ -2590,7 +2590,11 @@ function ProjectBoard({
 								type="button"
 								className="ghost"
 								aria-label="Align rules"
-								onClick={() => interview("/interview", { fix: true })}
+								onClick={() =>
+									window.confirm(
+										"Align rules? This creates a task that fixes AGENTS.md rules that contradict the tracker's pipeline.",
+									) && interview("/interview", { fix: true })
+								}
 								title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
 							>
 								<Icon name="refresh-cw" />
@@ -2646,6 +2650,9 @@ function ProjectBoard({
 								className="ghost"
 								aria-label="Explain project"
 								onClick={() =>
+									window.confirm(
+										"Explain project? This creates a task that writes docs/how-it-works.md with Mermaid diagrams.",
+									) &&
 									act(async () => {
 										const t = await post<TaskView>(
 											`/api/projects/${encodeURIComponent(project.name)}/tasks`,
