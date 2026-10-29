@@ -9040,7 +9040,7 @@ const signInPage = (output: string): string | null =>
 /** Settings "Provider sign-in" section: omp's sign-ins on the machine that runs the board. */
 function ProviderLoginSection() {
 	const [state, setState] = useState<SignInState | null>(null);
-	const [provider, setProvider] = useState("anthropic");
+	const [provider, setProvider] = useState("");
 	const [answer, setAnswer] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const act = useBusy();
