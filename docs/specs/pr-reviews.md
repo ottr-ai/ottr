@@ -68,9 +68,10 @@ Each project has its own store, so the PR number is the key inside it.
   - The card must be kind `pr_review`, in `done/idle`, and its last work turn must be `answered`, else 409.
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
+  - Before the gh call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
   - Ottr runs `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body> -f commit_id=<reviewedHead>`.
-  - Success sets `posted_head = reviewed_head` and clears `post_error`.
-  - A gh failure stores the error in `post_error`, returns 502, and does not change `posted_head`.
+  - A gh failure restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
+  - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
 
 ## Boundaries

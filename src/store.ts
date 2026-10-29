@@ -1456,6 +1456,46 @@ export class ProjectStore {
 		);
 	}
 
+	/** Sets only the PR state, so a write after an await never reverts post fields. */
+	setPrState(number: number, state: PrReviewRow["state"]): void {
+		this.db.run("UPDATE pr_review SET state = ? WHERE number = ?", [
+			state,
+			number,
+		]);
+	}
+
+	/**
+	 * Claims the post of `head` in one statement before the GitHub call: only an open PR whose
+	 * reviewed head is `head` and not yet posted wins, so two concurrent Posts send one review.
+	 * Returns the earlier posted head for releasePrPost, or undefined when the claim lost.
+	 */
+	claimPrPost(number: number, head: string): string | null | undefined {
+		const tx = this.db.transaction(() => {
+			const prev = this.getPrReview(number);
+			const res = this.db.run(
+				`UPDATE pr_review SET posted_head = ?, post_error = NULL
+				 WHERE number = ? AND state = 'open' AND reviewed_head = ?
+				   AND (posted_head IS NULL OR posted_head != ?)`,
+				[head, number, head, head],
+			);
+			return res.changes === 1 ? (prev?.postedHead ?? null) : undefined;
+		});
+		return tx();
+	}
+
+	/** Undoes a failed claim: restores the earlier posted head and stores the error; other fields stay. */
+	releasePrPost(
+		number: number,
+		head: string,
+		prev: string | null,
+		error: string,
+	): void {
+		this.db.run(
+			"UPDATE pr_review SET posted_head = ?, post_error = ? WHERE number = ? AND posted_head = ?",
+			[prev, error, number, head],
+		);
+	}
+
 	/** Review starts since `since` (project daily-rate gate). */
 	prReviewRunsSince(since: number): number {
 		return (

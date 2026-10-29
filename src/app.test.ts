@@ -4696,16 +4696,20 @@ describe("PR review routes", () => {
 	});
 	const ghCalls: string[][] = [];
 	let ghResult = { code: 0, stdout: "{}", stderr: "" };
+	/** Runs inside the fake gh call, after the route's checks: a race window for tests. */
+	let ghHook: (() => Promise<void>) | null = null;
 	const m = mount({
 		projects: prProjects,
 		gh: async (args) => {
 			ghCalls.push(args);
+			await ghHook?.();
 			return ghResult;
 		},
 	});
 	beforeEach(() => {
 		ghCalls.length = 0;
 		ghResult = { code: 0, stdout: "{}", stderr: "" };
+		ghHook = null;
 	});
 	const row = (n: number): PrReviewRow => {
 		const r = prStore.getPrReview(n);
@@ -4839,6 +4843,40 @@ describe("PR review routes", () => {
 		expect(await errorOf(res)).toBe("HTTP 422: nope");
 		expect(row(6).postError).toBe("HTTP 422: nope");
 		expect(row(6).postedHead).toBeNull();
+	});
+
+	test("two concurrent posts of one head send one GitHub review", async () => {
+		const t = reviewed(9, H1);
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		ghHook = () => {
+			entered.resolve();
+			return gate.promise;
+		};
+		const first = postReview(t.id, { body: "a" });
+		await entered.promise;
+		const second = await postReview(t.id, { body: "b" });
+		gate.resolve();
+		expect((await first).status).toBe(200);
+		expect(second.status).toBe(409);
+		expect(ghCalls).toHaveLength(1);
+		expect(row(9).postedHead).toBe(H1);
+	});
+
+	test("a post keeps a PR state the watcher wrote during the gh call, on success and failure", async () => {
+		for (const [n, code] of [
+			[10, 0],
+			[11, 1],
+		] as const) {
+			const t = reviewed(n, H1);
+			ghResult = { code, stdout: "{}", stderr: code ? "HTTP 500" : "" };
+			ghHook = async () => prStore.setPrState(n, "merged");
+			const res = await postReview(t.id, { body: "x" });
+			expect(res.status).toBe(code ? 502 : 200);
+			expect(row(n).state).toBe("merged");
+			expect(row(n).postedHead).toBe(code ? null : H1);
+			expect(row(n).postError).toBe(code ? "HTTP 500" : null);
+		}
 	});
 
 	test("the task view exposes prReview", async () => {

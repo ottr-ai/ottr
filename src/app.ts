@@ -5089,6 +5089,10 @@ export function createApp(deps: AppDeps) {
 					const head = row.reviewedHead;
 					if (head === null || row.postedHead === head)
 						return json({ error: "already posted for this head" }, 409);
+					// Claim before the await: a concurrent Post of the same head loses here.
+					const prev = e.store.claimPrPost(row.number, head);
+					if (prev === undefined)
+						return json({ error: "already posted for this head" }, 409);
 					const repo =
 						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
 					// argv array, no shell: body and head never reach a command line parser.
@@ -5107,10 +5111,9 @@ export function createApp(deps: AppDeps) {
 					if (res.code !== 0) {
 						const error =
 							res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
-						e.store.savePrReview({ ...row, postError: error });
+						e.store.releasePrPost(row.number, head, prev, error);
 						return json({ error }, 502);
 					}
-					e.store.savePrReview({ ...row, postedHead: head, postError: null });
 					return json({ ok: true });
 				}),
 		},

@@ -224,6 +224,34 @@ describe("createPrWatcher", () => {
 		expect(s.cards().length).toBe(0);
 	});
 
+	test("a vanished-PR state write keeps a post made during its gh call", async () => {
+		const s = setup();
+		s.setOpen([pr(12, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.closed.set(12, { merged_at: null });
+		s.setOpen([]);
+		const watcher = createPrWatcher({
+			projects: () => [
+				{ name: "p", path: s.store.serverDir, store: s.store, github: "o/r" },
+			],
+			log: () => {},
+			gh: async (args) => {
+				if (/pulls\/12$/.test(args[1] ?? "")) {
+					// The Post route claims the head while the watcher waits on GitHub.
+					expect(s.store.claimPrPost(12, sha("a"))).toBeNull();
+					return { code: 0, stdout: "{}", stderr: "" };
+				}
+				return { code: 0, stdout: "[]", stderr: "" };
+			},
+		});
+		await watcher.tick();
+		const row = s.store.getPrReview(12)!;
+		expect(row.state).toBe("closed");
+		expect(row.postedHead).toBe(sha("a"));
+	});
+
 	test("a gh failure logs and changes nothing", async () => {
 		const s = setup();
 		s.setOpen([pr(1, sha("a"))]);

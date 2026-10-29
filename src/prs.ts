@@ -140,7 +140,8 @@ export function createPrWatcher(deps: {
 				deps.log(`prs: ${project.name}: #${row.number}: bad JSON`);
 				continue;
 			}
-			store.savePrReview({ ...row, state: merged ? "merged" : "closed" });
+			// Only the state: a Post may have written the row during the await.
+			store.setPrState(row.number, merged ? "merged" : "closed");
 		}
 		for (const row of store.listPrReviews()) {
 			if (
