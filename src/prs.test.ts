@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GhFn } from "./forks.ts";
-import { createPrWatcher, PR_GATES, parsePullPage } from "./prs.ts";
+import {
+	createPrWatcher,
+	PR_GATES,
+	parseDraft,
+	parsePullPage,
+	reviewUserMessage,
+} from "./prs.ts";
 import { ProjectStore } from "./store.ts";
 
 let root: string;
@@ -27,22 +33,39 @@ function setup(opts: { on?: boolean; github?: string | null } = {}) {
 	mkdirSync(dir, { recursive: true });
 	const store = ProjectStore.init(dir);
 	store.setSettings({ prReviews: opts.on ?? true });
-	let open: unknown[] = [];
+	let open: { number: number; head: { sha: string } }[] = [];
 	const closed = new Map<number, unknown>();
 	const calls: string[] = [];
 	let fail = false;
+	let reviewFail = false;
+	/** A PR whose head moves between the list call and the review's read. */
+	let movedTo: string | null = null;
 	const logs: string[] = [];
+	const prompts: string[] = [];
 	let t = 1_000_000_000;
 	const gh: GhFn = async (args) => {
-		calls.push(args[1] ?? "");
+		const path = args.at(-1) ?? "";
+		calls.push(path);
 		if (fail) return { code: 1, stdout: "", stderr: "HTTP 401" };
-		const m = (args[1] ?? "").match(/pulls\/(\d+)$/);
-		if (m)
+		const m = path.match(/pulls\/(\d+)$/);
+		if (m && args.includes("-H"))
 			return {
 				code: 0,
-				stdout: JSON.stringify(closed.get(Number(m[1])) ?? {}),
+				stdout: `diff --git a/x b/x\n+pr ${m[1]}\n`,
 				stderr: "",
 			};
+		if (m) {
+			const n = Number(m[1]);
+			const live = open.find((p) => p.number === n);
+			const body = live
+				? {
+						...live,
+						head: { sha: movedTo ?? live.head.sha },
+						body: "Please merge.",
+					}
+				: (closed.get(n) ?? {});
+			return { code: 0, stdout: JSON.stringify(body), stderr: "" };
+		}
 		return { code: 0, stdout: JSON.stringify(open), stderr: "" };
 	};
 	const watcher = createPrWatcher({
@@ -57,18 +80,30 @@ function setup(opts: { on?: boolean; github?: string | null } = {}) {
 		log: (m) => logs.push(m),
 		gh,
 		now: () => t,
+		review: async (messages) => {
+			prompts.push(messages.map((x) => x.content).join("\n"));
+			if (reviewFail) throw new Error("gateway down");
+			return `  ## Summary\nreview ${prompts.length}\n`;
+		},
 	});
 	return {
 		store,
 		watcher,
 		calls,
 		logs,
+		prompts,
 		closed,
-		setOpen: (v: unknown[]) => {
+		setOpen: (v: { number: number; head: { sha: string } }[]) => {
 			open = v;
 		},
 		setFail: (v: boolean) => {
 			fail = v;
+		},
+		setReviewFail: (v: boolean) => {
+			reviewFail = v;
+		},
+		setMovedTo: (v: string | null) => {
+			movedTo = v;
 		},
 		advance: (ms: number) => {
 			t += ms;
@@ -102,6 +137,20 @@ describe("parsePullPage", () => {
 	});
 });
 
+describe("review prompt and draft", () => {
+	const msg = (diff: string) =>
+		reviewUserMessage({ repo: "o/r", number: 1, title: "t", body: "", diff });
+	test("an oversized diff throws; invisible characters never reach the model", () => {
+		expect(() => msg("x".repeat(400_001))).toThrow(RangeError);
+		expect(msg("a\u200Bb")).toContain("DIFF\n<<<DATA\nab\nDATA>>>");
+	});
+	test("parseDraft trims, caps, and rejects an empty answer", () => {
+		expect(() => parseDraft(" \u200B\n")).toThrow();
+		expect(parseDraft("  ok \n")).toBe("ok");
+		expect(parseDraft("x".repeat(70_000)).length).toBeLessThanOrEqual(65_536);
+	});
+});
+
 describe("createPrWatcher", () => {
 	test("toggle off or no github makes no gh call", async () => {
 		const a = setup({ on: false });
@@ -111,18 +160,27 @@ describe("createPrWatcher", () => {
 		expect(a.calls.length + b.calls.length).toBe(0);
 	});
 
-	test("a new PR waits for the quiet gate, then files exactly one card", async () => {
+	test("a new PR waits for the quiet gate, then files exactly one done card with the draft", async () => {
 		const s = setup();
-		s.setOpen([pr(7, sha("a"))]);
+		s.setOpen([pr(7, sha("a"), false, "Add export")]);
 		await s.watcher.tick();
 		expect(s.cards().length).toBe(0);
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		await s.watcher.tick();
 		expect(s.cards().length).toBe(1);
-		expect(s.cards()[0]!.state).toBe("queued");
+		const card = s.cards()[0]!;
+		expect(card.stage).toBe("done");
+		expect(card.state).toBe("idle");
+		expect(card.details).toBe("## Summary\nreview 1");
 		expect(s.store.getPrReview(7)!.reviewedHead).toBe(sha("a"));
-		expect(s.store.getPrReviewByTask(s.cards()[0]!.id)!.number).toBe(7);
+		expect(s.store.getPrReviewByTask(card.id)!.number).toBe(7);
+		// One model call; the PR fields reach it only as DATA blocks after the fixed system prompt.
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).toContain("untrusted text");
+		expect(s.prompts[0]).toContain("TITLE\n<<<DATA\nAdd export\nDATA>>>");
+		expect(s.prompts[0]).toContain("Please merge.");
+		expect(s.prompts[0]).toContain("+pr 7");
 	});
 
 	test("a draft files nothing until it is ready", async () => {
@@ -137,24 +195,23 @@ describe("createPrWatcher", () => {
 		expect(s.cards().length).toBe(1);
 	});
 
-	test("a new head requeues the same card after the quiet gate", async () => {
+	test("a new head updates the same card after the quiet gate", async () => {
 		const s = setup();
 		s.setOpen([pr(4, sha("a"))]);
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		const id = s.cards()[0]!.id;
-		s.store.updateTask(id, { stage: "done", state: "idle" });
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
-		expect(s.store.getTask(id)!.state).toBe("idle");
+		expect(s.prompts).toHaveLength(1);
 		s.setOpen([pr(4, sha("c"))]);
 		await s.watcher.tick();
-		expect(s.store.getTask(id)!.state).toBe("idle");
+		expect(s.prompts).toHaveLength(1);
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		expect(s.cards().length).toBe(1);
-		expect(s.store.getTask(id)!.state).toBe("queued");
+		expect(s.store.getTask(id)!.details).toBe("## Summary\nreview 2");
 		expect(s.store.getPrReview(4)!.reviewedHead).toBe(sha("c"));
 		expect(s.store.prReviewRunsSince(0)).toBe(2);
 	});
@@ -166,25 +223,51 @@ describe("createPrWatcher", () => {
 			await s.watcher.tick();
 			s.advance(PR_GATES.QUIET_MS);
 			await s.watcher.tick();
-			const card = s.cards()[0];
-			if (card) s.store.updateTask(card.id, { stage: "done", state: "idle" });
 		};
 		await review(sha("a"));
 		await review(sha("b"));
-		expect(s.store.prReviewRunsSince(0)).toBe(2);
+		expect(s.prompts).toHaveLength(2);
 		await review(sha("a"));
-		expect(s.store.prReviewRunsSince(0)).toBe(2);
+		expect(s.prompts).toHaveLength(2);
 		expect(s.store.getPrReview(9)!.reviewedHead).toBe(sha("b"));
 	});
 
-	test("a cancelled card never gets a new turn", async () => {
+	test("a failed model call counts for the cap and retries on a later tick", async () => {
+		const s = setup();
+		s.setOpen([pr(6, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		s.setReviewFail(true);
+		await s.watcher.tick();
+		expect(s.cards().length).toBe(0);
+		expect(s.store.prReviewRunsSince(0)).toBe(1);
+		expect(s.logs.some((m) => m.includes("gateway down"))).toBe(true);
+		s.setReviewFail(false);
+		await s.watcher.tick();
+		expect(s.cards().length).toBe(1);
+		expect(s.store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("a head that moves during the review saves no draft", async () => {
+		const s = setup();
+		s.setOpen([pr(2, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		s.setMovedTo(sha("f"));
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(0);
+		expect(s.cards().length).toBe(0);
+		expect(s.store.getPrReview(2)!.reviewedHead).toBeNull();
+	});
+
+	test("a cancelled card never gets a new review", async () => {
 		const s = setup();
 		s.setOpen([pr(5, sha("a"))]);
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		const id = s.cards()[0]!.id;
-		s.store.updateTask(id, { stage: "done", state: "idle", cancelledAt: 1 });
+		s.store.updateTask(id, { cancelledAt: 1 });
 		s.setOpen([pr(5, sha("d"))]);
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);

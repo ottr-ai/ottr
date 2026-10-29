@@ -4716,7 +4716,7 @@ describe("PR review routes", () => {
 		if (r === null) throw new Error(`no pr_review row ${n}`);
 		return r;
 	};
-	/** Starts a review turn for PR `n` at `head` and finishes it answered (a draft exists). */
+	/** Saves a draft for PR `n` at `head` as the watcher does; `answered: false` leaves no draft. */
 	const reviewed = (n: number, head: string, answered = true): Task => {
 		const prev = prStore.getPrReview(n);
 		prStore.savePrReview({
@@ -4731,23 +4731,14 @@ describe("PR review routes", () => {
 			title: "Fix it",
 			postError: null,
 		});
-		const t = prStore.startPrReview({
+		const t = prStore.savePrDraft({
+			run: prStore.startPrRun(n, head, Date.now()),
 			number: n,
 			head,
-			title: "Fix it",
+			draft: "draft",
 			prompt: "review",
-			at: Date.now(),
 		});
-		if (answered) {
-			const turn = prStore.startTurn(t.id, "work", ".", null);
-			prStore.finishTurn(turn.id, {
-				outcome: "answered",
-				details: "draft",
-				endedAt: Date.now(),
-				exitCode: 0,
-			});
-			prStore.updateTask(t.id, { stage: "done", state: "idle" });
-		}
+		if (!answered) prStore.updateTask(t.id, { details: null });
 		return t;
 	};
 	const postReview = (id: string, body: unknown) =>

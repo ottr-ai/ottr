@@ -164,9 +164,11 @@ CREATE TABLE IF NOT EXISTS pr_review (
   post_error TEXT
 );
 CREATE TABLE IF NOT EXISTS pr_review_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   number INTEGER NOT NULL,
   started_at INTEGER NOT NULL,
-  head TEXT NOT NULL
+  head TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
 CREATE TABLE IF NOT EXISTS learnings (
@@ -1507,64 +1509,65 @@ export class ProjectStore {
 		);
 	}
 
-	/** One review per PR per head SHA: true once any run of this PR reviewed `head`. */
+	/** One review per PR per head SHA: true once a draft of this PR's `head` was saved. */
 	prHeadReviewed(number: number, head: string): boolean {
 		return (
 			this.db
 				.query<{ n: number }, [number, string]>(
-					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE number = ? AND head = ?",
+					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1",
 				)
 				.get(number, head)?.n !== 0
 		);
 	}
 
+	/** Counts one review attempt (the daily cap) before the model call; returns its run id. */
+	startPrRun(number: number, head: string, at: number): number {
+		return Number(
+			this.db.run(
+				"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
+				[number, at, head],
+			).lastInsertRowid,
+		);
+	}
+
 	/**
-	 * Files the PR's review card, or requeues its existing card with a fresh session, then marks
-	 * the head reviewed and counts the run — one transaction, so a restart cannot start it twice.
+	 * Saves a review draft in one transaction: files the PR's card done/idle with the draft as
+	 * its details (or updates the existing card), marks `head` reviewed and the run done. It runs
+	 * after the model call, so it writes only its own columns of the live row.
 	 */
-	startPrReview(o: {
+	savePrDraft(o: {
+		run: number;
 		number: number;
 		head: string;
-		title: string;
+		draft: string;
 		prompt: string;
-		at: number;
 	}): Task {
 		let cardId = "";
 		const tx = this.db.transaction(() => {
 			const row = this.getPrReview(o.number);
 			if (!row) throw new Error(`unknown pr_review: #${o.number}`);
+			const summary = `Review draft for head ${o.head.slice(0, 7)}.`;
 			const existing = row.taskId === null ? null : this.getTask(row.taskId);
-			if (existing === null) {
-				const card = this.createTask(o.prompt, null, "pr_review");
-				this.updateTask(card.id, {
-					title: `PR review: #${o.number} ${o.title}`,
-					stage: "in_progress",
-					topic: "pr review",
-				});
-				cardId = card.id;
-			} else {
-				this.updateTask(existing.id, {
-					prompt: o.prompt,
-					sessionId: null,
-					pendingPrompt: null,
-					asked: null, // a fresh session knows nothing of the old ask
-					needsReason: null,
-					stage: "in_progress",
-					state: "queued",
-					queuedAt: Date.now(),
-				});
-				cardId = existing.id;
-			}
-			this.savePrReview({
-				...row,
-				taskId: cardId,
-				reviewedHead: o.head,
-				postError: null,
+			const card = existing ?? this.createTask(o.prompt, null, "pr_review");
+			this.updateTask(card.id, {
+				...(existing === null
+					? {
+							title: `PR review: #${o.number} ${row.title}`,
+							topic: "pr review",
+						}
+					: { prompt: o.prompt }),
+				stage: "done",
+				state: "idle",
+				queuedAt: null,
+				summary,
+				details: o.draft,
 			});
+			cardId = card.id;
 			this.db.run(
-				"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
-				[o.number, o.at, o.head],
+				"UPDATE pr_review SET task_id = ?, reviewed_head = ?, post_error = NULL WHERE number = ?",
+				[card.id, o.head, o.number],
 			);
+			this.db.run("UPDATE pr_review_runs SET done = 1 WHERE id = ?", [o.run]);
 		});
 		tx();
 		const card = this.getTask(cardId);

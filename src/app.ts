@@ -5074,14 +5074,11 @@ export function createApp(deps: AppDeps) {
 							: null;
 					if (row === null || e.github === null)
 						return json({ error: "not a PR review card" }, 409);
-					const lastWork = e.store
-						.listTurns(task.id)
-						.filter((t) => t.kind === "work")
-						.at(-1);
+					// The watcher saves each draft as the done card's details.
 					if (
 						task.stage !== "done" ||
 						task.state !== "idle" ||
-						lastWork?.outcome !== "answered"
+						task.details === null
 					)
 						return json({ error: "no draft to post" }, 409);
 					if (row.state !== "open")

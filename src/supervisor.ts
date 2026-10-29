@@ -288,9 +288,7 @@ export function createSupervisor(
 		const target = e.target ?? t.base ?? "HEAD";
 		let unsaved: string | null = null;
 		try {
-			// A PR review's worktree is disposable: its PR commits are never on the target.
-			if (t.kind !== "pr_review")
-				unsaved = await ops.unsavedWork(t.worktree, target);
+			unsaved = await ops.unsavedWork(t.worktree, target);
 		} catch {
 			unsaved = "git failed in the worktree";
 		}
@@ -749,6 +747,7 @@ export function createSupervisor(
 			t.releaseVersion !== null ||
 			isReview(t) ||
 			t.kind === "interview" ||
+			// A PR review card is a server-written draft: no agent turn to learn from.
 			t.kind === "pr_review"
 		)
 			return;

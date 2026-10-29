@@ -2309,89 +2309,67 @@ describe("pr review store methods", () => {
 		expect(store.getPrReviewByTask("T-2")).toBeNull();
 	});
 
-	test("prReviewRunsSince counts runs at or after the bound", () => {
+	test("prReviewRunsSince counts attempts at or after the bound", () => {
 		const store = open(join(root, "pr-runs"));
-		store.savePrReview(row);
-		store.startPrReview({
-			number: 12,
-			head: "a",
-			title: "t",
-			prompt: "p",
-			at: 1000,
-		});
-		store.startPrReview({
-			number: 12,
-			head: "b",
-			title: "t",
-			prompt: "p",
-			at: 2000,
-		});
+		store.startPrRun(12, "a", 1000);
+		store.startPrRun(12, "b", 2000);
 		expect(store.prReviewRunsSince(2000)).toBe(1);
 		expect(store.prReviewRunsSince(2001)).toBe(0);
 		expect(store.prReviewRunsSince(1000)).toBe(2);
 	});
 
-	test("startPrReview files one card, then requeues the same card with a fresh session", () => {
-		const store = open(join(root, "pr-start"));
+	test("savePrDraft files one done card, then updates the same card; only saved heads count as reviewed", () => {
+		const store = open(join(root, "pr-draft"));
 		expect(() =>
-			store.startPrReview({
+			store.savePrDraft({
+				run: 1,
 				number: 9,
 				head: "a",
-				title: "t",
+				draft: "d",
 				prompt: "p",
-				at: 1,
 			}),
 		).toThrow();
-		store.savePrReview({ ...row, postError: "old failure" });
-		const card = store.startPrReview({
+		store.savePrReview({ ...row, title: "Fix the thing", postError: "old" });
+		const run1 = store.startPrRun(12, "abc", 50);
+		// A failed attempt counts for the cap but leaves the head open for a retry.
+		expect(store.prHeadReviewed(12, "abc")).toBe(false);
+		const card = store.savePrDraft({
+			run: run1,
 			number: 12,
 			head: "abc",
-			title: "Fix the thing",
-			prompt: "review prompt 1",
-			at: 50,
+			draft: "## Summary\nok",
+			prompt: "review 1",
 		});
 		expect(card.kind).toBe("pr_review");
 		expect(card.title).toBe("PR review: #12 Fix the thing");
-		expect(card.prompt).toBe("review prompt 1");
-		expect(card.stage).toBe("in_progress");
-		expect(card.state).toBe("queued");
+		expect(card.stage).toBe("done");
+		expect(card.state).toBe("idle");
+		expect(card.details).toBe("## Summary\nok");
 		expect(card.topic).toBe("pr review");
-		expect(store.getPrReview(12)).toEqual({
-			...row,
+		expect(store.prHeadReviewed(12, "abc")).toBe(true);
+		expect(store.getPrReview(12)).toMatchObject({
 			taskId: card.id,
 			reviewedHead: "abc",
 			postError: null,
 		});
-		expect(store.getPrReviewByTask(card.id)?.number).toBe(12);
-		expect(store.prReviewRunsSince(0)).toBe(1);
 
-		store.updateTask(card.id, {
-			sessionId: "s1",
-			stage: "done",
-			state: "idle",
-			queuedAt: null,
-		});
-		store.savePrReview({
-			...store.getPrReview(12)!,
-			head: "def",
-			postError: "x",
-		});
-		const again = store.startPrReview({
+		// The watcher wrote a newer state during the model call: the draft save keeps it.
+		store.setPrState(12, "merged");
+		const again = store.savePrDraft({
+			run: store.startPrRun(12, "def", 60),
 			number: 12,
 			head: "def",
-			title: "Fix the thing",
-			prompt: "review prompt 2",
-			at: 60,
+			draft: "second",
+			prompt: "review 2",
 		});
 		expect(again.id).toBe(card.id);
-		expect(again.sessionId).toBeNull();
-		expect(again.prompt).toBe("review prompt 2");
-		expect(again.stage).toBe("in_progress");
-		expect(again.state).toBe("queued");
-		expect(again.queuedAt).not.toBeNull();
+		expect(again.details).toBe("second");
+		expect(again.prompt).toBe("review 2");
 		expect(store.listTasks()).toHaveLength(1);
-		expect(store.getPrReview(12)?.reviewedHead).toBe("def");
-		expect(store.getPrReview(12)?.postError).toBeNull();
+		expect(store.getPrReview(12)).toMatchObject({
+			reviewedHead: "def",
+			state: "merged",
+		});
 		expect(store.prReviewRunsSince(0)).toBe(2);
 	});
 

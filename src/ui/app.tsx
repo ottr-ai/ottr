@@ -6090,17 +6090,16 @@ function Drawer({
 		(task.stage === "done"
 			? task.turns.findLast((t) => t.kind === "work" && t.summary !== null)
 			: undefined) ?? task;
-	// PR review card: the last answered work turn holds the draft the PR review section edits and posts.
+	// PR review card: the watcher saves each draft as the done card's details.
 	const prDraft =
-		task.kind === "pr_review" && task.prReview !== undefined
-			? task.turns.findLast(
-					(t) => t.kind === "work" && t.outcome === "answered",
-				)
-			: undefined;
+		task.kind === "pr_review" &&
+		task.prReview !== undefined &&
+		task.stage === "done"
+			? task.details
+			: null;
 	// The Result skips details shown elsewhere: the research report section or the PR review draft.
 	const hideDetails =
-		(task.research && task.report !== null) ||
-		(prDraft !== undefined && prDraft.details === report.details);
+		(task.research && task.report !== null) || prDraft !== null;
 
 	// Merge anyway shows only while the newest blockers run still has an unresolved blocker and
 	// no run is live (a running or preparing card can still pass the check on its own).
@@ -6700,10 +6699,10 @@ function Drawer({
 					)}
 					{task.kind === "pr_review" && task.prReview !== undefined && (
 						<PrReviewSection
-							key={`${task.prReview.reviewedHead}:${prDraft?.id}`}
+							key={task.prReview.reviewedHead ?? ""}
 							task={task}
 							pr={task.prReview}
-							draft={prDraft?.details ?? null}
+							draft={prDraft}
 							act={act}
 							onLoaded={setDetail}
 						/>
