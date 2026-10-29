@@ -198,6 +198,8 @@ services:
   board-seed:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [seed]
+    logging: *logging
+    mem_limit: ${OTTR_SEED_MEM_LIMIT:-2g} # estimate: git clone, SkillSpector scan, installs
     volumes:
       - board-config:/etc/ottr
     environment:

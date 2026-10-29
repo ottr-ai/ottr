@@ -47,9 +47,9 @@ zero-auth access.
 
 Each container keeps at most 30 MB of logs: the `local` log driver keeps 3 files of 10 MB.
 Each container also has a RAM limit. The default is `4g` for the server and for each
-worker. The values are estimates. Measure the peak with `docker stats` under load, then set
-about 2x the peak in the compose env file:
-`OTTR_SERVER_MEM_LIMIT` and `OTTR_WORKER_MEM_LIMIT`. When a container gets to its limit,
+worker, and `2g` for the `board-seed` one-off. The values are estimates. Measure the peak
+with `docker stats` under load, then set about 2x the peak in the compose env file:
+`OTTR_SERVER_MEM_LIMIT`, `OTTR_WORKER_MEM_LIMIT`, and `OTTR_SEED_MEM_LIMIT`. When a container gets to its limit,
 the kernel stops a process in that container (OOM kill), not a process on the whole host.
 
 ## Updates
