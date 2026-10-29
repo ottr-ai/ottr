@@ -22,7 +22,7 @@ x-worker: &worker
   logging: *logging
   # ponytail: estimate (Chrome + bun test + agent turns), not a measured peak. Run
   # `docker stats` under load and set about 2x the peak in the compose env file.
-  mem_limit: ${OTTR_WORKER_MEM_LIMIT:-4g}
+  mem_limit: ${OTTR_WORKER_MEM_LIMIT:-8g}
   # Stateless: task data for workers (sessions, logs, images) lives on the ottr-data
   # volume, clones and worktrees on workspace. Both mount at the server's paths, so
   # the absolute paths in a run request resolve the same. A dead worker is replaced
@@ -74,7 +74,7 @@ services:
     init: true # reaps orphans as on the workers (148 zombies here after 7 hours, 2026-10-12)
     logging: *logging
     # Estimate: the board runs merge, release, and retro turns itself (bun test included).
-    mem_limit: ${OTTR_SERVER_MEM_LIMIT:-4g}
+    mem_limit: ${OTTR_SERVER_MEM_LIMIT:-8g}
     networks:
       default:
         aliases: [ottr] # turns file cards at http://ottr:<port> (OTTR_BOARD_URL below)
@@ -199,7 +199,7 @@ services:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [seed]
     logging: *logging
-    mem_limit: ${OTTR_SEED_MEM_LIMIT:-2g} # estimate: git clone, SkillSpector scan, installs
+    mem_limit: ${OTTR_SEED_MEM_LIMIT:-4g} # estimate: git clone, SkillSpector scan, installs
     volumes:
       - board-config:/etc/ottr
     environment:
