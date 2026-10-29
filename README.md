@@ -172,6 +172,7 @@ For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no
 
 ## Docs
 
+- [docs/how-it-works.md](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
 - [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md): the **Review due** feature.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
