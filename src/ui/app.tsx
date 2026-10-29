@@ -36,6 +36,7 @@ import type {
 	PerfResponse,
 	PerfStat,
 	ProjectView,
+	PrReviewView,
 	QuotaLimit,
 	QuotaState,
 	ReleasePlan,
@@ -5793,6 +5794,83 @@ function RelatedTasks({
 	);
 }
 
+/** PR review card: the agent's draft as an editable comment; it reaches GitHub only on the Post click. */
+function PrReviewSection({
+	task,
+	pr,
+	draft,
+	act,
+	onLoaded,
+}: {
+	task: TaskView;
+	pr: PrReviewView;
+	/** Details of the last answered work turn; null before the first review lands. */
+	draft: string | null;
+	act: Act;
+	onLoaded: (v: TaskView) => void;
+}) {
+	const [body, setBody] = useState(draft ?? "");
+	const [error, setError] = useState<string | null>(null);
+	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
+	const blocked =
+		pr.state !== "open"
+			? `PR is ${pr.state}`
+			: pr.postedHead !== null && pr.postedHead === pr.reviewedHead
+				? `Posted for ${pr.postedHead.slice(0, 7)}`
+				: draft === null
+					? "No review draft yet"
+					: task.stage !== "done" || task.state !== "idle"
+						? "The review is not done"
+						: body.trim() === ""
+							? "The comment is empty"
+							: null;
+	const shownError = error ?? pr.postError;
+	return (
+		<section>
+			<h3>PR review</h3>
+			<p>
+				<a href={pr.url} target="_blank" rel="noopener noreferrer">
+					PR #{pr.number}
+				</a>
+				{" · "}
+				{pr.state}
+			</p>
+			<div className="reply-form">
+				<label htmlFor="pr-review-text">Review comment</label>
+				<textarea
+					id="pr-review-text"
+					rows={10}
+					maxLength={65536}
+					value={body}
+					onChange={(e) => setBody(e.target.value)}
+				/>
+				<div className="reply-actions">
+					{blocked !== null && <span className="dim">{blocked}</span>}
+					<BusyButton
+						className="primary"
+						disabled={blocked !== null}
+						run={() =>
+							act(async () => {
+								setError(null);
+								await post(`${taskUrl}/pr-review/post`, { body });
+								onLoaded(await unwrap<TaskView>(await fetch(taskUrl)));
+							}, setError)
+						}
+					>
+						<Icon name="send" />
+						Post
+					</BusyButton>
+				</div>
+			</div>
+			{shownError !== null && (
+				<p className="auth-error" role="alert">
+					{shownError}
+				</p>
+			)}
+		</section>
+	);
+}
+
 function Drawer({
 	task: row,
 	project,
@@ -6012,6 +6090,17 @@ function Drawer({
 		(task.stage === "done"
 			? task.turns.findLast((t) => t.kind === "work" && t.summary !== null)
 			: undefined) ?? task;
+	// PR review card: the last answered work turn holds the draft the PR review section edits and posts.
+	const prDraft =
+		task.kind === "pr_review" && task.prReview !== undefined
+			? task.turns.findLast(
+					(t) => t.kind === "work" && t.outcome === "answered",
+				)
+			: undefined;
+	// The Result skips details shown elsewhere: the research report section or the PR review draft.
+	const hideDetails =
+		(task.research && task.report !== null) ||
+		(prDraft !== undefined && prDraft.details === report.details);
 
 	// Merge anyway shows only while the newest blockers run still has an unresolved blocker and
 	// no run is live (a running or preparing card can still pass the check on its own).
@@ -6598,18 +6687,26 @@ function Drawer({
 					)}
 					{/* A done research card renders the full report once, in the Research report section below; the Result keeps the summary (tldr) only. */}
 					{(report.summary !== null ||
-						(report.details !== null &&
-							!(task.research && task.report !== null))) && (
+						(report.details !== null && !hideDetails)) && (
 						<>
 							<h3>{task.stage === "done" ? "Result" : "Report"}</h3>
 							{report.summary !== null && (
 								<p className="summary">{report.summary}</p>
 							)}
-							{report.details !== null &&
-								!(task.research && task.report !== null) && (
-									<Markdown text={report.details} />
-								)}
+							{report.details !== null && !hideDetails && (
+								<Markdown text={report.details} />
+							)}
 						</>
+					)}
+					{task.kind === "pr_review" && task.prReview !== undefined && (
+						<PrReviewSection
+							key={`${task.prReview.reviewedHead}:${prDraft?.id}`}
+							task={task}
+							pr={task.prReview}
+							draft={prDraft?.details ?? null}
+							act={act}
+							onLoaded={setDetail}
+						/>
 					)}
 					{task.workCheckLog.length > 0 && (
 						<section className="work-checks">
@@ -10601,6 +10698,7 @@ function ProjectSettingsForm({
 	const [retro, setRetro] = useState(project.settings.retroSince !== null);
 	const [retroFilter, setRetroFilter] = useState(project.settings.retroFilter);
 	const [forkRes, setForkRes] = useState(project.settings.forkResearch);
+	const [prRev, setPrRev] = useState(project.settings.prReviews);
 	const [saved, flashSaved] = useFlash(1500);
 	const save = useBusy();
 	// The setup wizard, opened by Run setup again.
@@ -10633,7 +10731,8 @@ function ProjectSettingsForm({
 		hold !== project.settings.holdUpdateMerges ||
 		retro !== (project.settings.retroSince !== null) ||
 		retroFilter !== project.settings.retroFilter ||
-		forkRes !== project.settings.forkResearch;
+		forkRes !== project.settings.forkResearch ||
+		prRev !== project.settings.prReviews;
 	return (
 		<>
 			<div className="settings-head">
@@ -10684,6 +10783,7 @@ function ProjectSettingsForm({
 									retro,
 									retroFilter,
 									forkResearch: forkRes,
+									prReviews: prRev,
 								},
 							);
 							if (response.name !== project.name)
@@ -10923,6 +11023,20 @@ function ProjectSettingsForm({
 						<span className="hint">
 							Hourly watch of the project's GitHub forks; analysis files held
 							proposals; fork-born merges need approval.
+						</span>
+					</label>
+					<label className="add-check">
+						<input
+							type="checkbox"
+							checked={prRev}
+							disabled={project.github === null && !prRev}
+							onChange={(e) => setPrRev(e.target.checked)}
+						/>
+						PR reviews
+						<span className="hint">
+							{project.github === null ? "Needs a GitHub remote. " : ""}
+							Hourly watch of open pull requests on GitHub; each new head gets a
+							read-only review draft you can post as a comment.
 						</span>
 					</label>
 				</SettingsCard>

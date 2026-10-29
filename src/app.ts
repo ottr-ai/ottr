@@ -101,6 +101,7 @@ import {
 	reviewPrompt,
 	rulesInterviewPrompt,
 } from "./prompts.ts";
+import { createPrWatcher, prUrl } from "./prs.ts";
 import { fetchQuota } from "./quota.ts";
 import {
 	includedTasks,
@@ -682,6 +683,13 @@ export function createApp(deps: AppDeps) {
 	const forkWatcher = createForkWatcher({
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[fork] ${msg}`),
+	});
+
+	// PR review watcher: same live project Map as the fork watcher; tests fake `gh`.
+	const prWatcher = createPrWatcher({
+		projects: () => deps.projects.values(),
+		log: (msg: string) => console.log(`[pr] ${msg}`),
+		gh,
 	});
 
 	/**
@@ -1836,12 +1844,28 @@ export function createApp(deps: AppDeps) {
 	 * diff ships only from its own endpoint, so opening a drawer never carries the cap-sized text. */
 	function taskView(e: Entry, t: Task): TaskView {
 		const { diffText: _diffText, ...task } = t;
+		const pr = t.kind === "pr_review" ? e.store.getPrReviewByTask(t.id) : null;
 		return {
 			...task,
 			turns: e.store
 				.listTurns(t.id)
 				.map(({ prompt: _prompt, ...turn }) => turn),
 			sessionTitle: e.store.frozenTitle(t),
+			...(pr !== null && e.github !== null
+				? {
+						prReview: {
+							number: pr.number,
+							url: prUrl(
+								ownerRepo(`https://github.com/${e.github}.git`) ?? e.github,
+								pr.number,
+							),
+							state: pr.state,
+							reviewedHead: pr.reviewedHead,
+							postedHead: pr.postedHead,
+							postError: pr.postError,
+						},
+					}
+				: {}),
 		};
 	}
 
@@ -2003,6 +2027,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof fr !== "boolean")
 				return json({ error: "forkResearch must be a boolean" }, 400);
 			patch.forkResearch = fr;
+		}
+		const pr = body.prReviews;
+		if (pr !== undefined) {
+			if (typeof pr !== "boolean")
+				return json({ error: "prReviews must be a boolean" }, 400);
+			patch.prReviews = pr;
 		}
 		const sc = body.setupChecklist;
 		if (sc !== undefined) {
@@ -5012,6 +5042,78 @@ export function createApp(deps: AppDeps) {
 					return json({ ok: true });
 				}),
 		},
+		"/api/projects/:project/prs/check": {
+			POST: (req) =>
+				api(req, async () => {
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					if (e.github === null)
+						return json({ error: "project has no GitHub remote" }, 409);
+					// Body optional: a manual run of the same watch the hourly poll uses.
+					await prWatcher.tick({ manual: req.params.project });
+					return json({ ok: true });
+				}),
+		},
+		"/api/projects/:project/tasks/:id/pr-review/post": {
+			POST: (req) =>
+				api(req, async () => {
+					// 65536 chars may take up to 4 bytes each in UTF-8.
+					const r = await readJson(req, 4 * 65536 + 1024);
+					if ("error" in r) return r.error;
+					const body = r.body.body;
+					if (typeof body !== "string" || body.trim() === "")
+						return json({ error: "body must be a non-empty string" }, 400);
+					if (body.length > 65536)
+						return json({ error: "body is too long" }, 400);
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { e, task } = found;
+					const row =
+						task.kind === "pr_review"
+							? e.store.getPrReviewByTask(task.id)
+							: null;
+					if (row === null || e.github === null)
+						return json({ error: "not a PR review card" }, 409);
+					const lastWork = e.store
+						.listTurns(task.id)
+						.filter((t) => t.kind === "work")
+						.at(-1);
+					if (
+						task.stage !== "done" ||
+						task.state !== "idle" ||
+						lastWork?.outcome !== "answered"
+					)
+						return json({ error: "no draft to post" }, 409);
+					if (row.state !== "open")
+						return json({ error: `PR is ${row.state}` }, 409);
+					const head = row.reviewedHead;
+					if (head === null || row.postedHead === head)
+						return json({ error: "already posted for this head" }, 409);
+					const repo =
+						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
+					// argv array, no shell: body and head never reach a command line parser.
+					const res = await gh([
+						"api",
+						`repos/${repo}/pulls/${row.number}/reviews`,
+						"-X",
+						"POST",
+						"-f",
+						"event=COMMENT",
+						"-f",
+						`body=${body}`,
+						"-f",
+						`commit_id=${head}`,
+					]);
+					if (res.code !== 0) {
+						const error =
+							res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
+						e.store.savePrReview({ ...row, postError: error });
+						return json({ error }, 502);
+					}
+					e.store.savePrReview({ ...row, postedHead: head, postError: null });
+					return json({ ok: true });
+				}),
+		},
 		"/api/projects/:project/github": {
 			GET: (req) =>
 				api(req, async () => {
@@ -5134,5 +5236,6 @@ export function createApp(deps: AppDeps) {
 		alateProvisionTick,
 		refreshUpdates,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
+		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
 	};
 }

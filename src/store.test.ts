@@ -237,6 +237,7 @@ describe("settings", () => {
 			retroSince: null,
 			retroFilter: true,
 			forkResearch: false,
+			prReviews: false,
 			setupChecklist: false,
 		});
 		store.setSettings({ displayName: null, releaseCommand: null });
@@ -255,6 +256,7 @@ describe("settings", () => {
 			retroSince: null,
 			retroFilter: true,
 			forkResearch: false,
+			prReviews: false,
 			setupChecklist: false,
 		});
 		store.close();
@@ -2261,6 +2263,168 @@ describe("fork research store methods", () => {
 		expect(branch.lastRunAt).toBe(42);
 		expect(branch.lastError).toBeNull();
 		expect(branch.retries).toBe(0);
+	});
+});
+
+describe("pr review store methods", () => {
+	const row = {
+		number: 12,
+		taskId: null,
+		head: "abc",
+		firstSeenAt: 100,
+		reviewedHead: null,
+		postedHead: null,
+		state: "open" as const,
+		draft: false,
+		title: "Fix the thing",
+		postError: null,
+	};
+
+	test("prReviews defaults to false", () => {
+		expect(DEFAULT_SETTINGS.prReviews).toBe(false);
+		expect(open(join(root, "pr-settings")).getSettings().prReviews).toBe(false);
+	});
+
+	test("savePrReview upserts by number and round-trips booleans and nulls", () => {
+		const store = open(join(root, "pr-row"));
+		expect(store.getPrReview(12)).toBeNull();
+		store.savePrReview(row);
+		expect(store.getPrReview(12)).toEqual(row);
+		const changed = {
+			...row,
+			taskId: "T-1",
+			head: "def",
+			reviewedHead: "abc",
+			postedHead: "abc",
+			state: "merged" as const,
+			draft: true,
+			title: "Fix it",
+			postError: "gh: 502",
+		};
+		store.savePrReview(changed);
+		store.savePrReview({ ...row, number: 3 });
+		expect(store.getPrReview(12)).toEqual(changed);
+		expect(store.listPrReviews().map((r) => r.number)).toEqual([3, 12]);
+		expect(store.getPrReviewByTask("T-1")).toEqual(changed);
+		expect(store.getPrReviewByTask("T-2")).toBeNull();
+	});
+
+	test("prReviewRunsSince counts runs at or after the bound", () => {
+		const store = open(join(root, "pr-runs"));
+		store.savePrReview(row);
+		store.startPrReview({
+			number: 12,
+			head: "a",
+			title: "t",
+			prompt: "p",
+			at: 1000,
+		});
+		store.startPrReview({
+			number: 12,
+			head: "b",
+			title: "t",
+			prompt: "p",
+			at: 2000,
+		});
+		expect(store.prReviewRunsSince(2000)).toBe(1);
+		expect(store.prReviewRunsSince(2001)).toBe(0);
+		expect(store.prReviewRunsSince(1000)).toBe(2);
+	});
+
+	test("startPrReview files one card, then requeues the same card with a fresh session", () => {
+		const store = open(join(root, "pr-start"));
+		expect(() =>
+			store.startPrReview({
+				number: 9,
+				head: "a",
+				title: "t",
+				prompt: "p",
+				at: 1,
+			}),
+		).toThrow();
+		store.savePrReview({ ...row, postError: "old failure" });
+		const card = store.startPrReview({
+			number: 12,
+			head: "abc",
+			title: "Fix the thing",
+			prompt: "review prompt 1",
+			at: 50,
+		});
+		expect(card.kind).toBe("pr_review");
+		expect(card.title).toBe("PR review: #12 Fix the thing");
+		expect(card.prompt).toBe("review prompt 1");
+		expect(card.stage).toBe("in_progress");
+		expect(card.state).toBe("queued");
+		expect(card.topic).toBe("pr review");
+		expect(store.getPrReview(12)).toEqual({
+			...row,
+			taskId: card.id,
+			reviewedHead: "abc",
+			postError: null,
+		});
+		expect(store.getPrReviewByTask(card.id)?.number).toBe(12);
+		expect(store.prReviewRunsSince(0)).toBe(1);
+
+		store.updateTask(card.id, {
+			sessionId: "s1",
+			stage: "done",
+			state: "idle",
+			queuedAt: null,
+		});
+		store.savePrReview({
+			...store.getPrReview(12)!,
+			head: "def",
+			postError: "x",
+		});
+		const again = store.startPrReview({
+			number: 12,
+			head: "def",
+			title: "Fix the thing",
+			prompt: "review prompt 2",
+			at: 60,
+		});
+		expect(again.id).toBe(card.id);
+		expect(again.sessionId).toBeNull();
+		expect(again.prompt).toBe("review prompt 2");
+		expect(again.stage).toBe("in_progress");
+		expect(again.state).toBe("queued");
+		expect(again.queuedAt).not.toBeNull();
+		expect(store.listTasks()).toHaveLength(1);
+		expect(store.getPrReview(12)?.reviewedHead).toBe("def");
+		expect(store.getPrReview(12)?.postError).toBeNull();
+		expect(store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("an old database gains the pr_review tables on open, same shape as fresh", () => {
+		const dir = join(root, "pr-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.close();
+		const store = open(dir);
+		store.savePrReview(row);
+		expect(store.getPrReview(12)).toEqual(row);
+		store.close();
+
+		open(join(root, "pr-migration-fresh")).close();
+		const ddl = (path: string) => {
+			const db = new Database(join(path, ".tasks", "tasks.db"));
+			const sql = db
+				.query<{ name: string; sql: string }, []>(
+					"SELECT name, sql FROM sqlite_master WHERE name IN ('pr_review', 'pr_review_runs') ORDER BY name",
+				)
+				.all();
+			db.close();
+			return sql;
+		};
+		const migrated = ddl(dir);
+		expect(migrated.map((t) => t.name)).toEqual([
+			"pr_review",
+			"pr_review_runs",
+		]);
+		expect(migrated).toEqual(ddl(join(root, "pr-migration-fresh")));
 	});
 });
 

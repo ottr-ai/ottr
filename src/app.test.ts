@@ -49,7 +49,7 @@ import {
 	FORK_HOLD_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
-import type { AddProjectResponse, Task } from "./types.ts";
+import type { AddProjectResponse, PrReviewRow, Task } from "./types.ts";
 import { loadSkips } from "./updates.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
@@ -4668,6 +4668,192 @@ describe("fork research routes", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(store.getTask(t.id)?.forkMergeApproved).toBe(true);
+	});
+});
+
+describe("PR review routes", () => {
+	const H1 = "a".repeat(40);
+	const H2 = "b".repeat(40);
+	const prDir = join(root, "p-pr");
+	mkdirSync(prDir, { recursive: true });
+	const prStore = ProjectStore.open(prDir);
+	afterAll(() => {
+		prStore.close();
+	});
+	const prProjects = new Map<string, Entry>();
+	prProjects.set("pg", {
+		path: prDir,
+		name: "pg",
+		store: prStore,
+		target: null,
+		gitless: false,
+		github: "acme/widget",
+		remote: null,
+		dirty: false,
+		latestRelease: null,
+		latestImage: null,
+		archReview: null,
+	});
+	const ghCalls: string[][] = [];
+	let ghResult = { code: 0, stdout: "{}", stderr: "" };
+	const m = mount({
+		projects: prProjects,
+		gh: async (args) => {
+			ghCalls.push(args);
+			return ghResult;
+		},
+	});
+	beforeEach(() => {
+		ghCalls.length = 0;
+		ghResult = { code: 0, stdout: "{}", stderr: "" };
+	});
+	const row = (n: number): PrReviewRow => {
+		const r = prStore.getPrReview(n);
+		if (r === null) throw new Error(`no pr_review row ${n}`);
+		return r;
+	};
+	/** Starts a review turn for PR `n` at `head` and finishes it answered (a draft exists). */
+	const reviewed = (n: number, head: string, answered = true): Task => {
+		const prev = prStore.getPrReview(n);
+		prStore.savePrReview({
+			number: n,
+			taskId: prev?.taskId ?? null,
+			head,
+			firstSeenAt: 0,
+			reviewedHead: prev?.reviewedHead ?? null,
+			postedHead: prev?.postedHead ?? null,
+			state: "open",
+			draft: false,
+			title: "Fix it",
+			postError: null,
+		});
+		const t = prStore.startPrReview({
+			number: n,
+			head,
+			title: "Fix it",
+			prompt: "review",
+			at: Date.now(),
+		});
+		if (answered) {
+			const turn = prStore.startTurn(t.id, "work", ".", null);
+			prStore.finishTurn(turn.id, {
+				outcome: "answered",
+				details: "draft",
+				endedAt: Date.now(),
+				exitCode: 0,
+			});
+			prStore.updateTask(t.id, { stage: "done", state: "idle" });
+		}
+		return t;
+	};
+	const postReview = (id: string, body: unknown) =>
+		m.call(`/api/projects/pg/tasks/${id}/pr-review/post`, body);
+	const expectedArgv = (n: number, body: string, head: string) => [
+		"api",
+		`repos/acme/widget/pulls/${n}/reviews`,
+		"-X",
+		"POST",
+		"-f",
+		"event=COMMENT",
+		"-f",
+		`body=${body}`,
+		"-f",
+		`commit_id=${head}`,
+	];
+
+	test("project settings route accepts prReviews and rejects non-boolean", async () => {
+		const ok = await post("/api/projects/p1/settings", { prReviews: true });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().prReviews).toBe(true);
+		const bad = await post("/api/projects/p1/settings", { prReviews: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("prReviews must be a boolean");
+		await post("/api/projects/p1/settings", { prReviews: false });
+		expect(store.getSettings().prReviews).toBe(false);
+	});
+
+	test("prs/check refuses an unknown project and one without a GitHub remote", async () => {
+		const res = await post("/api/projects/p1/prs/check", {});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("project has no GitHub remote");
+		const unknown = await post("/api/projects/nope/prs/check", {});
+		expect(unknown.status).toBe(404);
+	});
+
+	test("post sends one COMMENT review at the reviewed head, then refuses the same head", async () => {
+		const t = reviewed(1, H1);
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(200);
+		expect(ghCalls).toEqual([expectedArgv(1, "Looks good.", H1)]);
+		expect(row(1).postedHead).toBe(H1);
+		expect(row(1).postError).toBeNull();
+		const again = await postReview(t.id, { body: "Looks good." });
+		expect(again.status).toBe(409);
+		expect(await errorOf(again)).toBe("already posted for this head");
+		expect(ghCalls).toHaveLength(1);
+	});
+
+	test("a new reviewed head opens post again", async () => {
+		const t = reviewed(2, H1);
+		expect((await postReview(t.id, { body: "first" })).status).toBe(200);
+		expect(reviewed(2, H2).id).toBe(t.id);
+		const res = await postReview(t.id, { body: "second" });
+		expect(res.status).toBe(200);
+		expect(ghCalls.at(-1)).toEqual(expectedArgv(2, "second", H2));
+		expect(row(2).postedHead).toBe(H2);
+	});
+
+	test("post refuses a closed PR", async () => {
+		const t = reviewed(3, H1);
+		prStore.savePrReview({ ...row(3), state: "closed" });
+		const res = await postReview(t.id, { body: "late" });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("PR is closed");
+		expect(ghCalls).toHaveLength(0);
+	});
+
+	test("post rejects an empty, blank, non-string or oversized body", async () => {
+		const t = reviewed(4, H1);
+		for (const body of ["", "   ", 5, "x".repeat(65537)]) {
+			const res = await postReview(t.id, { body });
+			expect(res.status).toBe(400);
+		}
+		expect(ghCalls).toHaveLength(0);
+	});
+
+	test("post refuses a card without a draft and a card of another kind", async () => {
+		const t = reviewed(5, H1, false);
+		const res = await postReview(t.id, { body: "early" });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no draft to post");
+		const work = prStore.createTask("plain card");
+		expect((await postReview(work.id, { body: "x" })).status).toBe(409);
+		expect(ghCalls).toHaveLength(0);
+	});
+
+	test("a gh failure returns 502, stores the error and keeps postedHead null", async () => {
+		const t = reviewed(6, H1);
+		ghResult = { code: 1, stdout: "", stderr: "  HTTP 422: nope\n" };
+		const res = await postReview(t.id, { body: "fail" });
+		expect(res.status).toBe(502);
+		expect(await errorOf(res)).toBe("HTTP 422: nope");
+		expect(row(6).postError).toBe("HTTP 422: nope");
+		expect(row(6).postedHead).toBeNull();
+	});
+
+	test("the task view exposes prReview", async () => {
+		const t = reviewed(8, H1);
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as { prReview?: unknown };
+		expect(view.prReview).toEqual({
+			number: 8,
+			url: "https://github.com/acme/widget/pull/8",
+			state: "open",
+			reviewedHead: H1,
+			postedHead: null,
+			postError: null,
+		});
 	});
 });
 

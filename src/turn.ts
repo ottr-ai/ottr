@@ -25,6 +25,7 @@ import {
 	mergePrompt,
 	PROPOSED_REASON_PREFIX,
 	proposedReason,
+	prReviewPrompt,
 	RESEARCH_REPORT,
 	replyPrompt,
 	restartResumePrompt,
@@ -36,6 +37,7 @@ import {
 	workPrompt,
 } from "./prompts.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
+import { ownerRepo } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
 	classify,
@@ -101,6 +103,8 @@ import type {
 } from "./worktree.ts";
 import {
 	commitSubjects,
+	createDetachedWorktree,
+	git,
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
@@ -237,6 +241,14 @@ export interface TurnOps {
 	refreshArchReview(e: TurnProject): Promise<void>;
 	resolveTarget: typeof resolveTarget;
 	createWorktree: typeof createWorktree;
+	/** pr_review cards: the branch-less worktree detached at the reviewed head; overridable for tests. */
+	createDetachedWorktree?: typeof createDetachedWorktree;
+	/** pr_review cards: the hardened, token-authenticated fetch of the PR head into the main checkout; overridable for tests. */
+	fetchPrHead?: (
+		mainPath: string,
+		url: string,
+		refspecs: string[],
+	) => Promise<void>;
 	removeWorktree: typeof removeWorktree;
 	commitsAhead: typeof commitsAhead;
 	changedFiles: typeof changedFiles;
@@ -1051,6 +1063,9 @@ export function createTurnLoop(
 			const interview = task.kind === "interview";
 			// A backlog card only ever runs grill turns: worktree-less, in the main checkout.
 			const grill = task.stage === "backlog";
+			// A PR review card has no branch: a detached worktree at the reviewed PR head, a fresh session each turn.
+			const prReview = task.kind === "pr_review";
+			let prPrompt: string | null = null;
 			// Review sessions get one fixed name, applied by the extension before the agent runs,
 			// so the board never depends on the agent inventing a title.
 			let sessionName = releaseCard
@@ -1083,6 +1098,83 @@ export function createTurnLoop(
 			const base = task.base ?? sha;
 			if (interview || grill) {
 				wt = e.path;
+			} else if (prReview) {
+				const row = store.getPrReviewByTask(id);
+				if (row === null || row.reviewedHead === null)
+					throw new Error(
+						"PR review card has no reviewed head: the PR watcher starts its turns",
+					);
+				const head = row.reviewedHead;
+				const repo = e.github === null ? null : ownerRepo(e.github);
+				// The repo and number build the fetch URL and refspec: validate both, never trust the strings.
+				if (repo === null || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo))
+					throw new Error(
+						`PR review needs a GitHub repo; the project remote is ${e.github ?? "none"}`,
+					);
+				if (!Number.isSafeInteger(row.number) || row.number <= 0)
+					throw new Error(`invalid PR number ${row.number}`);
+				const ref = `refs/ottr/pr/${row.number}`;
+				log(`+ fetch PR #${row.number} head into ${ref}`);
+				await (
+					ops.fetchPrHead ??
+					(async (p: string, u: string, r: string[]) => {
+						// Fork objects are fsck'd; git() hands the board's token only to github.com over https (no credential.helper reset, so private repos work).
+						const f = await git(
+							[
+								"-c",
+								"protocol.allow=never",
+								"-c",
+								"protocol.https.allow=always",
+								"-c",
+								"fetch.fsckObjects=true",
+								"-c",
+								"transfer.fsckObjects=true",
+								"fetch",
+								"--no-tags",
+								"--no-recurse-submodules",
+								u,
+								...r,
+							],
+							p,
+						);
+						if (f.code !== 0)
+							throw new Error(`git fetch ${u} failed: ${f.stderr.trim()}`);
+					})
+				)(e.path, `https://github.com/${repo}.git`, [
+					`+refs/pull/${row.number}/head:${ref}`,
+				]);
+				const fetched = await ops.targetSha(e.path, ref);
+				if (fetched !== head)
+					throw new Error(
+						`PR #${row.number} head moved: ${ref} is ${fetched ?? "missing"}, the review expects ${head}`,
+					);
+				wt = join(store.worktreesDir, id);
+				log(`+ worktree detached at ${head} (PR #${row.number})`);
+				await (ops.createDetachedWorktree ?? createDetachedWorktree)({
+					mainPath: e.path,
+					worktreePath: wt,
+					sha: head,
+					log,
+				});
+				store.updateTask(id, { worktree: wt });
+				if (store.getTask(id)?.cancelledAt) {
+					// the agent never ran in this checkout: nothing to lose
+					await ops
+						.removeWorktree({
+							mainPath: e.path,
+							worktreePath: wt,
+							branch: null,
+						})
+						.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+					return;
+				}
+				prPrompt = prReviewPrompt({
+					repo,
+					number: row.number,
+					title: row.title,
+					head,
+					base: target.replace(/^origin\//, ""),
+				});
 			} else if (!wt || !branch) {
 				branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
 				wt = join(store.worktreesDir, id);
@@ -1164,12 +1256,16 @@ export function createTurnLoop(
 							}),
 						})
 					: raw;
-			const plan = resumePlan(
-				live.sessionId,
-				sessionFile(store.sessionsDir, live.sessionId) !== null,
-				pending,
-			);
-			if (plan.resumeId !== live.sessionId)
+			// A PR review always starts a new session: each reviewed head gets a fresh review.
+			const plan =
+				prPrompt !== null
+					? resumePlan(null, false, pending)
+					: resumePlan(
+							live.sessionId,
+							sessionFile(store.sessionsDir, live.sessionId) !== null,
+							pending,
+						);
+			if (prPrompt === null && plan.resumeId !== live.sessionId)
 				log(
 					`! omp never saved session ${live.sessionId}; starting a fresh session`,
 				);
@@ -1192,8 +1288,15 @@ export function createTurnLoop(
 								// startTurn runs after startRun, so the last turn here is the one this reply answers.
 								rejected: rejectedReport(store.listTurns(id).at(-1)),
 							})
-					: releaseCard || interview || retroCard || boardCheck || grill
-						? withNote(grill ? grillPrompt(task.prompt) : task.prompt)
+					: releaseCard ||
+							interview ||
+							retroCard ||
+							boardCheck ||
+							grill ||
+							prPrompt !== null
+						? withNote(
+								prPrompt ?? (grill ? grillPrompt(task.prompt) : task.prompt),
+							)
 						: kind === "work"
 							? workPrompt({
 									text: task.prompt,
@@ -1426,7 +1529,11 @@ export function createTurnLoop(
 			// Sync read: settle must stay within one microtask flush (tests await runTurn or flush microtasks only).
 			const reportPath = join(wt, RESEARCH_REPORT);
 			const reportText =
-				kind === "work" && !interview && !grill && existsSync(reportPath)
+				kind === "work" &&
+				!interview &&
+				!grill &&
+				!prReview && // the PR tree is untrusted: its file must not flip the card to research
+				existsSync(reportPath)
 					? readFileSync(reportPath, "utf8")
 					: null;
 			const autoResearch =
@@ -1649,7 +1756,7 @@ export function createTurnLoop(
 				// A husk or unlinked dir would make git speak for the enclosing checkout instead,
 				// so the main-repo proof stands in for all three facts there.
 				commitsAhead:
-					interview || grill || fromMain
+					interview || grill || prReview || fromMain
 						? 0
 						: await ops.commitsAhead(wt, base).catch(() => 0),
 				clean: fromMain ? true : await ops.isClean(wt).catch(() => false),
@@ -1796,6 +1903,23 @@ export function createTurnLoop(
 						};
 				}
 			}
+			// A PR review never integrates: its deliverable is the answered details, the draft a person posts.
+			// Other outcomes park it; an ask, a death or an automatic continue keeps classify's verdict.
+			if (prReview) {
+				const status = result.outcome?.status;
+				if (status === "answered")
+					next = { stage: "done", state: "idle", needsReason: null };
+				else if (
+					status === "ready" ||
+					status === "integrated" ||
+					next.stage !== "in_progress"
+				)
+					next = {
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason: "PR review cards must report answered.",
+					};
+			}
 			// Review cards never integrate: committing fails the review, and a release publishes via the tracker.
 			if (reviewCard && next.stage === "merging")
 				next = {
@@ -1840,6 +1964,7 @@ export function createTurnLoop(
 				!grill &&
 				!research &&
 				!releaseCard &&
+				!prReview &&
 				// This turn's copies count, and so do shots an earlier turn on this card attached:
 				// changedFiles is the card's cumulative diff, so without the card's history
 				// every later clean turn would re-prompt for a screenshot that already exists.
@@ -1877,7 +2002,11 @@ export function createTurnLoop(
 			// must not commit), so it skips the check.
 			// A research card's worktree is disposable like a review card's: the report is already harvested.
 			const unsaved =
-				next.stage === "done" && !reviewCard && !interview && !research
+				next.stage === "done" &&
+				!reviewCard &&
+				!prReview && // the PR commits are never on the target: the worktree is disposable
+				!interview &&
+				!research
 					? await ops.unsavedWork(wt, target)
 					: null;
 			// A research card's deliverable is the report file: archive it before the worktree goes.
@@ -2630,8 +2759,14 @@ export function createTurnLoop(
 		if (task?.worktree) {
 			let unsaved: string | null = null;
 			// A Done task passed the delete check when its worktree was removed; only its record is left.
-			// A release card's worktree is disposable: cancel it like a forced cancel.
-			if (!force && task.stage !== "done" && task.releaseVersion === null) {
+			// A release card's worktree is disposable: cancel it like a forced cancel. So is a PR
+			// review's: its PR commits are never on the target.
+			if (
+				!force &&
+				task.stage !== "done" &&
+				task.releaseVersion === null &&
+				task.kind !== "pr_review"
+			) {
 				const into = e.target ?? task.base;
 				unsaved = (await ops.worktreeHusk(task.worktree))
 					? null // an unlinked husk holds no checkout: nothing to keep

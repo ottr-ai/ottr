@@ -145,6 +145,8 @@ export interface ProjectSettings {
 	retroFilter: boolean;
 	/** Hourly fork watch: analyze new fork-only commits with a tool-free model call and file held proposals (off by default). */
 	forkResearch: boolean;
+	/** Hourly PR watch: file or requeue a read-only review card for each settled open PR (off by default). */
+	prReviews: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 }
@@ -156,7 +158,34 @@ export interface DiffFileStat {
 	minus: number | null;
 }
 
-export type TaskKind = "work" | "retro" | "review" | "interview";
+export type TaskKind = "work" | "retro" | "review" | "interview" | "pr_review";
+
+export type PrState = "open" | "closed" | "merged";
+
+/** One pr_review row: the watch state of one PR of the project's GitHub repo. */
+export interface PrReviewRow {
+	number: number;
+	/** The PR's review card; null before the first review starts. */
+	taskId: string | null;
+	head: string;
+	firstSeenAt: number;
+	reviewedHead: string | null;
+	postedHead: string | null;
+	state: PrState;
+	draft: boolean;
+	title: string;
+	postError: string | null;
+}
+
+/** The PR facts a pr_review card's drawer shows. */
+export interface PrReviewView {
+	number: number;
+	url: string;
+	state: PrState;
+	reviewedHead: string | null;
+	postedHead: string | null;
+	postError: string | null;
+}
 
 export interface Task {
 	/** Trusted, server-set card kind set once by the route that created the card; never derived from prompt text. */
@@ -553,6 +582,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	sessionTitle: string;
 	/** Repo-relative uncommitted worktree files; present on the drawer detail view only. */
 	worktreeFiles?: string[];
+	/** Set only for kind "pr_review". */
+	prReview?: PrReviewView;
 }
 
 /** A turn as shipped over the API: everything but the prompt text. */

@@ -503,6 +503,10 @@ setInterval(() => void app.refreshUpdates(), 3_600_000);
 void app.forkResearchTick();
 setInterval(() => void app.forkResearchTick(), 3_600_000);
 
+// PR reviews: hourly poll; the watcher gates which open PRs start a review turn.
+void app.prReviewTick();
+setInterval(() => void app.prReviewTick(), 3_600_000);
+
 // No bind retry: nothing in the repo restarts this process on the same port, so a
 // bind failure surfaces as the thrown error from Bun.serve.
 serverRef.current = Bun.serve({

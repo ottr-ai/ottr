@@ -30,6 +30,8 @@ import type {
 	Learning,
 	OutcomeStatus,
 	ProjectSettings,
+	PrReviewRow,
+	PrState,
 	RunState,
 	Stage,
 	Task,
@@ -56,6 +58,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	retroSince: null,
 	retroFilter: true,
 	forkResearch: false,
+	prReviews: false,
 	setupChecklist: false,
 };
 
@@ -148,6 +151,23 @@ CREATE TABLE IF NOT EXISTS fork_runs (
   fork_id INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fork_runs_at ON fork_runs (started_at);
+CREATE TABLE IF NOT EXISTS pr_review (
+  number INTEGER PRIMARY KEY,
+  task_id TEXT,
+  head TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  reviewed_head TEXT,
+  posted_head TEXT,
+  state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
+  draft INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  post_error TEXT
+);
+CREATE TABLE IF NOT EXISTS pr_review_runs (
+  number INTEGER NOT NULL,
+  started_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   text TEXT NOT NULL,
@@ -230,6 +250,35 @@ function toForkBranch(r: ForkBranchRow): ForkBranchState {
 		lastRunAt: r.last_run_at,
 		lastError: r.last_error,
 		retries: r.retries,
+	};
+}
+
+/** One pr_review row. */
+interface PrReviewDbRow {
+	number: number;
+	task_id: string | null;
+	head: string;
+	first_seen_at: number;
+	reviewed_head: string | null;
+	posted_head: string | null;
+	state: string;
+	draft: number;
+	title: string;
+	post_error: string | null;
+}
+
+function toPrReview(r: PrReviewDbRow): PrReviewRow {
+	return {
+		number: r.number,
+		taskId: r.task_id,
+		head: r.head,
+		firstSeenAt: r.first_seen_at,
+		reviewedHead: r.reviewed_head,
+		postedHead: r.posted_head,
+		state: r.state as PrState,
+		draft: r.draft !== 0,
+		title: r.title,
+		postError: r.post_error,
 	};
 }
 
@@ -732,6 +781,7 @@ const SETTINGS_SHAPES = {
 	retroSince: "number",
 	retroFilter: "boolean",
 	forkResearch: "boolean",
+	prReviews: "boolean",
 	setupChecklist: "boolean",
 } as const satisfies Record<keyof ProjectSettings, string>;
 
@@ -1351,6 +1401,122 @@ export class ProjectStore {
 		tx();
 		const card = this.getTask(cardId);
 		if (!card) throw new Error(`fork result card vanished: ${cardId}`);
+		return card;
+	}
+
+	// ---- PR review watch state ----
+
+	listPrReviews(): PrReviewRow[] {
+		return this.db
+			.query<PrReviewDbRow, []>("SELECT * FROM pr_review ORDER BY number")
+			.all()
+			.map(toPrReview);
+	}
+
+	getPrReview(number: number): PrReviewRow | null {
+		const r = this.db
+			.query<PrReviewDbRow, [number]>(
+				"SELECT * FROM pr_review WHERE number = ?",
+			)
+			.get(number);
+		return r ? toPrReview(r) : null;
+	}
+
+	getPrReviewByTask(taskId: string): PrReviewRow | null {
+		const r = this.db
+			.query<PrReviewDbRow, [string]>(
+				"SELECT * FROM pr_review WHERE task_id = ?",
+			)
+			.get(taskId);
+		return r ? toPrReview(r) : null;
+	}
+
+	/** Upserts one PR watch row by PR number. */
+	savePrReview(row: PrReviewRow): void {
+		this.db.run(
+			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, state, draft, title, post_error)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(number) DO UPDATE SET
+			   task_id = excluded.task_id, head = excluded.head, first_seen_at = excluded.first_seen_at,
+			   reviewed_head = excluded.reviewed_head, posted_head = excluded.posted_head, state = excluded.state,
+			   draft = excluded.draft, title = excluded.title, post_error = excluded.post_error`,
+			[
+				row.number,
+				row.taskId,
+				row.head,
+				row.firstSeenAt,
+				row.reviewedHead,
+				row.postedHead,
+				row.state,
+				row.draft ? 1 : 0,
+				row.title,
+				row.postError,
+			],
+		);
+	}
+
+	/** Review starts since `since` (project daily-rate gate). */
+	prReviewRunsSince(since: number): number {
+		return (
+			this.db
+				.query<{ n: number }, [number]>(
+					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE started_at >= ?",
+				)
+				.get(since)?.n ?? 0
+		);
+	}
+
+	/**
+	 * Files the PR's review card, or requeues its existing card with a fresh session, then marks
+	 * the head reviewed and counts the run — one transaction, so a restart cannot start it twice.
+	 */
+	startPrReview(o: {
+		number: number;
+		head: string;
+		title: string;
+		prompt: string;
+		at: number;
+	}): Task {
+		let cardId = "";
+		const tx = this.db.transaction(() => {
+			const row = this.getPrReview(o.number);
+			if (!row) throw new Error(`unknown pr_review: #${o.number}`);
+			const existing = row.taskId === null ? null : this.getTask(row.taskId);
+			if (existing === null) {
+				const card = this.createTask(o.prompt, null, "pr_review");
+				this.updateTask(card.id, {
+					title: `PR review: #${o.number} ${o.title}`,
+					stage: "in_progress",
+					topic: "pr review",
+				});
+				cardId = card.id;
+			} else {
+				this.updateTask(existing.id, {
+					prompt: o.prompt,
+					sessionId: null,
+					pendingPrompt: null,
+					asked: null, // a fresh session knows nothing of the old ask
+					needsReason: null,
+					stage: "in_progress",
+					state: "queued",
+					queuedAt: Date.now(),
+				});
+				cardId = existing.id;
+			}
+			this.savePrReview({
+				...row,
+				taskId: cardId,
+				reviewedHead: o.head,
+				postError: null,
+			});
+			this.db.run(
+				"INSERT INTO pr_review_runs (number, started_at) VALUES (?, ?)",
+				[o.number, o.at],
+			);
+		});
+		tx();
+		const card = this.getTask(cardId);
+		if (!card) throw new Error(`pr review card vanished: ${cardId}`);
 		return card;
 	}
 

@@ -288,7 +288,9 @@ export function createSupervisor(
 		const target = e.target ?? t.base ?? "HEAD";
 		let unsaved: string | null = null;
 		try {
-			unsaved = await ops.unsavedWork(t.worktree, target);
+			// A PR review's worktree is disposable: its PR commits are never on the target.
+			if (t.kind !== "pr_review")
+				unsaved = await ops.unsavedWork(t.worktree, target);
 		} catch {
 			unsaved = "git failed in the worktree";
 		}
@@ -746,7 +748,8 @@ export function createSupervisor(
 			isRetro(t) ||
 			t.releaseVersion !== null ||
 			isReview(t) ||
-			t.kind === "interview"
+			t.kind === "interview" ||
+			t.kind === "pr_review"
 		)
 			return;
 		// A cancelled retro child counts: cancelling the retro of a card is final.

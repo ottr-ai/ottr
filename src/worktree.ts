@@ -576,66 +576,7 @@ export async function createWorktree(o: {
 	o.log(`worktree ${o.worktreePath} on ${o.branch}`);
 
 	try {
-		const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
-			existsSync(path.join(o.mainPath, p)),
-		);
-		const copied: string[] = [];
-		if (candidates.length > 0) {
-			// No ignore filter: local-only rules are ignored files by design (.git/info/exclude
-			// or a .gitignore), and the exclude entries that this copy adds would hide them from
-			// the next worktree. validateCopyPath rejects "." and the loop skips env files.
-			// ponytail: ls-files --others copies whole dirs (e.g. .omp) wholesale, ignored caches too; fine for rules-scale files
-			const ls = await git(
-				["ls-files", "-z", "--others", "--", ...candidates],
-				o.mainPath,
-			);
-			if (ls.code !== 0)
-				throw new Error(`git ls-files failed: ${ls.stderr.trim()}`);
-			for (const rel of ls.stdout.split("\0")) {
-				if (rel === "") continue;
-				if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
-					continue;
-				copyBelow(
-					{
-						anchor: trustedAnchor(o.mainPath),
-						file: path.join(o.mainPath, rel),
-					},
-					{
-						anchor: worktreeAnchor(o.mainPath, o.worktreePath),
-						file: path.join(o.worktreePath, rel),
-					},
-					o.mainPath,
-				);
-				copied.push(rel);
-				o.log(`copied ${rel}`);
-			}
-		}
-
-		if (copied.length > 0) {
-			const exclude = await excludeFile(o.mainPath);
-			for (const rel of copied) {
-				const relFwd = rel.replaceAll("\\", "/");
-				const ci = await git(["check-ignore", "-q", "--", rel], o.worktreePath);
-				if (ci.code === 1) {
-					appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
-					o.log(`added /${relFwd} to .git/info/exclude`);
-				} else if (ci.code > 1) {
-					throw new Error(
-						`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`,
-					);
-				}
-			}
-			const st = await git(
-				["status", "--porcelain", "--untracked-files=all"],
-				o.worktreePath,
-			);
-			if (st.code !== 0)
-				throw new Error(`git status failed in worktree: ${st.stderr.trim()}`);
-			if (st.stdout !== "")
-				throw new Error(
-					`worktree not clean after copying rules:\n${st.stdout}`,
-				);
-		}
+		await copyRules(o);
 	} catch (e) {
 		// worktree add succeeded; roll it back so a retry doesn't hit "already exists"
 		try {
@@ -650,6 +591,140 @@ export async function createWorktree(o: {
 			);
 		}
 		throw e;
+	}
+}
+
+/** Agent config a PR could add to steer the review agent or run code in it (omp hooks,
+ * extensions, MCP servers): a pr_review worktree never checks these out (gitignore syntax: a name without an inner slash matches at any depth). */
+export const PR_EXCLUDED_PATHS = [
+	"AGENTS.md",
+	"CLAUDE.md",
+	"GEMINI.md",
+	".cursorrules",
+	".omp/",
+	".claude/",
+	".agents/",
+	".cursor/",
+	".codex/",
+	".github/copilot-instructions.md",
+];
+
+/** A branch-less worktree detached at `sha` (a pr_review card) without PR_EXCLUDED_PATHS: a
+ * registered one moves to `sha`, a scratch dir from an interrupted add is replaced like
+ * createWorktree does. The main checkout's trusted untracked AGENTS.md/.omp are copied in. */
+export async function createDetachedWorktree(o: {
+	mainPath: string;
+	worktreePath: string;
+	sha: string;
+	log: (line: string) => void;
+}): Promise<void> {
+	if (!/^[0-9a-f]{40}$/.test(o.sha)) throw new Error(`invalid sha: ${o.sha}`);
+	const onDisk = existsSync(o.worktreePath);
+	if (!(onDisk && (await worktreeLinked(o.worktreePath)))) {
+		if (onDisk)
+			removeBelow(worktreeAnchor(o.mainPath, o.worktreePath), o.worktreePath);
+		else await git(["worktree", "prune"], o.mainPath);
+		const add = await git(
+			["worktree", "add", "--no-checkout", "--detach", o.worktreePath, o.sha],
+			o.mainPath,
+		);
+		if (add.code !== 0)
+			throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
+	}
+	// Sparse settings live in this worktree's config.worktree (git turns on
+	// extensions.worktreeConfig), so the main checkout stays full. expectFilesOutsideOfPatterns
+	// keeps the trusted copies below from clearing skip-worktree on a PR's excluded paths
+	// (git would then show them modified and refuse the next re-review checkout).
+	for (const args of [
+		[
+			"sparse-checkout",
+			"set",
+			"--no-cone",
+			"/*",
+			...PR_EXCLUDED_PATHS.map((p) => `!${p}`),
+		],
+		["config", "--worktree", "sparse.expectFilesOutsideOfPatterns", "true"],
+		["checkout", "--detach", o.sha],
+	]) {
+		const r = await git(args, o.worktreePath);
+		if (r.code !== 0)
+			throw new Error(
+				`git ${args.slice(0, 2).join(" ")} failed: ${r.stderr.trim()}`,
+			);
+	}
+	await copyRules({ ...o, copyExtra: [] });
+}
+
+/** Copies the main checkout's untracked AGENTS.md, .omp and `copyExtra` into the worktree,
+ * hides them via .git/info/exclude, and fails unless the worktree is clean afterwards. */
+async function copyRules(o: {
+	mainPath: string;
+	worktreePath: string;
+	copyExtra: string[];
+	log: (line: string) => void;
+}): Promise<void> {
+	const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
+		existsSync(path.join(o.mainPath, p)),
+	);
+	const copied: string[] = [];
+	if (candidates.length > 0) {
+		// No ignore filter: local-only rules are ignored files by design (.git/info/exclude
+		// or a .gitignore), and the exclude entries that this copy adds would hide them from
+		// the next worktree. validateCopyPath rejects "." and the loop skips env files.
+		// ponytail: ls-files --others copies whole dirs (e.g. .omp) wholesale, ignored caches too; fine for rules-scale files
+		const ls = await git(
+			["ls-files", "-z", "--others", "--", ...candidates],
+			o.mainPath,
+		);
+		if (ls.code !== 0)
+			throw new Error(`git ls-files failed: ${ls.stderr.trim()}`);
+		for (const rel of ls.stdout.split("\0")) {
+			if (rel === "") continue;
+			if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
+				continue;
+			copyBelow(
+				{
+					anchor: trustedAnchor(o.mainPath),
+					file: path.join(o.mainPath, rel),
+				},
+				{
+					anchor: worktreeAnchor(o.mainPath, o.worktreePath),
+					file: path.join(o.worktreePath, rel),
+				},
+				o.mainPath,
+			);
+			copied.push(rel);
+			o.log(`copied ${rel}`);
+		}
+	}
+
+	if (copied.length > 0) {
+		const exclude = await excludeFile(o.mainPath);
+		for (const rel of copied) {
+			const relFwd = rel.replaceAll("\\", "/");
+			// --no-index: a pr_review head may track the path (skip-worktree), which plain
+			// check-ignore never reports ignored, so each re-review would append it again.
+			const ci = await git(
+				["check-ignore", "-q", "--no-index", "--", rel],
+				o.worktreePath,
+			);
+			if (ci.code === 1) {
+				appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
+				o.log(`added /${relFwd} to .git/info/exclude`);
+			} else if (ci.code > 1) {
+				throw new Error(
+					`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`,
+				);
+			}
+		}
+		const st = await git(
+			["status", "--porcelain", "--untracked-files=all"],
+			o.worktreePath,
+		);
+		if (st.code !== 0)
+			throw new Error(`git status failed in worktree: ${st.stderr.trim()}`);
+		if (st.stdout !== "")
+			throw new Error(`worktree not clean after copying rules:\n${st.stdout}`);
 	}
 }
 

@@ -24,6 +24,7 @@ import {
 	archReviewDue,
 	branchMergedOrGone,
 	changedFiles,
+	createDetachedWorktree,
 	createWorktree,
 	diffStat,
 	diffText,
@@ -776,6 +777,50 @@ describe("against real repos", () => {
 		} finally {
 			await must(main, "remote", "remove", "gh");
 		}
+	}, 60_000);
+
+	test("createDetachedWorktree leaves PR agent config out and keeps the main checkout full", async () => {
+		const m = join(root, "pr-main");
+		const wt = join(root, "wt-pr");
+		await must(root, "init", "-q", "-b", "main", m);
+		mkdirSync(join(m, "sub"));
+		mkdirSync(join(m, ".omp"));
+		mkdirSync(join(m, "src"));
+		writeFileSync(join(m, "AGENTS.md"), "pr rules\n");
+		writeFileSync(join(m, "sub", "AGENTS.md"), "pr sub rules\n");
+		writeFileSync(join(m, ".omp", "x.json"), "{}\n");
+		writeFileSync(join(m, "src", "a.ts"), "one\n");
+		await must(m, "add", "-A");
+		await must(m, "commit", "-q", "-m", "pr 1");
+		const c1 = await must(m, "rev-parse", "HEAD");
+		writeFileSync(join(m, "src", "a.ts"), "two\n");
+		writeFileSync(join(m, "AGENTS.md"), "pr rules 2\n");
+		await must(m, "commit", "-q", "-am", "pr 2");
+		const c2 = await must(m, "rev-parse", "HEAD");
+		// The main checkout's trusted local rules: untracked, so copied into the PR worktree.
+		writeFileSync(join(m, ".omp", "trusted.json"), "{}\n");
+		const opts = { mainPath: m, worktreePath: wt, log: () => {} };
+
+		const check = async (sha: string, a: string) => {
+			expect(await must(wt, "rev-parse", "HEAD")).toBe(sha);
+			expect(readFileSync(join(wt, "src", "a.ts"), "utf8")).toBe(a);
+			expect(existsSync(join(wt, "AGENTS.md"))).toBe(false);
+			expect(existsSync(join(wt, "sub", "AGENTS.md"))).toBe(false);
+			expect(existsSync(join(wt, ".omp", "x.json"))).toBe(false);
+			expect(existsSync(join(wt, ".omp", "trusted.json"))).toBe(true);
+			expect(await must(wt, "status", "--porcelain")).toBe("");
+			// The main checkout keeps every file and never turns sparse.
+			for (const f of ["AGENTS.md", "sub/AGENTS.md", ".omp/x.json"])
+				expect(existsSync(join(m, f))).toBe(true);
+			expect(
+				(await git(["config", "--get", "core.sparseCheckout"], m)).code,
+			).not.toBe(0);
+		};
+		await createDetachedWorktree({ ...opts, sha: c1 });
+		await check(c1, "one\n");
+		// Re-review: the registered worktree moves to the new head and keeps the exclusion.
+		await createDetachedWorktree({ ...opts, sha: c2 });
+		await check(c2, "two\n");
 	}, 60_000);
 });
 
