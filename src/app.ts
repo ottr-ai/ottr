@@ -72,6 +72,7 @@ import {
 	agentDir,
 	boardOmpEnv,
 	boardOmpHome,
+	boardSignIns,
 	type DeadSignIn,
 	deadSignIns,
 	loginProviders,
@@ -3753,7 +3754,7 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, async () => {
 					return json({
-						signIns: signIns(),
+						...boardSignIns(),
 						pending: logins.pending(),
 						providers: loginProviders(),
 					});

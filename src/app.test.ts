@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import {
 	afterAll,
+	afterEach,
 	beforeAll,
+	beforeEach,
 	describe,
 	expect,
 	type Mock,
@@ -3461,16 +3463,44 @@ describe("add-project folder-name collisions (R1-5)", () => {
 });
 
 describe("GET /api/provider-login", () => {
+	// Pin the board's store to a scratch dir: the machine's own omp store must not decide the result.
+	let agent: string;
+	let savedAgent: string | undefined;
+	beforeEach(() => {
+		agent = mkdtempSync(join(tmpdir(), "ottr-login-agent"));
+		savedAgent = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agent;
+	});
+	afterEach(() => {
+		if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = savedAgent;
+		rmSync(agent, { recursive: true, force: true });
+	});
+
+	test("a missing store reads as unreadable, not a 500", async () => {
+		const res = await mount({}).call("/api/provider-login");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { signIns: unknown; error: unknown };
+		expect(b.signIns).toBeNull();
+		expect(b.error).toBe(
+			`cannot read omp's sign-ins: ${join(agent, "agent.db")} does not exist`,
+		);
+	});
+
 	test("carries the provider list omp's /login offers, next to the stored sign-ins", async () => {
+		const db = new Database(join(agent, "agent.db"));
+		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY,
+			provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
+			disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`);
+		db.close();
 		const m = mount({});
 		const res = await m.call("/api/provider-login");
 		expect(res.status).toBe(200);
 		const b: unknown = await res.json();
 		expect(typeof b === "object" && b !== null && "providers" in b).toBe(true);
 		if (typeof b !== "object" || b === null || !("providers" in b)) return;
-		// The board's store decides the sign-ins; the route only pins the shape.
-		expect("signIns" in b && Array.isArray(b.signIns)).toBe(true);
-		if (!("signIns" in b) || !Array.isArray(b.signIns)) return;
+		expect("signIns" in b && b.signIns).toEqual([]);
+		expect("error" in b && b.error).toBeNull();
 		expect("pending" in b).toBe(true);
 		const providers = b.providers;
 		// The machine's omp install decides the ids; the route only pins the shape.

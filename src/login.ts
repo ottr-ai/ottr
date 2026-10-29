@@ -472,6 +472,23 @@ export function signIns(dbPath = agentDb()): SignIn[] {
 	return [...by.values()].sort((a, b) => a.provider.localeCompare(b.provider));
 }
 
+/** The board store's sign-ins; `signIns` is null and `error` says why when the board cannot read the store. */
+export function boardSignIns(dbPath = agentDb()): {
+	signIns: SignIn[] | null;
+	error: string | null;
+} {
+	try {
+		// A readonly open of a missing path fails with a message that names no file.
+		if (!existsSync(dbPath)) throw new Error(`${dbPath} does not exist`);
+		return { signIns: signIns(dbPath), error: null };
+	} catch (err) {
+		return {
+			signIns: null,
+			error: `cannot read omp's sign-ins: ${errmsg(err)}`,
+		};
+	}
+}
+
 /** An active auth_credentials row and the moment the user signed it in. */
 export interface ActiveCredential {
 	id: number;

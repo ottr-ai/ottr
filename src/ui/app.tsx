@@ -8872,8 +8872,10 @@ type SignIn = {
 /** One provider omp's `/login` picker offers, as the server reads it from the installed omp. */
 type LoginProvider = { id: string; name: string };
 type SignInState = {
-	/** The board store's sign-ins, one per provider. */
-	signIns: SignIn[];
+	/** The board store's sign-ins, one per provider; null when the board cannot read the store. */
+	signIns: SignIn[] | null;
+	/** Why the board cannot read its store; null when it can. */
+	error: string | null;
 	pending: LoginView | null;
 	/** Empty when the machine has no omp install to read; the field then takes typed ids. */
 	providers: LoginProvider[];
@@ -9051,8 +9053,13 @@ function ProviderLoginSection() {
 					})}
 				</div>
 			)}
-			{signIns.length === 0 && (
+			{state?.signIns?.length === 0 && (
 				<p className="hint">omp has no sign-ins on this machine yet.</p>
+			)}
+			{state?.error && (
+				<p className="auth-error" role="alert">
+					{state.error}
+				</p>
 			)}
 			{waiting ? (
 				<form
