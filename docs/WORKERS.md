@@ -183,7 +183,9 @@ a recreated container does not download again. Each turn then gets a link folder
 ahead of the image PATH: the project's tools first, then the fleet folder
 `workers/_all/tools.json`, and a project's `name` wins over the same `name` in
 `_all`. The container PATH itself never changes, so two projects never see each
-other's pins. A failed download or a hash mismatch stops the turn with the error,
+other's pins. Turns with the same tool set share one link folder,
+`~/.ottr/tools/path-<hash>/`, so the folders do not grow with each turn.
+A failed download or a hash mismatch stops the turn with the error,
 like a failed apt install. The name `godot` gets a small wrapper instead of a
 link: without `DISPLAY` or `WAYLAND_DISPLAY` it adds `--headless`, because Godot
 exits with "Can't load Xlib" when it finds no display.

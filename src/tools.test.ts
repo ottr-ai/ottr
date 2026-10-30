@@ -505,6 +505,14 @@ describe("buildToolsPath", () => {
 		expect(readFileSync(realpathSync(join(dir, "all-only")), "utf8")).toBe(
 			"all\n",
 		);
+		// Same tool set, same dir: repeated turns add no new link dir and leave no build dir.
+		expect(buildToolsPath("picker", h)).toBe(dir);
+		expect(buildToolsPath("_all", h)).not.toBe(dir);
+		expect(
+			readdirSync(join(h, ".ottr", "tools")).filter((n) =>
+				n.startsWith("path-"),
+			),
+		).toHaveLength(2);
 	});
 
 	test("a name missing from the tools store throws", () => {

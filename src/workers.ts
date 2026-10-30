@@ -88,7 +88,7 @@ export function serveWorker(opts: {
 					const toolLines = await (opts.ensureTools ?? ensureProjectTools)(
 						project,
 					);
-					pathDir = await (opts.buildPath ?? buildToolsPath)(project);
+					pathDir = (opts.buildPath ?? buildToolsPath)(project);
 					notes = [...aptLines, ...toolLines].map((l) => `${l}\n`).join("");
 				} catch (err) {
 					const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
@@ -112,9 +112,9 @@ export function serveWorker(opts: {
 			stripGitAuthEnv(env);
 			delete env.OTTR_WORKER_TOKEN;
 			let child: ChildProcess;
-			// The tools link dir is per-turn: project pins, then _all pins, then the container
+			// The tools link dir is per tool set: project pins, then _all pins, then the container
 			// PATH. The daemon's own PATH never changes, and two projects never see each
-			// other's pins because the link dir is rebuilt per project.
+			// other's pins because the dir is keyed by the project's own tool set.
 			if (pathDir) env.PATH = `${pathDir}:${String(env.PATH ?? "")}`;
 			try {
 				child = spawn(opts.ompPath ?? "omp", body.argv, {

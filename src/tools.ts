@@ -2,7 +2,7 @@
 // The list lives in the data repo as workers/<project>/tools.json (sha256-pinned https URLs);
 // alate provisions it, with the env.txt name list, into the shared home volume. A worker or turn
 // container installs every entry it still lacks into ~/.ottr/tools/<sha256>/ and puts the names
-// on PATH through a fresh link dir.
+// on PATH through a link dir, one per distinct tool set.
 import {
 	chmodSync,
 	existsSync,
@@ -18,7 +18,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROJECT } from "./apt.ts";
 
@@ -313,27 +313,49 @@ async function exec(argv: string[]): Promise<string> {
 }
 
 /**
- * A fresh PATH dir for a turn: the project's tools first, then "_all", a project name winning.
- * Links only what is already installed; it never installs anything.
+ * The PATH dir for a turn: the project's tools first, then "_all", a project name winning.
+ * Links only what is already installed; it never installs anything. The dir is keyed by a
+ * hash of its content, so every turn with the same tool set reuses one dir and none leaks.
  */
 export function buildToolsPath(project: string, home = homedir()): string {
 	const root = join(home, ".ottr", "tools");
 	const entries = [...readTools(project, home), ...readTools("_all", home)];
 	// "" = nothing to prepend: the callers skip the PATH prefix for an empty turn.
 	if (entries.length === 0) return "";
-	const dir = join(tmpdir(), "ottr-path-" + crypto.randomUUID());
-	mkdirSync(dir);
-	const linked = new Set<string>();
+	const links = new Map<string, { target: string; wrapper: string | null }>();
 	for (const e of entries) {
-		if (linked.has(e.name)) continue;
-		linked.add(e.name);
+		if (links.has(e.name)) continue;
 		const target = join(root, e.sha256, e.bin ?? e.name);
 		if (!existsSync(target))
 			throw new Error(
 				`tools: ${e.name}: ${e.sha256.slice(0, 12)} missing from ${root}`,
 			);
-		if (e.name === "godot") writeHeadlessWrapper(target, join(dir, e.name));
-		else symlinkSync(target, join(dir, e.name));
+		links.set(e.name, {
+			target,
+			wrapper: e.name === "godot" ? headlessWrapper(target) : null,
+		});
+	}
+	const key = new Bun.CryptoHasher("sha256")
+		.update(JSON.stringify([...links]))
+		.digest("hex");
+	const dir = join(root, `path-${key}`);
+	if (existsSync(dir)) return dir;
+	// Built aside and moved in with one rename, so a reused dir is never half-built.
+	const tmp = mkdtempSync(join(root, "path-build-"));
+	try {
+		for (const [name, { target, wrapper }] of links) {
+			if (wrapper !== null)
+				writeFileSync(join(tmp, name), wrapper, { mode: 0o755 });
+			else symlinkSync(target, join(tmp, name));
+		}
+		try {
+			renameSync(tmp, dir);
+		} catch (err) {
+			// Two turns build the same set at once: the winner's dir is complete; reuse it.
+			if (!existsSync(dir)) throw err;
+		}
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
 	}
 	return dir;
 }
@@ -342,13 +364,9 @@ export function buildToolsPath(project: string, home = homedir()): string {
  * Without a display Godot exits ("Can't load Xlib"), so `godot` adds --headless when there is
  * none: godot-mcp's run_project then runs the game and reads its output. A display keeps it.
  */
-function writeHeadlessWrapper(target: string, path: string): void {
+function headlessWrapper(target: string): string {
 	const quoted = `'${target.replaceAll("'", `'\\''`)}'`;
-	writeFileSync(
-		path,
-		`#!/bin/sh\n[ -n "\${DISPLAY}\${WAYLAND_DISPLAY}" ] || set -- --headless "$@"\nexec ${quoted} "$@"\n`,
-		{ mode: 0o755 },
-	);
+	return `#!/bin/sh\n[ -n "\${DISPLAY}\${WAYLAND_DISPLAY}" ] || set -- --headless "$@"\nexec ${quoted} "$@"\n`;
 }
 
 /**

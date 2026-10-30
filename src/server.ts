@@ -402,7 +402,7 @@ const loop = createTurnLoop(projects, {
 	},
 	prepareTurn: async (project) => ({
 		lines: await ensureProjectTools(project),
-		pathDir: await buildToolsPath(project),
+		pathDir: buildToolsPath(project),
 	}),
 	publishRelease,
 	runReleaseCommand,
