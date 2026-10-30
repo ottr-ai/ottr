@@ -125,6 +125,25 @@ async function ompRefresh(
 	}
 }
 
+/** Refreshes in flight, by store dir and provider: concurrent turns share one omp run. */
+const inFlight = new Map<string, Promise<string | null>>();
+
+function sharedRefresh(
+	provider: string,
+	dir: string,
+	command: string[],
+): Promise<string | null> {
+	const key = `${dir}\0${provider}`;
+	let run = inFlight.get(key);
+	if (run === undefined) {
+		run = ompRefresh(provider, dir, command).finally(() =>
+			inFlight.delete(key),
+		);
+		inFlight.set(key, run);
+	}
+	return run;
+}
+
 /**
  * What a turn gets: the lent env, and `error` when nothing usable can be lent for a provider the
  * board lends (or for a model that names no provider). A turn with an error must not start. A
@@ -170,7 +189,7 @@ export async function lentProviderEnv(
 	if (before.expires - now > marginMs)
 		return { env: { [name]: before.access }, error: null };
 
-	const cause = await ompRefresh(
+	const cause = await sharedRefresh(
 		provider,
 		dirname(dbPath),
 		opts.command ?? ["omp", "token"],

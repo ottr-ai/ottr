@@ -144,6 +144,24 @@ describe("lentProviderEnv", () => {
 		]);
 	});
 
+	test("concurrent turns near expiry share one omp refresh", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 60_000,
+		});
+		omp(path, "ok");
+		const ok = { env: { ANTHROPIC_OAUTH_TOKEN: "access-new" }, error: null };
+		expect(
+			await Promise.all([
+				lend("anthropic/claude-opus-5-5", path),
+				lend("anthropic/claude-sonnet-5", path),
+			]),
+		).toEqual([ok, ok]);
+		expect(runs(path)).toHaveLength(1);
+	});
+
 	test("an expired codex token is refreshed by omp and lent under omp's codex env name", async () => {
 		const path = store();
 		addRow(path, "openai-codex", {

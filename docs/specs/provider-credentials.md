@@ -432,6 +432,9 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
   to omp's account order.
 - Each refresh starts one omp process (about one second). It runs only when
   the token has less than 30 minutes left, so at most a few times a day.
+  Turns that need a refresh of the same store and provider at the same time
+  share one omp run (`sharedRefresh` in `src/tokens.ts`), so one refresh
+  rotates the refresh token once.
 - An `api_key` row carries only whole seconds (`updated_at`). Two logins of
   one provider inside the same second can order wrong, and an API key that
   another omp process saves while a Settings sign-in runs counts as written
