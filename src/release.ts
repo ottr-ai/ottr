@@ -41,19 +41,52 @@ export function parseCommit(
 
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
+/** Body trailers that name a commit by (abbreviated) sha. */
+const DROPS_TARGET =
+	/^(?:(?:Supersedes|Reverts):\s*|This reverts commit )([0-9a-f]{7,40})\b/gim;
+const FOLDS_INTO = /^Fixes:\s*([0-9a-f]{7,40})\b/gim;
+
+/**
+ * Indexes of commits that get no bullet: targets of `Supersedes:`/`Reverts:`/`This reverts commit`
+ * (a revert drops itself too: net zero), and `Fixes: <sha>` commits whose target is in the range
+ * (the fix folds into that commit's bullet). Out-of-range shas change nothing.
+ */
+function droppedCommits(
+	commits: { sha?: string; body: string }[],
+): Set<number> {
+	const find = (ref: string) =>
+		commits.findIndex((c) => c.sha?.startsWith(ref.toLowerCase()));
+	const dropped = new Set<number>();
+	for (const [i, c] of commits.entries()) {
+		for (const [line, ref = ""] of c.body.matchAll(DROPS_TARGET)) {
+			const t = find(ref);
+			if (t < 0 || t === i) continue;
+			dropped.add(t);
+			if (!/^Supersedes/i.test(line)) dropped.add(i);
+		}
+		for (const [, ref = ""] of c.body.matchAll(FOLDS_INTO)) {
+			const t = find(ref);
+			if (t >= 0 && t !== i) dropped.add(i);
+		}
+	}
+	return dropped;
+}
+
 export function computeRelease(
 	from: string | null,
-	commits: { subject: string; body: string }[],
+	all: { sha?: string; subject: string; body: string }[],
 ): { version: string; notes: string; releasable: boolean } {
 	if (from === null) {
 		return {
 			version: "v0.1.0",
 			notes: "First release.",
-			releasable: commits.length > 0,
+			releasable: all.length > 0,
 		};
 	}
 	const m = from.match(SEMVER);
 	if (!m) throw new Error(`previous release tag ${from} is not vX.Y.Z`);
+	const dropped = droppedCommits(all);
+	const commits = all.filter((_, i) => !dropped.has(i));
 	const parsed = commits.map((c) => parseCommit(c.subject, c.body));
 	let [x = 0, y = 0, z = 0] = m.slice(1).map(Number);
 	if (parsed.some((c) => c?.breaking)) {
@@ -298,7 +331,12 @@ export async function planRelease(o: {
 				}))
 			: (
 					await git(
-						["log", "--no-merges", "--format=%s%x1f%b%x1e", `${from}..${sha}`],
+						[
+							"log",
+							"--no-merges",
+							"--format=%H%x1f%s%x1f%b%x1e",
+							`${from}..${sha}`,
+						],
 						o.mainPath,
 					)
 				).stdout
@@ -306,8 +344,8 @@ export async function planRelease(o: {
 					.map((r) => r.trim())
 					.filter(Boolean)
 					.map((r) => {
-						const [subject = "", body = ""] = r.split("\x1f");
-						return { subject, body };
+						const [hash = "", subject = "", body = ""] = r.split("\x1f");
+						return { sha: hash, subject, body };
 					});
 	const { version, notes, releasable } = computeRelease(from, commits);
 	if (blocked === null) {

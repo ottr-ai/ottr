@@ -327,6 +327,63 @@ describe("computeRelease", () => {
 				.notes,
 		).toBe("## Bug fixes\n\n- Same");
 	});
+
+	test("trailers drop superseded and reverted commits and fold in-range fixes", () => {
+		const c = (sha: string, subject: string, body = "") => ({
+			sha,
+			subject,
+			body,
+		});
+		const notes = computeRelease("v1.0.0", [
+			c("aaaaaaa1", "feat: two logins"),
+			c("bbbbbbb2", "feat: one login", "Why.\n\nSupersedes: AAAAAAA"),
+			c("ccccccc3", "fix: guard the lease"),
+			c(
+				"ddddddd4",
+				'Revert "fix: guard the lease"',
+				"This reverts commit ccccccc3.",
+			),
+			c("eeeeeee5", "fix: login crash", "Fixes: bbbbbbb"),
+			c("fffffff6", "fix: old bug", "Fixes: 1234567"),
+		]).notes;
+		expect(notes).toBe(
+			"## New features\n\n- One login\n\n## Bug fixes\n\n- Old bug",
+		);
+		// A commit naming itself, or trailers without shas, change nothing.
+		expect(
+			computeRelease("v1.0.0", [c("aaaaaaa1", "fix: a", "Supersedes: aaaaaaa")])
+				.notes,
+		).toBe("## Bug fixes\n\n- A");
+		// A feature reverted inside the range bumps nothing and leaves nothing to release.
+		expect(
+			computeRelease("v1.2.3", [
+				c("aaaaaaa1", "feat: x"),
+				c("bbbbbbb2", 'Revert "feat: x"', "Reverts: aaaaaaa1"),
+			]),
+		).toEqual({ version: "v1.2.4", notes: "", releasable: false });
+	});
+
+	test("property: without trailers every listed commit keeps its bullet", () => {
+		const hex = fc.stringMatching(/^[0-9a-f]{40}$/);
+		fc.assert(
+			fc.property(
+				fc.array(fc.tuple(hex, fc.stringMatching(/^[a-z ]{1,10}$/)), {
+					maxLength: 8,
+				}),
+				fc.string(),
+				(rows, junk) => {
+					fc.pre(!/(supersedes|reverts|fixes):|reverts commit/i.test(junk));
+					const commits = rows.map(([sha, d], i) => ({
+						sha,
+						subject: `fix: ${i} ${d}`,
+						body: junk,
+					}));
+					const notes = computeRelease("v1.0.0", commits).notes;
+					for (const [i] of rows.entries()) expect(notes).toContain(`- ${i} `);
+				},
+			),
+		);
+	});
 });
 
 describe("includedTasks", () => {
@@ -502,6 +559,20 @@ describe("against real repos", () => {
 			commits: 1,
 			blocked: null,
 		});
+	}, 60_000);
+
+	test("planRelease reads shas, so a Fixes trailer folds the fix", async () => {
+		await must(main, "switch", "-q", "-c", "fold", head);
+		const msg = `fix: z\n\nFixes: ${feat.slice(0, 7)}`;
+		await must(main, "commit", "-q", "--allow-empty", "-m", msg);
+		const fold = await must(main, "rev-parse", "HEAD");
+		await must(main, "switch", "-q", "main");
+		const plan = await planRelease({
+			mainPath: main,
+			target: "origin/main",
+			sha: fold,
+		});
+		expect(plan.notes).toBe("## New features\n\n- X\n\n## Bug fixes\n\n- Y");
 	}, 60_000);
 
 	test("a sha not on the target is blocked", async () => {
