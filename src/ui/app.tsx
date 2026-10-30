@@ -6044,7 +6044,7 @@ function RelatedTasks({
 	);
 }
 
-/** PR review card: the agent's draft as an editable comment; it reaches GitHub only on the Post click. */
+/** PR review card: the model's review draft as an editable comment; it reaches GitHub only on the Post click. */
 function PrReviewSection({
 	task,
 	pr,
@@ -6054,7 +6054,7 @@ function PrReviewSection({
 }: {
 	task: TaskView;
 	pr: PrReviewView;
-	/** Details of the last answered work turn; null before the first review lands. */
+	/** The review draft that the watcher saved as the done card's details; null before the first review lands. */
 	draft: string | null;
 	act: Act;
 	onLoaded: (v: TaskView) => void;

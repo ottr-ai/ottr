@@ -39,6 +39,14 @@ if (mode === "stdout-only") {
 	console.log("sk-ant-api-fake-env-key");
 	process.exit(0);
 }
+if (mode === "api-key-login") {
+	// An API-key login lands during the refresh, and the refresh fails.
+	const db = new Database(agentDir + "/agent.db");
+	db.query("INSERT INTO auth_credentials (provider, credential_type, data, created_at, updated_at) VALUES (?, 'api_key', ?, 2000000000, 2000000000)").run(args[0], JSON.stringify({ key: "key-1", source: "login" }));
+	db.close();
+	console.error("Error: token refresh failed");
+	process.exit(1);
+}
 const db = new Database(agentDir + "/agent.db");
 const row = db.query("SELECT id, data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id DESC LIMIT 1").get(args[0]);
 db.query("UPDATE auth_credentials SET data = ? WHERE id = ?").run(JSON.stringify({ ...JSON.parse(row.data), access: "access-new", refresh: "refresh-new", expires }), row.id);
@@ -255,6 +263,21 @@ describe("lentProviderEnv", () => {
 		db.close();
 		expect(await lend("zai/glm-5.3", path)).toEqual({ env: {}, error: null });
 		expect(runs(path)).toEqual([]);
+	});
+
+	test("an API key that becomes current during the refresh lends nothing and is no error", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 60_000,
+		});
+		omp(path, "api-key-login");
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: {},
+			error: null,
+		});
+		expect(runs(path)).toHaveLength(1);
 	});
 
 	test("a zai row with the sentinel expiry lends the key without running omp", async () => {

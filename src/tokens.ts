@@ -195,15 +195,15 @@ export async function lentProviderEnv(
 		opts.command ?? ["omp", "token"],
 	);
 	const after = readToken(dbPath, provider);
+	// A login during the refresh made an API key current: as before the refresh, lend nothing.
+	if (after.kind === "api_key") return { env: {}, error: null };
 	if (after.kind === "token" && after.expires - now > marginMs)
 		return { env: { [name]: after.access }, error: null };
 	const why =
 		cause ??
 		(after.kind === "error"
 			? after.cause
-			: after.kind === "api_key"
-				? "its newest login is now an API key"
-				: "the token is still near its expiry after omp ran");
+			: "the token is still near its expiry after omp ran");
 	return {
 		env: {},
 		error: `omp did not refresh the board's ${provider} sign-in: ${why}`,

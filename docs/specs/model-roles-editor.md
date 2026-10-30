@@ -95,8 +95,8 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 ## Acceptance
 
 - A test: a save changes only the `modelRoles` values and keeps every other byte of `config.yml`.
-- A test: an unknown model or level is refused, and nothing reaches Alate's `PUT /api/file`.
-- A test: a moved data repo gives a 409 conflict with the current roles and no write: a commit on main that leaves `config.yml` alone, a changed `config.yml`, and a move between the re-import and Alate's write (Alate 409, no second write).
+- A test: an unknown model or level is refused, and no write reaches GitHub (`gh api` git trees, commits, or refs).
+- A test: a moved data repo gives a 409 conflict with the current roles and no write: a commit on main that leaves `config.yml` alone, a changed `config.yml`, and a move between the re-import and the ref update (GitHub refuses the fast-forward, no second write).
 - Screenshots of the section at desktop width and at phone width.
 - `bun run check` and `bun test` pass.
 

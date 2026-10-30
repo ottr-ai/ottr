@@ -9,7 +9,7 @@ FROM oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9
 # scripts/update-image.ts prunes superseded builds of this image by this label.
 LABEL ottr.image=worker
 
-# Debian trixie git version (the 1.4.2-debian base is trixie); a wrong pin fails the build loudly (D1).
+# Debian trixie git version (the 1.4.4-debian base is trixie); a wrong pin fails the build loudly (D1).
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
 # when the binary is on PATH; without it every command runs raw. Host scoop runs 0.51.0.

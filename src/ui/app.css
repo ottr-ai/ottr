@@ -2439,7 +2439,7 @@ a.release:hover {
 	gap: 6px;
 }
 /* On a board card the chips right-align like the research chip does. After the research
-   chip they sit next to it: two auto margins split the free space and center the chip. */
+   chip they sit next to it with no auto margin, so the free space stays left of the research chip. */
 .card-head .rank-badges {
 	margin-left: auto;
 }

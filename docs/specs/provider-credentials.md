@@ -19,8 +19,10 @@ credential and its refresh token. Before each turn that a worker runs, the board
 puts the provider's short-lived access token into the turn env. The worker store
 keeps no credential that the board manages.
 
-Code flows first: Settings offers only flows that need no localhost return
-address to complete from any device (see "Sign-in flows").
+Code flows first: Settings lists every provider that omp's `/login` offers
+(`loginProviders()` in `src/login.ts`). This includes the loopback flows
+`anthropic` and `openai-codex`. These complete from any device through the
+paste fallback (see "Sign-in flows").
 
 ## Sign-in flows
 
@@ -256,7 +258,9 @@ provider (`provider` is the part before the first `/` in the model string):
    30 minutes), lend `access` under the provider's env name.
 4. Below the margin or expired: let omp refresh (see below), then read the row
    again with the same checks. When the new `expires - now` is above the
-   margin, lend the new `access`.
+   margin, lend the new `access`. When an API key is now the current
+   credential (a login during the refresh), lend nothing, no error, as in
+   step 1. This applies also when the refresh failed.
 5. omp does not refresh (non-zero exit, time-out, the row is still below the
    margin, or the new row fails a check): lend nothing and return the cause as
    `error` (`credentialError` of `turnEnv`). The turn does not start. The
