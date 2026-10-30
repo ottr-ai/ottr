@@ -830,6 +830,8 @@ export function createRunSink(o: {
 	onSession?: (sessionId: string) => void;
 	/** A progress event (stryker.ts): never logged; null text clears the card's progress. */
 	onProgress?: (text: string | null) => void;
+	/** Extra values redacted like the git secrets: the run's lent provider token. */
+	secrets?: readonly string[];
 }): RunSink {
 	const es = newEventState();
 	let stderrTail = "";
@@ -866,12 +868,13 @@ export function createRunSink(o: {
 		bytes += size;
 		o.onLog?.();
 	};
-	// Merge turns carry git host tokens (D6): a remote may echo one into a failed push, so no
-	// stored token or key path reaches the worker-shared task log raw, also when it spans two
-	// rendered events (the writer holds back a possible secret start until the next write).
-	// The run's own snapshot, taken when the run starts, joined with the current list: a token
-	// rotated or removed mid-run stays redacted in this run's log until the run ends.
-	const runSecrets = [...gitSecrets()];
+	// Merge turns carry git host tokens (D6) and every worker turn a lent provider token: a
+	// remote or provider may echo one into an error, so no stored token or key path reaches the
+	// worker-shared task log raw, also when it spans two rendered events (the writer holds back
+	// a possible secret start until the next write). The run's own snapshot, taken when the run
+	// starts, joined with the current list: a token rotated or removed mid-run stays redacted in
+	// this run's log until the run ends.
+	const runSecrets = [...gitSecrets(), ...(o.secrets ?? [])];
 	const liveSecrets = () => [...runSecrets, ...gitSecrets()];
 	const log = redactingWriter(appendLog, liveSecrets);
 
@@ -1001,6 +1004,8 @@ export function startRun(o: {
 	worker?: WorkerTarget | null;
 	/** Extra env merged into the child's base (a retro run's OTTR_RETRO=1). */
 	env?: Record<string, string>;
+	/** Values redacted from the log, stderr tail and provider error (the lent provider token). */
+	secrets?: readonly string[];
 	/** Set: strip the board coordinates from the child env (a retro run). */
 	stripBoard?: boolean;
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
@@ -1017,6 +1022,7 @@ export function startRun(o: {
 		onLog: o.onLog,
 		onSession: o.onSession,
 		onProgress: o.onProgress,
+		secrets: o.secrets,
 	});
 
 	// Context a no-stderr death reports (classify folds it into the failure reason): how the

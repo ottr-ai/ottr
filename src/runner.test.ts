@@ -2502,6 +2502,45 @@ describe("arch-review changed-line coverage", () => {
 		}
 	});
 
+	test("startRun() redacts the lent provider token from the task log and the stderr tail", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
+		const lent = "sk-ant-oat01-lent-echo-0000";
+		try {
+			const fake = new FakeOmp();
+			const logPath = join(dir, "run.log");
+			const handle = startRun({
+				cwd: dir,
+				prompt: "print env",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath,
+				dataRoot: dir,
+				env: { ANTHROPIC_OAUTH_TOKEN: lent },
+				secrets: [lent],
+				launcher: () => {
+					queueMicrotask(() => {
+						fake.stdout.emit(
+							"data",
+							Buffer.from(`ANTHROPIC_OAUTH_TOKEN=${lent}\n`),
+						);
+						fake.stderr.emit("data", Buffer.from(`401 for ${lent}\n`));
+						fake.emit("close", 1);
+					});
+					return fake as unknown as ChildProcess;
+				},
+			});
+			const r = await handle.done;
+			const log = readFileSync(logPath, "utf8");
+			expect(log).not.toContain(lent);
+			expect(log).toContain("ANTHROPIC_OAUTH_TOKEN=[REDACTED]");
+			expect(r.stderrTail).not.toContain(lent);
+			expect(r.stderrTail).toContain("[REDACTED]");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("createRunSink().result() merges the event-state snapshot with the caller's settle fields", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
 		try {

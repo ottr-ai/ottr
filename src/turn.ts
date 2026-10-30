@@ -289,6 +289,8 @@ export interface TurnOps {
 		env: Record<string, string>;
 		missing: string[];
 		credentialError?: string | null;
+		/** Values the run redacts from its log (the lent provider token). */
+		secrets?: string[];
 	}>;
 	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
 	prepareTurn?: (project: string) => Promise<{
@@ -1344,6 +1346,7 @@ export function createTurnLoop(
 				model: runModel,
 				sessionName,
 				worker,
+				secrets: turnEnv.secrets,
 				// Retro flags: the retro.yml config sits next to the tracker extension, the
 				// skill is pinned, and the board env is stripped (the proposal files here).
 				// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,

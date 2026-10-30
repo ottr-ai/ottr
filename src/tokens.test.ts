@@ -443,6 +443,7 @@ describe("turnEnv", () => {
 			env: { ANTHROPIC_OAUTH_TOKEN: "access-1", SHARED: "s" },
 			missing: ["ABSENT"],
 			credentialError: null,
+			secrets: ["access-1"],
 		});
 	});
 
@@ -465,6 +466,11 @@ describe("turnEnv", () => {
 		const h = home(path, ["SHARED"]);
 		expect(
 			await turnEnv("proj", null, { SHARED: "s" }, { dbPath: path, home: h }),
-		).toEqual({ env: { SHARED: "s" }, missing: [], credentialError: null });
+		).toEqual({
+			env: { SHARED: "s" },
+			missing: [],
+			credentialError: null,
+			secrets: [],
+		});
 	});
 });

@@ -96,6 +96,7 @@ interface Recorded {
 		resumeId?: string | null;
 		sessionName?: string | null;
 		env?: Record<string, string>;
+		secrets?: readonly string[];
 		stripBoard?: boolean;
 		tools?: string | null;
 		config?: string | null;
@@ -5307,7 +5308,11 @@ describe("prepareTurn", () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			turnEnv: async () => ({ env: { FOO: "v" }, missing: ["BAR"] }),
+			turnEnv: async () => ({
+				env: { FOO: "v" },
+				missing: ["BAR"],
+				secrets: ["lent-tok"],
+			}),
 			prepareTurn: async () => {
 				prepared = true;
 				return { lines: [], pathDir: null };
@@ -5320,6 +5325,7 @@ describe("prepareTurn", () => {
 			"env: no value for BAR (set it under Settings, Env)",
 		);
 		expect(record.runs[0]!.env?.FOO).toBe("v");
+		expect(record.runs[0]!.secrets).toEqual(["lent-tok"]);
 	});
 
 	/** A board store in omp's layout with one fresh OAuth sign-in per provider. */
