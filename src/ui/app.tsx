@@ -3,6 +3,7 @@ import type {
 	CSSProperties,
 	ClipboardEvent as ReactClipboardEvent,
 	DragEvent as ReactDragEvent,
+	MouseEvent as ReactMouseEvent,
 	ReactNode,
 } from "react";
 import {
@@ -3926,6 +3927,25 @@ export function LaneCol({
 		);
 		return dropBeforeId(cards, dragId, y);
 	};
+	// "Show more" moves focus to the first card it reveals: the button may unmount on the last page,
+	// and focus must not fall to <body> (WCAG 2.4.3). The index counts the cards above the button.
+	const moreFocus = useRef<{ scope: HTMLElement; index: number } | null>(null);
+	const showMore = (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => {
+		const btn = e.currentTarget;
+		const scope = btn.parentElement as HTMLElement;
+		const index = Array.from(scope.querySelectorAll(".card-open")).filter(
+			(el) =>
+				btn.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING,
+		).length;
+		moreFocus.current = { scope, index };
+		go();
+	};
+	useEffect(() => {
+		const f = moreFocus.current;
+		if (f === null) return;
+		moreFocus.current = null;
+		f.scope.querySelectorAll<HTMLElement>(".card-open")[f.index]?.focus();
+	});
 	const card = (t: TaskCard): ReactNode => (
 		<Card
 			key={t.id}
@@ -4091,8 +4111,9 @@ export function LaneCol({
 											<button
 												type="button"
 												className="lane-more"
-												onClick={() => onTopicMore(g.key)}
+												onClick={(e) => showMore(e, () => onTopicMore(g.key))}
 												title={`Show older ${g.label} cards`}
+												aria-label={`Show more, ${g.hidden} older ${g.label} cards`}
 											>
 												Show more
 												<span className="topic-count">{g.hidden}</span>
@@ -4114,8 +4135,9 @@ export function LaneCol({
 				<button
 					type="button"
 					className="lane-more"
-					onClick={onMore}
+					onClick={(e) => showMore(e, onMore)}
 					title="Show older done cards"
+					aria-label={`Show more, ${more} older cards`}
 				>
 					Show more
 					<span className="topic-count">{more}</span>
@@ -10212,7 +10234,9 @@ export function provisionWatchStep(
  *  sections above finish loading. Advisory link only — it never runs provisioning. */
 function openSettingsSection(sectionId: string): void {
 	const scroll = () => {
-		document.getElementById(sectionId)?.scrollIntoView({ block: "start" });
+		const el = document.getElementById(sectionId);
+		el?.scrollIntoView({ block: "start" });
+		el?.focus({ preventScroll: true });
 	};
 	location.hash = `#${SETTINGS_HASH}`;
 	let tries = 0;
@@ -10673,6 +10697,7 @@ function SettingsCard({
 			}
 			id={id}
 			aria-labelledby={titleId}
+			tabIndex={-1}
 		>
 			<div className="sec-head">
 				<div className="sec-title">
@@ -10894,6 +10919,7 @@ export function SettingsPage({
 							className="settings-group"
 							id="board-group"
 							aria-labelledby="board-group-title"
+							tabIndex={-1}
 						>
 							<h2 className="settings-group-title" id="board-group-title">
 								Board
@@ -10911,6 +10937,7 @@ export function SettingsPage({
 							className="settings-group"
 							id="access-group"
 							aria-labelledby="access-group-title"
+							tabIndex={-1}
 						>
 							<h2 className="settings-group-title" id="access-group-title">
 								Access
@@ -10922,6 +10949,7 @@ export function SettingsPage({
 							className="settings-group"
 							id="git-group"
 							aria-labelledby="git-group-title"
+							tabIndex={-1}
 						>
 							<h2 className="settings-group-title" id="git-group-title">
 								Git and secrets
@@ -10933,6 +10961,7 @@ export function SettingsPage({
 							className="settings-group"
 							id="agents-group"
 							aria-labelledby="agents-group-title"
+							tabIndex={-1}
 						>
 							<h2 className="settings-group-title" id="agents-group-title">
 								Agents
