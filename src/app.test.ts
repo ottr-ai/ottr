@@ -41,8 +41,10 @@ import {
 	forkProposedReason,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
+	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { createRunSink } from "./runner.ts";
+import { WORK_CHECK_THIRD_BLOCK, workCheckAsk } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import {
 	cancelKeptReason,
@@ -3282,6 +3284,59 @@ describe("merge anyway (OTTR-28)", () => {
 		});
 		expect(res.status).toBe(409);
 		expect(await errorOf(res)).toBe("the work turn is still running");
+	});
+
+	const parked = () => {
+		const t = inProgress([blockersRun()]);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: `${WORK_CHECK_THIRD_BLOCK}: 1. still open.`,
+			asked: workCheckAsk([{ finding: "still open", quote: "q1" }]),
+			workCheckSendbacks: 2,
+		});
+		return t;
+	};
+
+	test("the third block's Merge anyway answer overrides the blockers and queues the merge", async () => {
+		const t = parked();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "Merge anyway",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.stage).toBe("merging");
+		expect(row.state).toBe("queued");
+		expect(row.asked).toBeNull();
+		expect(row.pendingPrompt).toBeNull();
+		expect(row.workCheckLog[0]!.blockers[0]!.status).toBe("overridden");
+	});
+
+	test("the third block's Send it back answer resends the open blockers to the agent", async () => {
+		const t = parked();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "Send it back",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.stage).toBe("in_progress");
+		expect(row.state).toBe("queued");
+		expect(row.asked).toBeNull();
+		expect(row.workCheckSendbacks).toBe(3);
+		// A tracker send-back, so the next check does not count it as a human reply.
+		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		expect(row.pendingPrompt).toContain("still open");
+		expect(row.pendingPrompt).not.toContain("already fixed");
+	});
+
+	test("any other answer is a plain reply to the agent", async () => {
+		const t = parked();
+		await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "Merge anyway, but fix the README first",
+		});
+		const row = store.getTask(t.id)!;
+		expect(row.stage).toBe("in_progress");
+		expect(row.pendingPrompt).toBe("Merge anyway, but fix the README first");
+		expect(row.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
 	});
 });
 

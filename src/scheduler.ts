@@ -1,4 +1,5 @@
 import type {
+	AskQuestion,
 	RecordedFinding,
 	Task,
 	TaskKind,
@@ -465,6 +466,59 @@ export function openWorkBlockers(
 		return run.blockers.filter((b) => b.status === undefined);
 	}
 	return [];
+}
+
+/** Opening of the needs_you reason a third work-check block sets; the reply route reads the
+ * ask answers below only on a card parked with it. */
+export const WORK_CHECK_THIRD_BLOCK =
+	"The work check blocked the merge a third time";
+export const WORK_CHECK_ASK_SEND_BACK = "Send it back";
+export const WORK_CHECK_ASK_MERGE = "Merge anyway";
+
+/** The clickable question a third work-check block puts on the card. The reply route turns a
+ * click into the send-back or the merge; any other text is a plain reply to the agent. */
+export function workCheckAsk(
+	blockers: readonly WorkCheckBlocker[],
+): AskQuestion[] {
+	return [
+		{
+			question: `${WORK_CHECK_THIRD_BLOCK}: ${blockers.map((b, i) => `${i + 1}. ${b.finding}`).join(" ")}. How do you want to continue?`,
+			options: [
+				{
+					label: WORK_CHECK_ASK_SEND_BACK,
+					description:
+						"The agent gets the blockers once more, fixes them, and the check runs again.",
+				},
+				{
+					label: WORK_CHECK_ASK_MERGE,
+					description:
+						"Override the open blockers and queue the merge, for example when a blocker only asks for a human review.",
+				},
+			],
+			multi: false,
+			recommended: 0,
+		},
+	];
+}
+
+/** The log with every open blocker marked overridden with `reason` (Merge anyway). Copies only:
+ * the store's change detection needs a new log. Pure. */
+export function overrideWorkBlockers(
+	log: readonly WorkCheckRun[],
+	reason: string,
+): WorkCheckRun[] {
+	return log.map((run) =>
+		run.blockers.some((b) => b.status === undefined)
+			? {
+					...run,
+					blockers: run.blockers.map((b) =>
+						b.status === undefined
+							? { ...b, status: "overridden" as const, statusReason: reason }
+							: b,
+					),
+				}
+			: run,
+	);
 }
 
 /** Splits a check verdict's blockers from its notes. A blocker must quote a verbatim part of

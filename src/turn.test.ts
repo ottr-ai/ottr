@@ -8834,6 +8834,12 @@ describe("work card check", () => {
 		const longFinding = "long finding ".repeat(40).trim() + " end";
 		expect(after.needsReason).toContain(longFinding);
 		expect(after.workCheckHead).toBe("sha3");
+		// The user gets clickable choices, not only a reason text.
+		expect(after.asked![0]!.question).toContain("scope creep");
+		expect(after.asked![0]!.options.map((o) => o.label)).toEqual([
+			"Send it back",
+			"Merge anyway",
+		]);
 	});
 
 	test("with the switch off no check run starts and the card stays merging/queued", async () => {

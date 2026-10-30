@@ -100,6 +100,7 @@ import {
 	releasePrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
+	workCheckSendBack,
 } from "./prompts.ts";
 import { createPrWatcher, prUrl } from "./prs.ts";
 import { fetchQuota } from "./quota.ts";
@@ -124,7 +125,11 @@ import {
 	lastReviewBase,
 	liveCard,
 	openWorkBlockers,
+	overrideWorkBlockers,
 	reviewBlocked,
+	WORK_CHECK_ASK_MERGE,
+	WORK_CHECK_ASK_SEND_BACK,
+	WORK_CHECK_THIRD_BLOCK,
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { ProjectStore } from "./store.ts";
@@ -238,6 +243,20 @@ function silentSince(t: Task, logPath: string, now: number): number | null {
 	const at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
 	if (at === undefined || now - at <= SILENT_LOG_MS) return null;
 	return Math.floor(at);
+}
+
+/** Merge anyway: the user's override of the open work-check blockers, with `reason` on each,
+ * then the merge queue. Shared by the Merge anyway button and the third block's ask. */
+function mergeAnywayPatch(task: Task, reason: string) {
+	return {
+		workCheckLog: overrideWorkBlockers(task.workCheckLog, reason),
+		stage: "merging" as const,
+		state: "queued" as const,
+		queuedAt: Date.now(),
+		pendingPrompt: null,
+		needsReason: null,
+		asked: null,
+	};
 }
 
 /** The New tab's folder-name rule (unchanged from before git hosts), shared with the clone
@@ -4543,6 +4562,44 @@ export function createApp(deps: AppDeps) {
 						(trimmed === "" && decoded.images.length === 0)
 					)
 						return json({ error: "text must be 1-20000 characters" }, 400);
+					// A click on the third work-check block's ask: the send-back or the merge, done here.
+					// Any other text, or a picture, is a plain reply to the agent below.
+					const open = openWorkBlockers(task.workCheckLog);
+					if (
+						task.asked !== null &&
+						task.needsReason?.startsWith(WORK_CHECK_THIRD_BLOCK) === true &&
+						open.length > 0 &&
+						decoded.images.length === 0
+					) {
+						if (trimmed === WORK_CHECK_ASK_MERGE) {
+							e.store.updateTask(
+								task.id,
+								mergeAnywayPatch(
+									task,
+									"Merge anyway, chosen in the ask after the third work-check block",
+								),
+							);
+							deps.schedule();
+							return taskResponse(e, task.id);
+						}
+						if (trimmed === WORK_CHECK_ASK_SEND_BACK) {
+							const n = task.workCheckSendbacks + 1;
+							e.store.updateTask(task.id, {
+								pendingPrompt: workCheckSendBack({
+									blockers: open,
+									attempt: n,
+									max: n,
+								}),
+								workCheckSendbacks: n,
+								state: "queued",
+								queuedAt: Date.now(),
+								needsReason: null,
+								asked: null,
+							});
+							deps.schedule();
+							return taskResponse(e, task.id);
+						}
+					}
 					const names =
 						decoded.images.length > 0
 							? saveImages(
@@ -4596,33 +4653,7 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "only a work card can merge anyway" }, 409);
 					if (openWorkBlockers(task.workCheckLog).length === 0)
 						return json({ error: "no outstanding work-check blockers" }, 409);
-					// Merge anyway is the user's override of outstanding work-check blockers; the
-					// reason lands on every overridden blocker. Rebuilt immutably so the store's
-					// change detection sees the new log.
-					const rebuilt = task.workCheckLog.map((run) =>
-						run.blockers.some((b) => b.status === undefined)
-							? {
-									...run,
-									blockers: run.blockers.map((b) =>
-										b.status === undefined
-											? {
-													...b,
-													status: "overridden" as const,
-													statusReason: trimmed,
-												}
-											: b,
-									),
-								}
-							: run,
-					);
-					e.store.updateTask(task.id, {
-						workCheckLog: rebuilt,
-						stage: "merging",
-						state: "queued",
-						queuedAt: Date.now(),
-						pendingPrompt: null,
-						needsReason: null,
-					});
+					e.store.updateTask(task.id, mergeAnywayPatch(task, trimmed));
 					deps.schedule();
 					return taskResponse(e, task.id);
 				}),

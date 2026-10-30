@@ -61,6 +61,8 @@ import {
 	parseWorkCheck,
 	pickRunnable,
 	selectFindings,
+	WORK_CHECK_THIRD_BLOCK,
+	workCheckAsk,
 } from "./scheduler.ts";
 import { sessionFile, sessionHoldsPrompt, sessionModel } from "./session.ts";
 import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
@@ -2269,15 +2271,18 @@ export function createTurnLoop(
 						runs: WorkCheckRun[],
 					) => {
 						const sendbacks = cur.workCheckSendbacks;
+						// The third block asks the user: the reply route turns a click into the
+						// send-back or the merge (no board check skill needed to unstick it).
 						if (sendbacks >= 2)
 							store.updateTask(id, {
 								stage: "in_progress",
 								state: "needs_you",
-								needsReason: `The work check blocked the merge a third time: ${blockers
+								needsReason: `${WORK_CHECK_THIRD_BLOCK}: ${blockers
 									.map((b, i) => `${i + 1}. ${b.finding}`)
 									.join(
 										" ",
 									)}. Reply to send it back anyway, run Merge anyway, or cancel the card.`,
+								asked: workCheckAsk(blockers),
 								workCheckLog: runs,
 								workCheckHead: head,
 							});
