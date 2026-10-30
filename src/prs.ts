@@ -154,9 +154,6 @@ async function pullData(
 	};
 }
 
-// One watcher at a time: a second concurrent tick shares the running one.
-let inFlight: Promise<void> | null = null;
-
 export function createPrWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	log: (m: string) => void;
@@ -173,6 +170,10 @@ export function createPrWatcher(deps: {
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
+
+	// One scan at a time per watcher. `running` is the running scan's project (undefined = all).
+	let inFlight: Promise<void> | null = null;
+	let running: string | undefined;
 
 	async function scanProject(project: ForkProject): Promise<void> {
 		const store = project.store;
@@ -326,7 +327,14 @@ export function createPrWatcher(deps: {
 
 	return {
 		tick(opts?: { manual?: string }): Promise<void> {
-			if (inFlight !== null) return inFlight;
+			const want = opts?.manual;
+			if (inFlight !== null) {
+				if (running === undefined || running === want) return inFlight;
+				// The running scan skips the requested project: scan it next, whatever the first scan's outcome.
+				const next = () => this.tick(opts);
+				return inFlight.then(next, next);
+			}
+			running = want;
 			inFlight = (async () => {
 				try {
 					await scan(opts);

@@ -439,6 +439,36 @@ describe("createPrWatcher", () => {
 		expect(s.calls.length).toBe(1);
 	});
 
+	test("a manual check for one project during another project's scan still scans it", async () => {
+		const a = setup();
+		const b = setup();
+		const calls: string[] = [];
+		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+		const watcher = createPrWatcher({
+			projects: () => [
+				{ name: "a", path: a.store.serverDir, store: a.store, github: "o/a" },
+				{ name: "b", path: b.store.serverDir, store: b.store, github: "o/b" },
+			],
+			log: () => {},
+			gh: async (args) => {
+				const path = args.at(-1) ?? "";
+				calls.push(path);
+				if (path.startsWith("repos/o/a/")) await gate;
+				return { code: 0, stdout: "[]", stderr: "" };
+			},
+		});
+		const first = watcher.tick({ manual: "a" });
+		const second = watcher.tick({ manual: "b" });
+		const shared = watcher.tick({ manual: "a" });
+		await Promise.resolve();
+		// b waits for a's scan: one scan at a time.
+		expect(calls.filter((c) => c.startsWith("repos/o/b/"))).toEqual([]);
+		release();
+		await Promise.all([first, second, shared]);
+		expect(calls.filter((c) => c.startsWith("repos/o/a/")).length).toBe(1);
+		expect(calls.filter((c) => c.startsWith("repos/o/b/")).length).toBe(1);
+	});
+
 	test("paging stops on a short page", async () => {
 		const s = setup();
 		s.setOpen(Array.from({ length: 100 }, (_, i) => pr(i + 1, sha("a"))));
