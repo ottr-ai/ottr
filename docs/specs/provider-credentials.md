@@ -301,6 +301,11 @@ cause; the board writes only this cause string, it reads no value from the
 worker store). Worker turns then resolve the lent env token. A sign-in the
 board does not lend changes no worker row.
 
+Workers can write the worker store, so a trigger in it can run for any time
+inside the UPDATE. The board does each write to the worker store (this
+supersede, and the sign-out) in a child `bun` process. The board kills the
+child after 15 s, and the sign-in output then names the failure.
+
 The provider is omp's stored id, not the login id: `openai-codex-device`
 stores as `openai-codex`, `zai-coding-plan` as `zai`. The board takes the
 stored id from the rows that the login wrote (login moment at or after the
