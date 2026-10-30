@@ -46,7 +46,11 @@ import {
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { createRunSink } from "./runner.ts";
-import { WORK_CHECK_THIRD_BLOCK, workCheckAsk } from "./scheduler.ts";
+import {
+	SILENT_LOG_MS,
+	WORK_CHECK_THIRD_BLOCK,
+	workCheckAsk,
+} from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import {
 	cancelKeptReason,
@@ -84,7 +88,7 @@ mock.module("web-push", () => ({
 		return {};
 	},
 }));
-const { createApp, SILENT_LOG_MS } = await import("./app.ts");
+const { createApp } = await import("./app.ts");
 
 const root = mkdtempSync(join(tmpdir(), "app-routes-"));
 

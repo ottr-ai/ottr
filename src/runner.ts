@@ -845,7 +845,7 @@ export function createRunSink(o: {
 	let truncated = false;
 	const appendLog = (s: string): void => {
 		// Past the cap the bytes are dropped, but the mtime still moves: the board reads it as
-		// the run's last output (SILENT_LOG_MS in app.ts), so a busy capped run never looks hung.
+		// the run's last output (SILENT_LOG_MS in src/scheduler.ts), so a busy capped run never looks hung.
 		if (truncated) {
 			touchBelow(o.dataRoot, o.logPath);
 			return;

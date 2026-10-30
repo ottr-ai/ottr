@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import type {
 	AskQuestion,
 	RecordedFinding,
@@ -6,6 +7,25 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
+
+/** A live turn whose card log has not grown for this long may wait on a hung command (ALAT-23
+ * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
+export const SILENT_LOG_MS = 2 * 60 * 60_000;
+
+/** Last write of a preparing or running card's log once it has been silent past SILENT_LOG_MS;
+ * null for other states, a fresher log, or no log yet. A log past the runner's 2 MiB cap keeps
+ * its mtime current while output arrives (createRunSink), so the same rule covers it.
+ * Floored so the 1 s state diff stays still. */
+export function silentSince(
+	t: Pick<Task, "state">,
+	logPath: string,
+	now: number,
+): number | null {
+	if (t.state !== "running" && t.state !== "preparing") return null;
+	const at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
+	if (at === undefined || now - at <= SILENT_LOG_MS) return null;
+	return Math.floor(at);
+}
 
 /** True for a retro card (kind 'retro', set by the trusted retro route). */
 export function isRetro(t: Pick<Task, "kind">): boolean {
@@ -519,6 +539,23 @@ export function overrideWorkBlockers(
 				}
 			: run,
 	);
+}
+
+/** Merge anyway: the user's override of the open work-check blockers, with `reason` on each,
+ * then the merge queue. Shared by the Merge anyway button and the third block's ask. */
+export function mergeAnywayPatch(
+	task: Pick<Task, "workCheckLog">,
+	reason: string,
+) {
+	return {
+		workCheckLog: overrideWorkBlockers(task.workCheckLog, reason),
+		stage: "merging" as const,
+		state: "queued" as const,
+		queuedAt: Date.now(),
+		pendingPrompt: null,
+		needsReason: null,
+		asked: null,
+	};
 }
 
 /** Splits a check verdict's blockers from its notes. A blocker must quote a verbatim part of

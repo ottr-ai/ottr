@@ -1,4 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import {
+	mkdtempSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import {
 	applyCheckVerdicts,
@@ -10,18 +19,83 @@ import {
 	isReview,
 	lastReviewBase,
 	liveCard,
+	mergeAnywayPatch,
 	mergeHold,
 	openWorkBlockers,
+	overrideWorkBlockers,
 	parseCheckVerdicts,
 	parseWorkCheck,
 	pickRunnable,
 	queueOrder,
 	reviewBlocked,
 	reviewFindings,
+	SILENT_LOG_MS,
 	selectFindings,
+	silentSince,
 	waitingOn,
 } from "./scheduler.ts";
-import type { Task } from "./types.ts";
+import type { Task, WorkCheckRun } from "./types.ts";
+
+describe("silentSince", () => {
+	test("flags a preparing or running log silent past SILENT_LOG_MS, floored; else null", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-silent-"));
+		try {
+			const log = join(dir, "card.log");
+			writeFileSync(log, "x");
+			// A sub-millisecond part (where the filesystem keeps it) shows the floor.
+			utimesSync(log, 1_700_000_000.0007, 1_700_000_000.0007);
+			const at = statSync(log).mtimeMs;
+			const late = at + SILENT_LOG_MS + 1;
+			expect(SILENT_LOG_MS).toBe(7_200_000);
+			expect(silentSince({ state: "running" }, log, late)).toBe(Math.floor(at));
+			expect(silentSince({ state: "preparing" }, log, late)).toBe(
+				Math.floor(at),
+			);
+			// Exactly the limit is not yet silent (<=).
+			expect(silentSince({ state: "running" }, log, at + SILENT_LOG_MS)).toBe(
+				null,
+			);
+			expect(silentSince({ state: "running" }, log, at + 1000)).toBe(null);
+			for (const state of ["needs_you", "queued", "idle"] as const)
+				expect(silentSince({ state }, log, late)).toBe(null);
+			expect(silentSince({ state: "running" }, join(dir, "none"), late)).toBe(
+				null,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("mergeAnywayPatch", () => {
+	test("overrides open blockers and queues the merge with cleared prompts", () => {
+		const log: WorkCheckRun[] = [
+			{
+				at: 1,
+				model: null,
+				outcome: "blockers",
+				blockers: [{ finding: "f", quote: "q" }],
+				notes: [],
+				durationMs: 0,
+			},
+		];
+		const before = Date.now();
+		const patch = mergeAnywayPatch({ workCheckLog: log }, "why");
+		const after = Date.now();
+		expect(patch.queuedAt).toBeGreaterThanOrEqual(before);
+		expect(patch.queuedAt).toBeLessThanOrEqual(after);
+		expect(patch).toEqual({
+			workCheckLog: overrideWorkBlockers(log, "why"),
+			stage: "merging",
+			state: "queued",
+			queuedAt: patch.queuedAt,
+			pendingPrompt: null,
+			needsReason: null,
+			asked: null,
+		});
+		expect(patch.workCheckLog[0]?.blockers[0]?.statusReason).toBe("why");
+	});
+});
 
 let seq = 0;
 /** Deterministic Task with sane defaults; id/title/ids derive from a counter. */

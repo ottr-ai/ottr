@@ -81,9 +81,10 @@ export default {
     //   React render tree plus browser I/O (fetch, FileReader, localStorage). bun test has no DOM
     //   renderer and a component harness would be new dependencies. Move pure policy into a tested
     //   .ts module (e.g. src/ui/models.ts) instead of growing these files.
-    // - src/app.ts: the route construction that moved out of server.ts (ott/7f31693f), inheriting
-    //   server.ts's exclusion rationale (Bun.serve on import, covered by live proofs). A follow-up
-    //   task owns extracting testable policy and bringing the file back into the set.
+    // - src/app.ts: createApp(deps) is importable and src/app.test.ts drives it in-process (no
+    //   Bun.serve on import), but the file is thousands of lines of route wiring, and each mutant
+    //   would pay for the whole app suite. Policy belongs in a mutated module with its own tests
+    //   (src/alate.ts, src/scheduler.ts), and app.ts keeps only the wiring.
     "!src/app.ts",
   ],
   reporters: ["clear-text", "progress"],

@@ -603,7 +603,7 @@ export type TaskCard = Omit<
 	/** Live progress of a long tool run in the card's running turn (a Stryker run today); absent otherwise. */
 	progress?: string;
 	/** Epoch ms of the last log write, present only while a preparing or running card's log has been
-	 * silent past the board's limit (SILENT_LOG_MS): the agent may wait on a hung command. */
+	 * silent past the board's limit (SILENT_LOG_MS in src/scheduler.ts): the agent may wait on a hung command. */
 	silentSince?: number;
 };
 
