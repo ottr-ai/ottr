@@ -3838,21 +3838,16 @@ export function createApp(deps: AppDeps) {
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
 							// One sign-in, on the board (docs/specs/provider-credentials.md): the
-							// board store is the only store to warn about; null when it cannot be read.
-							signIns: [
-								{
-									store: "board",
-									active: (() => {
-										try {
-											return signIns()
-												.filter((a) => a.active)
-												.map((a) => a.provider);
-										} catch {
-											return null;
-										}
-									})(),
-								},
-							],
+							// board store's active providers; null when it cannot be read.
+							signIns: (() => {
+								try {
+									return signIns()
+										.filter((a) => a.active)
+										.map((a) => a.provider);
+								} catch {
+									return null;
+								}
+							})(),
 							seed: seedView(),
 						});
 					}),

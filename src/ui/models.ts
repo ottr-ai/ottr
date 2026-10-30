@@ -19,12 +19,6 @@ export function reviewModel(
 	return null;
 }
 
-/** One omp store's active sign-ins from /api/model-roles; `active` is null when the store cannot be read. */
-export type StoreActive = {
-	store: "board" | "workers";
-	active: string[] | null;
-};
-
 /** A role's field error from the save's 400 body: own keys only, so a role named "__proto__" or
     "constructor" never reads an inherited Object member as its message. */
 export function ownField(
@@ -34,20 +28,18 @@ export function ownField(
 	return Object.hasOwn(fields, role) ? fields[role] : undefined;
 }
 
-/** Warnings for a role selector whose provider (the text before "/") has no active sign-in in a readable store. */
+/** The warning for a role selector whose provider (the text before "/") has no active sign-in on
+    the board; `active` is null when the board cannot read its store, which warns about nothing. */
 export function roleWarnings(
 	selector: string,
-	signIns: readonly StoreActive[],
+	active: readonly string[] | null,
 ): string[] {
 	const i = selector.indexOf("/");
-	if (i <= 0) return [];
+	if (i <= 0 || active === null) return [];
 	const provider = selector.slice(0, i);
-	return signIns
-		.filter((s) => s.active !== null && !s.active.includes(provider))
-		.map(
-			(s) =>
-				`No active sign-in for ${provider} ${s.store === "board" ? "on the board" : "on the workers"}`,
-		);
+	return active.includes(provider)
+		? []
+		: [`No active sign-in for ${provider} on the board`];
 }
 
 /** Board seed state after a save, from the board copy's roles: "copy" when the board reads the

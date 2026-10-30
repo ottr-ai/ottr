@@ -323,7 +323,7 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 				["cursor", "oauth", { access: "u1", refresh: "worker-u1" }, "acct-1"],
 			]);
 		const boardDir = join(root, "board-home", ".omp", "agent");
-		const stores: LoginStores = { boardDir, worker: { home, db: workerDb } };
+		const stores: LoginStores = { boardDir, worker: { db: workerDb } };
 		const l = providerLogin({
 			command: [process.execPath, fake],
 			quietMs: 150,
@@ -535,7 +535,7 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 		expect(
 			await signOutEverywhere("deepseek", {
 				boardDir: t.boardDir,
-				worker: { home: dirname(dirname(t.workerDb)), db: missing },
+				worker: { db: missing },
 			}),
 		).toEqual({ board: 1, workers: 0 });
 		expect(existsSync(missing)).toBe(false);

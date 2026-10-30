@@ -27,10 +27,10 @@ export interface LoginStores {
 	/** The board's own agent dir (config.yml, agent.db): omp login runs against it. */
 	boardDir: string;
 	/**
-	 * The workers' store and the home it lies in; null when the board's agent.db is that file.
+	 * The workers' store; null when the board's agent.db is that file.
 	 * No sign-in runs against it: a successful sign-in only marks its rows superseded.
 	 */
-	worker: { db: string; home: string } | null;
+	worker: { db: string } | null;
 }
 
 /** omp's provider ids (`omp login --help`): lowercase words joined by hyphens. */
@@ -390,11 +390,10 @@ const agentDb = (): string => join(agentDir(), "agent.db");
  */
 function loginStores(): LoginStores {
 	const boardDir = agentDir();
-	const home = process.env.HOME ?? homedir();
-	const db = join(home, ".omp", "agent", "agent.db");
+	const db = join(process.env.HOME ?? homedir(), ".omp", "agent", "agent.db");
 	return {
 		boardDir,
-		worker: resolve(boardDir, "agent.db") === resolve(db) ? null : { db, home },
+		worker: resolve(boardDir, "agent.db") === resolve(db) ? null : { db },
 	};
 }
 
@@ -499,7 +498,7 @@ export function boardSignIns(dbPath = agentDb()): {
 }
 
 /** An active auth_credentials row and the moment the user signed it in. */
-export interface ActiveCredential {
+interface ActiveCredential {
 	id: number;
 	provider: string;
 	credential_type: string;

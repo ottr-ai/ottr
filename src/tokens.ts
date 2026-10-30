@@ -150,7 +150,7 @@ function sharedRefresh(
  * provider outside LENT_ENV, and a provider whose current board credential is an API key, get
  * neither: the worker uses its own credential.
  */
-export interface Lent {
+interface Lent {
 	env: Record<string, string>;
 	error: string | null;
 }
@@ -161,7 +161,6 @@ export async function lentProviderEnv(
 	opts: {
 		dbPath?: string;
 		now?: number;
-		marginMs?: number;
 		/** Only for tests: the command that gets `<provider> --force-refresh` appended. */
 		command?: string[];
 	} = {},
@@ -180,13 +179,12 @@ export async function lentProviderEnv(
 		: undefined;
 	if (name === undefined) return { env: {}, error: null };
 	const now = opts.now ?? Date.now();
-	const marginMs = opts.marginMs ?? TOKEN_REFRESH_MARGIN_MS;
 	const dbPath = opts.dbPath ?? join(agentDir(), "agent.db");
 
 	const before = readToken(dbPath, provider);
 	if (before.kind === "api_key") return { env: {}, error: null };
 	if (before.kind === "error") return { env: {}, error: before.cause };
-	if (before.expires - now > marginMs)
+	if (before.expires - now > TOKEN_REFRESH_MARGIN_MS)
 		return { env: { [name]: before.access }, error: null };
 
 	const cause = await sharedRefresh(
@@ -197,7 +195,7 @@ export async function lentProviderEnv(
 	const after = readToken(dbPath, provider);
 	// A login during the refresh made an API key current: as before the refresh, lend nothing.
 	if (after.kind === "api_key") return { env: {}, error: null };
-	if (after.kind === "token" && after.expires - now > marginMs)
+	if (after.kind === "token" && after.expires - now > TOKEN_REFRESH_MARGIN_MS)
 		return { env: { [name]: after.access }, error: null };
 	const why =
 		cause ??

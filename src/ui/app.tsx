@@ -69,7 +69,6 @@ import {
 	ownField,
 	reviewModel,
 	roleWarnings,
-	type StoreActive,
 	seedStep,
 	useModels,
 } from "./models.ts";
@@ -9398,10 +9397,7 @@ function ProviderLoginSection() {
 	};
 	const page = pending === null ? null : signInPage(pending.output);
 	const signIns = state?.signIns ?? [];
-	const rowIds = [...new Set(signIns.map((i) => i.provider))].sort();
-	const signedIn = new Set(
-		signIns.filter((i) => i.active).map((i) => i.provider),
-	).size;
+	const signedIn = signIns.filter((i) => i.active).length;
 	return (
 		<SettingsCard
 			id="signin-section"
@@ -9416,20 +9412,19 @@ function ProviderLoginSection() {
 			}
 			hint="One sign-in per provider, stored on the board's machine. For OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a short-lived token in their env. Other providers are not lent: workers use their own sign-in, or the provider's key under Settings, Env. A sign-in works the same from a phone or another machine: finish the provider's page there, copy the address it ends on, or the code it shows, and paste it below."
 		>
-			{rowIds.length > 0 && (
+			{signIns.length > 0 && (
 				<div className="alate-def-rows">
-					{rowIds.map((id) => {
+					{signIns.map((signIn) => {
+						const id = signIn.provider;
 						const limits = forProvider(quota?.limits ?? [], id);
 						const plan = limits.find((l) => l.plan !== null)?.plan ?? null;
-						const signIn = signIns.find((i) => i.provider === id);
-						const needs = signIn?.active !== true;
-						const led = needs ? "crit" : signIn?.kind === "oauth" ? "ok" : "";
-						const words =
-							signIn === undefined || !signIn.active
-								? "Sign-in expired: sign in again"
-								: signIn.kind === "oauth"
-									? "Signed in"
-									: "API key stored";
+						const needs = !signIn.active;
+						const led = needs ? "crit" : signIn.kind === "oauth" ? "ok" : "";
+						const words = needs
+							? "Sign-in expired: sign in again"
+							: signIn.kind === "oauth"
+								? "Signed in"
+								: "API key stored";
 						return (
 							<div className="alate-def-row providers-row" key={id}>
 								<div className="alate-def-name">
@@ -9439,7 +9434,7 @@ function ProviderLoginSection() {
 									</b>
 									<span>
 										{words}
-										{signIn?.active === true &&
+										{signIn.active &&
 											(signIn.lent
 												? " · Lent to workers"
 												: " · Not lent to workers")}
@@ -9615,7 +9610,8 @@ type RolesState = {
 	base: string | null;
 	hash: string;
 	roles: Record<string, string>;
-	signIns: StoreActive[];
+	/** The providers with an active sign-in on the board; null when the board cannot read its store. */
+	signIns: string[] | null;
 	/** `roles`: the board copy's roles, which tell whether the seed holds a save. */
 	seed: {
 		needed: boolean;

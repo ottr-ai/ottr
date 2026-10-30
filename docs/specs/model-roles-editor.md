@@ -30,13 +30,13 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
   "base": "<data repo commit of Alate's snapshot, or null for a path source>",
   "hash": "<sha256 hex of config.yml>",
   "roles": { "default": "zai/glm-5.3-flash:max", "slow": "anthropic/claude-opus-5-5:medium" },
-  "signIns": [{ "store": "board", "active": ["anthropic", "zai"] }],
+  "signIns": ["anthropic", "zai"],
   "seed": { "needed": true, "commit": "<sha or null>", "roles": { "default": "..." } }
 }
 ```
 
 - `roles` keeps the file order. Only nonempty string values count.
-- `signIns`: one entry, the board store (`signIns()`): one sign-in serves the board and the workers (docs/specs/provider-credentials.md). `active` lists the providers with an active sign-in. `active` is null when the store cannot be read.
+- `signIns`: the providers with an active sign-in in the board store (`signIns()`): one sign-in serves the board and the workers (docs/specs/provider-credentials.md). `signIns` is null when the store cannot be read.
 - `base` comes from `GET /api/state` (no re-import, so the read stays fast). When Alate's snapshot is behind the branch head, the first save gets a conflict and then shows the current values.
 - `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent. `seed.roles` is the board copy's `modelRoles` (`{}` when the board copy is not seeded). Both are null without `seed.needed`.
 
