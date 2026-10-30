@@ -13,6 +13,7 @@ import {
 	rmSync,
 	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,6 +37,7 @@ import {
 	headVersion,
 	httpsRemote,
 	ignoreInMain,
+	isClean,
 	isIntegrated,
 	mergeHoldMismatch,
 	parseKeptChoices,
@@ -2094,8 +2096,12 @@ describe("arch-review survivor kills", () => {
 		writeFileSync(join(main, "base.txt"), "x");
 		await must(main, "add", ".");
 		await must(main, "commit", "-q", "-m", "init");
-		// Copy detection in status is opt-in: without it the second entry reads as an add.
-		await must(main, "config", "diff.renames", "copies");
+		// Copy detection in status is opt-in: without it the second entry reads as an add. Board
+		// status ignores repo config (sealedGit), so the opt-in goes into the global config.
+		const globalCfg = join(main, ".git", "test-global.gitconfig");
+		writeFileSync(globalCfg, "[diff]\n\trenames = copies\n");
+		const prevGlobal = process.env.GIT_CONFIG_GLOBAL;
+		process.env.GIT_CONFIG_GLOBAL = globalCfg;
 		await must(main, "mv", "base.txt", "renamed.txt");
 		writeFileSync(
 			join(main, "copied.txt"),
@@ -2103,11 +2109,16 @@ describe("arch-review survivor kills", () => {
 		);
 		await must(main, "add", "copied.txt");
 
-		const rows = await statusRows(main);
-		const rc = rows.filter((r) => /^[RC]/.test(r));
-		expect(rc).toHaveLength(2); // one rename, one copy, detected
-		// The original-path record of each R/C pair never leaks into the path list.
-		expect(await statusFiles(main)).toEqual(["copied.txt", "renamed.txt"]);
+		try {
+			const rows = await statusRows(main);
+			const rc = rows.filter((r) => /^[RC]/.test(r));
+			expect(rc).toHaveLength(2); // one rename, one copy, detected
+			// The original-path record of each R/C pair never leaks into the path list.
+			expect(await statusFiles(main)).toEqual(["copied.txt", "renamed.txt"]);
+		} finally {
+			if (prevGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = prevGlobal;
+		}
 	}, 60_000);
 
 	test("changedFiles: success parses names, failure reads as no changes", async () => {
@@ -2225,6 +2236,115 @@ describe("git", () => {
 		const r = await git(["commit", "--allow-empty", "-m", "board"], main);
 		expect(r.code).toBe(0);
 		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	test("never runs planted filter, merge or gpg drivers (R5-1)", async () => {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "config", "user.name", "ott");
+		await must(main, "config", "user.email", "ott@example.invalid");
+		writeFileSync(join(main, "f.txt"), "one\ntwo\n");
+		writeFileSync(
+			join(main, ".gitattributes"),
+			"* filter=evil merge=evil diff=evil\n",
+		);
+		// Commit before any driver exists, so plain git runs nothing here.
+		await must(main, "add", "-A");
+		await must(main, "commit", "-q", "-m", "init");
+		const marker = (kind: string) => join(main, `planted.${kind}`);
+		const plant = (kind: string, body: string) => {
+			const script = join(main, `${kind}.sh`);
+			writeFileSync(script, `#!/bin/sh\ntouch '${marker(kind)}'\n${body}`);
+			chmodSync(script, 0o755);
+			return script;
+		};
+		const filter = plant("filter", "cat\n");
+		const merge = plant("merge", "exit 0\n");
+		const gpg = plant("gpg", "exit 1\n");
+		for (const [k, v] of [
+			["filter.evil.clean", filter],
+			["filter.evil.smudge", filter],
+			["filter.evil.process", filter],
+			["merge.evil.driver", merge],
+			["merge.default", "evil"],
+			["commit.gpgSign", "true"],
+			["tag.gpgSign", "true"],
+			["log.showSignature", "true"],
+			["gpg.program", gpg],
+			["gpg.ssh.program", gpg],
+			["gpg.x509.program", gpg],
+		] as const)
+			await must(main, "config", k, v);
+		writeFileSync(
+			join(main, ".git", "info", "attributes"),
+			"* filter=evil merge=evil\n",
+		);
+		const attrs = join(main, "planted-attributes");
+		writeFileSync(attrs, "* filter=evil merge=evil\n");
+		await must(main, "config", "core.attributesFile", attrs);
+		const old = new Date(2000, 0, 1);
+		// Controls: the plants are live under plain git.
+		utimesSync(join(main, "f.txt"), old, old);
+		await must(main, "status", "--porcelain");
+		expect(existsSync(marker("filter"))).toBe(true);
+		rmSync(marker("filter"));
+		Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "c"], { cwd: main });
+		expect(existsSync(marker("gpg"))).toBe(true);
+		// The control commit may also re-run the planted clean filter: clear every marker.
+		for (const kind of ["filter", "merge", "gpg"])
+			rmSync(marker(kind), { force: true });
+		// Board paths: checkout (smudge), status and diff (clean), tag, commit, log (gpg).
+		const wt = join(main, ".worktrees", "x");
+		await createWorktree({
+			mainPath: main,
+			worktreePath: wt,
+			branch: "ott/x",
+			base: "main",
+			copyExtra: [],
+			log: () => {},
+		});
+		utimesSync(join(wt, "f.txt"), old, old);
+		writeFileSync(join(wt, "f.txt"), "one\nedited\n");
+		utimesSync(join(wt, ".gitattributes"), old, old);
+		expect(await isClean(wt)).toBe(false);
+		await statusRows(wt);
+		expect(await changedFiles(wt, "main", "main")).toContain("f.txt");
+		await diffStat(wt, "main", "main");
+		expect(await diffText(wt, "main", "main")).toContain("+edited");
+		expect((await git(["tag", "-a", "v1", "-m", "t"], main)).code).toBe(0);
+		// The board commits only in a repo it just made (gitInitWithCommit): an empty index, so
+		// no clean filter applies there; the planted signing still must not run.
+		const fresh = repo();
+		await must(fresh, "init", "-q", "-b", "main");
+		await must(fresh, "config", "commit.gpgSign", "true");
+		await must(fresh, "config", "gpg.program", gpg);
+		const c = [
+			"-c",
+			"user.name=o",
+			"-c",
+			"user.email=o@o",
+			"commit",
+			"--allow-empty",
+			"-m",
+			"b",
+		];
+		expect((await git(c, fresh)).code).toBe(0);
+		// A signed commit makes a planted log.showSignature verify it with gpg.program.
+		const tree = (await must(fresh, "rev-parse", "HEAD^{tree}")).trim();
+		const raw = join(fresh, "signed-commit");
+		writeFileSync(
+			raw,
+			`tree ${tree}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\ns\n`,
+		);
+		const signed = (
+			await must(fresh, "hash-object", "-t", "commit", "-w", raw)
+		).trim();
+		await must(fresh, "update-ref", "refs/heads/main", signed);
+		await must(fresh, "config", "log.showSignature", "true");
+		expect((await git(["log", "-1", "--format=%s"], fresh)).code).toBe(0);
+		expect((await git(["log", "-1", "--format=%s"], main)).code).toBe(0);
+		for (const kind of ["filter", "merge", "gpg"])
+			expect(existsSync(marker(kind))).toBe(false);
 	}, 60_000);
 });
 

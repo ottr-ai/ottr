@@ -1,15 +1,21 @@
 import {
 	existsSync,
+	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	rmSync,
 	statSync,
+	writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	appendLineBelow,
 	copyBelow,
 	moveBelow,
+	readRegular,
 	removeBelow,
 	trustedAnchor,
 } from "./confine.ts";
@@ -156,13 +162,14 @@ export function gitEnv(
 
 /**
  * Run git; never throws for non-zero exit. Bounded: default ceiling 10 min; callers with
- * slow ops (clone, a big remote fetch) pass a larger timeoutMs.
+ * slow ops (clone, a big remote fetch) pass a larger timeoutMs. `env` adds to the child env.
  */
 export async function git(
 	args: string[],
 	cwd: string,
 	timeoutMs = 10 * 60_000,
 	authEnv?: Record<string, string>,
+	env: Record<string, string> = {},
 ): Promise<GitResult> {
 	let sub = "";
 	for (let i = 0; i < args.length; i++) {
@@ -190,18 +197,30 @@ export async function git(
 		[
 			gitExe(),
 			// Command-line config outranks repo and global config, so config a work turn planted
-			// in the shared workspace or home volume (R5-1) cannot run an fsmonitor command or a
-			// hook in the board's git, which holds GH_TOKEN. Residual: network subcommands still
-			// read credential.helper and core.sshCommand from planted config (docs/WORKERS.md).
+			// in the shared workspace or home volume (R5-1) cannot run an fsmonitor command, a
+			// hook or a signing program in the board's git, which holds GH_TOKEN. The board never
+			// signs, and a planted log.showSignature or signed commit can only reach `false`.
+			// Filter drivers need sealedGit. Residual: network subcommands still read
+			// credential.helper and core.sshCommand from planted config (docs/WORKERS.md).
 			"-c",
 			"core.fsmonitor=false",
 			"-c",
 			"core.hooksPath=/dev/null",
+			"-c",
+			"commit.gpgSign=false",
+			"-c",
+			"tag.gpgSign=false",
+			"-c",
+			"gpg.program=false",
+			"-c",
+			"gpg.x509.program=false",
+			"-c",
+			"gpg.ssh.program=false",
 			...args,
 		],
 		cwd,
 		timeoutMs,
-		gitEnv(args, auth),
+		{ ...gitEnv(args, auth), ...env },
 	);
 	// Network git carries host tokens, and a remote may echo one back: its output reaches task
 	// logs and API errors, so stored secrets never leave this function raw.
@@ -222,6 +241,101 @@ export function setGitSecrets(s: readonly string[]): void {
 
 export function gitSecrets(): readonly string[] {
 	return secrets;
+}
+
+/** Repo-local core keys that git probes at init (file modes, symlinks, case, Unicode, line
+ * endings). sealedGit copies them, so status reads the files as the repo's own git does.
+ * They steer only git's builtin conversion, never a command. */
+const PROBED_CORE =
+	"^core\\.(filemode|symlinks|ignorecase|precomposeunicode|autocrlf|eol)$";
+
+/**
+ * Board git over a worktree's files: status, diffs against the files, the first checkout.
+ * A work turn can write the shared gitdir (R5-1). Its config defines filter drivers
+ * (`filter.<d>.clean`/`smudge`/`process`) under names that planted attributes pick, so no
+ * `-c` can clear them, and git reads `$GIT_DIR/info/attributes` above every override. These
+ * calls run against a board-written stub gitdir instead: HEAD as a sha, the worktree's own
+ * index and objects, a copy of the main checkout's info/exclude, no repo config. Tracked
+ * .gitattributes still apply, but they can only name drivers of system, global or
+ * command-line config (git-lfs). Callers pass `--ignore-submodules=dirty`: a submodule
+ * status runs git in the submodule's own gitdir, which is planted the same way.
+ */
+async function sealedGit(
+	args: string[],
+	worktreePath: string,
+): Promise<GitResult> {
+	const info = await git(
+		[
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-dir",
+			"--git-common-dir",
+			"--show-object-format",
+			"HEAD",
+		],
+		worktreePath,
+	);
+	if (info.code !== 0) return info;
+	const [gitDir = "", common = "", format = "", head = ""] =
+		info.stdout.split("\n");
+	// Both values land in the stub's files: a planted objectformat must not inject config lines.
+	if (
+		!/^(sha1|sha256)$/.test(format) ||
+		!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(head)
+	)
+		return {
+			code: 128,
+			stdout: "",
+			stderr: `unexpected git rev-parse output: ${info.stdout.trim()}`,
+		};
+	const probed = await git(
+		["config", "-z", "--get-regexp", PROBED_CORE],
+		worktreePath,
+	);
+	const keep = probed.stdout
+		.split("\0")
+		.filter(Boolean)
+		.flatMap((kv) => ["-c", kv.replace("\n", "=")]);
+	const stub = mkdtempSync(path.join(tmpdir(), "ottr-git-"));
+	try {
+		mkdirSync(path.join(stub, "refs"));
+		mkdirSync(path.join(stub, "info"));
+		writeFileSync(path.join(stub, "HEAD"), `${head}\n`);
+		writeFileSync(
+			path.join(stub, "config"),
+			`[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`,
+		);
+		try {
+			writeFileSync(
+				path.join(stub, "info", "exclude"),
+				readRegular(path.join(common, "info", "exclude")),
+			);
+		} catch (e) {
+			if (!(e instanceof Error && "code" in e && e.code === "ENOENT"))
+				return { code: 128, stdout: "", stderr: String(e) };
+		}
+		return await git(
+			[
+				"--no-optional-locks",
+				...keep,
+				// git-lfs finds its object cache through the gitdir, which is now the stub.
+				"-c",
+				`lfs.storage=${path.join(common, "lfs")}`,
+				...args,
+			],
+			worktreePath,
+			undefined,
+			undefined,
+			{
+				GIT_DIR: stub,
+				GIT_WORK_TREE: worktreePath,
+				GIT_INDEX_FILE: path.join(gitDir, "index"),
+				GIT_OBJECT_DIRECTORY: path.join(common, "objects"),
+			},
+		);
+	} finally {
+		rmSync(stub, { recursive: true, force: true });
+	}
 }
 
 /** Every non-empty secret becomes [REDACTED] in ONE pass (longest first), so a secret that
@@ -554,6 +668,7 @@ export async function createWorktree(o: {
 	// forms (RUNNER~1), so a textual set lookup misreads a registered worktree as a scratch dir
 	// and deletes it behind git's back, and the next add dies with "already registered".
 	const onDisk = existsSync(o.worktreePath);
+	let fresh = false;
 	if (onDisk && (await worktreeLinked(o.worktreePath))) {
 		o.log(`reusing worktree ${o.worktreePath} on ${o.branch}`);
 	} else {
@@ -566,16 +681,38 @@ export async function createWorktree(o: {
 				.code === 0;
 		const add = await git(
 			branchExists
-				? ["worktree", "add", o.worktreePath, o.branch]
-				: ["worktree", "add", "-b", o.branch, o.worktreePath, o.base],
+				? ["worktree", "add", "--no-checkout", o.worktreePath, o.branch]
+				: [
+						"worktree",
+						"add",
+						"--no-checkout",
+						"-b",
+						o.branch,
+						o.worktreePath,
+						o.base,
+					],
 			o.mainPath,
 		);
 		if (add.code !== 0)
 			throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
+		fresh = true;
 	}
 	o.log(`worktree ${o.worktreePath} on ${o.branch}`);
 
 	try {
+		// The checkout `worktree add` would run, minus planted smudge drivers (sealedGit).
+		// ponytail: a crash between add and this checkout leaves an empty worktree that a retry
+		// reuses as is; check for the missing index on reuse if that ever bites.
+		if (fresh) {
+			const co = await sealedGit(
+				["reset", "--hard", "--no-recurse-submodules", "-q"],
+				o.worktreePath,
+			);
+			if (co.code !== 0)
+				throw new Error(
+					`git checkout of the worktree failed: ${co.stderr.trim()}`,
+				);
+		}
 		const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
 			existsSync(path.join(o.mainPath, p)),
 		);
@@ -625,8 +762,13 @@ export async function createWorktree(o: {
 					);
 				}
 			}
-			const st = await git(
-				["status", "--porcelain", "--untracked-files=all"],
+			const st = await sealedGit(
+				[
+					"status",
+					"--porcelain",
+					"--untracked-files=all",
+					"--ignore-submodules=dirty",
+				],
 				o.worktreePath,
 			);
 			if (st.code !== 0)
@@ -686,8 +828,13 @@ export async function commitsAhead(
 }
 
 export async function isClean(worktreePath: string): Promise<boolean> {
-	const r = await git(
-		["status", "--porcelain", "--untracked-files=all"],
+	const r = await sealedGit(
+		[
+			"status",
+			"--porcelain",
+			"--untracked-files=all",
+			"--ignore-submodules=dirty",
+		],
 		worktreePath,
 	);
 	return r.code === 0 && r.stdout === "";
@@ -942,8 +1089,14 @@ export function rowPath(line: string): string {
 export async function statusRows(worktreePath: string): Promise<string[]> {
 	if (!(await worktreeLinked(worktreePath)))
 		throw new Error(`not a linked git worktree: ${worktreePath}`);
-	const r = await git(
-		["status", "--porcelain", "-z", "--untracked-files=all"],
+	const r = await sealedGit(
+		[
+			"status",
+			"--porcelain",
+			"-z",
+			"--untracked-files=all",
+			"--ignore-submodules=dirty",
+		],
 		worktreePath,
 	);
 	if (r.code !== 0) throw new Error(`git status failed: ${r.stderr.trim()}`);
@@ -976,8 +1129,14 @@ async function diffFrom(
 	base: string,
 	target: string,
 ): Promise<string> {
+	// A sha: sealedGit's stub gitdir holds no refs, so a branch name in `base` must resolve here.
 	const mb = await git(["merge-base", "HEAD", target], worktreePath);
-	return mb.code === 0 ? mb.stdout.trim() : base;
+	if (mb.code === 0) return mb.stdout.trim();
+	const b = await git(
+		["rev-parse", "--verify", "--quiet", `${base}^{commit}`],
+		worktreePath,
+	);
+	return b.code === 0 ? b.stdout.trim() : base;
 }
 
 /** Repo-relative paths the branch changed (committed branch work plus uncommitted edits; untracked
@@ -993,7 +1152,10 @@ export async function changedFiles(
 	// turns never push, so that case means a broken rule, not a missed screenshot.
 	const from = await diffFrom(worktreePath, base, target);
 	// -z: NUL-separated names, never quoted — byte-exact even for non-ASCII or whitespace.
-	const r = await git(["diff", "--name-only", "-z", from, "--"], worktreePath);
+	const r = await sealedGit(
+		["diff", "--name-only", "-z", "--ignore-submodules=dirty", from, "--"],
+		worktreePath,
+	);
 	return r.code === 0 ? r.stdout.split("\0").filter(Boolean) : [];
 }
 
@@ -1022,7 +1184,10 @@ export async function diffStat(
 	target: string,
 ): Promise<DiffFileStat[]> {
 	const from = await diffFrom(worktreePath, base, target);
-	const r = await git(["diff", "--numstat", from, "--"], worktreePath);
+	const r = await sealedGit(
+		["diff", "--numstat", "--ignore-submodules=dirty", from, "--"],
+		worktreePath,
+	);
 	return r.code === 0 ? parseNumstat(r.stdout) : [];
 }
 
@@ -1033,7 +1198,10 @@ export async function diffText(
 	target: string,
 ): Promise<string | null> {
 	const from = await diffFrom(worktreePath, base, target);
-	const r = await git(["diff", from, "--"], worktreePath);
+	const r = await sealedGit(
+		["diff", "--ignore-submodules=dirty", from, "--"],
+		worktreePath,
+	);
 	return r.code === 0 ? r.stdout : null;
 }
 

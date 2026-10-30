@@ -369,7 +369,29 @@ environment. The board hardens against all three on two layers.
 Code: every board git call overrides `core.fsmonitor=false` and `core.hooksPath=/dev/null`
 on the command line (command-line config outranks repo and global config), and `GH_TOKEN`
 reaches only the network subcommands (`clone`, `fetch`, `ls-remote`, `pull`, `push`);
-local subcommands such as `status` run without it.
+local subcommands such as `status` run without it. Every board git call also sets
+`commit.gpgSign=false` and `tag.gpgSign=false`, and sets `gpg.program`, `gpg.x509.program`
+and `gpg.ssh.program` to `false`. Thus a planted signing or `log.showSignature` setting
+cannot run a program.
+
+Filter drivers (`filter.<driver>.clean`, `smudge`, `process`) need one more step. The
+driver name comes from attributes, so no `-c` can clear the driver. Also, git reads
+`$GIT_DIR/info/attributes` above every override. Thus the board reads the files of a
+worktree only through a stub gitdir that it writes for each call (`sealedGit` in
+`src/worktree.ts`):
+
+- The stub holds HEAD as a sha and no repo config. The calls use the real index and objects
+  of the worktree and a copy of the main checkout's `info/exclude`.
+- `git status`, `git diff <from> --` and the first checkout of a new worktree use the stub.
+  The board runs `git worktree add --no-checkout`, then `git reset --hard` in the stub.
+- The tracked `.gitattributes` still apply. They can name only the drivers of the system,
+  global or command-line config, for example git-lfs. The stub points `lfs.storage` at the
+  main checkout's LFS cache.
+- These calls pass `--ignore-submodules=dirty`. A submodule status runs git in the gitdir of
+  the submodule, and a work turn can plant that gitdir too.
+
+No board git call merges, rebases or cherry-picks in a checkout that a worker can write.
+Thus no call reaches a planted `merge.<driver>.driver` or `merge.default`.
 
 Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` to
 `/etc/ottr/gitconfig` and `GH_CONFIG_DIR` to `/etc/ottr/gh`. These paths are on the
@@ -525,7 +547,11 @@ inside the worktrees, and projects are onboarded at run time, so compose cannot 
 each config. The board's network subcommands still read `credential.helper`,
 `core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
 whatever the turn's env holds. Closing the board's repo-config reads fully is code-side
-work in `src/worktree.ts` (per-call `-c` overrides), not topology. On the omp side, omp
+work in `src/worktree.ts` (per-call `-c` overrides and the `sealedGit` stub gitdir), not
+topology. The stub copies only these probed keys from the repo config:
+`core.filemode`, `symlinks`, `ignorecase`, `precomposeunicode`, `autocrlf` and `eol`. These
+keys control only the builtin conversion of git. A new board call that merges in a worker
+checkout must use the stub or pin the merge driver. On the omp side, omp
 writes the http-400 dump directory under `$HOME/.omp/logs` of the HOME it runs with,
 because its state root does not follow `PI_CODING_AGENT_DIR`. The reader in
 `src/runner.ts` thus scans the shared home and the board's omp home. The board reads only
