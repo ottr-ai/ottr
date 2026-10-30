@@ -201,6 +201,15 @@ describe("paths", () => {
 		]);
 	});
 
+	test("a malformed env.txt skips only its own project", () => {
+		const h = mkdtempSync(join(home, "bad-env-"));
+		provision("good", null, ["GOOD_ONE"], h);
+		provision("bad", null, ["OK_NAME", "my-key"], h);
+		expect(listedEnvNames(h)).toEqual([
+			{ name: "GOOD_ONE", projects: ["good"] },
+		]);
+	});
+
 	test("a missing env.txt lists nothing", () => {
 		expect(listedEnvNames(mkdtempSync(join(home, "empty-")))).toEqual([]);
 	});

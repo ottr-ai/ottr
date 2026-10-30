@@ -133,7 +133,10 @@ export function readEnvNames(project: string, home = homedir()): string[] {
 	return parseEnvTxt(readFileSync(file, "utf8"));
 }
 
-/** Every name provisioned for any project, with the projects that list it. */
+/**
+ * Every name provisioned for any project, with the projects that list it. A malformed env.txt
+ * is logged and skipped, so one bad list does not hide every other project's names.
+ */
 export function listedEnvNames(
 	home = homedir(),
 ): { name: string; projects: string[] }[] {
@@ -141,7 +144,16 @@ export function listedEnvNames(
 	const byName = new Map<string, string[]>();
 	for (const project of existsSync(dir) ? readdirSync(dir).sort() : []) {
 		if (!PROJECT.test(project)) continue;
-		for (const name of readEnvNames(project, home)) {
+		let names: string[];
+		try {
+			names = readEnvNames(project, home);
+		} catch (err) {
+			console.warn(
+				`env: ${project}: ${err instanceof Error ? err.message : err}`,
+			);
+			continue;
+		}
+		for (const name of names) {
 			const projects = byName.get(name) ?? [];
 			projects.push(project);
 			byName.set(name, projects);
