@@ -2003,16 +2003,24 @@ export function createTurnLoop(
 			// settle lands at merging (commits to integrate) or straight done (already integrated).
 			// fork-born tasks (analysis proposals AND manual follow-ups of a fork research card) always
 			// hold their merge for approval; the parent existing implies the feature ran, so this is
-			// independent of the forkResearch toggle.
+			// independent of the forkResearch toggle. The hold covers every descendant: a card an agent
+			// files from a fork-born card (create_task) must not merge without approval either.
 			const readyWork =
 				kind === "work" && (next.stage === "done" || next.stage === "merging");
 			const updateHold =
 				readyWork &&
 				task.updateIds.length > 0 &&
 				store.getSettings().holdUpdateMerges;
-			const forkParent =
-				task.followUpOf !== null ? store.getTask(task.followUpOf) : null;
-			const forkHold = readyWork && forkParent?.topic === "fork research";
+			let forkBorn = false;
+			const seen = new Set<string>([task.id]);
+			let up = task.followUpOf;
+			while (up !== null && !seen.has(up) && !forkBorn) {
+				seen.add(up);
+				const anc = store.getTask(up);
+				forkBorn = anc?.topic === "fork research";
+				up = anc?.followUpOf ?? null;
+			}
+			const forkHold = readyWork && forkBorn;
 			const head =
 				updateHold || forkHold
 					? await ops.targetSha(wt, "HEAD").catch(() => null)

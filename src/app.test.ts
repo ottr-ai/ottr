@@ -1831,6 +1831,30 @@ describe("alate routes", () => {
 			);
 		});
 
+		test("a card filed from an update card inherits its merge hold; others do not", async () => {
+			const p1 = projects.get("p1")!;
+			const held = p1.store.createTask("update pins");
+			p1.store.updateTask(held.id, {
+				updateIds: ["x@1"],
+				updateMergeHead: "abc123",
+			});
+			const plain = p1.store.createTask("plain parent");
+			for (const parent of [held, plain]) {
+				const res = await post("/api/projects/p1/tasks", {
+					prompt: `split from ${parent.id}`,
+					followUpOf: parent.id,
+					backlog: true,
+				});
+				expect(res.status).toBe(200);
+			}
+			const kid = (id: string) =>
+				p1.store.listTasks().find((t) => t.followUpOf === id)!;
+			// The parent's approval covers its own diff only: the child starts unapproved.
+			expect(kid(held.id).updateIds).toEqual(["x@1"]);
+			expect(kid(held.id).updateMergeHead).toBeNull();
+			expect(kid(plain.id).updateIds).toEqual([]);
+		});
+
 		test("a pin already at its qualified target is applied; the refresh drops it", async () => {
 			// The push-throttle test above skips goodRec.id and leaves the skip set.
 			gstore.set("updateSkips", []);

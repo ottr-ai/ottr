@@ -4465,6 +4465,7 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "prompt must be 1-20000 characters" }, 400);
 					// Agents filing cards from another task's run pass that task here; the link renders in both drawers.
 					let followUpOf: string | null = null;
+					let updateIds: string[] = [];
 					if (r.body.followUpOf !== undefined && r.body.followUpOf !== null) {
 						if (typeof r.body.followUpOf !== "string")
 							return json({ error: "followUpOf must be a task id" }, 400);
@@ -4472,6 +4473,8 @@ export function createApp(deps: AppDeps) {
 						if (parent instanceof Response)
 							return json({ error: "unknown followUpOf task" }, 404);
 						followUpOf = parent.task.id;
+						// A child of an update card inherits its merge hold: split-off update work needs the same approval.
+						updateIds = parent.task.updateIds;
 					}
 					let dependsOn: string[] = [];
 					if (r.body.dependsOn !== undefined && r.body.dependsOn !== null) {
@@ -4520,7 +4523,8 @@ export function createApp(deps: AppDeps) {
 							500,
 						);
 					}
-					if (followUpOf !== null) e.store.updateTask(t.id, { followUpOf });
+					if (followUpOf !== null)
+						e.store.updateTask(t.id, { followUpOf, updateIds });
 					if (dependsOn.length > 0) e.store.updateTask(t.id, { dependsOn });
 					if (r.body.backlog === true)
 						e.store.updateTask(t.id, {

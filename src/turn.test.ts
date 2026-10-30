@@ -8284,6 +8284,14 @@ describe("turn fork-born merge hold", () => {
 		expect(ok.record.removeWorktree).toHaveLength(1);
 	});
 
+	test("a card filed from a fork-born card inherits the hold", async () => {
+		const { store, loop, task } = forkCase();
+		const child = store.createTask("split-off fork work");
+		store.updateTask(child.id, { followUpOf: task.id });
+		await loop.runTurn(store.name, child.id);
+		expect(store.getTask(child.id)!.needsReason).toBe(FORK_HOLD_REASON);
+	});
+
 	test("a follow-up of a non-fork parent settles done", async () => {
 		const { store, loop, task } = forkCase();
 		const retro = store.createTask("weekly retro");
