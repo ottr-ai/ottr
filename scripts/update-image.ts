@@ -569,8 +569,8 @@ export async function updateImage(
 	const serverWasRunning = running.out.trim().split("\n").includes("server");
 	// The board's agent layer comes from the data repo, and the board-seed service is its
 	// only writer (never the worker-writable shared home). A commit the volume has not
-	// recorded yet seeds once, before the drain. A failed seed never blocks the deploy;
-	// the run only exits 1 after the normal success line.
+	// recorded yet seeds once, before the drain. A failed seed never blocks the deploy,
+	// but the run exits 1: after the normal success line, or when the drain ends it early.
 	let seeded = false;
 	let seedFailed = false;
 	let wantedSha = "";
@@ -654,7 +654,7 @@ export async function updateImage(
 			r.changed || seeded,
 			stop,
 		);
-		if (early !== null) return early;
+		if (early !== null) return early === 0 && seedFailed ? 1 : early;
 	} else d.log("no running board to count turns in; restarting anyway");
 	// --wait fails the run when the recreated board never turns healthy, so the script
 	// never logs success for a crash-loop.

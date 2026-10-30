@@ -1196,6 +1196,27 @@ describe("board seed", () => {
 		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
 	}, 60_000);
 
+	test("a failed seed exits 1 even when running turns hold the restart", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			seedCode: 1,
+			turns: "2",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		const log = f.logs.join("\n");
+		expect(log).toContain("board seed failed: the seed step failed");
+		expect(log).toContain("2 turns run: the restart waits for a later run");
+		expect(f.calls).not.toContain(UP);
+	}, 60_000);
+
 	test("a seed with no alate image anywhere fails and names the env file", async () => {
 		const { main } = checkout();
 		const data = checkout();
