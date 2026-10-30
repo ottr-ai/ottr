@@ -2,6 +2,7 @@ import {
 	PROMPT_CHAR_BUDGET,
 	redactSecrets,
 	runGateway,
+	type SpawnFn,
 	stripInvisible,
 } from "./forkAnalysis.ts";
 import type { ForkProject, GhFn } from "./forks.ts";
@@ -161,12 +162,15 @@ export function createPrWatcher(deps: {
 	log: (m: string) => void;
 	gh?: GhFn;
 	now?: () => number;
-	/** The tool-free model call; defaults to the board's `omp auth-gateway`. */
+	/** The tool-free model call; defaults to the board's `omp auth-gateway` on the `plan` role. */
 	review?: ReviewFn;
+	/** The process spawner for the default review. */
+	spawn?: SpawnFn;
 }): { tick(opts?: { manual?: string }): Promise<void> } {
 	const gh = deps.gh ?? runGh;
 	const now = deps.now ?? Date.now;
-	const review: ReviewFn = deps.review ?? ((m) => runGateway(m));
+	const review: ReviewFn =
+		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
 
 	async function scanProject(project: ForkProject): Promise<void> {
 		const store = project.store;

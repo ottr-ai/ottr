@@ -216,16 +216,17 @@ const defaultSpawn: SpawnFn = async (argv, o) => {
 	return { code: await proc.exited, stdout, stderr };
 };
 
-/** One JSON-line request over `omp auth-gateway stdio`; returns the assistant message content. */
+/** One JSON-line request over `omp auth-gateway stdio`; returns the assistant message content. `model` is an omp role selector. */
 export async function runGateway(
 	messages: Array<{ role: "system" | "user"; content: string }>,
 	spawn: SpawnFn = defaultSpawn,
 	timeoutMs = 15 * 60_000,
+	model = "@default",
 ): Promise<string> {
 	const body = {
 		id: 1,
 		path: "/v1/chat/completions",
-		body: { model: "@default", messages },
+		body: { model, messages },
 	};
 	const result = await spawn(["omp", "auth-gateway", "stdio"], {
 		stdin: JSON.stringify(body) + "\n",

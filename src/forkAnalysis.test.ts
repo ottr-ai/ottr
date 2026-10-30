@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	analyzeRange,
 	buildUserMessage,
 	parseAnalysis,
 	proposalPrompt,
@@ -284,6 +285,20 @@ describe("runGateway", () => {
 		expect(req.id).toBe(1);
 		expect(req.path).toBe("/v1/chat/completions");
 		expect(req.body.messages).toHaveLength(1);
+	});
+	test("fork analysis asks the gateway for the default role", async () => {
+		let model = "";
+		await analyzeRange(
+			range(),
+			{ titles: [], declines: [] },
+			{
+				spawn: async (_argv, o) => {
+					model = JSON.parse(o.stdin).body.model;
+					return { code: 1, stdout: "", stderr: "stop" };
+				},
+			},
+		).catch(() => {});
+		expect(model).toBe("@default");
 	});
 	test("non-200 throws with the error message", async () => {
 		const out = runGateway([{ role: "user", content: "hi" }], async () => ({

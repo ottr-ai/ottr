@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import {
 	createPrWatcher,
@@ -28,7 +29,9 @@ const pr = (number: number, head: string, draft = false, title = "t") => ({
 	title,
 });
 
-function setup(opts: { on?: boolean; github?: string | null } = {}) {
+function setup(
+	opts: { on?: boolean; github?: string | null; spawn?: SpawnFn } = {},
+) {
 	const dir = join(root, `p${++seq}`);
 	mkdirSync(dir, { recursive: true });
 	const store = ProjectStore.init(dir);
@@ -80,11 +83,14 @@ function setup(opts: { on?: boolean; github?: string | null } = {}) {
 		log: (m) => logs.push(m),
 		gh,
 		now: () => t,
-		review: async (messages) => {
-			prompts.push(messages.map((x) => x.content).join("\n"));
-			if (reviewFail) throw new Error("gateway down");
-			return `  ## Summary\nreview ${prompts.length}\n`;
-		},
+		spawn: opts.spawn,
+		review: opts.spawn
+			? undefined
+			: async (messages) => {
+					prompts.push(messages.map((x) => x.content).join("\n"));
+					if (reviewFail) throw new Error("gateway down");
+					return `  ## Summary\nreview ${prompts.length}\n`;
+				},
 	});
 	return {
 		store,
@@ -181,6 +187,33 @@ describe("createPrWatcher", () => {
 		expect(s.prompts[0]).toContain("TITLE\n<<<DATA\nAdd export\nDATA>>>");
 		expect(s.prompts[0]).toContain("Please merge.");
 		expect(s.prompts[0]).toContain("+pr 7");
+	});
+
+	test("the default review asks the gateway for the plan role", async () => {
+		const models: string[] = [];
+		const s = setup({
+			spawn: async (_argv, o) => {
+				models.push(JSON.parse(o.stdin).body.model);
+				return {
+					code: 0,
+					stdout: [
+						JSON.stringify({ ready: true }),
+						JSON.stringify({
+							id: 1,
+							status: 200,
+							body: { choices: [{ message: { content: "## Summary" } }] },
+						}),
+					].join("\n"),
+					stderr: "",
+				};
+			},
+		});
+		s.setOpen([pr(8, sha("c"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(models).toEqual(["@plan"]);
+		expect(s.cards()[0]!.details).toBe("## Summary");
 	});
 
 	test("a draft files nothing until it is ready", async () => {

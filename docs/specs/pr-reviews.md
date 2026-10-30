@@ -15,7 +15,7 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 ### Watcher (`src/prs.ts`)
 
-- `createPrWatcher({ projects, log, gh?, now?, review? })` returns `{ tick(opts?: { manual?: string }): Promise<void> }`. A second `tick` while one runs returns the same promise (single flight). `review` is the model call. It defaults to `runGateway` (`omp auth-gateway stdio`, the fork research path).
+- `createPrWatcher({ projects, log, gh?, now?, review?, spawn? })` returns `{ tick(opts?: { manual?: string }): Promise<void> }`. A second `tick` while one runs returns the same promise (single flight). `review` is the model call. It defaults to `runGateway` (`omp auth-gateway stdio`, the fork research path) with the omp role `@plan`. Fork research and other gateway calls keep `@default`. `spawn` replaces the process call of the default review in tests.
 - `server.ts` runs `app.prReviewTick()` at start and every hour.
 - `POST /api/projects/:project/prs/check` runs `tick({ manual: project })`. An unknown project gets 404. A project with no GitHub repo gets 409.
 - Each tick does these steps for each enabled project:
