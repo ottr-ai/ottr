@@ -1590,27 +1590,62 @@ describe("board seed", () => {
 });
 
 describe("envFileValues", () => {
-	test("reads --env-file flags and the root .env, later files win", () => {
+	const inDir = (files: Record<string, string>, run: (dir: string) => void) => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-env-"));
-		writeFileSync(
-			join(dir, "a.env"),
-			"# comment\n\nKEY=a\nURL=http://x/?y=1\nBAD\n=none\n",
-		);
-		writeFileSync(join(dir, "b.env"), "KEY=b\n");
-		writeFileSync(join(dir, ".env"), "ROOT=yes\n");
+		for (const [name, text] of Object.entries(files))
+			writeFileSync(join(dir, name), text);
 		const prev = process.cwd();
 		process.chdir(dir);
 		try {
-			expect(
-				envFileValues([
-					"--env-file",
-					join(dir, "a.env"),
-					`--env-file=${join(dir, "b.env")}`,
-				]),
-			).toEqual({ KEY: "b", URL: "http://x/?y=1", ROOT: "yes" });
+			run(dir);
 		} finally {
 			process.chdir(prev);
 			rmSync(dir, { recursive: true, force: true });
 		}
+	};
+
+	test("reads the script's keys from --env-file flags, later files win, .env is ignored", () => {
+		inDir(
+			{
+				"a.env":
+					"# comment\n\nALATE_IMAGE=a\nGH_TOKEN=t=1\nOTTR_PORT=8080\nBAD\n=none\n",
+				"b.env": "ALATE_IMAGE=b\n",
+				".env": "ALATE_DATA=/root\n",
+			},
+			(dir) =>
+				expect(
+					envFileValues([
+						"--env-file",
+						join(dir, "a.env"),
+						`--env-file=${join(dir, "b.env")}`,
+					]),
+				).toEqual({ ALATE_IMAGE: "b", GH_TOKEN: "t=1" }),
+		);
+	});
+
+	test("reads the root .env without --env-file", () => {
+		inDir({ ".env": "ALATE_DATA=/root\n" }, () =>
+			expect(envFileValues([])).toEqual({ ALATE_DATA: "/root" }),
+		);
+	});
+
+	test("strips quotes and inline comments like compose", () => {
+		inDir(
+			{
+				"s.env": [
+					'ALATE_DATA="/home/u/agent data" # the checkout',
+					"ALATE_DATA_REPO='o/r@main'",
+					"ALATE_IMAGE=alate:1 # pinned",
+					"GH_TOKEN=a#b",
+				].join("\n"),
+			},
+			(dir) =>
+				expect(envFileValues(["--env-file", join(dir, "s.env")])).toEqual({
+					ALATE_DATA: "/home/u/agent data",
+					ALATE_DATA_REPO: "o/r@main",
+					ALATE_IMAGE: "alate:1",
+					GH_TOKEN: "a#b",
+				}),
+		);
 	});
 });

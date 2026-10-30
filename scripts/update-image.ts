@@ -62,10 +62,20 @@ const HOLD_LIMIT_MS = 60 * 60_000;
 const lastLine = (out: string): string =>
 	out.trim().split("\n").at(-1)?.trim() ?? "";
 
+/** The env-file keys this script reads itself; compose reads the rest from --env-file. */
+const SCRIPT_KEYS = new Set([
+	"ALATE_DATA",
+	"ALATE_DATA_REPO",
+	"ALATE_IMAGE",
+	"GH_TOKEN",
+]);
+
 /**
- * The env-file values a run passes as `--env-file`, plus the repo root's `.env` when it
- * exists (cwd-relative). Later files win; blank and `#` lines are skipped, and a value
- * may itself contain `=`. Pure: it reads, it never touches the environment.
+ * The script's own keys (SCRIPT_KEYS) from the env files a run passes as `--env-file`,
+ * else from the repo root's `.env` (cwd-relative), as compose does. Later files win;
+ * blank and `#` lines are skipped, and a value may itself contain `=`. Like compose, a
+ * quoted value loses its quotes and the text after them, and an unquoted value loses a
+ * ` # comment`. Pure: it reads, it never touches the environment.
  */
 export function envFileValues(args: string[]): Record<string, string> {
 	const files: string[] = [];
@@ -75,7 +85,7 @@ export function envFileValues(args: string[]): Record<string, string> {
 		else if (a.startsWith("--env-file="))
 			files.push(a.slice("--env-file=".length));
 	}
-	if (existsSync(".env")) files.push(".env");
+	if (files.length === 0 && existsSync(".env")) files.push(".env");
 	const values: Record<string, string> = {};
 	for (const file of files) {
 		let text: string;
@@ -89,7 +99,13 @@ export function envFileValues(args: string[]): Record<string, string> {
 			if (t === "" || t.startsWith("#")) continue;
 			const eq = t.indexOf("=");
 			if (eq <= 0) continue;
-			values[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+			const key = t.slice(0, eq).trim();
+			if (!SCRIPT_KEYS.has(key)) continue;
+			const raw = t.slice(eq + 1).trim();
+			const end =
+				raw[0] === '"' || raw[0] === "'" ? raw.indexOf(raw[0], 1) : -1;
+			// ponytail: no escapes inside double quotes; add them when a key needs one.
+			values[key] = end > 0 ? raw.slice(1, end) : raw.replace(/\s+#.*$/, "");
 		}
 	}
 	return values;
