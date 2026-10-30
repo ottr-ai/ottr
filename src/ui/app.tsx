@@ -2637,8 +2637,14 @@ function ProjectBoard({
 								type="button"
 								className="ghost"
 								aria-label="Create release"
+								// Same guard as Review: a release runs that review (releaseBlocked).
+								disabled={project.archReview?.running}
 								onClick={() => setShowRelease(true)}
-								title="Release everything new on the target"
+								title={
+									project.archReview?.running
+										? "A release or review is still open: one at a time"
+										: "Release everything new on the target"
+								}
 							>
 								<Icon name="tag" />
 								<span className="seg-label">Create release</span>

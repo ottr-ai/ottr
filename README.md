@@ -62,7 +62,7 @@ The project's **Review** button starts a read-only review card: full verificatio
 
 **Create release** runs the same review since the last tag, then tags the reviewed commit and creates the GitHub release. Versions follow Conventional Commits; notes are one bullet per commit. A project can set a **release command** instead, which runs at the reviewed commit with `OTTR_RELEASE_VERSION`, `OTTR_RELEASE_COMMIT`, `OTTR_RELEASE_NOTES_FILE` and `OTTR_ARCH_REVIEW` in its environment.
 
-While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else.
+While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else. Also, the **Create release** and **Review** buttons stay disabled until the open review or release and its findings are done.
 
 **Explain project** asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project. The skill comes from agent-data, so the host and the workers must have it.
 
