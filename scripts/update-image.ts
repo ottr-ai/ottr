@@ -416,8 +416,11 @@ async function seedSource(
 
 /**
  * The alate image the board-seed service runs in: ALATE_IMAGE, else the running alate of
- * this compose project, else any running alate container. `discovered` marks an image read
- * from docker, which the compose child then needs as ALATE_IMAGE for `${ALATE_IMAGE:-...}`.
+ * this compose project, else the running container named exactly `alate`. Docker's name
+ * filter is an unanchored regex, so a bare `name=alate` also matches `translate-api`: the
+ * seed would run that image with GH_TOKEN and the board-config volume. `discovered` marks
+ * an image read from docker, which the compose child then needs as ALATE_IMAGE for
+ * `${ALATE_IMAGE:-...}`.
  */
 async function alateImage(
 	d: Deps,
@@ -440,7 +443,7 @@ async function alateImage(
 	const dps = await d.docker(
 		"ps",
 		"--filter",
-		"name=alate",
+		"name=^/?alate$",
 		"--format",
 		"{{.Image}}",
 	);

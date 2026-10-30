@@ -95,8 +95,8 @@ function fakes(
 		alatePs?: string;
 		/** The image the project's alate container runs (`inspect .Config.Image`). */
 		alateInspect?: string;
-		/** Output of `docker ps --filter name=alate` (any running alate's image). */
-		alateDockerPs?: string;
+		/** Running containers that `docker ps --filter name=<regex>` filters like docker does. */
+		containers?: { name: string; image: string }[];
 		/** The containerd store's platform manifests: the one the server runs, the build's. */
 		manifest?: {
 			runs: string;
@@ -118,6 +118,7 @@ function fakes(
 	const calls: string[] = [];
 	const drains: string[] = [];
 	const seedRuns: string[] = [];
+	const seedImages: (string | undefined)[] = [];
 	const seedWrites: string[] = [];
 	const logs: string[] = [];
 	const waits: number[] = [];
@@ -139,6 +140,7 @@ function fakes(
 			if (drain) drains.push(line);
 			if (args.includes("board-seed")) {
 				seedRuns.push(line);
+				seedImages.push(process.env.ALATE_IMAGE);
 				calls.push(line);
 				return {
 					code: o.seedCode ?? 0,
@@ -153,9 +155,15 @@ function fakes(
 				seedWrites.push(line);
 				return { code: 0, out: "" };
 			}
-			if (line.includes("name=alate")) {
+			if (line.startsWith("ps --filter name=")) {
+				// Docker's name filter: an unanchored regex against the name, with or without "/".
 				calls.push(line);
-				return { code: 0, out: `${o.alateDockerPs ?? ""}\n` };
+				const re = new RegExp(line.split(" ")[2]?.slice(5) ?? "");
+				const out = (o.containers ?? [])
+					.filter((c) => re.test(c.name) || re.test(`/${c.name}`))
+					.map((c) => `${c.image}\n`)
+					.join("");
+				return { code: 0, out };
 			}
 			calls.push(
 				line.replace(
@@ -279,7 +287,17 @@ function fakes(
 		},
 		now: () => clock,
 	};
-	return { deps, calls, drains, logs, waits, built, seedRuns, seedWrites };
+	return {
+		deps,
+		calls,
+		drains,
+		logs,
+		waits,
+		built,
+		seedRuns,
+		seedImages,
+		seedWrites,
+	};
 }
 
 const BUILD = "compose -f c.yml build server";
@@ -327,6 +345,8 @@ interface FakeRun {
 	built: { tree: string; files: string[]; dockerfile: string }[];
 	/** The board-seed run call lines, in order. */
 	seedRuns: string[];
+	/** The ALATE_IMAGE each board-seed run saw, in order. */
+	seedImages: (string | undefined)[];
 	/** The record writes (`printf %s <sha> > /etc/ottr/seed-commit`), in order. */
 	seedWrites: string[];
 }
@@ -1076,7 +1096,7 @@ describe("board seed", () => {
 		"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit";
 	const ALATE_PS = "compose -f c.yml ps -q alate";
 	const ALATE_INSPECT = "inspect -f {{.Config.Image}} alate123";
-	const DOCKER_PS = "ps --filter name=alate --format {{.Image}}";
+	const DOCKER_PS = "ps --filter name=^/?alate$ --format {{.Image}}";
 	const RESTART = "compose -f c.yml restart server";
 	const unrecorded = "0".repeat(40);
 
@@ -1200,6 +1220,36 @@ describe("board seed", () => {
 			UP,
 			PRUNE,
 		]);
+	}, 60_000);
+
+	test("the docker ps fallback takes only the container named exactly alate", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// Docker lists newer containers first: the substring matches come before alate.
+		const others = [
+			{ name: "translate-api", image: "evil:1" },
+			{ name: "my-alate-test", image: "evil:2" },
+		];
+		const f = fakes({
+			seedRecord: unrecorded,
+			containers: [...others, { name: "alate", image: "alate:good" }],
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedImages).toEqual(["alate:good"]);
+
+		// Only substring matches: no image, and the seed never runs.
+		const none = fakes({ seedRecord: unrecorded, containers: others });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], none.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(none.seedRuns).toEqual([]);
+		expect(none.logs.join("\n")).toContain("set ALATE_IMAGE in the env file");
 	}, 60_000);
 
 	test("a seed with a changed server image holds, and the recreate restarts it without another restart call", async () => {
