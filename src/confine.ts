@@ -462,6 +462,53 @@ export function appendLineBelow(
 }
 
 /**
+ * Reads the regular file `file` below `anchor`, following no symlink under the anchor (the
+ * file included). Null when the file or a parent is missing. A symlink, a non-regular entry,
+ * or a file over `maxBytes` fails with "refusing <path>".
+ */
+export function readBelow(
+	anchor: string,
+	file: string,
+	maxBytes: number,
+): Buffer | null {
+	try {
+		return withDir(anchor, dirname(file), {}, (d) => {
+			let fd: number;
+			try {
+				fd = openSync(d.at(basename(file)), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+			} catch (err) {
+				if (errCode(err) === "ELOOP")
+					throw new Error(`refusing ${file}: a symlink`);
+				throw err;
+			}
+			try {
+				const st = fstatSync(fd);
+				if (!st.isFile())
+					throw new Error(`refusing ${file}: not a regular file`);
+				if (st.size > maxBytes)
+					throw new Error(`refusing ${file}: larger than ${maxBytes} bytes`);
+				// One spare byte catches a file that grew after fstat.
+				const buf = Buffer.allocUnsafe(st.size + 1);
+				let n = 0;
+				while (n < buf.length) {
+					const r = readSync(fd, buf, n, buf.length - n, null);
+					if (r === 0) break;
+					n += r;
+				}
+				if (n > st.size)
+					throw new Error(`refusing ${file}: it grew while read`);
+				return buf.subarray(0, n);
+			} finally {
+				closeSync(fd);
+			}
+		});
+	} catch (err) {
+		if (errCode(err) === "ENOENT") return null;
+		throw err;
+	}
+}
+
+/**
  * Removes the entry at `p`, a path that resolves no parent again (a Dir.at result or a
  * /proc/self/fd path); recurses into real directories only.
  */

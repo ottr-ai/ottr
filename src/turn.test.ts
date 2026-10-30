@@ -4499,6 +4499,37 @@ describe("turn research cards", () => {
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
 	});
 
+	test.skipIf(process.platform !== "linux")(
+		"a symlinked research report is refused, never read through (OTTR-233)",
+		async () => {
+			const { store, record, projects } = researchStore();
+			const outside = mkdtempSync(join(tmpdir(), "turn-report-secret-"));
+			dirs.push(outside);
+			const secret = join(outside, "secret");
+			writeFileSync(secret, "top secret");
+			const loop = createTurnLoop(
+				projects,
+				fakeOps(record, {
+					commitsAhead: async () => 0,
+					createWorktree: async (o: { worktreePath: string }) => {
+						record.createWorktree.push(o);
+						mkdirSync(o.worktreePath, { recursive: true });
+						symlinkSync(secret, join(o.worktreePath, RESEARCH_REPORT));
+					},
+				}),
+			);
+			const task = researchTask(store);
+
+			await loop.runTurn(store.name, task.id);
+
+			const after = store.getTask(task.id)!;
+			expect(after.report ?? "").not.toContain("top secret");
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toContain(RESEARCH_REPORT);
+			expect(logText(store, task.id)).toContain("a symlink");
+		},
+	);
+
 	test("research turn saves agent-reported shots before the worktree goes", async () => {
 		const { store, record, projects } = researchStore();
 		const loop = createTurnLoop(

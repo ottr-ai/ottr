@@ -26,6 +26,7 @@ import {
 	mkdirBelow,
 	moveBelow,
 	openDir,
+	readBelow,
 	readRegular,
 	removeBelow,
 	renameBelow,
@@ -508,6 +509,40 @@ describe("a FIFO in place of the task log", () => {
 		const f = join(anchor, "f");
 		writeFileSync(f, "bytes");
 		expect(readRegular(f).toString()).toBe("bytes");
+	});
+});
+
+describe("readBelow", () => {
+	test("reads a file up to the cap; null when it or a parent is missing", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "a", "f");
+		mkdirSync(join(anchor, "a"));
+		writeFileSync(f, "four");
+		expect(readBelow(anchor, f, 4)?.toString()).toBe("four");
+		expect(() => readBelow(anchor, f, 3)).toThrow(/larger than 3 bytes/);
+		expect(readBelow(anchor, join(anchor, "a", "none"), 4)).toBeNull();
+		expect(readBelow(anchor, join(anchor, "b", "f"), 4)).toBeNull();
+	});
+
+	test.skipIf(!linux)("refuses a symlink at the file or a parent", () => {
+		const { anchor, outside } = fixture();
+		writeFileSync(join(outside, "secret"), "s");
+		symlinkSync(join(outside, "secret"), join(anchor, "f"));
+		symlinkSync(outside, join(anchor, "ln"));
+		expect(() => readBelow(anchor, join(anchor, "f"), 100)).toThrow(
+			/refusing .*: a symlink/,
+		);
+		expect(() => readBelow(anchor, join(anchor, "ln", "secret"), 100)).toThrow(
+			/refusing/,
+		);
+	});
+
+	test("refuses a directory", () => {
+		const { anchor } = fixture();
+		mkdirSync(join(anchor, "d"));
+		expect(() => readBelow(anchor, join(anchor, "d"), 100)).toThrow(
+			/not a regular file/,
+		);
 	});
 });
 

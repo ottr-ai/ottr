@@ -7,6 +7,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
 import {
 	copyBelow,
+	readBelow,
 	readRegular,
 	renameBelow,
 	trustedAnchor,
@@ -15,7 +16,12 @@ import {
 import type { pidAlive } from "./dblock.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
-import { type DecodedImage, saveImages, sniffImage } from "./images.ts";
+import {
+	type DecodedImage,
+	MAX_IMAGE_BYTES,
+	saveImages,
+	sniffImage,
+} from "./images.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
 import { modelRoles } from "./models.ts";
 import {
@@ -341,6 +347,8 @@ export function checkRunError(r: RunResult): string | null {
 const KEPT_PREFIX = "Kept the worktree: ";
 const demoBoard = () => process.env.OTTR_DEMO === "1";
 const CANCEL_KEPT_PREFIX = "Cancel kept the worktree: ";
+// ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
+const REPORT_MAX_BYTES = 4 * 1024 * 1024;
 
 export function keptReason(unsaved: string): string {
 	return `${KEPT_PREFIX}${unsaved}. Reply to continue, or Cancel to delete it.`;
@@ -1438,11 +1446,20 @@ export function createTurnLoop(
 			if (entry?.abandoned) return;
 			// The agent self-declares research by writing the report file; its presence at settle flips the card.
 			// Sync read: settle must stay within one microtask flush (tests await runTurn or flush microtasks only).
-			const reportPath = join(wt, RESEARCH_REPORT);
-			const reportText =
-				kind === "work" && !interview && !grill && existsSync(reportPath)
-					? readRegular(reportPath).toString("utf8")
-					: null;
+			// No symlink is followed: a worker could point the file at a server-only secret (OTTR-233).
+			let reportText: string | null = null;
+			if (kind === "work" && !interview && !grill) {
+				try {
+					reportText =
+						readBelow(
+							worktreeAnchor(e.path, wt),
+							join(wt, RESEARCH_REPORT),
+							REPORT_MAX_BYTES,
+						)?.toString("utf8") ?? null;
+				} catch (err) {
+					log(`! ${RESEARCH_REPORT}: ${errmsg(err)}`);
+				}
+			}
 			const autoResearch =
 				!releaseCard && !task.research && reportText !== null;
 			if (autoResearch) store.updateTask(id, { research: true });
@@ -1570,7 +1587,12 @@ export function createTurnLoop(
 						if (!p.startsWith(resolve(wt) + sep))
 							log(`! shot ${shot}: path escapes the worktree`);
 						else {
-							const bytes = readRegular(p);
+							const bytes = readBelow(
+								worktreeAnchor(e.path, wt),
+								p,
+								MAX_IMAGE_BYTES,
+							);
+							if (bytes === null) throw new Error("no such file");
 							const ext = sniffImage(bytes);
 							if (ext === null) log(`! shot ${shot}: not a recognized image`);
 							else {
