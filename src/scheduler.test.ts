@@ -205,6 +205,12 @@ describe("queueOrder", () => {
 });
 
 describe("pickRunnable", () => {
+	test("a queued card waits until its queuedAt", () => {
+		const held = task({ stage: "in_progress", queuedAt: 5_000 });
+		expect(pickRunnable([held], { ...opts, now: 4_999 })).toEqual([]);
+		expect(pickRunnable([held], { ...opts, now: 5_000 })).toEqual([held]);
+	});
+
 	test("merge picked before an older queued todo", () => {
 		const todo = task({ queuedAt: 100 });
 		const merge = task({ stage: "merging", queuedAt: 200 });

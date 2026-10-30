@@ -58,6 +58,7 @@ import {
 	FORK_HOLD_REASON,
 	generateTitle,
 	getSettingsLogged,
+	hitUsageLimit,
 	isKeptReason,
 	keptReason,
 	logStoreError,
@@ -8568,6 +8569,62 @@ describe("review findings check", () => {
 		);
 	});
 
+	test("a check at the usage limit holds the review until the reset and files nothing", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const resetsAt = Date.now() + 3_600_000;
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			quota: async () => ({
+				limits: [
+					{
+						provider: "openai-codex",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 100,
+						resetsAt,
+					},
+				],
+				error: null,
+				at: Date.now(),
+			}),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				const result =
+					record.runs.length === 1
+						? runResult({
+								outcome: { status: "answered", summary: "review done" },
+								recorded: record.recorded,
+							})
+						: runResult({
+								exitCode: 1,
+								model: "openai-codex/gpt-5.5",
+								providerError:
+									"Codex error event: The usage limit has been reached (code=usage_limit_reached)",
+							});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at the limit
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.queuedAt).toBe(resetsAt);
+		expect(after.needsReason).toContain("openai-codex usage limit");
+		expect(after.pendingPrompt).toContain("usage limit");
+		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
+			[],
+		);
+	});
+
 	test("the check holds a global cap slot while it runs", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
@@ -8743,6 +8800,16 @@ describe("review findings check", () => {
 		expect(
 			checkRunError(runResult({ exitCode: 1, stderrTail: "boom\n" })),
 		).toBe("the check run exited with code 1: boom");
+		const limited = runResult({
+			exitCode: 1,
+			providerError:
+				"Codex error event: The usage limit has been reached (code=usage_limit_reached)",
+		});
+		expect(checkRunError(limited)).toMatch(/provider usage limit is reached/);
+		expect(hitUsageLimit(limited)).toBe(true);
+		expect(
+			hitUsageLimit(runResult({ exitCode: 1, stderrTail: "boom\n" })),
+		).toBe(false);
 		expect(checkRunError(runResult({ finalText: "  " }))).toMatch(
 			/without a final message/,
 		);
@@ -9244,6 +9311,86 @@ describe("work card check", () => {
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
 		expect(after.workCheckLog[0]!.error).toContain("quota exceeded");
+	});
+
+	const usageLimited = runResult({
+		exitCode: 1,
+		model: "openai-codex/gpt-5.5",
+		providerError:
+			"Codex error event: The usage limit has been reached (code=usage_limit_reached)",
+	});
+
+	test("a check at the usage limit holds the card until the reset, then runs again", async () => {
+		const head = { sha: "sha1" };
+		const resetsAt = Date.now() + 3_600_000;
+		const { store, record, loop } = workCheckCase(
+			head,
+			[usageLimited, pass()],
+			{
+				modelRoles: () => ({ adversary: "openai-codex/gpt-5.5" }),
+				quota: async () => ({
+					limits: [
+						{
+							provider: "openai-codex",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt,
+						},
+					],
+					error: null,
+					at: Date.now(),
+				}),
+			},
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // work run + one check attempt: no retry at the limit
+		const held = store.getTask(task.id)!;
+		expect(held.stage).toBe("in_progress");
+		expect(held.state).toBe("queued");
+		expect(held.queuedAt).toBe(resetsAt);
+		expect(held.needsReason).toContain("openai-codex");
+		expect(held.needsReason).toContain(
+			`${new Date(resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC`,
+		);
+		expect(held.needsReason).not.toContain("failed twice");
+		expect(held.pendingPrompt).toContain("Report the same outcome again");
+		expect(held.workCheckHead).toBeNull();
+		expect(held.workCheckLog[0]!.outcome).toBe("error");
+		const ids = (now?: number) =>
+			pickRunnable(store.listTasks(), {
+				maxParallel: null,
+				hasRules: true,
+				now,
+			}).map((t) => t.id);
+		expect(ids()).not.toContain(task.id);
+		expect(ids(resetsAt + 1)).toContain(task.id);
+
+		// After the reset the scheduler starts the turn: the agent re-reports ready, the check re-runs.
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(4);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckHead).toBe("sha1");
+	});
+
+	test("a check at the usage limit with no known reset parks needs_you after one attempt", async () => {
+		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+			usageLimited,
+		]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // work run + one check attempt
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("usage limit");
+		expect(after.needsReason).not.toContain("failed twice");
+		expect(after.workCheckHead).toBeNull();
 	});
 
 	test("the check holds a global cap slot while it runs", async () => {

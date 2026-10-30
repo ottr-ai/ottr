@@ -12,9 +12,10 @@ import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { defaultSshDir } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { boardOmpHome } from "./login.ts";
+import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { fetchQuota } from "./quota.ts";
 import {
 	highestTag,
 	latestImage,
@@ -361,6 +362,7 @@ const loop = createTurnLoop(projects, {
 	maxTotalRuns: () => shared.maxTotalRuns,
 	reviewCheck: () => shared.reviewCheck,
 	workCheck: () => shared.workCheck,
+	quota: () => fetchQuota(boardOmpEnv()),
 	drained: () => app.drained(),
 	publishSoon: () => app.publishSoon(),
 	notifyLog: (project, id) => app.notifyLog(project, id),

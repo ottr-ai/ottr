@@ -105,6 +105,25 @@ export function forModel(
 	return [...best.values(), ...solo];
 }
 
+/** When this model's provider can run again: over its exhausted windows (100% used) with a
+ *  future reset, the latest reset (every full window must reset). Null when none is known. */
+export function usageReset(
+	limits: QuotaLimit[],
+	model: string | null,
+	now: number,
+): { provider: string; resetsAt: number } | null {
+	let best: { provider: string; resetsAt: number } | null = null;
+	for (const l of forModel(limits, model))
+		if (
+			l.usedPct >= 100 &&
+			l.resetsAt !== null &&
+			l.resetsAt > now &&
+			(best === null || l.resetsAt > best.resetsAt)
+		)
+			best = { provider: l.provider, resetsAt: l.resetsAt };
+	return best;
+}
+
 /** Runs `omp usage --json` with `env` (the board's own omp env, login.ts boardOmpEnv: this
  * module stays free of server imports, the UI bundles it); a failure is a value (error set,
  * no limits), never a throw. */

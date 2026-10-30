@@ -19,6 +19,7 @@ const t = (
 	needsReason: null,
 	pendingPrompt: null,
 	asked: null,
+	queuedAt: null,
 	...overrides,
 });
 
@@ -306,4 +307,24 @@ test("strykerStats splits the stats tail into readout rows", () => {
 		{ label: "", value: "4454/6523" },
 	]);
 	expect(strykerStats("")).toEqual([]);
+});
+
+test("statusLine queued with a future queuedAt shows its hold reason", () => {
+	const reason = "usage limit: openai-codex resets 14:00";
+	expect(
+		statusLine(
+			t({
+				stage: "in_progress",
+				needsReason: reason,
+				queuedAt: Date.now() + 60_000,
+			}),
+			true,
+		),
+	).toBe(reason);
+	expect(
+		statusLine(
+			t({ stage: "in_progress", needsReason: reason, queuedAt: 1 }),
+			true,
+		),
+	).toBe("resuming");
 });

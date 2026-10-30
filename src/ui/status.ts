@@ -48,7 +48,13 @@ export function strykerStats(rest: string): Array<{
 export function statusLine(
 	t: Pick<
 		TaskCard,
-		"state" | "stage" | "needsReason" | "pendingPrompt" | "asked" | "progress"
+		| "state"
+		| "stage"
+		| "needsReason"
+		| "pendingPrompt"
+		| "asked"
+		| "progress"
+		| "queuedAt"
 	>,
 	hasRules: boolean,
 	hold?: string | null,
@@ -60,7 +66,10 @@ export function statusLine(
 		return t.stage === "backlog"
 			? "grill queued"
 			: t.needsReason !== null
-				? "resuming"
+				? // A future queuedAt holds the card (a usage limit): show why.
+					t.queuedAt !== null && t.queuedAt > Date.now()
+					? t.needsReason
+					: "resuming"
 				: t.pendingPrompt !== null
 					? drain
 						? "reply queued · waits for the update restart"

@@ -43,6 +43,7 @@ import {
 	workCheckSendBack,
 	workPrompt,
 } from "./prompts.ts";
+import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
@@ -80,6 +81,7 @@ import type {
 	GitFacts,
 	LatestImage,
 	ProjectSettings,
+	QuotaState,
 	RecordedFinding,
 	RunResult,
 	Task,
@@ -312,6 +314,8 @@ export interface TurnOps {
 		target: string,
 		lastReview: string | null,
 	): Promise<ArchReviewDelta | null>;
+	/** Provider usage limits (`omp usage`), so a check that hit a limit waits for its reset; absent = unknown. */
+	quota?: () => Promise<QuotaState>;
 }
 
 // ponytail: module-level notify hook so exported appendLog keeps its 3-arg
@@ -337,11 +341,27 @@ export function checkRunError(r: RunResult): string | null {
 		const provider = /^No API key found for (.+)$/.exec(last)?.[1];
 		if (provider)
 			return `the check run exited with code ${r.exitCode}: ${provider} has no usable sign-in. Sign in again under Settings, then reply to re-run the check`;
+		if (hitUsageLimit(r))
+			return `the check run exited with code ${r.exitCode}: the provider usage limit is reached. Reply after the limit resets to re-run the check`;
 		return `the check run exited with code ${r.exitCode}${last ? `: ${last}` : ""}`;
 	}
 	if (r.finalText.trim() === "")
 		return "the check run ended without a final message";
 	return null;
+}
+
+/** True when the run stopped at the provider's usage limit: a retry before the reset fails the same way. */
+export function hitUsageLimit(r: RunResult): boolean {
+	return /usage_limit_reached|usage limit/i.test(
+		`${r.stderrTail}\n${r.providerError ?? ""}`,
+	);
+}
+
+/** The queued write that holds a check run until its provider's usage limit resets. */
+interface UsageHold {
+	queuedAt: number;
+	needsReason: string;
+	pendingPrompt: string;
 }
 
 const KEPT_PREFIX = "Kept the worktree: ";
@@ -480,6 +500,21 @@ export function createTurnLoop(
 ): TurnLoop {
 	notifyHook = ops.notifyLog;
 	const running = new Map<string, RunEntry>();
+	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
+	async function usageHold(model: string | null): Promise<UsageHold | null> {
+		const q = await ops.quota?.().catch(() => null);
+		const hit = q ? usageReset(q.limits, model, Date.now()) : null;
+		if (hit === null) return null;
+		const at = new Date(hit.resetsAt)
+			.toISOString()
+			.slice(0, 16)
+			.replace("T", " ");
+		return {
+			queuedAt: hit.resetsAt,
+			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Reply to run it now, or cancel the card.`,
+			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+		};
+	}
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
 	 * once startRun returns, so the cap counts distinct keys, never the two sets' summed sizes.
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
@@ -2282,6 +2317,9 @@ export function createTurnLoop(
 						commitsSince,
 					});
 					// Two attempts, then the user decides: a half-checked review files no cards.
+					// A usage limit skips the retry: it fails the same way until the reset.
+					let hold: UsageHold | null = null;
+					let limitHit = false;
 					for (let attempt = 1; attempt <= 2; attempt++) {
 						const startedAt = Date.now();
 						const handle = ops.startRun({
@@ -2322,18 +2360,37 @@ export function createTurnLoop(
 								break;
 							}
 							checkFailed = "the check verdict was not valid JSON";
-						} else checkFailed = err;
+						} else {
+							checkFailed = err;
+							limitHit = hitUsageLimit(checkResult);
+						}
 						log(`! review check attempt ${attempt} failed: ${checkFailed}`);
+						if (limitHit) {
+							hold = await usageHold(checkResult.model ?? selector ?? null);
+							break;
+						}
 					}
 					if (checkFailed !== null) {
-						log(`- review check gave up after a retry: ${checkFailed}`);
 						const cur = store.getTask(id);
-						if (cur !== null && cur.cancelledAt === null)
-							store.updateTask(id, {
-								stage: "in_progress",
-								state: "needs_you",
-								needsReason: `The review check failed twice: ${checkFailed}. Reply to re-run the review, or cancel the card.`,
-							});
+						if (hold !== null) {
+							log(
+								`- review check held until ${new Date(hold.queuedAt).toISOString()}: usage limit`,
+							);
+							if (cur !== null && cur.cancelledAt === null)
+								store.updateTask(id, {
+									stage: "in_progress",
+									state: "queued",
+									...hold,
+								});
+						} else {
+							log(`- review check gave up after a retry: ${checkFailed}`);
+							if (cur !== null && cur.cancelledAt === null)
+								store.updateTask(id, {
+									stage: "in_progress",
+									state: "needs_you",
+									needsReason: `The review check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run the review, or cancel the card.`,
+								});
+						}
 					} else
 						for (const d of dropped)
 							log(`- dropped finding ${d.id}: ${d.reason}`);
@@ -2507,6 +2564,9 @@ export function createTurnLoop(
 							notes: string[];
 						} | null = null;
 						// Two attempts, then the user decides: an unchecked card never merges.
+						// A usage limit skips the retry: it fails the same way until the reset.
+						let hold: UsageHold | null = null;
+						let limitHit = false;
 						for (let attempt = 1; attempt <= 2; attempt++) {
 							const startedAt = Date.now();
 							const handle = ops.startRun({
@@ -2601,16 +2661,31 @@ export function createTurnLoop(
 									break;
 								}
 								checkFailed = "the work check verdict was not valid JSON";
-							} else checkFailed = err;
+							} else {
+								checkFailed = err;
+								limitHit = hitUsageLimit(checkResult);
+							}
 							log(`! work check attempt ${attempt} failed: ${checkFailed}`);
+							if (limitHit) {
+								hold = await usageHold(checkResult.model ?? selector ?? null);
+								break;
+							}
 						}
 						if (checkFailed !== null) {
 							// No head stamp: the next ready at this head must run the check again.
-							log(`- work check failed: ${checkFailed}`);
+							log(
+								hold !== null
+									? `- work check held until ${new Date(hold.queuedAt).toISOString()}: usage limit`
+									: `- work check failed: ${checkFailed}`,
+							);
 							store.updateTask(id, {
 								stage: "in_progress",
-								state: "needs_you",
-								needsReason: `The work check failed twice: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+								...(hold !== null
+									? { state: "queued" as const, ...hold }
+									: {
+											state: "needs_you" as const,
+											needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+										}),
 								workCheckLog: [
 									...priorLog,
 									{

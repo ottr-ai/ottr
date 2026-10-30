@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { forModel, parseUsage, tightest, tightestFor } from "./quota.ts";
+import {
+	forModel,
+	parseUsage,
+	tightest,
+	tightestFor,
+	usageReset,
+} from "./quota.ts";
 import type { QuotaLimit } from "./types.ts";
 
 // Trimmed from real `omp usage --json` output (2026-09-28).
@@ -228,4 +234,30 @@ test("the picker chip hides when the model has no provider or its provider repor
 	expect(forModel(LIMITS, "glm-5.3-flash")).toEqual([]);
 	expect(forModel(LIMITS, "openai/gpt-5")).toEqual([]);
 	expect(forModel([], "zai/glm-5.3-flash")).toEqual([]);
+});
+
+test("usageReset waits for the latest reset of the model's full windows", () => {
+	const row = (p: Partial<QuotaLimit>): QuotaLimit => ({
+		provider: "openai-codex",
+		label: "x",
+		window: null,
+		plan: null,
+		usedPct: 100,
+		resetsAt: 500,
+		...p,
+	});
+	const rows = [
+		row({ window: "5h", resetsAt: 300 }),
+		row({ window: "7d", resetsAt: 900 }),
+		row({ usedPct: 99, resetsAt: 5_000 }),
+		row({ resetsAt: null }),
+		row({ resetsAt: 50 }),
+		row({ provider: "anthropic", resetsAt: 9_000 }),
+	];
+	expect(usageReset(rows, "openai-codex/gpt-5", 100)).toEqual({
+		provider: "openai-codex",
+		resetsAt: 900,
+	});
+	expect(usageReset(rows, "openai-codex/gpt-5", 1_000)).toBeNull();
+	expect(usageReset(rows, "gpt-5", 100)).toBeNull();
 });
