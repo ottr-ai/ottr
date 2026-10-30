@@ -11,24 +11,25 @@ globalThis.sessionStorage = {
 	clear: () => {},
 	key: () => null,
 } as Storage;
-// A static import cannot work: ESM hoists it, so app.tsx evaluates before the stub above exists.
+// A static import cannot work: ESM hoists it, so the modules evaluate before the stub above exists.
 const {
 	UpdateRowLine,
 	visibleUpdateRows,
 	LaneCol,
-	alateHint,
-	monogram,
-	sourceIconUrl,
 	AskBlock,
 	triageWait,
+	WarningLines,
+	doneTopicPages,
+} = await import("./app.tsx");
+const { monogram, sourceIconUrl } = await import("./kit.tsx");
+const {
+	alateHint,
 	provisionWatchStep,
 	ALATE_WATCH_MAX_DOWN,
 	ALATE_WATCH_DEADLINE_MS,
-	WarningLines,
 	SETTINGS_TOC,
 	SettingsPage,
-	doneTopicPages,
-} = await import("./app.tsx");
+} = await import("./settings.tsx");
 
 describe("monogram", () => {
 	test("initials of the first two words, else the first two characters", () => {

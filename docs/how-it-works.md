@@ -46,7 +46,7 @@ flowchart LR
   supervisor -->|"CI checks, cleanup, reclassify"| projectStore
 ```
 
-- **Board UI (React)** — `src/ui/app.tsx`, live updates in `src/ui/socket.ts` (`connectLive` uses `/api/ws`, `connectPolling` reads `/api/state` every 5 s in production)
+- **Board UI (React)** — `src/ui/app.tsx`, the Settings page in `src/ui/settings.tsx`, live updates in `src/ui/socket.ts` (`connectLive` uses `/api/ws`, `connectPolling` reads `/api/state` every 5 s in production)
 - **HTTP API and WebSocket (createApp)** — `src/app.ts` (`createApp`), request checks in `src/requestGuards.ts`, login in `src/auth.ts`
 - **Web Push** — `src/webpush.ts`
 - **Server bootstrap** — `src/server.ts` (`Bun.serve`, project discovery, timers)

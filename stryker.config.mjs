@@ -77,10 +77,10 @@ export default {
     // Prose for the model; killing its mutants would take tests that pin wording.
     "!src/prompts.ts",
     // Not mutated, on purpose:
-    // - src/ui/app.tsx: what the model-picker/status-line extraction (ott/613bf146) leaves is the
+    // - src/ui/app.tsx, src/ui/settings.tsx, src/ui/kit.tsx (.tsx, so "src/**/*.ts" skips them): the
     //   React render tree plus browser I/O (fetch, FileReader, localStorage). bun test has no DOM
     //   renderer and a component harness would be new dependencies. Move pure policy into a tested
-    //   .ts module instead of growing the file.
+    //   .ts module (e.g. src/ui/models.ts) instead of growing these files.
     // - src/app.ts: the route construction that moved out of server.ts (ott/7f31693f), inheriting
     //   server.ts's exclusion rationale (Bun.serve on import, covered by live proofs). A follow-up
     //   task owns extracting testable policy and bringing the file back into the set.

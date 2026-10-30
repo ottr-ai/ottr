@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import { joinLevel, splitLevel } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
+import fc from "../test/properties.ts";
 import {
+	addRoleError,
+	classifyRolesSave,
 	fetchCatalog,
 	loadCatalog,
 	modelMatches,
@@ -9,9 +12,159 @@ import {
 	ownField,
 	resetCatalogCache,
 	reviewModel,
+	rolesDirty,
 	roleWarnings,
 	seedStep,
 } from "./models.ts";
+
+test("rolesDirty compares rows with the roles in order", () => {
+	const roles = { default: "a/x", slow: "b/y" };
+	expect(
+		rolesDirty(
+			[
+				["default", "a/x"],
+				["slow", "b/y"],
+			],
+			roles,
+		),
+	).toBe(false);
+	expect(
+		rolesDirty(
+			[
+				["default", "a/x"],
+				["slow", "b/z"],
+			],
+			roles,
+		),
+	).toBe(true);
+	expect(
+		rolesDirty(
+			[
+				["slow", "b/y"],
+				["default", "a/x"],
+			],
+			roles,
+		),
+	).toBe(true);
+	expect(
+		rolesDirty(
+			[
+				["default", "a/x"],
+				["slow", "b/y"],
+				["new", "a/x"],
+			],
+			roles,
+		),
+	).toBe(true);
+});
+
+test("addRoleError gives the first failing reason, or null", () => {
+	const rows = [["default", "a/x"]] as const;
+	expect(addRoleError("", rows, undefined)).toBe("Type a role name.");
+	expect(addRoleError("default", rows, undefined)).toBe(
+		"The default role exists already.",
+	);
+	expect(addRoleError("new", rows, undefined)).toBe(
+		"The model list is empty, so a new role has no model.",
+	);
+	expect(addRoleError("new", rows, "a/x")).toBeNull();
+});
+
+const seed = { needed: true, commit: null, roles: null, expiresAt: null };
+const tail = " The rows now show the current values. Make your change again.";
+
+test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
+	const body = { commit: "c1", hash: "h1", roles: { a: "b/c" }, seed };
+	expect(classifyRolesSave(true, 200, body)).toEqual({
+		kind: "saved",
+		...body,
+	});
+	const { seed: _, ...noSeed } = body;
+	expect(classifyRolesSave(true, 200, noSeed)).toEqual({
+		kind: "failed",
+		error: "HTTP 200",
+		fields: {},
+	});
+});
+
+test("classifyRolesSave: saved needs ok and every part", () => {
+	const body = { commit: "c1", hash: "h1", roles: { a: "b/c" }, seed };
+	const failed = (status: number) => ({
+		kind: "failed" as const,
+		error: `HTTP ${status}`,
+		fields: {},
+	});
+	expect(classifyRolesSave(false, 500, body)).toEqual(failed(500));
+	expect(classifyRolesSave(true, 200, { ...body, commit: "" })).toEqual(
+		failed(200),
+	);
+	expect(classifyRolesSave(true, 200, { ...body, hash: undefined })).toEqual(
+		failed(200),
+	);
+	expect(classifyRolesSave(true, 200, { ...body, roles: [] })).toEqual(
+		failed(200),
+	);
+});
+
+test("classifyRolesSave: 409 with hash and roles is a conflict", () => {
+	expect(classifyRolesSave(false, 409, { hash: "h", roles: {} })).toEqual({
+		kind: "conflict",
+		base: null,
+		hash: "h",
+		roles: {},
+		error: `The model roles changed in the data repo.${tail}`,
+	});
+	expect(
+		classifyRolesSave(false, 409, {
+			hash: "h",
+			roles: {},
+			base: "b1",
+			error: "Moved.",
+		}),
+	).toMatchObject({ kind: "conflict", base: "b1", error: `Moved.${tail}` });
+	expect(classifyRolesSave(false, 409, { hash: "h", error: "x" })).toEqual({
+		kind: "failed",
+		error: "x",
+		fields: {},
+	});
+});
+
+test("classifyRolesSave: failures keep string fields and the error", () => {
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "Bad roles.",
+			fields: { a: "Unknown model.", b: 3 },
+		}),
+	).toEqual({
+		kind: "failed",
+		error: "Bad roles.",
+		fields: { a: "Unknown model." },
+	});
+	for (const body of [null, [1], 7, "x"])
+		expect(classifyRolesSave(false, 500, body)).toEqual({
+			kind: "failed",
+			error: "HTTP 500",
+			fields: {},
+		});
+	expect(classifyRolesSave(false, 502, { error: 5 })).toMatchObject({
+		error: "HTTP 502",
+	});
+});
+
+test("classifyRolesSave never throws; saved needs ok, conflict needs 409", () => {
+	fc.assert(
+		fc.property(
+			fc.jsonValue(),
+			fc.boolean(),
+			fc.integer(),
+			(body, ok, status) => {
+				const r = classifyRolesSave(ok, status, body);
+				if (r.kind === "saved") expect(ok).toBe(true);
+				if (r.kind === "conflict") expect(status).toBe(409);
+			},
+		),
+	);
+});
 
 /** id doubles as the selector for these fixtures. */
 const m = (id: string, name: string): ModelOption => ({

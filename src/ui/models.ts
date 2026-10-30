@@ -62,6 +62,103 @@ export function seedStep(
 	return unseeded || same(before) ? "wait" : "replaced";
 }
 
+/** GET /api/model-roles: omp's modelRoles in the data repo, the sign-ins, and the board seed state. */
+export type RolesState = {
+	/** The data repo commit the roles come from; a save sends it back as its base. */
+	base: string | null;
+	hash: string;
+	roles: Record<string, string>;
+	/** The providers with an active sign-in on the board; null when the board cannot read its store. */
+	signIns: string[] | null;
+	/** `roles`: the board copy's roles, which tell whether the seed holds a save. */
+	seed: {
+		needed: boolean;
+		commit: string | null;
+		roles: Record<string, string> | null;
+		expiresAt: string | null;
+	};
+};
+
+/** True when the edited rows differ from the saved roles, order included. */
+export function rolesDirty(
+	rows: readonly (readonly [string, string])[],
+	roles: Record<string, string>,
+): boolean {
+	return JSON.stringify(rows) !== JSON.stringify(Object.entries(roles));
+}
+
+/** Why a new role (trimmed `name`, model `first`) can not be added, or null when it can. */
+export function addRoleError(
+	name: string,
+	rows: readonly (readonly [string, string])[],
+	first: string | undefined,
+): string | null {
+	if (name === "") return "Type a role name.";
+	if (rows.some(([n]) => n === name)) return `The ${name} role exists already.`;
+	if (first === undefined)
+		return "The model list is empty, so a new role has no model.";
+	return null;
+}
+
+/** The result of POST /api/model-roles. */
+export type RolesSave =
+	| {
+			kind: "saved";
+			commit: string;
+			hash: string;
+			roles: Record<string, string>;
+			seed: RolesState["seed"];
+	  }
+	| {
+			kind: "conflict";
+			base: string | null;
+			hash: string;
+			roles: Record<string, string>;
+			error: string;
+	  }
+	| { kind: "failed"; error: string; fields: Record<string, string> };
+
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj =>
+	typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Classifies the save response; `body` is untrusted JSON, so only own, well-typed fields count. */
+export function classifyRolesSave(
+	ok: boolean,
+	status: number,
+	body: unknown,
+): RolesSave {
+	const b: Obj = isObj(body) ? body : {};
+	const own = (k: string) => (Object.hasOwn(b, k) ? b[k] : undefined);
+	const str = (k: string) => {
+		const v = own(k);
+		return typeof v === "string" ? v : undefined;
+	};
+	const obj = (k: string) => {
+		const v = own(k);
+		return isObj(v) ? v : undefined;
+	};
+	const commit = str("commit");
+	const hash = str("hash");
+	const roles = obj("roles") as Record<string, string> | undefined;
+	const seed = obj("seed") as RolesState["seed"] | undefined;
+	const error = str("error");
+	if (ok && commit && hash && roles && seed)
+		return { kind: "saved", commit, hash, roles, seed };
+	if (status === 409 && hash && roles)
+		return {
+			kind: "conflict",
+			base: str("base") ?? null,
+			hash,
+			roles,
+			error: `${error ?? "The model roles changed in the data repo."} The rows now show the current values. Make your change again.`,
+		};
+	const fields: Record<string, string> = {};
+	for (const [k, v] of Object.entries(obj("fields") ?? {}))
+		if (typeof v === "string") fields[k] = v;
+	return { kind: "failed", error: error ?? `HTTP ${status}`, fields };
+}
+
 /** Case-insensitive quick search over the selector and the display name. */
 export function modelMatches(m: ModelOption, query: string): boolean {
 	const q = query.trim().toLowerCase();
