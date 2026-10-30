@@ -1373,6 +1373,148 @@ describe("board seed", () => {
 		]);
 		expect(f.logs.join("\n")).toContain("ALATE_DATA wins over ALATE_DATA_REPO");
 	}, 60_000);
+
+	/** Runs `run` with GitHub served from `dir`: real git, with each `https://github.com/<name>`
+	 *  rewritten to `<dir>/<name>` (url.insteadOf). Returns the argv of each ls-remote. */
+	async function fromLocalGitHub(
+		dir: string,
+		run: () => Promise<void>,
+	): Promise<string[][]> {
+		const remotes: string[][] = [];
+		mock.module("../src/worktree.ts", () => ({
+			...realWorktree,
+			git: (args: string[], cwd: string, timeoutMs?: number) => {
+				if (args.includes("ls-remote")) remotes.push(args);
+				return realGit(
+					["-c", `url.${dir}/.insteadOf=https://github.com/`, ...args],
+					cwd,
+					timeoutMs,
+				);
+			},
+		}));
+		try {
+			await run();
+		} finally {
+			mock.module("../src/worktree.ts", () => ({ ...realWorktree }));
+		}
+		return remotes;
+	}
+
+	test("ALATE_DATA_REPO seeds the head of its GitHub branch, with the token only in the env", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const github = join(root, String(fixtures++));
+		must(
+			root,
+			"clone",
+			"-q",
+			"--bare",
+			data.origin,
+			join(github, "example", "data"),
+		);
+		const head = must(data.main, "rev-parse", "HEAD");
+		// A second branch whose head differs from main's: the @ref picks it.
+		must(data.main, "commit", "-q", "--allow-empty", "-m", "b");
+		const other = must(data.main, "rev-parse", "HEAD");
+		must(
+			data.main,
+			"push",
+			"-q",
+			join(github, "example", "data"),
+			"HEAD:refs/heads/seed",
+		);
+		const token = "tok-never-in-argv";
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		const g = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		const remotes = await fromLocalGitHub(github, async () => {
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA_REPO: "example/data",
+					GH_TOKEN: token,
+				}),
+			).toBe(0);
+			expect(
+				await updateImage(main, ["-f", "c.yml"], g.deps, {
+					ALATE_DATA_REPO: "example/data@seed",
+				}),
+			).toBe(0);
+		});
+		expect(remotes).toEqual([
+			[
+				"-c",
+				"credential.helper=!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f",
+				"ls-remote",
+				"https://github.com/example/data",
+				"refs/heads/main",
+			],
+			["ls-remote", "https://github.com/example/data", "refs/heads/seed"],
+		]);
+		expect(remotes.flat().join(" ")).not.toContain(token);
+		// No ref means main; the board-seed gets the repo value as written.
+		expect(f.seedRuns).toEqual([
+			"compose -f c.yml run --rm --no-deps board-seed --repo example/data",
+		]);
+		expect(f.seedWrites).toEqual([
+			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+		]);
+		expect(g.seedRuns).toEqual([
+			"compose -f c.yml run --rm --no-deps board-seed --repo example/data@seed",
+		]);
+		expect(g.seedWrites).toEqual([
+			`compose -f c.yml exec -T server sh -c printf %s '${other}' > /etc/ottr/seed-commit`,
+		]);
+	}, 60_000);
+
+	test("an ALATE_DATA_REPO that ls-remote cannot read fails the seed, but the deploy completes", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const github = join(root, String(fixtures++));
+		must(
+			root,
+			"clone",
+			"-q",
+			"--bare",
+			data.origin,
+			join(github, "example", "data"),
+		);
+		// A missing branch: ls-remote exits 0 with no line. A missing repo: ls-remote exits non-zero.
+		const runs = ["example/data@nope", "example/gone"].map((repo) => ({
+			repo,
+			f: fakes({ seedRecord: unrecorded, alatePs: "alate123" }),
+		}));
+		await fromLocalGitHub(github, async () => {
+			for (const { repo, f } of runs)
+				expect(
+					await updateImage(main, ["-f", "c.yml"], f.deps, {
+						ALATE_DATA_REPO: repo,
+					}),
+				).toBe(1);
+		});
+		for (const { repo, f } of runs) {
+			expect(f.seedRuns).toEqual([]);
+			expect(f.seedWrites).toEqual([]);
+			expect(f.calls).toEqual([
+				BUILD,
+				CFGJSON,
+				PS,
+				...COMPARE,
+				COUNT,
+				UP,
+				PRUNE,
+			]);
+			expect(f.logs.join("\n")).toContain(
+				`board seed failed: git ls-remote ${repo.split("@")[0]} failed`,
+			);
+		}
+	}, 60_000);
 });
 
 describe("envFileValues", () => {
