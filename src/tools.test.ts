@@ -354,9 +354,8 @@ describe("ensureProjectTools", () => {
 					bin: "f",
 				},
 			]);
-			await expect(ensureProjectTools("slip", home)).rejects.toThrow(
-				/tar|climbs out/,
-			);
+			// tar itself refuses the "../" member; the exec error names it.
+			await expect(ensureProjectTools("slip", home)).rejects.toThrow(/tar/);
 			expect(existsSync(join(home, ".ottr", "tools", sha256(body)))).toBe(
 				false,
 			);

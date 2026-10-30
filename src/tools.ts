@@ -273,7 +273,12 @@ async function unpackInto(
 	}
 }
 
-/** Rejects any entry that is a symlink out of the unpacked dir or whose path climbs out. */
+/**
+ * Rejects a symlink that points out of the unpacked dir. This is a post-check: tar/unzip
+ * already ran, so it cannot stop a write through a symlink during extraction. The trust
+ * boundary is the sha256 pin from the data repo; this only keeps an escaping link out of
+ * the installed folder. Entry names come from readdirSync, so they never hold "..".
+ */
 function guardPaths(name: string, dir: string): void {
 	const stack = [""];
 	while (stack.length > 0) {
@@ -286,8 +291,6 @@ function guardPaths(name: string, dir: string): void {
 				);
 			continue; // never walk through a symlinked dir
 		}
-		if (rel.split("/").includes(".."))
-			throw new Error(`tools: ${name}: archive entry climbs out: ${rel}`);
 		if (statSync(full).isDirectory())
 			for (const child of readdirSync(full))
 				stack.push(rel ? `${rel}/${child}` : child);
