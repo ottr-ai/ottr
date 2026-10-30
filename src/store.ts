@@ -217,8 +217,9 @@ interface TaskRow {
 	topic: string | null;
 	depends_on: string;
 	update_ids: string;
-	update_merge_approved: number;
-	fork_merge_approved: number;
+	update_merge_head: string | null;
+	fork_merge_head: string | null;
+	hold_head: string | null;
 	diff_files: string | null;
 	diff_text: string | null;
 	work_check_log: string;
@@ -363,8 +364,9 @@ function toTask(project: string, r: TaskRow): Task {
 		topic: r.topic,
 		dependsOn: parseStringList(r.depends_on),
 		updateIds: parseStringList(r.update_ids),
-		updateMergeApproved: r.update_merge_approved === 1,
-		forkMergeApproved: r.fork_merge_approved === 1,
+		updateMergeHead: r.update_merge_head,
+		forkMergeHead: r.fork_merge_head,
+		holdHead: r.hold_head,
 		diffFiles: parseDiffFiles(r.diff_files),
 		diffText: r.diff_text,
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
@@ -545,8 +547,9 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	topic: "topic",
 	dependsOn: "depends_on",
 	updateIds: "update_ids",
-	updateMergeApproved: "update_merge_approved",
-	forkMergeApproved: "fork_merge_approved",
+	updateMergeHead: "update_merge_head",
+	forkMergeHead: "fork_merge_head",
+	holdHead: "hold_head",
 	diffFiles: "diff_files",
 	diffText: "diff_text",
 	workCheckLog: "work_check_log",
@@ -1121,6 +1124,11 @@ export class ProjectStore {
 			db.exec("ALTER TABLE tasks ADD COLUMN priority TEXT");
 		if (!cols.includes("close_candidate"))
 			db.exec("ALTER TABLE tasks ADD COLUMN close_candidate TEXT");
+		// Merge-hold heads (replace the retired update/fork_merge_approved flags, which stay
+		// unused in old rows): ALTER-only after the rebuilds, same reason as priority above.
+		for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
+			if (!cols.includes(col))
+				db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
 		const turnCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
 			.all()

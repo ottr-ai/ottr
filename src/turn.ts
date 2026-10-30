@@ -1915,38 +1915,40 @@ export function createTurnLoop(
 						? await ops.statusFiles(wt)
 						: undefined;
 			// U7: an update card on a hold-update-merges project parks for a human approval; the reply
-			// sets updateMergeApproved, and the next ready work turn integrates as usual. A ready work
+			// approves the parked head (holdHead), and the next ready work turn integrates only while
+			// HEAD still equals it: a commit after the approval parks the card again. A ready work
 			// settle lands at merging (commits to integrate) or straight done (already integrated).
-			if (
-				kind === "work" &&
-				(next.stage === "done" || next.stage === "merging") &&
-				task.updateIds.length > 0 &&
-				!task.updateMergeApproved &&
-				store.getSettings().holdUpdateMerges
-			) {
-				next = {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: UPDATE_HOLD_REASON,
-				};
-				commits = undefined; // not done: the approving settle re-measures
-			}
 			// fork-born tasks (analysis proposals AND manual follow-ups of a fork research card) always
 			// hold their merge for approval; the parent existing implies the feature ran, so this is
 			// independent of the forkResearch toggle.
+			const readyWork =
+				kind === "work" && (next.stage === "done" || next.stage === "merging");
+			const updateHold =
+				readyWork &&
+				task.updateIds.length > 0 &&
+				store.getSettings().holdUpdateMerges;
 			const forkParent =
 				task.followUpOf !== null ? store.getTask(task.followUpOf) : null;
-			if (
-				kind === "work" &&
-				(next.stage === "done" || next.stage === "merging") &&
-				forkParent?.topic === "fork research" &&
-				!task.forkMergeApproved
-			) {
+			const forkHold = readyWork && forkParent?.topic === "fork research";
+			const head =
+				updateHold || forkHold
+					? await ops.targetSha(wt, "HEAD").catch(() => null)
+					: null;
+			// A null head (git failed) never matches: the hold fails closed.
+			let holdHead: string | null = null;
+			const holdReason =
+				updateHold && (head === null || task.updateMergeHead !== head)
+					? UPDATE_HOLD_REASON
+					: forkHold && (head === null || task.forkMergeHead !== head)
+						? FORK_HOLD_REASON
+						: null;
+			if (holdReason !== null) {
 				next = {
 					stage: "in_progress",
 					state: "needs_you",
-					needsReason: FORK_HOLD_REASON,
+					needsReason: holdReason,
 				};
+				holdHead = head;
 				commits = undefined; // not done: the approving settle re-measures
 			}
 			const settled = store.getTask(id);
@@ -2023,6 +2025,12 @@ export function createTurnLoop(
 				commits,
 				report,
 				keptFiles,
+				holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
+				// A park spends that hold's approval (undefined keeps the column): a stale approval never
+				// carries into a later settle. Only the parked hold's column clears, so an approved
+				// update hold survives a fork-hold park of the same card.
+				updateMergeHead: holdReason === UPDATE_HOLD_REASON ? null : undefined,
+				forkMergeHead: holdReason === FORK_HOLD_REASON ? null : undefined,
 			});
 
 			// A retro's proposal is filed as a held card (needs_you, followUpOf this retro):

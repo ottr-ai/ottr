@@ -254,10 +254,12 @@ export interface Task {
 	dependsOn: string[];
 	/** Update-card only: record ids (`<name>@<target>`) this card updates; [] for every other task. */
 	updateIds: string[];
-	/** Update card on a hold-update-merges project: a reply to the hold reason approved the merge; the next ready work turn integrates. */
-	updateMergeApproved: boolean;
-	/** Task born from fork research (a proposal or a follow-up of a fork research card): a reply to the hold reason approved the merge. */
-	forkMergeApproved: boolean;
+	/** Update card on a hold-update-merges project: the head the admin approved by a reply to the hold; the merge goes on only while HEAD equals it. */
+	updateMergeHead: string | null;
+	/** Task born from fork research (a proposal or a follow-up of a fork research card): the head the admin approved by a reply to the hold. */
+	forkMergeHead: string | null;
+	/** Server-set HEAD of the worktree when a settle parked the card for a merge hold; null otherwise. A reply approves this head, never one an agent names. */
+	holdHead: string | null;
 	/** Per-file +/- counts of the branch's diff, captured at merge-turn start (after the ff-merge lands, the branch is indistinguishable from the target); null when never captured. */
 	diffFiles: DiffFileStat[] | null;
 	/** The unified diff captured with diffFiles, capped; null when never captured. */

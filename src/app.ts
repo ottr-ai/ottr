@@ -4641,12 +4641,17 @@ export function createApp(deps: AppDeps) {
 									decoded.images,
 								)
 							: [];
-					// U7: a reply on a parked update card approves its merge hold (undefined keeps the column).
-					// Same for a fork-born card parked by the fork merge hold.
+					// U7: a reply on a parked update card approves its merge hold for the head the settle
+					// parked (undefined keeps the column). Same for a fork-born card parked by the fork
+					// merge hold. An agent can write the hold text as its own question, but only a settle
+					// sets holdHead, so that reply approves nothing.
+					const parked = task.holdHead;
 					const approveHold =
+						parked !== null &&
 						task.updateIds.length > 0 &&
 						task.needsReason === UPDATE_HOLD_REASON;
-					const approveForkHold = task.needsReason === FORK_HOLD_REASON;
+					const approveForkHold =
+						parked !== null && task.needsReason === FORK_HOLD_REASON;
 					e.store.updateTask(task.id, {
 						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
 						pendingPrompt: trimmed || ".",
@@ -4655,8 +4660,9 @@ export function createApp(deps: AppDeps) {
 						queuedAt: Date.now(),
 						needsReason: null,
 						asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
-						updateMergeApproved: approveHold || undefined,
-						forkMergeApproved: approveForkHold || undefined,
+						updateMergeHead: approveHold ? parked : undefined,
+						forkMergeHead: approveForkHold ? parked : undefined,
+						holdHead: null,
 					});
 					deps.schedule();
 					return taskResponse(e, task.id);

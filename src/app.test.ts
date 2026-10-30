@@ -1722,30 +1722,46 @@ describe("alate routes", () => {
 			}
 		});
 
-		test("a reply on a parked update card approves the merge hold; other replies do not", async () => {
+		test("a reply on a parked update card approves the parked head; other replies do not", async () => {
 			const p1 = projects.get("p1")!;
 			const held = p1.store.createTask("update pins");
 			p1.store.updateTask(held.id, {
 				updateIds: ["x@1"],
 				needsReason: UPDATE_HOLD_REASON,
 				state: "needs_you",
+				holdHead: "sha-parked",
 			});
 			const res = await post(`/api/projects/p1/tasks/${held.id}/reply`, {
 				text: "approved",
 			});
 			expect(res.status).toBe(200);
-			expect(p1.store.getTask(held.id)!.updateMergeApproved).toBe(true);
-			// Control: a needs_you card with any other reason keeps the column false.
+			expect(p1.store.getTask(held.id)!.updateMergeHead).toBe("sha-parked");
+			expect(p1.store.getTask(held.id)!.holdHead).toBeNull();
+			// An agent can write the hold text itself (a needs_you question): no settle parked
+			// a head, so the reply approves nothing.
+			const forged = p1.store.createTask("update pins");
+			p1.store.updateTask(forged.id, {
+				updateIds: ["x@1"],
+				needsReason: UPDATE_HOLD_REASON,
+				state: "needs_you",
+			});
+			const fres = await post(`/api/projects/p1/tasks/${forged.id}/reply`, {
+				text: "approved",
+			});
+			expect(fres.status).toBe(200);
+			expect(p1.store.getTask(forged.id)!.updateMergeHead).toBeNull();
+			// Control: a needs_you card with any other reason keeps the column null.
 			const control = p1.store.createTask("other question");
 			p1.store.updateTask(control.id, {
 				needsReason: "something else",
 				state: "needs_you",
+				holdHead: "sha-parked",
 			});
 			const cres = await post(`/api/projects/p1/tasks/${control.id}/reply`, {
 				text: "answered",
 			});
 			expect(cres.status).toBe(200);
-			expect(p1.store.getTask(control.id)!.updateMergeApproved).toBe(false);
+			expect(p1.store.getTask(control.id)!.updateMergeHead).toBeNull();
 		});
 
 		test("a pin already at its qualified target is applied; the refresh drops it", async () => {
@@ -4743,12 +4759,13 @@ describe("fork research routes", () => {
 		store.updateTask(t.id, {
 			state: "needs_you",
 			needsReason: FORK_HOLD_REASON,
+			holdHead: "sha-parked",
 		});
 		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
 			text: "approve",
 		});
 		expect(res.status).toBe(200);
-		expect(store.getTask(t.id)?.forkMergeApproved).toBe(true);
+		expect(store.getTask(t.id)?.forkMergeHead).toBe("sha-parked");
 	});
 });
 

@@ -7750,24 +7750,83 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
-	test("the approving reply lets the next turn integrate and remove the worktree", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+	test("an approval binds to the parked head: a later commit parks the card again", async () => {
+		let head: string | null = "sha-1";
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			targetSha: async (_p: string, ref: string) =>
+				ref === "HEAD" ? head : null,
+		});
 		const task = store.createTask("update pins");
 		store.updateTask(task.id, { updateIds: ["a@1"] });
 		store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		// What POST /reply does (U7): queue the card with the hold approved.
-		store.updateTask(task.id, {
-			pendingPrompt: "approved",
-			state: "queued",
-			queuedAt: Date.now(),
-			needsReason: null,
-			updateMergeApproved: true,
-		});
+		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		// What POST /reply does (U7): queue the card and approve the parked head.
+		const approve = () =>
+			store.updateTask(task.id, {
+				pendingPrompt: "approved",
+				state: "queued",
+				queuedAt: Date.now(),
+				needsReason: null,
+				updateMergeHead: store.getTask(task.id)!.holdHead,
+				holdHead: null,
+			});
+		approve();
+		head = "sha-2"; // the agent commits after the approval
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		let after = store.getTask(task.id)!;
+		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
+		expect(after.holdHead).toBe("sha-2");
+		expect(record.removeWorktree).toHaveLength(0);
+		// HEAD unreadable: an approval never matches, the hold fails closed.
+		approve();
+		head = null;
+		await loop.runTurn(store.name, task.id);
+		after = store.getTask(task.id)!;
+		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
+		expect(after.holdHead).toBeNull();
+		expect(after.updateMergeHead).toBeNull(); // the park spent the sha-2 approval
+		// A reply with no parked head approves nothing; the next settle parks at sha-2 again.
+		head = "sha-2";
+		approve();
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.holdHead).toBe("sha-2");
+		// Approved at the head the next settle sees: it integrates.
+		approve();
+		await loop.runTurn(store.name, task.id);
+		after = store.getTask(task.id)!;
 		expect(after.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("an agent's own needs_you with the hold text leaves no head to approve", async () => {
+		const { store, loop } = setup({
+			targetSha: async () => "sha-1",
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "needs_you",
+								summary: "hold",
+								question: UPDATE_HOLD_REASON,
+							},
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, { updateIds: ["a@1"], holdHead: "stale" });
+		store.setSettings({ holdUpdateMerges: true });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
+		expect(after.holdHead).toBeNull();
 	});
 });
 
@@ -8081,8 +8140,8 @@ describe("turn survivor round 4", () => {
 });
 
 describe("turn fork-born merge hold", () => {
-	function forkCase() {
-		const s = setup({ commitsAhead: async () => 0 });
+	function forkCase(overrides: Partial<TurnOps> = {}) {
+		const s = setup({ commitsAhead: async () => 0, ...overrides });
 		const parent = s.store.createTask("fork research: weekly digest");
 		s.store.updateTask(parent.id, {
 			topic: "fork research",
@@ -8105,13 +8164,18 @@ describe("turn fork-born merge hold", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
-	test("an approved fork-born card integrates", async () => {
+	test("an approved fork-born card integrates only at the approved head", async () => {
 		const { store, record, loop, task } = forkCase();
-		store.updateTask(task.id, { forkMergeApproved: true });
+		store.updateTask(task.id, { forkMergeHead: "sha-1" });
+		// The fake HEAD is unreadable (null): the approval does not match.
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
-		expect(after.stage).toBe("done");
-		expect(record.removeWorktree).toHaveLength(1);
+		expect(store.getTask(task.id)!.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+		const ok = forkCase({ targetSha: async () => "sha-1" });
+		ok.store.updateTask(ok.task.id, { forkMergeHead: "sha-1" });
+		await ok.loop.runTurn(ok.store.name, ok.task.id);
+		expect(ok.store.getTask(ok.task.id)!.stage).toBe("done");
+		expect(ok.record.removeWorktree).toHaveLength(1);
 	});
 
 	test("a follow-up of a non-fork parent settles done", async () => {
