@@ -221,8 +221,11 @@ A listed name with no value does not stop the turn; the card log names it.
   401, and every other route there answers 403, even with the token. A turn
   that outlives a board restart holds a stale token: its card filing fails
   with 401.
-- Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default and
-  fallback; `runner.startRun` stays the reference implementation).
+- Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
+  `runner.startRun` stays the reference implementation). When the variable is
+  set, a work turn never runs on the server: if a worker is down or answers
+  non-200, the board settles the turn as a lost worker and requeues it once for
+  a worker. A second failure in a row stops the card with needs_you.
 - Provider keys pass through from the host shell, and so do the keys a project's
   MCP servers read from its committed `.omp/mcp.json` (the file adds its servers
   only to that project's turns). The host omp oauth dir is mounted read-only
@@ -403,7 +406,7 @@ models`, `omp usage`, `omp login`, `omp token` (the token refresh), and the fork
 `boardOmpEnv`). The agent dir above lies in this directory. The entry script creates the
 directory and copies nothing into it, and refuses to start when the variable points into
 the shared home. A worker dispatch removes the variable from the turn env, so a work turn
-and its local fallback keep the shared home. The board's own reads of the shared home keep
+keeps the shared home. The board's own reads of the shared home keep
 `/root`: the apt lists, the shared credential store, and the shared `config.yml` of the
 hindsight flip.
 

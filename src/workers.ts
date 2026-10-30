@@ -203,7 +203,7 @@ export function serveWorker(opts: {
 	});
 }
 
-/** Thrown when the worker is unreachable or answers non-200; the caller falls back to a local spawn. */
+/** Thrown when the worker is unreachable or answers non-200; the caller settles the run as a lost worker. */
 export class WorkerConnectError extends Error {}
 
 function parseSentinel(

@@ -5490,7 +5490,7 @@ describe("turn ownership, cap and settle regressions", () => {
 					record.runs.push(o);
 					o.onSession?.("sess-1");
 					markStarted();
-					// The worker→local fallback: the handle learns its pid only after startTurn.
+					// A handle that learns its pid only after startTurn.
 					queueMicrotask(() => {
 						pid = 4242;
 					});

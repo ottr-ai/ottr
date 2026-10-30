@@ -2141,25 +2141,15 @@ describe("startRun worker dispatch", () => {
 		}
 	}, 30_000); // The dispatch runs the real daemon and a real child; the 5 s default is tighter than that under load.
 
-	test("a connect failure falls back to the local launcher", async () => {
+	test("a connect failure with a worker pool never runs the turn locally", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
-		const saved = {
-			GH_TOKEN: process.env.GH_TOKEN,
-			OTTR_WORKER_TOKEN: process.env.OTTR_WORKER_TOKEN,
-			PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
-		};
-		process.env.GH_TOKEN = "ghp_board_token";
-		process.env.OTTR_WORKER_TOKEN = "worker-secret";
-		process.env.PI_CODING_AGENT_DIR = "/etc/ottr/omp-agent";
 		try {
 			const logPath = join(dir, "run.log");
-			const fake = new FakeOmp();
-			// The fallback starts inside the done-.catch, a tick later; the fake must
-			// emit close only once startLocal's listeners are attached, so the launcher
-			// schedules it.
-			const seen: Parameters<RunLauncher>[2][] = [];
-			const launcher: RunLauncher = (_c, _a, options) => {
-				seen.push(options);
+			// The server mounts board-only volumes (tokens, ssh keys): a worker turn must never spawn here.
+			let spawned = 0;
+			const launcher: RunLauncher = () => {
+				spawned++;
+				const fake = new FakeOmp();
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
@@ -2167,36 +2157,33 @@ describe("startRun worker dispatch", () => {
 			const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
 			const deadUrl = `http://127.0.0.1:${dead.port}`;
 			dead.stop(true);
-			const handle = startRun({
+			const r = await startRun({
 				...baseOpts(dir, logPath),
 				worker: { urls: [deadUrl] },
-				board: {
-					url: "http://127.0.0.1:4747",
-					token: "boot-token",
-					project: "ottr",
-					taskId: "t1",
-				},
 				launcher,
+			}).done;
+			expect(spawned).toBe(0);
+			expect(r.exitCode).toBeNull();
+			expect(r.workerLost).toBe(true);
+			expect(readFileSync(logPath, "utf8")).toContain("worker dispatch failed");
+			// Settled as a lost worker: requeued once for a worker, then parked for a human.
+			const first = classify({
+				kind: "work",
+				result: r,
+				git: git(),
+				target: null,
+				previousError: null,
 			});
-			fake.emit("close", 0);
-			const r = await handle.done;
-			expect(r.exitCode).toBe(0);
-			// The fallback is still a work turn on the server: neither the worker token
-			// nor the board's GitHub token may reach it (D6); the board coordinates must.
-			// The pinned agent dir stays out too: a turn must not hold the directory the
-			// board's privileged turns execute (R5-1).
-			expect(seen[0]!.env).not.toHaveProperty("OTTR_WORKER_TOKEN");
-			expect(seen[0]!.env).not.toHaveProperty("GH_TOKEN");
-			expect(seen[0]!.env).not.toHaveProperty("PI_CODING_AGENT_DIR");
-			expect(seen[0]!.env).toHaveProperty("OTTR_BOARD_TOKEN", "boot-token");
-			const log = readFileSync(logPath, "utf8");
-			expect(log).toContain("worker: dispatching to");
-			expect(log).toContain("falling back to local spawn");
+			expect(first.state).toBe("queued");
+			const again = classify({
+				kind: "work",
+				result: r,
+				git: git(),
+				target: null,
+				previousError: first.needsReason ?? null,
+			});
+			expect(again.state).toBe("needs_you");
 		} finally {
-			for (const [k, v] of Object.entries(saved)) {
-				if (v === undefined) delete process.env[k];
-				else process.env[k] = v;
-			}
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -2235,19 +2222,8 @@ describe("startRun worker dispatch", () => {
 			// A board-side turn (merge, release review, release): no worker target.
 			await startRun({ ...baseOpts(dir, join(dir, "board.log")), ...opts })
 				.done;
-			// A work turn whose worker is down runs locally and keeps the shared home.
-			const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
-			const deadUrl = `http://127.0.0.1:${dead.port}`;
-			dead.stop(true);
-			await startRun({
-				...baseOpts(dir, join(dir, "work.log")),
-				...opts,
-				worker: { urls: [deadUrl] },
-			}).done;
-			expect(seen.map((s) => s.env?.HOME)).toEqual([board, shared]);
+			expect(seen.map((s) => s.env?.HOME)).toEqual([board]);
 			expect(reachable(seen[0]!.env)).toBe(0);
-			expect(reachable(seen[1]!.env)).toBe(plants.length);
-			expect(seen[1]!.env).not.toHaveProperty("OTTR_BOARD_OMP_HOME");
 			// The board's own config readers (model roles, sign-in store) follow its omp.
 			expect(agentDir()).toBe(join(board, ".omp", "agent"));
 		} finally {
@@ -2259,48 +2235,22 @@ describe("startRun worker dispatch", () => {
 		}
 	});
 
-	test("a 500 spawn-failed body reaches the dispatch context and the failure reason", async () => {
+	test("a 500 spawn-failed body reaches the dispatch context and the stderr tail", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
 		const server = Bun.serve({
 			port: 0,
 			fetch: () => new Response("spawn failed: no such image", { status: 500 }),
 		});
 		try {
-			const fake = new FakeOmp(4242);
-			// The fallback starts inside the done-.catch, a tick later; the fake must
-			// emit close only once startLocal's listeners are attached, so the launcher
-			// schedules it.
-			const launcher: RunLauncher = () => {
-				queueMicrotask(() => fake.emit("close", 1));
-				return fake as unknown as ChildProcess;
-			};
-			const handle = startRun({
+			const r = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				launcher,
-			});
-			fake.emit("close", 1);
-			const r = await handle.done;
-			expect(r.exitCode).toBe(1);
-			expect(r.stderrTail).toBe("");
-			expect(r.dispatch).toContain(
-				`local fallback (worker http://127.0.0.1:${server.port} responded 500: spawn failed: no such image)`,
+			}).done;
+			expect(r.workerLost).toBe(true);
+			expect(r.dispatch).toContain(`worker http://127.0.0.1:${server.port}`);
+			expect(r.stderrTail).toContain(
+				`worker http://127.0.0.1:${server.port} responded 500: spawn failed: no such image`,
 			);
-			expect(r.dispatch).toContain("argv ");
-			expect(r.dispatch).toContain("pid 4242");
-			// The board's failure reason answers "why did my turn die" in one glance.
-			const next = classify({
-				kind: "work",
-				result: r,
-				git: git(),
-				target: null,
-				previousError: null,
-			});
-			expect(next.needsReason).toContain(
-				"before finishing (dispatch local fallback (worker http://127.0.0.1:",
-			);
-			expect(next.needsReason).toContain("spawn failed: no such image");
-			expect(next.needsReason?.endsWith(", no stderr).")).toBe(true);
 		} finally {
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
@@ -2310,7 +2260,7 @@ describe("startRun worker dispatch", () => {
 	test("a worker never receives the board's GitHub token or data dir (D6)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
 		let forwarded: object | null = null;
-		// Records the run request, then refuses it: the turn falls back to the local launcher.
+		// Records the run request, then refuses it: the turn settles as a lost worker.
 		const server = Bun.serve({
 			port: 0,
 			fetch: async (req) => {
@@ -2337,15 +2287,9 @@ describe("startRun worker dispatch", () => {
 		process.env.OTTR_SERVER_DATA_DIR = join(dir, "state");
 		process.env.OTTR_PROBE_KEPT = "kept"; // stands in for provider keys, which must travel
 		try {
-			const fake = new FakeOmp();
-			const launcher: RunLauncher = () => {
-				queueMicrotask(() => fake.emit("close", 0));
-				return fake as unknown as ChildProcess;
-			};
 			const handle = startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				launcher,
 			});
 			await handle.done;
 			expect(forwarded).not.toBeNull();
@@ -2396,15 +2340,9 @@ describe("startRun worker dispatch", () => {
 			process.env[n] = keyPath;
 		}
 		try {
-			const fake = new FakeOmp();
-			const launcher: RunLauncher = () => {
-				queueMicrotask(() => fake.emit("close", 0));
-				return fake as unknown as ChildProcess;
-			};
 			const handle = startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				launcher,
 			});
 			await handle.done;
 			expect(forwarded).not.toBeNull();

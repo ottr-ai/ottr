@@ -302,7 +302,7 @@ export const MODEL_RESTORE = "This board cannot load the session's model";
  * omp writes one JSON file per rejected HTTP 400 request under its state root:
  * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
  * runs with even when PI_CODING_AGENT_DIR pins the agent dir — omp skips the XDG state-root probe
- * under the override. Worker turns (and their local fallback) write to the shared home, the
+ * under the override. Worker turns write to the shared home, the
  * board's own turns to boardOmpHome(), so the reader scans both. The shared one is
  * worker-writable, but only the file name (never the body) is read; a plant can forge a file
  * name at worst.
@@ -1024,28 +1024,22 @@ export function startRun(o: {
 	const args = buildOmpArgs(o);
 	const startedAt = Date.now();
 
-	// A fallback reuses the caller's (secret-stripped) env; a plain launch derives it. Every
-	// local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
-	const startLocal = (
-		mode = "local",
-		withEnv?: Record<string, string>,
-	): RunHandle => {
+	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
+	const startLocal = (): RunHandle => {
 		const launch: RunLauncher = o.launcher ?? spawn;
 		const child = launch("omp", args, {
 			cwd: o.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
-			env:
-				withEnv ??
-				childEnv({
-					sessionName: o.sessionName,
-					board: o.board ?? null,
-					// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
-					// replacing it would strip PATH and the provider auth the child needs. HOME moves
-					// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
-					base: boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env })),
-					stripBoard: o.stripBoard,
-				}),
+			env: childEnv({
+				sessionName: o.sessionName,
+				board: o.board ?? null,
+				// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
+				// replacing it would strip PATH and the provider auth the child needs. HOME moves
+				// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
+				base: boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env })),
+				stripBoard: o.stripBoard,
+			}),
 		});
 
 		let killed = false;
@@ -1074,7 +1068,7 @@ export function startRun(o: {
 					exitCode: code,
 					killed,
 					stderrTail: sink.tail(),
-					dispatch: `${mode}, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
+					dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
 				}),
 			);
 		};
@@ -1111,7 +1105,7 @@ export function startRun(o: {
 	// The pinned PI_CODING_AGENT_DIR and OTTR_BOARD_OMP_HOME stay out too (R5-1): a turn that
 	// ran the board's own agent dir or home could rewrite the config, skills and plugins the
 	// board's privileged turns execute, and a worker without its own shared store would find
-	// no credentials. The worker turn and its local fallback keep the shared HOME.
+	// no credentials. The worker turn keeps the shared HOME.
 	const env = childEnv({
 		sessionName: o.sessionName,
 		board: o.board ?? null,
@@ -1135,31 +1129,30 @@ export function startRun(o: {
 		o.worker,
 		sink,
 	);
-	let current: RunHandle | null = null;
+	const dispatch = (): string =>
+		`worker ${workerHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`;
 	return {
 		// pid is null while omp lives in the worker container's namespace; sweepLostTurns
 		// treats an open pid-null row without a live entry as lost after a tracker restart.
-		get pid() {
-			return current?.pid ?? null;
-		},
+		pid: null,
 		done: workerHandle.done
-			.then((r) => ({
-				...r,
-				// The worker's own pid is in its container namespace; only the wall duration is local.
-				dispatch: `worker ${workerHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
-			}))
+			// The worker's own pid is in its container namespace; only the wall duration is local.
+			.then((r) => ({ ...r, dispatch: dispatch() }))
 			.catch((err) => {
 				if (!(err instanceof WorkerConnectError)) throw err;
-				sink.logMark(
-					`! worker dispatch failed: ${err.message}; falling back to local spawn\n`,
-				);
-				current = startLocal(`local fallback (${err.message})`, env);
-				return current.done;
+				// Fail closed: never run a worker turn in the server, which mounts server-only
+				// volumes (board config, tracker state, tokens, ssh keys). Settle as a lost worker:
+				// classify requeues it once for a worker, then parks it for a human.
+				sink.logMark(`! worker dispatch failed: ${err.message}\n`);
+				return sink.result({
+					exitCode: null,
+					killed: false,
+					stderrTail: `${sink.tail()}\nworker dispatch failed: ${err.message}`,
+					workerLost: true,
+					dispatch: dispatch(),
+				});
 			}),
-		kill: async () => {
-			workerHandle.kill();
-			await current?.kill();
-		},
+		kill: async () => workerHandle.kill(),
 	};
 }
 

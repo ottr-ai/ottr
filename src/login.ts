@@ -365,7 +365,7 @@ export const boardOmpHome = (): string => {
 /**
  * Env for every omp the board spawns for itself (merge, release review and release turns,
  * `omp models`, `omp usage`, `omp login`, the fork-analysis gateway): `base` with HOME moved to
- * boardOmpHome(). Worker turns and their local fallback keep the shared home.
+ * boardOmpHome(). Worker turns keep the shared home.
  */
 export const boardOmpEnv = (
 	base: Record<string, string | undefined> = process.env,
