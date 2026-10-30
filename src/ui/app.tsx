@@ -8676,6 +8676,7 @@ function GitHostsSection() {
 					</table>
 				)}
 				<form
+					className="settings-form"
 					onSubmit={(e) => {
 						e.preventDefault();
 						saveToken();
@@ -10323,7 +10324,7 @@ function LearningsSection({
 			hint="Standing review conventions, stated once. Every Review card's prompt carries them, so a finding that only restates one is treated as noise."
 		>
 			{items !== null && items.length === 0 && (
-				<p className="dim">No learnings yet.</p>
+				<p className="hint">No learnings yet.</p>
 			)}
 			{items !== null && items.length > 0 && (
 				<ul className="learnings-list">
@@ -11312,7 +11313,7 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 		<>
 			{warnings.map((w, i) => (
 				<p className="notif-line" role="note" key={`warn:${i}`}>
-					<span aria-hidden="true">⚠</span>
+					<Mark kind="warn" />
 					<span>{w}</span>
 				</p>
 			))}

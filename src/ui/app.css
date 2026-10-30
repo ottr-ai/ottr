@@ -661,6 +661,10 @@ textarea {
 	flex: 1;
 	min-width: 0;
 }
+/* The select fills its column, so its box ends level with the taller model trigger. */
+.model-fields select {
+	flex: 1;
+}
 /* Model picker: the trigger looks like the select it replaced and opens the popover
    holding the search bar and the roles/catalog list. */
 /* Caption row above the trigger: label text left, the selected model's quota chip right. */
@@ -711,6 +715,13 @@ textarea {
 .model-trigger:focus-visible {
 	border-color: var(--accent);
 	outline-offset: 0;
+}
+/* One line like the select it replaced: a long model name ellipsizes instead of growing the row. */
+.model-trigger > span {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
 }
 .model-trigger .icon-svg {
 	flex: none;
@@ -1160,6 +1171,7 @@ textarea {
 }
 .area-add {
 	justify-content: flex-start;
+	width: 100%;
 	margin-top: 8px;
 	color: var(--text);
 	background: transparent;
@@ -1214,6 +1226,7 @@ textarea {
 .project-head {
 	display: flex;
 	align-items: flex-start;
+	flex-wrap: wrap; /* a narrow board puts the actions under the name, never crushes it */
 	justify-content: space-between;
 	gap: 16px;
 }
@@ -1237,6 +1250,7 @@ textarea {
 	color: var(--accent);
 }
 .project-id {
+	flex: 1 1 200px; /* the actions move under the name only when it would get less than 200px */
 	display: flex;
 	align-items: center;
 	gap: 12px;
@@ -1418,8 +1432,26 @@ textarea {
 .project-actions {
 	display: flex;
 	flex-shrink: 0;
-	align-items: center;
+	align-items: stretch; /* search, segment group and New task share one height and top */
 	gap: 8px;
+}
+/* Narrow board: the actions take their own line, the search fills what the icon-only
+   segments and New task leave. The icon plus its aria-label/tooltip carry each action. */
+@container (max-width: 960px) {
+	.project-actions {
+		flex: 1 1 100%;
+	}
+	.project-head .search {
+		flex: 1 1 auto;
+		width: auto;
+		min-width: 0;
+	}
+	.project-actions .seg .seg-label {
+		display: none;
+	}
+	.project-actions .primary {
+		flex: none;
+	}
 }
 /* Release preview: the version change reads first, the notes sit in a recessed scrollable well. */
 .release-line {
@@ -1936,11 +1968,17 @@ a.release:hover {
 	letter-spacing: 0.08em;
 	color: var(--dim);
 }
-/* Todo lane's backlog row: label, right-aligned count and the Add draft button share one line. */
+/* Todo lane's backlog row: the count sits beside the label, the Add draft button takes the line's end. */
 .backlog-head {
 	display: flex;
 	align-items: center;
 	gap: 6px;
+}
+.backlog-head .topic-count {
+	margin-left: 0;
+}
+.backlog-head .lane-add {
+	margin-left: auto;
 }
 .lane-add {
 	display: inline-flex;
@@ -2233,6 +2271,11 @@ a.release:hover {
 	height: 9px;
 	margin-right: 6px;
 }
+/* An svg has no text baseline, so a bare mark rides high: drop it onto the row's text. */
+.ov td > .mark-needs {
+	vertical-align: -2px;
+	margin-right: 6px;
+}
 .ov td:last-child {
 	padding: 4px 8px;
 }
@@ -2240,8 +2283,12 @@ a.release:hover {
 	display: inline-flex;
 	align-items: center;
 	gap: 5px;
+	vertical-align: -3px;
 	font-weight: 600;
 	color: var(--alarm);
+}
+.needs-count + .needs-count {
+	margin-left: 12px;
 }
 .needs-count.ask-n {
 	color: var(--accent);
@@ -2443,6 +2490,9 @@ a.release:hover {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
+}
+/* Only the caption is small: the select keeps the input type size, so the row's controls share one height. */
+.triage-rank > span {
 	font-size: 13px;
 	color: var(--dim);
 }
@@ -2472,7 +2522,8 @@ a.release:hover {
 }
 /* Review learnings: one row per convention, then the add form. */
 .learnings-list {
-	margin: 8px 0 0;
+	align-self: stretch;
+	margin: 0;
 	padding: 0;
 	list-style: none;
 }
@@ -2503,17 +2554,21 @@ a.release:hover {
 	font-size: 12px;
 	font-variant-numeric: tabular-nums;
 }
+/* Same field width and caption as .settings-field; the button keeps its own width. */
 .learnings-add {
 	display: grid;
 	gap: 8px;
-	margin-top: 10px;
-	max-width: 480px;
+	align-self: stretch;
+	max-width: 460px;
 }
 .learnings-add label {
 	display: grid;
 	gap: 4px;
-	font-size: 13px;
+	font-size: 12.5px;
 	color: var(--dim);
+}
+.learnings-add > button {
+	justify-self: start;
 }
 .tri-sep {
 	height: 1px;
@@ -2656,6 +2711,10 @@ a.release:hover {
 @container (max-width: 1100px) {
 	.kpis {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+	/* An odd last tile spans the row, so no bare hairline-grey cell fills the gap. */
+	.kpi:last-child:nth-child(odd) {
+		grid-column: 1 / -1;
 	}
 }
 @media (max-width: 720px) {
@@ -2887,8 +2946,12 @@ dialog.diff-view {
 }
 .dialog-actions {
 	display: flex;
+	flex-wrap: wrap; /* phone width: the primary drops to a second row instead of wrapping its label */
 	justify-content: flex-end;
 	gap: 8px;
+}
+.dialog-actions > button {
+	white-space: nowrap;
 }
 /* The image picker sits apart on the row's left edge; Cancel and the primary stay right. */
 .dialog-actions .browse {
@@ -2899,6 +2962,7 @@ dialog.diff-view {
 .settings-form {
 	display: flex;
 	flex-direction: column;
+	align-self: stretch;
 	align-items: flex-start;
 	gap: 8px;
 }
@@ -2912,6 +2976,12 @@ dialog.diff-view {
 	border: 1px solid var(--line-soft);
 	border-radius: 6px;
 }
+/* The panel holds the fields: same column rhythm as the form. [hidden] must keep display: none. */
+.add-form > [role="tabpanel"]:not([hidden]) {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
 .add-form label {
 	display: flex;
 	flex: 1;
@@ -2923,8 +2993,18 @@ dialog.diff-view {
 .add-tabs .gh-mark {
 	margin-right: 6px;
 }
-.settings-form .meter-track {
-	width: 120px;
+/* Runners' Configured readout: label on the definition rows' name column, bar on the value column. */
+.settings-sec > .meter {
+	display: grid;
+	grid-template-columns: minmax(180px, 240px) 120px auto;
+	gap: 14px;
+	justify-content: start;
+	align-self: stretch;
+}
+/* Outranks the stacked-shell rule that hides bar tracks. */
+.settings-sec > .meter .meter-track {
+	display: block;
+	width: auto;
 }
 /* ---- Settings page: a config bench beside a section rail, not a dialog. ---- */
 .settings-page {
@@ -2979,6 +3059,9 @@ dialog.diff-view {
 	flex-direction: column;
 	gap: 20px;
 	min-width: 0;
+	/* The cards collapse on this column's width (@container below), not the viewport's:
+	   at tablet widths the rails leave the column phone-narrow. */
+	container-type: inline-size;
 	/* Signature interaction: a section switch arrives once, on the shared easing. */
 	animation: settings-in 160ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
@@ -3005,8 +3088,9 @@ dialog.diff-view {
 	gap: 8px;
 	margin: 0;
 }
+/* The name takes the free space, so the chip, Run setup again and Save group at the right. */
 .settings-head h2 {
-	margin: 0;
+	margin: 0 auto 0 0;
 }
 .settings-sec {
 	display: flex;
@@ -3162,6 +3246,10 @@ dialog.diff-view {
 .settings-sec > .hint {
 	margin: 0;
 }
+/* An idle live region stays mounted for announcements; cancel its flex gap so it adds no blank band. */
+.settings-sec > [aria-live]:empty {
+	margin-top: -12px;
+}
 /* Field pairs: dim caption over a full-width value, capped for readable line lengths. */
 .settings-field {
 	display: flex;
@@ -3194,17 +3282,20 @@ dialog.diff-view {
 .settings-danger .sec-title h3 {
 	color: var(--crit);
 }
-@media (max-width: 720px) {
+@media (max-width: 900px) {
 	.settings-page {
 		grid-template-columns: 1fr;
 		gap: 12px;
 	}
+	/* One tab run that wraps tight (the 44px links need no row gap), so the
+	   current page never hides off-screen: General, the Projects divider, each project. */
 	.settings-nav {
 		position: static;
 		flex-flow: row wrap;
-		gap: 4px 12px;
+		align-items: center;
+		gap: 0 12px;
 		max-height: none;
-		overflow-x: auto;
+		border-bottom: 1px solid var(--line-soft);
 	}
 	.settings-nav .settings-toc {
 		display: none;
@@ -3229,6 +3320,7 @@ dialog.diff-view {
 		min-height: 44px;
 	}
 	.snb {
+		min-height: 44px;
 		padding: 11px 2px;
 		white-space: nowrap;
 		border-left: 0;
@@ -3238,8 +3330,14 @@ dialog.diff-view {
 		border-bottom-color: var(--accent);
 	}
 	.snb-label {
-		flex-basis: 100%;
-		margin: 6px 0 2px;
+		flex: none;
+		margin: 0;
+		padding-left: 12px;
+		white-space: nowrap;
+		border-left: 1px solid var(--line-soft);
+	}
+	.snb-label::after {
+		display: none;
 	}
 }
 .settings-save {
@@ -3267,6 +3365,13 @@ dialog.diff-view {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 16px;
+}
+.settings-numbers label {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
 }
 .settings-numbers input {
 	width: 72px;
@@ -3308,6 +3413,8 @@ dialog.diff-view {
 	outline-offset: -1px;
 }
 .stage-tabs button {
+	flex: 1 0 auto; /* never shrink under the label: tabs grow to fill, or the strip scrolls */
+	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
 	gap: 6px;
 	white-space: nowrap;
 }
@@ -3647,19 +3754,25 @@ dialog.drawer[open] {
 	font-size: 12.5px;
 	color: var(--dim);
 }
-/* Quiet meta line: values bright, timestamps dim, dots between; no chip boxes. */
+/* Quiet meta line: values bright, timestamps dim, dots between; no chip boxes.
+   Every item leads with its dot; the dot that starts a line hangs in a clipped
+   20px gutter, so a wrapped line starts flush instead of with an orphan dot. */
 .drawer-sub {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: baseline;
 	gap: 4px 0;
-	margin: 8px 0 0;
+	margin: 8px 0 0 -20px;
+	/* the outset keeps the id button's focus ring */
+	clip-path: inset(-6px -6px -6px 20px);
 	font-size: 12.5px;
 	color: var(--text);
 }
-.drawer-sub > span + span::before {
+.drawer-sub > span::before {
 	content: "·";
-	margin: 0 7px;
+	display: inline-block;
+	width: 20px;
+	text-align: center;
 	color: var(--dim);
 }
 .drawer-sub .sub-dim {
@@ -3999,6 +4112,9 @@ dialog.drawer[open] {
 	flex: 1;
 	min-width: 0;
 }
+.ask-custom > button {
+	align-self: stretch; /* same height as the field beside it */
+}
 .kept-panel {
 	margin: 8px 0;
 	padding: 10px 12px;
@@ -4316,6 +4432,14 @@ button.diff-path {
 	position: relative;
 	padding: 7px 9px;
 }
+/* The section's own 18px step follows the last turn; its padding (and the flex list keeps
+   a trailing callout's margin inside) would double it. */
+.turns li:last-child {
+	padding-bottom: 0;
+}
+.turns li:last-child .turn-body > .needs-reason:last-child {
+	margin-bottom: 0;
+}
 /* The glow wraps the agent's part only: the turn's steer/reply bubble leads the
    row display-only (the click skips it), so the hover must not paint it either. */
 .turn-body {
@@ -4364,6 +4488,7 @@ button.diff-path {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: baseline;
+	justify-content: flex-start; /* the base button centers; a wrapped row must keep the left edge */
 	gap: 8px;
 	/* border-box: 100% + both paddings, so the content column stays where it was */
 	width: calc(100% + 18px);
@@ -4525,12 +4650,6 @@ button.diff-path {
 .composer-actions select {
 	padding: 0 9px;
 }
-.composer-actions .model-trigger > span {
-	min-width: 0;
-	overflow: hidden;
-	white-space: nowrap;
-	text-overflow: ellipsis;
-}
 /* Add image hugs the left edge; the secondaries and the primary stay on the right, also when
    the narrow drawer wraps them to a second line. */
 .composer-bar {
@@ -4671,6 +4790,28 @@ button.diff-path {
 	display: none;
 }
 
+/* Mid-width windows: the meters drop the note, then fold to the phone summary,
+   so the bar never outgrows the window and widens the page. */
+@media (max-width: 1340px) {
+	.meter-note {
+		display: none;
+	}
+}
+@media (max-width: 1140px) {
+	/* Stats collapse to one inline number: the third meter, the quota (falls
+	   back to agent occupancy when no quota meter renders).
+	   The detail popover (the whole .meters button) still carries every meter. */
+	.meters .meter {
+		display: none;
+	}
+	.meters .meter:nth-of-type(3) {
+		display: inline-flex;
+	}
+	/* The icon and the running count stand in for the hidden Agents meter. */
+	.agents-count {
+		display: inline-flex;
+	}
+}
 @media (max-width: 720px) {
 	.shell {
 		grid-template-columns: minmax(0, 1fr);
@@ -4711,18 +4852,8 @@ button.diff-path {
 		min-width: 0;
 		padding: 0 6px;
 	}
-	.meter-track,
-	.meter-note {
+	.meter-track {
 		display: none;
-	}
-	/* Stats collapse to one inline number: the third meter, the quota (falls
-	   back to agent occupancy when no quota meter renders).
-	   The detail popover (the whole .meters button) still carries every meter. */
-	.meters .meter {
-		display: none;
-	}
-	.meters .meter:nth-of-type(3) {
-		display: inline-flex;
 	}
 	/* The detail panel spans the screen instead of hanging off its anchor past the right edge. */
 	.popover {
@@ -4733,10 +4864,6 @@ button.diff-path {
 	.meter-value {
 		min-width: 0;
 	}
-	/* The icon and the running count stand in for the hidden Agents meter. */
-	.agents-count {
-		display: inline-flex;
-	}
 	.main {
 		padding: 14px 12px;
 	}
@@ -4745,45 +4872,22 @@ button.diff-path {
 	.stage-cards {
 		padding-bottom: 72px; /* FAB 56px + 16px bottom offset */
 	}
-	.project-head {
-		flex-wrap: wrap;
-	}
-	/* The GitHub mark and release tag flow beside the h1 on one line; only a long
-	   name wraps them below. */
-	.project-id-text {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 2px 12px;
-	}
-	.project-meta {
-		margin: 0;
-	}
-	/* Search fills its line, buttons share the next; the row itself takes one full-width line. */
+	/* The segments take the full line under the search. */
 	.project-actions {
-		flex: 1 1 100%;
 		flex-wrap: wrap;
 	}
-	.project-head .search {
-		flex: 1 1 auto;
-		width: auto;
-		min-width: 0;
-	}
-	/* Icon-only segments share one row: the label hides on touch, the icon plus
-	   its aria-label/tooltip carry the action. Equal thirds, halves, or a lone
-	   full-width icon; min-height 40px comes from the tier's button rule. */
+	/* Icon-only segments share one row as separate buttons: equal thirds, halves, or a
+	   lone full-width icon; min-height 40px comes from the tier's button rule. */
 	.project-actions .seg {
 		display: flex;
 		gap: 8px;
+		border: 0; /* separate bordered buttons on touch, no group edge around them */
 		width: 100%;
 	}
 	.project-actions .seg button {
 		flex: 1;
 		border: 1px solid var(--line);
 		border-radius: 4px;
-	}
-	.project-actions .seg .seg-label {
-		display: none;
 	}
 	/* No hardware keyboard on touch: the shortcut badge is noise and costs width. */
 	.project-actions kbd {
@@ -4822,10 +4926,12 @@ button.diff-path {
 	button.icon {
 		min-width: 40px;
 	}
-	/* 16px stops iOS Safari zooming the field on focus. */
+	/* 16px stops iOS Safari zooming the field on focus. The model trigger stands in for a
+	   select, so it keeps the same type size as the Thinking select beside it. */
 	input,
 	select,
-	textarea {
+	textarea,
+	.model-trigger {
 		font-size: 16px;
 	}
 	/* The composer's narrow select keeps 16px (no iOS zoom) and matches the 40px trigger beside it. */
@@ -4980,11 +5086,16 @@ button.diff-path {
 	display: grid;
 	gap: 0.5rem;
 	justify-items: start;
+	align-self: stretch;
 }
+/* Same caption and width cap as .settings-field. */
 .pending-key label {
 	display: grid;
-	gap: 0.25rem;
+	gap: 4px;
 	width: 100%;
+	max-width: 460px;
+	font-size: 12.5px;
+	color: var(--dim);
 }
 
 /* --- Web Push (begin): the bell toggle is desktop-only; phones use the push opt-in instead. --- */
@@ -5009,9 +5120,28 @@ button.diff-path {
 	.ask-opt,
 	.add-tabs button,
 	.stage-tabs button,
+	.perf-range button,
 	.notif-line button.icon {
 		min-height: 44px;
 		min-width: 44px;
+	}
+	/* The bar is 48px: the lit bell keeps its 44px hit area but paints a 32px plate,
+	   the same height as the other bar chrome, so it never touches the bar edges. */
+	.bar > button.inbox.lit,
+	.bar > button.inbox.lit:hover {
+		position: relative;
+		isolation: isolate;
+		background: transparent;
+		border-color: transparent;
+	}
+	.bar > button.inbox.lit::before {
+		content: "";
+		position: absolute;
+		inset: 6px 0;
+		z-index: -1;
+		background: var(--lit);
+		border: 1px solid var(--lit);
+		border-radius: 4px;
 	}
 	/* The X floats over the image corner: grow around the same center point. */
 	.thumb .thumb-x {
@@ -5036,12 +5166,14 @@ button.diff-path {
 /* Alate settings section: definition rows. Each row names the field, its purpose,
    and the value shape it wants; the input fills the rest. Theme vars keep the rows
    readable in the light theme too (these rules hardcoded dark-theme colors before). */
+/* Rows span the card like its foot rule; the value column caps at the field width (460px). */
 .settings-sec .alate-def-rows {
 	display: grid;
+	align-self: stretch;
 }
 .settings-sec .alate-def-row {
 	display: grid;
-	grid-template-columns: minmax(180px, 240px) 1fr;
+	grid-template-columns: minmax(180px, 240px) minmax(0, 460px);
 	gap: 14px;
 	padding: 10px 0;
 	border-bottom: 1px solid var(--line-soft);
@@ -5049,6 +5181,9 @@ button.diff-path {
 }
 .settings-sec .alate-def-row:first-child {
 	border-top: 1px solid var(--line-soft);
+}
+.settings-sec .alate-def-row > label > input:not([type="checkbox"]) {
+	width: 100%;
 }
 .settings-sec .alate-def-name {
 	display: grid;
@@ -5072,6 +5207,14 @@ button.diff-path {
 	justify-content: flex-end;
 	gap: 10px;
 	margin-top: 12px;
+}
+/* Inside a row (Env value + Save, a provider's Sign out) the actions sit on the row's center line. */
+.settings-sec .alate-def-row > .alate-def-actions {
+	margin-top: 0;
+}
+.settings-sec .alate-def-row > .alate-def-actions > input {
+	flex: 1;
+	min-width: 0;
 }
 /* Usage windows inside a sign-in row: span both columns of the row grid. */
 .settings-sec .alate-def-row .quota {
@@ -5139,7 +5282,9 @@ button.diff-path {
 	grid-area: meta;
 	justify-self: end;
 }
+/* display: block outranks the stacked-shell rule that hides bar tracks. */
 .providers-meters .meter-track {
+	display: block;
 	grid-area: track;
 	width: auto;
 	min-width: 0;
@@ -5194,17 +5339,53 @@ button.diff-path {
 	border-bottom: none;
 	flex: 1;
 }
-@media (max-width: 720px) {
+@container (max-width: 640px) {
 	.settings-sec.providers .alate-def-row.providers-row {
 		grid-template-columns: 1fr;
 	}
 	.settings-sec.providers .alate-def-actions {
 		justify-self: start;
 	}
+	/* Label and percentage take the full line; the bar shares the next line with the reset. */
+	.providers-meters .quota-row {
+		grid-template-columns: minmax(0, 1fr) auto;
+		grid-template-areas:
+			"meta  meta"
+			"track reset";
+	}
+	.settings-sec.providers .providers-form .alate-def-row {
+		grid-template-columns: 1fr;
+	}
+	.settings-sec.providers .providers-form button[type="submit"] {
+		justify-self: start;
+	}
 }
-@media (max-width: 700px) {
+@container (max-width: 600px) {
 	.settings-sec .alate-def-row {
 		grid-template-columns: 1fr;
+	}
+	/* Label and bar share a line; the value wraps under the bar. */
+	.settings-sec > .meter {
+		grid-template-columns: auto 1fr;
+		gap: 4px 8px;
+	}
+	.settings-sec > .meter .meter-value {
+		grid-column: 2;
+	}
+}
+/* A checkbox value starts on the column edge, not at the native 4px inset. */
+.settings-sec .alate-def-row input[type="checkbox"] {
+	margin: 0;
+	vertical-align: middle;
+}
+/* On touch, the label around a checkbox is the 44px hit target; the negative
+   margin spends its extra height on the row's gap and padding, not on blank space. */
+@media (pointer: coarse) {
+	.settings-sec .alate-def-row > label:has(> input[type="checkbox"]) {
+		display: flex;
+		align-items: center;
+		min-height: 44px;
+		margin: -10px 0;
 	}
 }
 /* Model roles: name, model, thinking and remove on one line; the notes span the row below.
@@ -5257,7 +5438,7 @@ button.diff-path {
 		min-height: 44px;
 	}
 }
-@media (max-width: 480px) {
+@container (max-width: 480px) {
 	.settings-sec .alate-def-row.role-row {
 		grid-template-columns: minmax(0, 1fr) auto;
 	}
