@@ -409,6 +409,10 @@ async function copyText(text: string): Promise<void> {
 /** Set by logOut; keeps the login gate up after reload on hosts that don't enforce sessions (loopback). */
 const LOGOUT_KEY = "ottr.loggedout";
 
+/** 401 (no or expired session) and 403 (refused) both mean the board needs a fresh login. */
+const sessionLost = (status: number): boolean =>
+	status === 401 || status === 403;
+
 /** Ends the session and reloads into the login gate, even where the server never returns 401 (loopback).
  * Runs through App's act(): a failed POST shows the error and leaves the button usable, and the
  * gate flag is only set once the server confirmed the session is gone. */
@@ -11426,7 +11430,7 @@ function App() {
 				else if (localStorage.getItem(LOGOUT_KEY) !== null) setGate("login");
 				else
 					void fetch("/api/state").then((r) => {
-						if (r.status === 401) setGate("login");
+						if (sessionLost(r.status)) setGate("login");
 					});
 			})
 			.catch(() => {
@@ -11538,7 +11542,16 @@ function App() {
 			onUpdate: (behind: number, commits: string[]) =>
 				setUpdate({ behind, commits }),
 			onOnline: () => setOffline(false),
-			onOffline: () => setOffline(true),
+			// A dead socket cannot show the HTTP status, so ask once per drop: an expired or
+			// revoked session lands on the login page instead of an endless "Retrying…".
+			onOffline: () => {
+				setOffline(true);
+				void fetch("/api/state")
+					.then((r) => {
+						if (sessionLost(r.status)) setGate("login");
+					})
+					.catch(() => {}); // server down: the banner already says so
+			},
 		};
 		// Prod board polls: the server refuses the socket in production mode.
 		return live ? connectLive(h) : connectPolling(h);
