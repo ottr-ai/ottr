@@ -314,7 +314,7 @@ interface AppDeps {
 	listProcesses?: () => ProcessInfo[];
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
-	/** Worker-folder base home (<home>/.ottr/workers holds env.txt); injectable for tests. */
+	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
 	workersHome?: string;
 	/** ssh-keyscan seam for the host-key check; defaults to realKeyscan. Tests inject a stub. */
 	keyscan?: Keyscan;
@@ -411,8 +411,9 @@ export function createApp(deps: AppDeps) {
 	const prod = deps.prod === true;
 	// Server-only ssh material: a data dir outside every checkout.
 	const sshDir = deps.sshDir ?? defaultSshDir();
-	// Base home whose .ottr/workers folders hold the env.txt name lists (tests inject it).
-	const workersHome = deps.workersHome ?? homedir();
+	// Base home whose .ottr/workers folders hold the env.txt name lists: the board's
+	// server-only home, never the turn-writable shared one (R5-1; tests inject it).
+	const workersHome = deps.workersHome ?? boardOmpHome();
 	const keyscan = deps.keyscan ?? realKeyscan;
 	const ambientHelpers = readAmbientHelpers();
 	/** Sorted task ids marked as read; missing/corrupt row = empty. */

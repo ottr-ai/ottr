@@ -430,8 +430,9 @@ const app = createApp({
 	// Server-only ssh keys and known_hosts: a data dir outside every
 	// checkout, which no worker mounts (compose: OTTR_SSH_DIR on the ottr-state volume).
 	sshDir: defaultSshDir(),
-	// Base home whose .ottr/workers folders hold the provisioned env.txt name lists
-	// (Settings -> Env); the dev board pins a fixture so demo names stay off the real home.
+	// Base home whose .ottr/workers folders hold the env.txt name lists (Settings -> Env);
+	// unset: the board's server-only home, as for turnEnv (R5-1). The dev board pins a fixture
+	// so demo names stay off the real home.
 	workersHome: process.env.OTTR_WORKERS_HOME,
 	projects,
 	cancel: loop.cancel,

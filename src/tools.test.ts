@@ -577,4 +577,24 @@ describe("turnEnvValues", () => {
 			missing: [],
 		});
 	});
+
+	test("a list in the shared home grants nothing; only the board home's lists count (R5-1)", () => {
+		// The shared home a turn can write lists a secret for every project and for B.
+		const shared = mkdtempSync(join(home, "envshared-"));
+		provision("_all", null, ["A_SECRET"], shared);
+		provision("b", null, ["A_SECRET"], shared);
+		const board = mkdtempSync(join(home, "envboard-"));
+		provision("a", null, ["A_SECRET"], board);
+		const saved = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = board;
+		try {
+			const values = { A_SECRET: "s" };
+			expect(turnEnvValues("b", values)).toEqual({ env: {}, missing: [] });
+			expect(turnEnvValues("a", values).env).toEqual({ A_SECRET: "s" });
+			expect(listedEnvNames()).toEqual([{ name: "A_SECRET", projects: ["a"] }]);
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = saved;
+		}
+	});
 });

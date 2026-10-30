@@ -21,6 +21,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROJECT } from "./apt.ts";
+import { boardOmpHome } from "./login.ts";
 
 // PATH command names, unique within one file; a list entry can never escape its target dir.
 const NAME = /^[a-z0-9][a-z0-9._-]*$/;
@@ -119,15 +120,19 @@ export function parseEnvTxt(text: string): string[] {
 	return [...new Set(names)];
 }
 
-/** Where alate provisions a project's env var name list. */
-export function envListPath(project: string, home = homedir()): string {
+/**
+ * Where the board reads a project's env var name list. R5-1: the names decide which saved
+ * secrets a turn gets, so the default is the board's server-only home (compose: the
+ * board-seed copy under OTTR_BOARD_OMP_HOME), never the shared home that turns can write.
+ */
+export function envListPath(project: string, home = boardOmpHome()): string {
 	if (!PROJECT.test(project))
 		throw new Error(`env: unsafe project name ${JSON.stringify(project)}`);
 	return join(home, ".ottr", "workers", project, "env.txt");
 }
 
 /** The names a project's env.txt lists; a missing file lists nothing. */
-export function readEnvNames(project: string, home = homedir()): string[] {
+export function readEnvNames(project: string, home = boardOmpHome()): string[] {
 	const file = envListPath(project, home);
 	if (!existsSync(file)) return [];
 	return parseEnvTxt(readFileSync(file, "utf8"));
@@ -138,7 +143,7 @@ export function readEnvNames(project: string, home = homedir()): string[] {
  * is logged and skipped, so one bad list does not hide every other project's names.
  */
 export function listedEnvNames(
-	home = homedir(),
+	home = boardOmpHome(),
 ): { name: string; projects: string[] }[] {
 	const dir = join(home, ".ottr", "workers");
 	const byName = new Map<string, string[]>();
@@ -376,7 +381,7 @@ function headlessWrapper(target: string): string {
 export function turnEnvValues(
 	project: string,
 	values: Record<string, string>,
-	home = homedir(),
+	home = boardOmpHome(),
 ): { env: Record<string, string>; missing: string[] } {
 	const names = [
 		...new Set([...readEnvNames("_all", home), ...readEnvNames(project, home)]),

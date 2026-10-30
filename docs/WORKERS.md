@@ -195,6 +195,12 @@ files: one name per line, `#` comments allowed, never a value. The value is a
 secret and lives on the board: save it once under **Settings → Env**, and every
 turn of a project whose `env.txt` (or `_all/env.txt`) lists the name receives it.
 A listed name with no value does not stop the turn; the card log names it.
+The board reads these lists only from its own home (`OTTR_BOARD_OMP_HOME`,
+`/etc/ottr/home` on compose), never from the shared home volume. The reason is
+R5-1: a turn can write the shared home, and a list there could give the secrets
+of project A to project B. The board-seed one-off copies the lists to the board
+home; the hourly deploy runs it when it seeds the board ("Seed the board
+config"). Until a seed runs, turns get no env values.
 
 ## Env settings
 
