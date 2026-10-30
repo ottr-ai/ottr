@@ -155,8 +155,11 @@ installs every list when it starts, so a project's first turn there does not wai
 its log (`docker compose logs worker-a`) names what was installed, and a list that
 fails does not stop the others. Before a turn starts, the container that runs it
 installs the packages it still lacks: a worker for work turns, the server for merge
-turns. The turn log names what was installed. An install that fails stops the turn
-with apt's error. The packages stay until the container is recreated.
+turns. The turn log names what was installed. Before the install, the container
+runs `dpkg --configure -a` and reinstalls the packages that `dpkg --audit` still
+names, so an apt run that a container stop interrupted does not block it. An install
+that fails stops the turn with apt's error. The packages stay until the container is
+recreated.
 
 A tool with no Debian package (Godot, for example) goes into the same data-repo
 folder as `tools.json`: a JSON array of pinned downloads, one per tool.

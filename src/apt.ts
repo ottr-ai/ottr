@@ -95,12 +95,47 @@ export async function ensureAllPackages(home = homedir()): Promise<string[]> {
 	return lines;
 }
 
-async function install(names: string[], file: string): Promise<string[]> {
-	const status = await exec(["dpkg-query", "--status", ...names], false);
+/** The packages `dpkg --audit` names: each sits on a line `" <name>[:arch]  <summary>"`. */
+export function auditedPackages(audit: string): string[] {
+	const names = audit
+		.split("\n")
+		.map((line) => /^ (\S+)/.exec(line)?.[1]?.split(":")[0] ?? "")
+		.filter((name) => PACKAGE.test(name));
+	return [...new Set(names)];
+}
+
+type Exec = (argv: string[], check?: boolean) => Promise<string>;
+
+/** Exported for tests, which inject `run` in place of the real commands. */
+export async function install(
+	names: string[],
+	file: string,
+	run: Exec = exec,
+): Promise<string[]> {
+	const status = await run(["dpkg-query", "--status", ...names], false);
 	const missing = missingFrom(names, status);
 	if (missing.length === 0) return [];
-	await exec(["apt-get", "update", "-qq"]);
-	await exec([
+	// A container stopped during apt-get leaves dpkg interrupted, and every later apt-get
+	// install then fails (OTTR-221). dpkg has no lock timeout: when another apt run holds the
+	// lock, this fails, and apt-get install below waits for the lock and reports instead.
+	await run(["dpkg", "--configure", "-a"], false);
+	const broken = auditedPackages(await run(["dpkg", "--audit"], false));
+	await run(["apt-get", "update", "-qq"]);
+	if (broken.length > 0) {
+		await run([
+			"apt-get",
+			"install",
+			"-y",
+			"-qq",
+			"--reinstall",
+			"-o",
+			"DPkg::Lock::Timeout=120",
+			...broken,
+		]);
+		const audit = (await run(["dpkg", "--audit"], false)).trim();
+		if (audit) throw new Error(`apt: dpkg --audit after repair: ${audit}`);
+	}
+	await run([
 		"apt-get",
 		"install",
 		"-y",
