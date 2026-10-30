@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 
 // ponytail: subset markdown — headings, paragraphs, fenced code, lists (nested),
 // blockquotes, hr, tables (GFM pipe), bold/italic/code/strike, links, bare URLs.
@@ -55,8 +55,8 @@ function inline(text: string, keyPrefix: string): ReactNode[] {
 }
 
 const BULLET = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
-/** Opening fence: ``` plus any CommonMark info string (language, attributes). */
-const FENCE_OPEN = /^\s*(`{3,})/;
+/** Opening fence: ``` plus any CommonMark info string; group 2 is its first word (the language). */
+const FENCE_OPEN = /^\s*(`{3,})\s*([^\s`]*)/;
 /** A line that would start a new block, ending paragraph collection. */
 const BLOCK_START = /^\s{0,3}(?:```|#{1,6}\s|>)/;
 /** GFM delimiter row: |-cells, optional colons. Must contain a pipe so a bare `---` never matches. */
@@ -116,7 +116,10 @@ function parseListAt(
 	];
 }
 
-function parseBlocks(src: string): ReactNode[] {
+/** Renders a fenced block in place of the default <pre>; null keeps the default. */
+type Fence = (lang: string, code: string) => ReactNode | null;
+
+function parseBlocks(src: string, fence?: Fence): ReactNode[] {
 	const lines = src.replace(/\r\n?/g, "\n").split("\n");
 	const out: ReactNode[] = [];
 	let i = 0;
@@ -138,10 +141,15 @@ function parseBlocks(src: string): ReactNode[] {
 				i++;
 			}
 			i++; // closing fence or EOF
+			const code = buf.join("\n");
 			out.push(
-				<pre key={`b${k++}`}>
-					<code>{buf.join("\n")}</code>
-				</pre>,
+				<Fragment key={`b${k++}`}>
+					{fence?.(open[2] ?? "", code) ?? (
+						<pre>
+							<code>{code}</code>
+						</pre>
+					)}
+				</Fragment>,
 			);
 			continue;
 		}
@@ -164,7 +172,9 @@ function parseBlocks(src: string): ReactNode[] {
 				i++;
 			}
 			out.push(
-				<blockquote key={`b${k++}`}>{parseBlocks(buf.join("\n"))}</blockquote>,
+				<blockquote key={`b${k++}`}>
+					{parseBlocks(buf.join("\n"), fence)}
+				</blockquote>,
 			);
 			continue;
 		}
@@ -246,7 +256,13 @@ function parseBlocks(src: string): ReactNode[] {
 }
 
 /** Renders markdown text as React elements; all text stays escaped, no raw HTML. */
-export function Markdown({ text }: { text: string }): ReactNode {
+export function Markdown({
+	text,
+	fence,
+}: {
+	text: string;
+	fence?: Fence;
+}): ReactNode {
 	if (text.trim() === "") return null;
-	return <div className="md">{parseBlocks(text)}</div>;
+	return <div className="md">{parseBlocks(text, fence)}</div>;
 }

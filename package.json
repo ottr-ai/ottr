@@ -14,6 +14,7 @@
       "stryker run && stryker run stryker.release.config.mjs && stryker run stryker.turn.config.mjs && stryker run stryker.worktree.config.mjs && stryker run stryker.update-image.config.mjs"
   },
   "dependencies": {
+    "mermaid": "11.17.2",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "web-push": "3.6.7"

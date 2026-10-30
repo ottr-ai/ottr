@@ -10,7 +10,12 @@ const ALLOWED: Record<string, true> = {
 	MIT: true,
 	"MIT OR Apache-2.0": true,
 	"MPL-2.0": true,
+	"(MPL-2.0 OR Apache-2.0)": true,
+	Unlicense: true,
 };
+// Packages whose package.json names no license, checked by hand. khroma (a mermaid dependency)
+// ships an MIT license file. Any other "Unknown" package still fails.
+const UNKNOWN_OK: Record<string, true> = { khroma: true };
 
 const proc = Bun.spawnSync([process.execPath, "pm", "licenses", "--json"]);
 if (proc.exitCode !== 0) {
@@ -24,7 +29,14 @@ const licenses: Record<string, { name: string }[]> = JSON.parse(
 	proc.stdout.toString(),
 );
 // `=== true`, not `in`: a key such as "constructor" must not match the object prototype.
-const bad = Object.entries(licenses).filter(([key]) => ALLOWED[key] !== true);
+const bad = Object.entries(licenses)
+	.map(([key, packages]): [string, { name: string }[]] => [
+		key,
+		key === "Unknown"
+			? packages.filter((p) => UNKNOWN_OK[p.name] !== true)
+			: packages,
+	])
+	.filter(([key, packages]) => packages.length > 0 && ALLOWED[key] !== true);
 for (const [key, packages] of bad)
 	console.error(
 		`license outside the allowlist: ${key}: ${packages.map((p) => p.name).join(", ")}`,

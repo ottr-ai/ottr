@@ -66,6 +66,8 @@ While a review is open, only its finding cards merge — a release ships reviewe
 
 **Explain project** asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project. The skill comes from agent-data, so the host and the workers must have it.
 
+**Diagrams** shows `docs/how-it-works.md` as committed on the target branch, with each Mermaid block drawn as a diagram. If the target branch has no such file, the window tells you to use **Explain project** first.
+
 ## Requirements
 
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)

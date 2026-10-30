@@ -1,3 +1,4 @@
+import type { Mermaid } from "mermaid";
 import type {
 	CSSProperties,
 	ClipboardEvent as ReactClipboardEvent,
@@ -1440,6 +1441,140 @@ function WorkflowModal({
 	);
 }
 
+declare global {
+	interface Window {
+		/** Set by /mermaid.min.js; see loadMermaid. */
+		mermaid?: Mermaid;
+	}
+}
+let mermaidLoad: Promise<Mermaid> | null = null;
+/** mermaid's prebuilt bundle, served by the server at /mermaid.min.js and loaded once on first
+ *  use: Bun's HTML bundler would inline a dynamic import into the board bundle. A failed load
+ *  clears the promise, so the next open retries. */
+function loadMermaid(): Promise<Mermaid> {
+	if (mermaidLoad !== null) return mermaidLoad;
+	const { promise, resolve, reject } = Promise.withResolvers<Mermaid>();
+	const fail = () => {
+		mermaidLoad = null;
+		s.remove();
+		reject(new Error("mermaid failed to load"));
+	};
+	const s = document.createElement("script");
+	s.src = "/mermaid.min.js";
+	s.onload = () => (window.mermaid ? resolve(window.mermaid) : fail());
+	s.onerror = fail;
+	document.head.append(s);
+	mermaidLoad = promise;
+	return promise;
+}
+
+/** One Mermaid block drawn as SVG. mermaid's default securityLevel "strict" sanitizes the SVG
+ *  before it reaches the DOM. */
+function MermaidDiagram({ code }: { code: string }) {
+	const [svg, setSvg] = useState<string | null>(null);
+	const [failed, setFailed] = useState(false);
+	const id = useId().replace(/[^a-zA-Z0-9]/g, "");
+	useEffect(() => {
+		let alive = true;
+		loadMermaid()
+			.then(async (mermaid) => {
+				mermaid.initialize({
+					startOnLoad: false,
+					theme:
+						document.documentElement.dataset.theme === "light"
+							? "default"
+							: "dark",
+				});
+				const r = await mermaid.render(`mmd${id}`, code);
+				if (alive) setSvg(r.svg);
+			})
+			.catch(() => {
+				if (alive) setFailed(true);
+			});
+		return () => {
+			alive = false;
+		};
+	}, [code, id]);
+	if (failed)
+		return (
+			<>
+				<p className="hint" role="alert">
+					This diagram failed to render.
+				</p>
+				<pre>
+					<code>{code}</code>
+				</pre>
+			</>
+		);
+	if (svg === null) return <p className="hint">Drawing…</p>;
+	// biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid's strict mode sanitizes the SVG
+	return (
+		<div className="hiw-diagram" dangerouslySetInnerHTML={{ __html: svg }} />
+	);
+}
+
+/** The board's Diagrams button: the project's docs/how-it-works.md as committed on its target,
+ *  with each ```mermaid block drawn. */
+function HowItWorksModal({
+	project,
+	onClose,
+}: {
+	project: string;
+	onClose: () => void;
+}) {
+	const [result, setResult] = useState<
+		{ text: string } | { missing: true } | { failed: true } | null
+	>(null);
+	useEffect(() => {
+		let alive = true;
+		fetch(`/api/projects/${encodeURIComponent(project)}/how-it-works`)
+			.then(async (res) => {
+				if (!alive) return;
+				if (res.status === 404) return setResult({ missing: true });
+				if (!res.ok) throw new Error(String(res.status));
+				setResult({ text: await res.text() });
+			})
+			.catch(() => {
+				if (alive) setResult({ failed: true });
+			});
+		return () => {
+			alive = false;
+		};
+	}, [project]);
+	return (
+		<Modal
+			open
+			onClose={onClose}
+			label="Project diagrams"
+			className="hiw-modal"
+		>
+			<div className="wf-head">
+				<h3>docs/how-it-works.md</h3>
+				<CloseButton />
+			</div>
+			{result === null ? (
+				<p className="hint">Loading…</p>
+			) : "missing" in result ? (
+				<p className="hint">
+					The target branch has no docs/how-it-works.md yet. Use Explain project
+					to create it.
+				</p>
+			) : "failed" in result ? (
+				<p className="hint" role="alert">
+					The file failed to load.
+				</p>
+			) : (
+				<Markdown
+					text={result.text}
+					fence={(lang, code) =>
+						lang === "mermaid" ? <MermaidDiagram code={code} /> : null
+					}
+				/>
+			)}
+		</Modal>
+	);
+}
+
 /** The task diff in a lightbox: the whole diff for file=null, one file's section otherwise.
  *  Fetched live per open; done cards serve the text captured at merge. */
 function DiffModal({
@@ -2458,6 +2593,7 @@ function ProjectBoard({
 }) {
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
+	const [showDiagrams, setShowDiagrams] = useState(false);
 	const [query, setQuery] = useState("");
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
 	const [stage, setStage] = useState<Stage>("todo");
@@ -2677,6 +2813,18 @@ function ProjectBoard({
 								<span className="seg-label">Explain project</span>
 							</button>
 						)}
+						{!project.gitless && (
+							<button
+								type="button"
+								className="ghost"
+								aria-label="Diagrams"
+								onClick={() => setShowDiagrams(true)}
+								title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
+							>
+								<Icon name="image" />
+								<span className="seg-label">Diagrams</span>
+							</button>
+						)}
 					</div>
 					{!project.gitless && (
 						<button
@@ -2704,6 +2852,12 @@ function ProjectBoard({
 				onClose={() => setShowReview(false)}
 				act={act}
 			/>
+			{showDiagrams && (
+				<HowItWorksModal
+					project={project.name}
+					onClose={() => setShowDiagrams(false)}
+				/>
+			)}
 			{project.dirty && (
 				<p className="advisory">
 					<Icon name="info" size={14} />

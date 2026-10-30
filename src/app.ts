@@ -2760,6 +2760,17 @@ export function createApp(deps: AppDeps) {
 		"/workflow-release.svg": {
 			GET: () => workflowFile("/workflow-release.svg"),
 		},
+		// The Diagrams modal loads mermaid's prebuilt bundle (3.5 MB) on first open, so the board's
+		// own bundle stays small: Bun's HTML bundler does not split a dynamic import into a chunk.
+		"/mermaid.min.js": {
+			GET: () =>
+				new Response(
+					Bun.file(
+						Bun.resolveSync("mermaid/dist/mermaid.min.js", import.meta.dir),
+					),
+					{ headers: { "Content-Type": "text/javascript; charset=utf-8" } },
+				),
+		},
 		"/api/ws": (req, srv) => {
 			if (prod)
 				return json(
@@ -3984,6 +3995,29 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "bad learning id" }, 400);
 					e.store.deleteLearning(Number(req.params.id));
 					return json({ ok: true });
+				}),
+		},
+		// The board's Diagrams button: docs/how-it-works.md as committed on the target branch.
+		"/api/projects/:project/how-it-works": {
+			GET: (req) =>
+				api(req, async () => {
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					if (e.target === null) return json({ error: "no target" }, 404);
+					const r = await git(
+						["show", `${e.target}:docs/how-it-works.md`],
+						e.path,
+					);
+					if (r.code !== 0)
+						return json({ error: "no docs/how-it-works.md" }, 404);
+					return new Response(r.stdout, {
+						headers: {
+							"Content-Type": "text/plain; charset=utf-8",
+							"Content-Security-Policy": "sandbox",
+							"X-Content-Type-Options": "nosniff",
+							"Cache-Control": "no-store",
+						},
+					});
 				}),
 		},
 		"/api/projects/:project/release": {

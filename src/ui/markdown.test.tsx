@@ -32,6 +32,23 @@ describe("Markdown", () => {
 		);
 	});
 
+	test("fence hook replaces only the blocks it claims, quotes included", () => {
+		const fence = (lang: string, code: string) =>
+			lang === "mermaid" ? <figure>{code}</figure> : null;
+		expect(
+			renderToStaticMarkup(
+				<Markdown
+					text={
+						"```mermaid x\nA-->B\n```\n\n```ts\nlet a\n```\n\n> ```mermaid\n> C\n> ```"
+					}
+					fence={fence}
+				/>,
+			),
+		).toBe(
+			'<div class="md"><figure>A--&gt;B</figure><pre><code>let a</code></pre><blockquote><figure>C</figure></blockquote></div>',
+		);
+	});
+
 	test("fenced code keeps newlines verbatim", () => {
 		expect(render("```\nconst x = 1;\n\nkeep me\n```")).toBe(
 			'<div class="md"><pre><code>const x = 1;\n\nkeep me</code></pre></div>',

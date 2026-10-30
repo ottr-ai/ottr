@@ -3711,6 +3711,22 @@ dialog.drawer[open] {
 	align-items: center;
 	gap: 6px;
 }
+/* The board's Diagrams modal: docs/how-it-works.md with its Mermaid blocks drawn. */
+.hiw-modal {
+	padding: 18px 22px;
+	width: min(1080px, 94vw);
+}
+.hiw-diagram {
+	margin: 10px 0;
+	overflow-x: auto;
+}
+.hiw-diagram svg {
+	display: block;
+	max-width: 100%;
+	height: auto;
+	margin: 0 auto;
+}
+
 /* The drawer's Workflow modal: a README diagram of the card's workflow with its live stage
    highlighted. The embedded SVG keeps its styles under its own .wf root class; the ids below
    are the diagrams' stage nodes. */

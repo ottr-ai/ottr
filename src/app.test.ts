@@ -3818,6 +3818,32 @@ describe("review prompt carries the project's learnings", () => {
 	});
 });
 
+describe("how-it-works route", () => {
+	test("serves docs/how-it-works.md as committed on the target, 404 without it", async () => {
+		expect((await post("/api/projects", { name: "hiw-proj" })).status).toBe(
+			200,
+		);
+		const e = projects.get("hiw-proj")!;
+		e.target = "main";
+		const url = "/api/projects/hiw-proj/how-it-works";
+		expect((await get(url)).status).toBe(404);
+		mkdirSync(join(e.path, "docs"));
+		writeFileSync(join(e.path, "docs/how-it-works.md"), "committed");
+		execSync(
+			"git add docs && git -c user.name=t -c user.email=t@t commit -qm d",
+			{ cwd: e.path },
+		);
+		// An uncommitted edit stays out: the board shows the target's version.
+		writeFileSync(join(e.path, "docs/how-it-works.md"), "draft");
+		const res = await get(url);
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("committed");
+		expect((await get("/api/projects/nope/how-it-works")).status).toBe(404);
+		projects.delete("hiw-proj");
+		e.store.close();
+	});
+});
+
 describe("boot host wall (R2-11)", () => {
 	test("/api/boot answers through api()'s Host allowlist", async () => {
 		const evil = await fetch(new URL("/api/boot", server.url), {
