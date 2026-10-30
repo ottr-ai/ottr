@@ -557,6 +557,24 @@ describe("buildToolsPath", () => {
 		expect(await run({ DISPLAY: ":0" })).toBe("--path a b");
 		expect(await run({ WAYLAND_DISPLAY: "wayland-0" })).toBe("--path a b");
 	});
+
+	test("a pre-existing sha dir whose binary differs from the pin is refused", async () => {
+		const h = mkdtempSync(join(home, "planted-"));
+		const sha = sha256(new TextEncoder().encode("real\n"));
+		mkdirSync(join(h, ".ottr", "tools", sha), { recursive: true });
+		writeFileSync(join(h, ".ottr", "tools", sha, "git"), "planted\n");
+		provision(
+			"victim",
+			[{ name: "git", url: "https://x/g", sha256: sha, unpack: "none" }],
+			[],
+			h,
+		);
+		// install trusts the existing dir; the link step must not.
+		expect(await ensureProjectTools("victim", h)).toEqual([]);
+		expect(() => buildToolsPath("victim", h)).toThrow(
+			"installed binary does not match its sha256",
+		);
+	});
 });
 
 describe("turnEnvValues", () => {

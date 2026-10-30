@@ -189,6 +189,15 @@ A failed download or a hash mismatch stops the turn with the error,
 like a failed apt install. The name `godot` gets a small wrapper instead of a
 link: without `DISPLAY` or `WAYLAND_DISPLAY` it adds `--headless`, because Godot
 exits with "Can't load Xlib" when it finds no display.
+Before a turn links a `none` tool, it checks the installed binary against
+`sha256` again. A changed binary stops the turn.
+
+A turn that runs in the server (a merge turn, or a work turn with no worker) does
+not use the shared home volume for tools. The server reads `tools.json` and
+installs the tools under its own home (`OTTR_BOARD_OMP_HOME`, `/etc/ottr/home` on
+compose). The board-seed one-off copies the lists there. The reason is R5-1: a
+worker turn can write the shared home, so a binary there must never run in the
+server. Until a seed runs, server-side turns get no tools.
 
 An env var name a project's turns need goes into `env.txt` beside the other two
 files: one name per line, `#` comments allowed, never a value. The value is a

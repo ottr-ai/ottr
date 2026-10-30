@@ -12,6 +12,7 @@ import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { defaultSshDir } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
+import { boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
 import {
@@ -394,9 +395,11 @@ const loop = createTurnLoop(projects, {
 	startRun,
 	ensurePackages: ensureProjectPackages,
 	turnEnv: (project, model) => turnEnv(project, model, shared.envValues),
+	// R5-1: a server-local turn reads tools.json and installs under the board's server-only
+	// home (the board-seed copy), never the shared home a worker turn can write.
 	prepareTurn: async (project) => ({
-		lines: await ensureProjectTools(project),
-		pathDir: buildToolsPath(project),
+		lines: await ensureProjectTools(project, boardOmpHome()),
+		pathDir: buildToolsPath(project, boardOmpHome()),
 	}),
 	publishRelease,
 	runReleaseCommand,

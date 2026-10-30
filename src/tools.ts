@@ -334,6 +334,18 @@ export function buildToolsPath(project: string, home = homedir()): string {
 			throw new Error(
 				`tools: ${e.name}: ${e.sha256.slice(0, 12)} missing from ${root}`,
 			);
+		// A plain binary must still be the pinned download: a dir someone else wrote under this
+		// sha256 is refused. ponytail: an archive's unpacked files carry no pin to check against;
+		// the server-only root (prepareTurn) is what keeps those trusted.
+		if (e.unpack === "none") {
+			const hash = new Bun.CryptoHasher("sha256")
+				.update(readFileSync(target))
+				.digest("hex");
+			if (hash !== e.sha256)
+				throw new Error(
+					`tools: ${e.name}: installed binary does not match its sha256 (${hash.slice(0, 12)})`,
+				);
+		}
 		links.set(e.name, {
 			target,
 			wrapper: e.name === "godot" ? headlessWrapper(target) : null,
