@@ -125,7 +125,7 @@ describe("groupTopics", () => {
 		expect(sections[1]?.key).toBe("topic00");
 		expect(sections[9]?.key).toBe("topic08");
 		const other = sections[10]!;
-		expect(other.key).toBe("other");
+		expect(other.key).toBe("");
 		expect(other.label).toBe("Everything else");
 		expect(other.tasks.map((x) => x.id)).toEqual(["s9", "s10", "s11"]);
 	});
@@ -140,11 +140,16 @@ describe("groupTopics", () => {
 		expect(sections).toEqual([
 			{ key: "one", label: "one", tasks: [t("a", "one"), t("b", "one")] },
 			{
-				key: "other",
+				key: "",
 				label: "Everything else",
 				tasks: [t("c", null), t("d", null)],
 			},
 		]);
+	});
+
+	test("a topic named other keeps a key apart from Everything else", () => {
+		const keys = groupTopics([t("a", "other"), t("b", null)]).map((s) => s.key);
+		expect(new Set(keys).size).toBe(keys.length);
 	});
 
 	test("no Everything else when it would hold zero tasks", () => {

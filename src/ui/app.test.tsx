@@ -338,14 +338,32 @@ describe("LaneCol backlog divider", () => {
 		for (let j = 0; j < 25; j++)
 			tasks.push(cardFixture({ id: `new${j}`, topic: null, doneAt: 500 - j }));
 		const other = doneTopicPages(tasks, new Map()).at(-1)!;
-		expect(other.key).toBe("other");
+		expect(other.key).toBe("");
 		expect(other.tasks.map((t) => t.id)).toEqual(
 			Array.from({ length: 20 }, (_, j) => `new${j}`),
 		);
 		expect(other.hidden).toBe(7);
-		const grown = doneTopicPages(tasks, new Map([["other", 40]])).at(-1)!;
+		const grown = doneTopicPages(tasks, new Map([["", 40]])).at(-1)!;
 		expect(grown.tasks.at(-1)!.id).toBe("old0");
 		expect(grown.hidden).toBe(0);
+	});
+
+	test("Show more on Everything else leaves a topic named other alone", () => {
+		const tasks = [
+			...Array.from({ length: 25 }, (_, j) =>
+				cardFixture({ id: `o${j}`, topic: "other", doneAt: j }),
+			),
+			...Array.from({ length: 25 }, (_, j) =>
+				cardFixture({ id: `u${j}`, topic: null, doneAt: j }),
+			),
+		];
+		const before = doneTopicPages(tasks, new Map());
+		const rest = before.find((g) => g.label === "Everything else")!;
+		const pages = doneTopicPages(tasks, new Map([[rest.key, 40]]));
+		expect(pages.find((g) => g.label === "other")!.tasks).toHaveLength(20);
+		expect(
+			pages.find((g) => g.label === "Everything else")!.tasks,
+		).toHaveLength(25);
 	});
 
 	test("a topic named constructor still pages", () => {

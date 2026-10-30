@@ -89,7 +89,9 @@ export function groupTopics<T extends { topic: string | null }>(
 		...sorted.slice(10).flatMap((s) => s.tasks),
 		...tasks.filter((t) => (t.topic?.trim().toLowerCase() ?? "") === ""),
 	];
+	// Key "": every topic key is non-empty (blank topics skip above), so a topic named
+	// "other" never shares Everything else's collapse or page state.
 	if (other.length > 0)
-		sections.push({ key: "other", label: "Everything else", tasks: other });
+		sections.push({ key: "", label: "Everything else", tasks: other });
 	return sections;
 }
