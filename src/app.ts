@@ -72,11 +72,11 @@ import {
 	boardOmpEnv,
 	boardOmpHome,
 	boardSignIns,
-	type DeadSignIn,
 	deadSignIns,
 	loginProviders,
 	PROVIDER_ID,
 	providerLogin,
+	type SignIn,
 	signIns,
 	signOutEverywhere,
 } from "./login.ts";
@@ -475,8 +475,11 @@ function tokenExpiryWarning(
  * Warnings the board must show the user (not only log): an unseeded agent layer, and a model
  * role whose provider has no active sign-in in the board store and no provider env key. Advisory
  * only; the state recomputes them on every poll, so a warning disappears by itself once fixed.
+ * A provider that deadSignIns reports is skipped: its sign-in advisory already names the cause.
  */
 export function boardWarnings(
+	list: readonly SignIn[],
+	roles: Readonly<Record<string, string>>,
 	env: Record<string, string | undefined> = process.env,
 	expiry: TokenExpiryView = tokenExpiryView(env),
 ): string[] {
@@ -485,19 +488,10 @@ export function boardWarnings(
 			'The board\'s agent layer is not seeded: the board runs without rules and config.yml until a seed fills /etc/ottr/home (docs/WORKERS.md, "Seed the board config").',
 		];
 	// Roles are unreadable without config.yml, so the unseeded warning replaces the rest.
-	let active = new Set<string>();
-	try {
-		active = new Set(
-			signIns(join(agentDir(), "agent.db"))
-				.filter((s) => s.active)
-				.map((s) => s.provider),
-		);
-	} catch {
-		// An unreadable or missing store counts as no active sign-in.
-	}
-	const named = new Set<string>();
+	const active = new Set(list.filter((s) => s.active).map((s) => s.provider));
+	const named = new Set(deadSignIns(list, roles).map((d) => d.provider));
 	const out: string[] = [];
-	for (const [role, selector] of Object.entries(modelRoles())) {
+	for (const [role, selector] of Object.entries(roles)) {
 		// Selectors without a provider prefix name no provider to check.
 		const i = selector.indexOf("/");
 		if (i <= 0) continue;
@@ -2029,12 +2023,14 @@ export function createApp(deps: AppDeps) {
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
 		const scan = currentOrphanScan();
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
-		let dead: DeadSignIn[];
+		let list: SignIn[] = [];
 		try {
-			dead = deadSignIns(signIns(), modelRoles());
+			list = signIns();
 		} catch {
-			dead = [];
+			// An unreadable or missing store counts as no active sign-in.
 		}
+		const roles = modelRoles();
+		const dead = deadSignIns(list, roles);
 		return {
 			projects: [...deps.projects.values()].flatMap((e) => {
 				try {
@@ -2058,7 +2054,7 @@ export function createApp(deps: AppDeps) {
 			keptWorktrees: { held: keptHeld, stale: keptStale },
 			drainUntil: drainUntil > now ? drainUntil : null,
 			drainCommits: drainUntil > now ? drainCommits : null,
-			warnings: boardWarnings(),
+			warnings: boardWarnings(list, roles),
 			updates: updatesView(),
 			alatePendingSince,
 			deadSignIns: dead,

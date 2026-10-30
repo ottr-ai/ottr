@@ -34,6 +34,8 @@ import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
+import { type SignIn, signIns } from "./login.ts";
+import { modelRoles } from "./models.ts";
 import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
@@ -5837,9 +5839,20 @@ describe("board warnings", () => {
 	const UNSEEDED =
 		'The board\'s agent layer is not seeded: the board runs without rules and config.yml until a seed fills /etc/ottr/home (docs/WORKERS.md, "Seed the board config").';
 
+	// What stateResponse passes: the store's sign-ins ([] when unreadable) and the configured roles.
+	function warnings(dir: string, env: Record<string, string | undefined>) {
+		let list: SignIn[] = [];
+		try {
+			list = signIns(join(dir, "agent.db"));
+		} catch {
+			// A missing store is no sign-in, as in stateResponse.
+		}
+		return boardWarnings(list, modelRoles(), env);
+	}
+
 	test("an empty agent dir warns unseeded, in boardWarnings and in the state payload", async () =>
-		withAgentDir(async () => {
-			expect(boardWarnings()).toEqual([UNSEEDED]);
+		withAgentDir(async (dir) => {
+			expect(warnings(dir, {})).toEqual([UNSEEDED]);
 			const state = (await (await get("/api/state")).json()) as {
 				warnings: string[];
 			};
@@ -5856,12 +5869,33 @@ describe("board warnings", () => {
 				"No active sign-in for anthropic (role default): sign in under Settings - Provider sign-in, or set its API key in the environment.",
 			];
 			// A fixed env: the host shell may export the provider's key.
-			expect(boardWarnings({})).toEqual(expected);
+			expect(warnings(dir, {})).toEqual(expected);
 			credStore(join(dir, "agent.db"), [["anthropic", null]]);
-			expect(boardWarnings({})).toEqual([]);
-			// A disabled row counts as no active sign-in.
+			expect(warnings(dir, {})).toEqual([]);
+			// A signed-out row counts as no active sign-in.
 			credStore(join(dir, "agent.db"), [["anthropic", "replaced by"]]);
-			expect(boardWarnings({})).toEqual(expected);
+			expect(warnings(dir, {})).toEqual(expected);
+		}));
+
+	test("a disabled sign-in yields one advisory: the dead sign-in, not a board warning too", async () =>
+		withAgentDir(async (dir) => {
+			writeFileSync(
+				join(dir, "config.yml"),
+				"modelRoles:\n  default: anthropic/claude-opus-5-5:high\n  smol: zai/glm-5\n",
+			);
+			credStore(join(dir, "agent.db"), [
+				["anthropic", "oauth refresh failed: invalid_grant"],
+			]);
+			const state = (await (await get("/api/state")).json()) as {
+				warnings: string[];
+				deadSignIns: Array<{ provider: string }>;
+			};
+			expect(state.deadSignIns.map((d) => d.provider)).toEqual(["anthropic"]);
+			expect(state.warnings.some((w) => w.includes("anthropic"))).toBe(false);
+			// The other provider still warns: the skip covers only the dead one.
+			expect(warnings(dir, {})).toEqual([
+				"No active sign-in for zai (role smol): sign in under Settings - Provider sign-in, or set its API key in the environment.",
+			]);
 		}));
 });
 
