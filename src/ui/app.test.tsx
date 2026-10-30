@@ -27,6 +27,7 @@ const {
 	WarningLines,
 	SETTINGS_TOC,
 	SettingsPage,
+	doneTopicPages,
 } = await import("./app.tsx");
 
 describe("monogram", () => {
@@ -317,10 +318,43 @@ describe("LaneCol backlog divider", () => {
 			/>,
 		);
 		expect(html.match(/lane-more/g)?.length).toBe(1);
-		// A paged topic head reads loaded/total; a fully loaded one reads its total.
+		// Every topic head reads loaded/total, a fully loaded topic too.
 		expect(html).toContain(">1/8</span>");
-		expect(html).toContain(">1</span>");
+		expect(html).toContain(">1/1</span>");
 		expect(html).toContain(">7</span>");
+	});
+
+	test("each topic pages its newest cards, Everything else by landing time too", () => {
+		// 11 named topics: the smallest overflows into Everything else ahead of the
+		// unclassified cards, though the unclassified cards landed later.
+		const tasks: TaskCard[] = [];
+		for (let i = 0; i < 10; i++)
+			for (let j = 0; j < 3; j++)
+				tasks.push(
+					cardFixture({ id: `n${i}-${j}`, topic: `topic${i}`, doneAt: 1000 }),
+				);
+		for (let j = 0; j < 2; j++)
+			tasks.push(cardFixture({ id: `old${j}`, topic: "overflow", doneAt: j }));
+		for (let j = 0; j < 25; j++)
+			tasks.push(cardFixture({ id: `new${j}`, topic: null, doneAt: 500 - j }));
+		const other = doneTopicPages(tasks, new Map()).at(-1)!;
+		expect(other.key).toBe("other");
+		expect(other.tasks.map((t) => t.id)).toEqual(
+			Array.from({ length: 20 }, (_, j) => `new${j}`),
+		);
+		expect(other.hidden).toBe(7);
+		const grown = doneTopicPages(tasks, new Map([["other", 40]])).at(-1)!;
+		expect(grown.tasks.at(-1)!.id).toBe("old0");
+		expect(grown.hidden).toBe(0);
+	});
+
+	test("a topic named constructor still pages", () => {
+		const tasks = Array.from({ length: 25 }, (_, j) =>
+			cardFixture({ id: `c${j}`, topic: "constructor", doneAt: j }),
+		);
+		const [g] = doneTopicPages(tasks, new Map());
+		expect(g!.tasks).toHaveLength(20);
+		expect(g!.hidden).toBe(5);
 	});
 });
 

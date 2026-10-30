@@ -2566,6 +2566,28 @@ const EXPLAIN_PROJECT =
 /** Done lane page size: the cards shown before "Show more", and the step each click adds. */
 const DONE_PAGE = 20;
 
+/** Done order: latest landing first. doneAt stamps each entry into Done (the done clock). */
+const newestLanded = (a: TaskCard, b: TaskCard): number =>
+	(b.doneAt ?? b.updatedAt) - (a.doneAt ?? a.updatedAt);
+
+/** The done lane's topic view: every topic, each cut to its newest page. `limits` holds the
+ * page size of each topic its "Show more" grew; other topics show DONE_PAGE cards. */
+export function doneTopicPages(
+	tasks: TaskCard[],
+	limits: ReadonlyMap<string, number>,
+): { key: string; label: string; tasks: TaskCard[]; hidden: number }[] {
+	return groupTopics(tasks).map((g) => {
+		// groupTopics can append unclassified cards after overflow topics, so each topic
+		// re-sorts by landing time before its newest page is cut.
+		const page = donePage(
+			[...g.tasks].sort(newestLanded),
+			() => false,
+			limits.get(g.key) ?? DONE_PAGE,
+		);
+		return { ...g, tasks: page.shown, hidden: page.hidden };
+	});
+}
+
 /** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
 function ProjectBoard({
 	project,
@@ -2613,7 +2635,10 @@ function ProjectBoard({
 	// Done lane lazy load: how many read cards render before "Show more" appends a page.
 	// The topic view pages each topic on its own, keyed by topic.
 	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
-	const [topicLimits, setTopicLimits] = useState<Record<string, number>>({});
+	// A Map, not a plain object: a topic named "constructor" must not read Object.prototype.
+	const [topicLimits, setTopicLimits] = useState<ReadonlyMap<string, number>>(
+		() => new Map(),
+	);
 	// The setup wizard, opened from the checklist's Open setup button.
 	const [setupOpen, setSetupOpen] = useState(false);
 	/** One settings patch from the checklist row buttons; the board's project state refreshes. */
@@ -2977,11 +3002,7 @@ function ProjectBoard({
 					// A kicked backlog card (grill session started) renders as a normal card in the todo lane.
 					const filtered = shown.filter((t) => laneStage(t) === c.key);
 					// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
-					if (c.key === "done") {
-						filtered.sort(
-							(a, b) => (b.doneAt ?? b.updatedAt) - (a.doneAt ?? a.updatedAt),
-						);
-					}
+					if (c.key === "done") filtered.sort(newestLanded);
 					// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
 					const unread = (t: TaskCard): boolean =>
 						t.answered && !seenAnswers.has(t.id);
@@ -2995,14 +3016,10 @@ function ProjectBoard({
 					// every topic loaded and each one paged by its own "Show more".
 					const doneGroups =
 						c.key === "done" && q === "" && grouped
-							? groupTopics(col.filter((t) => !unread(t))).map((g) => {
-									const page = donePage(
-										g.tasks,
-										() => false,
-										topicLimits[g.key] ?? DONE_PAGE,
-									);
-									return { ...g, tasks: page.shown, hidden: page.hidden };
-								})
+							? doneTopicPages(
+									col.filter((t) => !unread(t)),
+									topicLimits,
+								)
 							: null;
 					if (c.key === "done" && q === "" && !grouped) {
 						const page = donePage(col, unread, doneLimit);
@@ -3110,10 +3127,12 @@ function ProjectBoard({
 									setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
 								}
 								onTopicMore={(key) =>
-									setTopicLimits((prev) => ({
-										...prev,
-										[key]: (prev[key] ?? DONE_PAGE) + DONE_PAGE,
-									}))
+									setTopicLimits((prev) =>
+										new Map(prev).set(
+											key,
+											(prev.get(key) ?? DONE_PAGE) + DONE_PAGE,
+										),
+									)
 								}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -4056,9 +4075,7 @@ export function LaneCol({
 									</svg>
 									<span className="lane-label">{g.label}</span>
 									<span className="topic-count">
-										{g.hidden > 0
-											? `${g.tasks.length}/${g.tasks.length + g.hidden}`
-											: g.tasks.length}
+										{`${g.tasks.length}/${g.tasks.length + g.hidden}`}
 									</span>
 								</button>
 								<div className="topic-body" id={bodyId}>
