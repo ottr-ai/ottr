@@ -32,8 +32,8 @@ import {
 	ProjectStore,
 } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
-import { lentProviderEnv } from "./tokens.ts";
-import { buildToolsPath, ensureProjectTools, turnEnvValues } from "./tools.ts";
+import { turnEnv } from "./tokens.ts";
+import { buildToolsPath, ensureProjectTools } from "./tools.ts";
 import {
 	appendLog,
 	createTurnLoop,
@@ -393,15 +393,7 @@ const loop = createTurnLoop(projects, {
 	workerTarget: workerFromEnv(),
 	startRun,
 	ensurePackages: ensureProjectPackages,
-	turnEnv: async (project, model) => {
-		const base = turnEnvValues(project, shared.envValues);
-		const lent = await lentProviderEnv(model);
-		return {
-			env: { ...base.env, ...lent.env },
-			missing: base.missing,
-			credentialError: lent.error,
-		};
-	},
+	turnEnv: (project, model) => turnEnv(project, model, shared.envValues),
 	prepareTurn: async (project) => ({
 		lines: await ensureProjectTools(project),
 		pathDir: buildToolsPath(project),

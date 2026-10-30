@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	rmSync,
@@ -11,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { boardOmpHome } from "./login.ts";
 import fc from "./test/properties.ts";
-import { lentProviderEnv } from "./tokens.ts";
+import { lentProviderEnv, turnEnv } from "./tokens.ts";
 
 // A stand-in for the board store (omp's auth_credentials) and for `omp token <provider>
 // --force-refresh`. The fake logs each run's argv and env, then acts by the mode file in its
@@ -408,5 +409,62 @@ describe("lentProviderEnv", () => {
 			}),
 		);
 		db.close();
+	});
+});
+
+describe("turnEnv", () => {
+	/** A home whose `_all` env.txt lists `names`, next to a fresh store. */
+	function home(path: string, names: string[]): string {
+		const h = dirname(path);
+		mkdirSync(join(h, ".ottr", "workers", "_all"), { recursive: true });
+		writeFileSync(
+			join(h, ".ottr", "workers", "_all", "env.txt"),
+			names.join("\n"),
+		);
+		return h;
+	}
+
+	test("the lent token wins over a Settings value of the same name", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		const h = home(path, ["ANTHROPIC_OAUTH_TOKEN", "SHARED", "ABSENT"]);
+		expect(
+			await turnEnv(
+				"proj",
+				"anthropic/claude-opus-5-5",
+				{ ANTHROPIC_OAUTH_TOKEN: "settings-value", SHARED: "s" },
+				{ dbPath: path, now: NOW, command, home: h },
+			),
+		).toEqual({
+			env: { ANTHROPIC_OAUTH_TOKEN: "access-1", SHARED: "s" },
+			missing: ["ABSENT"],
+			credentialError: null,
+		});
+	});
+
+	test("a lending error comes back as credentialError and lends nothing", async () => {
+		const path = store();
+		const h = home(path, ["SHARED"]);
+		const env = await turnEnv(
+			"proj",
+			"anthropic/claude-opus-5-5",
+			{ SHARED: "s", ANTHROPIC_OAUTH_TOKEN: "settings-value" },
+			{ dbPath: path, now: NOW, command, home: h },
+		);
+		expect(env.env).toEqual({ SHARED: "s" });
+		expect(env.missing).toEqual([]);
+		expect(env.credentialError).toBeString();
+	});
+
+	test("a local run (null model) gets the Settings values and no error", async () => {
+		const path = store();
+		const h = home(path, ["SHARED"]);
+		expect(
+			await turnEnv("proj", null, { SHARED: "s" }, { dbPath: path, home: h }),
+		).toEqual({ env: { SHARED: "s" }, missing: [], credentialError: null });
 	});
 });

@@ -47,7 +47,7 @@ import {
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
-import { lentProviderEnv } from "./tokens.ts";
+import { turnEnv } from "./tokens.ts";
 import type { TurnOps, TurnProject } from "./turn.ts";
 import {
 	appendLog,
@@ -5355,10 +5355,8 @@ describe("prepareTurn", () => {
 		return setup({
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			turnEnv: async (_project, model) => {
-				const lent = await lentProviderEnv(model, { dbPath });
-				return { env: lent.env, missing: [], credentialError: lent.error };
-			},
+			turnEnv: (project, model) =>
+				turnEnv(project, model, {}, { dbPath, home: dirname(dbPath) }),
 			...overrides,
 		});
 	}

@@ -8,6 +8,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
 import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
+import { turnEnvValues } from "./tools.ts";
 
 const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
 const REFRESH_TIMEOUT_MS = 60_000;
@@ -205,5 +206,28 @@ export async function lentProviderEnv(
 	return {
 		env: {},
 		error: `omp did not refresh the board's ${provider} sign-in: ${why}`,
+	};
+}
+
+/**
+ * A turn's env: the Settings values the project lists, then the lent token on top (a lent name
+ * wins over a Settings value of the same name). A lending error stops the turn (fail closed).
+ */
+export async function turnEnv(
+	project: string,
+	model: string | null | undefined,
+	envValues: Record<string, string>,
+	opts: Parameters<typeof lentProviderEnv>[1] & { home?: string } = {},
+): Promise<{
+	env: Record<string, string>;
+	missing: string[];
+	credentialError: string | null;
+}> {
+	const base = turnEnvValues(project, envValues, opts.home);
+	const lent = await lentProviderEnv(model, opts);
+	return {
+		env: { ...base.env, ...lent.env },
+		missing: base.missing,
+		credentialError: lent.error,
 	};
 }
