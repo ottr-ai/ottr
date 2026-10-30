@@ -1,7 +1,7 @@
 // The Settings model roles editor: reads and edits the `modelRoles` block of the data repo's
 // user/omp/agent/config.yml text, byte for byte outside the changed lines
 // (docs/specs/model-roles-editor.md "Text edit").
-import { splitLevel, THINKING_LEVELS } from "./ui/models.ts";
+import { splitLevel, THINKING_LEVELS } from "./levels.ts";
 
 /** A config.yml the editor cannot edit safely; the route answers 422. */
 export class RolesLayoutError extends Error {}

@@ -31,7 +31,7 @@ export interface AttachedImages {
 	clear: () => void;
 }
 
-export function readImage(file: File): Promise<string> {
+function readImage(file: File): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	const reader = new FileReader();
 	reader.onload = () => {

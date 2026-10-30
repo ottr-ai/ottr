@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
 import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
 
-export const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
+const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
 const REFRESH_TIMEOUT_MS = 60_000;
 /** omp's "never" for a zai token (`expires "never"` in zai-coding-plan.kdl): the largest Date. */
 const ZAI_NO_EXPIRY = 8_640_000_000_000_000;

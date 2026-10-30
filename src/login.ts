@@ -388,7 +388,7 @@ const agentDb = (): string => join(agentDir(), "agent.db");
  * are one file. A sign-in runs against the board's store only; the worker field serves the
  * supersede and sign-out sweeps.
  */
-export function loginStores(): LoginStores {
+function loginStores(): LoginStores {
 	const boardDir = agentDir();
 	const home = process.env.HOME ?? homedir();
 	const db = join(home, ".omp", "agent", "agent.db");

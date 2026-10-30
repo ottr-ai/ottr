@@ -589,7 +589,7 @@ export interface TaskView extends Omit<Task, "diffText"> {
 }
 
 /** A turn as shipped over the API: everything but the prompt text. */
-export type TurnView = Omit<Turn, "prompt">;
+type TurnView = Omit<Turn, "prompt">;
 
 /** A task as shipped in /api/state: card facts without the full report text (the drawer fetches it per task). */
 export type TaskCard = Omit<

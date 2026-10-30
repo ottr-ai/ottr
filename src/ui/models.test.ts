@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
+import { joinLevel, splitLevel } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import {
 	fetchCatalog,
-	joinLevel,
 	loadCatalog,
 	modelMatches,
 	modelRows,
@@ -11,7 +11,6 @@ import {
 	reviewModel,
 	roleWarnings,
 	seedStep,
-	splitLevel,
 } from "./models.ts";
 
 /** id doubles as the selector for these fixtures. */

@@ -593,7 +593,7 @@ export function tasksDirFor(projectPath: string): string {
  * this state must not live there: `$OTTR_SERVER_DATA_DIR/<folder name>` on a volume only the
  * server mounts. Unset (native start, tests): the tasks dir, as before.
  */
-export function serverDirFor(projectPath: string): string {
+function serverDirFor(projectPath: string): string {
 	const serverDataDir = process.env.OTTR_SERVER_DATA_DIR;
 	return serverDataDir
 		? join(resolve(serverDataDir), basename(projectPath))
@@ -685,7 +685,7 @@ export function adoptSharedProjectData(
  * worker can replace), or the project checkout. Server writes below it go through
  * src/confine.ts, so a symlink a worker plants under it is never followed (OTTR-172).
  */
-export function dataRootFor(projectPath: string): string {
+function dataRootFor(projectPath: string): string {
 	const dataDir = process.env.OTTR_DATA_DIR;
 	return dataDir ? resolve(dataDir) : resolve(projectPath);
 }

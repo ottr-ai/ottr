@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { PROJECT } from "./apt.ts";
+import { PROJECT, workerProjects } from "./apt.ts";
 import { boardOmpHome } from "./login.ts";
 
 // PATH command names, unique within one file; a list entry can never escape its target dir.
@@ -132,7 +132,7 @@ export function envListPath(project: string, home = boardOmpHome()): string {
 }
 
 /** The names a project's env.txt lists; a missing file lists nothing. */
-export function readEnvNames(project: string, home = boardOmpHome()): string[] {
+function readEnvNames(project: string, home = boardOmpHome()): string[] {
 	const file = envListPath(project, home);
 	if (!existsSync(file)) return [];
 	return parseEnvTxt(readFileSync(file, "utf8"));
@@ -145,10 +145,8 @@ export function readEnvNames(project: string, home = boardOmpHome()): string[] {
 export function listedEnvNames(
 	home = boardOmpHome(),
 ): { name: string; projects: string[] }[] {
-	const dir = join(home, ".ottr", "workers");
 	const byName = new Map<string, string[]>();
-	for (const project of existsSync(dir) ? readdirSync(dir).sort() : []) {
-		if (!PROJECT.test(project)) continue;
+	for (const project of workerProjects(home)) {
 		let names: string[];
 		try {
 			names = readEnvNames(project, home);
@@ -194,10 +192,8 @@ export async function ensureProjectTools(
  * for its tools. A list that fails adds its error line, and the other lists still install.
  */
 export async function ensureAllTools(home = homedir()): Promise<string[]> {
-	const dir = join(home, ".ottr", "workers");
 	const lines: string[] = [];
-	for (const project of existsSync(dir) ? readdirSync(dir).sort() : []) {
-		if (!PROJECT.test(project)) continue;
+	for (const project of workerProjects(home)) {
 		try {
 			lines.push(...(await ensureProjectTools(project, home)));
 		} catch (err) {

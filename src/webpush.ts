@@ -159,7 +159,7 @@ export interface SendReport {
 
 /** One send must answer within this bound: web-push sets no timeout, and one hung push
  * endpoint would otherwise stall the fan-out and hold the test-push route open. */
-export const SEND_TIMEOUT_MS = 10_000;
+const SEND_TIMEOUT_MS = 10_000;
 
 /** Races one send against a deadline. `Promise.race` attaches handlers to both promises,
  * so a late rejection after the deadline won is swallowed, never unhandled. */

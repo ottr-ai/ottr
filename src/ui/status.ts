@@ -1,24 +1,6 @@
 import { depHold, mergeHold, type ReviewTask } from "../scheduler.ts";
 import type { Task, TaskCard } from "../types.ts";
 
-/** The state mark shapes a task card can carry; "crit" renders elsewhere and never comes from a task. */
-export type TaskMark =
-	| "needs"
-	| "asked"
-	| "running"
-	| "preparing"
-	| "queued"
-	| "done";
-
-/** Redundant state coding (ISA-101): the mark shape per task state — alarms only on needs_you,
-    the question mark ("asked") while its question is out. */
-export function markKind(t: Pick<Task, "state" | "asked">): TaskMark {
-	if (t.state === "needs_you") return t.asked !== null ? "asked" : "needs";
-	if (t.state === "running" || t.state === "preparing" || t.state === "queued")
-		return t.state;
-	return "done";
-}
-
 /** Split a live Stryker or Python mutate.py progress line into its parts; format produced by src/stryker.ts.
  * Returns null for text with no numbers (including "mutate.py running"). `rest` is the tail after `n/total`. */
 export function strykerProgress(text: string | null | undefined): {

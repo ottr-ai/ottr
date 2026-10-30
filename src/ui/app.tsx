@@ -15,6 +15,7 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import { commitDeltas } from "../progress.ts";
 import {
@@ -61,7 +62,6 @@ import { freshTaskIds, listSlides, stageFlights } from "./flight.ts";
 import logo from "./icon-192.png";
 import { Markdown } from "./markdown.tsx";
 import {
-	joinLevel,
 	type ModelCatalog,
 	modelMatches,
 	modelRows,
@@ -70,8 +70,6 @@ import {
 	roleWarnings,
 	type StoreActive,
 	seedStep,
-	splitLevel,
-	THINKING_LEVELS,
 	useModels,
 } from "./models.ts";
 import {

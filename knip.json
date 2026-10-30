@@ -3,9 +3,11 @@
   "entry": [
     "src/worker.ts",
     "src/ui/app.tsx",
+    "src/stryker-tap.cjs",
     "scripts/**/*.{js,mjs,ts}",
     "extension/tracker.ts"
   ],
-  "ignoreBinaries": ["tailscale", "omp"],
+  "ignoreBinaries": ["tailscale", "ssh-keygen", "mkfifo"],
+  "ignoreDependencies": ["@stryker-mutator/api", "@stryker-mutator/command-runner"],
   "ignoreUnresolved": ["src/server.ts"]
 }

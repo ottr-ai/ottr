@@ -12,6 +12,15 @@ const PACKAGE = /^[a-z0-9][a-z0-9+.-]+$/;
 // rejects only separators and the dot names, so any other folder name is legal here.
 export const PROJECT = /^(?!\.\.?$)[^/\\]+$/;
 
+/** The projects alate provisioned under ~/.ottr/workers, sorted; unsafe names are skipped. */
+export function workerProjects(home = homedir()): string[] {
+	const dir = join(home, ".ottr", "workers");
+	if (!existsSync(dir)) return [];
+	return readdirSync(dir)
+		.sort()
+		.filter((p) => PROJECT.test(p));
+}
+
 /** Where alate provisions a project's package list. */
 export function aptListPath(project: string, home = homedir()): string {
 	if (!PROJECT.test(project))
@@ -75,10 +84,8 @@ export async function ensureProjectPackages(
  * for its packages. A list that fails adds its error line, and the other lists still install.
  */
 export async function ensureAllPackages(home = homedir()): Promise<string[]> {
-	const dir = join(home, ".ottr", "workers");
 	const lines: string[] = [];
-	for (const project of existsSync(dir) ? readdirSync(dir).sort() : []) {
-		if (!PROJECT.test(project)) continue;
+	for (const project of workerProjects(home)) {
 		try {
 			lines.push(...(await ensureProjectPackages(project, home)));
 		} catch (err) {

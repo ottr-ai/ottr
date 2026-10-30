@@ -16,6 +16,7 @@ import type { pidAlive } from "./dblock.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { type DecodedImage, saveImages, sniffImage } from "./images.ts";
+import { joinLevel, splitLevel } from "./levels.ts";
 import { modelRoles } from "./models.ts";
 import {
 	DEP_HELD_PROMPT,
@@ -80,7 +81,6 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
-import { joinLevel, splitLevel } from "./ui/models.ts";
 import type {
 	ArchReviewDelta,
 	branchMergedOrGone,
