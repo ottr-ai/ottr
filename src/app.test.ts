@@ -4993,8 +4993,12 @@ describe("PR review routes", () => {
 		if (!answered) prStore.updateTask(t.id, { details: null });
 		return t;
 	};
-	const postReview = (id: string, body: unknown) =>
-		m.call(`/api/projects/pg/tasks/${id}/pr-review/post`, body);
+	/** Posts with the card's current reviewed head, as the drawer does, unless `body` names one. */
+	const postReview = (id: string, body: Record<string, unknown>) =>
+		m.call(`/api/projects/pg/tasks/${id}/pr-review/post`, {
+			head: prStore.getPrReviewByTask(id)?.reviewedHead,
+			...body,
+		});
 	const expectedArgv = (n: number, body: string, head: string) => [
 		"api",
 		`repos/acme/widget/pulls/${n}/reviews`,
@@ -5048,6 +5052,20 @@ describe("PR review routes", () => {
 		expect(res.status).toBe(200);
 		expect(ghCalls.at(-1)).toEqual(expectedArgv(2, "second", H2));
 		expect(row(2).postedHead).toBe(H2);
+	});
+
+	test("post refuses a draft of an older head after a newer draft landed, then posts the new one", async () => {
+		const t = reviewed(14, H1);
+		reviewed(14, H2);
+		for (const head of [H1, undefined, 7]) {
+			const res = await postReview(t.id, { body: "edited A", head });
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("the draft changed");
+		}
+		expect(ghCalls).toHaveLength(0);
+		expect(row(14).postedHead).toBeNull();
+		expect((await postReview(t.id, { body: "B", head: H2 })).status).toBe(200);
+		expect(ghCalls).toEqual([expectedArgv(14, "B", H2)]);
 	});
 
 	test("post refuses a closed PR", async () => {

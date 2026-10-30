@@ -5127,7 +5127,10 @@ function PrReviewSection({
 						run={() =>
 							act(async () => {
 								setError(null);
-								await post(`${taskUrl}/pr-review/post`, { body });
+								await post(`${taskUrl}/pr-review/post`, {
+									body,
+									head: pr.reviewedHead,
+								});
 								onLoaded(await unwrap<TaskView>(await fetch(taskUrl)));
 							}, setError)
 						}

@@ -5382,8 +5382,11 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "no draft to post" }, 409);
 					if (row.state !== "open")
 						return json({ error: `PR is ${row.state}` }, 409);
-					const head = row.reviewedHead;
-					if (head === null || row.postedHead === head)
+					// The client names the head its draft belongs to: a newer draft may have replaced it meanwhile.
+					const head = r.body.head;
+					if (typeof head !== "string" || head !== row.reviewedHead)
+						return json({ error: "the draft changed" }, 409);
+					if (row.postedHead === head)
 						return json({ error: "already posted for this head" }, 409);
 					// Claim before the await: a concurrent Post of the same head loses here.
 					const prev = e.store.claimPrPost(row.number, head);
