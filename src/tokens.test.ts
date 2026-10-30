@@ -344,6 +344,9 @@ describe("lentProviderEnv", () => {
 		const path = store();
 		const id = addRow(path, "anthropic", { access: "access-1" });
 		const db = new Database(path);
+		// Each run rewrites the row: with fsync on, 200 writes took 18 s on a loaded host.
+		// The store is throwaway, so skip fsync; readers still see each write.
+		db.exec("PRAGMA synchronous = OFF");
 		const set = db.query("UPDATE auth_credentials SET data = ? WHERE id = ?");
 		await fc.assert(
 			fc.asyncProperty(fc.json(), async (junk) => {
