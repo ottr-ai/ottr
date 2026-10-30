@@ -317,8 +317,9 @@ describe("LaneCol backlog divider", () => {
 			/>,
 		);
 		expect(html.match(/lane-more/g)?.length).toBe(1);
-		// The topic head counts every card of the topic, hidden ones too.
-		expect(html).toContain(">8</span>");
+		// A paged topic head reads loaded/total; a fully loaded one reads its total.
+		expect(html).toContain(">1/8</span>");
+		expect(html).toContain(">1</span>");
 		expect(html).toContain(">7</span>");
 	});
 });

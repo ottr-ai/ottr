@@ -4056,7 +4056,9 @@ export function LaneCol({
 									</svg>
 									<span className="lane-label">{g.label}</span>
 									<span className="topic-count">
-										{g.tasks.length + g.hidden}
+										{g.hidden > 0
+											? `${g.tasks.length}/${g.tasks.length + g.hidden}`
+											: g.tasks.length}
 									</span>
 								</button>
 								<div className="topic-body" id={bodyId}>
