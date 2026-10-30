@@ -320,9 +320,23 @@ export function buildToolsPath(project: string, home = homedir()): string {
 			throw new Error(
 				`tools: ${e.name}: ${e.sha256.slice(0, 12)} missing from ${root}`,
 			);
-		symlinkSync(target, join(dir, e.name));
+		if (e.name === "godot") writeHeadlessWrapper(target, join(dir, e.name));
+		else symlinkSync(target, join(dir, e.name));
 	}
 	return dir;
+}
+
+/**
+ * Without a display Godot exits ("Can't load Xlib"), so `godot` adds --headless when there is
+ * none: godot-mcp's run_project then runs the game and reads its output. A display keeps it.
+ */
+function writeHeadlessWrapper(target: string, path: string): void {
+	const quoted = `'${target.replaceAll("'", `'\\''`)}'`;
+	writeFileSync(
+		path,
+		`#!/bin/sh\n[ -n "\${DISPLAY}\${WAYLAND_DISPLAY}" ] || set -- --headless "$@"\nexec ${quoted} "$@"\n`,
+		{ mode: 0o755 },
+	);
 }
 
 /**

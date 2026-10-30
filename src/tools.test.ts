@@ -515,6 +515,32 @@ describe("buildToolsPath", () => {
 		);
 		expect(() => buildToolsPath("ghost", h)).toThrow("missing from");
 	});
+
+	test("godot gets --headless only when no display is set", async () => {
+		const h = mkdtempSync(join(home, "godot-"));
+		const body = new TextEncoder().encode('#!/bin/sh\necho "$@"\n');
+		const sha = sha256(body);
+		const bin = "it's godot"; // a quote in the path must survive the shell
+		mkdirSync(join(h, ".ottr", "tools", sha), { recursive: true });
+		writeFileSync(join(h, ".ottr", "tools", sha, bin), body, { mode: 0o755 });
+		provision(
+			"game",
+			[{ name: "godot", url: "https://x/g", sha256: sha, unpack: "zip", bin }],
+			[],
+			h,
+		);
+		const godot = join(buildToolsPath("game", h), "godot");
+		const run = async (env: Record<string, string>) => {
+			const p = Bun.spawn([godot, "--path", "a b"], {
+				env: { PATH: process.env.PATH ?? "", ...env },
+				stdout: "pipe",
+			});
+			return (await new Response(p.stdout).text()).trim();
+		};
+		expect(await run({})).toBe("--headless --path a b");
+		expect(await run({ DISPLAY: ":0" })).toBe("--path a b");
+		expect(await run({ WAYLAND_DISPLAY: "wayland-0" })).toBe("--path a b");
+	});
 });
 
 describe("turnEnvValues", () => {

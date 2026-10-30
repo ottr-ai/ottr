@@ -184,7 +184,9 @@ ahead of the image PATH: the project's tools first, then the fleet folder
 `workers/_all/tools.json`, and a project's `name` wins over the same `name` in
 `_all`. The container PATH itself never changes, so two projects never see each
 other's pins. A failed download or a hash mismatch stops the turn with the error,
-like a failed apt install.
+like a failed apt install. The name `godot` gets a small wrapper instead of a
+link: without `DISPLAY` or `WAYLAND_DISPLAY` it adds `--headless`, because Godot
+exits with "Can't load Xlib" when it finds no display.
 
 An env var name a project's turns need goes into `env.txt` beside the other two
 files: one name per line, `#` comments allowed, never a value. The value is a
