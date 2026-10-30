@@ -226,8 +226,9 @@ A listed name with no value does not stop the turn; the card log names it.
   only to that project's turns). The host omp oauth dir is mounted read-only
   into every container via `OTTR_OAUTH_DIR` (required; for example
   `C:/Users/<you>/.omp/oauth`). Provider sign-in is one sign-in per provider,
-  done once on the board: **Settings → Provider sign-in**, or
-  `docker compose exec server omp login <provider>`. The board store
+  done once on the board in **Settings → Provider sign-in**. Do not use
+  `docker compose exec server omp login`: it skips the worker-store update and
+  runs omp with the worker-writable home. The board store
   (`/etc/ottr/home/.omp/agent/agent.db` on the `board-config` volume) holds the
   credential. `OTTR_AGENT_DB` is the worker store: a file bind-mounted at
   `/root/.omp/agent/agent.db`. Seed it once with a consistent copy of the
@@ -239,7 +240,7 @@ A listed name with no value does not stop the turn; the card log names it.
   Before each worker turn, the board puts the provider's short-lived access
   token into the turn env (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`,
   `ZAI_API_KEY`). The worker store keeps no board-managed credential.
-  A sign-in marks the provider's worker-store rows `replaced by newer
+  A lent OAuth sign-in marks the provider's worker-store rows `replaced by newer
   credential`, and sign-out clears both stores.
   Never copy the host's file over the board store again. A copied login shares
   its refresh token with the host, and a provider that rotates refresh tokens
