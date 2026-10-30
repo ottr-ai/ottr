@@ -446,16 +446,20 @@ export function createSupervisor(
 		});
 		if (next.state === "needs_you") return; // still stuck the same way; leave it
 		if (next.state === "queued") {
+			// Only a work report re-classifies to queued (merging). The turn settle runs the work
+			// check and the update/fork merge holds on that path; promoting here would skip them,
+			// so resume the work turn ("." = the resume marker) and let its settle decide.
 			e.store.updateTask(t.id, {
-				stage: next.stage,
+				stage: "in_progress",
 				state: "queued",
 				needsReason: null,
 				queuedAt: ops.now(),
+				pendingPrompt: ".",
 			});
 			ops.appendLog(
 				e.store,
 				t.id,
-				`supervisor: stale needs_you cleared — git now proves the ${last.kind} report; re-queued for integration`,
+				"supervisor: stale needs_you cleared — git now proves the work report; resumed the work turn so its settle runs the work check and merge holds",
 			);
 			ops.schedule();
 		} else if (next.stage === "done") {

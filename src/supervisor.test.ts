@@ -562,22 +562,26 @@ describe("stale needs_you re-classification", () => {
 		store.close();
 	});
 
-	test("ready card with landable commits re-queues for integration", async () => {
+	test("held card with landable commits resumes the work turn instead of merging", async () => {
 		const { store, t } = staleCard("re-queue", {
 			needsReason:
 				"Reported ready, but git shows 2 commit(s) ahead of the base.",
 			outcome: "ready",
 		});
+		// An admin update-merge hold: only the work turn's settle enforces it (and the work check).
+		store.updateTask(t.id, { updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
 		const ops = fakeOps({ commitsAheadNow: 2 });
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = store.getTask(t.id)!;
-		expect(after.stage).toBe("merging");
+		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe(".");
 		expect(after.needsReason).toBeNull();
 		expect(after.queuedAt).toBe(ops.time);
 		expect(ops.calls.scheduled).toBe(1);
 		const log = await Bun.file(store.logPath(t.id)).text();
-		expect(log).toContain("re-queued for integration");
+		expect(log).toContain("resumed the work turn");
 		store.close();
 	});
 
