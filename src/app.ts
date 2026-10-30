@@ -140,7 +140,7 @@ import {
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { ProjectStore } from "./store.ts";
-import { listedEnvNames } from "./tools.ts";
+import { ENV_NAME, listedEnvNames } from "./tools.ts";
 import {
 	type CancelOutcome,
 	errmsg,
@@ -278,7 +278,9 @@ interface AppDeps {
 		workCheck: boolean;
 		removedPaths: string[];
 		projectPaths: string[];
-		/** Secret env values from Settings, for the turn loop's redaction/env seeding. */
+		/** Secret env values from Settings, one per env.txt name; the only copy. Stored plaintext
+		 * in the config file like githubToken (same trust level), never served back after save.
+		 * The turn loop reads it for redaction and env seeding. */
 		envValues: Record<string, string>;
 	};
 	serverRef: { current: Server<undefined> | undefined };
@@ -628,11 +630,6 @@ export function createApp(deps: AppDeps) {
 	};
 	/** GitHub token from onboarding or Settings; stored plaintext like apiKey (same trust level). */
 	let githubToken: string | null = null;
-	/**
-	 * Secret env values from Settings, one per env.txt name; stored plaintext in the config
-	 * file like githubToken (same trust level), never served back after save.
-	 */
-	let envValues: Record<string, string> = {};
 	/**
 	 * Per-host HTTPS tokens for every git host; stored plaintext like
 	 * githubToken (same trust level). One entry per host; the token is handed to git through a
@@ -1170,7 +1167,7 @@ export function createApp(deps: AppDeps) {
 			alate,
 			githubToken,
 			gitTokens,
-			envValues,
+			envValues: deps.shared.envValues,
 			hindsightToken,
 			hindsightUrl,
 		});
@@ -1265,10 +1262,10 @@ export function createApp(deps: AppDeps) {
 			// Each stored row re-runs the request validation; a corrupt entry is dropped.
 			const vals: Record<string, string> = {};
 			for (const [name, value] of Object.entries(parsed.envValues)) {
-				if (/^[A-Z_][A-Z0-9_]*$/.test(name) && typeof value === "string")
+				if (ENV_NAME.test(name) && typeof value === "string")
 					vals[name] = value;
 			}
-			envValues = vals;
+			deps.shared.envValues = vals;
 		}
 	}
 	applyGithubToken();
@@ -1279,13 +1276,12 @@ export function createApp(deps: AppDeps) {
 	function applyGitSecrets(): void {
 		setGitSecrets([
 			...gitTokens.map((t) => t.token),
-			...Object.values(envValues),
+			...Object.values(deps.shared.envValues),
 			sshDir,
 			sshDir.replaceAll("\\", "/"),
 		]);
 	}
 	applyGitSecrets();
-	deps.shared.envValues = { ...envValues };
 	// D6: every network git call (clone/fetch/ls-remote/pull/push, merge turns included) picks
 	// up the auth of the project that owns cwd. Workers get none of these names: the runner
 	// strips them from the env it forwards (GIT_AUTH_ENV_RE in src/worktree.ts).
@@ -2805,12 +2801,10 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, async () =>
 					json({
-						names: listedEnvNames(workersHome)
-							.map((row) => ({
-								...row,
-								set: envValues[row.name] !== undefined,
-							}))
-							.sort((a, b) => a.name.localeCompare(b.name)),
+						names: listedEnvNames(workersHome).map((row) => ({
+							...row,
+							set: deps.shared.envValues[row.name] !== undefined,
+						})),
 					}),
 				),
 			POST: (req) =>
@@ -2819,12 +2813,12 @@ export function createApp(deps: AppDeps) {
 					if ("error" in r) return r.error;
 					const name = r.body.name;
 					const value = r.body.value;
+					// Listed names already passed parseEnvTxt's ENV_NAME check.
 					const listed = listedEnvNames(workersHome).some(
 						(row) => row.name === name,
 					);
 					if (
 						typeof name !== "string" ||
-						!/^[A-Z_][A-Z0-9_]*$/.test(name) ||
 						!listed ||
 						typeof value !== "string" ||
 						value === ""
@@ -2836,10 +2830,9 @@ export function createApp(deps: AppDeps) {
 							},
 							400,
 						);
-					envValues[name] = value;
+					deps.shared.envValues[name] = value;
 					saveConfig();
 					applyGitSecrets();
-					deps.shared.envValues = { ...envValues };
 					return json({ ok: true });
 				}),
 		},

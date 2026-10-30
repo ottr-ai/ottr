@@ -1,6 +1,6 @@
 import {
+	clean,
 	PROMPT_CHAR_BUDGET,
-	redactSecrets,
 	runGateway,
 	type SpawnFn,
 	stripInvisible,
@@ -100,9 +100,12 @@ export function reviewUserMessage(o: {
 	diff: string;
 }): string {
 	const block = (label: string, raw: string): string => {
-		const r = redactSecrets(stripInvisible(raw).text);
-		if (r.paused !== null) throw new Error(`${label}: ${r.paused}`);
-		return `${label}\n<<<DATA\n${r.text}\nDATA>>>`;
+		try {
+			return `${label}\n<<<DATA\n${clean(raw)}\nDATA>>>`;
+		} catch (err) {
+			// clean throws only its own pause Error.
+			throw new Error(`${label}: ${(err as Error).message}`);
+		}
 	};
 	const msg = [
 		`Pull request #${o.number} of ${o.repo}.`,

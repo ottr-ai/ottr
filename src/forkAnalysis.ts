@@ -78,6 +78,13 @@ export function redactSecrets(s: string): {
 	return { text, hits, paused: null };
 }
 
+/** Untrusted text for a prompt: stripInvisible then redactSecrets; throws when redaction pauses. */
+export function clean(s: string): string {
+	const red = redactSecrets(stripInvisible(s).text);
+	if (red.paused !== null) throw new Error(red.paused);
+	return red.text;
+}
+
 /** Fixed system prompt; all fork content arrives as data blocks in the user message. */
 export function systemPrompt(): string {
 	return `You are a code-research triage assistant.
@@ -109,13 +116,6 @@ export function buildUserMessage(
 	range: ForkRange,
 	prior: { titles: string[]; declines: string[] },
 ): string {
-	const clean = (s: string): string => {
-		const stripped = stripInvisible(s);
-		const red = redactSecrets(stripped.text);
-		if (red.paused) throw new Error(red.paused);
-		return red.text;
-	};
-
 	const fork = clean(
 		`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
 			range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),

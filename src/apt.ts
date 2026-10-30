@@ -28,6 +28,16 @@ export function aptListPath(project: string, home = homedir()): string {
 	return join(home, ".ottr", "workers", project, "apt.txt");
 }
 
+/** Every provisioned project folder with a safe name, sorted. */
+export function workerProjects(home = homedir()): string[] {
+	const dir = join(home, ".ottr", "workers");
+	return existsSync(dir)
+		? readdirSync(dir)
+				.sort()
+				.filter((p) => PROJECT.test(p))
+		: [];
+}
+
 /** apt.txt: one Debian package per line; `#` comments and blank lines are ignored. */
 export function parseAptTxt(text: string): string[] {
 	const names = text

@@ -28,7 +28,7 @@ const NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const UNPACK: Record<string, true> = { zip: true, "tar.gz": true, none: true };
 // env.txt holds names only, never values; a turn fills them from ottr settings.
-const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+export const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 export interface ToolEntry {
 	name: string;
