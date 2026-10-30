@@ -2611,7 +2611,9 @@ function ProjectBoard({
 	// Done lane layout: flat newest-done-first list (default) or topic sections.
 	const [grouped, setGrouped] = useState(false);
 	// Done lane lazy load: how many read cards render before "Show more" appends a page.
+	// The topic view pages each topic on its own, keyed by topic.
 	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
+	const [topicLimits, setTopicLimits] = useState<Record<string, number>>({});
 	// The setup wizard, opened from the checklist's Open setup button.
 	const [setupOpen, setSetupOpen] = useState(false);
 	/** One settings patch from the checklist row buttons; the board's project state refreshes. */
@@ -2989,16 +2991,24 @@ function ProjectBoard({
 					// ponytail: the state payload still carries every card; paginate /api/state
 					// instead if boards grow into the thousands of done cards.
 					let doneHidden = 0;
-					if (c.key === "done" && q === "") {
+					// Empty search only: the done lane groups into topic sections under sticky heads,
+					// every topic loaded and each one paged by its own "Show more".
+					const doneGroups =
+						c.key === "done" && q === "" && grouped
+							? groupTopics(col.filter((t) => !unread(t))).map((g) => {
+									const page = donePage(
+										g.tasks,
+										() => false,
+										topicLimits[g.key] ?? DONE_PAGE,
+									);
+									return { ...g, tasks: page.shown, hidden: page.hidden };
+								})
+							: null;
+					if (c.key === "done" && q === "" && !grouped) {
 						const page = donePage(col, unread, doneLimit);
 						col = page.shown;
 						doneHidden = page.hidden;
 					}
-					// Empty search only: the done lane groups into topic sections under sticky heads.
-					const doneGroups =
-						c.key === "done" && q === "" && grouped
-							? groupTopics(col.filter((t) => !unread(t)))
-							: null;
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
@@ -3098,6 +3108,12 @@ function ProjectBoard({
 								collapsed={collapsed}
 								onToggle={(key) =>
 									setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
+								}
+								onTopicMore={(key) =>
+									setTopicLimits((prev) => ({
+										...prev,
+										[key]: (prev[key] ?? DONE_PAGE) + DONE_PAGE,
+									}))
 								}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -3747,6 +3763,7 @@ export function LaneCol({
 	onAddDraft,
 	more = 0,
 	onMore,
+	onTopicMore,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
@@ -3761,8 +3778,12 @@ export function LaneCol({
 	onMore?: () => void;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
-	/** Done lane only: topic sections to render instead of the flat landing order. */
-	groups: { key: string; label: string; tasks: TaskCard[] }[] | null;
+	/** Done lane only: topic sections to render instead of the flat landing order;
+	 * `hidden` counts the topic's cards behind its own "Show more" button. */
+	groups:
+		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
+		| null;
+	onTopicMore?: (key: string) => void;
 	collapsed: Record<string, boolean>;
 	onToggle: (key: string) => void;
 	hasRules: boolean;
@@ -4034,10 +4055,25 @@ export function LaneCol({
 										<path d="M2 3l2 2 2-2" />
 									</svg>
 									<span className="lane-label">{g.label}</span>
-									<span className="topic-count">{g.tasks.length}</span>
+									<span className="topic-count">
+										{g.tasks.length + g.hidden}
+									</span>
 								</button>
 								<div className="topic-body" id={bodyId}>
-									<div className="topic-cards">{g.tasks.map(card)}</div>
+									<div className="topic-cards">
+										{g.tasks.map(card)}
+										{g.hidden > 0 && onTopicMore && (
+											<button
+												type="button"
+												className="lane-more"
+												onClick={() => onTopicMore(g.key)}
+												title={`Show older ${g.label} cards`}
+											>
+												Show more
+												<span className="topic-count">{g.hidden}</span>
+											</button>
+										)}
+									</div>
 								</div>
 							</section>
 						);

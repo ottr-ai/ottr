@@ -299,6 +299,28 @@ describe("LaneCol backlog divider", () => {
 		);
 		expect(defaultOff).not.toContain("lane-more");
 	});
+
+	test("the topic view puts a Show more button in each topic that hides cards", () => {
+		const t1 = cardFixture({ id: "t1", stage: "done", state: "idle" });
+		const t2 = cardFixture({ id: "t2", stage: "done", state: "idle" });
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[t1, t2]}
+				more={0}
+				groups={[
+					{ key: "a", label: "Alpha", tasks: [t1], hidden: 7 },
+					{ key: "b", label: "Beta", tasks: [t2], hidden: 0 },
+				]}
+				onTopicMore={() => {}}
+			/>,
+		);
+		expect(html.match(/lane-more/g)?.length).toBe(1);
+		// The topic head counts every card of the topic, hidden ones too.
+		expect(html).toContain(">8</span>");
+		expect(html).toContain(">7</span>");
+	});
 });
 
 describe("alateHint", () => {
