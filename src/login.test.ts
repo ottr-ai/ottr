@@ -18,6 +18,7 @@ import {
 	signIns,
 	signOut,
 	signOutEverywhere,
+	signOutWorkerStore,
 } from "./login.ts";
 import { lentProviderEnv } from "./tokens.ts";
 
@@ -504,13 +505,13 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 		]);
 	}, 30_000);
 
-	test("signOutEverywhere marks both stores deleted by user; a missing worker store counts as none", () => {
+	test("signOutEverywhere marks both stores deleted by user; a missing worker store counts as none", async () => {
 		const t = setup();
 		credStore(join(t.boardDir, "agent.db"), [
 			["anthropic", "oauth", { refresh: "board-r" }, "acct-1"],
 			["deepseek", "api_key", { key: "test-key" }, null],
 		]);
-		expect(signOutEverywhere("anthropic", t.stores)).toEqual({
+		expect(await signOutEverywhere("anthropic", t.stores)).toEqual({
 			board: 1,
 			workers: 3,
 		});
@@ -532,13 +533,39 @@ describe("worker store: supersede on sign-in, sign-out everywhere", () => {
 
 		const missing = join(t.boardDir, "..", "absent", "agent.db");
 		expect(
-			signOutEverywhere("deepseek", {
+			await signOutEverywhere("deepseek", {
 				boardDir: t.boardDir,
 				worker: { home: dirname(dirname(t.workerDb)), db: missing },
 			}),
 		).toEqual({ board: 1, workers: 0 });
 		expect(existsSync(missing)).toBe(false);
-	});
+	}, 30_000);
+
+	test("a slow trigger planted in the worker store neither blocks the event loop nor runs past the bound", async () => {
+		const t = setup();
+		const db = new Database(t.workerDb);
+		// A pure-SQL loop: PRAGMA trusted_schema=OFF does not stop it, and nothing ends it.
+		db.exec(`CREATE TABLE sink(x); CREATE TRIGGER slow AFTER UPDATE ON auth_credentials BEGIN
+			INSERT INTO sink SELECT count(*) FROM (WITH RECURSIVE c(i) AS
+				(SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 1000000000000) SELECT i FROM c); END`);
+		db.close();
+		// A real timer on purpose: the test measures whether the real event loop stays free.
+		let ticks = 0;
+		const tick = setInterval(() => ticks++, 20);
+		const start = Date.now();
+		const err = await signOutWorkerStore(
+			"anthropic",
+			t.workerDb,
+			"replaced by newer credential",
+			1500,
+		).catch((e: Error) => e);
+		clearInterval(tick);
+		expect(String(err)).toContain("did not end within 1500 ms");
+		expect(Date.now() - start).toBeLessThan(5000);
+		expect(ticks).toBeGreaterThan(30); // the loop kept running during the write
+		// The killed write rolled back: no row changed.
+		expect(rows(t.workerDb).every((r) => r.disabled_cause === null)).toBe(true);
+	}, 30_000);
 });
 
 describe("code-flow paste path (the phone path)", () => {

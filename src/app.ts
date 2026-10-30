@@ -3874,7 +3874,7 @@ export function createApp(deps: AppDeps) {
 							400,
 						);
 					// One sign-in serves the board and the workers; a logout removes it everywhere.
-					return json({ removed: signOutEverywhere(provider) });
+					return json({ removed: await signOutEverywhere(provider) });
 				}),
 		},
 		"/api/update": {

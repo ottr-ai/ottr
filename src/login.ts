@@ -183,10 +183,15 @@ export function providerLogin({
 		}
 	}
 
-	/** Waits until the step's omp exits, `settled()` holds, or `ms` pass. */
+	/** Waits until the step's verdict is in, `settled()` holds while omp runs, or `ms` pass. */
 	async function wait(s: Step, ms: number, settled: () => boolean) {
 		const end = Date.now() + ms;
-		while (s.code === null && Date.now() < end && !settled())
+		// An exited omp asks nothing more: its verdict lands once onExit settles.
+		while (
+			s.code === null &&
+			Date.now() < end &&
+			((s.child.exitCode ?? s.child.signalCode) !== null || !settled())
+		)
 			await Bun.sleep(50);
 	}
 
@@ -194,13 +199,13 @@ export function providerLogin({
 
 	/**
 	 * Runs `omp login <provider>` against the board's agent dir, with the board's own HOME (R5-1:
-	 * never a worker-writable dir). `onExit` runs once omp exited and both streams ended, in the
-	 * same tick that sets the exit code, so a waiter that sees the code also sees the verdict.
+	 * never a worker-writable dir). `onExit` runs once omp exited and both streams ended; the exit
+	 * code is set once `onExit` settles, so a waiter that sees the code also sees the verdict.
 	 */
 	function launch(
 		provider: string,
 		dir: string,
-		onExit: (code: number) => void,
+		onExit: (code: number) => Promise<void> | void,
 	): Step {
 		const child = Bun.spawn([...command, provider], {
 			stdin: "pipe",
@@ -214,9 +219,9 @@ export function providerLogin({
 			pump(s, child.stdout).catch(() => {}),
 			pump(s, child.stderr).catch(() => {}),
 			child.exited,
-		]).then(([, , code]) => {
+		]).then(async ([, , code]) => {
+			await onExit(code);
 			s.code = code;
-			onExit(code);
 		});
 		return s;
 	}
@@ -237,12 +242,12 @@ export function providerLogin({
 	 * leaves the worker store alone: the workers keep their own. The board writes only the cause
 	 * string and reads nothing from the worker store; a failure cannot fail the sign-in.
 	 */
-	function supersedeWorkers(
+	async function supersedeWorkers(
 		l: Login,
 		boardDb: string,
 		startedAt: number,
 		worker: LoginStores["worker"],
-	): void {
+	): Promise<void> {
 		if (worker === null) return;
 		try {
 			for (const r of activeCredentials(boardDb)) {
@@ -250,7 +255,11 @@ export function providerLogin({
 				if (!lendable(r))
 					l.step.raw += `\nWorker turns do not get ${r.provider} from the board: they keep their own sign-in, or set its env key under Settings, Env.\n`;
 				else if (existsSync(worker.db))
-					signOut(r.provider, worker.db, "replaced by newer credential");
+					await signOutWorkerStore(
+						r.provider,
+						worker.db,
+						"replaced by newer credential",
+					);
 			}
 		} catch (err) {
 			l.step.raw += `\nCannot mark the workers' rows replaced in ${worker.db}: ${errmsg(err)}\n`;
@@ -264,11 +273,11 @@ export function providerLogin({
 		const startedAt = Date.now();
 		const l: Login = {
 			provider,
-			step: launch(provider, boardDir, (code) => {
+			step: launch(provider, boardDir, async (code) => {
 				if (code !== 0 || l.stopped) finish(l, false);
 				else {
 					finish(l, true);
-					supersedeWorkers(l, boardDb, startedAt, worker);
+					await supersedeWorkers(l, boardDb, startedAt, worker);
 				}
 			}),
 			ok: null,
@@ -393,16 +402,16 @@ export function loginStores(): LoginStores {
  * Marks the provider's rows signed out everywhere: the board store, and the workers' store when
  * it is another file and exists. A missing worker store counts as none.
  */
-export function signOutEverywhere(
+export async function signOutEverywhere(
 	provider: string,
 	s: LoginStores = loginStores(),
-): { board: number; workers?: number } {
+): Promise<{ board: number; workers?: number }> {
 	const removed: { board: number; workers?: number } = {
 		board: signOut(provider, join(s.boardDir, "agent.db")),
 	};
 	if (s.worker !== null)
 		removed.workers = existsSync(s.worker.db)
-			? signOut(provider, s.worker.db)
+			? await signOutWorkerStore(provider, s.worker.db)
 			: 0;
 	return removed;
 }
@@ -630,4 +639,44 @@ export function signOut(
 	} finally {
 		db.close();
 	}
+}
+
+/**
+ * signOut on the workers' store, in a child bun with a time bound. Workers can write that file,
+ * so a planted trigger on auth_credentials can run for any time inside the UPDATE, and bun:sqlite
+ * cannot interrupt a statement (PRAGMA trusted_schema=OFF does not stop a pure-SQL trigger, and
+ * omp's own triggers must keep firing). In the board's process that would freeze the event loop.
+ * The child is killed at `ms`; SQLite rolls the write back on the next open.
+ */
+export async function signOutWorkerStore(
+	provider: string,
+	dbPath: string,
+	cause = "deleted by user",
+	ms = 15_000,
+): Promise<number> {
+	const child = Bun.spawn(
+		[process.execPath, import.meta.path, provider, dbPath, cause],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: ms,
+			killSignal: "SIGKILL",
+			windowsHide: true,
+		},
+	);
+	const [out, err, code] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	if (child.signalCode !== null)
+		throw new Error(`the write did not end within ${ms} ms`);
+	if (code !== 0) throw new Error(err.trim().slice(-500) || `exit ${code}`);
+	return Number(out.trim());
+}
+
+// The child of signOutWorkerStore: `bun login.ts <provider> <db> <cause>`.
+if (import.meta.main) {
+	const [provider = "", dbPath = "", cause = ""] = Bun.argv.slice(2);
+	console.log(signOut(provider, dbPath, cause));
 }
