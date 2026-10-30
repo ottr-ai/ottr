@@ -43,6 +43,8 @@ function setup(
 	let reviewFail = false;
 	/** A PR whose head moves between the list call and the review's read. */
 	let movedTo: string | null = null;
+	/** Diff overrides by PR number; others get a small default diff. */
+	const diffs = new Map<number, string>();
 	const logs: string[] = [];
 	const prompts: string[] = [];
 	let t = 1_000_000_000;
@@ -54,7 +56,7 @@ function setup(
 		if (m && args.includes("-H"))
 			return {
 				code: 0,
-				stdout: `diff --git a/x b/x\n+pr ${m[1]}\n`,
+				stdout: diffs.get(Number(m[1])) ?? `diff --git a/x b/x\n+pr ${m[1]}\n`,
 				stderr: "",
 			};
 		if (m) {
@@ -99,6 +101,7 @@ function setup(
 		logs,
 		prompts,
 		closed,
+		diffs,
 		setOpen: (v: { number: number; head: { sha: string } }[]) => {
 			open = v;
 		},
@@ -279,6 +282,26 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		expect(s.cards().length).toBe(1);
 		expect(s.store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("an over-budget or secret-flagged PR takes no cap slot and never blocks a newer PR", async () => {
+		const s = setup();
+		s.setOpen([pr(1, sha("a")), pr(2, sha("a")), pr(3, sha("a"))]);
+		s.diffs.set(1, "x".repeat(400_001));
+		s.diffs.set(2, '+cfg.password = "abcdefghijklmnop"');
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		for (let i = 0; i <= PR_GATES.PROJECT_DAILY_RUNS; i++)
+			await s.watcher.tick();
+		expect(s.store.prReviewRunsSince(0)).toBe(1);
+		expect(s.cards().length).toBe(1);
+		expect(s.store.prHeadReviewed(3, sha("a"))).toBe(true);
+		expect(
+			s.logs.some((m) => m.includes("#1 review skipped: diff exceeds")),
+		).toBe(true);
+		expect(s.logs.some((m) => m.includes("#2 review skipped: DIFF"))).toBe(
+			true,
+		);
 	});
 
 	test("a head that moves during the review saves no draft", async () => {

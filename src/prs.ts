@@ -254,27 +254,36 @@ export function createPrWatcher(deps: {
 				);
 				return;
 			}
-			// The attempt counts against the cap before the slow model call; only a saved draft
-			// marks the head reviewed, so a failed attempt retries on a later tick.
-			const run = store.startPrRun(row.number, row.head, t);
+			// Diff fetch, prompt budget and redaction pause fail the same way for the same head on
+			// every tick: run them before the attempt takes a cap slot, so one such PR cannot
+			// starve the others of the project.
+			let user: string;
 			try {
 				const data = await pullData(repo, row.number, row.head, gh);
 				if (data === null) {
 					deps.log(`prs: ${project.name}: #${row.number} moved; next tick`);
 					continue;
 				}
+				user = reviewUserMessage({
+					repo,
+					number: row.number,
+					title: row.title,
+					...data,
+				});
+			} catch (e) {
+				deps.log(
+					`prs: ${project.name}: #${row.number} review skipped: ${(e as Error).message}`,
+				);
+				continue;
+			}
+			// The model attempt counts against the cap before the slow call; only a saved draft
+			// marks the head reviewed, so a failed attempt retries on a later tick.
+			const run = store.startPrRun(row.number, row.head, t);
+			try {
 				const draft = parseDraft(
 					await review([
 						{ role: "system", content: reviewSystemPrompt() },
-						{
-							role: "user",
-							content: reviewUserMessage({
-								repo,
-								number: row.number,
-								title: row.title,
-								...data,
-							}),
-						},
+						{ role: "user", content: user },
 					]),
 				);
 				store.savePrDraft({

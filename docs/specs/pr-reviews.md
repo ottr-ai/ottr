@@ -30,12 +30,14 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
      - The card, if it exists, is not cancelled.
      - Review attempts in the last 24 h are fewer than `PROJECT_DAILY_RUNS` (5). The cap stops the tick for that project.
   6. A review does these steps:
-     1. `startPrRun` records the attempt. The attempt counts for the cap.
-     2. Read the diff with `gh api -H "Accept: application/vnd.github.diff" repos/{repo}/pulls/N`. Then read the PR with `gh api repos/{repo}/pulls/N`. When its `head.sha` is not the gated head, stop: the next tick sees the new head.
-     3. Call the model with the fixed `reviewSystemPrompt()` and `reviewUserMessage()`. The user message holds the title, the description (at most 20000 characters) and the diff as labelled DATA blocks. Each block passes `stripInvisible` and `redactSecrets`. A suspicious credential or a message over `PROMPT_CHAR_BUDGET` stops the review.
-     4. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer stops the review.
-     5. `savePrDraft` saves the draft.
-     - A failure logs the error. The head stays open for a retry on a later tick, within the cap.
+     1. Read the diff with `gh api -H "Accept: application/vnd.github.diff" repos/{repo}/pulls/N`. Then read the PR with `gh api repos/{repo}/pulls/N`. When its `head.sha` is not the gated head, stop: the next tick sees the new head.
+     2. Build the user message with `reviewUserMessage()`. The message holds the title, the description (at most 20000 characters) and the diff as labelled DATA blocks. Each block passes `stripInvisible` and `redactSecrets`. A suspicious credential or a message over `PROMPT_CHAR_BUDGET` stops the review.
+     3. A failure in step 1 or 2 logs `review skipped` and uses no cap slot. These checks fail the same way for the same head, so one such PR cannot block the other PRs of the project.
+     4. `startPrRun` records the attempt. The attempt counts for the cap.
+     5. Call the model with the fixed `reviewSystemPrompt()` and the user message.
+     6. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer stops the review.
+     7. `savePrDraft` saves the draft.
+     - A failure after step 4 logs the error. The head stays open for a retry on a later tick, within the cap.
 
 ### Store (additive)
 
