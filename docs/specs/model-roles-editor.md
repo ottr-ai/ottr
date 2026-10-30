@@ -85,10 +85,10 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - After a commit, the section shows each step and its result:
   1. "Committed <short sha> to the data repo."
   2. The provision: running, then success, or the failed scripts and their error. A failure keeps the commit and says so.
-  3. The board copy: with `seed.needed`, the section compares `seed.roles` (the board copy) with the roles before and after the save. The section reads again each 60 s while it waits.
+  3. The board copy: with `seed.needed`, the section keeps `seed.commit` from the save answer. It compares `seed.roles` (the board copy) with the saved roles, and the current `seed.commit` with the kept one. The section reads again each 60 s while it waits.
      - The board copy holds the saved roles: "The board copy has the saved roles".
-     - The board copy holds the roles from before the save, or no roles: "Waiting for the hourly deploy to seed <short sha>".
-     - The board copy holds other roles: "The board copy has other roles: a later change replaced this save". The wait ends.
+     - `seed.commit` is the same as at the save: "Waiting for the hourly deploy to seed <short sha>". The board copy can hold the roles of an earlier save, because two saves can come before one seed.
+     - `seed.commit` changed after the save, and the board copy holds other roles: "The board copy has other roles: a later change replaced this save". The wait ends.
      - Without `seed.needed`: "The board reads the provisioned copy."
 - The section works at 360 px width and keeps WCAG 2.1 AA (DESIGN.md "Accessibility").
 
@@ -107,4 +107,4 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - Saves to a path source in Alate: these need a GitHub repo source.
 - A board-triggered seed: the board container cannot run `board-seed`. The hourly deploy does it.
 - Provider API keys in the env do not clear the sign-in warning.
-- A seed state from git history: the board has no clone of the data repo, so the seed step compares roles, not commits.
+- A seed state from git history: the board has no clone of the data repo. The seed step compares the roles and the recorded `seed.commit`, not the commit graph.

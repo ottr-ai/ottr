@@ -2123,9 +2123,9 @@ function ModelRolesSection() {
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
-	// The roles before and after the last save: the board seed step compares the board copy with both.
+	// The saved roles and the board's seed commit at the save: the seed step compares the board copy with both.
 	const [saved, setSaved] = useState<{
-		before: Record<string, string>;
+		seedAtSave: string | null;
 		after: Record<string, string>;
 	} | null>(null);
 	const [prov, setProv] = useState<ProvisionStep | null>(null);
@@ -2156,7 +2156,7 @@ function ModelRolesSection() {
 	const step =
 		seed === null || saved === null
 			? null
-			: seedStep(seed, saved.before, saved.after);
+			: seedStep(seed, saved.seedAtSave, saved.after);
 	const seedWaits = commit !== null && step === "wait";
 	// The hourly deploy seeds the board copy: read the seed state each minute until it holds the save.
 	useEffect(() => {
@@ -2246,7 +2246,7 @@ function ModelRolesSection() {
 					const { commit: sha, hash, roles, seed } = r;
 					setState((old) => old && { ...old, base: sha, hash, roles, seed });
 					setRows(Object.entries(roles));
-					setSaved({ before: state.roles, after: roles });
+					setSaved({ seedAtSave: seed.commit, after: roles });
 					setCommit(sha);
 					// The commit stands even when the provision fails; the steps list says so.
 					await provision();

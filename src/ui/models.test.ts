@@ -438,19 +438,36 @@ test("roleWarnings warns when the board has no active sign-in for the provider",
 });
 
 test("seedStep: a later seed that holds the save ends the wait; a replaced save is not stuck", () => {
-	const before = { default: "a/b" };
 	const after = { default: "c/d:max" };
-	const seed = (roles: Record<string, string> | null) => ({
+	const seed = (
+		commit: string | null,
+		roles: Record<string, string> | null,
+	) => ({
 		needed: true,
+		commit,
 		roles,
 	});
-	expect(seedStep({ needed: false, roles: null }, before, after)).toBe("copy");
-	expect(seedStep(seed({}), before, after)).toBe("wait");
-	expect(seedStep(seed({ ...before }), before, after)).toBe("wait");
-	expect(seedStep(seed({ ...after }), before, after)).toBe("done");
-	expect(seedStep(seed({ default: "e/f" }), before, after)).toBe("replaced");
-	expect(seedStep(seed({ ...after, plan: "e/f" }), before, after)).toBe(
+	expect(
+		seedStep({ needed: false, commit: null, roles: null }, null, after),
+	).toBe("copy");
+	expect(seedStep(seed(null, {}), null, after)).toBe("wait");
+	expect(seedStep(seed("s1", { default: "a/b" }), "s1", after)).toBe("wait");
+	expect(seedStep(seed("s2", { ...after }), "s1", after)).toBe("done");
+	expect(seedStep(seed("s2", { default: "e/f" }), "s1", after)).toBe(
 		"replaced",
+	);
+	expect(seedStep(seed("s1", {}), null, after)).toBe("replaced");
+	expect(seedStep(seed("s2", { ...after, plan: "e/f" }), "s1", after)).toBe(
+		"replaced",
+	);
+});
+
+test("seedStep: two saves before one seed wait, the board holds neither save's roles", () => {
+	// Save 1 A→B, save 2 B→C, the hourly seed has not run: the board still holds A.
+	const board = { default: "a/a" };
+	const c = { default: "c/c" };
+	expect(seedStep({ needed: true, commit: "s1", roles: board }, "s1", c)).toBe(
+		"wait",
 	);
 });
 

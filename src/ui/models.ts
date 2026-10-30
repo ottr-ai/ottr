@@ -42,24 +42,27 @@ export function roleWarnings(
 		: [`No active sign-in for ${provider} on the board`];
 }
 
-/** Board seed state after a save, from the board copy's roles: "copy" when the board reads the
-    provisioned copy (no seed), "done" when it holds the saved roles, "wait" while it holds the
-    roles from before the save (or none yet: unseeded), "replaced" when a later change gave it
-    other roles. */
+/** Board seed state after a save: "copy" when the board reads the provisioned copy (no seed),
+    "done" when the board copy holds the saved roles, "replaced" when a seed ran after the save
+    (its commit differs from `seedAtSave`) and left other roles, else "wait". Roles alone cannot
+    tell: two saves before one seed leave the board with the roles of neither. */
 export function seedStep(
-	seed: { needed: boolean; roles: Record<string, string> | null },
-	before: Record<string, string>,
+	seed: {
+		needed: boolean;
+		commit: string | null;
+		roles: Record<string, string> | null;
+	},
+	seedAtSave: string | null,
 	after: Record<string, string>,
 ): "copy" | "done" | "wait" | "replaced" {
 	if (!seed.needed) return "copy";
 	const board = seed.roles;
-	const same = (a: Record<string, string>) =>
+	const done =
 		board !== null &&
-		Object.keys(a).length === Object.keys(board).length &&
-		Object.entries(a).every(([r, v]) => board[r] === v);
-	if (same(after)) return "done";
-	const unseeded = board === null || Object.keys(board).length === 0;
-	return unseeded || same(before) ? "wait" : "replaced";
+		Object.keys(after).length === Object.keys(board).length &&
+		Object.entries(after).every(([r, v]) => board[r] === v);
+	if (done) return "done";
+	return seed.commit === seedAtSave ? "wait" : "replaced";
 }
 
 /** GET /api/model-roles: omp's modelRoles in the data repo, the sign-ins, and the board seed state. */
