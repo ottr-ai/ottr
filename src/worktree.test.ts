@@ -2446,6 +2446,67 @@ describe("git", () => {
 		]);
 		expect(await diffText(wt, base, base)).toContain("-old\n+new\n");
 	}, 60_000);
+
+	test("never runs planted diff.external, textconv, uploadpack or receivepack (R5-1)", async () => {
+		const main = repo();
+		const origin = repo();
+		await must(origin, "init", "-q", "--bare", "-b", "main");
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "config", "user.name", "ott");
+		await must(main, "config", "user.email", "ott@example.invalid");
+		writeFileSync(join(main, ".gitattributes"), "f.txt diff=planted\n");
+		writeFileSync(join(main, "f.txt"), "a\n");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "a");
+		writeFileSync(join(main, "f.txt"), "b\n");
+		const plant = (key: string, name: string) => {
+			const script = join(main, `${name}.sh`);
+			writeFileSync(
+				script,
+				`#!/bin/sh\ntouch '${join(main, `planted.${name}`)}'\nexit 1\n`,
+			);
+			chmodSync(script, 0o755);
+			return must(main, "config", key, script);
+		};
+		await plant("diff.external", "external");
+		await plant("diff.planted.textconv", "textconv");
+		await must(main, "remote", "add", "origin", origin);
+		await plant("remote.origin.uploadpack", "uploadpack");
+		await plant("remote.origin.receivepack", "receivepack");
+		const planted = () =>
+			["external", "textconv", "uploadpack", "receivepack"].filter((n) =>
+				existsSync(join(main, `planted.${n}`)),
+			);
+		// Control: the plants are live — plain git runs them (and fails, as each plant exits 1).
+		const plain = (...a: string[]) =>
+			Bun.spawnSync([gitExe(), ...a], {
+				cwd: main,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+		plain("diff", "HEAD", "--");
+		plain("-c", "diff.external=", "diff", "--no-ext-diff", "HEAD", "--");
+		plain("fetch", "-q", "origin");
+		plain("push", "-q", "origin", "main");
+		expect(planted()).toEqual([
+			"external",
+			"textconv",
+			"uploadpack",
+			"receivepack",
+		]);
+		for (const n of planted()) rmSync(join(main, `planted.${n}`));
+		// Board git: diffs still render, network calls still work, and no plant runs.
+		const d = await git(["diff", "HEAD", "--"], main);
+		expect(d.code).toBe(0);
+		expect(d.stdout).toContain("+b");
+		expect((await git(["log", "-p", "-1", "--"], main)).code).toBe(0);
+		expect((await git(["show", "HEAD", "--"], main)).code).toBe(0);
+		expect((await git(["push", "-q", "origin", "main"], main)).code).toBe(0);
+		expect((await git(["fetch", "-q", "origin"], main)).code).toBe(0);
+		expect((await git(["ls-remote", "origin"], main)).code).toBe(0);
+		expect(planted()).toEqual([]);
+	}, 60_000);
 });
 
 describe("gitEnv", () => {

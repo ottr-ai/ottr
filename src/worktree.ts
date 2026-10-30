@@ -99,6 +99,26 @@ const NETWORK_GIT: Record<string, true> = {
 };
 
 /**
+ * Flags the board puts right after the subcommand. Repo config a work turn planted (R5-1)
+ * can name a command in keys no `-c` can clear: `diff.external` (an empty value makes git
+ * fail, not skip it), `diff.<driver>.textconv`/`command` (driver names come from planted
+ * attributes) and `remote.<name>.uploadpack`/`receivepack` (git keeps the first value it
+ * reads). Command-line flags outrank all of them.
+ */
+const NO_EXT_DIFF = ["--no-ext-diff", "--no-textconv"];
+const UPLOAD_PACK = ["--upload-pack=git-upload-pack"];
+const PINNED_ARGS: Record<string, readonly string[]> = {
+	diff: NO_EXT_DIFF,
+	log: NO_EXT_DIFF,
+	show: NO_EXT_DIFF,
+	clone: UPLOAD_PACK,
+	fetch: UPLOAD_PACK,
+	"ls-remote": UPLOAD_PACK,
+	pull: UPLOAD_PACK,
+	push: ["--receive-pack=git-receive-pack"],
+};
+
+/**
  * Child env for one board git call: GH_TOKEN only when the subcommand touches the network
  * (finding the subcommand skips `-c <k>=<v>` global pairs). Work turns share the workspace
  * and home volumes the board runs git in and can write its repo's .git/config or the home
@@ -171,7 +191,7 @@ export async function git(
 	authEnv?: Record<string, string>,
 	env: Record<string, string> = {},
 ): Promise<GitResult> {
-	let sub = "";
+	let at = -1;
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
 		if (a === "-c") {
@@ -179,10 +199,11 @@ export async function git(
 			continue;
 		}
 		if (a && !a.startsWith("-")) {
-			sub = a;
+			at = i;
 			break;
 		}
 	}
+	const sub = at < 0 ? "" : (args[at] as string);
 	const isNetwork = NETWORK_GIT[sub] === true;
 	const auth = isNetwork ? (authEnv ?? networkGitAuth(cwd)) : {};
 	// The redaction list is fixed at spawn: the stored secrets now, plus the tokens this call
@@ -200,8 +221,9 @@ export async function git(
 			// in the shared workspace or home volume (R5-1) cannot run an fsmonitor command, a
 			// hook or a signing program in the board's git, which holds GH_TOKEN. The board never
 			// signs, and a planted log.showSignature or signed commit can only reach `false`.
-			// Filter drivers need sealedGit. Residual: network subcommands still read
-			// credential.helper and core.sshCommand from planted config (docs/WORKERS.md).
+			// PINNED_ARGS covers the diff and pack keys -c cannot clear. Filter drivers need
+			// sealedGit. Residual: network subcommands still read credential.helper and
+			// core.sshCommand from planted config (docs/WORKERS.md).
 			"-c",
 			"core.fsmonitor=false",
 			"-c",
@@ -216,7 +238,9 @@ export async function git(
 			"gpg.x509.program=false",
 			"-c",
 			"gpg.ssh.program=false",
-			...args,
+			...args.slice(0, at + 1),
+			...(PINNED_ARGS[sub] ?? []),
+			...args.slice(at + 1),
 		],
 		cwd,
 		timeoutMs,

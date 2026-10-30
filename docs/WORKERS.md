@@ -354,9 +354,11 @@ Server-side git is the only holder of these credentials. Each network call also
 resets the repo-config credential helpers (then re-adds the global and system
 ones), disables `ext::` transport, signed pushes and askpass, and always sets
 `GIT_SSH_COMMAND`, so config that a turn plants in a main checkout's
-`.git/config` cannot run with the tokens. Residual limits: a planted
-`remote.<name>.uploadpack` or `receivepack` on a local-path remote still runs,
-because git keeps the first value it reads. A planted `http.<url>.proxy` with
+`.git/config` cannot run with the tokens. Every board git also passes explicit
+`--upload-pack`/`--receive-pack` to network subcommands and `--no-ext-diff
+--no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
+`receivepack`, `diff.external` or textconv driver does not run. Residual limit: a planted
+`http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees
 them. For a project without a GitHub remote, the server pushes the merged target

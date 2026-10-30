@@ -503,9 +503,9 @@ const shq = (v: string): string =>
  * main checkout's .git/config (R5-1), and env config outranks it, so this env also neutralizes
  * the repo-config paths that could run a command while the call holds the tokens: credential
  * helpers (reset, then the ambient global/system ones and Ottr's re-added), ext:: transport,
- * signed pushes, askpass and core.sshCommand. Residual (R5-1, docs/WORKERS.md): a planted
- * remote.<name>.uploadpack/receivepack on a local-path remote is first-wins in git, so env
- * config cannot override it.
+ * signed pushes, askpass and core.sshCommand. A planted remote.<name>.uploadpack/receivepack
+ * is first-wins in git, so env config cannot override it: `git()` in worktree.ts passes
+ * explicit --upload-pack/--receive-pack instead.
  */
 export function gitAuthEnv(o: {
 	tokens: readonly GitToken[];
