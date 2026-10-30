@@ -5,7 +5,6 @@ import {
 	existsSync,
 	fstatSync,
 	mkdirSync,
-	openSync,
 	readFileSync,
 	readSync,
 	statSync,
@@ -29,7 +28,7 @@ import {
 	verifyAdminLogin,
 	verifySession,
 } from "./auth.ts";
-import { unlinkBelow, writeBelow } from "./confine.ts";
+import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import {
 	createForkWatcher,
@@ -4528,7 +4527,7 @@ export function createApp(deps: AppDeps) {
 					const file = found.e.store.logPath(found.task.id);
 					let fd: number;
 					try {
-						fd = openSync(file, "r");
+						fd = openRegular(file);
 					} catch {
 						return new Response("", {
 							headers: {

@@ -2,11 +2,12 @@
 // operation (process/git/release) injected so tests can drive the flows with fakes.
 
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
 import {
 	copyBelow,
+	readRegular,
 	renameBelow,
 	trustedAnchor,
 	writeBelow,
@@ -1429,7 +1430,7 @@ export function createTurnLoop(
 			const reportPath = join(wt, RESEARCH_REPORT);
 			const reportText =
 				kind === "work" && !interview && !grill && existsSync(reportPath)
-					? readFileSync(reportPath, "utf8")
+					? readRegular(reportPath).toString("utf8")
 					: null;
 			const autoResearch =
 				!releaseCard && !task.research && reportText !== null;
@@ -1528,7 +1529,7 @@ export function createTurnLoop(
 					try {
 						seen.add(
 							createHash("sha256")
-								.update(readFileSync(join(store.imagesDir(id), name)))
+								.update(readRegular(join(store.imagesDir(id), name)))
 								.digest("hex"),
 						);
 					} catch {
@@ -1558,7 +1559,7 @@ export function createTurnLoop(
 						if (!p.startsWith(resolve(wt) + sep))
 							log(`! shot ${shot}: path escapes the worktree`);
 						else {
-							const bytes = readFileSync(p);
+							const bytes = readRegular(p);
 							const ext = sniffImage(bytes);
 							if (ext === null) log(`! shot ${shot}: not a recognized image`);
 							else {
@@ -1853,7 +1854,7 @@ export function createTurnLoop(
 				const ui = uiFiles(changed);
 				if (ui.length > 0) {
 					const priorLog = existsSync(store.logPath(id))
-						? readFileSync(store.logPath(id), "utf8")
+						? readRegular(store.logPath(id)).toString("utf8")
 						: "";
 					appendLog(store, id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
 					if (next.needsReason === null && !steered) {
@@ -2337,7 +2338,7 @@ export function createTurnLoop(
 							sessionFile(store.sessionsDir, result.sessionId) ?? "";
 						let transcriptText = "";
 						try {
-							transcriptText = readFileSync(transcriptPath, "utf8");
+							transcriptText = readRegular(transcriptPath).toString("utf8");
 						} catch {
 							// No transcript file on disk: the check works from the diff alone.
 						}

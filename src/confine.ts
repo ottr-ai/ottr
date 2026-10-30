@@ -8,6 +8,7 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readlinkSync,
 	readSync,
 	renameSync,
@@ -199,14 +200,50 @@ export function withDir<T>(
 	}
 }
 
-/** Opens an entry for writing; a symlink there fails ("refusing"), it is never followed. */
+/**
+ * Opens an entry for writing; a symlink there fails ("refusing"), it is never followed.
+ * O_NONBLOCK keeps a planted FIFO from blocking the board's thread (ENXIO without a reader),
+ * and anything but a regular file fails with "refusing".
+ */
 function openEntry(path: string, label: string, mode: WriteMode, perm = 0o666) {
+	let fd: number;
 	try {
-		return openSync(path, FLAGS[mode] | O_NOFOLLOW, perm);
+		fd = openSync(path, FLAGS[mode] | O_NOFOLLOW | O_NONBLOCK, perm);
 	} catch (err) {
-		if (errCode(err) === "ELOOP")
-			throw new Error(`refusing ${label}: a symlink`);
+		const code = errCode(err);
+		if (code === "ELOOP") throw new Error(`refusing ${label}: a symlink`);
+		if (code === "ENXIO") throw new Error(`refusing ${label}: a FIFO`);
 		throw err;
+	}
+	return regularOrClose(fd, label);
+}
+
+function regularOrClose(fd: number, label: string): number {
+	try {
+		if (!fstatSync(fd).isFile())
+			throw new Error(`refusing ${label}: not a regular file`);
+	} catch (err) {
+		closeSync(fd);
+		throw err;
+	}
+	return fd;
+}
+
+/**
+ * Opens `path` for reading without blocking on a FIFO a worker planted there; anything but
+ * a regular file fails with "refusing". Close the result.
+ */
+export function openRegular(path: string): number {
+	return regularOrClose(openSync(path, O_RDONLY | O_NONBLOCK), path);
+}
+
+/** readFileSync for a path on a worker-writable volume: openRegular's refusals apply. */
+export function readRegular(path: string): Buffer {
+	const fd = openRegular(path);
+	try {
+		return readFileSync(fd);
+	} finally {
+		closeSync(fd);
 	}
 }
 

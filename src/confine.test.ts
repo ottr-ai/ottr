@@ -2,10 +2,13 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	closeSync,
+	constants,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readlinkSync,
@@ -23,8 +26,10 @@ import {
 	mkdirBelow,
 	moveBelow,
 	openDir,
+	readRegular,
 	removeBelow,
 	renameBelow,
+	touchBelow,
 	trustedAnchor,
 	unlinkBelow,
 	type WriteMode,
@@ -457,6 +462,52 @@ describe("appendLineBelow", () => {
 		expect(spawnSync("mkfifo", [f]).status).toBe(0);
 		expect(() => appendLineBelow(anchor, f, "x")).toThrow(/not a regular file/);
 		expect(lstatSync(f).isFIFO()).toBe(true);
+	});
+});
+
+describe("a FIFO in place of the task log", () => {
+	const fifoOk =
+		linux && spawnSync("sh", ["-c", "command -v mkfifo"]).status === 0;
+
+	function fifoLog(): { anchor: string; log: string } {
+		const { anchor } = fixture();
+		const log = join(anchor, "logs", "t.log");
+		mkdirSync(join(anchor, "logs"));
+		expect(spawnSync("mkfifo", [log]).status).toBe(0);
+		return { anchor, log };
+	}
+
+	test.skipIf(!fifoOk)("appends and touches refuse it without hanging", () => {
+		const { anchor, log } = fifoLog();
+		expect(() => writeBelow(anchor, log, "x", "append")).toThrow(
+			/refusing .*: a FIFO/,
+		);
+		expect(() => touchBelow(anchor, log)).toThrow(/refusing .*: a FIFO/);
+		expect(lstatSync(log).isFIFO()).toBe(true);
+	});
+
+	test.skipIf(!fifoOk)("an append refuses it while a reader holds it", () => {
+		const { anchor, log } = fifoLog();
+		const reader = openSync(log, constants.O_RDONLY | constants.O_NONBLOCK);
+		try {
+			expect(() => writeBelow(anchor, log, "x", "append")).toThrow(
+				/not a regular file/,
+			);
+		} finally {
+			closeSync(reader);
+		}
+	});
+
+	test.skipIf(!fifoOk)("readRegular refuses it without hanging", () => {
+		const { log } = fifoLog();
+		expect(() => readRegular(log)).toThrow(/not a regular file/);
+	});
+
+	test("readRegular reads a regular file", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "bytes");
+		expect(readRegular(f).toString()).toBe("bytes");
 	});
 });
 
