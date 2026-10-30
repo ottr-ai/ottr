@@ -29,7 +29,7 @@ Ottr (**O**hMyPi **T**ask **Tr**acker) is a local kanban board that runs omp cod
 | Todo | Waits for a free slot: 2 agents per project, 3 in total. Cards can declare dependencies and split into sub-task cards. |
 | In progress | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool. |
 | Merging | A second turn rebases, re-runs the project's checks, and integrates the work the way `AGENTS.md` says. One merge turn per project at a time. |
-| Done | The report passed the git checks. Worktree and branch are gone. |
+| Done | The report passed the git checks. Worktree and branch are gone. The lane shows the newest 20 cards and every card with an unread answer. **Show more** loads 20 more. |
 | Backlog | Parks ideas that are not ready to run. The list sits under Todo below a divider. A grill session refines an idea; a grilled card moves to Todo. While the grill session runs, the card leaves the backlog row and shows as a normal card in the Todo lane. |
 
 Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch.
