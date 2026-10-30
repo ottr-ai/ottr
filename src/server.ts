@@ -354,6 +354,10 @@ const board = {
 	token: newSecret(),
 };
 
+// Override for the worker folders (env.txt, tools.json): Settings and turns share it, so
+// they never disagree. Unset = each reader's default (boardOmpHome() for env.txt and
+// tools.json, R5-1); the dev board pins a fixture so demo names stay off the real home.
+const workersHome = process.env.OTTR_WORKERS_HOME;
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
 const loop = createTurnLoop(projects, {
@@ -396,12 +400,13 @@ const loop = createTurnLoop(projects, {
 	workerTarget: workerFromEnv(),
 	startRun,
 	ensurePackages: ensureProjectPackages,
-	turnEnv: (project, model) => turnEnv(project, model, shared.envValues),
+	turnEnv: (project, model) =>
+		turnEnv(project, model, shared.envValues, { home: workersHome }),
 	// R5-1: a server-local turn reads tools.json and installs under the board's server-only
 	// home (the board-seed copy), never the shared home a worker turn can write.
 	prepareTurn: async (project) => ({
-		lines: await ensureProjectTools(project, boardOmpHome()),
-		pathDir: buildToolsPath(project, boardOmpHome()),
+		lines: await ensureProjectTools(project, workersHome ?? boardOmpHome()),
+		pathDir: buildToolsPath(project, workersHome ?? boardOmpHome()),
 	}),
 	publishRelease,
 	runReleaseCommand,
@@ -430,9 +435,9 @@ const app = createApp({
 	// checkout, which no worker mounts (compose: OTTR_SSH_DIR on the ottr-state volume).
 	sshDir: defaultSshDir(),
 	// Base home whose .ottr/workers folders hold the env.txt name lists (Settings -> Env);
-	// unset: the board's server-only home, as for turnEnv (R5-1). The dev board pins a fixture
-	// so demo names stay off the real home.
-	workersHome: process.env.OTTR_WORKERS_HOME,
+	// unset: the board's server-only home, as for turnEnv (R5-1). The same home the turns
+	// read, so both see one list.
+	workersHome,
 	projects,
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,
