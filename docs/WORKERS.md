@@ -63,7 +63,9 @@ turns and work turns all get the new omp. Two parts do the work:
 1. The workflow `.github/workflows/omp-bump.yml` runs every 6 hours on GitHub. When npm
    has an omp that is 7 or more days old and newer than `OMP_VERSION` in
    `Dockerfile.worker`, it starts that omp on
-   the image's bun, then pushes `chore: bump omp to <version>` to `main`. It is the
+   the image's bun, then pushes `chore: bump omp to <version>` to `main`. It pushes
+   over SSH with a write deploy key (Actions secret `OMP_BUMP_DEPLOY_KEY`), because
+   the ruleset on `main` lets only admins and deploy keys bypass it. It is the
    only place that moves the pin. The pin sits above the omp layer, near the end of
    the file, so a bump rebuilds only the last layers.
 2. Each host that runs the stack deploys `main` with `scripts/update-image.ts`, from

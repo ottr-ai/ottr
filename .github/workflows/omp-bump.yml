@@ -20,12 +20,15 @@ jobs:
     name: Bump
     runs-on: ubuntu-latest
     permissions:
-      contents: write # the bump commit
+      contents: read # the push goes over SSH with the deploy key, not GITHUB_TOKEN
     steps:
-      # Pinned by SHA: this job holds a token that can push to main.
+      # Pinned by SHA: this job holds a key that can push to main.
+      # The ruleset on main lets only admins and deploy keys bypass it, so the push uses
+      # the write deploy key "omp-bump workflow (push to main)", not github-actions[bot].
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true # zizmor: ignore[artipacked] the push step below needs the token
+          ssh-key: ${{ secrets.OMP_BUMP_DEPLOY_KEY }}
+          persist-credentials: true # zizmor: ignore[artipacked] the push step below needs the deploy key
       - name: Move the pin to the newest omp that is 7 or more days old
         id: pin
         run: |
