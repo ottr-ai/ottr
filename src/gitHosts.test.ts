@@ -551,13 +551,16 @@ describe("gitAuthEnv", () => {
 		expect(env.GIT_SSH_COMMAND).toContain("IdentitiesOnly=yes");
 		expect(env.GIT_SSH_COMMAND).toContain("'/state/ssh/global'");
 		expect(env.GIT_SSH_COMMAND).toContain("'/state/ssh/known_hosts'");
+		// ssh reads ~/.ssh/config from the passwd home (/root, the worker-writable volume),
+		// not $HOME: a planted ProxyCommand must never run in the board's ssh (OTTR-264).
+		expect(env.GIT_SSH_COMMAND).toStartWith("ssh -F /dev/null ");
 	});
 
 	// Changed on purpose (merge security review): GIT_SSH_COMMAND is always set so a
 	// core.sshCommand planted in the repo config never runs with the tokens in env.
 	test("no key and no known_hosts still sets a plain batch ssh command", () => {
 		const noKey = gitAuthEnv({ tokens: [], key: null, knownHosts: "/x" });
-		expect(noKey.GIT_SSH_COMMAND).toBe("ssh -o BatchMode=yes");
+		expect(noKey.GIT_SSH_COMMAND).toBe("ssh -F /dev/null -o BatchMode=yes");
 	});
 
 	test("a quote in a key path cannot end the shell word", () => {
@@ -574,6 +577,7 @@ describe("gitAuthEnv", () => {
 			expect(env.GIT_SSH_COMMAND).toContain(`UserKnownHostsFile='${kh}'`);
 			expect(env.GIT_SSH_COMMAND).toContain("StrictHostKeyChecking=yes");
 			expect(env.GIT_SSH_COMMAND).not.toContain(" -i ");
+			expect(env.GIT_SSH_COMMAND).toStartWith("ssh -F /dev/null ");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

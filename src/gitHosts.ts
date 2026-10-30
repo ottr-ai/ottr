@@ -543,13 +543,15 @@ export function gitAuthEnv(o: {
 	env.GIT_CONFIG_COUNT = String(config.length);
 	// Always set (it beats core.sshCommand). Once Ottr holds a confirmed host (its known_hosts
 	// exists), every ssh run keeps the strict host controls, also after the last key is removed.
+	// -F /dev/null: ssh reads ~/.ssh/config from the passwd home (/root), not $HOME, and in
+	// Docker /root is the worker-writable home volume, so a planted ProxyCommand would run here.
 	const strict = `-o UserKnownHostsFile=${shq(o.knownHosts)} -o StrictHostKeyChecking=yes -o BatchMode=yes`;
 	env.GIT_SSH_COMMAND =
 		o.key !== null
-			? `ssh -i ${shq(o.key)} -o IdentitiesOnly=yes ${strict}`
+			? `ssh -F /dev/null -i ${shq(o.key)} -o IdentitiesOnly=yes ${strict}`
 			: existsSync(o.knownHosts)
-				? `ssh ${strict}`
-				: "ssh -o BatchMode=yes";
+				? `ssh -F /dev/null ${strict}`
+				: "ssh -F /dev/null -o BatchMode=yes";
 	return env;
 }
 
