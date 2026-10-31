@@ -1,12 +1,20 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "./globalStore.ts";
 
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0))
+		rmSync(d, { recursive: true, force: true, maxRetries: 5 });
+});
+
 function tempRoot(): string {
-	return mkdtempSync(join(tmpdir(), "ottr-gstore-"));
+	const root = mkdtempSync(join(tmpdir(), "ottr-gstore-"));
+	dirs.push(root);
+	return root;
 }
 
 describe("GlobalStore", () => {

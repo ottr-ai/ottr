@@ -2893,6 +2893,7 @@ describe("hindsight settings", () => {
 	afterAll(() => {
 		if (savedHome === undefined) delete process.env.HOME;
 		else process.env.HOME = savedHome;
+		rmSync(flipHome, { recursive: true, force: true });
 	});
 	// A getter: after an assignment, TypeScript narrows a direct read for good.
 	const token = (): string | undefined => process.env.HINDSIGHT_API_TOKEN;

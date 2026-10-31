@@ -1,4 +1,5 @@
 import { ensureAllPackages } from "./apt.ts";
+import { sweepTmpDirs } from "./tmpsweep.ts";
 import { ensureAllTools } from "./tools.ts";
 import { serveWorker } from "./workers.ts";
 
@@ -8,6 +9,9 @@ if (!token) {
 	console.error("OTTR_WORKER_TOKEN is required");
 	process.exit(1);
 }
+
+sweepTmpDirs();
+setInterval(() => sweepTmpDirs(), 60 * 60 * 1000);
 
 const server = serveWorker({
 	port: Number(process.env.WORKER_PORT) || 8787,

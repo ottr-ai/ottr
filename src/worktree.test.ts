@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { GIT_AUTH_ENV_RE } from "./gitHosts.ts";
 import fc from "./test/properties.ts";
 import {
@@ -1617,6 +1617,7 @@ describe("quarantineUntracked", () => {
 		async () => {
 			const main = await seeded();
 			const outside = mkdtempSync(join(tmpdir(), "ottr-q-out-"));
+			repos.push(outside);
 			mkdirSync(join(main, ".tasks"), { recursive: true });
 			symlinkSync(outside, join(main, ".tasks", "quarantine"));
 			writeFileSync(join(main, "scratch.md"), "s");
@@ -1635,6 +1636,7 @@ describe("quarantineUntracked", () => {
 		async () => {
 			const main = await seeded();
 			const outside = join(mkdtempSync(join(tmpdir(), "ottr-q-tgt-")), "f");
+			repos.push(dirname(outside));
 			writeFileSync(outside, "keep");
 			symlinkSync(outside, join(main, "link"));
 			const q = join(main, ".tasks", "quarantine", "t7");

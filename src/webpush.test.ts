@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -166,9 +166,17 @@ describe("payloadsFor", () => {
 	});
 });
 
+const pushRoots: string[] = [];
+afterEach(() => {
+	for (const root of pushRoots)
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	pushRoots.length = 0;
+});
+
 describe("saveSubs/loadSubs", () => {
 	test("dedupes by endpoint and round-trips", () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
 		const store = GlobalStore.open(root);
 		const sub = (endpoint: string): PushSub => ({
 			endpoint,
@@ -182,25 +190,25 @@ describe("saveSubs/loadSubs", () => {
 		]);
 		expect(loadSubs(store)).toEqual([sub("https://x/1"), sub("https://x/2")]);
 		store.close();
-		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 	test("missing subs load empty", () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
 		const store = GlobalStore.open(root);
 		expect(loadSubs(store)).toEqual([]);
 		store.close();
-		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 	test("non-array kv row loads empty", () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
 		const store = GlobalStore.open(root);
 		store.set("push_subs", { not: "an array" } as unknown as PushSub[]);
 		expect(loadSubs(store)).toEqual([]);
 		store.close();
-		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 	test("malformed entries are skipped, good sub kept", () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
 		const store = GlobalStore.open(root);
 		store.set("push_subs", [
 			{ endpoint: 42, keys: { p256dh: "p", auth: "a" } },
@@ -220,7 +228,6 @@ describe("saveSubs/loadSubs", () => {
 			},
 		]);
 		store.close();
-		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 });
 
@@ -311,6 +318,7 @@ describe("pruneSubs", () => {
 
 	test("prunes against a fresh read, so subs added during the sends survive", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
 		const store = GlobalStore.open(root);
 		saveSubs(store, [sub(1), sub(2)]);
 		// Hold sub 1's send while a concurrent subscribe lands, then answer 410.
@@ -337,7 +345,6 @@ describe("pruneSubs", () => {
 			"https://x/3",
 		]);
 		store.close();
-		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 });
 

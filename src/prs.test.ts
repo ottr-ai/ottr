@@ -1,5 +1,5 @@
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
@@ -18,6 +18,10 @@ let seq = 0;
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-prs-"));
+});
+
+afterAll(() => {
+	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 const sha = (c: string) => c.repeat(40);

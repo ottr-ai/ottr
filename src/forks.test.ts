@@ -1,5 +1,5 @@
-import { beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,6 +26,10 @@ let root: string;
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-forks-"));
+});
+
+afterAll(() => {
+	rmSync(root, { recursive: true, force: true });
 });
 
 function run(allArgs: string[], cwd: string, env?: Record<string, string>) {
@@ -528,6 +532,8 @@ describe("watcher", () => {
 			expect(below(cachePath, shared)).toBe(false);
 			expect(existsSync(cachePath)).toBe(true);
 		} finally {
+			rmSync(shared, { recursive: true, force: true });
+			rmSync(server, { recursive: true, force: true });
 			for (const [k, v] of Object.entries(saved)) {
 				if (v === undefined) delete process.env[k];
 				else process.env[k] = v;

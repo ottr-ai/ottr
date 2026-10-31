@@ -1,11 +1,18 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	buildImportMap,
 	discoverTestFiles,
 	findMutatedFile,
+	run,
 } from "./mutant-run.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-mutant-run-"));
@@ -66,6 +73,48 @@ describe("buildImportMap", () => {
 		} finally {
 			process.chdir(cwd);
 		}
+	});
+});
+
+describe("run", () => {
+	const runRoot = mkdtempSync(join(tmpdir(), "ottr-mutant-run-run-"));
+	afterAll(() =>
+		rmSync(runRoot, { recursive: true, force: true, maxRetries: 5 }),
+	);
+
+	function leftOver(): string[] {
+		return readdirSync(runRoot).filter((f) => f.startsWith("ott-mutant-run-"));
+	}
+
+	test("success: child sees fresh TMPDIR and the dir is removed", async () => {
+		const code = await run(
+			[
+				"bun",
+				"-e",
+				`await require("node:fs/promises").writeFile(
+					require("node:path").join(process.env.TMPDIR!, "out.txt"),
+					"x",
+				);`,
+			],
+			runRoot,
+		);
+		expect(code).toBe(0);
+		expect(leftOver()).toEqual([]);
+	});
+
+	test("failure: dir is removed after a non-zero exit", async () => {
+		const code = await run(["bun", "-e", "process.exit(3)"], runRoot);
+		expect(code).toBe(3);
+		expect(leftOver()).toEqual([]);
+	});
+
+	test("killed: dir is removed after SIGKILL death", async () => {
+		const code = await run(
+			["bun", "-e", "process.kill(process.pid, 'SIGKILL')"],
+			runRoot,
+		);
+		expect(code).not.toBe(0);
+		expect(leftOver()).toEqual([]);
 	});
 });
 

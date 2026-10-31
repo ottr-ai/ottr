@@ -288,6 +288,7 @@ function freshStore(): ProjectStore {
 
 afterEach(() => {
 	for (const s of stores.splice(0)) s.close();
+	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 describe("turn loop", () => {
@@ -5323,10 +5324,9 @@ describe("prepareTurn", () => {
 
 	/** A board store in omp's layout with one fresh OAuth sign-in per provider. */
 	function boardStore(tokens: Record<string, string>): string {
-		const dbPath = join(
-			mkdtempSync(join(tmpdir(), "ottr-turn-lend-")),
-			"agent.db",
-		);
+		const lendDir = mkdtempSync(join(tmpdir(), "ottr-turn-lend-"));
+		dirs.push(lendDir);
+		const dbPath = join(lendDir, "agent.db");
 		const db = new Database(dbPath);
 		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT,
 			provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,

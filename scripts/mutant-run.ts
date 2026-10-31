@@ -5,7 +5,15 @@
 // mutated file; a map miss skips stage 1 and only the full suite runs — slower,
 // never wrong. The parent shell runs under `ulimit -d 2097152`; children inherit
 // it. Linux-only: relies on POSIX grep and the ulimit.
-import { type Dirent, existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+	type Dirent,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
 const IGNORED = [
@@ -155,9 +163,40 @@ export async function findMutatedFile(
 	return out.split("\n")[0] ?? "";
 }
 
-async function run(cmd: string[]): Promise<number> {
-	const proc = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit" });
-	return await proc.exited;
+// Each child gets a fresh TMPDIR; `bun test` temp files die with the folder.
+// The `ott-` prefix matches the worker's hourly /tmp sweep (SIGKILL backstop).
+const activeDirs = new Set<string>();
+
+function removeActiveDirs(): void {
+	for (const dir of activeDirs) rmSync(dir, { recursive: true, force: true });
+}
+
+process.on("SIGTERM", () => {
+	removeActiveDirs();
+	process.exit(143);
+});
+process.on("SIGINT", () => {
+	removeActiveDirs();
+	process.exit(130);
+});
+
+export async function run(
+	cmd: string[],
+	root: string = tmpdir(),
+): Promise<number> {
+	const dir = mkdtempSync(join(root, "ott-mutant-run-"));
+	activeDirs.add(dir);
+	try {
+		const proc = Bun.spawn(cmd, {
+			stdout: "inherit",
+			stderr: "inherit",
+			env: { ...process.env, TMPDIR: dir },
+		});
+		return await proc.exited;
+	} finally {
+		activeDirs.delete(dir);
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 async function dryRun(flags: string[]): Promise<void> {
