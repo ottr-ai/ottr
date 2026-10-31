@@ -27,7 +27,13 @@ const card = (
 	over: Partial<
 		Pick<
 			TaskCard,
-			"title" | "sessionTitle" | "prompt" | "summary" | "asked" | "answered"
+			| "title"
+			| "sessionTitle"
+			| "prompt"
+			| "summary"
+			| "asked"
+			| "answered"
+			| "kind"
 		>
 	> = {},
 ) => ({
@@ -40,6 +46,7 @@ const card = (
 	summary: over.summary ?? null,
 	asked: over.asked ?? null,
 	answered: over.answered ?? false,
+	kind: over.kind ?? "work",
 });
 
 test("slotUse counts running tasks per stage", () => {
@@ -222,6 +229,16 @@ test("laneCounts counts shown, total, fresh and waiting per stage", () => {
 		total: 2,
 		fresh: 0,
 	});
+});
+
+test("a PR review card counts as unread until opened, like an answered card", () => {
+	const tasks = [card("p1", "done", "idle", { kind: "pr_review" })];
+	expect(laneCounts(tasks, "", new Set()).counts.done.fresh).toBe(1);
+	expect(laneCounts(tasks, "", new Set(["p1"])).counts.done.fresh).toBe(0);
+	// A done work card without an answer never counts, even unseen.
+	expect(
+		laneCounts([card("w1", "done", "idle")], "", new Set()).counts.done.fresh,
+	).toBe(0);
 });
 
 test("laneCounts keeps waiting and alarm search-unfiltered", () => {

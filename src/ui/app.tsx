@@ -99,12 +99,14 @@ import {
 import {
 	donePage,
 	dropBeforeId,
+	isUnread,
 	laneCounts,
 	laneOrder,
 	laneStage,
 	reorderIds,
 	SLOT_STAGES,
 	type SlotCounts,
+	seenable,
 	slotUse,
 } from "./queue.ts";
 import { readHash, SETTINGS_HASH, settingsSub } from "./route.ts";
@@ -900,7 +902,14 @@ function Card({
 						{task.id}
 					</span>
 					{unread && (
-						<span className="unread" title="Answered; not opened yet">
+						<span
+							className="unread"
+							title={
+								task.kind === "pr_review"
+									? "New PR review"
+									: "Answered; not opened yet"
+							}
+						>
 							new
 						</span>
 					)}
@@ -3002,8 +3011,7 @@ function ProjectBoard({
 					// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
 					if (c.key === "done") filtered.sort(newestLanded);
 					// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
-					const unread = (t: TaskCard): boolean =>
-						t.answered && !seenAnswers.has(t.id);
+					const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers);
 					let col = c.key === "done" ? filtered : laneOrder(filtered);
 					// Done lazy-loads: the newest page renders and "Show more" appends the next page;
 					// a search shows every match. Unread answers always stay above the cut.
@@ -7603,7 +7611,7 @@ function Drawer({
 							)}
 						{task.stage === "done" && read && (
 							<BusyButton
-								title="Puts the new badge back on this card: the answer counts as not opened again"
+								title="Puts the new badge back on this card: it counts as not opened again"
 								run={async () => {
 									onMarkUnread();
 									return true;
@@ -11565,7 +11573,7 @@ function App() {
 	const [showAdd, setShowAdd] = useState(false);
 	const [showUpdates, setShowUpdates] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	/** Answered cards the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
+	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
 	/** One-shot localStorage → server migration of seen answers, run after the first state load. */
 	const migratedSeen = useRef(false);
@@ -11583,10 +11591,10 @@ function App() {
 			.filter((r) => r.target !== null && !coveredUpdates.has(r.id))
 			.map((r) => r.id) ?? [];
 	const updateCount = updateIds.length;
-	/** Only an ANSWERED card counts as seen: opening a card before its answer lands
-	 * must not hide the "new" badge the answer earns. */
+	/** Only a card with something to read (an answer, a PR review) counts as seen: opening
+	 * a card before that lands must not hide the "new" badge it earns. */
 	const markSeen = useCallback((t: TaskCard | null | undefined) => {
-		if (t?.answered !== true) return;
+		if (t == null || !seenable(t)) return;
 		setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
 		void post("/api/seen", { ids: [t.id] }).catch(() =>
 			setNotice(
@@ -11596,7 +11604,7 @@ function App() {
 	}, []);
 	/** The reverse of markSeen: puts a read answer back to unread, locally and on the server. */
 	const markUnread = useCallback((t: TaskCard | null | undefined) => {
-		if (t?.answered !== true) return;
+		if (t == null || !seenable(t)) return;
 		setSeenAnswers((s) => {
 			if (!s.has(t.id)) return s;
 			const next = new Set(s);
@@ -12645,7 +12653,7 @@ function App() {
 					usedTotal={usedTotal}
 					maxTotal={state?.maxTotal ?? null}
 					act={act}
-					read={selected.answered === true && seenAnswers.has(selected.id)}
+					read={seenable(selected) && seenAnswers.has(selected.id)}
 					onMarkUnread={() => {
 						void markUnread(selected);
 						setSelectedId(null); // close so the board shows the card unread; onClose would re-mark it read

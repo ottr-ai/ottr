@@ -66,6 +66,7 @@ Each project has its own store, so the PR number is the key inside it.
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
+- A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review of the same PR updates the read card and does not restore the badge.
 
 ## Boundaries
 

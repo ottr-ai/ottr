@@ -555,20 +555,21 @@ export function createApp(deps: AppDeps) {
 		deps.gstore.set("seen_answers", [...new Set(ids)].sort());
 	}
 
-	/** Ids of the cards that are question-only right now, by the same rule the state frame
-	 * ships (stateResponse): a read mark only means something for them. Marks a client sends
-	 * for anything else are stale — a pre-server-sync tab imported marks for cards it merely
+	/** Ids of the cards a read mark can stick to right now, by the same rule the state frame
+	 * ships (stateResponse): question-only answered cards and pr_review cards. Marks a client
+	 * sends for anything else are stale — a pre-server-sync tab imported marks for cards it merely
 	 * had open — so /api/seen drops them and the store decays instead of poisoning the board. */
-	function answeredIds(): Set<string> {
+	function seenableIds(): Set<string> {
 		const ids = new Set<string>();
 		for (const e of deps.projects.values()) {
 			try {
 				for (const t of e.store.listTasks()) {
 					if (
 						t.cancelledAt === null &&
-						t.stage === "done" &&
-						!isRetro(t) &&
-						answeredCard(e.store.listTurns(t.id))
+						(t.kind === "pr_review" ||
+							(t.stage === "done" &&
+								!isRetro(t) &&
+								answeredCard(e.store.listTurns(t.id))))
 					)
 						ids.add(t.id);
 				}
@@ -3528,8 +3529,9 @@ export function createApp(deps: AppDeps) {
 						saveSeen(loadSeen().filter((id) => !ids.includes(id)));
 						return json({ ok: true });
 					}
-					// seen ⇒ answered right now: drop anything else (stale clients, dead ids).
-					const live = answeredIds();
+					// seen ⇒ a card that can carry the mark right now: drop anything else
+					// (stale clients, dead ids).
+					const live = seenableIds();
 					saveSeen([...loadSeen(), ...ids].filter((id) => live.has(id)));
 					return json({ ok: true });
 				}),

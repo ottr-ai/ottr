@@ -234,6 +234,31 @@ describe("LaneCol backlog divider", () => {
 		);
 	});
 
+	test("an unread PR review card wears the new badge with its own tooltip", () => {
+		const pr = cardFixture({
+			id: "p1",
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[pr]} unread={() => true} />,
+		);
+		expect(html).toContain('class="unread"');
+		expect(html).toContain('title="New PR review"');
+		// An answered work card keeps the answer tooltip.
+		const answered = cardFixture({
+			id: "t9",
+			stage: "done",
+			state: "idle",
+			answered: true,
+		});
+		const work = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[answered]} unread={() => true} />,
+		);
+		expect(work).toContain('title="Answered; not opened yet"');
+	});
+
 	test("a lane with only backlog cards still renders", () => {
 		const parked = cardFixture({ id: "b1", stage: "backlog", state: "idle" });
 		const html = renderToStaticMarkup(

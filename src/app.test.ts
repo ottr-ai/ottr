@@ -4327,6 +4327,37 @@ describe("read marks (/api/seen)", () => {
 		expect(quiet.status).toBe(200);
 		expect(await seenIn()).not.toContain(stranger.id);
 	});
+
+	test("a pr_review card keeps its read mark like an answered card", async () => {
+		store.savePrReview({
+			number: 4700,
+			taskId: null,
+			head: "cafe123",
+			firstSeenAt: 0,
+			reviewedHead: null,
+			postedHead: null,
+			state: "open",
+			draft: false,
+			title: "Fix it",
+			postError: null,
+		});
+		const pr = store.savePrDraft({
+			run: store.startPrRun(4700, "cafe123", Date.now()),
+			number: 4700,
+			head: "cafe123",
+			draft: "the draft",
+			prompt: "review",
+		});
+		// The watcher files the card done with the draft as its details.
+		expect(pr.kind).toBe("pr_review");
+		expect(pr.stage).toBe("done");
+		const res = await post("/api/seen", { ids: [pr.id] });
+		expect(res.status).toBe(200);
+		expect(await seenIn()).toContain(pr.id);
+		const unread = await post("/api/seen", { ids: [pr.id], unread: true });
+		expect(unread.status).toBe(200);
+		expect(await seenIn()).not.toContain(pr.id);
+	});
 });
 
 describe("cancel keeps the worktree (R5-2)", () => {

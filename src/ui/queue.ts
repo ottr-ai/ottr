@@ -13,7 +13,21 @@ type LaneTask = Pick<
 	| "state"
 	| "asked"
 	| "answered"
+	| "kind"
 >;
+
+/** Cards a read mark can stick to: answered question cards and PR review cards. */
+export function seenable(t: Pick<TaskCard, "answered" | "kind">): boolean {
+	return t.answered === true || t.kind === "pr_review";
+}
+
+/** Unread: has something to read and no read mark yet. */
+export function isUnread(
+	t: Pick<TaskCard, "id" | "answered" | "kind">,
+	seen: ReadonlySet<string>,
+): boolean {
+	return seenable(t) && !seen.has(t.id);
+}
 
 const STAGES = [
 	"todo",
@@ -29,7 +43,7 @@ export type LaneCount = {
 	shown: number;
 	/** All cards in the stage, ignoring the filter. */
 	total: number;
-	/** Done only: answered cards not opened yet. */
+	/** Done only: cards not opened yet (answers, PR reviews). */
 	fresh: number;
 	/** needs_you cards, ignoring the filter: an alarm must not hide behind the search box. */
 	waiting: number;
@@ -68,9 +82,7 @@ export function laneCounts<T extends LaneTask>(
 			shown: visible.length,
 			total: tasks.filter((t) => laneStage(t) === stage).length,
 			fresh:
-				stage === "done"
-					? visible.filter((t) => t.answered && !seen.has(t.id)).length
-					: 0,
+				stage === "done" ? visible.filter((t) => isUnread(t, seen)).length : 0,
 			waiting: waiting.length,
 			alarm:
 				waiting.length === 0
