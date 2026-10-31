@@ -1686,3 +1686,833 @@ describe("envFileValues", () => {
 		expect(env).toEqual({ ALATE_IMAGE: "x" });
 	});
 });
+
+describe("helpers survivor kills", () => {
+	/** The bun -e scripts a hold that lapses after 1 h runs in the server: hold, count, free. */
+	async function boardScripts(): Promise<string[]> {
+		const { main } = checkout();
+		const f = fakes({ newImage: true, turns: "1" });
+		const scripts = new Set<string>();
+		const docker: Deps["docker"] = (...a) => {
+			if (a.at(-2) === "-e") scripts.add(a.at(-1)!);
+			return f.deps.docker(...a);
+		};
+		expect(
+			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
+		).toBe(0);
+		return [...scripts];
+	}
+
+	/** Runs a board script with PORT on a local fake board: its exit code and stdout. */
+	async function runOnBoard(
+		script: string,
+		board: (req: Request) => Response,
+	): Promise<{ code: number; out: string }> {
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: board });
+		try {
+			const p = Bun.spawn([process.execPath, "-e", script], {
+				env: { ...process.env, PORT: String(server.port) },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [out, code] = await Promise.all([
+				new Response(p.stdout).text(),
+				p.exited,
+			]);
+			return { code, out: out.trim() };
+		} finally {
+			server.stop(true);
+		}
+	}
+
+	test("the board scripts count running turns and end the hold from the board's own origin", async () => {
+		const scripts = await boardScripts();
+		expect(scripts).toHaveLength(3);
+		const [, count, free] = scripts as [string, string, string];
+		const state = {
+			tasks: ["running", "preparing", "done", "queued"].map((state) => ({
+				state,
+			})),
+		};
+		expect(
+			await runOnBoard(count, (req) =>
+				new URL(req.url).pathname === "/api/state"
+					? Response.json(state)
+					: new Response("", { status: 404 }),
+			),
+		).toEqual({ code: 0, out: "2" });
+		const seen: string[] = [];
+		const freed = await runOnBoard(free, (req) => {
+			seen.push(
+				`${req.method} ${new URL(req.url).pathname} ${req.headers.get("origin")}`,
+			);
+			return new Response("");
+		});
+		expect(freed).toEqual({ code: 0, out: "" });
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toMatch(/^DELETE \/api\/drain http:\/\/127\.0\.0\.1:\d+$/);
+		// A board older than DELETE /api/drain refuses: the script fails closed with the status.
+		expect(
+			await runOnBoard(free, () => new Response("", { status: 404 })),
+		).toEqual({ code: 1, out: "HTTP 404" });
+	}, 60_000);
+
+	test("envFileValues trims keys, values and indented comments, and reads only named files", () => {
+		const dir = mkdtempSync(join(root, "env-"));
+		writeFileSync(join(dir, "a.env"), "  # NOTE=x\nKEY = v \n");
+		writeFileSync(join(dir, "x.env"), "TYPO=read\n");
+		const prev = process.cwd();
+		process.chdir(dir);
+		try {
+			expect(
+				envFileValues([
+					"--env-file",
+					"a.env",
+					"--env-file",
+					"gone.env",
+					"--env_file=x.env",
+				]),
+			).toEqual({ KEY: "v" });
+		} finally {
+			process.chdir(prev);
+		}
+	});
+
+	test("an indented count after a compose warning still reads as the count", async () => {
+		const { main } = checkout();
+		const f = fakes({ turns: "WARN[0000] a warning\n 0\n" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+	}, 60_000);
+
+	test("a manifest descriptor without a digest compares the image ids", async () => {
+		const { main } = checkout();
+		const f = fakes({ manifest: { runs: "", built: "sha256:m" } });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+	}, 60_000);
+
+	test("a server ps -q that fails reads no manifest and compares the image ids", async () => {
+		const { main } = checkout();
+		const f = fakes({ manifest: { runs: "sha256:m", built: "sha256:m" } });
+		const docker: Deps["docker"] = async (...a) =>
+			a.join(" ") === SERVER
+				? { code: 1, out: "no such service" }
+				: f.deps.docker(...a);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
+		).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			...COMPARE.slice(2),
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a failed image comparison logs docker's error text trimmed", async () => {
+		const { main } = checkout();
+		const f = fakes();
+		const docker: Deps["docker"] = async (...a) =>
+			a.join(" ") === COMPARE[2]
+				? { code: 1, out: "\nno such service\n" }
+				: f.deps.docker(...a);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
+		).toBe(1);
+		expect(f.logs).toContain(
+			"stopped: the server's image cannot be compared with the build: no such service",
+		);
+	}, 60_000);
+});
+
+describe("deploy flow survivor kills", () => {
+	/** Answers the docker calls that `pick` matches; the rest reach the fake. */
+	const overriding = (
+		f: FakeRun,
+		pick: (line: string) => { code: number; out: string } | undefined,
+	): FakeRun => {
+		const inner = f.deps.docker;
+		f.deps.docker = (...a) => {
+			const r = pick(a.join(" "));
+			return r ? Promise.resolve(r) : inner(...a);
+		};
+		return f;
+	};
+	const seedFakes = (o: Parameters<typeof fakes>[0] = {}) =>
+		fakes({
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			...o,
+		});
+	const DATA_READ =
+		"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit";
+	/** Runs `body` with the shell's ALATE_IMAGE set to `value`, then restores it. */
+	const withShellImage = async (
+		value: string | undefined,
+		body: () => Promise<void>,
+	) => {
+		const prev = process.env.ALATE_IMAGE;
+		if (value === undefined) delete process.env.ALATE_IMAGE;
+		else process.env.ALATE_IMAGE = value;
+		try {
+			await body();
+		} finally {
+			if (prev === undefined) delete process.env.ALATE_IMAGE;
+			else process.env.ALATE_IMAGE = prev;
+		}
+	};
+	const push = (ci: string, content: string, ...msg: string[]) => {
+		writeFileSync(join(ci, "Dockerfile.worker"), content);
+		must(ci, "commit", "-q", "-a", ...msg);
+		must(ci, "push", "-q", "origin", "HEAD:main");
+	};
+
+	test("a hold logs the running turns once, and an accepted hold logs no refusal", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({ newImage: true, turns: ["2", "1", "0"] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.filter((l) => l.includes("holds new turns"))).toEqual([
+			"2 turns run: the board holds new turns, and the restart follows when they finish",
+		]);
+		expect(f.logs.join("\n")).not.toContain("cannot hold new turns");
+	}, 60_000);
+
+	test("a count whose exec fails stops, though its output ends in a number", async () => {
+		const { main } = checkout();
+		const f = overriding(fakes(), (line) =>
+			line.startsWith("compose -f c.yml exec -T server bun -e") &&
+			!line.includes("/api/drain")
+				? { code: 137, out: "3\n" }
+				: undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).not.toContain(UP);
+	}, 60_000);
+
+	test("a count with text after the number stops and logs docker's trimmed output", async () => {
+		const { main } = checkout();
+		const f = fakes({ turns: "10a\n" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.logs).toContain(
+			"stopped: the board's turns cannot be counted: 10a",
+		);
+		expect(f.calls).not.toContain(UP);
+	}, 60_000);
+
+	test("a count with text before the number stops", async () => {
+		const { main } = checkout();
+		const f = fakes({ turns: "a10" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).not.toContain(UP);
+	}, 60_000);
+
+	test("a main that cannot fast-forward stops before the build and says so", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// A held index lock: the checkout is clean and behind, but the merge cannot run.
+		writeFileSync(join(main, ".git", "index.lock"), "");
+		const f = fakes();
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).toEqual([]);
+		expect(f.logs).toContain(
+			"stopped: main does not fast-forward to origin/main",
+		);
+	}, 60_000);
+
+	test("the success line takes the OMP_VERSION pin at a line start, not one in a comment", async () => {
+		const { main, ci } = checkout();
+		push(
+			ci,
+			"FROM x\n# was ARG OMP_VERSION=0.9.0\nARG OMP_VERSION=1.2.0\n",
+			"-m",
+			"pin",
+		);
+		const f = fakes();
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.at(-1)).toEndWith("with omp 1.2.0");
+	}, 60_000);
+
+	test("a Dockerfile without an OMP_VERSION pin deploys with omp unknown", async () => {
+		const { main, ci } = checkout();
+		push(ci, "FROM x\n", "-m", "unpin");
+		const f = fakes();
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.at(-1)).toEndWith("with omp unknown");
+	}, 60_000);
+
+	test("the hold sends commit subjects without their leading spaces", async () => {
+		const { main, ci } = checkout();
+		push(ci, dockerfile("1.1.0"), "--cleanup=verbatim", "-m", "  padded");
+		const f = fakes({ newImage: true, turns: ["1", "0"] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(drainBody(f)).toEqual({ commits: ["padded"] });
+	}, 60_000);
+
+	test("a failed build logs the last 10 lines of docker's trimmed output", async () => {
+		const { main } = checkout();
+		const lines = Array.from({ length: 12 }, (_, i) => `step ${i + 1}`);
+		const f = overriding(fakes(), (line) =>
+			line === BUILD ? { code: 1, out: `\n${lines.join("\n")}\n` } : undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.logs).toEqual([
+			lines.slice(-10).join("\n"),
+			"stopped: the image does not build; the stack keeps the old one",
+		]);
+	}, 60_000);
+
+	test("a failed ps logs docker's trimmed error", async () => {
+		const { main } = checkout();
+		const f = overriding(fakes(), (line) =>
+			line === PS ? { code: 1, out: "daemon down\n" } : undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.logs).toContain("stopped: docker compose ps failed: daemon down");
+	}, 60_000);
+
+	test("a CRLF ps listing still counts the server as running", async () => {
+		const { main } = checkout();
+		const f = fakes({ running: "worker\r\nserver\r", turns: "2" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toContain(COUNT);
+		expect(f.calls).not.toContain(UP);
+	}, 60_000);
+
+	test("a failed up --wait logs docker's trimmed error", async () => {
+		const { main } = checkout();
+		const f = fakes({ up: 1, upOut: "dependency failed to start\n" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.logs).toContain(
+			"stopped: docker compose up --wait failed: dependency failed to start",
+		);
+	}, 60_000);
+
+	test("a board that is down seeds without reading the record", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = seedFakes({ running: "", seedRecord: head });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).not.toContain(DATA_READ);
+		expect(f.seedRuns).toHaveLength(1);
+		expect(f.logs).toContain(
+			`board agent layer seeded at ${head.slice(0, 12)}`,
+		);
+	}, 60_000);
+
+	test("a record read that fails seeds again, whatever the exec printed", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = overriding(seedFakes(), (line) =>
+			line === DATA_READ ? { code: 1, out: head } : undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedRuns).toHaveLength(1);
+	}, 60_000);
+
+	test("a current agent layer logs the short commit", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({ seedRecord: head });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.logs).toContain(
+			`board agent layer current at ${head.slice(0, 12)}`,
+		);
+	}, 60_000);
+
+	test("an ALATE_IMAGE the caller passes is never copied into the process env", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		await withShellImage(undefined, async () => {
+			const f = seedFakes();
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+					ALATE_IMAGE: "alate:env",
+				}),
+			).toBe(0);
+			expect(f.seedImages).toEqual([undefined]);
+			expect(process.env.ALATE_IMAGE).toBeUndefined();
+		});
+	}, 60_000);
+
+	test("a discovered image reaches the seed, and the shell's own ALATE_IMAGE comes back after", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		await withShellImage("alate:shell", async () => {
+			const f = seedFakes();
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.seedImages).toEqual(["alate:current"]);
+			expect(process.env.ALATE_IMAGE).toBe("alate:shell");
+		});
+	}, 60_000);
+
+	test("a failed seed run logs the last 3 lines of docker's trimmed output", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = overriding(seedFakes(), (line) =>
+			line.includes("board-seed")
+				? { code: 1, out: "l1\nl2\nl3\nl4\n" }
+				: undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs).toContain("board seed failed: l2\nl3\nl4");
+	}, 60_000);
+
+	test("a failed restart after a seed stops with docker's trimmed error and records nothing", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = overriding(seedFakes(), (line) =>
+			line === "compose -f c.yml restart server"
+				? { code: 1, out: "restart boom\n" }
+				: undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs).toContain(
+			"stopped: docker compose restart server failed: restart boom",
+		);
+		expect(f.seedWrites).toEqual([]);
+		expect(f.calls).not.toContain(PRUNE);
+	}, 60_000);
+
+	test("a seed record that cannot be written exits 1 after the deploy completes", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = overriding(seedFakes(), (line) =>
+			line.includes("printf %s")
+				? { code: 1, out: "read-only file system\n" }
+				: undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs).toContain(
+			"board seed failed: the seed commit cannot be recorded; the next run seeds again",
+		);
+		expect(f.logs.at(-1)).toStartWith("the stack runs main at");
+	}, 60_000);
+});
+
+describe("sidecar and seed survivor kills", () => {
+	type Out = { code: number; out: string };
+	/** f's fake docker, with `pick` answering a call first when it returns a result. */
+	const over = (f: FakeRun, pick: (line: string) => Out | undefined): Deps => ({
+		...f.deps,
+		docker: async (...a) => pick(a.join(" ")) ?? f.deps.docker(...a),
+	});
+	/** Runs `run` with `fake` answering a git call first when it returns a result; real git
+	 *  answers the rest. Returns the args of every git call. */
+	async function withGit(
+		fake: (
+			args: string[],
+			cwd: string,
+		) => Promise<worktree.GitResult> | undefined,
+		run: () => Promise<void>,
+	): Promise<string[][]> {
+		const seen: string[][] = [];
+		mock.module("../src/worktree.ts", () => ({
+			...realWorktree,
+			git: (args: string[], cwd: string, timeoutMs?: number) => {
+				seen.push(args);
+				return fake(args, cwd) ?? realGit(args, cwd, timeoutMs);
+			},
+		}));
+		try {
+			await run();
+		} finally {
+			mock.module("../src/worktree.ts", () => ({ ...realWorktree }));
+		}
+		return seen;
+	}
+	const NO_SIDECAR = [BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE];
+	const WITH_SIDECAR = [
+		BUILD,
+		CFGJSON,
+		SIDE_BUILD,
+		...SIDE_COMPARE,
+		PS,
+		...COMPARE,
+		COUNT,
+		UP,
+		PRUNE,
+	];
+	const services = (s: Record<string, unknown>) =>
+		JSON.stringify({ services: s });
+
+	test("compose warnings ahead of the config JSON still find the sidecar", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+		});
+		const json = services({ sidecar: { build: { context: side.main } } });
+		const deps = over(f, (l) =>
+			l === CFGJSON
+				? {
+						code: 0,
+						out: `WARN the attribute \`version\` is obsolete\n${json}`,
+					}
+				: undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+		expect(f.calls).toEqual(WITH_SIDECAR.filter((c) => c !== CFGJSON));
+		expect(f.logs.join("\n")).not.toContain("stays as it is");
+	}, 60_000);
+
+	test("a failed or JSON-less compose config logs docker's text and deploys no sidecar", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		for (const [cfg, line] of [
+			[
+				{
+					code: 1,
+					out: `services.sidecar Additional property {bad} is not allowed\n`,
+				},
+				"compose config failed: services.sidecar Additional property {bad} is not allowed",
+			],
+			// Valid JSON on a failed exit is still a failure.
+			[
+				{
+					code: 1,
+					out: services({ sidecar: { build: { context: side.main } } }),
+				},
+				"compose config failed: ",
+			],
+			[
+				{ code: 0, out: "no configuration file provided: not found\n" },
+				"compose config failed: no configuration file provided: not found",
+			],
+		] as const) {
+			const f = fakes({ turns: "0" });
+			const deps = over(f, (l) => (l === CFGJSON ? cfg : undefined));
+			expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+			expect(f.calls).toEqual(NO_SIDECAR.filter((c) => c !== CFGJSON));
+			expect(f.logs.some((l) => l.startsWith(line))).toBe(true);
+			expect(f.logs.join("\n")).not.toContain("not JSON");
+			expect(f.logs.join("\n")).not.toContain("skipping");
+		}
+	}, 60_000);
+
+	test("a compose config without a services map deploys no sidecar and says so", async () => {
+		const { main } = checkout();
+		for (const out of ["{not json\n", "{}\n", '{"services": 5}\n']) {
+			const f = fakes({ turns: "0" });
+			const deps = over(f, (l) =>
+				l === CFGJSON ? { code: 0, out } : undefined,
+			);
+			expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+			expect(f.calls).toEqual(NO_SIDECAR.filter((c) => c !== CFGJSON));
+			expect(f.logs).toContain(
+				"compose config is not JSON: deploying no foreign checkouts",
+			);
+			expect(f.logs.join("\n")).not.toContain("skipping");
+		}
+	}, 60_000);
+
+	test("services without a build context, or with a plain directory, are no sidecar", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		const plain = mkdtempSync(join(root, "plain-")); // exists, but no .git
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+		});
+		const json = services({
+			server: { build: { context: "." } },
+			redis: { image: "redis:7" },
+			cache: { build: {} },
+			plain: { build: { context: plain } },
+			sidecar: { build: { context: side.main } },
+		});
+		const deps = over(f, (l) =>
+			l === CFGJSON ? { code: 0, out: json } : undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+		expect(f.calls).toEqual(WITH_SIDECAR.filter((c) => c !== CFGJSON));
+		const log = f.logs.join("\n");
+		expect(log).not.toContain("skipping");
+		// A clean checkout on main fast-forwards: nothing to report about it.
+		expect(log).not.toContain("stays as it is");
+	}, 60_000);
+
+	test("a sidecar build that fails logs the last 10 lines of docker's output", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		const lines = Array.from({ length: 12 }, (_, i) => `#${i} step ${i}`);
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+		});
+		const deps = over(f, (l) =>
+			l.endsWith(" build sidecar")
+				? { code: 1, out: `\n${lines.join("\n")}\n` }
+				: undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+		expect(f.logs).toContain(lines.slice(-10).join("\n"));
+	}, 60_000);
+
+	test("a failed restart of the sidecar logs docker's text without its padding", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		bump(side.ci, "2.0.0");
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+			sidecarNewImage: true,
+		});
+		const deps = over(f, (l) =>
+			l === SIDE_UP
+				? { code: 1, out: "\ncontainer sidecar is unhealthy\n" }
+				: undefined,
+		);
+		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
+		expect(f.logs).toContain(
+			"sidecar: docker compose up --wait failed: container sidecar is unhealthy",
+		);
+	}, 60_000);
+
+	test("a sidecar worktree that cannot be made skips the service and leaves no temp files", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+		});
+		const trees: string[] = [];
+		await withGit(
+			(args, cwd) => {
+				if (args[0] !== "worktree" || args[1] !== "add") return undefined;
+				trees.push(args[4]!);
+				return realGit([...args.slice(0, -1), "refs/heads/no-such"], cwd);
+			},
+			async () => {
+				expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+			},
+		);
+		expect(f.logs).toContain(
+			`skipping sidecar: no worktree of origin/main from ${side.main}`,
+		);
+		expect(f.calls).toEqual(NO_SIDECAR);
+		expect(trees).toHaveLength(1);
+		expect(existsSync(trees[0]!)).toBe(false);
+		expect(existsSync(`${trees[0]}.yml`)).toBe(false);
+	}, 60_000);
+
+	test("an origin/main that cannot be read there makes no worktree", async () => {
+		const { main } = checkout();
+		const side = checkout();
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+		});
+		const seen = await withGit(
+			(args) =>
+				args[0] === "rev-parse" && args.includes("origin/main")
+					? Promise.resolve({ code: 128, stdout: "", stderr: "fatal: bad rev" })
+					: undefined,
+			async () => {
+				expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+			},
+		);
+		expect(f.logs).toContain(
+			`skipping sidecar: no worktree of origin/main from ${side.main}`,
+		);
+		expect(seen.filter((a) => a[0] === "worktree")).toEqual([]);
+		expect(f.calls).toEqual(NO_SIDECAR);
+	}, 60_000);
+
+	test("an origin that cannot be fetched stops the run before any build", async () => {
+		const { origin, main } = checkout();
+		rmSync(origin, { recursive: true, force: true });
+		const f = fakes();
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.logs).toEqual(["stopped: git fetch origin main failed"]);
+		expect(f.calls).toEqual([]);
+	}, 60_000);
+
+	describe("seed source and alate image", () => {
+		const DATA_READ =
+			"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit";
+		const ALATE_PS = "compose -f c.yml ps -q alate";
+		const ALATE_INSPECT = "inspect -f {{.Config.Image}} alate123";
+		const DOCKER_PS = "ps --filter name=^/?alate$ --format {{.Image}}";
+		const RESTART = "compose -f c.yml restart server";
+		const unrecorded = "0".repeat(40);
+
+		test("ALATE_DATA alone logs no precedence over ALATE_DATA_REPO", async () => {
+			const { main } = checkout();
+			const data = checkout();
+			const f = fakes({ seedRecord: must(data.main, "rev-parse", "HEAD") });
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.logs.join("\n")).not.toContain("wins over");
+		}, 60_000);
+
+		test("an ALATE_DATA without a commit fails the seed, but the deploy completes", async () => {
+			const { main } = checkout();
+			const empty = join(root, String(fixtures++));
+			must(root, "init", "-q", empty); // rev-parse HEAD prints "HEAD" and exits 128
+			const f = fakes({ seedRecord: unrecorded, alatePs: "alate123" });
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, { ALATE_DATA: empty }),
+			).toBe(1);
+			expect(f.seedRuns).toEqual([]);
+			expect(f.calls).toEqual(NO_SIDECAR);
+			expect(f.logs).toContain(
+				`board seed failed: git rev-parse HEAD failed in ${empty}`,
+			);
+		}, 60_000);
+
+		test("an ls-remote that fails after it printed a head fails the seed", async () => {
+			const { main } = checkout();
+			const f = fakes({ seedRecord: unrecorded, alatePs: "alate123" });
+			await withGit(
+				(args) =>
+					args.includes("ls-remote")
+						? Promise.resolve({
+								code: 128,
+								stdout: `${"a".repeat(40)}\trefs/heads/main\n`,
+								stderr: "fatal: the remote end hung up unexpectedly",
+							})
+						: undefined,
+				async () => {
+					expect(
+						await updateImage(main, ["-f", "c.yml"], f.deps, {
+							ALATE_DATA_REPO: "example/data",
+						}),
+					).toBe(1);
+				},
+			);
+			expect(f.seedRuns).toEqual([]);
+			expect(f.calls).toEqual(NO_SIDECAR);
+			expect(f.logs).toContain(
+				"board seed failed: git ls-remote example/data failed",
+			);
+		}, 60_000);
+
+		test("an ALATE_IMAGE in the environment seeds without discovery or an env change", async () => {
+			const { main } = checkout();
+			const data = checkout();
+			const f = fakes({ seedRecord: unrecorded });
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+					ALATE_IMAGE: "alate:pinned",
+				}),
+			).toBe(0);
+			expect(f.calls).not.toContain(ALATE_PS);
+			expect(f.calls).not.toContain(DOCKER_PS);
+			expect(f.seedRuns).toHaveLength(1);
+			// The env file already gives the compose child ALATE_IMAGE: the run sets nothing.
+			expect(f.seedImages).toEqual([process.env.ALATE_IMAGE]);
+		}, 60_000);
+
+		test("the seed runs in the image its discovery reads", async () => {
+			const { main } = checkout();
+			const data = checkout();
+			const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+			const write = `compose -f c.yml exec -T server sh -c printf %s '${must(data.main, "rev-parse", "HEAD")}' > /etc/ottr/seed-commit`;
+			const alate = [{ name: "alate", image: "alate:ps" }];
+			const cases: {
+				o: Parameters<typeof fakes>[0];
+				pick?: (l: string) => Out | undefined;
+				image: string;
+				calls?: string[];
+			}[] = [
+				// The project's alate runs: its image.
+				{
+					o: { alatePs: "alate123", alateInspect: "alate:current" },
+					image: "alate:current",
+				},
+				// No project alate: no inspect, the docker ps fallback.
+				{
+					o: { containers: alate },
+					image: "alate:ps",
+					calls: [
+						BUILD,
+						CFGJSON,
+						PS,
+						DATA_READ,
+						ALATE_PS,
+						DOCKER_PS,
+						seedRun,
+						...COMPARE,
+						HOLD,
+						COUNT,
+						UP,
+						RESTART,
+						write,
+						PRUNE,
+					],
+				},
+				// An inspect with no image, or one that fails: the fallback.
+				{ o: { alatePs: "alate123", containers: alate }, image: "alate:ps" },
+				{
+					o: { alatePs: "alate123", containers: alate },
+					pick: (l) =>
+						l === ALATE_INSPECT
+							? { code: 1, out: "Error: No such object: alate123\n" }
+							: undefined,
+					image: "alate:ps",
+				},
+				// docker on Windows ends its lines with CRLF.
+				{
+					o: {},
+					pick: (l) =>
+						l === DOCKER_PS ? { code: 0, out: "alate:win\r\n" } : undefined,
+					image: "alate:win",
+				},
+			];
+			for (const c of cases) {
+				const f = fakes({ seedRecord: unrecorded, ...c.o });
+				const deps = c.pick ? over(f, c.pick) : f.deps;
+				expect(
+					await updateImage(main, ["-f", "c.yml"], deps, {
+						ALATE_DATA: data.main,
+					}),
+				).toBe(0);
+				expect(f.seedImages).toEqual([c.image]);
+				if (c.calls) expect(f.calls).toEqual(c.calls);
+			}
+		}, 60_000);
+	});
+});

@@ -7,18 +7,27 @@ export default {
   ...base,
   commandRunner: { command: "ulimit -d 2097152 && bun test --bail scripts/update-image.test.ts" },
   mutate: ["scripts/update-image.ts"],
-  // Pinned at 8: without it this inherits the main config's 24, and this git-fixture suite
-  // inherits the base budget (10 s + 2x), which a 24-way run can inflate past — same caution as
-  // the release and worktree configs.
+  // 8, not the main config's 24, with the git-heavy configs' budget (timeoutMS + timeoutFactor x
+  // dry-run net time). The comment here said "Pinned at 8" while the field was missing, so the run
+  // inherited 24-way and the 10 s + 2x budget. Under host load (load average ~50, 2026-10-30)
+  // that budget turned survivors into timeouts: of 17 timed-out mutants re-run at 6-way with a
+  // 300 s budget, 11 survived and 6 were killed. Real hangs (the `i--` in the --env-file loop)
+  // still time out under any budget and count as detected.
+  concurrency: 8,
+  timeoutMS: 120000,
+  timeoutFactor: 3,
   // incremental off (R8-3): an inherited untracked cache file would corrupt the main one.
   incremental: false,
   // Sandbox outside any git repo: the test clones/inspects repos, a sandbox inside this repo
   // would nest them.
   tempDirName: base.tempDirName,
-  // break = measured score rounded down (83.08%, 2026-10-25 release review run at f0e3416;
-  // earlier 76.96, 2026-10-14); raise it when the score rises. The 2026-10-13 73.43 came from
-  // the shared-host run whose base score did not reproduce here. The script-side caps are
-  // defense in depth: the /api/drain route re-sanitizes, so a surviving cap mutant cannot
-  // change what the notice shows.
-  thresholds: { ...base.thresholds, break: 83 },
+  // break = measured score rounded down (91.97%, 2026-10-31 at 4f6d93b plus the survivor-kill
+  // tests: 684 killed, 3 timed out, 60 survived, with the 8-way 120 s + 3x budget above). The
+  // 2026-10-30 review's 88.95 and the earlier 83.08 (2026-10-25, f0e3416) and 76.96 (2026-10-14)
+  // ran 24-way on the 10 s + 2x budget and counted slow survivors as timeouts: the same code
+  // measured 76.84 on the honest budget before these tests. Raise it when the score rises. Most
+  // survivors left are equivalent (unreachable fallbacks, never-empty git output) or sit in the
+  // `import.meta.main` CLI entry. The script-side caps are defense in depth: the /api/drain
+  // route re-sanitizes, so a surviving cap mutant cannot change what the notice shows.
+  thresholds: { ...base.thresholds, break: 91 },
 };
