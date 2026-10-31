@@ -442,10 +442,11 @@ export interface SignIn {
 // The causes omp itself hides (pi-coding-agent usage-cli): a logout or a newer login of the account.
 const GONE = /^(replaced by|deleted by user)/i;
 
-/** omp's stored sign-ins, one per provider: its current credential (see currentCredential); a failed one only when none is active. */
+/** omp's stored sign-ins, one per provider: its current credential (see currentCredential); a failed one only when none is active. One connection per call. */
 export function signIns(dbPath = agentDb()): SignIn[] {
 	const db = new Database(dbPath, { readonly: true });
 	const by = new Map<string, SignIn>();
+	let current: Map<string, ActiveCredential>;
 	try {
 		const failed = db
 			.query(
@@ -466,10 +467,11 @@ export function signIns(dbPath = agentDb()): SignIn[] {
 				lent: false,
 			});
 		}
+		current = newestPerProvider(readActive(db));
 	} finally {
 		db.close();
 	}
-	for (const r of currentCredentials(dbPath).values())
+	for (const r of current.values())
 		by.set(r.provider, {
 			provider: r.provider,
 			kind: r.credential_type,
@@ -518,6 +520,15 @@ function activeCredentials(dbPath: string): ActiveCredential[] {
 	if (!existsSync(dbPath)) return [];
 	const db = new Database(dbPath, { readonly: true });
 	try {
+		return readActive(db);
+	} finally {
+		db.close();
+	}
+}
+
+/** The active rows of an open store; empty when it has no auth_credentials table. */
+function readActive(db: Database): ActiveCredential[] {
+	try {
 		const rows = db
 			.query(
 				"SELECT id, provider, credential_type, data, created_at, updated_at FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id",
@@ -556,15 +567,15 @@ function activeCredentials(dbPath: string): ActiveCredential[] {
 		// No auth_credentials table: not an omp store. Anything else (a locked store) surfaces.
 		if (errmsg(err).includes("no such table")) return [];
 		throw err;
-	} finally {
-		db.close();
 	}
 }
 
 /** Each provider's current credential: the active row of its newest login (ties: the higher id). */
-function currentCredentials(dbPath: string): Map<string, ActiveCredential> {
+function newestPerProvider(
+	rows: readonly ActiveCredential[],
+): Map<string, ActiveCredential> {
 	const by = new Map<string, ActiveCredential>();
-	for (const r of activeCredentials(dbPath)) {
+	for (const r of rows) {
 		const prev = by.get(r.provider);
 		if (prev === undefined || r.loginAt >= prev.loginAt) by.set(r.provider, r);
 	}
@@ -579,7 +590,8 @@ function currentCredentials(dbPath: string): Map<string, ActiveCredential> {
 export const currentCredential = (
 	dbPath: string,
 	provider: string,
-): ActiveCredential | null => currentCredentials(dbPath).get(provider) ?? null;
+): ActiveCredential | null =>
+	newestPerProvider(activeCredentials(dbPath)).get(provider) ?? null;
 
 /** The board lends this credential to worker turns: OAuth, of a LENT_ENV provider. */
 const lendable = (r: ActiveCredential): boolean =>
