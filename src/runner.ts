@@ -959,6 +959,8 @@ export function createRunSink(o: {
 				providerError:
 					es.providerError && redact(es.providerError, liveSecrets()),
 				...r,
+				// After the spread: a caller's raw tail (a worker's sentinel) is redacted too.
+				stderrTail: redact(r.stderrTail, liveSecrets()),
 			};
 		},
 	};

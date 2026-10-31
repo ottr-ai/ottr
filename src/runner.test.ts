@@ -33,7 +33,7 @@ import {
 	workerFromEnv,
 } from "./runner.ts";
 import type { GitFacts, Next, Outcome, RunResult, TurnKind } from "./types.ts";
-import { serveWorker } from "./workers.ts";
+import { serveWorker, WORKER_DONE } from "./workers.ts";
 import { setGitSecrets } from "./worktree.ts";
 
 const result = (over: Partial<RunResult> = {}): RunResult => ({
@@ -2372,6 +2372,32 @@ describe("startRun worker dispatch", () => {
 			const r = await handle.done;
 			expect(r.exitCode).toBeNull();
 			expect(r.killed).toBe(true);
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 15000);
+
+	test("a worker's sentinel stderr tail reaches the result with the lent token redacted", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
+		const lent = "sk-ant-oat01-worker-echo-0000";
+		const sentinel = {
+			[WORKER_DONE]: { exitCode: 1, stderrTail: `401 for ${lent}\n` },
+		};
+		const server = Bun.serve({
+			port: 0,
+			fetch: () => new Response(`${JSON.stringify(sentinel)}\n`),
+		});
+		try {
+			const logPath = join(dir, "run.log");
+			const r = await startRun({
+				...baseOpts(dir, logPath),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				secrets: [lent],
+			}).done;
+			expect(r.exitCode).toBe(1);
+			expect(r.stderrTail).toBe("401 for [REDACTED]\n");
+			expect(readFileSync(logPath, "utf8")).not.toContain(lent);
 		} finally {
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
