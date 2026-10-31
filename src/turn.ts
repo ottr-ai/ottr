@@ -2020,7 +2020,8 @@ export function createTurnLoop(
 				forkBorn = anc?.topic === "fork research";
 				up = anc?.followUpOf ?? null;
 			}
-			const forkHold = readyWork && forkBorn;
+			// A read-only retro has nothing to merge; holding it blocks later retros.
+			const forkHold = readyWork && forkBorn && !retroCard;
 			const head =
 				updateHold || forkHold
 					? await ops.targetSha(wt, "HEAD").catch(() => null)

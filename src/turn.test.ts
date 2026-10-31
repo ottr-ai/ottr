@@ -8292,6 +8292,18 @@ describe("turn fork-born merge hold", () => {
 		expect(store.getTask(child.id)!.needsReason).toBe(FORK_HOLD_REASON);
 	});
 
+	test("a retro filed below fork-born work settles done and files its proposal", async () => {
+		const { store, record, loop, task } = forkCase();
+		record.proposal = { prompt: "Add a benchmark", model: null };
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		store.updateTask(retro.id, { followUpOf: task.id });
+		await loop.runTurn(store.name, retro.id);
+		expect(store.getTask(retro.id)!.stage).toBe("done");
+		expect(
+			store.listTasks().filter((t) => t.followUpOf === retro.id),
+		).toHaveLength(1);
+	});
+
 	test("a follow-up of a non-fork parent settles done", async () => {
 		const { store, loop, task } = forkCase();
 		const retro = store.createTask("weekly retro");
