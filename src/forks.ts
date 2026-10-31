@@ -524,9 +524,6 @@ function openProposals(store: ProjectStore): number {
 		).length;
 }
 
-// One watcher at a time: a second concurrent tick is a no-op, not a queue.
-let inFlight: Promise<void> | null = null;
-
 export function createForkWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	log: (msg: string) => void;
@@ -545,6 +542,10 @@ export function createForkWatcher(deps: {
 		((range: ForkRange, prior: { titles: string[]; declines: string[] }) =>
 			analyzeRange(range, prior));
 	const now = deps.now ?? Date.now;
+
+	// One scan at a time per watcher. `running` is the running scan's project (undefined = all).
+	let inFlight: Promise<void> | null = null;
+	let running: string | undefined;
 
 	async function scan(opts?: { manual?: string }): Promise<void> {
 		const manual = opts?.manual;
@@ -762,7 +763,14 @@ export function createForkWatcher(deps: {
 
 	return {
 		tick(opts?: { manual?: string }): Promise<void> {
-			if (inFlight !== null) return Promise.resolve();
+			const want = opts?.manual;
+			if (inFlight !== null) {
+				if (running === undefined || running === want) return inFlight;
+				// The running scan skips the requested project: scan it next, whatever the first scan's outcome.
+				const next = () => this.tick(opts);
+				return inFlight.then(next, next);
+			}
+			running = want;
 			inFlight = (async () => {
 				try {
 					await scan(opts);

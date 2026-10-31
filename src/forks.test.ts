@@ -618,6 +618,49 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(ghCalls).toBe(2);
 	});
+
+	test("a manual check for one project during another project's scan still scans it", async () => {
+		const a = mkRepo("watch-overlap-a");
+		const b = mkRepo("watch-overlap-b");
+		const storeA = ProjectStore.init(a);
+		storeA.setSettings({ forkResearch: true });
+		const storeB = ProjectStore.init(b);
+		storeB.setSettings({ forkResearch: true });
+		const calls: string[] = [];
+		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+		const watcher = createForkWatcher({
+			projects: () => [
+				{
+					name: "a",
+					path: a,
+					store: storeA,
+					github: "o/a",
+				} satisfies ForkProject,
+				{
+					name: "b",
+					path: b,
+					store: storeB,
+					github: "o/b",
+				} satisfies ForkProject,
+			],
+			log: () => {},
+			gh: async (args) => {
+				const path = args.at(-1) ?? "";
+				calls.push(path);
+				if (path.startsWith("repos/o/a/")) await gate;
+				return { code: 0, stdout: "[]", stderr: "" };
+			},
+		});
+		const first = watcher.tick({ manual: "a" });
+		const second = watcher.tick({ manual: "b" });
+		await Promise.resolve();
+		// b waits for a's scan: one scan at a time.
+		expect(calls.filter((c) => c.startsWith("repos/o/b/"))).toEqual([]);
+		release();
+		await Promise.all([first, second]);
+		expect(calls.filter((c) => c.startsWith("repos/o/a/")).length).toBe(1);
+		expect(calls.filter((c) => c.startsWith("repos/o/b/")).length).toBe(1);
+	});
 });
 
 describe("ensureCache", () => {
