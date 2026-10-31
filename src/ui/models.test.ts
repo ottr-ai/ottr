@@ -15,6 +15,7 @@ import {
 	rolesDirty,
 	roleWarnings,
 	seedStep,
+	stepIndex,
 } from "./models.ts";
 
 test("rolesDirty compares rows with the roles in order", () => {
@@ -479,4 +480,18 @@ test("ownField reads only own keys: __proto__ and constructor never get an inher
 	// A 400 body names the bad role: JSON.parse makes "__proto__" an own key.
 	const sent = JSON.parse('{"__proto__":"bad name"}') as Record<string, string>;
 	expect(ownField(sent, "__proto__")).toBe("bad name");
+});
+
+test("stepIndex walks the picker rows with the arrow keys", () => {
+	// Entering from the search box (no row focused, -1) lands on the first row either way.
+	expect(stepIndex(5, -1, true)).toBe(0);
+	expect(stepIndex(5, -1, false)).toBe(0);
+	expect(stepIndex(5, 1, true)).toBe(2);
+	expect(stepIndex(5, 2, false)).toBe(1);
+	// Clamped: no wrap past the ends.
+	expect(stepIndex(5, 4, true)).toBe(4);
+	expect(stepIndex(5, 0, false)).toBe(0);
+	// An empty list has nothing to focus.
+	expect(stepIndex(0, -1, true)).toBe(-1);
+	expect(stepIndex(0, -1, false)).toBe(-1);
 });

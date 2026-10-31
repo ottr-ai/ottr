@@ -87,6 +87,7 @@ import {
 	modelMatches,
 	modelRows,
 	reviewModel,
+	stepIndex,
 	useModels,
 } from "./models.ts";
 import {
@@ -1213,6 +1214,10 @@ function ModelField({
 	const [base, level] = splitLevel(model);
 	const models = allModels.filter((m) => modelMatches(m, modelQuery));
 	const modelSearch = useRef<HTMLInputElement | null>(null);
+	const trigger = useRef<HTMLButtonElement | null>(null);
+	// Set when the trigger opened the popover with an arrow key: the toggle then lands the
+	// focus on the first role row instead of the search box.
+	const arrowOpen = useRef(false);
 	// Native light-dismiss misses pointerdowns on the dialog backdrop / inert page behind the
 	// popover (both sit in the top layer), so some engines never close on "click somewhere else".
 	const [modelOpen, setModelOpen] = useState(false);
@@ -1250,6 +1255,32 @@ function ModelField({
 		setModel(selector);
 		document.getElementById(popId)?.hidePopover();
 	};
+	// Arrow keys walk the role/catalog rows from wherever the focus sits inside the open
+	// popover; Escape closes and hands the focus back to the trigger.
+	const popKeys = (e: React.KeyboardEvent<HTMLElement>): void => {
+		if (e.key === "Escape") {
+			// Cancel the native light dismiss: its deferred focus fixup would override the
+			// trigger focus below and drop the focus on the page behind the dialog.
+			e.preventDefault();
+			document.getElementById(popId)?.hidePopover();
+			trigger.current?.focus();
+			return;
+		}
+		if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+		const opts = [
+			...(document
+				.getElementById(popId)
+				?.querySelectorAll<HTMLElement>(".model-option") ?? []),
+		];
+		const idx = stepIndex(
+			opts.length,
+			opts.indexOf(document.activeElement as HTMLElement),
+			e.key === "ArrowDown",
+		);
+		if (idx < 0) return;
+		e.preventDefault();
+		opts[idx]?.focus();
+	};
 	return (
 		<>
 			<div className="model-fields">
@@ -1283,7 +1314,18 @@ function ModelField({
 							</span>
 						)}
 					</span>
-					<button type="button" className="model-trigger" popoverTarget={popId}>
+					<button
+						type="button"
+						className="model-trigger"
+						popoverTarget={popId}
+						ref={trigger}
+						onKeyDown={(e) => {
+							if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+							if (modelOpen) return;
+							arrowOpen.current = true;
+							document.getElementById(popId)?.showPopover();
+						}}
+					>
 						<span>{modelLabel}</span>
 						<Icon name="chevron-right" size={14} />
 					</button>
@@ -1314,7 +1356,16 @@ function ModelField({
 				className="popover model-pop"
 				onToggle={(e) => {
 					setModelOpen(e.newState === "open");
-					if (e.newState === "open") modelSearch.current?.focus();
+					if (e.newState !== "open") return;
+					if (arrowOpen.current) {
+						document
+							.getElementById(popId)
+							?.querySelector<HTMLElement>(".model-option")
+							?.focus();
+					} else {
+						modelSearch.current?.focus();
+					}
+					arrowOpen.current = false;
 				}}
 			>
 				<input
@@ -1324,9 +1375,10 @@ function ModelField({
 					placeholder="Search models"
 					aria-label="Search models"
 					value={modelQuery}
-					// Enter in the search box must not submit a surrounding form (steer, New task).
 					onKeyDown={(e) => {
+						// Enter in the search box must not submit a surrounding form (steer, New task).
 						if (e.key === "Enter") e.preventDefault();
+						popKeys(e);
 					}}
 					onChange={(e) => {
 						// Search filters the list only; clearing the pick here would silently
@@ -1353,6 +1405,7 @@ function ModelField({
 									className="model-option"
 									aria-pressed={r.pressed}
 									onClick={() => pickModel(r.selector)}
+									onKeyDown={popKeys}
 								>
 									<span>{r.label}</span>
 									{r.pressed && <Icon name="check" size={14} />}

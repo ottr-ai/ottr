@@ -227,6 +227,13 @@ export function modelRows(
 	];
 }
 
+/** The focused row after an ArrowDown/ArrowUp in the picker list: clamped at both ends,
+    -1 (no row focused, e.g. the search box) enters at the first row, an empty list stays -1. */
+export function stepIndex(count: number, index: number, down: boolean): number {
+	if (count === 0) return -1;
+	return down ? Math.min(index + 1, count - 1) : Math.max(index - 1, 0);
+}
+
 // --- Catalog loader: one shared request serves every picker. ---
 
 let modelsCache: ModelCatalog | null = null;
