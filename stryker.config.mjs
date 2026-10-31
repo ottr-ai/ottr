@@ -52,6 +52,9 @@ export default {
   // %TEMP%, so runs inflate past the standalone suite time; the 5 s / 1.5x default was too tight.
   timeoutMS: 10000,
   timeoutFactor: 2,
+  // The dry run (full sequential suite, then each test file alone) took 260 s standalone on a quiet
+  // host at 16b3326; the cold sandbox crossed Stryker's 5-minute default (2026-10-30 v0.2.0 review).
+  dryRunTimeoutMinutes: 20,
   // Sandbox outside any repo: a mutant that drops git()'s cwd must fail there, not run git in this repo.
   tempDirName,
   // TypeScript 7's JS API has no parseConfigFileTextToJson, which Stryker 10's sandbox tsconfig
