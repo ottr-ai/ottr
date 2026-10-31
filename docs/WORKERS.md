@@ -511,6 +511,10 @@ token from the board store. Ottr has no OAuth refresh code of its own.
   never resolves or runs a key a worker could plant (R5-1, unchanged). The
   only worker-store write is the cause string above.
 - The entry script does not copy the shared `agent.db` into the board store.
+- The board's git ssh runs with `-F /dev/null` (`gitAuthEnv` in `src/gitHosts.ts`).
+  ssh reads `~/.ssh/config` from the passwd home (`/root`), not from `$HOME`, and
+  `/root` is the shared home. Without the flag, a `ProxyCommand` or `Match exec` that a
+  worker plants there runs in the board's git fetch or push over ssh (OTTR-264).
 
 #### Residuals
 
