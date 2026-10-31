@@ -4499,36 +4499,49 @@ describe("turn research cards", () => {
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
 	});
 
-	test.skipIf(process.platform !== "linux")(
-		"a symlinked research report is refused, never read through (OTTR-233)",
-		async () => {
-			const { store, record, projects } = researchStore();
-			const outside = mkdtempSync(join(tmpdir(), "turn-report-secret-"));
-			dirs.push(outside);
-			const secret = join(outside, "secret");
-			writeFileSync(secret, "top secret");
-			const loop = createTurnLoop(
-				projects,
-				fakeOps(record, {
-					commitsAhead: async () => 0,
-					createWorktree: async (o: { worktreePath: string }) => {
-						record.createWorktree.push(o);
-						mkdirSync(o.worktreePath, { recursive: true });
-						symlinkSync(secret, join(o.worktreePath, RESEARCH_REPORT));
-					},
-				}),
+	// OTTR-233: a refused report holds every work card — a plain card too — before the
+	// untracked-file quarantine and the worktree removal, and never copies the target.
+	for (const research of [false, true])
+		for (const shape of ["symlink", "oversized"] as const)
+			test.skipIf(shape === "symlink" && process.platform !== "linux")(
+				`a ${shape} report on a ${research ? "research" : "plain"} card holds the card`,
+				async () => {
+					const { store, record, projects } = researchStore();
+					const outside = mkdtempSync(join(tmpdir(), "turn-report-secret-"));
+					dirs.push(outside);
+					const secret = join(outside, "secret");
+					writeFileSync(secret, "top secret");
+					const loop = createTurnLoop(
+						projects,
+						fakeOps(record, {
+							commitsAhead: async () => 0,
+							createWorktree: async (o: { worktreePath: string }) => {
+								record.createWorktree.push(o);
+								mkdirSync(o.worktreePath, { recursive: true });
+								const p = join(o.worktreePath, RESEARCH_REPORT);
+								if (shape === "symlink") symlinkSync(secret, p);
+								else writeFileSync(p, Buffer.alloc(4 * 1024 * 1024 + 1, 0x61));
+							},
+						}),
+					);
+					const task = research
+						? researchTask(store)
+						: store.createTask("work please");
+
+					await loop.runTurn(store.name, task.id);
+
+					const after = store.getTask(task.id)!;
+					expect(after.report ?? "").not.toContain("top secret");
+					expect(after.stage).toBe("in_progress");
+					expect(after.state).toBe("needs_you");
+					expect(after.needsReason).toContain("cannot be read");
+					expect(after.needsReason).toContain(
+						shape === "symlink" ? "a symlink" : "larger than",
+					);
+					expect(record.quarantine).toHaveLength(0);
+					expect(record.removeWorktree).toHaveLength(0);
+				},
 			);
-			const task = researchTask(store);
-
-			await loop.runTurn(store.name, task.id);
-
-			const after = store.getTask(task.id)!;
-			expect(after.report ?? "").not.toContain("top secret");
-			expect(after.state).toBe("needs_you");
-			expect(after.needsReason).toContain(RESEARCH_REPORT);
-			expect(logText(store, task.id)).toContain("a symlink");
-		},
-	);
 
 	test("research turn saves agent-reported shots before the worktree goes", async () => {
 		const { store, record, projects } = researchStore();

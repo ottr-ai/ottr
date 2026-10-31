@@ -1448,6 +1448,8 @@ export function createTurnLoop(
 			// Sync read: settle must stay within one microtask flush (tests await runTurn or flush microtasks only).
 			// No symlink is followed: a worker could point the file at a server-only secret (OTTR-233).
 			let reportText: string | null = null;
+			// A refused report (symlink, not a file, too big) holds the card: no quarantine, no removal.
+			let reportError: string | null = null;
 			if (kind === "work" && !interview && !grill) {
 				try {
 					reportText =
@@ -1457,7 +1459,8 @@ export function createTurnLoop(
 							REPORT_MAX_BYTES,
 						)?.toString("utf8") ?? null;
 				} catch (err) {
-					log(`! ${RESEARCH_REPORT}: ${errmsg(err)}`);
+					reportError = errmsg(err);
+					log(`! ${RESEARCH_REPORT}: ${reportError}`);
 				}
 			}
 			const autoResearch =
@@ -1473,6 +1476,7 @@ export function createTurnLoop(
 				!grill &&
 				!releaseCard &&
 				reportText === null &&
+				reportError === null &&
 				result0.outcome?.status === "ready";
 			// An interview card has nothing to integrate, and agents mix up statuses: a ready outcome settles done.
 			// A research card has nothing to integrate either: its deliverable is the report file.
@@ -1620,7 +1624,8 @@ export function createTurnLoop(
 				!grill &&
 				!wasResearch &&
 				!releaseCard &&
-				finishedCleanly
+				finishedCleanly &&
+				reportError === null
 			) {
 				try {
 					const moved = await ops.quarantineUntracked(
@@ -1983,6 +1988,12 @@ export function createTurnLoop(
 					}
 				}
 			}
+			if (reportError !== null && !releaseCard && next.state !== "queued")
+				next = {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: `The research report file ${RESEARCH_REPORT} cannot be read: ${reportError}. Reply to have the agent write it as a regular file, or cancel the card.`,
+				};
 			// Delete check: a worktree that still holds changes or unmerged commits is kept, and the card asks you.
 			// A review card's worktree is disposable (mutation runs leave report files, and a review
 			// must not commit), so it skips the check.
