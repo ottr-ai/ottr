@@ -354,9 +354,10 @@ const board = {
 	token: newSecret(),
 };
 
-// Override for the worker folders (env.txt, tools.json): Settings and turns share it, so
-// they never disagree. Unset = each reader's default (boardOmpHome() for env.txt and
-// tools.json, R5-1); the dev board pins a fixture so demo names stay off the real home.
+// Override for the worker folders (env.txt, tools.json, apt.txt): Settings and turns share
+// it, so they never disagree. Unset = each reader's default (boardOmpHome() for env.txt and
+// tools.json, R5-1; homedir() for apt.txt); the dev board pins a fixture so demo names stay
+// off the real home.
 const workersHome = process.env.OTTR_WORKERS_HOME;
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
@@ -399,7 +400,7 @@ const loop = createTurnLoop(projects, {
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).
 	workerTarget: workerFromEnv(),
 	startRun,
-	ensurePackages: ensureProjectPackages,
+	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
 		turnEnv(project, model, shared.envValues, { home: workersHome }),
 	// R5-1: a server-local turn reads tools.json and installs under the board's server-only
