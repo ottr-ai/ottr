@@ -3,6 +3,7 @@
 // mutants timed out there, 2026-10-01), so only this module's mutants pay for its suite — the same
 // isolation pattern as stryker.release.config.mjs and stryker.worktree.config.mjs.
 import base from "./stryker.config.mjs";
+import { mutationConcurrency } from "./scripts/stryker-load.mjs";
 
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
@@ -12,9 +13,10 @@ export default {
   // killed one stops at the first failure.
   commandRunner: { command: "ulimit -d 2097152 && bun test --bail src/turn.test.ts" },
   mutate: ["src/turn.ts"],
-  // 24 with the cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
-  // 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite.
-  concurrency: 24,
+  // The base cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
+  // 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite. The CPU-derived value and
+  // STRYKER_CONCURRENCY only lower it.
+  concurrency: Math.min(24, mutationConcurrency()),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time: the store-heavy suite inflates
   // in the cold sandbox under parallel runners.
   timeoutMS: 60000,

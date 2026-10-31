@@ -1,5 +1,12 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireMutationLock, mutationConcurrency } from "./scripts/stryker-load.mjs";
+
+// One mutation run at a time on a worker: every config imports this base module, so the lock
+// next to the temp dir serializes all five Stryker runs here. A second run waits and logs; a
+// lock from a killed run is taken over.
+const tempDirName = join(tmpdir(), "ott-stryker");
+acquireMutationLock(tempDirName);
 
 // Mutation testing: `bun run test:mutation` runs this config, then stryker.release.config.mjs,
 // stryker.turn.config.mjs, stryker.worktree.config.mjs and stryker.update-image.config.mjs.
@@ -31,20 +38,22 @@ export default {
   // No `incremental`: with the command runner the cache detects changed mutants only, never
   // changed tests, so a Killed mutant survives its killing test being deleted or weakened
   // (finding R8-3, 2026-10-12 review). Every run re-tests everything; do not re-enable.
-  // 24 workers, each under the 2 GB cap. The 421-mutant uniform sample kept every verdict
-  // identical at c8/c16/c24, while 48 slots produced 5 false timeouts from CPU saturation, so do
-  // not raise past 24 without re-measuring. The 2026-10-13 exit-137 run
+  // Half of the host CPUs (os.availableParallelism()), at least 1, so a run never asks for more
+  // CPU than the host has; STRYKER_CONCURRENCY wins when set. Capped at the measured 24: each
+  // worker runs under the 2 GB cap, the 421-mutant uniform sample kept every verdict identical
+  // at c8/c16/c24, while 48 slots produced 5 false timeouts from CPU saturation, so do not
+  // raise the cap without re-measuring. The 2026-10-13 exit-137 run
   // deaths were never memory: a guard mutant signalled the whole process group until a fake kill
   // was injected (fixed the same day). On a loaded machine inflated
   // run times can still mass-time-out past the budget (2026-09-30 review; a full clean base pass
   // once measured ~4 h at 8, 2026-10-13).
-  concurrency: 24,
+  concurrency: Math.min(24, mutationConcurrency()),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time. The sandbox is a cold copy in
   // %TEMP%, so runs inflate past the standalone suite time; the 5 s / 1.5x default was too tight.
   timeoutMS: 10000,
   timeoutFactor: 2,
   // Sandbox outside any repo: a mutant that drops git()'s cwd must fail there, not run git in this repo.
-  tempDirName: join(tmpdir(), "ott-stryker"),
+  tempDirName,
   // TypeScript 7's JS API has no parseConfigFileTextToJson, which Stryker 10's sandbox tsconfig
   // rewrite calls. Our tsconfig has no extends/references to rewrite, so point it at a missing file.
   tsconfigFile: "no-tsconfig-rewrite.json",

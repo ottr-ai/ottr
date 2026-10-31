@@ -168,6 +168,8 @@ bun run audit:quality  # duplicate and dead code
 bun run dev            # UI-only demo board on port 5747
 ```
 
+A mutation run stays inside the host CPU. Each config takes the concurrency from the CPU: half of `os.availableParallelism()`, at least 1, capped at the config's measured maximum. `STRYKER_CONCURRENCY` overrides this value when set. A worker runs one mutation run at a time: each run holds a lock file (`<tempDirName>.lock`) next to the Stryker sandbox. A second run waits and logs that it waits. A run removes a lock whose holder died.
+
 CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; weekly workflows add Docker build checks, Trivy and an OWASP ZAP baseline scan. Package versions stay 7 days back (`bunfig.toml`), and every action pins a full commit SHA.
 
 For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. It is also the way to refresh the screenshots under `.github/assets/`.
