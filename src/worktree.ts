@@ -103,19 +103,24 @@ const NETWORK_GIT: Record<string, true> = {
  * can name a command in keys no `-c` can clear: `diff.external` (an empty value makes git
  * fail, not skip it), `diff.<driver>.textconv`/`command` (driver names come from planted
  * attributes) and `remote.<name>.uploadpack`/`receivepack` (git keeps the first value it
- * reads). Command-line flags outrank all of them.
+ * reads). Command-line flags outrank all of them. The flags reach only this git process, not
+ * the child git a submodule diff, fetch or push starts, and a submodule's config is
+ * worker-writable too: so the board never recurses into submodules either.
  */
-const NO_EXT_DIFF = ["--no-ext-diff", "--no-textconv"];
-const UPLOAD_PACK = ["--upload-pack=git-upload-pack"];
+const NO_EXT_DIFF = ["--no-ext-diff", "--no-textconv", "--submodule=short"];
+const UPLOAD_PACK = [
+	"--upload-pack=git-upload-pack",
+	"--no-recurse-submodules",
+];
 const PINNED_ARGS: Record<string, readonly string[]> = {
 	diff: NO_EXT_DIFF,
 	log: NO_EXT_DIFF,
 	show: NO_EXT_DIFF,
 	clone: UPLOAD_PACK,
 	fetch: UPLOAD_PACK,
-	"ls-remote": UPLOAD_PACK,
+	"ls-remote": ["--upload-pack=git-upload-pack"],
 	pull: UPLOAD_PACK,
-	push: ["--receive-pack=git-receive-pack"],
+	push: ["--receive-pack=git-receive-pack", "--recurse-submodules=no"],
 };
 
 /**

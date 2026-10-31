@@ -2507,6 +2507,68 @@ describe("git", () => {
 		expect((await git(["ls-remote", "origin"], main)).code).toBe(0);
 		expect(planted()).toEqual([]);
 	}, 60_000);
+
+	test("never recurses into a submodule whose config names a command (R5-1)", async () => {
+		const subOrigin = repo();
+		const origin = repo();
+		const main = repo();
+		const marker = join(main, "planted.sub");
+		const script = join(origin, "plant.sh");
+		writeFileSync(script, `#!/bin/sh\necho "$@" >> '${marker}'\nexit 1\n`);
+		chmodSync(script, 0o755);
+		await must(subOrigin, "init", "-q", "-b", "main");
+		writeFileSync(join(subOrigin, "s"), "1\n");
+		await must(subOrigin, "add", ".");
+		await must(subOrigin, "commit", "-q", "-m", "s");
+		await must(origin, "init", "-q", "--bare", "-b", "main");
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "remote", "add", "origin", origin);
+		const fileOk = ["-c", "protocol.file.allow=always"];
+		await must(main, ...fileOk, "submodule", "add", "-q", subOrigin, "sub");
+		await must(main, "commit", "-q", "-m", "m");
+		await must(main, "push", "-q", "origin", "main");
+		// The plants: the submodule's own config names the command, the parent turns recursion on.
+		const sub = join(main, "sub");
+		await must(sub, "config", "protocol.file.allow", "always");
+		await must(sub, "config", "diff.external", script);
+		await must(sub, "config", "remote.origin.uploadpack", script);
+		await must(sub, "config", "remote.origin.receivepack", script);
+		await must(main, "config", "diff.submodule", "diff");
+		await must(main, "config", "fetch.recurseSubmodules", "yes");
+		await must(main, "config", "push.recurseSubmodules", "on-demand");
+		// An unpublished submodule commit makes an on-demand push recurse.
+		writeFileSync(join(sub, "s"), "2\n");
+		await must(sub, "commit", "-q", "-a", "-m", "s2");
+		await must(main, "add", "sub");
+		await must(main, "commit", "-q", "-m", "bump");
+		const board = [
+			["diff", "HEAD~1", "--"],
+			["log", "-p", "-1", "--"],
+			["show", "HEAD", "--"],
+			["fetch", "-q", "origin"],
+			["pull", "-q", "--ff-only", "origin", "main"],
+			["push", "-q", "origin", "main"],
+		];
+		// Control: plain git recurses and runs each plant (diff, fetch and push).
+		for (const a of [board[0], board[3], board[5]]) {
+			Bun.spawnSync(
+				[gitExe(), "-c", "core.hooksPath=/dev/null", ...(a as string[])],
+				{
+					cwd: main,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+				},
+			);
+		}
+		const ran = readFileSync(marker, "utf8");
+		expect(ran).toContain(subOrigin); // the planted uploadpack and receivepack
+		expect(ran.split("\n").filter(Boolean).length).toBeGreaterThanOrEqual(3);
+		rmSync(marker);
+		// Board git: every call succeeds and no plant runs.
+		for (const a of board) expect((await git(a, main)).code).toBe(0);
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
 });
 
 describe("gitEnv", () => {

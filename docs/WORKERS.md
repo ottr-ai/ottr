@@ -357,7 +357,9 @@ ones), disables `ext::` transport, signed pushes and askpass, and always sets
 `.git/config` cannot run with the tokens. Every board git also passes explicit
 `--upload-pack`/`--receive-pack` to network subcommands and `--no-ext-diff
 --no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
-`receivepack`, `diff.external` or textconv driver does not run. Residual limit: a planted
+`receivepack`, `diff.external` or textconv driver does not run. These flags do not reach
+the child git of a submodule, so board git also never recurses into submodules
+(`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Residual limit: a planted
 `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees
