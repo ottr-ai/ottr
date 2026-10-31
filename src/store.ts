@@ -227,6 +227,7 @@ interface TaskRow {
 	work_check_head: string | null;
 	priority: string | null;
 	close_candidate: string | null;
+	hold_until: number | null;
 	kind: string;
 }
 
@@ -375,6 +376,7 @@ function toTask(project: string, r: TaskRow): Task {
 		priority: (r.priority as Task["priority"]) ?? null,
 		closeCandidate: r.close_candidate,
 		kind: r.kind as TaskKind,
+		holdUntil: r.hold_until,
 	};
 }
 
@@ -557,6 +559,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	workCheckHead: "work_check_head",
 	priority: "priority",
 	closeCandidate: "close_candidate",
+	holdUntil: "hold_until",
 };
 
 const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
@@ -1178,6 +1181,9 @@ export class ProjectStore {
 				[ARCH_REVIEW_MARKER],
 			);
 		}
+		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
+		if (!cols.includes("hold_until"))
+			db.exec("ALTER TABLE tasks ADD COLUMN hold_until INTEGER");
 		return new ProjectStore(root, db);
 	}
 

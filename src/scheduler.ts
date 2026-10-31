@@ -231,7 +231,7 @@ export function pickRunnable(
 		/** Set during an update's hold: only this queued card may start, and null lets none start.
 		 * The other cards still take their slots and hold their dependents. */
 		only?: string | null;
-		/** A queued card waits until its queuedAt, e.g. a check held until a usage limit resets. */
+		/** A queued card waits until its holdUntil, e.g. a check held until a usage limit resets. */
 		now?: number;
 	},
 ): Task[] {
@@ -246,7 +246,7 @@ export function pickRunnable(
 	const queued = queueOrder(tasks).filter(
 		(t) =>
 			(o.only === undefined || t.id === o.only) &&
-			(t.queuedAt === null || t.queuedAt <= now),
+			(t.holdUntil === null || t.holdUntil <= now),
 	);
 
 	const picked: Task[] = [];

@@ -54,7 +54,7 @@ export function statusLine(
 		| "pendingPrompt"
 		| "asked"
 		| "progress"
-		| "queuedAt"
+		| "holdUntil"
 	>,
 	hasRules: boolean,
 	hold?: string | null,
@@ -66,8 +66,8 @@ export function statusLine(
 		return t.stage === "backlog"
 			? "grill queued"
 			: t.needsReason !== null
-				? // A future queuedAt holds the card (a usage limit): show why.
-					t.queuedAt !== null && t.queuedAt > Date.now()
+				? // A future holdUntil holds the card (a usage limit): show why.
+					t.holdUntil !== null && t.holdUntil > Date.now()
 					? t.needsReason
 					: "resuming"
 				: t.pendingPrompt !== null

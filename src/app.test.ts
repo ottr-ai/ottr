@@ -2632,6 +2632,19 @@ describe("steer cancel route", () => {
 		expect(after.state).toBe("queued");
 	});
 
+	test("a steer on a card held for a usage limit ends the hold", async () => {
+		const t = store.createTask("held");
+		store.updateTask(t.id, {
+			stage: "in_progress",
+			holdUntil: Date.now() + 3_600_000,
+			pendingPrompt: "hold prompt",
+		});
+		await post(`/api/projects/p1/tasks/${t.id}/steer`, { text: "run now" });
+		const after = store.getTask(t.id)!;
+		expect(after.holdUntil).toBeNull();
+		expect(after.pendingPrompt).toBe("hold prompt\n\nrun now");
+	});
+
 	test("nothing queued, or an automatic resume, is 409", async () => {
 		const t = store.createTask("nothing queued");
 		store.updateTask(t.id, { state: "running" });

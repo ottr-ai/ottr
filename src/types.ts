@@ -270,6 +270,9 @@ export interface Task {
 	workCheckSendbacks: number;
 	/** Branch head the last completed check saw; a ready report at the same head does not re-check. */
 	workCheckHead: string | null;
+	/** Epoch ms before which the queued card must not start (a check held until a provider usage
+	 * limit resets); null = no hold. Kept apart from queuedAt: a queue reorder rewrites that. */
+	holdUntil: number | null;
 	/** Manual triage rank; null = unrated. Overview triage sorts P0 first, unrated last. */
 	priority: Priority | null;
 	/** Close-candidate nomination: the reason this card is a duplicate, superseded, or drifted; null = not nominated. */

@@ -359,7 +359,7 @@ export function hitUsageLimit(r: RunResult): boolean {
 
 /** The queued write that holds a check run until its provider's usage limit resets. */
 interface UsageHold {
-	queuedAt: number;
+	holdUntil: number;
 	needsReason: string;
 	pendingPrompt: string;
 }
@@ -510,9 +510,32 @@ export function createTurnLoop(
 			.slice(0, 16)
 			.replace("T", " ");
 		return {
-			queuedAt: hit.resetsAt,
-			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Reply to run it now, or cancel the card.`,
+			holdUntil: hit.resetsAt,
+			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
 			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+		};
+	}
+	/** The write that holds card `id`, or null when the card is no longer this run's: a cancel or
+	 * kept-worktree cancel may land during the quota await and owns the state then. Text the user
+	 * queued meanwhile stays ahead of the hold's own prompt. */
+	function holdPatch(store: ProjectStore, id: string, hold: UsageHold) {
+		const cur = store.getTask(id);
+		if (
+			cur === null ||
+			cur.cancelledAt !== null ||
+			(cur.state !== "running" && cur.state !== "preparing")
+		)
+			return null;
+		return {
+			stage: "in_progress" as const,
+			state: "queued" as const,
+			queuedAt: Date.now(),
+			holdUntil: hold.holdUntil,
+			needsReason: hold.needsReason,
+			pendingPrompt:
+				cur.pendingPrompt === null
+					? hold.pendingPrompt
+					: `${cur.pendingPrompt}\n\n${hold.pendingPrompt}`,
 		};
 	}
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
@@ -2374,14 +2397,10 @@ export function createTurnLoop(
 						const cur = store.getTask(id);
 						if (hold !== null) {
 							log(
-								`- review check held until ${new Date(hold.queuedAt).toISOString()}: usage limit`,
+								`- review check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`,
 							);
-							if (cur !== null && cur.cancelledAt === null)
-								store.updateTask(id, {
-									stage: "in_progress",
-									state: "queued",
-									...hold,
-								});
+							const patch = holdPatch(store, id, hold);
+							if (patch !== null) store.updateTask(id, patch);
 						} else {
 							log(`- review check gave up after a retry: ${checkFailed}`);
 							if (cur !== null && cur.cancelledAt === null)
@@ -2675,17 +2694,18 @@ export function createTurnLoop(
 							// No head stamp: the next ready at this head must run the check again.
 							log(
 								hold !== null
-									? `- work check held until ${new Date(hold.queuedAt).toISOString()}: usage limit`
+									? `- work check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`
 									: `- work check failed: ${checkFailed}`,
 							);
+							const patch = hold === null ? null : holdPatch(store, id, hold);
 							store.updateTask(id, {
-								stage: "in_progress",
-								...(hold !== null
-									? { state: "queued" as const, ...hold }
-									: {
+								...(hold === null
+									? {
+											stage: "in_progress" as const,
 											state: "needs_you" as const,
 											needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
-										}),
+										}
+									: patch),
 								workCheckLog: [
 									...priorLog,
 									{

@@ -4725,6 +4725,8 @@ export function createApp(deps: AppDeps) {
 								? prompt
 								: `${task.pendingPrompt}\n\n${prompt}`,
 						pendingImages: [...task.pendingImages, ...names],
+						// A message on a card held for a usage limit runs it now.
+						holdUntil: null,
 					});
 					deps.schedule();
 					return taskResponse(e, task.id);

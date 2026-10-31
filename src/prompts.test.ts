@@ -517,6 +517,7 @@ describe("handoffMarkdown research report", () => {
 		createdAt: 1,
 		updatedAt: 1,
 		queuedAt: null,
+		holdUntil: null,
 		doneAt: null,
 		cancelledAt: null,
 		commits: null,

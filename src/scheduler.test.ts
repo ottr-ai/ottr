@@ -125,6 +125,7 @@ function task(p: Partial<Task> = {}): Task {
 		createdAt: now,
 		updatedAt: now,
 		queuedAt: now,
+		holdUntil: null,
 		doneAt: null,
 		cancelledAt: null,
 		commits: null,
@@ -205,8 +206,8 @@ describe("queueOrder", () => {
 });
 
 describe("pickRunnable", () => {
-	test("a queued card waits until its queuedAt", () => {
-		const held = task({ stage: "in_progress", queuedAt: 5_000 });
+	test("a queued card waits until its holdUntil, whatever its queue position", () => {
+		const held = task({ stage: "in_progress", queuedAt: 1, holdUntil: 5_000 });
 		expect(pickRunnable([held], { ...opts, now: 4_999 })).toEqual([]);
 		expect(pickRunnable([held], { ...opts, now: 5_000 })).toEqual([held]);
 	});

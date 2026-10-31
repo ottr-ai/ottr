@@ -8569,26 +8569,34 @@ describe("review findings check", () => {
 		);
 	});
 
-	test("a check at the usage limit holds the review until the reset and files nothing", async () => {
+	/** A review whose check hits the openai-codex usage limit; `duringQuota` runs while the
+	 * board awaits the quota, where a cancel or a steer can land. */
+	async function limitedReview(
+		duringQuota: (store: ProjectStore, id: string) => void = () => {},
+	) {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
 		const resetsAt = Date.now() + 3_600_000;
+		const ref: { id: string; store?: ProjectStore } = { id: "" };
 		const { store, loop } = setupWith(record, {
 			commitsAhead: async () => 0,
-			quota: async () => ({
-				limits: [
-					{
-						provider: "openai-codex",
-						label: "5 hours",
-						window: "5h",
-						plan: null,
-						usedPct: 100,
-						resetsAt,
-					},
-				],
-				error: null,
-				at: Date.now(),
-			}),
+			quota: async () => {
+				duringQuota(ref.store!, ref.id);
+				return {
+					limits: [
+						{
+							provider: "openai-codex",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt,
+						},
+					],
+					error: null,
+					at: Date.now(),
+				};
+			},
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				o.onSession?.("sess");
@@ -8612,17 +8620,45 @@ describe("review findings check", () => {
 			},
 		});
 		const review = reviewCard(store);
+		ref.store = store;
+		ref.id = review.id;
 		await loop.runTurn(store.name, review.id);
+		return { record, store, review, resetsAt };
+	}
+
+	test("a check at the usage limit holds the review until the reset and files nothing", async () => {
+		const { record, store, review, resetsAt } = await limitedReview();
 		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at the limit
 		const after = store.getTask(review.id)!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
-		expect(after.queuedAt).toBe(resetsAt);
+		expect(after.holdUntil).toBe(resetsAt);
 		expect(after.needsReason).toContain("openai-codex usage limit");
 		expect(after.pendingPrompt).toContain("usage limit");
 		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
 			[],
 		);
+	});
+
+	test("a cancel that keeps the worktree during the quota await is not resumed by the hold", async () => {
+		const kept = "Cancel kept the worktree: uncommitted changes";
+		const { store, review } = await limitedReview((s, id) =>
+			s.updateTask(id, { state: "needs_you", needsReason: kept }),
+		);
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(kept);
+		expect(after.holdUntil).toBeNull();
+	});
+
+	test("a message steered during the quota await survives the hold", async () => {
+		const { store, review } = await limitedReview((s, id) =>
+			s.updateTask(id, { pendingPrompt: "also check the docs" }),
+		);
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toStartWith("also check the docs\n\n");
+		expect(after.pendingPrompt).toContain("usage limit");
 	});
 
 	test("the check holds a global cap slot while it runs", async () => {
@@ -9351,7 +9387,7 @@ describe("work card check", () => {
 		const held = store.getTask(task.id)!;
 		expect(held.stage).toBe("in_progress");
 		expect(held.state).toBe("queued");
-		expect(held.queuedAt).toBe(resetsAt);
+		expect(held.holdUntil).toBe(resetsAt);
 		expect(held.needsReason).toContain("openai-codex");
 		expect(held.needsReason).toContain(
 			`${new Date(resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC`,
@@ -9368,6 +9404,12 @@ describe("work card check", () => {
 			}).map((t) => t.id);
 		expect(ids()).not.toContain(task.id);
 		expect(ids(resetsAt + 1)).toContain(task.id);
+		// A queue reorder rewrites queuedAt; the hold must survive it.
+		const other = store.createTask("another");
+		expect(store.reorderQueue([task.id, other.id])).toBe(true);
+		expect(store.getTask(task.id)!.holdUntil).toBe(resetsAt);
+		expect(ids()).not.toContain(task.id);
+		store.updateTask(other.id, { state: "idle" });
 
 		// After the reset the scheduler starts the turn: the agent re-reports ready, the check re-runs.
 		await loop.runTurn(store.name, task.id);
