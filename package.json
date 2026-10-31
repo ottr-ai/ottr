@@ -7,7 +7,7 @@
     "dev": "bun src/dev.ts",
     "update": "git fetch origin && git merge --ff-only origin/main && bun install --frozen-lockfile",
     "check": "tsc --noEmit && biome check src scripts extension && bun scripts/boot-smoke.ts && bun scripts/licenses.ts && bun scripts/no-scratch-images.ts",
-    "audit:quality": "jscpd src scripts extension --min-tokens 70 --reporters console --threshold 2.94 && knip",
+    "audit:quality": "jscpd src scripts extension --min-tokens 70 --reporters console --threshold 2.92 && knip",
     "test": "bun test",
     "test:e2e": "bun scripts/e2e-steer.js",
     "test:mutation":
