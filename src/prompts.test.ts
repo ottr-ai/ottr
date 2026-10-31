@@ -52,6 +52,14 @@ describe("no-destruction rule", () => {
 	});
 });
 
+describe("mergePrompt fast-forward step", () => {
+	test("names the ff-merge of the branch in the main checkout", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p).toContain("git merge --ff-only ott/x");
+		expect(p).toContain("main checkout");
+	});
+});
+
 describe("workPrompt research hatch", () => {
 	test("carries the research contract, report file and answered outcome", () => {
 		const p = workPrompt({

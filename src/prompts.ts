@@ -73,6 +73,7 @@ export const RESEARCH_REPORT = "research-report.md";
 
 export function mergePrompt(o: { branch: string; target: string }): string {
 	return `Your turn to integrate ${o.branch}: rebase onto ${o.target} (resolve conflicts keeping both intents), re-run the project's verification, then integrate exactly as AGENTS.md prescribes.
+Then, in the main checkout, fast-forward main to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so main holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
 Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated. If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.
 ${RENAME}
 ${NO_DESTRUCTION}
