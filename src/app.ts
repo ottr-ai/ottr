@@ -320,6 +320,12 @@ interface AppDeps {
 	keyscan?: Keyscan;
 	/** Model catalog seam for the model roles editor; defaults to modelList. */
 	models?: () => Promise<ModelOption[]>;
+	/**
+	 * GitHub token expiry probe seam; defaults to GET https://api.github.com/repos/ottr-ai/ottr
+	 * with the token, reading `github-authentication-token-expiration`. ISO date or null (no
+	 * expiry). A throw keeps the stored value (advisory; retried on the next tick).
+	 */
+	githubTokenExpiry?: (token: string) => Promise<string | null>;
 }
 
 /** The persisted removed/added project paths; boot discovery needs them before createApp runs. */
@@ -360,6 +366,110 @@ const defineRoutes = <R extends string>(
 	r: Serve.RoutesWithUpgrade<undefined, R>,
 ) => r;
 
+/** GitHub's `github-authentication-token-expiration` header ("2027-10-30 00:00:00 UTC") as ISO 8601 UTC; null when absent or unparsable. */
+export function parseGithubExpiry(h: string | null): string | null {
+	if (h === null) return null;
+	const d = new Date(h.replace(" ", "T").replace(/ UTC$/, "Z"));
+	return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/** Whole UTC days from today to the expiry date: 0 on the expiry day itself, negative after. */
+export function tokenDaysLeft(expiresAt: string, now: Date): number {
+	const midnight = (t: number) => {
+		const d = new Date(t);
+		return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+	};
+	const target = midnight(new Date(expiresAt).getTime());
+	if (Number.isNaN(target)) return Number.NaN;
+	return Math.floor((target - midnight(now.getTime())) / 86_400_000);
+}
+
+/** Per-token reminder state next to seed-commit (board config, not SQLite; spec 3). */
+export type TokenReminder = {
+	expiresAt: string | null;
+	lastPushDay: string | null;
+};
+export type ReminderState = { board: TokenReminder; seed: TokenReminder };
+export type TokenExpiryView = {
+	board: { tokenSet: boolean; expiresAt: string | null };
+	seed: { seeded: boolean; expiresAt: string | null };
+};
+const emptyReminder = (): TokenReminder => ({
+	expiresAt: null,
+	lastPushDay: null,
+});
+
+/** token-reminders.json lives next to the board omp home (like seed-commit). */
+export function tokenRemindersPath(): string {
+	return join(dirname(boardOmpHome()), "token-reminders.json");
+}
+/** The compose-side probe writes the seed token's expiry here (spec 1). */
+export function seedTokenExpiresPath(): string {
+	return join(dirname(boardOmpHome()), "seed-token-expires");
+}
+function readSeedTokenExpires(): string | null {
+	try {
+		const v = readFileSync(seedTokenExpiresPath(), "utf8").trim();
+		return v === "none" || v === "" ? null : v;
+	} catch {
+		return null;
+	}
+}
+/** Missing or corrupt file: defaults, no error. */
+export function loadReminders(): ReminderState {
+	try {
+		const p = JSON.parse(readFileSync(tokenRemindersPath(), "utf8")) as {
+			board?: Partial<TokenReminder>;
+			seed?: Partial<TokenReminder>;
+		};
+		return {
+			board: { ...emptyReminder(), ...p.board },
+			seed: { ...emptyReminder(), ...p.seed },
+		};
+	} catch {
+		return { board: emptyReminder(), seed: emptyReminder() };
+	}
+}
+export function saveReminders(s: ReminderState): void {
+	mkdirSync(dirname(tokenRemindersPath()), { recursive: true });
+	writeFileSync(tokenRemindersPath(), `${JSON.stringify(s, null, "\t")}\n`);
+}
+/** The stateless view the warnings and the UI derive from: files + env, no token crosses. */
+export function tokenExpiryView(
+	env: Record<string, string | undefined> = process.env,
+): TokenExpiryView {
+	return {
+		board: {
+			tokenSet: !!env.GH_TOKEN?.trim(),
+			expiresAt: loadReminders().board.expiresAt,
+		},
+		seed: {
+			seeded: !!env.OTTR_BOARD_OMP_HOME?.trim(),
+			expiresAt: readSeedTokenExpires(),
+		},
+	};
+}
+/** The active (or expired-effect) warning for one token; null when none is due. */
+function tokenExpiryWarning(
+	kind: "board" | "seed",
+	expiresAt: string | null,
+	now: Date,
+): string | null {
+	if (expiresAt === null) return null;
+	const days = tokenDaysLeft(expiresAt, now);
+	if (Number.isNaN(days) || days > 30) return null;
+	const date = expiresAt.slice(0, 10);
+	const renew =
+		"Renew it at https://github.com/settings/personal-access-tokens.";
+	if (days < 0)
+		return kind === "board"
+			? `The board's GitHub token expired on ${date}. GitHub calls from the board fail. ${renew}`
+			: `The board seed token expired on ${date}. The board seed stops. ${renew}`;
+	return kind === "board"
+		? `The board's GitHub token expires on ${date} (in ${days} days). ${renew}`
+		: `The board seed token expires on ${date} (in ${days} days). ${renew}`;
+}
+
 /**
  * Warnings the board must show the user (not only log): an unseeded agent layer, and a model
  * role whose provider has no active sign-in in the board store and no provider env key. Advisory
@@ -367,6 +477,7 @@ const defineRoutes = <R extends string>(
  */
 export function boardWarnings(
 	env: Record<string, string | undefined> = process.env,
+	expiry: TokenExpiryView = tokenExpiryView(env),
 ): string[] {
 	if (!existsSync(join(agentDir(), "config.yml")))
 		return [
@@ -403,6 +514,21 @@ export function boardWarnings(
 			`No active sign-in for ${provider} (role ${role}): sign in under Settings - Provider sign-in, or set its API key in the environment.`,
 		);
 	}
+	// Token warnings come last; a token that is not in effect (not set / board unseeded) never warns.
+	const now = new Date();
+	for (const w of [
+		tokenExpiryWarning(
+			"board",
+			expiry.board.tokenSet ? expiry.board.expiresAt : null,
+			now,
+		),
+		tokenExpiryWarning(
+			"seed",
+			expiry.seed.seeded ? expiry.seed.expiresAt : null,
+			now,
+		),
+	])
+		if (w !== null) out.push(w);
 	return out;
 }
 
@@ -561,6 +687,79 @@ export function createApp(deps: AppDeps) {
 	 */
 	function applyGithubToken(): void {
 		if (githubToken !== null) process.env.GH_TOKEN = githubToken;
+	}
+	// Default probe: the board's own repo answers with the expiry header when the token expires.
+	const githubTokenExpiry =
+		deps.githubTokenExpiry ??
+		(async (token: string): Promise<string | null> => {
+			const res = await noRedirectFetch(
+				"https://api.github.com/repos/ottr-ai/ottr",
+				{
+					headers: {
+						authorization: `Bearer ${token}`,
+						accept: "application/vnd.github+json",
+					},
+				},
+			);
+			return parseGithubExpiry(
+				res.headers.get("github-authentication-token-expiration"),
+			);
+		});
+	/**
+	 * Probe the board token and refresh the reminder file: a failed probe keeps the stored value
+	 * (log, retry next tick); a differing date is a renewed token and resets that day's throttle.
+	 * Returns the stored board expiry after the refresh.
+	 */
+	async function refreshBoardExpiry(): Promise<string | null> {
+		const state = loadReminders();
+		const seed = readSeedTokenExpires();
+		if (state.seed.expiresAt !== seed)
+			state.seed = { expiresAt: seed, lastPushDay: null };
+		if (githubToken !== null) {
+			try {
+				const probed = await githubTokenExpiry(githubToken);
+				if (probed !== state.board.expiresAt)
+					state.board = { expiresAt: probed, lastPushDay: null };
+			} catch (err) {
+				logError("github token expiry probe failed", err);
+			}
+		}
+		saveReminders(state);
+		return state.board.expiresAt;
+	}
+	/** Daily reminder: one push per UTC day per token, at 30 days out and through the last two weeks. */
+	async function tokenReminderTick(): Promise<void> {
+		await refreshBoardExpiry();
+		const state = loadReminders();
+		const now = new Date();
+		const today = now.toISOString().slice(0, 10);
+		for (const kind of ["board", "seed"] as const) {
+			const r = state[kind];
+			if (r.expiresAt === null || r.lastPushDay === today) continue;
+			const body = tokenExpiryWarning(kind, r.expiresAt, now);
+			const days = tokenDaysLeft(r.expiresAt, now);
+			if (body === null || !(days === 30 || (days >= 0 && days <= 14)))
+				continue;
+			try {
+				ensureVapid();
+				await sendAll(
+					loadSubs(deps.gstore),
+					JSON.stringify({
+						title: "Ottr",
+						body,
+						tag: "token-expiry",
+						url: "/",
+					}),
+					(sub, p) => sendNotification(sub, p),
+				);
+			} catch (err) {
+				logError("token expiry push failed", err);
+			} finally {
+				// One attempt per UTC day even when sends failed (same rule as the alert channel).
+				r.lastPushDay = today;
+				saveReminders(state);
+			}
+		}
 	}
 	/** One token-shaped word (ghp_, github_pat_, gho_, legacy hex) or null; keeps the credential helper's password line single. */
 	function githubTokenParam(v: unknown): string | null {
@@ -1225,19 +1424,21 @@ export function createApp(deps: AppDeps) {
 		needed: boolean;
 		commit: string | null;
 		roles: Record<string, string> | null;
+		expiresAt: string | null;
 	} {
 		const needed = !!process.env.OTTR_BOARD_OMP_HOME?.trim();
-		if (!needed) return { needed, commit: null, roles: null };
+		if (!needed) return { needed, commit: null, roles: null, expiresAt: null };
 		const roles = modelRoles();
+		const expiresAt = readSeedTokenExpires();
 		try {
 			const commit = readFileSync(
 				join(dirname(boardOmpHome()), "seed-commit"),
 				"utf8",
 			).trim();
-			return { needed, commit: commit || null, roles };
+			return { needed, commit: commit || null, roles, expiresAt };
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			return { needed, commit: null, roles };
+			return { needed, commit: null, roles, expiresAt };
 		}
 	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
@@ -2915,7 +3116,12 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/settings/github-token": {
 			GET: (req) =>
-				api(req, async () => json({ tokenSet: githubToken !== null })),
+				api(req, async () =>
+					json({
+						tokenSet: githubToken !== null,
+						expiresAt: loadReminders().board.expiresAt,
+					}),
+				),
 			POST: (req) =>
 				api(req, async () => {
 					const r = await readJson(req);
@@ -2925,7 +3131,9 @@ export function createApp(deps: AppDeps) {
 					githubToken = token;
 					saveConfig();
 					applyGithubToken();
-					return json({ tokenSet: true });
+					// Immediate probe: a pasted token shows its real date at once.
+					const expiresAt = await refreshBoardExpiry();
+					return json({ tokenSet: true, expiresAt });
 				}),
 		},
 		// Secret env values, one per env.txt name. No answer ever holds a value; a re-save
@@ -5312,6 +5520,7 @@ export function createApp(deps: AppDeps) {
 		sampleStats,
 		alateProvisionTick,
 		refreshUpdates,
+		tokenReminderTick,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
 		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
 	};

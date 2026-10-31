@@ -27,6 +27,8 @@ export interface Deps {
 	wait: (ms: number) => Promise<void>;
 	/** Clock in ms (Date.now) that measures the hold against its limit. */
 	now: () => number;
+	/** GitHub REST probe; the default prefixes https://api.github.com. Tests inject a fake. */
+	githubApi?: (path: string, token: string) => Promise<Response>;
 }
 
 // Counted inside the server container, so the host needs no board port.
@@ -357,7 +359,11 @@ async function seedSource(
 	d: Deps,
 	env: Record<string, string | undefined>,
 	repo: string,
-): Promise<{ wanted: string; args: string[] } | { failed: string } | null> {
+): Promise<
+	| { wanted: string; args: string[]; tokenExpires?: string | null }
+	| { failed: string }
+	| null
+> {
 	const { ALATE_DATA, ALATE_DATA_REPO, GH_TOKEN } = env;
 	if (ALATE_DATA === undefined) {
 		if (ALATE_DATA_REPO === undefined) {
@@ -381,6 +387,31 @@ async function seedSource(
 		const wanted = r.stdout.trim().split(/\s+/)[0] ?? "";
 		if (r.code !== 0 || wanted === "")
 			return { failed: `git ls-remote ${name} failed` };
+		// Advisory probe: the seed token's expiry from the REST response header. Never
+		// fails the run, and only the date leaves this function, never the token.
+		let tokenExpires: string | null | undefined;
+		if (GH_TOKEN !== undefined) {
+			const api =
+				d.githubApi ??
+				((path: string, token: string) =>
+					fetch(`https://api.github.com${path}`, {
+						headers: {
+							authorization: `Bearer ${token}`,
+							accept: "application/vnd.github+json",
+						},
+					}));
+			try {
+				const res = await api(`/repos/${name}`, GH_TOKEN);
+				if (!res.ok) throw new Error(`HTTP ${res.status}`);
+				const h = res.headers.get("github-authentication-token-expiration");
+				tokenExpires =
+					h === null
+						? "none"
+						: new Date(h.replace(" ", "T").replace(/ UTC$/, "Z")).toISOString();
+			} catch {
+				d.log("board seed token expiry check failed");
+			}
+		}
 		return {
 			wanted,
 			args: [
@@ -391,6 +422,7 @@ async function seedSource(
 				"--repo",
 				ALATE_DATA_REPO,
 			],
+			tokenExpires,
 		};
 	}
 	if (ALATE_DATA_REPO !== undefined)
@@ -574,6 +606,7 @@ export async function updateImage(
 	let seeded = false;
 	let seedFailed = false;
 	let wantedSha = "";
+	let seedExpires: string | null | undefined;
 	const seed = await seedSource(d, env, repo);
 	if (seed === null) {
 		// seedSource already logged the skip.
@@ -581,6 +614,7 @@ export async function updateImage(
 		d.log(`board seed failed: ${seed.failed}`);
 		seedFailed = true;
 	} else {
+		seedExpires = seed.tokenExpires;
 		wantedSha = seed.wanted;
 		let record: string | null = null;
 		if (serverWasRunning) {
@@ -688,6 +722,22 @@ export async function updateImage(
 			);
 			seedFailed = true;
 		}
+	}
+	// Every run that probed writes the expiry, so a renewed token updates the file even
+	// when the data repo did not move. Advisory: a failed write never fails the run.
+	if (seedExpires !== undefined) {
+		const w = await d.docker(
+			"compose",
+			...compose,
+			"exec",
+			"-T",
+			"server",
+			"sh",
+			"-c",
+			`printf %s '${seedExpires ?? "none"}' > /etc/ottr/seed-token-expires`,
+		);
+		if (w.code !== 0) d.log("board seed token expiry check failed");
+		else d.log(`board seed token expires ${seedExpires ?? "none"}`);
 	}
 	await d.docker(
 		"image",

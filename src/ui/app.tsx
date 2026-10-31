@@ -8415,6 +8415,21 @@ function SessionSection() {
 	);
 }
 
+/** Shared expiry line: whole UTC days left, or "No expiry" when the date is unknown. */
+export function expiryLine(expiresAt: string | null): string | null {
+	if (expiresAt === null) return "No expiry";
+	const d = new Date(expiresAt);
+	if (Number.isNaN(d.getTime())) return null;
+	const utcMidnight = (t: number): number => {
+		const x = new Date(t);
+		return Date.UTC(x.getUTCFullYear(), x.getUTCMonth(), x.getUTCDate());
+	};
+	const n = Math.floor(
+		(utcMidnight(d.getTime()) - utcMidnight(Date.now())) / 86_400_000,
+	);
+	return `Expires on ${d.toISOString().slice(0, 10)} (in ${n} days)`;
+}
+
 /** Shared write-only secret form: loads whether it is set, saves a pasted value, flashes "Saved". */
 function SecretTokenForm<T extends { tokenSet: boolean }>({
 	endpoint,
@@ -8423,6 +8438,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 	captionSet,
 	captionUnset,
 	captionUnknown,
+	expiry,
 	onLoaded,
 }: {
 	endpoint: string;
@@ -8434,11 +8450,14 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 	captionUnset: string;
 	/** Shown while the check is pending or failed: never claim "Not set" then. */
 	captionUnknown: string;
+	/** Optional expiry line from the loaded/saved view; a string renders as plain text. */
+	expiry?: (cfg: T) => string | null;
 	/** Observes the loaded/saved view; pass a stable callback (a setState works). */
 	onLoaded?: (data: T) => void;
 }) {
 	// null until the load answers: a failed check must not claim "Not set".
 	const [tokenSet, setTokenSet] = useState<boolean | null>(null);
+	const [expiryText, setExpiryText] = useState<string | null>(null);
 	const [token, setToken] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const [saved, flashSaved] = useFlash(1500);
@@ -8450,6 +8469,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 			.then((cfg) => {
 				if (!live) return;
 				setTokenSet(cfg.tokenSet);
+				setExpiryText(expiry?.(cfg) ?? null);
 				onLoaded?.(cfg);
 			})
 			.catch((err) => {
@@ -8458,13 +8478,14 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 		return () => {
 			live = false;
 		};
-	}, [endpoint, onLoaded]);
+	}, [endpoint, expiry, onLoaded]);
 	const submit = (): void =>
 		save.start(async () => {
 			setError(null);
 			try {
 				const cfg = await post<T>(endpoint, { token: token.trim() });
 				setTokenSet(cfg.tokenSet);
+				setExpiryText(expiry?.(cfg) ?? null);
 				setToken("");
 				onLoaded?.(cfg);
 				flashSaved();
@@ -8494,6 +8515,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 										? captionUnset
 										: captionUnknown}
 							</span>
+							{expiryText !== null && <span>{expiryText}</span>}
 							<code>secret · stored, never shown</code>
 						</div>
 						<label>
@@ -8844,13 +8866,14 @@ function GitHostsSection() {
 					The board's git fetches, pushes and publishes releases with this
 					token. Agents on workers never receive it.
 				</p>
-				<SecretTokenForm
+				<SecretTokenForm<{ tokenSet: boolean; expiresAt: string | null }>
 					endpoint="/api/settings/github-token"
 					title="GitHub token"
 					label="GitHub token"
 					captionSet="Set. Paste a new token to replace it"
 					captionUnset="Not set: fetch and push fail"
 					captionUnknown="Unknown: the check failed"
+					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
 			</div>
 			<div className="sec-block">
@@ -9568,6 +9591,7 @@ type RolesState = {
 		needed: boolean;
 		commit: string | null;
 		roles: Record<string, string> | null;
+		expiresAt: string | null;
 	};
 };
 /** One script result of POST /api/alate/provision. */
@@ -9971,6 +9995,9 @@ function ModelRolesSection() {
 											{" "}
 											(seed <code>{shortSha(seed.commit)}</code>)
 										</>
+									) : null}
+									{seed?.expiresAt !== undefined ? (
+										<> · {expiryLine(seed.expiresAt)}</>
 									) : null}
 									.
 								</>

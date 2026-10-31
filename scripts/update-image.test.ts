@@ -147,7 +147,7 @@ function fakes(
 					out: o.seedCode ? "the seed step failed\n" : "",
 				};
 			}
-			if (line.includes("seed-commit")) {
+			if (line.includes("seed-commit") || line.includes("seed-token-expires")) {
 				// The read is the `cat` exec, the write is the `printf` exec.
 				calls.push(line);
 				if (line.includes("cat "))
@@ -280,6 +280,10 @@ function fakes(
 			return { code: 0, out: "" };
 		},
 		log: (line) => logs.push(line),
+		// The harness default never reaches the network: an injected githubApi replaces it.
+		githubApi: async () => {
+			throw new Error("githubApi not faked");
+		},
 		wait: async (ms) => {
 			clock += ms;
 			waits.push(ms);
@@ -1514,6 +1518,74 @@ describe("board seed", () => {
 				`board seed failed: git ls-remote ${repo.split("@")[0]} failed`,
 			);
 		}
+	}, 60_000);
+
+	test("the seed token probe writes the expiry (or none) to seed-token-expires, and never logs the token", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const github = join(root, String(fixtures++));
+		must(
+			root,
+			"clone",
+			"-q",
+			"--bare",
+			data.origin,
+			join(github, "example", "data"),
+		);
+		const token = "tok-never-in-argv";
+		const head = must(data.main, "rev-parse", "HEAD");
+		const iso = "2027-10-30T00:00:00.000Z";
+		const expiryRun = (
+			githubApi: Deps["githubApi"],
+			o?: Parameters<typeof fakes>[0],
+		) => {
+			const f = fakes({
+				seedRecord: unrecorded,
+				alatePs: "alate123",
+				alateInspect: "alate:current",
+				...o,
+			});
+			f.deps.githubApi = githubApi;
+			return f;
+		};
+		const header = (h: string) => async () =>
+			new Response("{}", {
+				status: 200,
+				headers: { "github-authentication-token-expiration": h },
+			});
+		const dated = expiryRun(header("2027-10-30 00:00:00 UTC"));
+		const undated = expiryRun(async () => new Response("{}", { status: 200 }));
+		const badDate = expiryRun(header("not a date"));
+		const refused = expiryRun(async () => new Response("{}", { status: 403 }));
+		const thrown = expiryRun(async () => {
+			throw new Error("offline");
+		});
+		await fromLocalGitHub(github, async () => {
+			for (const f of [dated, undated, badDate, refused, thrown])
+				expect(
+					await updateImage(main, ["-f", "c.yml"], f.deps, {
+						ALATE_DATA_REPO: "example/data",
+						GH_TOKEN: token,
+					}),
+				).toBe(0);
+		});
+		expect(dated.seedWrites).toEqual([
+			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+			`compose -f c.yml exec -T server sh -c printf %s '${iso}' > /etc/ottr/seed-token-expires`,
+		]);
+		expect(dated.logs.join("\n")).toContain(`board seed token expires ${iso}`);
+		expect(undated.seedWrites.at(-1)).toBe(
+			"compose -f c.yml exec -T server sh -c printf %s 'none' > /etc/ottr/seed-token-expires",
+		);
+		expect(undated.logs.join("\n")).toContain("board seed token expires none");
+		for (const f of [badDate, refused, thrown]) {
+			expect(f.seedWrites.at(-1)).not.toContain("seed-token-expires");
+			expect(f.logs.join("\n")).toContain(
+				"board seed token expiry check failed",
+			);
+		}
+		for (const f of [dated, undated, badDate, refused, thrown])
+			expect(f.logs.join("\n")).not.toContain(token);
 	}, 60_000);
 });
 

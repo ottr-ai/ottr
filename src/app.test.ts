@@ -2666,6 +2666,8 @@ describe("github token", () => {
 				projectPaths: [],
 			},
 			serverRef: { current: undefined },
+			// The save probes at once; a stub keeps the test off the network.
+			githubTokenExpiry: async () => null,
 		});
 	const served = boot();
 	const srv = Bun.serve({ port: 0, ...served.serveOptions });
@@ -2713,6 +2715,7 @@ describe("github token", () => {
 		// Write-only: the views say whether it is set, never what it is.
 		expect(await (await call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			expiresAt: null,
 		});
 		expect(await (await call("/api/state")).text()).not.toContain(first);
 	});
@@ -5691,4 +5694,266 @@ describe("board warnings", () => {
 			credStore(join(dir, "agent.db"), [["anthropic", "replaced by"]]);
 			expect(boardWarnings({})).toEqual(expected);
 		}));
+});
+
+describe("token expiry reminders", () => {
+	// Pinned board omp home: token-reminders.json and seed-token-expires land in home/.
+	const home = mkdtempSync(join(tmpdir(), "ottr-expiry-"));
+	const savedOmp = process.env.OTTR_BOARD_OMP_HOME;
+	process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+	const remindersFile = join(home, "token-reminders.json");
+	const seedFile = join(home, "seed-token-expires");
+	// A seeded agent dir with no roles: warnings are exactly the token ones, never the
+	// unseeded early return or provider noise from the host's real ~/.omp/agent.
+	const agentTmp = join(home, "agent");
+	mkdirSync(agentTmp, { recursive: true });
+	writeFileSync(join(agentTmp, "config.yml"), "modelRoles: {}\n");
+	const savedAgent = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentTmp;
+
+	const g = GlobalStore.open(join(root, "g-expiry"));
+	const TOKEN = `ghp_${"c".repeat(36)}`;
+	const EXP = "2026-10-31T00:00:00.000Z";
+	let probeExpiry: string | null = null;
+	let probeFail = false;
+	const boot = () =>
+		createApp({
+			gstore: g,
+			defaultDir: root,
+			projects: new Map(),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				removedPaths: [],
+				envValues: {},
+				projectPaths: [],
+			},
+			serverRef: { current: undefined },
+			githubTokenExpiry: async () => {
+				if (probeFail) throw new Error("probe down");
+				return probeExpiry;
+			},
+		});
+	const served = boot();
+	const srv = Bun.serve({ port: 0, ...served.serveOptions });
+	served.serverRef.current = srv;
+	mounted.push(srv);
+	mountStores.push(g);
+	const call = (path: string, body?: unknown) =>
+		fetch(new URL(path, srv.url), {
+			method: body === undefined ? "GET" : "POST",
+			headers: {
+				...(body === undefined ? {} : { "content-type": "application/json" }),
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+			},
+			body: body === undefined ? undefined : JSON.stringify(body),
+		});
+	const sub = {
+		endpoint: "https://push.test/expiry",
+		keys: { p256dh: "k", auth: "a" },
+		addedAt: 0,
+	};
+	// Fake calendar: day n of October 2026, so daysLeft against Oct 31 is 31 - n.
+	const dayAt = (n: number) => new Date(Date.UTC(2026, 9, n, 12));
+	const BOARD_RENEW =
+		"Renew it at https://github.com/settings/personal-access-tokens.";
+	const tokenWarnings = (): string[] =>
+		boardWarnings({
+			GH_TOKEN: TOKEN,
+			OTTR_BOARD_OMP_HOME: join(home, "omp-home"),
+		}).filter((w) => w.includes("GitHub token"));
+	afterAll(() => {
+		srv.stop(true);
+		setSystemTime();
+		delete process.env.GH_TOKEN;
+		if (savedOmp === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+		else process.env.OTTR_BOARD_OMP_HOME = savedOmp;
+		if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = savedAgent;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	test("POST probes at once and the GET answers the new shape; the 30-day push fires once per day", async () => {
+		setSystemTime(dayAt(1));
+		probeExpiry = EXP;
+		const save = await call("/api/settings/github-token", { token: TOKEN });
+		expect(save.status).toBe(200);
+		expect(await save.json()).toEqual({ tokenSet: true, expiresAt: EXP });
+		expect(await (await call("/api/settings/github-token")).json()).toEqual({
+			tokenSet: true,
+			expiresAt: EXP,
+		});
+		pushSends.length = 0;
+		saveSubs(g, [sub]);
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+		expect(JSON.parse(pushSends[0]!.payload)).toEqual({
+			title: "Ottr",
+			body: `The board's GitHub token expires on 2026-10-31 (in 30 days). ${BOARD_RENEW}`,
+			tag: "token-expiry",
+			url: "/",
+		});
+		// No second push on the same day.
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+	});
+
+	test("days 29..15 stay silent; 14 down to 0 push once per UTC day", async () => {
+		const base = pushSends.length;
+		for (let n = 2; n <= 16; n++) {
+			setSystemTime(dayAt(n));
+			await served.tokenReminderTick();
+			expect(pushSends.length).toBe(base);
+		}
+		for (let n = 17; n <= 31; n++) {
+			setSystemTime(dayAt(n));
+			await served.tokenReminderTick();
+			expect(pushSends.length).toBe(base + 1 + (n - 17));
+		}
+		// The last attempt is recorded, so the same day stays quiet.
+		setSystemTime(dayAt(31));
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(base + 15);
+	});
+
+	test("a token with no expiry never pushes and never warns", async () => {
+		setSystemTime(dayAt(20));
+		probeExpiry = null;
+		await call("/api/settings/github-token", { token: TOKEN });
+		pushSends.length = 0;
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(0);
+		expect(tokenWarnings().length).toBe(0);
+	});
+
+	test("a failed probe keeps the stored value", async () => {
+		probeExpiry = EXP;
+		await call("/api/settings/github-token", { token: TOKEN });
+		probeFail = true;
+		pushSends.length = 0;
+		await served.tokenReminderTick();
+		probeFail = false;
+		expect(await (await call("/api/settings/github-token")).json()).toEqual({
+			tokenSet: true,
+			expiresAt: EXP,
+		});
+		const kept = JSON.parse(readFileSync(remindersFile, "utf8")) as {
+			board: { expiresAt: string | null };
+		};
+		expect(kept.board.expiresAt).toBe(EXP);
+	});
+
+	test("an expired token warns with the effect text and no push", async () => {
+		setSystemTime(dayAt(5));
+		probeExpiry = "2026-09-01T00:00:00.000Z";
+		await call("/api/settings/github-token", { token: TOKEN });
+		pushSends.length = 0;
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(0);
+		expect(tokenWarnings()).toEqual([
+			`The board's GitHub token expired on 2026-09-01. GitHub calls from the board fail. ${BOARD_RENEW}`,
+		]);
+	});
+
+	test("a renewed token stops the old reminders and starts a new schedule", async () => {
+		setSystemTime(dayAt(20));
+		probeExpiry = EXP;
+		await served.tokenReminderTick(); // 11 days left: pushes once
+		const afterOld = pushSends.length;
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(afterOld); // throttled for today
+		// Renewal: the old date's reminders stop (stateless), and the new schedule runs
+		// on the new date — quiet until its 30-day point, even though today pushed already.
+		probeExpiry = "2027-01-30T00:00:00.000Z";
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(afterOld);
+		expect(tokenWarnings()).toEqual([]);
+		setSystemTime(new Date(Date.UTC(2026, 11, 31, 12))); // 30 days before 2027-01-30
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(afterOld + 1);
+		expect(pushSends[pushSends.length - 1]!.payload).toContain(
+			"expires on 2027-01-30 (in 30 days)",
+		);
+	});
+
+	test("the seed token pushes and warns from seed-token-expires; 'none' means no expiry", async () => {
+		// Quiet the board token for this test.
+		probeExpiry = null;
+		await call("/api/settings/github-token", { token: TOKEN });
+		writeFileSync(seedFile, EXP);
+		setSystemTime(dayAt(1));
+		// A stored date differing from the fresh one resets the seed's day throttle.
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: null, lastPushDay: "2026-10-01" },
+				seed: { expiresAt: null, lastPushDay: "2026-10-01" },
+			}),
+		);
+		pushSends.length = 0;
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+		expect(JSON.parse(pushSends[0]!.payload)).toEqual({
+			title: "Ottr",
+			body: `The board seed token expires on 2026-10-31 (in 30 days). ${BOARD_RENEW}`,
+			tag: "token-expiry",
+			url: "/",
+		});
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+		// "none" refreshes to null: no push, no warning.
+		writeFileSync(seedFile, "none");
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: JSON.parse(readFileSync(remindersFile, "utf8")).board,
+				seed: { expiresAt: EXP, lastPushDay: null },
+			}),
+		);
+		setSystemTime(dayAt(2));
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+	});
+
+	test("seedView carries seed.expiresAt through /api/model-roles", async () => {
+		// A minimal fake alate: /api/state answers the source, other paths answer
+		// the config.yml file load that readConfigYml performs.
+		const fake = Bun.serve({
+			port: 0,
+			fetch: (req) => {
+				const u = new URL(req.url);
+				if (u.pathname === "/api/state")
+					return Response.json({
+						source: { kind: "repo", name: "o/data", importedSha: "a".repeat(40) },
+					});
+				return Response.json({
+					path: u.searchParams.get("path"),
+					content: "modelRoles:\n  default: zai/glm-5.3-flash:max\n",
+					hash: "h",
+				});
+			},
+		});
+		mounted.push(fake);
+		mountStores.push(g);
+		const linked = await call("/api/alate", { url: fake.url.origin, key: "k" });
+		expect(linked.status).toBe(200);
+		writeFileSync(seedFile, EXP);
+		const withDate = (await (await call("/api/model-roles")).json()) as {
+			seed: { expiresAt: string | null };
+		};
+		expect(withDate.seed.expiresAt).toBe(EXP);
+		writeFileSync(seedFile, "none");
+		const withNone = (await (await call("/api/model-roles")).json()) as {
+			seed: { expiresAt: string | null };
+		};
+		expect(withNone.seed.expiresAt).toBeNull();
+		fake.stop(true);
+	});
 });

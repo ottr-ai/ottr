@@ -508,6 +508,10 @@ setInterval(() => void app.forkResearchTick(), 3_600_000);
 void app.prReviewTick();
 setInterval(() => void app.prReviewTick(), 3_600_000);
 
+// Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
+void app.tokenReminderTick();
+setInterval(() => void app.tokenReminderTick(), 86_400_000);
+
 // No bind retry: nothing in the repo restarts this process on the same port, so a
 // bind failure surfaces as the thrown error from Bun.serve.
 serverRef.current = Bun.serve({

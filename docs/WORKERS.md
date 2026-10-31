@@ -445,6 +445,8 @@ past the hold, the restart waits for a later run, and that run seeds again. A fa
 keeps the recorded commit, and
 the run exits non-zero. The updater takes the alate image from `ALATE_IMAGE` in the env
 file, or from the running alate container. Set `ALATE_IMAGE` when no alate container runs.
+When `GH_TOKEN` is set with `ALATE_DATA_REPO`, the updater also probes the token's expiry
+and records the date (or `none`) at `/etc/ottr/seed-token-expires` in the same volume.
 
 The seed uses the same SkillSpector scan as worker provisioning, and a failed scan stops
 it. `--force` lets the data repo win over board-local edits. The seed installs the whole
