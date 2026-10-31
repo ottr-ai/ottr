@@ -21,11 +21,11 @@ export default {
   // in the cold sandbox under parallel runners.
   timeoutMS: 60000,
   timeoutFactor: 2,
-  // break = killed-only score rounded down (2118 killed of 2446 = 86.59%, 2026-10-25 run after
-  // the round-5 behavior tests). That run reported 99.02, but it counted 304 timeouts as
-  // detected: the host ran other cards' Stryker runs at a load average of ~25, so most of those
-  // are slow runs, not hangs. The 24 survivors are all equivalent mutants (OTTR-175 report).
-  // Raise the break when a clean run on a quiet host measures more. History: 84.10 (2026-10-14
-  // clean run), 77.51 (2026-10-25 release review, before round 5).
-  thresholds: { ...base.thresholds, break: 86 },
+  // break = killed-only score rounded down (2462 killed of 2635 = 93.4%, 2026-10-30 release
+  // v0.2.0 review run at 16b3326; that run reported 94.50 with 28 timeouts and 145 survivors).
+  // Timeouts count as detected but are not counted here: under host load they are mostly slow
+  // survivors, not hangs (a 2026-10-31 rerun at a load average of ~90 timed out 1000 mutants and
+  // left 3 survivors). Raise the break when a clean run on a quiet host measures more. History:
+  // 86.59 (2026-10-25, after round 5), 84.10 (2026-10-14 clean run), 77.51 (2026-10-25 review).
+  thresholds: { ...base.thresholds, break: 93 },
 };

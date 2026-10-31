@@ -17,8 +17,9 @@ export default {
   // state: a git spawn's cost on Windows swings ~3x, and the git-heavy suite inflates with it.
   timeoutMS: 120000,
   timeoutFactor: 3,
-  // break = measured score rounded down (68.27%, 2026-10-25 release review run at f0e3416).
-  // Earlier: 60.17 (2026-10-14 clean run on this worker; the 2026-10-13 shared-host
-  // measurement was 58.87). Never lower it; raise it when a clean run measures above 68.
-  thresholds: { ...base.thresholds, break: 68 },
+  // break = measured score rounded down (70.68%, 2026-10-30 release v0.2.0 review run at
+  // 16b3326: 903 killed, 18 timed out, 382 survived). Earlier: 68.27 (2026-10-25 at f0e3416),
+  // 60.17 (2026-10-14 clean run; the 2026-10-13 shared-host measurement was 58.87). Never lower
+  // it; raise it when a clean run measures above 70.
+  thresholds: { ...base.thresholds, break: 70 },
 };
