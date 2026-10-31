@@ -5968,10 +5968,14 @@ describe("token expiry reminders", () => {
 	const BOARD_RENEW =
 		"Renew it at https://github.com/settings/personal-access-tokens.";
 	const tokenWarnings = (): string[] =>
-		boardWarnings({
-			GH_TOKEN: TOKEN,
-			OTTR_BOARD_OMP_HOME: join(home, "omp-home"),
-		}).filter((w) => w.includes("GitHub token"));
+		boardWarnings(
+			[],
+			{},
+			{
+				GH_TOKEN: TOKEN,
+				OTTR_BOARD_OMP_HOME: join(home, "omp-home"),
+			},
+		).filter((w) => w.includes("GitHub token"));
 	afterAll(() => {
 		srv.stop(true);
 		setSystemTime();
