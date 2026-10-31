@@ -309,15 +309,18 @@ describe("mergeHoldMismatch", () => {
 	};
 	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
 	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
-	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1),
-	 * so a merge turn must rebase onto a moved target. */
+	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1,
+	 * which rewrites o.txt — a file the branch never touches, so rebases stay clean), so a merge
+	 * turn must rebase onto a moved target. */
 	const fixture = () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-mhm-"));
 		const bare = join(dir, "origin.git");
 		run(dir, "init", "-q", "--bare", "-b", "main", bare);
 		const main = join(dir, "main");
 		run(dir, "clone", "-q", bare, main);
-		run(main, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+		writeFileSync(join(main, "o.txt"), "o");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
 		run(main, "push", "-q", "origin", "main");
 		const wt = join(dir, "wt");
 		run(main, "worktree", "add", "-q", "-b", "ott/x", wt);
@@ -331,7 +334,8 @@ describe("mergeHoldMismatch", () => {
 		}
 		const base = run(main, "rev-parse", "refs/heads/main");
 		const approvedHead = run(wt, "rev-parse", "HEAD");
-		run(main, ...id, "commit", "-q", "--allow-empty", "-m", "O1");
+		writeFileSync(join(main, "o.txt"), "O1");
+		run(main, ...id, "commit", "-qam", "O1");
 		run(main, "push", "-q", "origin", "main");
 		return { dir, main, wt, base, approvedHead };
 	};
@@ -386,6 +390,24 @@ describe("mergeHoldMismatch", () => {
 			writeFileSync(join(f.main, "smuggle.txt"), "x");
 			run(f.main, ...id, "add", ".");
 			run(f.main, ...id, "commit", "-q", "--amend", "--no-edit");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
+			).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a merge that keeps the branch's stale copy of a file origin changed mismatches", async () => {
+		const f = fixture();
+		try {
+			// No rebase: the agent merges the stale branch and revives the branch's pre-O1 copy
+			// of o.txt inside the merge commit. The merge's combined diff is empty there (the
+			// result equals one parent), so only the tree diff against the target sees the
+			// reverted origin change.
+			run(f.main, ...id, "merge", "--no-ff", "--no-commit", "ott/x");
+			run(f.main, "checkout", "ott/x", "--", "o.txt");
+			run(f.main, ...id, "commit", "-qm", "merge");
 			expect(
 				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
 			).toBe(true);
