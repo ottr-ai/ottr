@@ -93,6 +93,7 @@ import type {
 	ignoreInMain,
 	isClean,
 	isIntegrated,
+	mergeHoldMismatch,
 	removeWorktree,
 	resolveTarget,
 	serverMergePush,
@@ -155,6 +156,10 @@ export const UPDATE_HOLD_REASON =
 /** A fork-born task parked for merge approval; the reply recognizes it by this reason. */
 export const FORK_HOLD_REASON =
 	"Fork-research-born task: the merge is held. Reply to approve the merge, or cancel the card.";
+
+/** OTTR-274: a merge turn added changes beyond an approved hold head; the reply approves the exact parked push head. */
+export const MERGE_HOLD_MISMATCH_REASON =
+	"The merge added changes beyond the approved head. Read the diff, then reply to approve the merge, or cancel the card.";
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
 export const UI_SHOT_WARNING =
@@ -263,6 +268,8 @@ export interface TurnOps {
 	targetSha(mainPath: string, ref: string): Promise<string | null>;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
+	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
+	mergeHoldMismatch: typeof mergeHoldMismatch;
 	pidAlive: typeof pidAlive;
 	/** Parsed once at boot from OTTR_WORKER_URLS; null = local spawn. Merge turns never use it (D6). */
 	workerTarget?: WorkerTarget | null;
@@ -1611,39 +1618,82 @@ export function createTurnLoop(
 			// the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
 			// local branch, and only this push moves it to origin.
 			let pushError: string | null = null;
+			// The head a settle parks for a hold: a work-settle hold parks the worktree HEAD, a
+			// merge-hold mismatch park the local target head. A reply approves exactly this head.
+			let holdHead: string | null = null;
+			// OTTR-274: set when a held merge carries patches beyond the approval; parks the card
+			// after classify instead of landing it.
+			let holdMismatch: string | null = null;
 			if (kind === "merge" && !interview && !grill && !releaseCard) {
-				const p = await ops
-					.serverMergePush(e.path, wt, target, task.branch ?? "")
-					.catch((err: unknown) => ({
-						status: "failed" as const,
-						error: errmsg(err),
-					}));
-				if (p.status === "pushed") {
-					log(`- pushed ${target} from the server`);
-					// The agent's own push has no credentials (D6). A merge agent that stopped at
-					// needs_you on that authentication failure did integrate: the server push landed
-					// it, so the report becomes integrated with the push output in details.
-					const o = result.outcome;
-					const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
-					if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
-						result = {
-							...result,
-							asked: null,
-							outcome: {
-								...o,
-								status: "integrated",
-								question: undefined,
-								details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
-							},
-						};
-						log(
-							"- needs_you on a push authentication failure resolved: the server pushed",
-						);
+				// An approved merge hold fixes what may ship. The merge turn resumes the same agent
+				// session and could commit beyond the approved head, so the push set
+				// (target..refs/heads/<branch>) must carry exactly the approved patches
+				// (base..approvedHead). Fails closed: git trouble parks the card. A reply to the
+				// mismatch park approves the exact parked head, so a sha-equal re-merge pushes.
+				const approvedHeads = [task.updateMergeHead, task.forkMergeHead].filter(
+					(h) => h !== null,
+				);
+				const branch = target.startsWith("origin/")
+					? target.slice("origin/".length)
+					: null;
+				const localHead =
+					branch === null || approvedHeads.length === 0
+						? null
+						: await ops
+								.targetSha(e.path, `refs/heads/${branch}`)
+								.catch(() => null);
+				if (branch !== null && approvedHeads.length > 0) {
+					if (localHead !== null && approvedHeads.includes(localHead)) {
+						// the exact head a reply approved: nothing new to judge
+					} else {
+						for (const ah of approvedHeads) {
+							if (
+								await ops
+									.mergeHoldMismatch(e.path, target, base, ah)
+									.catch(() => true)
+							) {
+								holdMismatch = MERGE_HOLD_MISMATCH_REASON;
+								holdHead = localHead;
+								log("! held merge carries patches beyond the approved head");
+								break;
+							}
+						}
 					}
 				}
-				if (p.status === "failed") {
-					pushError = p.error;
-					log(`! server push of ${target} failed: ${p.error}`);
+				if (holdMismatch === null) {
+					const p = await ops
+						.serverMergePush(e.path, wt, target, task.branch ?? "")
+						.catch((err: unknown) => ({
+							status: "failed" as const,
+							error: errmsg(err),
+						}));
+					if (p.status === "pushed") {
+						log(`- pushed ${target} from the server`);
+						// The agent's own push has no credentials (D6). A merge agent that stopped at
+						// needs_you on that authentication failure did integrate: the server push landed
+						// it, so the report becomes integrated with the push output in details.
+						const o = result.outcome;
+						const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
+						if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
+							result = {
+								...result,
+								asked: null,
+								outcome: {
+									...o,
+									status: "integrated",
+									question: undefined,
+									details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
+								},
+							};
+							log(
+								"- needs_you on a push authentication failure resolved: the server pushed",
+							);
+						}
+					}
+					if (p.status === "failed") {
+						pushError = p.error;
+						log(`! server push of ${target} failed: ${p.error}`);
+					}
 				}
 			}
 			const facts: GitFacts = {
@@ -1692,6 +1742,14 @@ export function createTurnLoop(
 					stage: "merging",
 					state: "needs_you",
 					needsReason: `Server push to origin failed: ${pushError}`,
+				};
+			// OTTR-274: a held merge carries patches beyond the approval: park instead of landing
+			// it. holdHead holds the exact local target head the reply can approve.
+			if (holdMismatch !== null)
+				next = {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: holdMismatch,
 				};
 			if (
 				fromMain &&
@@ -1935,7 +1993,6 @@ export function createTurnLoop(
 					? await ops.targetSha(wt, "HEAD").catch(() => null)
 					: null;
 			// A null head (git failed) never matches: the hold fails closed.
-			let holdHead: string | null = null;
 			const holdReason =
 				updateHold && (head === null || task.updateMergeHead !== head)
 					? UPDATE_HOLD_REASON

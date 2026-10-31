@@ -61,6 +61,7 @@ import {
 	isKeptReason,
 	keptReason,
 	logStoreError,
+	MERGE_HOLD_MISMATCH_REASON,
 	parseReleaseVersion,
 	parseTopicReport,
 	turnModel,
@@ -201,6 +202,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		targetCommits: async () => 3,
 		targetSha: async () => null,
 		serverMergePush: async () => ({ status: "skipped" as const }),
+		mergeHoldMismatch: async () => false,
 		pidAlive: () => true,
 		startRun: (o: {
 			cwd: string;
@@ -3993,6 +3995,75 @@ describe("turn ci watch pinning", () => {
 		expect(logText(store, task.id)).toContain(
 			"- pushed origin/main from the server",
 		);
+	});
+
+	test("a held merge with patches beyond the approved head parks instead of pushing", async () => {
+		const pushes: string[] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref.startsWith("origin/") ? "sha-pushed" : "sha-local-main",
+			serverMergePush: async (_m: string, _w: string, target: string) => {
+				pushes.push(target);
+				return { status: "pushed" as const, output: "" };
+			},
+			mergeHoldMismatch: async () => true,
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(pushes).toEqual([]);
+		expect(t.stage).toBe("in_progress");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+		expect(t.holdHead).toBe("sha-local-main");
+	});
+
+	test("a held fork merge with patches beyond the approved head parks too", async () => {
+		const pushes: string[] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async () => "sha-local-main",
+			serverMergePush: async () => {
+				pushes.push("origin/main");
+				return { status: "pushed" as const, output: "" };
+			},
+			mergeHoldMismatch: async () => true,
+		});
+		store.updateTask(task.id, { forkMergeHead: "sha-approved" });
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(pushes).toEqual([]);
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+	});
+
+	test("a merge whose head is exactly the approved push head pushes without the patch compare", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref.startsWith("origin/") ? "sha-pushed" : "sha-approved",
+			serverMergePush: async () => ({ status: "pushed" as const, output: "" }),
+			mergeHoldMismatch: async () => {
+				throw new Error("must not compare when the head is the approved one");
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a merge without a hold approval is not gated", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			mergeHoldMismatch: async () => {
+				throw new Error("no hold columns set: nothing to compare");
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
 	test("a merge agent that removed its worktree still gets the server push", async () => {

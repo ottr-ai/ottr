@@ -60,6 +60,7 @@ import {
 	isClean,
 	isGitRepoWithCommit,
 	isIntegrated,
+	mergeHoldMismatch,
 	quarantineUntracked,
 	remoteUrl,
 	removeWorktree,
@@ -385,6 +386,7 @@ const loop = createTurnLoop(projects, {
 	targetCommits,
 	targetSha,
 	serverMergePush,
+	mergeHoldMismatch,
 	pidAlive,
 	// OTTR_WORKER_URLS selects worker dispatch for work turns; unset (the default) and any
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).

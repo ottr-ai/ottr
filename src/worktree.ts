@@ -760,6 +760,53 @@ export async function serverMergePush(
 }
 
 /**
+ * OTTR-274: true when the commits a server push would ship (target..refs/heads/<branch>) do not
+ * carry exactly the approved hold's patches (base..approvedHead). A merge turn resumes the same
+ * agent session and can commit beyond an approved head, so the push set must match the approval.
+ * Patch-ids survive a rebase onto a moved target; any content change flips one. Unresolvable refs
+ * and git trouble count as a mismatch: the hold fails closed. Runs in the main repo, where the
+ * target refs live. Clean merge commits yield no patch (empty --cc diff), so a smuggled change
+ * inside one still shows: --cc prints only the content that differs from every parent.
+ */
+export async function mergeHoldMismatch(
+	mainPath: string,
+	target: string,
+	base: string,
+	approvedHead: string,
+): Promise<boolean> {
+	if (!target.startsWith("origin/")) return false; // no server push, nothing to hold
+	// ponytail: one `git log -p` per side piped through patch-id; upgrade to per-commit
+	// diff batching only if a card ships a range big enough to block a settle.
+	const ids = async (range: string): Promise<string[] | null> => {
+		const log = await git(["log", "--cc", "-p", "--root", range], mainPath);
+		if (log.code !== 0) return null;
+		const proc = Bun.spawn([gitExe(), "patch-id", "--stable"], {
+			cwd: mainPath,
+			stdin: new Response(log.stdout).body,
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		const out = await new Response(proc.stdout).text();
+		return (await proc.exited) === 0
+			? out
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => line.split(" ")[0]!)
+					.sort()
+			: null;
+	};
+	const push = await ids(
+		`${target}..refs/heads/${target.slice("origin/".length)}`,
+	);
+	const approved = await ids(`${base}..${approvedHead}`);
+	return (
+		push === null ||
+		approved === null ||
+		push.join("\n") !== approved.join("\n")
+	);
+}
+
+/**
  * True when path is itself the top of a checkout with its own git link. A plain directory inside
  * the main repo must not borrow the main repo's state: git climbs out of unlinked dirs, so status
  * and ancestor checks would silently report the main checkout (observed: an emptied worktree dir

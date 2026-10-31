@@ -49,6 +49,7 @@ import { ProjectStore } from "./store.ts";
 import {
 	cancelKeptReason,
 	FORK_HOLD_REASON,
+	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
 import type { AddProjectResponse, PrReviewRow, Task } from "./types.ts";
@@ -1762,6 +1763,48 @@ describe("alate routes", () => {
 			});
 			expect(cres.status).toBe(200);
 			expect(p1.store.getTask(control.id)!.updateMergeHead).toBeNull();
+		});
+
+		test("a reply on a parked merge-mismatch card approves the parked push head", async () => {
+			const p1 = projects.get("p1")!;
+			const held = p1.store.createTask("held merge");
+			p1.store.updateTask(held.id, {
+				updateIds: ["x@1"],
+				needsReason: MERGE_HOLD_MISMATCH_REASON,
+				state: "needs_you",
+				holdHead: "sha-push",
+			});
+			const res = await post(`/api/projects/p1/tasks/${held.id}/reply`, {
+				text: "approved",
+			});
+			expect(res.status).toBe(200);
+			expect(p1.store.getTask(held.id)!.updateMergeHead).toBe("sha-push");
+			expect(p1.store.getTask(held.id)!.holdHead).toBeNull();
+			// A fork-born card parks the same way: the reply lands in forkMergeHead.
+			const fork = p1.store.createTask("fork merge");
+			p1.store.updateTask(fork.id, {
+				needsReason: MERGE_HOLD_MISMATCH_REASON,
+				state: "needs_you",
+				holdHead: "sha-push-f",
+			});
+			const fres = await post(`/api/projects/p1/tasks/${fork.id}/reply`, {
+				text: "approved",
+			});
+			expect(fres.status).toBe(200);
+			expect(p1.store.getTask(fork.id)!.forkMergeHead).toBe("sha-push-f");
+			expect(p1.store.getTask(fork.id)!.updateMergeHead).toBeNull();
+			// No parked head: the reply approves nothing.
+			const forged = p1.store.createTask("held merge");
+			p1.store.updateTask(forged.id, {
+				updateIds: ["x@1"],
+				needsReason: MERGE_HOLD_MISMATCH_REASON,
+				state: "needs_you",
+			});
+			const gres = await post(`/api/projects/p1/tasks/${forged.id}/reply`, {
+				text: "approved",
+			});
+			expect(gres.status).toBe(200);
+			expect(p1.store.getTask(forged.id)!.updateMergeHead).toBeNull();
 		});
 
 		test("a pin already at its qualified target is applied; the refresh drops it", async () => {

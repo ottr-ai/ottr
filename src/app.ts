@@ -140,6 +140,7 @@ import {
 	FORK_HOLD_REASON,
 	isKeptReason,
 	logStoreError,
+	MERGE_HOLD_MISMATCH_REASON,
 	type StopOutcome,
 	type TurnProject,
 	UPDATE_HOLD_REASON,
@@ -4857,15 +4858,21 @@ export function createApp(deps: AppDeps) {
 							: [];
 					// U7: a reply on a parked update card approves its merge hold for the head the settle
 					// parked (undefined keeps the column). Same for a fork-born card parked by the fork
-					// merge hold. An agent can write the hold text as its own question, but only a settle
-					// sets holdHead, so that reply approves nothing.
+					// merge hold, and for a merge-hold mismatch park (OTTR-274: the parked head is the
+					// exact local target head, so the next merge turn pushes it sha-equal). An agent can
+					// write the hold text as its own question, but only a settle sets holdHead, so that
+					// reply approves nothing.
 					const parked = task.holdHead;
+					const mismatchHold =
+						parked !== null && task.needsReason === MERGE_HOLD_MISMATCH_REASON;
 					const approveHold =
 						parked !== null &&
 						task.updateIds.length > 0 &&
-						task.needsReason === UPDATE_HOLD_REASON;
+						(task.needsReason === UPDATE_HOLD_REASON || mismatchHold);
 					const approveForkHold =
-						parked !== null && task.needsReason === FORK_HOLD_REASON;
+						parked !== null &&
+						(task.needsReason === FORK_HOLD_REASON ||
+							(mismatchHold && task.updateIds.length === 0));
 					e.store.updateTask(task.id, {
 						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
 						pendingPrompt: trimmed || ".",

@@ -258,7 +258,7 @@ export interface Task {
 	updateMergeHead: string | null;
 	/** Task born from fork research (a proposal or a follow-up of a fork research card): the head the admin approved by a reply to the hold. */
 	forkMergeHead: string | null;
-	/** Server-set HEAD of the worktree when a settle parked the card for a merge hold; null otherwise. A reply approves this head, never one an agent names. */
+	/** Server-set HEAD when a settle parked the card for a merge hold: the worktree HEAD for a work-settle hold, the local target HEAD for a merge-hold mismatch park (OTTR-274); null otherwise. A reply approves this head, never one an agent names. */
 	holdHead: string | null;
 	/** Per-file +/- counts of the branch's diff, captured at merge-turn start (after the ff-merge lands, the branch is indistinguishable from the target); null when never captured. */
 	diffFiles: DiffFileStat[] | null;

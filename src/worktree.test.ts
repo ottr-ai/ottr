@@ -37,6 +37,7 @@ import {
 	httpsRemote,
 	ignoreInMain,
 	isIntegrated,
+	mergeHoldMismatch,
 	parseKeptChoices,
 	parseNumstat,
 	planKeptFinish,
@@ -289,6 +290,118 @@ describe("serverMergePush", () => {
 			const r = await serverMergePush(f.main, f.wt, "origin/main", "ott/x");
 			expect(r.status).toBe("failed");
 			expect("error" in r && r.error.length > 0).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("mergeHoldMismatch", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
+	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1),
+	 * so a merge turn must rebase onto a moved target. */
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-mhm-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		run(main, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+		run(main, "push", "-q", "origin", "main");
+		const wt = join(dir, "wt");
+		run(main, "worktree", "add", "-q", "-b", "ott/x", wt);
+		for (const [name, text] of [
+			["p1.txt", "1"],
+			["p2.txt", "2"],
+		] as const) {
+			writeFileSync(join(wt, name), text);
+			run(wt, ...id, "add", ".");
+			run(wt, ...id, "commit", "-qm", name);
+		}
+		const base = run(main, "rev-parse", "refs/heads/main");
+		const approvedHead = run(wt, "rev-parse", "HEAD");
+		run(main, ...id, "commit", "-q", "--allow-empty", "-m", "O1");
+		run(main, "push", "-q", "origin", "main");
+		return { dir, main, wt, base, approvedHead };
+	};
+
+	test("a rebase of exactly the approved changes still pushes (no mismatch)", async () => {
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			run(f.main, "merge", "-q", "--ff-only", "ott/x");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
+			).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a clean no-ff merge of exactly the approved changes pushes (no mismatch)", async () => {
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			run(f.main, ...id, "merge", "-q", "--no-ff", "--no-edit", "ott/x");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
+			).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a merge turn that adds a commit beyond the approved head mismatches", async () => {
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			writeFileSync(join(f.wt, "evil.txt"), "x");
+			run(f.wt, ...id, "add", ".");
+			run(f.wt, ...id, "commit", "-qm", "EVIL");
+			run(f.main, "merge", "-q", "--ff-only", "ott/x");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
+			).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a change smuggled inside a merge commit mismatches", async () => {
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			run(f.main, ...id, "merge", "-q", "--no-ff", "--no-edit", "ott/x");
+			writeFileSync(join(f.main, "smuggle.txt"), "x");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-q", "--amend", "--no-edit");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
+			).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an unresolvable approved head fails closed", async () => {
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			run(f.main, "merge", "-q", "--ff-only", "ott/x");
+			expect(
+				await mergeHoldMismatch(f.main, "origin/main", f.base, "0".repeat(40)),
+			).toBe(true);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
