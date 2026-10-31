@@ -17,7 +17,12 @@ const realGit = worktree.git;
 const realWorktree = { ...worktree };
 const { gitExe } = worktree;
 
-import { type Deps, envFileValues, updateImage } from "./update-image.ts";
+import {
+	type Deps,
+	dropBunDotenv,
+	envFileValues,
+	updateImage,
+} from "./update-image.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-update-image-"));
 afterAll(
@@ -1647,5 +1652,37 @@ describe("envFileValues", () => {
 					GH_TOKEN: "a#b",
 				}),
 		);
+	});
+
+	test("with --env-file, the values Bun loads from .env go, a shell value stays", () => {
+		const script = join(import.meta.dir, "update-image.ts");
+		inDir(
+			{
+				".env": "ALATE_IMAGE=root-image\nOTTR_PORT=9000\n",
+				"probe.ts": `import { dropBunDotenv } from ${JSON.stringify(script)};\ndropBunDotenv(process.argv.slice(2));\nconsole.log(JSON.stringify({ i: process.env.ALATE_IMAGE ?? null, p: process.env.OTTR_PORT ?? null }));\n`,
+			},
+			(dir) => {
+				const probe = (...args: string[]) => {
+					const env: Record<string, string> = { OTTR_PORT: "1" };
+					for (const k of ["PATH", "SYSTEMROOT"])
+						if (process.env[k] !== undefined) env[k] = process.env[k];
+					const r = Bun.spawnSync(
+						[process.execPath, join(dir, "probe.ts"), ...args],
+						{ cwd: dir, env, stdout: "pipe", stderr: "pipe" },
+					);
+					expect(r.stderr.toString()).toBe("");
+					return JSON.parse(r.stdout.toString());
+				};
+				expect(probe("--env-file", "stack.env")).toEqual({ i: null, p: "1" });
+				// Without --env-file compose reads .env itself, so Bun's copy may stay.
+				expect(probe()).toEqual({ i: "root-image", p: "1" });
+			},
+		);
+	});
+
+	test("dropBunDotenv does nothing without --env-file", () => {
+		const env = { ALATE_IMAGE: "x" };
+		dropBunDotenv(["-f", "docker-compose.yml"], env);
+		expect(env).toEqual({ ALATE_IMAGE: "x" });
 	});
 });

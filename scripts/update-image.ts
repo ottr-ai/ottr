@@ -78,13 +78,7 @@ const SCRIPT_KEYS = new Set([
  * ` # comment`. Pure: it reads, it never touches the environment.
  */
 export function envFileValues(args: string[]): Record<string, string> {
-	const files: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const a = args[i]!;
-		if (a === "--env-file") files.push(args[++i] ?? "");
-		else if (a.startsWith("--env-file="))
-			files.push(a.slice("--env-file=".length));
-	}
+	const files = envFiles(args);
 	if (files.length === 0 && existsSync(".env")) files.push(".env");
 	const values: Record<string, string> = {};
 	for (const file of files) {
@@ -109,6 +103,47 @@ export function envFileValues(args: string[]): Record<string, string> {
 		}
 	}
 	return values;
+}
+
+/** The files a run passes as `--env-file`, in order. */
+function envFiles(args: string[]): string[] {
+	const files: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i]!;
+		if (a === "--env-file") files.push(args[++i] ?? "");
+		else if (a.startsWith("--env-file="))
+			files.push(a.slice("--env-file=".length));
+	}
+	return files;
+}
+
+/**
+ * Bun loads the cwd's `.env` files into process.env before the script starts, and every
+ * compose child would pass them on as shell values that beat `--env-file`. Compose ignores
+ * `.env` when `--env-file` is given, so this removes what Bun loaded: it asks a bare Bun
+ * child (same cwd, empty env) what it loads, and deletes each key that still holds that
+ * value. A shell key with another value stays.
+ */
+export function dropBunDotenv(
+	args: string[],
+	env: Record<string, string | undefined> = process.env,
+): void {
+	if (envFiles(args).length === 0) return;
+	// Windows needs SYSTEMROOT to start a process; NODE_ENV picks Bun's `.env.<mode>` file.
+	const base: Record<string, string> = {};
+	for (const k of ["SYSTEMROOT", "NODE_ENV"])
+		if (env[k] !== undefined) base[k] = env[k];
+	const r = Bun.spawnSync(
+		[process.execPath, "-e", "console.log(JSON.stringify(process.env))"],
+		{ env: base },
+	);
+	if (r.exitCode !== 0)
+		throw new Error(`bun could not list its .env values: ${r.stderr}`);
+	const loaded: Record<string, string> = JSON.parse(r.stdout.toString());
+	// ponytail: a shell key with the same value as `.env` goes too; compose then reads it
+	// from --env-file. Read the start env (/proc/self/environ) if that case matters.
+	for (const [k, v] of Object.entries(loaded))
+		if (!(k in base) && env[k] === v) delete env[k];
 }
 
 /**
@@ -770,6 +805,7 @@ export async function updateImage(
 
 if (import.meta.main) {
 	const repo = resolve(import.meta.dir, "..");
+	dropBunDotenv(process.argv.slice(2));
 	// The shell env wins over --env-file values, matching compose's precedence.
 	for (const [key, value] of Object.entries(
 		envFileValues(process.argv.slice(2)),
