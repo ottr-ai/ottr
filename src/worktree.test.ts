@@ -2346,6 +2346,106 @@ describe("git", () => {
 		for (const kind of ["filter", "merge", "gpg"])
 			expect(existsSync(marker(kind))).toBe(false);
 	}, 60_000);
+
+	test("sees uncommitted submodule edits without running the submodule's planted filter (R5-1)", async () => {
+		const sub = repo();
+		await must(sub, "init", "-q", "-b", "main");
+		writeFileSync(join(sub, "x.txt"), "one\n");
+		writeFileSync(join(sub, "y.txt"), "same\n");
+		await must(sub, "add", ".");
+		await must(sub, "commit", "-q", "-m", "sub");
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		await must(
+			main,
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"-q",
+			"add",
+			sub,
+			"sub",
+		);
+		await must(main, "commit", "-q", "-m", "add sub");
+		const base = await must(main, "rev-parse", "HEAD");
+		const wt = join(main, ".worktrees", "s");
+		await createWorktree({
+			mainPath: main,
+			worktreePath: wt,
+			branch: "ott/s",
+			base: "main",
+			copyExtra: [],
+			log: () => {},
+		});
+		await must(
+			wt,
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"-q",
+			"update",
+			"--init",
+		);
+		expect(await isClean(wt)).toBe(true);
+		// Plant a clean filter in the submodule's own gitdir, then edit a file there.
+		const marker = join(main, "planted.subfilter");
+		const script = join(main, "subfilter.sh");
+		writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\ncat\n`);
+		chmodSync(script, 0o755);
+		const subGit = join(wt, "sub");
+		await must(subGit, "config", "filter.evil.clean", script);
+		const subGitDir = await must(subGit, "rev-parse", "--absolute-git-dir");
+		writeFileSync(join(subGitDir, "info", "attributes"), "* filter=evil\n");
+		writeFileSync(join(subGit, "x.txt"), "one\ntwo\n");
+		// Same size, new mtime: git must hash y.txt, which runs the clean filter in plain git.
+		const old = new Date(2000, 0, 1);
+		utimesSync(join(subGit, "y.txt"), old, old);
+		expect(await isClean(wt)).toBe(false);
+		expect(await statusRows(wt)).toEqual([" M sub"]);
+		expect(await changedFiles(wt, base, "main")).toEqual(["sub"]);
+		expect(await diffStat(wt, base, "main")).toEqual([
+			{ file: "sub", plus: 0, minus: 0 },
+		]);
+		expect(await diffText(wt, base, "main")).toContain("-dirty\n");
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	test("a blob:none partial clone checks out and diffs through the sealed gitdir", async () => {
+		const up = repo();
+		await must(up, "init", "-q", "-b", "main");
+		await must(up, "config", "uploadpack.allowFilter", "true");
+		writeFileSync(join(up, "f.txt"), "old\n");
+		await must(up, "add", ".");
+		await must(up, "commit", "-q", "-m", "one");
+		const base = await must(up, "rev-parse", "HEAD");
+		writeFileSync(join(up, "f.txt"), "new\n");
+		await must(up, "commit", "-q", "-am", "two");
+		const main = join(repo(), "clone");
+		await must(
+			tmpdir(),
+			"clone",
+			"-q",
+			"--no-checkout",
+			"--filter=blob:none",
+			`file://${up}`,
+			main,
+		);
+		const wt = join(main, ".worktrees", "p");
+		// Both the checkout and the diff need blobs the clone has not fetched yet.
+		await createWorktree({
+			mainPath: main,
+			worktreePath: wt,
+			branch: "ott/p",
+			base: "origin/main",
+			copyExtra: [],
+			log: () => {},
+		});
+		expect(readFileSync(join(wt, "f.txt"), "utf8")).toBe("new\n");
+		expect(await diffStat(wt, base, base)).toEqual([
+			{ file: "f.txt", plus: 1, minus: 1 },
+		]);
+		expect(await diffText(wt, base, base)).toContain("-old\n+new\n");
+	}, 60_000);
 });
 
 describe("gitEnv", () => {

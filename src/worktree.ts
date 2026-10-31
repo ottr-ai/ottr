@@ -257,8 +257,11 @@ const PROBED_CORE =
  * calls run against a board-written stub gitdir instead: HEAD as a sha, the worktree's own
  * index and objects, a copy of the main checkout's info/exclude, no repo config. Tracked
  * .gitattributes still apply, but they can only name drivers of system, global or
- * command-line config (git-lfs). Callers pass `--ignore-submodules=dirty`: a submodule
- * status runs git in the submodule's own gitdir, which is planted the same way.
+ * command-line config (git-lfs). A partial clone's promisor remote (name, url, filter) is
+ * copied, so a missing blob still fetches lazily; that fetch reads the stub too, never the
+ * planted remote keys (uploadpack, sshCommand, helpers). Callers pass
+ * `--ignore-submodules=dirty`: a submodule status runs git in the submodule's own gitdir,
+ * which is planted the same way. dirtySubmodules probes each submodule through this stub.
  */
 async function sealedGit(
 	args: string[],
@@ -314,6 +317,45 @@ async function sealedGit(
 			if (!(e instanceof Error && "code" in e && e.code === "ENOENT"))
 				return { code: 128, stdout: "", stderr: String(e) };
 		}
+		// Promisor remotes: extensions.partialClone and every remote.<name>.promisor=true.
+		const pc = await git(
+			[
+				"config",
+				"-z",
+				"--get-regexp",
+				"^(extensions\\.partialclone|remote\\..*\\.(url|promisor|partialclonefilter))$",
+			],
+			worktreePath,
+		);
+		const entries = pc.stdout
+			.split("\0")
+			.filter(Boolean)
+			.map((kv) => {
+				const nl = kv.indexOf("\n");
+				return nl < 0 ? [kv, ""] : [kv.slice(0, nl), kv.slice(nl + 1)];
+			});
+		const remoteOf = (k: string, v: string) =>
+			k === "extensions.partialclone"
+				? v
+				: k.slice("remote.".length, k.lastIndexOf("."));
+		const promisors = new Set(
+			entries
+				.filter(
+					([k = "", v = ""]) =>
+						k === "extensions.partialclone" ||
+						(k.endsWith(".promisor") && /^(true|yes|on|1)$/i.test(v)),
+				)
+				.map(([k = "", v = ""]) => remoteOf(k, v)),
+		);
+		// git config --file escapes every value: a planted name or url cannot add config lines.
+		for (const [k = "", v = ""] of entries) {
+			if (!promisors.has(remoteOf(k, v))) continue;
+			const w = await git(
+				["config", "--file", path.join(stub, "config"), "--add", k, v],
+				stub,
+			);
+			if (w.code !== 0) return w;
+		}
 		return await git(
 			[
 				"--no-optional-locks",
@@ -336,6 +378,45 @@ async function sealedGit(
 	} finally {
 		rmSync(stub, { recursive: true, force: true });
 	}
+}
+
+/**
+ * Checked-out submodules below `dir` whose files differ from their HEAD (edits or untracked
+ * files, also deeper down), each probed through sealedGit, since the `--ignore-submodules=dirty`
+ * the sealed calls pass hides them. Throws when a submodule cannot be read: unknown is not clean.
+ */
+async function dirtySubmodules(
+	dir: string,
+	seen = new Set<string>(),
+): Promise<string[]> {
+	// A planted symlink loop (sub -> ..) would recurse forever.
+	const real = realpathSync(dir);
+	if (seen.has(real)) throw new Error(`submodule loop at ${dir}`);
+	seen.add(real);
+	const ls = await git(["ls-files", "-z", "--stage"], dir);
+	if (ls.code !== 0)
+		throw new Error(`git ls-files failed in ${dir}: ${ls.stderr.trim()}`);
+	const dirty: string[] = [];
+	for (const rec of ls.stdout.split("\0")) {
+		if (!rec.startsWith("160000 ")) continue;
+		const rel = rec.slice(rec.indexOf("\t") + 1);
+		const sub = path.join(dir, rel);
+		if (!existsSync(path.join(sub, ".git"))) continue; // not checked out: no files to lose
+		const st = await sealedGit(
+			[
+				"status",
+				"--porcelain",
+				"--untracked-files=all",
+				"--ignore-submodules=dirty",
+			],
+			sub,
+		);
+		if (st.code !== 0)
+			throw new Error(`git status failed in ${sub}: ${st.stderr.trim()}`);
+		if (st.stdout !== "" || (await dirtySubmodules(sub, seen)).length > 0)
+			dirty.push(rel);
+	}
+	return dirty;
 }
 
 /** Every non-empty secret becomes [REDACTED] in ONE pass (longest first), so a secret that
@@ -837,7 +918,11 @@ export async function isClean(worktreePath: string): Promise<boolean> {
 		],
 		worktreePath,
 	);
-	return r.code === 0 && r.stdout === "";
+	if (r.code !== 0 || r.stdout !== "") return false;
+	return dirtySubmodules(worktreePath).then(
+		(d) => d.length === 0,
+		() => false,
+	);
 }
 
 export async function isIntegrated(
@@ -1111,6 +1196,9 @@ export async function statusRows(worktreePath: string): Promise<string[]> {
 		if (rec[0] === "R" || rec[0] === "C" || rec[1] === "R" || rec[1] === "C")
 			i++;
 	}
+	// Same row plain git status prints for a dirty submodule; throws when one is unreadable.
+	for (const rel of await dirtySubmodules(worktreePath))
+		if (!out.some((row) => rowPath(row) === rel)) out.push(` M ${rel}`);
 	return out;
 }
 
@@ -1156,7 +1244,12 @@ export async function changedFiles(
 		["diff", "--name-only", "-z", "--ignore-submodules=dirty", from, "--"],
 		worktreePath,
 	);
-	return r.code === 0 ? r.stdout.split("\0").filter(Boolean) : [];
+	if (r.code !== 0) return [];
+	const files = r.stdout.split("\0").filter(Boolean);
+	// Display list: an unreadable submodule drops out of it; decisions read statusRows.
+	for (const rel of await dirtySubmodules(worktreePath).catch(() => []))
+		if (!files.includes(rel)) files.push(rel);
+	return files;
 }
 
 /** Parses `git diff --numstat` output. A `-` count marks a binary file (null here); a rename
@@ -1188,7 +1281,13 @@ export async function diffStat(
 		["diff", "--numstat", "--ignore-submodules=dirty", from, "--"],
 		worktreePath,
 	);
-	return r.code === 0 ? parseNumstat(r.stdout) : [];
+	if (r.code !== 0) return [];
+	const files = parseNumstat(r.stdout);
+	// Plain git counts a submodule with only uncommitted edits as 0/0.
+	for (const rel of await dirtySubmodules(worktreePath).catch(() => []))
+		if (!files.some((f) => f.file === rel))
+			files.push({ file: rel, plus: 0, minus: 0 });
+	return files;
 }
 
 /** The branch's unified diff (same base as diffStat), or null when git fails. */
@@ -1202,7 +1301,30 @@ export async function diffText(
 		["diff", "--ignore-submodules=dirty", from, "--"],
 		worktreePath,
 	);
-	return r.code === 0 ? r.stdout : null;
+	if (r.code !== 0) return null;
+	let text = r.stdout;
+	// Plain git marks a dirty submodule's new commit line `-dirty`; the sealed diff cannot see it.
+	// ponytail: matches the header by its unquoted path; a C-quoted submodule path gets a second section.
+	for (const rel of await dirtySubmodules(worktreePath).catch(() => [])) {
+		const head = `diff --git a/${rel} b/${rel}\n`;
+		const at = text.indexOf(head);
+		if (at >= 0) {
+			const next = text.indexOf("\ndiff --git ", at);
+			const end = next < 0 ? text.length : next + 1;
+			text =
+				text.slice(0, at) +
+				text
+					.slice(at, end)
+					.replace(/^\+Subproject commit [0-9a-f]+$/m, "$&-dirty") +
+				text.slice(end);
+			continue;
+		}
+		const sha = (
+			await git(["rev-parse", "HEAD"], path.join(worktreePath, rel))
+		).stdout.trim();
+		text += `${head}--- a/${rel}\n+++ b/${rel}\n@@ -1 +1 @@\n-Subproject commit ${sha}\n+Subproject commit ${sha}-dirty\n`;
+	}
+	return text;
 }
 
 /** Progress increment: commits on the integration target. Null when it cannot be counted (no target, unknown ref, git failure). */

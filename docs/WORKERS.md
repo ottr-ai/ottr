@@ -388,7 +388,13 @@ worktree only through a stub gitdir that it writes for each call (`sealedGit` in
   global or command-line config, for example git-lfs. The stub points `lfs.storage` at the
   main checkout's LFS cache.
 - These calls pass `--ignore-submodules=dirty`. A submodule status runs git in the gitdir of
-  the submodule, and a work turn can plant that gitdir too.
+  the submodule, and a work turn can plant that gitdir too. Instead, the board checks each
+  checked-out submodule with its own stub. A dirty submodule shows as ` M <path>` in the
+  status, in the changed files and in the diff, the same as plain git. When the board cannot
+  read a submodule, the worktree is not clean, and `statusRows` fails.
+- For a partial clone, the stub gets a copy of the promisor remote (name, `url`,
+  `partialclonefilter`). Thus git can still fetch a missing blob. That fetch also reads only
+  the stub, and never reads a planted `uploadpack`, `sshCommand` or credential helper.
 
 No board git call merges, rebases or cherry-picks in a checkout that a worker can write.
 Thus no call reaches a planted `merge.<driver>.driver` or `merge.default`.
