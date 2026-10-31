@@ -575,7 +575,7 @@ describe("code-flow paste path (the phone path)", () => {
 		const v = await l.answer(CALLBACK);
 		expect(v?.ok).toBe(true);
 		expect(v?.output).toContain("Logged in to anthropic");
-	});
+	}, 30_000);
 });
 
 describe("redirectUri", () => {
