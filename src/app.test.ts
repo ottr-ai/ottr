@@ -1807,6 +1807,30 @@ describe("alate routes", () => {
 			expect(p1.store.getTask(forged.id)!.updateMergeHead).toBeNull();
 		});
 
+		test("a merge-mismatch park serves the stored push diff", async () => {
+			const p1 = projects.get("p1")!;
+			const held = p1.store.createTask("held merge");
+			p1.store.updateTask(held.id, {
+				needsReason: MERGE_HOLD_MISMATCH_REASON,
+				state: "needs_you",
+				diffText: "diff --git a/evil.txt b/evil.txt",
+				diffFiles: [{ file: "evil.txt", plus: 1, minus: 0 }],
+			});
+			// The park's own delta, not the live branch diff: the worktree no longer speaks
+			// for the push set once the branch is integrated.
+			const raw = await get(`/api/projects/p1/tasks/${held.id}/diff`);
+			expect(raw.status).toBe(200);
+			expect(await raw.text()).toContain("evil.txt");
+			const detail = await get(`/api/projects/p1/tasks/${held.id}`);
+			const b = (await detail.json()) as { diffFiles?: unknown };
+			expect(b.diffFiles).toEqual([{ file: "evil.txt", plus: 1, minus: 0 }]);
+			// After the reply the reason is gone and the card reads live again.
+			p1.store.updateTask(held.id, { needsReason: null });
+			expect((await get(`/api/projects/p1/tasks/${held.id}/diff`)).status).toBe(
+				404,
+			);
+		});
+
 		test("a pin already at its qualified target is applied; the refresh drops it", async () => {
 			// The push-throttle test above skips goodRec.id and leaves the skip set.
 			gstore.set("updateSkips", []);

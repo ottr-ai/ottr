@@ -308,6 +308,10 @@ describe("mergeHoldMismatch", () => {
 		return r.stdout.toString().trim();
 	};
 	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const mismatch = async (
+		f: { main: string; base: string; approvedHead: string },
+		approvedHead = f.approvedHead,
+	) => mergeHoldMismatch(f.main, "origin/main", f.base, approvedHead);
 	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
 	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1,
 	 * which rewrites o.txt — a file the branch never touches, so rebases stay clean), so a merge
@@ -345,9 +349,11 @@ describe("mergeHoldMismatch", () => {
 		try {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, "merge", "-q", "--ff-only", "ott/x");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
-			).toBe(false);
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(false);
+			// The reviewer sees the push set the gate measured.
+			expect(r.pushDiff).toContain("p1.txt");
+			expect(r.pushDiff).not.toContain("evil");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -358,9 +364,7 @@ describe("mergeHoldMismatch", () => {
 		try {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, ...id, "merge", "-q", "--no-ff", "--no-edit", "ott/x");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
-			).toBe(false);
+			expect((await mismatch(f)).mismatch).toBe(false);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -374,9 +378,9 @@ describe("mergeHoldMismatch", () => {
 			run(f.wt, ...id, "add", ".");
 			run(f.wt, ...id, "commit", "-qm", "EVIL");
 			run(f.main, "merge", "-q", "--ff-only", "ott/x");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
-			).toBe(true);
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil.txt");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -390,9 +394,7 @@ describe("mergeHoldMismatch", () => {
 			writeFileSync(join(f.main, "smuggle.txt"), "x");
 			run(f.main, ...id, "add", ".");
 			run(f.main, ...id, "commit", "-q", "--amend", "--no-edit");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
-			).toBe(true);
+			expect((await mismatch(f)).mismatch).toBe(true);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -408,9 +410,45 @@ describe("mergeHoldMismatch", () => {
 			run(f.main, ...id, "merge", "--no-ff", "--no-commit", "ott/x");
 			run(f.main, "checkout", "ott/x", "--", "o.txt");
 			run(f.main, ...id, "commit", "-qm", "merge");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, f.approvedHead),
-			).toBe(true);
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("o.txt");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a rigged remote-tracking ref cannot hide smuggled content", async () => {
+		const f = fixture();
+		try {
+			// The merge agent runs git in the main checkout and can rewrite any local ref.
+			// It parents the smuggled tree on the real origin tip (a fast-forward for the
+			// push) and aims the remote-tracking ref at a synthetic commit that carries the
+			// smuggled file but lacks the approved paths, so a ref-to-ref diff would read
+			// exactly like the approval. The gate must re-fetch from origin instead.
+			run(f.main, "checkout", "-q", "--detach", "origin/main");
+			writeFileSync(join(f.main, "p1.txt"), "1");
+			writeFileSync(join(f.main, "p2.txt"), "2");
+			writeFileSync(join(f.main, "evil.txt"), "EVIL");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "evil merge");
+			run(f.main, ...id, "rm", "-q", "p1.txt", "p2.txt");
+			run(f.main, ...id, "commit", "-qm", "anchor");
+			run(
+				f.main,
+				"update-ref",
+				"refs/remotes/origin/main",
+				run(f.main, "rev-parse", "HEAD"),
+			);
+			run(
+				f.main,
+				"update-ref",
+				"refs/heads/main",
+				run(f.main, "rev-parse", "HEAD~1"),
+			);
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil.txt");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -421,9 +459,7 @@ describe("mergeHoldMismatch", () => {
 		try {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, "merge", "-q", "--ff-only", "ott/x");
-			expect(
-				await mergeHoldMismatch(f.main, "origin/main", f.base, "0".repeat(40)),
-			).toBe(true);
+			expect((await mismatch(f, "0".repeat(40))).mismatch).toBe(true);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}

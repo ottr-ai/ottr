@@ -4548,9 +4548,13 @@ export function createApp(deps: AppDeps) {
 					view.worktreeFiles =
 						task.worktree === null ? [] : await statusFiles(task.worktree);
 					// Finished cards read the stat captured at merge start (the worktree and branch are
-					// gone); open cards read the branch live, uncommitted edits included.
+					// gone); open cards read the branch live, uncommitted edits included. A merge-hold
+					// mismatch park also serves the stored stat: it is the push-side numstat the gate
+					// flagged, which the live worktree diff cannot show once the branch is integrated.
 					view.diffFiles =
-						task.stage === "done" || task.cancelledAt !== null
+						task.stage === "done" ||
+						task.cancelledAt !== null ||
+						task.needsReason === MERGE_HOLD_MISMATCH_REASON
 							? task.diffFiles
 							: task.worktree === null || e.target === null
 								? null
@@ -4598,8 +4602,13 @@ export function createApp(deps: AppDeps) {
 					const { e, task } = found;
 					// Same source rule as the drawer's diffFiles: captured text for finished cards,
 					// the live branch diff for open ones. Git output only — no path reaches the fs.
+					// A merge-hold mismatch park also serves the captured text: it holds the exact
+					// push-side delta the gate flagged, which the live worktree diff cannot show
+					// once the branch is integrated.
 					const text =
-						task.stage === "done" || task.cancelledAt !== null
+						task.stage === "done" ||
+						task.cancelledAt !== null ||
+						task.needsReason === MERGE_HOLD_MISMATCH_REASON
 							? task.diffText
 							: task.worktree === null || e.target === null
 								? null

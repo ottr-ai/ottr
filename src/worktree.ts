@@ -760,22 +760,30 @@ export async function serverMergePush(
 }
 
 /**
- * OTTR-274: true when the commits a server push would ship (target..refs/heads/<branch>) do not
- * produce exactly the approved hold's content change (base..approvedHead). A merge turn resumes
- * the same agent session and can commit beyond an approved head, so the push's total tree effect
- * must equal the approved one. A rebase onto a moved target keeps the effect equal. The tree diff
- * is the check (not per-commit patch-ids): a merge commit can take one parent's stale side, which
- * git's combined diff hides — only the total effect against the target shows a smuggled revert.
- * Unresolvable refs and git trouble count as a mismatch: the hold fails closed. Runs in the main
- * repo, where the target refs live.
+ * OTTR-274: whether the commits a server push would ship (refs/heads/<branch>) carry exactly the
+ * approved hold's content change (base..approvedHead), plus the push-side diff for the reviewer.
+ * A merge turn resumes the same agent session and can commit beyond an approved head, so the
+ * push's total tree effect must equal the approved one. A rebase onto a moved target keeps the
+ * effect equal. The tree diff is the check (not per-commit patch-ids): a merge commit can take
+ * one parent's stale side, which git's combined diff hides — only the total effect against the
+ * target shows a smuggled revert. The merge agent can rewrite refs in the main checkout,
+ * including the remote-tracking ref, so the target side is re-fetched from origin right here
+ * (the push below goes to the same remote: a tampered remote.origin.url sends both to the same
+ * fake and ships nothing real). Any git trouble mismatches: the hold fails closed. Runs in the
+ * main repo, where the target refs live.
  */
 export async function mergeHoldMismatch(
 	mainPath: string,
 	target: string,
 	base: string,
 	approvedHead: string,
-): Promise<boolean> {
-	if (!target.startsWith("origin/")) return false; // no server push, nothing to hold
+): Promise<{ mismatch: boolean; pushDiff: string | null }> {
+	const failClosed = (pushDiff: string | null = null) => ({
+		mismatch: true,
+		pushDiff,
+	});
+	if (!target.startsWith("origin/")) return { mismatch: false, pushDiff: null };
+	const branch = target.slice("origin/".length);
 	// --no-renames keeps the text deterministic across the two tree pairs (rename detection is
 	// pair-dependent); --full-index keeps blob ids content-exact.
 	// ponytail: full diff text in memory; upgrade to hashing only if a card ships a range big
@@ -787,12 +795,20 @@ export async function mergeHoldMismatch(
 		);
 		return r.code === 0 ? r.stdout : null;
 	};
-	const push = await effect(
-		target,
-		`refs/heads/${target.slice("origin/".length)}`,
+	const fetch = await git(["fetch", "origin", branch], mainPath);
+	if (fetch.code !== 0) return failClosed();
+	const tip = await git(
+		["rev-parse", `refs/remotes/origin/${branch}`],
+		mainPath,
 	);
+	if (tip.code !== 0) return failClosed();
+	const push = await effect(tip.stdout.trim(), `refs/heads/${branch}`);
+	if (push === null) return failClosed();
 	const approved = await effect(base, approvedHead);
-	return push === null || approved === null || push !== approved;
+	return {
+		mismatch: approved === null || push !== approved,
+		pushDiff: push,
+	};
 }
 
 /**

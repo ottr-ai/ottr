@@ -202,7 +202,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		targetCommits: async () => 3,
 		targetSha: async () => null,
 		serverMergePush: async () => ({ status: "skipped" as const }),
-		mergeHoldMismatch: async () => false,
+		mergeHoldMismatch: async () => ({ mismatch: false, pushDiff: null }),
 		pidAlive: () => true,
 		startRun: (o: {
 			cwd: string;
@@ -4006,7 +4006,10 @@ describe("turn ci watch pinning", () => {
 				pushes.push(target);
 				return { status: "pushed" as const, output: "" };
 			},
-			mergeHoldMismatch: async () => true,
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: "diff --git a/evil.txt b/evil.txt",
+			}),
 		});
 		store.updateTask(task.id, {
 			updateIds: ["x@1"],
@@ -4019,6 +4022,8 @@ describe("turn ci watch pinning", () => {
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(t.holdHead).toBe("sha-local-main");
+		// The park stores the flagged push-side delta so the reviewer reads what failed.
+		expect(t.diffText).toBe("diff --git a/evil.txt b/evil.txt");
 	});
 
 	test("a held fork merge with patches beyond the approved head parks too", async () => {
@@ -4029,7 +4034,10 @@ describe("turn ci watch pinning", () => {
 				pushes.push("origin/main");
 				return { status: "pushed" as const, output: "" };
 			},
-			mergeHoldMismatch: async () => true,
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: null,
+			}),
 		});
 		store.updateTask(task.id, { forkMergeHead: "sha-approved" });
 		await loop.runTurn(store.name, task.id);
@@ -4037,6 +4045,7 @@ describe("turn ci watch pinning", () => {
 		expect(pushes).toEqual([]);
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+		expect(t.diffText).toBeNull();
 	});
 
 	test("a merge whose head is exactly the approved push head pushes without the patch compare", async () => {

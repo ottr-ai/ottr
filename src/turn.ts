@@ -70,6 +70,7 @@ import { sessionFile, sessionHoldsPrompt, sessionModel } from "./session.ts";
 import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
 import type {
 	ArchReview,
+	DiffFileStat,
 	GitFacts,
 	LatestImage,
 	ProjectSettings,
@@ -1622,8 +1623,12 @@ export function createTurnLoop(
 			// merge-hold mismatch park the local target head. A reply approves exactly this head.
 			let holdHead: string | null = null;
 			// OTTR-274: set when a held merge carries patches beyond the approval; parks the card
-			// after classify instead of landing it.
+			// after classify instead of landing it. holdDiff/holdFiles carry the exact push-side
+			// delta for the reviewer: the parked card's drawer serves them instead of the live
+			// worktree diff, which no longer speaks for the push set.
 			let holdMismatch: string | null = null;
+			let holdDiff: string | null = null;
+			let holdFiles: DiffFileStat[] | null = null;
 			if (kind === "merge" && !interview && !grill && !releaseCard) {
 				// An approved merge hold fixes what may ship. The merge turn resumes the same agent
 				// session and could commit beyond the approved head, so the push set
@@ -1647,13 +1652,28 @@ export function createTurnLoop(
 						// the exact head a reply approved: nothing new to judge
 					} else {
 						for (const ah of approvedHeads) {
-							if (
-								await ops
-									.mergeHoldMismatch(e.path, target, base, ah)
-									.catch(() => true)
-							) {
+							const { mismatch, pushDiff } = await ops
+								.mergeHoldMismatch(e.path, target, base, ah)
+								.catch(() => ({
+									mismatch: true,
+									pushDiff: null,
+								}));
+							if (mismatch) {
 								holdMismatch = MERGE_HOLD_MISMATCH_REASON;
 								holdHead = localHead;
+								// Same cap as the merge-start capture: bigger diffs keep their numstat.
+								holdDiff =
+									pushDiff === null
+										? null
+										: pushDiff.length > 200_000
+											? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
+											: pushDiff;
+								holdFiles =
+									holdDiff === null
+										? null
+										: await ops
+												.diffStat(e.path, target, `refs/heads/${branch}`)
+												.catch(() => null);
 								log("! held merge carries patches beyond the approved head");
 								break;
 							}
@@ -2083,6 +2103,11 @@ export function createTurnLoop(
 				report,
 				keptFiles,
 				holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
+				// A merge-hold mismatch park serves the reviewer the exact push-side delta it
+				// flagged (undefined keeps the column): the live worktree diff no longer speaks
+				// for the push set once the branch is integrated.
+				diffFiles: holdFiles ?? undefined,
+				diffText: holdDiff ?? undefined,
 				// A park spends that hold's approval (undefined keeps the column): a stale approval never
 				// carries into a later settle. Only the parked hold's column clears, so an approved
 				// update hold survives a fork-hold park of the same card.
