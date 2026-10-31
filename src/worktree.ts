@@ -713,13 +713,17 @@ export async function isIntegrated(
  * can say so). Then the local branch ahead of origin is the proof: only merge turns move it.
  * git() adds the host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local
  * tip is refs/heads/<branch>: `origin/<branch>` names the remote-tracking ref, which only this
- * push moves.
+ * push moves. A hold-approved merge passes `leaseTip` (OTTR-274): the audited origin tip the
+ * gate fetched. The push then requires the local target to contain that tip, and pins the
+ * remote with --force-with-lease, so a merge agent cannot aim the gate's fetch at one remote
+ * and the push at another: the real remote rejects any push whose lease does not match.
  */
 export async function serverMergePush(
 	mainPath: string,
 	worktreePath: string,
 	target: string,
 	taskBranch: string,
+	leaseTip: string | null = null,
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
@@ -737,6 +741,17 @@ export async function serverMergePush(
 	const local = await sha(`refs/heads/${branch}`);
 	if (local === null || local === (await sha(`refs/remotes/origin/${branch}`)))
 		return { status: "skipped" };
+	if (leaseTip !== null) {
+		const pinned = await git(
+			["merge-base", "--is-ancestor", leaseTip, `refs/heads/${branch}`],
+			mainPath,
+		);
+		if (pinned.code !== 0)
+			return {
+				status: "failed",
+				error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in refs/heads/${branch}`,
+			};
+	}
 	const head = (await worktreeLinked(worktreePath))
 		? await sha("HEAD", worktreePath)
 		: taskBranch === ""
@@ -750,7 +765,17 @@ export async function serverMergePush(
 		if (merged.code !== 0) return { status: "skipped" };
 	}
 	const r = await git(
-		["push", "origin", `refs/heads/${branch}:refs/heads/${branch}`],
+		[
+			"push",
+			// With the lease the update is a fast-forward by construction (the local target
+			// contains the audited tip the remote must still sit at), so the force part of
+			// the lease never fires; it only rejects a remote that moved off the audited tip.
+			...(leaseTip !== null
+				? [`--force-with-lease=refs/heads/${branch}:${leaseTip}`]
+				: []),
+			"origin",
+			`refs/heads/${branch}:refs/heads/${branch}`,
+		],
 		mainPath,
 	);
 	if (r.code === 0)
@@ -761,28 +786,35 @@ export async function serverMergePush(
 
 /**
  * OTTR-274: whether the commits a server push would ship (refs/heads/<branch>) carry exactly the
- * approved hold's content change (base..approvedHead), plus the push-side diff for the reviewer.
- * A merge turn resumes the same agent session and can commit beyond an approved head, so the
- * push's total tree effect must equal the approved one. A rebase onto a moved target keeps the
- * effect equal. The tree diff is the check (not per-commit patch-ids): a merge commit can take
- * one parent's stale side, which git's combined diff hides — only the total effect against the
- * target shows a smuggled revert. The merge agent can rewrite refs in the main checkout,
- * including the remote-tracking ref, so the target side is re-fetched from origin right here
- * (the push below goes to the same remote: a tampered remote.origin.url sends both to the same
- * fake and ships nothing real). Any git trouble mismatches: the hold fails closed. Runs in the
- * main repo, where the target refs live.
+ * approved hold's content change (base..approvedHead), plus the push-side diff for the reviewer
+ * and the audited origin tip for the push's lease. A merge turn resumes the same agent session
+ * and can commit beyond an approved head, so the push's total tree effect must equal the
+ * approved one. A rebase onto a moved target keeps the effect equal. The tree diff is the check
+ * (not per-commit patch-ids): a merge commit can take one parent's stale side, which git's
+ * combined diff hides — only the total effect against the target shows a smuggled revert. The
+ * merge agent can rewrite any local ref and the repo's remote config, so the fetch uses a
+ * gate-owned refspec into refs/ottr/gate/<branch> (configured refspecs and the remote-tracking
+ * ref stay irrelevant) and serverMergePush pins the real remote to the returned auditedTip. Any
+ * git trouble mismatches: the hold fails closed. Runs in the main repo, where the target refs
+ * live.
  */
 export async function mergeHoldMismatch(
 	mainPath: string,
 	target: string,
 	base: string,
 	approvedHead: string,
-): Promise<{ mismatch: boolean; pushDiff: string | null }> {
+): Promise<{
+	mismatch: boolean;
+	pushDiff: string | null;
+	auditedTip: string | null;
+}> {
 	const failClosed = (pushDiff: string | null = null) => ({
 		mismatch: true,
 		pushDiff,
+		auditedTip: null,
 	});
-	if (!target.startsWith("origin/")) return { mismatch: false, pushDiff: null };
+	if (!target.startsWith("origin/"))
+		return { mismatch: false, pushDiff: null, auditedTip: null };
 	const branch = target.slice("origin/".length);
 	// --no-renames keeps the text deterministic across the two tree pairs (rename detection is
 	// pair-dependent); --full-index keeps blob ids content-exact.
@@ -795,19 +827,21 @@ export async function mergeHoldMismatch(
 		);
 		return r.code === 0 ? r.stdout : null;
 	};
-	const fetch = await git(["fetch", "origin", branch], mainPath);
-	if (fetch.code !== 0) return failClosed();
-	const tip = await git(
-		["rev-parse", `refs/remotes/origin/${branch}`],
+	const fetch = await git(
+		["fetch", "origin", `+refs/heads/${branch}:refs/ottr/gate/${branch}`],
 		mainPath,
 	);
+	if (fetch.code !== 0) return failClosed();
+	const tip = await git(["rev-parse", `refs/ottr/gate/${branch}`], mainPath);
 	if (tip.code !== 0) return failClosed();
-	const push = await effect(tip.stdout.trim(), `refs/heads/${branch}`);
+	const auditedTip = tip.stdout.trim();
+	const push = await effect(auditedTip, `refs/heads/${branch}`);
 	if (push === null) return failClosed();
 	const approved = await effect(base, approvedHead);
 	return {
 		mismatch: approved === null || push !== approved,
 		pushDiff: push,
+		auditedTip,
 	};
 }
 

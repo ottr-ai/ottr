@@ -1629,6 +1629,9 @@ export function createTurnLoop(
 			let holdMismatch: string | null = null;
 			let holdDiff: string | null = null;
 			let holdFiles: DiffFileStat[] | null = null;
+			// The origin tip the gate fetched and audited; the push leases against it so a
+			// merge agent cannot aim the fetch and the push at different remotes.
+			let holdTip: string | null = null;
 			if (kind === "merge" && !interview && !grill && !releaseCard) {
 				// An approved merge hold fixes what may ship. The merge turn resumes the same agent
 				// session and could commit beyond the approved head, so the push set
@@ -1652,11 +1655,12 @@ export function createTurnLoop(
 						// the exact head a reply approved: nothing new to judge
 					} else {
 						for (const ah of approvedHeads) {
-							const { mismatch, pushDiff } = await ops
+							const { mismatch, pushDiff, auditedTip } = await ops
 								.mergeHoldMismatch(e.path, target, base, ah)
 								.catch(() => ({
 									mismatch: true,
 									pushDiff: null,
+									auditedTip: null,
 								}));
 							if (mismatch) {
 								holdMismatch = MERGE_HOLD_MISMATCH_REASON;
@@ -1677,12 +1681,13 @@ export function createTurnLoop(
 								log("! held merge carries patches beyond the approved head");
 								break;
 							}
+							holdTip = auditedTip;
 						}
 					}
 				}
 				if (holdMismatch === null) {
 					const p = await ops
-						.serverMergePush(e.path, wt, target, task.branch ?? "")
+						.serverMergePush(e.path, wt, target, task.branch ?? "", holdTip)
 						.catch((err: unknown) => ({
 							status: "failed" as const,
 							error: errmsg(err),

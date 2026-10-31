@@ -202,7 +202,11 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		targetCommits: async () => 3,
 		targetSha: async () => null,
 		serverMergePush: async () => ({ status: "skipped" as const }),
-		mergeHoldMismatch: async () => ({ mismatch: false, pushDiff: null }),
+		mergeHoldMismatch: async () => ({
+			mismatch: false,
+			pushDiff: null,
+			auditedTip: null,
+		}),
 		pidAlive: () => true,
 		startRun: (o: {
 			cwd: string;
@@ -4009,6 +4013,7 @@ describe("turn ci watch pinning", () => {
 			mergeHoldMismatch: async () => ({
 				mismatch: true,
 				pushDiff: "diff --git a/evil.txt b/evil.txt",
+				auditedTip: null,
 			}),
 		});
 		store.updateTask(task.id, {
@@ -4037,6 +4042,7 @@ describe("turn ci watch pinning", () => {
 			mergeHoldMismatch: async () => ({
 				mismatch: true,
 				pushDiff: null,
+				auditedTip: null,
 			}),
 		});
 		store.updateTask(task.id, { forkMergeHead: "sha-approved" });
@@ -4073,6 +4079,28 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a held merge that passes the gate pins the push to the audited tip", async () => {
+		const calls: unknown[][] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async (...args: unknown[]) => {
+				calls.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			mergeHoldMismatch: async () => ({
+				mismatch: false,
+				pushDiff: null,
+				auditedTip: "sha-audited",
+			}),
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect(calls.at(-1)![4]).toBe("sha-audited");
 	});
 
 	test("a merge agent that removed its worktree still gets the server push", async () => {

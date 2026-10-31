@@ -294,6 +294,76 @@ describe("serverMergePush", () => {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
+
+	test("a hold-audited push pins the remote to the audited tip", async () => {
+		const f = fixture();
+		try {
+			const tip = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				tip,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(
+				run(f.main, "rev-parse", "refs/heads/main"),
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a push whose lease does not match the remote fails", async () => {
+		const f = fixture();
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			const stale = run(f.bare, "rev-parse", "main");
+			// Move the real remote past the audited tip without moving the local target.
+			run(f.main, "checkout", "-q", "--detach", "origin/main");
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "later");
+			run(f.main, "push", "-q", "origin", "HEAD:main");
+			run(f.main, "checkout", "-q", "main");
+			const before = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				stale,
+			);
+			expect(r.status).toBe("failed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a push whose lease tip is not contained in the local target fails", async () => {
+		const f = fixture();
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(f.wt, "late.txt"), "late");
+			run(f.wt, ...id, "add", ".");
+			run(f.wt, ...id, "commit", "-qm", "late");
+			const before = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				run(f.wt, "rev-parse", "HEAD"),
+			);
+			expect(r.status).toBe("failed");
+			expect(r.status === "failed" && r.error.includes("not contained")).toBe(
+				true,
+			);
+			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("mergeHoldMismatch", () => {
@@ -341,7 +411,7 @@ describe("mergeHoldMismatch", () => {
 		writeFileSync(join(main, "o.txt"), "O1");
 		run(main, ...id, "commit", "-qam", "O1");
 		run(main, "push", "-q", "origin", "main");
-		return { dir, main, wt, base, approvedHead };
+		return { dir, bare, main, wt, base, approvedHead };
 	};
 
 	test("a rebase of exactly the approved changes still pushes (no mismatch)", async () => {
@@ -449,6 +519,51 @@ describe("mergeHoldMismatch", () => {
 			const r = await mismatch(f);
 			expect(r.mismatch).toBe(true);
 			expect(r.pushDiff).toContain("evil.txt");
+			// The gate audited the real tip and hands it to the push as the lease anchor.
+			expect(r.auditedTip).toBe(run(f.bare, "rev-parse", "main"));
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a rigged fetch refspec cannot hide smuggled content", async () => {
+		const f = fixture();
+		try {
+			// The tampered config is the fetch refspec this time: the fetch the gate runs is
+			// redirected into a namespace it plants, while refs/remotes/origin/main keeps a
+			// rigged anchor. The gate-owned refspec must ignore the configured one, and the
+			// audited tip it returns pins the push to the real remote.
+			run(f.main, "checkout", "-q", "--detach", "origin/main");
+			writeFileSync(join(f.main, "p1.txt"), "1");
+			writeFileSync(join(f.main, "p2.txt"), "2");
+			writeFileSync(join(f.main, "evil.txt"), "EVIL");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "evil merge");
+			run(f.main, ...id, "rm", "-q", "p1.txt", "p2.txt");
+			run(f.main, ...id, "commit", "-qm", "anchor");
+			// HEAD is the anchor; the smuggled tree sits one commit below.
+			run(
+				f.main,
+				"update-ref",
+				"refs/remotes/origin/main",
+				run(f.main, "rev-parse", "HEAD"),
+			);
+			run(
+				f.main,
+				"update-ref",
+				"refs/heads/main",
+				run(f.main, "rev-parse", "HEAD~1"),
+			);
+			run(
+				f.main,
+				"config",
+				"remote.origin.fetch",
+				"+refs/heads/*:refs/remotes/rigged/*",
+			);
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil.txt");
+			expect(r.auditedTip).toBe(run(f.bare, "rev-parse", "main"));
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
