@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { PROJECT, workerProjects } from "./apt.ts";
+import { eachWorkerProject, PROJECT, workerProjects } from "./apt.ts";
 import { boardOmpHome } from "./login.ts";
 
 // PATH command names, unique within one file; a list entry can never escape its target dir.
@@ -192,17 +192,7 @@ export async function ensureProjectTools(
  * for its tools. A list that fails adds its error line, and the other lists still install.
  */
 export async function ensureAllTools(home = homedir()): Promise<string[]> {
-	const lines: string[] = [];
-	for (const project of workerProjects(home)) {
-		try {
-			lines.push(...(await ensureProjectTools(project, home)));
-		} catch (err) {
-			lines.push(
-				`tools: ${project}: ${err instanceof Error ? err.message : err}`,
-			);
-		}
-	}
-	return lines;
+	return eachWorkerProject(home, "tools: ", ensureProjectTools);
 }
 
 function readTools(project: string, home: string): ToolEntry[] {

@@ -38,6 +38,28 @@ export function workerProjects(home = homedir()): string[] {
 		: [];
 }
 
+/**
+ * Runs `ensure` for every worker project in turn and joins its log lines. A project that
+ * throws adds `<prefix><project>: <error>`, and the other projects still run.
+ */
+export async function eachWorkerProject(
+	home: string,
+	prefix: string,
+	ensure: (project: string, home: string) => Promise<string[]>,
+): Promise<string[]> {
+	const lines: string[] = [];
+	for (const project of workerProjects(home)) {
+		try {
+			lines.push(...(await ensure(project, home)));
+		} catch (err) {
+			lines.push(
+				`${prefix}${project}: ${err instanceof Error ? err.message : err}`,
+			);
+		}
+	}
+	return lines;
+}
+
 /** apt.txt: one Debian package per line; `#` comments and blank lines are ignored. */
 export function parseAptTxt(text: string): string[] {
 	const names = text
@@ -94,15 +116,7 @@ export async function ensureProjectPackages(
  * for its packages. A list that fails adds its error line, and the other lists still install.
  */
 export async function ensureAllPackages(home = homedir()): Promise<string[]> {
-	const lines: string[] = [];
-	for (const project of workerProjects(home)) {
-		try {
-			lines.push(...(await ensureProjectPackages(project, home)));
-		} catch (err) {
-			lines.push(`${project}: ${err instanceof Error ? err.message : err}`);
-		}
-	}
-	return lines;
+	return eachWorkerProject(home, "", ensureProjectPackages);
 }
 
 /** The packages `dpkg --audit` names: each sits on a line `" <name>[:arch]  <summary>"`. */
