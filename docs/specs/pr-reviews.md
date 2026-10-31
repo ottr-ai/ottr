@@ -66,7 +66,7 @@ Each project has its own store, so the PR number is the key inside it.
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
-- A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review of the same PR updates the read card and does not restore the badge.
+- A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review (a new head) rewrites the draft and drops the read mark, so the updated card wears the badge again.
 
 ## Boundaries
 
@@ -80,6 +80,7 @@ Each project has its own store, so the PR number is the key inside it.
 - The toggle is off by default. With the toggle off or no GitHub repo, the watcher makes no `gh` call.
 - A new non-draft PR files one card after the quiet gate. A draft PR files nothing until it is ready.
 - A new push updates the same card after the quiet gate. An unchanged head adds nothing.
+- A re-review of a card the user already read drops the read mark, so the updated card wears the badge again.
 - A failed model call counts for the cap and retries later. A head that moves during the review saves no draft.
 - The sixth review start in 24 h waits.
 - Malformed entries are skipped. A gh failure is logged.

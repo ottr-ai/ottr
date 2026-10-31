@@ -47,6 +47,8 @@ function setup(
 	const diffs = new Map<number, string>();
 	const logs: string[] = [];
 	const prompts: string[] = [];
+	/** Card ids the watcher un-read on a re-review (the board's seen-set drop). */
+	const forgotten: string[] = [];
 	let t = 1_000_000_000;
 	const gh: GhFn = async (args) => {
 		const path = args.at(-1) ?? "";
@@ -84,6 +86,7 @@ function setup(
 		],
 		log: (m) => logs.push(m),
 		gh,
+		forgetSeen: (id) => forgotten.push(id),
 		now: () => t,
 		spawn: opts.spawn,
 		review: opts.spawn
@@ -100,6 +103,7 @@ function setup(
 		calls,
 		logs,
 		prompts,
+		forgotten,
 		closed,
 		diffs,
 		setOpen: (v: { number: number; head: { sha: string } }[]) => {
@@ -250,6 +254,26 @@ describe("createPrWatcher", () => {
 		expect(s.store.getTask(id)!.details).toBe("## Summary\nreview 2");
 		expect(s.store.getPrReview(4)!.reviewedHead).toBe(sha("c"));
 		expect(s.store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("a re-review drops the read mark so the updated card is unread again", async () => {
+		const s = setup();
+		s.setOpen([pr(11, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const id = s.cards()[0]!.id;
+		// The first review files a new card: nothing read yet, nothing to drop.
+		expect(s.forgotten).toEqual([]);
+		// The user reads the card, then a new head re-reviews the same card:
+		// its read mark must go, or the new draft never wears the badge.
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.setOpen([pr(11, sha("c"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.forgotten).toEqual([id]);
 	});
 
 	test("a head reviewed before is never reviewed again (A, B, then A)", async () => {

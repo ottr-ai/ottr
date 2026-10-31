@@ -909,6 +909,9 @@ export function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
+		// A re-review rewrites a draft the user may have read: the mark must go,
+		// or the updated card never wears the unread badge again.
+		forgetSeen: (taskId) => saveSeen(loadSeen().filter((id) => id !== taskId)),
 	});
 
 	/**

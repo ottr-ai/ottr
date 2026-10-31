@@ -161,6 +161,8 @@ export function createPrWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	log: (m: string) => void;
 	gh?: GhFn;
+	/** Called with the card id when a re-review rewrites a draft the user may have read; the board drops the read mark so the card wears the unread badge again. */
+	forgetSeen?: (taskId: string) => void;
 	now?: () => number;
 	/** The tool-free model call; defaults to the board's `omp auth-gateway` on the `plan` role. */
 	review?: ReviewFn;
@@ -293,6 +295,10 @@ export function createPrWatcher(deps: {
 					draft,
 					prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
 				});
+				// A re-review rewrites the draft the user may already have read: drop the
+				// read mark so the card wears the unread badge again. `row` predates the
+				// awaits, and only this single-flight watcher writes task_id.
+				if (row.taskId !== null) deps.forgetSeen?.(row.taskId);
 			} catch (e) {
 				deps.log(
 					`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
