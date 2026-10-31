@@ -2223,7 +2223,7 @@ extensions:
 			base: string | null;
 			hash: string;
 			roles: Record<string, string>;
-			signIns: unknown[];
+			signIns: string[] | null;
 			seed: { needed: boolean };
 		};
 		expect(b.base).toBe(BASE);
@@ -2232,12 +2232,40 @@ extensions:
 			["default", "zai/glm-5.3-flash:max"],
 			["slow", "anthropic/claude-opus-5-5:medium"],
 		]);
-		expect(Array.isArray(b.signIns)).toBe(true);
+		// The board store pinned by PI_CODING_AGENT_DIR decides the list: none there reads as null.
+		expect(b.signIns).toBeNull();
 		expect(typeof b.seed.needed).toBe("boolean");
 		expect(alateReqs.map((r) => `${r.method} ${r.url} ${r.auth}`)).toEqual([
 			"GET /api/state Bearer roles_secret",
 			"GET /api/file?path=user%2Fomp%2Fagent%2Fconfig.yml Bearer roles_secret",
 		]);
+	});
+
+	test("GET lists the providers with an active sign-in in the board store", async () => {
+		reset();
+		const agent = mkdtempSync(join(tmpdir(), "ottr-roles-agent"));
+		const db = new Database(join(agent, "agent.db"));
+		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY,
+			provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
+			disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`);
+		db.exec(`INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES
+			('deepseek', 'api_key', '{"key":"k"}', NULL, 1, 1),
+			('zai', 'oauth', '{"access":"a","refresh":"r","expires":1}', 'refresh failed', 1, 1)`);
+		db.close();
+		const saved = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agent;
+		try {
+			const res = await m.call("/api/model-roles");
+			expect(res.status).toBe(200);
+			const b: unknown = await res.json();
+			expect(
+				typeof b === "object" && b !== null && "signIns" in b && b.signIns,
+			).toEqual(["deepseek"]);
+		} finally {
+			if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = saved;
+			rmSync(agent, { recursive: true, force: true });
+		}
 	});
 
 	test("an unknown model or level is refused and nothing is committed", async () => {
