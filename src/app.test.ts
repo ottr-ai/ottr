@@ -5931,7 +5931,11 @@ describe("token expiry reminders", () => {
 				const u = new URL(req.url);
 				if (u.pathname === "/api/state")
 					return Response.json({
-						source: { kind: "repo", name: "o/data", importedSha: "a".repeat(40) },
+						source: {
+							kind: "repo",
+							name: "o/data",
+							importedSha: "a".repeat(40),
+						},
 					});
 				return Response.json({
 					path: u.searchParams.get("path"),
