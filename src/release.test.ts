@@ -363,6 +363,54 @@ describe("computeRelease", () => {
 		).toEqual({ version: "v1.2.4", notes: "", releasable: false });
 	});
 
+	test("cancel chains, breaking folds and partly out-of-range trailers", () => {
+		const c = (sha: string, subject: string, body = "") => ({
+			sha,
+			subject,
+			body,
+		});
+		// git log order: newest first. A revert of a revert restores the feature.
+		expect(
+			computeRelease("v1.2.3", [
+				c("ccccccc3", "Revert again", "This reverts commit bbbbbbb2."),
+				c("bbbbbbb2", "Revert once", "This reverts commit aaaaaaa1."),
+				c("aaaaaaa1", "feat: a"),
+			]),
+		).toEqual({
+			version: "v1.3.0",
+			notes: "## New features\n\n- A",
+			releasable: true,
+		});
+		// A reverted replacement no longer supersedes the original.
+		expect(
+			computeRelease("v1.2.3", [
+				c("ccccccc3", "Revert b", "Reverts: bbbbbbb2"),
+				c("bbbbbbb2", "feat: b", "Supersedes: aaaaaaa1"),
+				c("aaaaaaa1", "feat: a"),
+			]).notes,
+		).toBe("## New features\n\n- A");
+		// A breaking fix keeps its bullet and its major bump.
+		expect(
+			computeRelease("v1.2.3", [
+				c("bbbbbbb2", "fix!: rename the flag", "Fixes: aaaaaaa1"),
+				c("aaaaaaa1", "feat: a"),
+			]),
+		).toEqual({
+			version: "v2.0.0",
+			notes:
+				"## New features\n\n- A\n\n## Bug fixes\n\n- **Breaking:** Rename the flag",
+			releasable: true,
+		});
+		// One target before the range keeps the fix and the revert.
+		expect(
+			computeRelease("v1.2.3", [
+				c("ccccccc3", "fix: both", "Fixes: aaaaaaa1\nFixes: 1234567"),
+				c("bbbbbbb2", "Revert two", "Reverts: aaaaaaa1\nReverts: 7654321"),
+				c("aaaaaaa1", "feat: a"),
+			]).notes,
+		).toBe("## Bug fixes\n\n- Both\n\n## Changes\n\n- Revert two");
+	});
+
 	test("property: without trailers every listed commit keeps its bullet", () => {
 		const hex = fc.stringMatching(/^[0-9a-f]{40}$/);
 		fc.assert(
@@ -573,6 +621,25 @@ describe("against real repos", () => {
 			sha: fold,
 		});
 		expect(plan.notes).toBe("## New features\n\n- X\n\n## Bug fixes\n\n- Y");
+	}, 60_000);
+
+	test("planRelease keeps a feature that git revert restored", async () => {
+		await must(main, "switch", "-q", "-c", "rerevert", head);
+		writeFileSync(join(main, "w.txt"), "w\n");
+		await must(main, "add", "w.txt");
+		await must(main, "commit", "-q", "-m", "feat: w");
+		await must(main, "revert", "--no-edit", "HEAD");
+		await must(main, "revert", "--no-edit", "HEAD");
+		const tip = await must(main, "rev-parse", "HEAD");
+		await must(main, "switch", "-q", "main");
+		const plan = await planRelease({
+			mainPath: main,
+			target: "origin/main",
+			sha: tip,
+		});
+		expect(plan.notes).toBe(
+			"## New features\n\n- W\n- X\n\n## Bug fixes\n\n- Y",
+		);
 	}, 60_000);
 
 	test("a sha not on the target is blocked", async () => {

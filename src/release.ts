@@ -41,33 +41,48 @@ export function parseCommit(
 
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
-/** Body trailers that name a commit by (abbreviated) sha. */
-const DROPS_TARGET =
-	/^(?:(?:Supersedes|Reverts):\s*|This reverts commit )([0-9a-f]{7,40})\b/gim;
-const FOLDS_INTO = /^Fixes:\s*([0-9a-f]{7,40})\b/gim;
+/** Body lines that name a commit by (abbreviated) sha; git's revert line counts as `Reverts:`. */
+const TRAILER =
+	/^(?:(Supersedes|Reverts|Fixes):\s*|This reverts commit )([0-9a-f]{7,40})\b/gim;
 
 /**
- * Indexes of commits that get no bullet: targets of `Supersedes:`/`Reverts:`/`This reverts commit`
- * (a revert drops itself too: net zero), and `Fixes: <sha>` commits whose target is in the range
- * (the fix folds into that commit's bullet). Out-of-range shas change nothing.
+ * Indexes of commits that get no bullet and no version bump.
+ * - A `Supersedes:`/`Reverts:` line cancels the named in-range commit, but only while the
+ *   canceller itself stays in effect: a revert of a revert, or of a superseding commit,
+ *   restores the original.
+ * - A non-breaking commit whose `Reverts:`/`Fixes:` lines all name in-range commits folds away:
+ *   a revert nets out, a fix joins its feature. One out-of-range target keeps its bullet.
  */
 function droppedCommits(
-	commits: { sha?: string; body: string }[],
+	commits: { sha?: string; subject: string; body: string }[],
 ): Set<number> {
-	const find = (ref: string) =>
-		commits.findIndex((c) => c.sha?.startsWith(ref.toLowerCase()));
+	const refs = commits.map((c, i) =>
+		[...c.body.matchAll(TRAILER)].map(([, kind = "reverts", ref = ""]) => {
+			const t = commits.findIndex((o) => o.sha?.startsWith(ref.toLowerCase()));
+			return { kind: kind.toLowerCase(), t: t === i ? -1 : t };
+		}),
+	);
+	const memo = new Map<number, boolean>();
+	// Sha references only point back in history; the in-progress guard stops a forged cycle.
+	const effective = (i: number): boolean => {
+		const known = memo.get(i);
+		if (known !== undefined) return known;
+		memo.set(i, true);
+		const cancelled = refs.some(
+			(rs, j) =>
+				rs.some((r) => r.t === i && r.kind !== "fixes") && effective(j),
+		);
+		memo.set(i, !cancelled);
+		return !cancelled;
+	};
 	const dropped = new Set<number>();
 	for (const [i, c] of commits.entries()) {
-		for (const [line, ref = ""] of c.body.matchAll(DROPS_TARGET)) {
-			const t = find(ref);
-			if (t < 0 || t === i) continue;
-			dropped.add(t);
-			if (!/^Supersedes/i.test(line)) dropped.add(i);
-		}
-		for (const [, ref = ""] of c.body.matchAll(FOLDS_INTO)) {
-			const t = find(ref);
-			if (t >= 0 && t !== i) dropped.add(i);
-		}
+		const folds = refs[i]?.filter((r) => r.kind !== "supersedes") ?? [];
+		const folded =
+			folds.length > 0 &&
+			folds.every((r) => r.t >= 0) &&
+			!parseCommit(c.subject, c.body)?.breaking;
+		if (folded || !effective(i)) dropped.add(i);
 	}
 	return dropped;
 }
