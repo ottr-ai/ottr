@@ -5441,6 +5441,8 @@ function Drawer({
 	const [kidsOpen, setKidsOpen] = useState(true);
 	/** The rendered research report node; the HTML download serializes its DOM. */
 	const mdRef = useRef<HTMLDivElement | null>(null);
+	// Collapsed Triage section in this drawer; open by default.
+	const [triageOpen, setTriageOpen] = useState(true);
 	// Arrow keys page a multi-image lightbox; a window listener, since the modal dialog owns focus.
 	useEffect(() => {
 		if (viewing === null || viewing.list.length < 2) return;
@@ -5807,77 +5809,6 @@ function Drawer({
 							</dl>
 						</section>
 					)}
-					<section className="drawer-triage">
-						<h3>Triage</h3>
-						<div className="triage-row">
-							<label className="triage-rank">
-								<span>Rank</span>
-								<select
-									value={task.priority ?? ""}
-									disabled={triageSave.busy}
-									onChange={(e) => setRank(e.target.value)}
-								>
-									<option value="">Default</option>
-									{PRIORITIES.map((p) => (
-										<option key={p} value={p}>
-											{p}
-										</option>
-									))}
-								</select>
-							</label>
-							{task.closeCandidate === null ? (
-								<form
-									className="triage-nominate"
-									onSubmit={(e) => {
-										e.preventDefault();
-										if (triageReason.trim() !== "") nominateCandidate();
-									}}
-								>
-									<input
-										value={triageReason}
-										maxLength={200}
-										required
-										placeholder="Close candidate: duplicate, superseded…"
-										aria-label="Close candidate reason"
-										disabled={triageSave.busy}
-										onChange={(e) => setTriageReason(e.target.value)}
-									/>
-									<button
-										type="submit"
-										disabled={triageSave.busy || triageReason.trim() === ""}
-										aria-busy={triageSave.busy || undefined}
-									>
-										{triageSave.busy && (
-											<span className="spinner" aria-hidden="true" />
-										)}
-										Nominate
-									</button>
-								</form>
-							) : (
-								<span className="triage-set">
-									<span className="close-badge" title={task.closeCandidate}>
-										Close
-									</span>
-									<span className="triage-reason" title={task.closeCandidate}>
-										{task.closeCandidate}
-									</span>
-									<button
-										type="button"
-										disabled={triageSave.busy}
-										aria-busy={triageSave.busy || undefined}
-										onClick={clearCandidate}
-									>
-										Clear
-									</button>
-								</span>
-							)}
-						</div>
-						{triageError !== null && (
-							<p className="auth-error" role="alert">
-								{triageError}
-							</p>
-						)}
-					</section>
 					{parent !== null && (
 						<button
 							type="button"
@@ -5930,6 +5861,93 @@ function Drawer({
 							</div>
 						</>
 					)}
+					{/* Collapsible Triage, open by default: the head mirrors the Follow-ups
+					    head, the button inside toggles the controls below. */}
+					<section className="drawer-triage">
+						<h3 className="fu-head" data-collapsed={!triageOpen || undefined}>
+							<button
+								type="button"
+								aria-expanded={triageOpen}
+								aria-controls="drawer-triage-body"
+								onClick={() => setTriageOpen(!triageOpen)}
+							>
+								<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+									<path d="M2 3l2 2 2-2" />
+								</svg>
+								Triage
+							</button>
+						</h3>
+						<div id="drawer-triage-body" hidden={!triageOpen}>
+							<div className="triage-row">
+								<label className="triage-rank">
+									<span>Rank</span>
+									<select
+										value={task.priority ?? ""}
+										disabled={triageSave.busy}
+										onChange={(e) => setRank(e.target.value)}
+									>
+										<option value="">Default</option>
+										{PRIORITIES.map((p) => (
+											<option key={p} value={p}>
+												{p}
+											</option>
+										))}
+									</select>
+								</label>
+								{task.closeCandidate === null ? (
+									<form
+										className="triage-nominate"
+										onSubmit={(e) => {
+											e.preventDefault();
+											if (triageReason.trim() !== "") nominateCandidate();
+										}}
+									>
+										<input
+											value={triageReason}
+											maxLength={200}
+											required
+											placeholder="Close candidate: duplicate, superseded…"
+											aria-label="Close candidate reason"
+											disabled={triageSave.busy}
+											onChange={(e) => setTriageReason(e.target.value)}
+										/>
+										<button
+											type="submit"
+											disabled={triageSave.busy || triageReason.trim() === ""}
+											aria-busy={triageSave.busy || undefined}
+										>
+											{triageSave.busy && (
+												<span className="spinner" aria-hidden="true" />
+											)}
+											Nominate
+										</button>
+									</form>
+								) : (
+									<span className="triage-set">
+										<span className="close-badge" title={task.closeCandidate}>
+											Close
+										</span>
+										<span className="triage-reason" title={task.closeCandidate}>
+											{task.closeCandidate}
+										</span>
+										<button
+											type="button"
+											disabled={triageSave.busy}
+											aria-busy={triageSave.busy || undefined}
+											onClick={clearCandidate}
+										>
+											Clear
+										</button>
+									</span>
+								)}
+							</div>
+							{triageError !== null && (
+								<p className="auth-error" role="alert">
+									{triageError}
+								</p>
+							)}
+						</div>
+					</section>
 					{/* A live ask round hides its reason: the runner echoes the first question into
 					    it, and the ask panel below already carries the full questions. */}
 					{task.needsReason !== null && !askedNow && (

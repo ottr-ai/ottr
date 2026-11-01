@@ -2500,9 +2500,13 @@ a.release:hover {
 	border-radius: 3px;
 	cursor: help;
 }
-/* Drawer triage row: the rank picker and the close-candidate control share one line. */
+/* Drawer triage row: the rank picker and the close-candidate control share one line.
+   The section carries the drawer's hairline itself: its head is an fu-head button
+   inside the section, so the `.drawer-body > h3` boundary no longer applies. */
 .drawer-triage {
-	margin: 10px 0 0;
+	margin: 18px 0 0;
+	padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
 }
 .drawer-triage h3 {
 	margin: 0 0 6px;
