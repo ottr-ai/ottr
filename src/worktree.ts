@@ -1590,6 +1590,8 @@ async function guardAdminEntries(
 	// clash; a clashed entry stays registered (add then fails loudly). Match every entry's
 	// gitdir file if that ever happens.
 	const entry = path.join(dir, path.basename(worktreePath));
+	// Like git's prune, a locked entry stays: its lock protects the index (add then fails loudly).
+	if (lstatSync(path.join(entry, "locked"), { throwIfNoEntry: false })) return;
 	if (!liveAdminEntry(entry)) removeBelow(anchor, entry);
 }
 

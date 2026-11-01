@@ -2089,6 +2089,27 @@ describe("server writes never follow planted symlinks", () => {
 		60_000,
 	);
 
+	test("createWorktree keeps a locked admin entry whose checkout is gone, as git's prune does", async () => {
+		const { main, base } = await checkout();
+		const wt = join(main, ".worktrees", "OTTR-5");
+		await must(main, "worktree", "add", "-q", "-b", "ott/locked", wt);
+		await must(main, "worktree", "lock", wt);
+		rmSync(wt, { recursive: true, force: true }); // e.g. an unmounted disk
+		const entry = join(main, ".git", "worktrees", "OTTR-5");
+		await expect(
+			createWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/locked",
+				base,
+				copyExtra: [],
+				log: () => {},
+			}),
+		).rejects.toThrow(/locked/);
+		expect(existsSync(join(entry, "locked"))).toBe(true);
+		expect(existsSync(join(entry, "index"))).toBe(true);
+	}, 60_000);
+
 	test("ignoreInMain refuses a git dir outside the checkout; that exclude stays unchanged", async () => {
 		const main = repo();
 		const gitDir = join(repo(), "g");
