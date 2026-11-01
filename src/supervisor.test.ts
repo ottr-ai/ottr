@@ -1895,7 +1895,13 @@ describe("Dependabot pass", () => {
 	test("files one card per new PR with the exact prompt, schedule and log", async () => {
 		const { store, e } = depProject("dep-file");
 		const ops = fakeOps({
-			prResult: ghOk([{ number: 7, title: "Bump vite from 5.0.0 to 6.0.0" }]),
+			prResult: ghOk([
+				{
+					number: 7,
+					title: "Bump vite from 5.0.0 to 6.0.0",
+					createdAt: "2026-10-30T00:00:00Z",
+				},
+			]),
 		});
 		await tick(new Map([["proj", e]]), ops);
 		const tasks = store.listTasks();
@@ -1923,7 +1929,9 @@ describe("Dependabot pass", () => {
 		await tick(projects, ops);
 		expect(ops.prCalls).toBe(1);
 		ops.time += 1000; // exactly 1 h after the first poll
-		ops.prResult = ghOk([{ number: 3, title: "b" }]);
+		ops.prResult = ghOk([
+			{ number: 3, title: "b", createdAt: "2026-10-30T00:00:00Z" },
+		]);
 		await tick(projects, ops);
 		expect(ops.prCalls).toBe(2);
 		expect(store.listTasks()).toHaveLength(1);
@@ -1938,17 +1946,74 @@ describe("Dependabot pass", () => {
 		store.updateTask(done.id, { stage: "done" });
 		const cancelled = store.createTask(`${head}: bump c`);
 		store.updateTask(cancelled.id, { cancelledAt: 1 });
-		const ops = fakeOps({ prResult: ghOk([{ number: 1, title: "bump a" }]) });
+		const ops = fakeOps({
+			prResult: ghOk([
+				{ number: 1, title: "bump a", createdAt: "2000-01-01T00:00:00Z" },
+			]),
+		});
 		const projects = new Map([["proj", e]]);
 		await tick(projects, ops);
 		expect(store.listTasks()).toHaveLength(3);
 		ops.time += HOUR;
-		ops.prResult = ghOk([{ number: 12, title: "bump d" }]);
+		ops.prResult = ghOk([
+			{ number: 12, title: "bump d", createdAt: "2000-01-01T00:00:00Z" },
+		]);
 		await tick(projects, ops);
 		expect(store.listTasks()).toHaveLength(4);
 		expect(store.listTasks().map(firstLine)).toContain(
 			"Dependabot PR #12 (https://github.com/acme/widget/pull/12): bump d",
 		);
+		store.close();
+	});
+
+	test("an old done card with the same number does not block a newer PR", async () => {
+		const { store, e } = depProject("dep-restart");
+		const head = "Dependabot PR #3 (https://github.com/acme/widget/pull/3)";
+		store.createTask(`${head}: old bump a`);
+		const cancelled = store.createTask(`${head}: old bump c`);
+		store.updateTask(cancelled.id, { cancelledAt: 1 });
+		const ops = fakeOps({
+			prResult: ghOk([
+				{ number: 3, title: "new bump", createdAt: "2999-01-01T00:00:00Z" },
+			]),
+		});
+		await tick(new Map([["proj", e]]), ops);
+		expect(store.listTasks().map(firstLine)).toContain(
+			"Dependabot PR #3 (https://github.com/acme/widget/pull/3): new bump",
+		);
+		store.close();
+	});
+
+	test("a card at least as new as the PR blocks, cancelled included", async () => {
+		const { store, e } = depProject("dep-newer-blocks");
+		const head = "Dependabot PR #3 (https://github.com/acme/widget/pull/3)";
+		store.createTask(`${head}: bump a`);
+		const cancelled = store.createTask(`${head}: bump c`);
+		store.updateTask(cancelled.id, { cancelledAt: 1 });
+		const ops = fakeOps({
+			prResult: ghOk([
+				{ number: 3, title: "bump a", createdAt: "2000-01-01T00:00:00Z" },
+			]),
+		});
+		await tick(new Map([["proj", e]]), ops);
+		expect(store.listTasks()).toHaveLength(2);
+		store.close();
+	});
+
+	test("an entry with a missing or bad createdAt is dropped", async () => {
+		const { store, e } = depProject("dep-bad-date");
+		const ops = fakeOps({
+			prResult: ghOk([
+				{ number: 1, title: "no date" },
+				{ number: 2, title: "bad date", createdAt: "not-a-date" },
+				{ number: 3, title: "number date", createdAt: 42 },
+				{ number: 4, title: "ok", createdAt: "2026-10-30T00:00:00Z" },
+			]),
+		});
+		await tick(new Map([["proj", e]]), ops);
+		expect(store.listTasks().map(firstLine)).toEqual([
+			"Dependabot PR #4 (https://github.com/acme/widget/pull/4): ok",
+		]);
 		store.close();
 	});
 
@@ -2020,7 +2085,9 @@ describe("Dependabot pass", () => {
 				expect(errs[0]![0]).toBe(c.errorLine);
 			}
 			ops.time += HOUR;
-			ops.prResult = ghOk([{ number: 4, title: "x" }]);
+			ops.prResult = ghOk([
+				{ number: 4, title: "x", createdAt: "2026-10-30T00:00:00Z" },
+			]);
 			await tick(projects, ops);
 			expect(store.listTasks()).toHaveLength(1);
 			store.close();
@@ -2038,8 +2105,17 @@ describe("Dependabot pass", () => {
 				{ number: 1.5, title: "a" },
 				{ number: "3", title: "a" },
 				{ number: 5, title: 42 },
-				{ number: 9, title: "Bump x\nfrom 1\tto 2" },
-				{ number: 11, title: "ok", url: "https://evil.example/pull/999" },
+				{
+					number: 9,
+					title: "Bump x\nfrom 1\tto 2",
+					createdAt: "2026-10-30T00:00:00Z",
+				},
+				{
+					number: 11,
+					title: "ok",
+					createdAt: "2026-10-30T00:00:00Z",
+					url: "https://evil.example/pull/999",
+				},
 			]),
 		});
 		await tick(new Map([["proj", e]]), ops);
@@ -2071,7 +2147,7 @@ describe("Dependabot pass", () => {
 			"--state",
 			"open",
 			"--json",
-			"number,title",
+			"number,title,createdAt",
 			"--limit",
 			"100",
 		]);

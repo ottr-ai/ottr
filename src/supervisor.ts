@@ -124,11 +124,12 @@ export function dependabotPrompt(
 	].join("\n");
 }
 
-/** Open PRs from `gh pr list --json number,title`. The JSON is untrusted: only entries with a
- * positive safe-integer number and a string title pass. A string result is the error. Pure. */
+/** Open PRs from `gh pr list --json number,title,createdAt`. The JSON is untrusted: only entries with a
+ * positive safe-integer number, a string title and a parseable createdAt (epoch ms) pass. A string
+ * result is the error. Pure. */
 function dependabotPrs(
 	stdout: string,
-): { n: number; title: string }[] | string {
+): { n: number; title: string; createdAt: number }[] | string {
 	let prs: unknown;
 	try {
 		prs = JSON.parse(stdout);
@@ -137,15 +138,22 @@ function dependabotPrs(
 	}
 	if (!Array.isArray(prs)) return "expected a JSON array of PRs";
 	return prs.flatMap((raw: unknown) => {
-		const { number: n, title } = (raw ?? {}) as {
+		const {
+			number: n,
+			title,
+			createdAt,
+		} = (raw ?? {}) as {
 			number?: unknown;
 			title?: unknown;
+			createdAt?: unknown;
 		};
+		const ms = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
 		return typeof n === "number" &&
 			Number.isSafeInteger(n) &&
 			n > 0 &&
-			typeof title === "string"
-			? [{ n, title }]
+			typeof title === "string" &&
+			!Number.isNaN(ms)
+			? [{ n, title, createdAt: ms }]
 			: [];
 	});
 }
@@ -967,7 +975,7 @@ export function createSupervisor(
 				"--state",
 				"open",
 				"--json",
-				"number,title",
+				"number,title,createdAt",
 				"--limit",
 				"100",
 			])
@@ -982,13 +990,21 @@ export function createSupervisor(
 			);
 			return;
 		}
-		// Any stored card blocks, done or cancelled included: cancelling a card skips that update.
-		const heads = e.store.listTasks().map((x) => x.prompt.split("\n", 1)[0]!);
-		for (const { n, title } of prs) {
+		// A stored card blocks only when it is at least as new as the PR: a repo can restart
+		// its PR numbers, so an older card with the same number must not skip the new PR.
+		// Done and cancelled cards still block (a cancel skips that update) while not older.
+		const cards = e.store.listTasks().map((x) => ({
+			head: x.prompt.split("\n", 1)[0]!,
+			createdAt: x.createdAt,
+		}));
+		for (const { n, title, createdAt } of prs) {
 			// GitHub JSON is untrusted: the URL is built from the repo, never taken from the entry.
 			const head = dependabotHead(n, repo);
-			if (heads.some((h) => h.startsWith(head))) continue;
-			heads.push(head);
+			if (
+				cards.some((c) => c.head.startsWith(head) && c.createdAt >= createdAt)
+			)
+				continue;
+			cards.push({ head, createdAt });
 			const child = e.store.createTask(dependabotPrompt(n, repo, title));
 			ops.schedule();
 			ops.appendLog(
