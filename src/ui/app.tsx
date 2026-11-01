@@ -3429,6 +3429,15 @@ export function LaneCol({
 	});
 	const hasTasks = tasks.length > 0 || (parked?.length ?? 0) > 0;
 	const showBacklogRow = parked != null;
+	// "Show more" moves focus to the first card it reveals: the button may unmount on the last page,
+	// and focus must not fall to <body> (WCAG 2.4.3). The index counts the cards above the button.
+	const moreFocus = useRef<{ scope: HTMLElement; index: number } | null>(null);
+	useEffect(() => {
+		const f = moreFocus.current;
+		if (f === null) return;
+		moreFocus.current = null;
+		f.scope.querySelectorAll<HTMLElement>(".card-open")[f.index]?.focus();
+	});
 
 	if (!hasTasks && !showBacklogRow)
 		return (
@@ -3478,9 +3487,6 @@ export function LaneCol({
 		);
 		return dropBeforeId(cards, dragId, y);
 	};
-	// "Show more" moves focus to the first card it reveals: the button may unmount on the last page,
-	// and focus must not fall to <body> (WCAG 2.4.3). The index counts the cards above the button.
-	const moreFocus = useRef<{ scope: HTMLElement; index: number } | null>(null);
 	const showMore = (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => {
 		const btn = e.currentTarget;
 		const scope = btn.parentElement as HTMLElement;
@@ -3491,12 +3497,6 @@ export function LaneCol({
 		moreFocus.current = { scope, index };
 		go();
 	};
-	useEffect(() => {
-		const f = moreFocus.current;
-		if (f === null) return;
-		moreFocus.current = null;
-		f.scope.querySelectorAll<HTMLElement>(".card-open")[f.index]?.focus();
-	});
 	const card = (t: TaskCard): ReactNode => (
 		<Card
 			key={t.id}
