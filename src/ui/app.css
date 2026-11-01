@@ -1852,9 +1852,8 @@ textarea {
    ponytail: marks the Todo lane's head; a queued reply in In progress can still run first. Pass the
    scheduler's head as a data attribute if that ever matters. */
 .card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
-		.card[data-state="queued"]:not([data-held]) ~ .card
-	)
-	.card-head {
+	.card[data-state="queued"]:not([data-held]) ~ .card
+) .card-head {
 	padding-right: 40px;
 }
 .card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
