@@ -4492,6 +4492,11 @@ button.diff-path {
 .turn-body {
 	border-radius: 4px;
 	cursor: pointer;
+	/* The glow needs inner padding, like the head's focus ring: pad the body and
+	   pull it back out with a negative margin, so the row layout stays
+	   pixel-identical to the unpadded body. */
+	padding: 7px 9px;
+	margin: -7px -9px;
 }
 .turn-body:hover {
 	background: var(--card);
