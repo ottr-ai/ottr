@@ -4606,6 +4606,7 @@ describe("read marks (/api/seen)", () => {
 			firstSeenAt: 0,
 			reviewedHead: null,
 			postedHead: null,
+			postedUrl: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -5128,6 +5129,7 @@ describe("PR review routes", () => {
 			firstSeenAt: 0,
 			reviewedHead: prev?.reviewedHead ?? null,
 			postedHead: prev?.postedHead ?? null,
+			postedUrl: prev?.postedUrl ?? null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -5187,11 +5189,38 @@ describe("PR review routes", () => {
 		expect(res.status).toBe(200);
 		expect(ghCalls).toEqual([expectedArgv(1, "Looks good.", H1)]);
 		expect(row(1).postedHead).toBe(H1);
+		// The default gh body is "{}": no parseable html_url, no link.
+		expect(row(1).postedUrl).toBeNull();
 		expect(row(1).postError).toBeNull();
 		const again = await postReview(t.id, { body: "Looks good." });
 		expect(again.status).toBe(409);
 		expect(await errorOf(again)).toBe("already posted for this head");
 		expect(ghCalls).toHaveLength(1);
+	});
+
+	test("a successful post stores the review's html_url, the view links it, and junk URLs stay null", async () => {
+		const url = "https://github.com/acme/widget/pull/15#pullrequestreview-9";
+		const t = reviewed(15, H1);
+		ghResult = {
+			code: 0,
+			stdout: JSON.stringify({ html_url: url }),
+			stderr: "",
+		};
+		expect((await postReview(t.id, { body: "x" })).status).toBe(200);
+		expect(row(15).postedUrl).toBe(url);
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as { prReview?: { postedUrl?: unknown } };
+		expect(view.prReview?.postedUrl).toBe(url);
+		// GitHub's stdout is untrusted: only an https github URL becomes the drawer link.
+		const t2 = reviewed(16, H1);
+		ghResult = {
+			code: 0,
+			stdout: '{"html_url":"javascript:alert(1)"}',
+			stderr: "",
+		};
+		expect((await postReview(t2.id, { body: "x" })).status).toBe(200);
+		expect(row(16).postedUrl).toBeNull();
 	});
 
 	test("a new reviewed head opens post again", async () => {
@@ -5254,6 +5283,7 @@ describe("PR review routes", () => {
 		expect(await errorOf(res)).toBe("HTTP 422: nope");
 		expect(row(6).postError).toBe("HTTP 422: nope");
 		expect(row(6).postedHead).toBeNull();
+		expect(row(6).postedUrl).toBeNull();
 	});
 
 	test("a gh spawn error frees the claim, stores the error, and allows a retry", async () => {
@@ -5316,6 +5346,7 @@ describe("PR review routes", () => {
 			state: "open",
 			reviewedHead: H1,
 			postedHead: null,
+			postedUrl: null,
 			postError: null,
 		});
 	});

@@ -2313,6 +2313,7 @@ describe("pr review store methods", () => {
 		firstSeenAt: 100,
 		reviewedHead: null,
 		postedHead: null,
+		postedUrl: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -2335,6 +2336,7 @@ describe("pr review store methods", () => {
 			head: "def",
 			reviewedHead: "abc",
 			postedHead: "abc",
+			postedUrl: "https://github.com/acme/widget/pull/12#pullrequestreview-1",
 			state: "merged" as const,
 			draft: true,
 			title: "Fix it",
@@ -2442,6 +2444,39 @@ describe("pr review store methods", () => {
 			"pr_review_runs",
 		]);
 		expect(migrated).toEqual(ddl(join(root, "pr-migration-fresh")));
+	});
+
+	test("a pre-posted_url pr_review converges on open and setPrPostedUrl round-trips", () => {
+		const dir = join(root, "pr-posted-url");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE pr_review (
+  number INTEGER PRIMARY KEY,
+  task_id TEXT,
+  head TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  reviewed_head TEXT,
+  posted_head TEXT,
+  state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
+  draft INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  post_error TEXT
+)`);
+		old.run(
+			"INSERT INTO pr_review (number, head, first_seen_at, state, draft, title) VALUES (7, 'abc', 1, 'open', 0, 'Old row')",
+		);
+		old.close();
+		const store = open(dir);
+		expect(store.getPrReview(7)).toMatchObject({ postedUrl: null });
+		const url = "https://github.com/acme/widget/pull/7#pullrequestreview-2";
+		store.setPrPostedUrl(7, url);
+		expect(store.getPrReview(7)?.postedUrl).toBe(url);
+		store.setPrPostedUrl(7, null);
+		expect(store.getPrReview(7)?.postedUrl).toBeNull();
+		store.close();
 	});
 });
 

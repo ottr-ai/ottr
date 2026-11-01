@@ -171,6 +171,8 @@ export interface PrReviewRow {
 	firstSeenAt: number;
 	reviewedHead: string | null;
 	postedHead: string | null;
+	/** html_url of the posted review; null until a Post succeeds. */
+	postedUrl: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;
@@ -184,6 +186,8 @@ export interface PrReviewView {
 	state: PrState;
 	reviewedHead: string | null;
 	postedHead: string | null;
+	/** html_url of the posted review; null until a Post succeeds. */
+	postedUrl: string | null;
 	postError: string | null;
 }
 

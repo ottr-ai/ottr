@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   first_seen_at INTEGER NOT NULL,
   reviewed_head TEXT,
   posted_head TEXT,
+  posted_url TEXT,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
@@ -267,6 +268,7 @@ interface PrReviewDbRow {
 	first_seen_at: number;
 	reviewed_head: string | null;
 	posted_head: string | null;
+	posted_url: string | null;
 	state: string;
 	draft: number;
 	title: string;
@@ -281,6 +283,7 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		firstSeenAt: r.first_seen_at,
 		reviewedHead: r.reviewed_head,
 		postedHead: r.posted_head,
+		postedUrl: r.posted_url,
 		state: r.state as PrState,
 		draft: r.draft !== 0,
 		title: r.title,
@@ -1191,6 +1194,14 @@ export class ProjectStore {
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
 			);
+		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
+		// updates a live table, so converge additively like the tasks columns above.
+		const prCols = db
+			.query<{ name: string }, []>("PRAGMA table_info(pr_review)")
+			.all()
+			.map((c) => c.name);
+		if (!prCols.includes("posted_url"))
+			db.exec("ALTER TABLE pr_review ADD COLUMN posted_url TEXT");
 		return new ProjectStore(root, db);
 	}
 
@@ -1460,12 +1471,12 @@ export class ProjectStore {
 	/** Upserts one PR watch row by PR number. */
 	savePrReview(row: PrReviewRow): void {
 		this.db.run(
-			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, state, draft, title, post_error)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, posted_url, state, draft, title, post_error)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(number) DO UPDATE SET
 			   task_id = excluded.task_id, head = excluded.head, first_seen_at = excluded.first_seen_at,
-			   reviewed_head = excluded.reviewed_head, posted_head = excluded.posted_head, state = excluded.state,
-			   draft = excluded.draft, title = excluded.title, post_error = excluded.post_error`,
+			   reviewed_head = excluded.reviewed_head, posted_head = excluded.posted_head, posted_url = excluded.posted_url,
+			   state = excluded.state, draft = excluded.draft, title = excluded.title, post_error = excluded.post_error`,
 			[
 				row.number,
 				row.taskId,
@@ -1473,6 +1484,7 @@ export class ProjectStore {
 				row.firstSeenAt,
 				row.reviewedHead,
 				row.postedHead,
+				row.postedUrl,
 				row.state,
 				row.draft ? 1 : 0,
 				row.title,
@@ -1485,6 +1497,14 @@ export class ProjectStore {
 	setPrState(number: number, state: PrReviewRow["state"]): void {
 		this.db.run("UPDATE pr_review SET state = ? WHERE number = ?", [
 			state,
+			number,
+		]);
+	}
+
+	/** Stores the posted review's html_url after a successful Post; null clears it. */
+	setPrPostedUrl(number: number, url: string | null): void {
+		this.db.run("UPDATE pr_review SET posted_url = ? WHERE number = ?", [
+			url,
 			number,
 		]);
 	}

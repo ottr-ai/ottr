@@ -43,7 +43,7 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 Each project has its own store, so the PR number is the key inside it.
 
-- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
+- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
 - Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
 - `savePrDraft({ run, number, head, draft, prompt })` runs in one transaction:
@@ -54,8 +54,8 @@ Each project has its own store, so the PR number is the key inside it.
 
 ### Post
 
-- `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postError }` for a `pr_review` card.
-- The drawer shows the draft (the card's `details`) in an editable text box and a Post button.
+- `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postedUrl, postError }` for a `pr_review` card.
+- The drawer shows the draft (the card's `details`) in an editable text box and a Post button. When the head is posted, the drawer shows `Posted for <head>`; with a stored `posted_url` it links to the posted review on GitHub.
 - `POST /api/projects/:project/tasks/:id/pr-review/post { body }`:
   - `body` must be a non-empty string of at most 65536 characters, else 400.
   - The card must be kind `pr_review`, in `done/idle`, and have `details`, else 409.
@@ -63,6 +63,7 @@ Each project has its own store, so the PR number is the key inside it.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the gh call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
   - Ottr runs `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body> -f commit_id=<reviewedHead>`.
+  - On success Ottr parses the response body and stores its `html_url` in `posted_url`; a body without an `https://github.com/` URL stores null.
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.

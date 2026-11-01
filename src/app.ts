@@ -1752,6 +1752,7 @@ export function createApp(deps: AppDeps) {
 							state: pr.state,
 							reviewedHead: pr.reviewedHead,
 							postedHead: pr.postedHead,
+							postedUrl: pr.postedUrl,
 							postError: pr.postError,
 						},
 					}
@@ -5120,7 +5121,7 @@ export function createApp(deps: AppDeps) {
 					const repo =
 						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
 					// argv array, no shell: body and head never reach a command line parser.
-					let res: { code: number; stderr: string };
+					let res: { code: number; stdout: string; stderr: string };
 					try {
 						res = await gh([
 							"api",
@@ -5136,7 +5137,7 @@ export function createApp(deps: AppDeps) {
 						]);
 					} catch (err) {
 						// A spawn failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
-						res = { code: -1, stderr: errmsg(err) };
+						res = { code: -1, stdout: "", stderr: errmsg(err) };
 					}
 					if (res.code !== 0) {
 						const error =
@@ -5144,6 +5145,23 @@ export function createApp(deps: AppDeps) {
 						e.store.releasePrPost(row.number, head, prev, error);
 						return json({ error }, 502);
 					}
+					// GitHub's response body is untrusted: only an https github URL becomes the drawer link.
+					let url: string | null = null;
+					try {
+						const body: unknown = JSON.parse(res.stdout);
+						if (
+							typeof body === "object" &&
+							body !== null &&
+							"html_url" in body
+						) {
+							const u: unknown = body.html_url;
+							if (typeof u === "string" && u.startsWith("https://github.com/"))
+								url = u;
+						}
+					} catch {
+						// No parseable body: the drawer just shows the posted head without a link.
+					}
+					e.store.setPrPostedUrl(row.number, url);
 					return json({ ok: true });
 				}),
 		},

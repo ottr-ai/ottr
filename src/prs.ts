@@ -203,6 +203,7 @@ export function createPrWatcher(deps: {
 					firstSeenAt: t,
 					reviewedHead: null,
 					postedHead: null,
+					postedUrl: null,
 					state: "open",
 					draft: p.draft,
 					title: p.title,

@@ -5345,18 +5345,24 @@ function PrReviewSection({
 	const [body, setBody] = useState(draft ?? "");
 	const [error, setError] = useState<string | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
+	// The posted head only shows while it is the reviewed one; postedUrl links the actual GitHub review.
+	const postedLabel =
+		pr.state === "open" &&
+		pr.postedHead !== null &&
+		pr.postedHead === pr.reviewedHead
+			? `Posted for ${pr.postedHead.slice(0, 7)}`
+			: null;
 	const blocked =
 		pr.state !== "open"
 			? `PR is ${pr.state}`
-			: pr.postedHead !== null && pr.postedHead === pr.reviewedHead
-				? `Posted for ${pr.postedHead.slice(0, 7)}`
-				: draft === null
+			: (postedLabel ??
+				(draft === null
 					? "No review draft yet"
 					: task.stage !== "done" || task.state !== "idle"
 						? "The review is not done"
 						: body.trim() === ""
 							? "The comment is empty"
-							: null;
+							: null));
 	const shownError = error ?? pr.postError;
 	return (
 		<section>
@@ -5378,7 +5384,21 @@ function PrReviewSection({
 					onChange={(e) => setBody(e.target.value)}
 				/>
 				<div className="reply-actions">
-					{blocked !== null && <span className="dim">{blocked}</span>}
+					{blocked !== null && (
+						<span className="dim">
+							{postedLabel !== null && pr.postedUrl !== null ? (
+								<a
+									href={pr.postedUrl}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{blocked}
+								</a>
+							) : (
+								blocked
+							)}
+						</span>
+					)}
 					<BusyButton
 						className="primary"
 						disabled={blocked !== null}
