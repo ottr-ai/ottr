@@ -5077,6 +5077,13 @@ function turnPage<T extends { list: string[]; index: number }>(
 const IMPLEMENT_RECOMMENDATIONS =
 	"Implement the recommended steps (also called next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
+/** True when a research report names steps worth implementing. Same phrases the
+ * follow-up prompt searches for, so the button never promises work the agent
+ * cannot find. ponytail: phrase heuristic; a report saying "no next steps are
+ * needed" still matches — an explicit recommendations field would fix that. */
+export const recommendsSteps = (report: string): boolean =>
+	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report);
+
 /** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
  * status words and alarm coding as the meta line; a click opens the card. */
 function RelatedTasks({
@@ -6435,23 +6442,25 @@ function Drawer({
 								<Icon name="send" />
 								Follow up
 							</button>
-							{task.research && task.report !== null && (
-								<BusyButton
-									title="Creates a follow-up task that implements the report's recommended steps"
-									run={() =>
-										act(async () => {
-											const next = await post<TaskView>(
-												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/follow-up`,
-												{ text: IMPLEMENT_RECOMMENDATIONS },
-											);
-											onFollowed(next.id, task.id);
-										})
-									}
-								>
-									<Icon name="play" />
-									Implement recommendations
-								</BusyButton>
-							)}
+							{task.research &&
+								task.report !== null &&
+								recommendsSteps(task.report) && (
+									<BusyButton
+										title="Creates a follow-up task that implements the report's recommended steps"
+										run={() =>
+											act(async () => {
+												const next = await post<TaskView>(
+													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/follow-up`,
+													{ text: IMPLEMENT_RECOMMENDATIONS },
+												);
+												onFollowed(next.id, task.id);
+											})
+										}
+									>
+										<Icon name="play" />
+										Implement recommendations
+									</BusyButton>
+								)}
 							<p className="hint">
 								Creates a new task that continues this one with a full handoff.
 							</p>

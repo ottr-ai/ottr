@@ -20,6 +20,7 @@ const {
 	triageWait,
 	WarningLines,
 	doneTopicPages,
+	recommendsSteps,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl } = await import("./kit.tsx");
 const {
@@ -630,5 +631,21 @@ describe("settings TOC", () => {
 			SETTINGS_TOC.flatMap((g) => [g.label, ...g.sections.map((s) => s.label)]),
 		);
 		expect(html).not.toMatch(/<h[23][^>]*>GitHub<\/h[23]>/);
+	});
+});
+
+describe("recommendsSteps", () => {
+	test("matches the step phrases the follow-up prompt searches for", () => {
+		expect(recommendsSteps("## Next steps\n\n1. Buy the rack")).toBe(true);
+		expect(recommendsSteps("Our recommended steps are listed below.")).toBe(
+			true,
+		);
+		expect(recommendsSteps("Action items: order the RAM.")).toBe(true);
+		// A pure research answer names no steps, so it earns no button.
+		expect(
+			recommendsSteps(
+				"Server hardware: the X chassis runs cooler than the Y at the same price.",
+			),
+		).toBe(false);
 	});
 });
