@@ -91,7 +91,8 @@ export default {
     "!src/app.ts",
   ],
   reporters: ["clear-text", "progress"],
-  // break = the 2026-10-14 clean measured score (74.89%) rounded down; raise it when the score
+  // break = the 2026-10-31 measured score at 16b3326 (76.48%, 14,098 mutants) rounded down; it was
+  // 74 from the 2026-10-14 clean measured score (74.89%). Raise it when the score
   // rises. The 2026-10-13 99.42 did not reproduce on this worker (873 survivors over 7,034
   // mutants; planted-survivor probes pass the whole suite here, so this host's verdicts are
   // honest); on 2026-10-14 the break was lowered to the measured score by decision. The
@@ -100,5 +101,5 @@ export default {
   // killing tests the 2026-10-12 review follow-up added. --bail also ended the OOM deaths:
   // full-suite runs of killed mutants accumulated leaked test servers until the host OOM-killed
   // the run (~1,430 tested in, at every concurrency tried).
-  thresholds: { high: 80, low: 60, break: 74 },
+  thresholds: { high: 80, low: 60, break: 76 },
 };
