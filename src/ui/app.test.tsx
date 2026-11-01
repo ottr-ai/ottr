@@ -640,11 +640,33 @@ describe("recommendsSteps", () => {
 		expect(recommendsSteps("Our recommended steps are listed below.")).toBe(
 			true,
 		);
-		expect(recommendsSteps("Action items: order the RAM.")).toBe(true);
-		// A pure research answer names no steps, so it earns no button.
+		// Real shape (OTTR-94): a report whose steps section is the follow-up's target.
 		expect(
 			recommendsSteps(
-				"Server hardware: the X chassis runs cooler than the Y at the same price.",
+				"## Suggested next steps (outside this repo)\n\n1. Add a scan.",
+			),
+		).toBe(true);
+		// Real shape (OTTR-283, the server hardware research): a tier comparison with
+		// picks but no step section earns no button. Headings from the archived report.
+		expect(
+			recommendsSteps(
+				[
+					"## Short answer",
+					"",
+					"| Your goal | Buy this | Price | Idle power |",
+					"|---|---|---|---|",
+					"| Cheapest real upgrade | GMKtec M6 Ultra 32 GB/1 TB | €599.99 | about 10 W |",
+					"",
+					"## What Ottr needs",
+					"",
+					"## Tier 1 — Budget (up to about €850)",
+					"",
+					"## My recommendation",
+					"",
+					"**Ottr/Alate only (my pick)**: Beelink GTi15 Ultra, 64 GB / 1 TB, €1589.",
+					"",
+					"## Limits of this research",
+				].join("\n"),
 			),
 		).toBe(false);
 	});
