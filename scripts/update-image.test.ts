@@ -1759,8 +1759,8 @@ describe("helpers survivor kills", () => {
 
 	test("envFileValues trims keys, values and indented comments, and reads only named files", () => {
 		const dir = mkdtempSync(join(root, "env-"));
-		writeFileSync(join(dir, "a.env"), "  # NOTE=x\nKEY = v \n");
-		writeFileSync(join(dir, "x.env"), "TYPO=read\n");
+		writeFileSync(join(dir, "a.env"), "  # ALATE_IMAGE=x\nALATE_DATA = v \n");
+		writeFileSync(join(dir, "x.env"), "ALATE_DATA_REPO=read\n");
 		const prev = process.cwd();
 		process.chdir(dir);
 		try {
@@ -1772,7 +1772,7 @@ describe("helpers survivor kills", () => {
 					"gone.env",
 					"--env_file=x.env",
 				]),
-			).toEqual({ KEY: "v" });
+			).toEqual({ ALATE_DATA: "v" });
 		} finally {
 			process.chdir(prev);
 		}
