@@ -1106,3 +1106,66 @@ describe("Drawer prompt markdown", () => {
 		expect(html).toContain("<strong>not</strong>");
 	});
 });
+
+describe("Drawer approve button", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("a parked merge hold renders the approve button", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Update card: read the summary, then reply to approve the merge.",
+			holdHead: "sha-parked",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Approve merge");
+	});
+
+	test("a needs-you card without a parked hold renders none", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+			holdHead: null,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain("Approve merge");
+	});
+});
