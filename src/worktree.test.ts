@@ -2017,6 +2017,78 @@ describe("server writes never follow planted symlinks", () => {
 		60_000,
 	);
 
+	// git worktree prune (and remove) recurse through a symlinked .git/worktrees/<id> when they
+	// delete a stale admin entry: a planted link would empty /app/.tasks as root.
+	test.skipIf(process.platform !== "linux")(
+		"createWorktree and removeWorktree leave a symlinked admin entry's target intact",
+		async () => {
+			const { main, base } = await checkout();
+			const outside = repo();
+			writeFileSync(join(outside, "keep.txt"), "keep\n");
+			const admin = join(main, ".git", "worktrees");
+			const wt = join(main, ".worktrees", "OTTR-3");
+			const plant = () => {
+				mkdirSync(admin, { recursive: true });
+				symlinkSync(outside, join(admin, "evil"));
+				symlinkSync(outside, join(admin, "OTTR-3")); // the card's own entry name
+			};
+			plant();
+			const opts = {
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/admin-link",
+				base,
+				copyExtra: [],
+				log: () => {},
+			};
+			await createWorktree(opts);
+			expect(await worktreeLinked(wt)).toBe(true);
+			expect(lstatSync(join(admin, "evil"), { throwIfNoEntry: false })).toBe(
+				undefined,
+			);
+			expect(readdirSync(outside)).toEqual(["keep.txt"]);
+			symlinkSync(outside, join(admin, "evil"));
+			await removeWorktree({ mainPath: main, worktreePath: wt, branch: null });
+			expect(existsSync(wt)).toBe(false);
+			expect(existsSync(admin) ? readdirSync(admin) : []).toEqual([]);
+			expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep\n");
+			// A crashed attempt: the dir is gone, the planted links wait for the retry.
+			plant();
+			await createWorktree(opts);
+			expect(await worktreeLinked(wt)).toBe(true);
+			expect(readdirSync(outside)).toEqual(["keep.txt"]);
+		},
+		60_000,
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"a symlinked .git/worktrees dir is unlinked, its target stays intact",
+		async () => {
+			const { main, base } = await checkout();
+			const outside = repo();
+			mkdirSync(join(outside, "stale"));
+			writeFileSync(join(outside, "stale", "keep.txt"), "keep\n");
+			symlinkSync(outside, join(main, ".git", "worktrees"));
+			const wt = join(main, ".worktrees", "OTTR-4");
+			await createWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/admin-dir-link",
+				base,
+				copyExtra: [],
+				log: () => {},
+			});
+			expect(await worktreeLinked(wt)).toBe(true);
+			expect(lstatSync(join(main, ".git", "worktrees")).isDirectory()).toBe(
+				true,
+			);
+			expect(readFileSync(join(outside, "stale", "keep.txt"), "utf8")).toBe(
+				"keep\n",
+			);
+		},
+		60_000,
+	);
+
 	test("ignoreInMain refuses a git dir outside the checkout; that exclude stays unchanged", async () => {
 		const main = repo();
 		const gitDir = join(repo(), "g");

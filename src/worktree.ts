@@ -1,7 +1,11 @@
 import {
+	closeSync,
+	constants,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -243,6 +247,12 @@ export async function git(
 			"gpg.x509.program=false",
 			"-c",
 			"gpg.ssh.program=false",
+			// Auto gc/maintenance prunes stale worktree admin entries, and git follows a symlinked
+			// entry when it deletes one (guardAdminEntries): the board's git never runs either.
+			"-c",
+			"gc.auto=0",
+			"-c",
+			"maintenance.auto=false",
 			...args.slice(0, at + 1),
 			...(PINNED_ARGS[sub] ?? []),
 			...args.slice(at + 1),
@@ -785,7 +795,8 @@ export async function createWorktree(o: {
 		if (onDisk)
 			// scratch dir from an interrupted add; the tracker owns .worktrees/<id>
 			removeBelow(worktreeAnchor(o.mainPath, o.worktreePath), o.worktreePath);
-		else await git(["worktree", "prune"], o.mainPath); // stale admin entry
+		// a stale admin entry would fail the add with "missing but already registered"
+		await guardAdminEntries(o.mainPath, o.worktreePath);
 		const branchExists =
 			(await git(["rev-parse", "--quiet", "--verify", o.branch], o.mainPath))
 				.code === 0;
@@ -910,6 +921,7 @@ export async function removeWorktree(o: {
 	worktreePath: string;
 	branch: string | null;
 }): Promise<void> {
+	await guardAdminEntries(o.mainPath, null);
 	await git(["worktree", "remove", "--force", o.worktreePath], o.mainPath); // best effort
 	if (existsSync(o.worktreePath)) {
 		const anchor = worktreeAnchor(o.mainPath, o.worktreePath);
@@ -924,7 +936,7 @@ export async function removeWorktree(o: {
 			}
 		}
 	}
-	await git(["worktree", "prune"], o.mainPath);
+	await guardAdminEntries(o.mainPath, o.worktreePath);
 	if (o.branch) await git(["branch", "-D", o.branch], o.mainPath); // best effort
 }
 
@@ -1524,13 +1536,8 @@ export function worktreeAnchor(mainPath: string, worktreePath: string): string {
 	);
 }
 
-/**
- * The main checkout's .git/info/exclude. A worker can point .git at any git dir, so a git dir
- * outside the checkout is refused: no anchor would keep the append on the shared volume.
- */
-async function excludeFile(
-	mainPath: string,
-): Promise<{ anchor: string; file: string }> {
+/** The main checkout's git dir. A worker can point .git at any git dir, so one outside the checkout is refused. */
+async function gitCommonDir(mainPath: string): Promise<string> {
 	const common = await git(["rev-parse", "--git-common-dir"], mainPath);
 	if (common.code !== 0)
 		throw new Error(
@@ -1539,8 +1546,73 @@ async function excludeFile(
 	const dir = path.resolve(mainPath, common.stdout.trim());
 	if (!isBelow(mainPath, dir))
 		throw new Error(`refusing ${dir}: the git dir is outside ${mainPath}`);
+	return dir;
+}
+
+/**
+ * The main checkout's .git/info/exclude; no anchor would keep an append to a git dir outside
+ * the checkout on the shared volume.
+ */
+async function excludeFile(
+	mainPath: string,
+): Promise<{ anchor: string; file: string }> {
 	return {
 		anchor: trustedAnchor(mainPath),
-		file: path.join(dir, "info", "exclude"),
+		file: path.join(await gitCommonDir(mainPath), "info", "exclude"),
 	};
+}
+
+/**
+ * Run before every board `git worktree` command. A worker can write the main checkout's
+ * .git/worktrees, and git (2.47) recurses through a symlinked admin entry when it deletes
+ * one, emptying the link's target as root. So symlinked entries (and a symlinked worktrees
+ * dir) are removed here, never their targets, and the board never runs a global
+ * `git worktree prune`: it drops only `worktreePath`'s own admin entry, when given.
+ */
+async function guardAdminEntries(
+	mainPath: string,
+	worktreePath: string | null,
+): Promise<void> {
+	const anchor = trustedAnchor(mainPath);
+	const dir = path.join(await gitCommonDir(mainPath), "worktrees");
+	const st = lstatSync(dir, { throwIfNoEntry: false });
+	if (!st) return;
+	if (!st.isDirectory()) return removeBelow(anchor, dir);
+	for (const name of readdirSync(dir))
+		if (
+			lstatSync(path.join(dir, name), {
+				throwIfNoEntry: false,
+			})?.isSymbolicLink()
+		)
+			removeBelow(anchor, path.join(dir, name));
+	if (!worktreePath) return;
+	// ponytail: git names the entry after the checkout's basename and appends a digit on a
+	// clash; a clashed entry stays registered (add then fails loudly). Match every entry's
+	// gitdir file if that ever happens.
+	const entry = path.join(dir, path.basename(worktreePath));
+	if (!liveAdminEntry(entry)) removeBelow(anchor, entry);
+}
+
+/**
+ * True when the admin entry's gitdir file names a checkout that still exists: a same-named
+ * worktree elsewhere, never this card's stale one. O_NONBLOCK: a planted FIFO cannot hang
+ * the board, and O_NOFOLLOW reads no planted link.
+ */
+function liveAdminEntry(entry: string): boolean {
+	let fd: number;
+	try {
+		fd = openSync(
+			path.join(entry, "gitdir"),
+			constants.O_RDONLY |
+				(constants.O_NONBLOCK ?? 0) |
+				(constants.O_NOFOLLOW ?? 0),
+		);
+	} catch {
+		return false; // no readable gitdir file: git itself prunes such an entry
+	}
+	try {
+		return existsSync(readFileSync(fd, "utf8").trim());
+	} finally {
+		closeSync(fd);
+	}
 }
