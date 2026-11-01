@@ -3366,6 +3366,16 @@ dialog.diff-view {
 		min-height: 44px;
 		cursor: pointer;
 	}
+	/* Expanded/collapsed affordance: right-chevron points down when open. The
+	   flex display already hides the native summary marker. */
+	.settings-toc-mobile > summary .icon-svg {
+		flex: none;
+		margin-left: auto;
+		transition: transform 160ms var(--ease);
+	}
+	.settings-toc-mobile[open] > summary .icon-svg {
+		transform: rotate(90deg);
+	}
 	.settings-toc-mobile > .settings-toc {
 		padding-bottom: 8px;
 	}

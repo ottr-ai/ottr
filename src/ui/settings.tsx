@@ -3368,7 +3368,10 @@ export function SettingsPage({
 				{project === null ? (
 					<>
 						<details className="settings-toc-mobile">
-							<summary>On this page</summary>
+							<summary>
+								On this page
+								<Icon name="chevron-right" size={16} />
+							</summary>
 							<SettingsToc active={active} onPick={onPick} />
 						</details>
 						<section
