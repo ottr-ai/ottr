@@ -4343,10 +4343,14 @@ export function UpdateRowLine({
 			<span className="updates-versions">
 				<span className="updates-ver">
 					<code>{row.current}</code>
-					<span className="updates-arrow">→</span>
-					<code>{row.target ?? row.latest}</code>
+					{row.removed !== true && (
+						<>
+							<span className="updates-arrow">→</span>
+							<code>{row.target ?? row.latest}</code>
+						</>
+					)}
 				</span>
-				{row.target === null && (
+				{row.target === null && row.removed !== true && (
 					<span
 						className="updates-qualifies"
 						title={`Qualifies ${new Date(row.qualifiesAt).toLocaleString()}`}
@@ -4359,7 +4363,30 @@ export function UpdateRowLine({
 				// One cell so the phone layout cannot stack text and Skip onto the same grid area.
 				<span className="updates-removed">
 					<span className="dialog-sub">Removed upstream</span>
-					{skipButton}
+					{card === null ? (
+						<>
+							<button
+								type="button"
+								className="updates-remove ghost"
+								onClick={() => {
+									// The filed card covers the row; the WS state frame then shows "in progress".
+									void act(() => post("/api/updates/remove", { id: row.id }));
+								}}
+							>
+								Remove
+							</button>
+							{skipButton}
+						</>
+					) : (
+						<button
+							type="button"
+							className="updates-inprogress"
+							title={card.sessionTitle}
+							onClick={() => openTask(card.id)}
+						>
+							in progress
+						</button>
+					)}
 				</span>
 			) : row.managedBy !== undefined ? (
 				<span className="dialog-sub">managed by {row.managedBy}</span>

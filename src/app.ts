@@ -185,6 +185,7 @@ import {
 	mapRepo,
 	migratePendingToSkips,
 	planUpdatesPush,
+	removePrompt,
 	type UpdatesPushState,
 	updatePrompt,
 	validateUpdates,
@@ -877,6 +878,40 @@ export function createApp(deps: AppDeps) {
 	});
 
 	/**
+	 * Shared guards for filing a card from an updates row: unknown id, foreign updater,
+	 * unmapped repo, gitless project. `removed` selects the row class: update cards refuse
+	 * removed rows, remove cards refuse everything else. Throws the route's `{status, error}`
+	 * json responses as errors.
+	 */
+	function fileableUpdate(
+		id: string,
+		removed: boolean,
+	): { rec: UpdateRecord; e: Entry } {
+		const fail = (status: number, error: string): never => {
+			throw { status, error };
+		};
+		if (updates === null) return fail(409, "no updates loaded");
+		const rec = updates.updates.find((u) => u.id === id);
+		if (!rec) return fail(400, `unknown update id: ${id}`);
+		if ((rec.removed === true) !== removed)
+			return fail(
+				400,
+				removed
+					? `not a removed update: ${id}`
+					: `removed update files no card: ${id}`,
+			);
+		// Another updater owns this item; the panel offers no actions on it (U5).
+		if (rec.managedBy !== undefined)
+			return fail(400, `${id} is managed by ${rec.managedBy}`);
+		const projectName = mapRepo(rec.repo, deps.projects.values());
+		if (projectName === null)
+			return fail(400, `no board project maps ${rec.repo}`);
+		const e = deps.projects.get(projectName)!;
+		if (e.gitless) return fail(409, "init a git repository first");
+		return { rec, e };
+	}
+
+	/**
 	 * File update cards now instead of waiting for the daily push window (U6). Throws the
 	 * route's `{status, error}` json responses as errors; the endpoint turns them back.
 	 */
@@ -890,17 +925,7 @@ export function createApp(deps: AppDeps) {
 		if (updates === null) return fail(409, "no updates loaded");
 		const picked: Array<{ rec: UpdateRecord; e: Entry }> = [];
 		for (const id of ids) {
-			const rec = updates.updates.find((u) => u.id === id);
-			if (!rec) return fail(400, `unknown update id: ${id}`);
-			if (rec.removed) return fail(400, `removed update files no card: ${id}`);
-			// Another updater owns this item; the panel offers no actions on it (U5).
-			if (rec.managedBy !== undefined)
-				return fail(400, `${id} is managed by ${rec.managedBy}`);
-			const projectName = mapRepo(rec.repo, deps.projects.values());
-			if (projectName === null)
-				return fail(400, `no board project maps ${rec.repo}`);
-			const e = deps.projects.get(projectName)!;
-			if (e.gitless) return fail(409, "init a git repository first");
+			const { rec, e } = fileableUpdate(id, false);
 			// Allow waits for a qualified target; propose picks the too-young latest.
 			if (propose && rec.target !== null)
 				return fail(400, `${id} already has a target`);
@@ -937,6 +962,33 @@ export function createApp(deps: AppDeps) {
 		}
 		deps.schedule();
 		return created;
+	}
+
+	/** Files one card that removes an upstream-deleted row (U5): the mapped project's agent
+	 *  drops the installed copy, the pin and every reference. One id, one card. */
+	async function fileRemoveCard(
+		id: string,
+	): Promise<Array<{ project: string; id: string }>> {
+		const { rec, e } = fileableUpdate(id, true);
+		for (const pe of deps.projects.values())
+			if (
+				pe.store
+					.listTasks()
+					.some(
+						(t) =>
+							t.cancelledAt === null &&
+							t.stage !== "done" &&
+							t.updateIds.includes(id),
+					)
+			)
+				throw {
+					status: 409,
+					error: `${id} is already covered by an open update card`,
+				};
+		const t = e.store.createTask(removePrompt([rec]));
+		e.store.updateTask(t.id, { updateIds: [id] });
+		deps.schedule();
+		return [{ project: e.name, id: t.id }];
 	}
 
 	/** Single-flight pull from the alate provider; failure keeps the last good result. */
@@ -3710,6 +3762,33 @@ export function createApp(deps: AppDeps) {
 						if (body.propose !== undefined && typeof body.propose !== "boolean")
 							return json({ error: "propose must be a boolean" }, 400);
 						created = await fileUpdateCards(ids, body.propose === true);
+						publishSoon();
+					} catch (err) {
+						const e = err as { status?: unknown; error?: unknown };
+						if (
+							typeof e === "object" &&
+							e !== null &&
+							typeof e.status === "number" &&
+							typeof e.error === "string"
+						)
+							return json({ error: e.error }, e.status);
+						throw err;
+					}
+					return json({ tasks: created });
+				}),
+		},
+		"/api/updates/remove": {
+			POST: (req) =>
+				api(req, async () => {
+					// U5: the card removes the upstream-deleted item instead of updating it.
+					let created: Array<{ project: string; id: string }>;
+					try {
+						const r = await readJson(req);
+						if ("error" in r) return r.error;
+						const id = (r.body as Record<string, unknown>).id;
+						if (typeof id !== "string")
+							return json({ error: "id must be a string" }, 400);
+						created = await fileRemoveCard(id);
 						publishSoon();
 					} catch (err) {
 						const e = err as { status?: unknown; error?: unknown };

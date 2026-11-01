@@ -138,7 +138,7 @@ describe("visibleUpdateRows", () => {
 });
 
 describe("UpdateRowLine", () => {
-	test("a removed row shows 'Removed upstream' with Skip and no pick", () => {
+	test("a removed row shows 'Removed upstream' with Remove and Skip, no pick and no target", () => {
 		const html = renderToStaticMarkup(
 			<UpdateRowLine
 				row={removedRow}
@@ -155,6 +155,30 @@ describe("UpdateRowLine", () => {
 		expect(html).not.toContain("updates-box");
 		expect(html).toContain('class="updates-skip ghost"');
 		expect(html).toContain(">Skip</button>");
+		// Remove files a card that pins the removed upstream row.
+		expect(html).toContain(">Remove</button>");
+		expect(html).toContain('class="updates-remove ghost"');
+		// A removed row shows only the current pin: no arrow, no target, no qualifies.
+		expect(html).toContain("<code>1.0.0</code>");
+		expect(html).not.toContain("updates-arrow");
+		expect(html).not.toContain("qualifies");
+	});
+
+	test("a covered removed row shows in progress instead of Remove and Skip", () => {
+		const html = renderToStaticMarkup(
+			<UpdateRowLine
+				row={removedRow}
+				act={async () => true}
+				card={cardFixture({ id: "t9", updateIds: [removedRow.id] })}
+				selected={false}
+				onToggle={() => {}}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html).toContain("Removed upstream");
+		expect(html).toContain(">in progress</button>");
+		expect(html).not.toContain(">Remove</button>");
+		expect(html).not.toContain(">Skip</button>");
 	});
 
 	test("a plain row renders no decision chip", () => {

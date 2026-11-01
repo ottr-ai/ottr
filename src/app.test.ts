@@ -1750,6 +1750,72 @@ describe("alate routes", () => {
 			}
 		});
 
+		test("remove files one card for a removed id and rejects the rest", async () => {
+			const p1 = projects.get("p1")!;
+			p1.github = "https://github.com/Octo/Repo.GIT";
+			// Set the alate config here too: -t filtered runs skip the test that sets it.
+			await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+			try {
+				const removed = {
+					...goodRec,
+					id: "octo/repo@rm9",
+					name: "resolving-merge-conflicts",
+					kind: "skill",
+					target: null,
+					removed: true as const,
+				};
+				alateBody = envelope([goodRec, removed]);
+				await post("/api/updates/refresh", {});
+				// A not-removed id is rejected.
+				expect(
+					(await post("/api/updates/remove", { id: goodRec.id })).status,
+				).toBe(400);
+				// An unknown id is rejected.
+				expect(
+					(await post("/api/updates/remove", { id: "nope@1" })).status,
+				).toBe(400);
+				// A managedBy row offers no actions (U5).
+				const managed = {
+					...removed,
+					id: "octo/repo@rm8",
+					managedBy: "renovate",
+				};
+				alateBody = envelope([goodRec, removed, managed]);
+				await post("/api/updates/refresh", {});
+				expect(
+					(await post("/api/updates/remove", { id: managed.id })).status,
+				).toBe(400);
+				// An unmapped repo is rejected.
+				const elsewhere = {
+					...removed,
+					id: "elsewhere/other@rm7",
+					repo: "nobody/else",
+				};
+				alateBody = envelope([removed, elsewhere]);
+				await post("/api/updates/refresh", {});
+				expect(
+					(await post("/api/updates/remove", { id: elsewhere.id })).status,
+				).toBe(400);
+				const res = await post("/api/updates/remove", { id: removed.id });
+				expect(res.status).toBe(200);
+				const { tasks } = (await res.json()) as {
+					tasks: Array<{ project: string; id: string }>;
+				};
+				expect(tasks).toEqual([{ project: "p1", id: tasks[0]!.id }]);
+				const task = p1.store.getTask(tasks[0]!.id)!;
+				expect(task.updateIds).toEqual([removed.id]);
+				expect(task.prompt).toContain(
+					"`npx skills remove 'resolving-merge-conflicts' -g -y`",
+				);
+				// A covered id is rejected: the open card owns the row, a second click files no duplicate.
+				expect(
+					(await post("/api/updates/remove", { id: removed.id })).status,
+				).toBe(409);
+			} finally {
+				p1.github = null;
+			}
+		});
+
 		test("a reply on a parked update card approves the parked head; other replies do not", async () => {
 			const p1 = projects.get("p1")!;
 			const held = p1.store.createTask("update pins");
