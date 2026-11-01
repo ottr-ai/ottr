@@ -3712,13 +3712,48 @@ dialog.drawer {
 	border-left: 1px solid var(--line);
 	border-radius: 0;
 }
-dialog.drawer[open] {
-	animation: drawer-in 0.2s var(--ease);
+/* Open and close both slide the sheet along its entry path; allow-discrete keeps the
+   dialog and backdrop in the top layer until the exit transition ends. The JS side holds
+   the dialog mounted for this duration (the close effect in App holds 300 ms). */
+dialog.drawer {
+	opacity: 0;
+	transform: translateX(24px);
+	transition:
+		opacity 0.2s var(--ease),
+		transform 0.2s var(--ease),
+		display 0.2s allow-discrete,
+		overlay 0.2s allow-discrete;
 }
-@keyframes drawer-in {
-	from {
+dialog.drawer[open] {
+	opacity: 1;
+	transform: none;
+	animation: none; /* the generic dialog-in keyframes would fight the transition */
+}
+@starting-style {
+	dialog.drawer[open] {
 		opacity: 0;
 		transform: translateX(24px);
+	}
+}
+dialog.drawer::backdrop {
+	background: transparent;
+	transition:
+		background 0.2s var(--ease),
+		display 0.2s allow-discrete,
+		overlay 0.2s allow-discrete;
+}
+dialog.drawer[open]::backdrop {
+	background: var(--scrim);
+	animation: none;
+}
+@starting-style {
+	dialog.drawer[open]::backdrop {
+		background: transparent;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	dialog.drawer {
+		transform: none; /* the fade stays, the slide goes */
 	}
 }
 .drawer-body {

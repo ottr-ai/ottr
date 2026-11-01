@@ -5379,6 +5379,7 @@ export function reportHtml(title: string, body: string): string {
 }
 
 function Drawer({
+	open = true,
 	task: row,
 	project,
 	act,
@@ -5393,6 +5394,8 @@ function Drawer({
 	usedTotal,
 	maxTotal,
 }: {
+	/** False while the exit animation plays; the dialog then closes natively on screen. */
+	open?: boolean;
 	task: TaskCard;
 	project: ProjectView;
 	act: Act;
@@ -5699,6 +5702,7 @@ function Drawer({
 	return (
 		<>
 			<Modal
+				open={open}
 				onClose={onClose}
 				label={task.sessionTitle ?? task.title}
 				className="drawer"
@@ -7852,6 +7856,52 @@ function App() {
 		selected === null
 			? null
 			: (projects.find((p) => p.name === selected.project) ?? null);
+	/** The drawer task+project a close froze; held while the exit animation plays, then dropped. */
+	const [sheet, setSheet] = useState<{
+		task: TaskCard;
+		project: ProjectView;
+	} | null>(null);
+	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
+	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
+	const drawerTask = selected ?? sheet?.task ?? null;
+	const drawerProject = selectedProject ?? sheet?.project ?? null;
+	useEffect(() => {
+		if (selected !== null && selectedProject !== null) {
+			setSheet((s) =>
+				s !== null && s.task.id === selected.id && s.project === selectedProject
+					? s
+					: { task: selected, project: selectedProject },
+			);
+			return;
+		}
+		if (sheet === null) return;
+		// The card the drawer closed on gets one outline-and-tint flash, so the board
+		// points back at it. Color only, so reduced motion needs no separate variant.
+		const el = document.querySelector<HTMLElement>(
+			`.card[data-task-id="${CSS.escape(sheet.task.id)}"]`,
+		);
+		el?.animate(
+			[
+				{
+					outline: "2px solid var(--accent)",
+					outlineOffset: "2px",
+					backgroundColor: "var(--accent-bg)",
+				},
+				{
+					outline: "2px solid transparent",
+					outlineOffset: "2px",
+					backgroundColor: "var(--card)",
+				},
+			],
+			{
+				duration: 900,
+				easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", // --ease; WAAPI options don't resolve var()
+			},
+		);
+		// Matches the drawer's 0.2 s CSS exit plus headroom; reopened sooner keeps the sheet.
+		const t = setTimeout(() => setSheet(null), 300);
+		return () => clearTimeout(t);
+	}, [selected, selectedProject]);
 	const deltas = commitDeltas(tasks);
 	// Live agent counts for the drawer's Workflow modal: slots busy now machine-wide, against
 	// the global cap (SystemBar shows the same count in the app bar).
@@ -8535,24 +8585,27 @@ function App() {
 				/>
 			))}
 
-			{selected !== null && selectedProject !== null && (
+			{drawerTask !== null && drawerProject !== null && (
 				<Drawer
-					key={selected.id}
-					task={selected}
-					project={selectedProject}
-					delta={deltas.get(selected.id)}
-					tasks={tasks.filter((t) => t.project === selectedProject.name)}
+					key={drawerTask.id}
+					open={selected !== null}
+					task={drawerTask}
+					project={drawerProject}
+					delta={deltas.get(drawerTask.id)}
+					tasks={tasks.filter((t) => t.project === drawerProject.name)}
 					onOpenTask={openTask}
 					draining={draining}
 					usedTotal={usedTotal}
 					maxTotal={state?.maxTotal ?? null}
 					act={act}
-					read={seenable(selected) && seenAnswers.has(selected.id)}
+					read={seenable(drawerTask) && seenAnswers.has(drawerTask.id)}
 					onMarkUnread={() => {
+						if (selected === null) return; // the deferred native close after an app-driven close
 						void markUnread(selected);
 						setSelectedId(null); // close so the board shows the card unread; onClose would re-mark it read
 					}}
 					onClose={() => {
+						if (selected === null) return; // same deferred close; do not re-mark it read
 						// An answer that landed while the drawer was open counts as read.
 						markSeen(selected);
 						setSelectedId(null);
