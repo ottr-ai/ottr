@@ -147,6 +147,45 @@ describe("Markdown", () => {
 		);
 	});
 
+	test("markdown images and raw <img> tags render as img elements", () => {
+		// react-dom/server prepends <link rel="preload"> for images; assert the rendered subtree.
+		expect(render("![logo](https://x.test/a.png)")).toContain(
+			'<p><img src="https://x.test/a.png" alt="logo"/></p>',
+		);
+		const raw = render(
+			'<img src="https://x.test/b.png" alt="box" width="220">',
+		);
+		expect(raw).toContain('src="https://x.test/b.png"');
+		expect(raw).toContain('alt="box"');
+		expect(raw).toContain('width="220"');
+	});
+
+	test("images with unsafe sources never render as img", () => {
+		const out = render(
+			'![x](javascript:alert(1))\n\n<img src=x onerror=alert(1)>\n\n<img src="javascript:alert(2)" onerror="alert(3)">',
+		);
+		expect(out).not.toContain("<img");
+		expect(out).not.toContain("onerror");
+	});
+
+	test("raw <img> tags render inside table cells", () => {
+		const out = render(
+			'| <img src="https://x.test/c.png" alt="pc" width="220"> | box |\n|---|---|\n| a | b |',
+		);
+		expect(out).toContain('src="https://x.test/c.png"');
+		expect(out).toContain('width="220"');
+		expect(out).toContain("<td>a</td>");
+	});
+
+	test("property: any input renders without handlers or script tags", () => {
+		fc.assert(
+			fc.property(fc.string(), (text) => {
+				const out = render(text);
+				expect(out).not.toMatch(/on\w+\s*=|<script/i);
+			}),
+		);
+	});
+
 	test("property: parse never throws and renders content for any string", () => {
 		fc.assert(
 			fc.property(fc.string(), (text) => {

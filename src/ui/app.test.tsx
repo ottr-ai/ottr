@@ -23,6 +23,7 @@ const {
 	recommendsSteps,
 	serverLine,
 	workerNote,
+	reportHtml,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl } = await import("./kit.tsx");
 const {
@@ -744,5 +745,13 @@ describe("recommendsSteps", () => {
 				].join("\n"),
 			),
 		).toBe(false);
+	});
+});
+
+describe("reportHtml", () => {
+	test("escapes the title and embeds the body verbatim", () => {
+		const html = reportHtml('a<b>&"c', '<div class="md">x</div>');
+		expect(html).toContain("<title>a&#60;b&#62;&#38;&#34;c</title>");
+		expect(html).toContain('<div class="md">x</div>');
 	});
 });

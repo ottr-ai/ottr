@@ -5,5 +5,20 @@
       "maxFindings": 5,
       "maxChars": 8000
     }
+  },
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "broken-image",
+        "value": "*",
+        "files": [
+          "src/ui/markdown.tsx"
+        ],
+        "createdAt": "2026-11-01T10:31:46.252Z",
+        "reason": "Agent: markdown.tsx's only img-like text is the inline-token regex literal; real img elements are React createElement calls with allowlisted http(s) src"
+      }
+    ]
   }
 }

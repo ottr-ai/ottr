@@ -1,16 +1,40 @@
 import { Fragment, type ReactNode } from "react";
 
 // ponytail: subset markdown — headings, paragraphs, fenced code, lists (nested),
-// blockquotes, hr, tables (GFM pipe), bold/italic/code/strike, links, bare URLs.
-// No images, no reference links; swap in a real parser if reports start needing them.
+// blockquotes, hr, tables (GFM pipe), bold/italic/code/strike, links, bare URLs,
+// images (markdown syntax and raw <img> tags, http(s) src only).
+// No reference links; swap in a real parser if reports start needing them.
 
 /** Inline tokens; alternation order is precedence: code first so markup inside stays literal. */
 const INLINE_RE =
-	/(`[^`\n]+`)|(\*\*[^*]+?\*\*)|(__[^_]+?__)|(\*[^*\n]+\*)|(_[^_\n]+_)|(~~[^~\n]+~~)|(\[([^\]\n]*)\]\(([^()\s]+)\))|(https?:\/\/[^\s<>")\]]+)/g;
+	/(`[^`\n]+`)|(\*\*[^*]+?\*\*)|(__[^_]+?__)|(\*[^*\n]+\*)|(_[^_\n]+_)|(~~[^~\n]+~~)|(\[([^\]\n]*)\]\(([^()\s]+)\))|(https?:\/\/[^\s<>")\]]+)|(!\[([^\]\n]*)\]\(([^()\s]+)\))|(<img\s[^>]*>)/g;
 
 /** Only http(s) links become anchors; anything else renders as plain text. */
 function safeHref(url: string): string | null {
 	return /^https?:\/\//i.test(url) ? url : null;
+}
+
+/** Copies only safe attributes out of a raw <img> tag: http(s) src, alt, numeric width.
+ *  Everything else (on* handlers, style, srcset) is dropped; a tag without a safe src is dropped. */
+function parseImg(tag: string): {
+	src: string;
+	alt: string;
+	width: string | undefined;
+} | null {
+	const attr = (name: string): string | null => {
+		const m = tag.match(
+			new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s">]+))`, "i"),
+		);
+		return m?.[1] ?? m?.[2] ?? m?.[3] ?? null;
+	};
+	const src = attr("src");
+	if (src === null || safeHref(src) === null) return null;
+	const width = attr("width");
+	return {
+		src,
+		alt: attr("alt") ?? "",
+		width: width !== null && /^\d+$/.test(width) ? width : undefined,
+	};
 }
 
 function inline(text: string, keyPrefix: string): ReactNode[] {
@@ -39,6 +63,18 @@ function inline(text: string, keyPrefix: string): ReactNode[] {
 					</a>
 				),
 			);
+		} else if (tok.startsWith("!")) {
+			const src = safeHref(m[13] ?? "");
+			out.push(
+				src === null ? tok : <img key={key} src={src} alt={m[12] ?? ""} />,
+			);
+		} else if (tok.startsWith("<img")) {
+			const img = parseImg(tok);
+			if (img !== null) {
+				out.push(
+					<img key={key} src={img.src} alt={img.alt} width={img.width} />,
+				);
+			}
 		} else if (tok.startsWith("http")) {
 			out.push(
 				<a key={key} href={tok} target="_blank" rel="noreferrer">

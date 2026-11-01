@@ -5337,6 +5337,47 @@ function PrReviewSection({
 	);
 }
 
+/** Saves a Blob as a file; the delayed revoke keeps early-revoking browsers from cancelling. */
+function downloadBlob(name: string, blob: Blob): void {
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement("a");
+	a.href = url;
+	a.download = name;
+	a.click();
+	// Delay the revoke: some browsers cancel a download whose URL dies too early.
+	setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** Standalone document around the rendered report's HTML: inline CSS, no JS. The body is
+ *  React-rendered (escaped); the title is the only untrusted string, so it is escaped here. */
+export function reportHtml(title: string, body: string): string {
+	const esc = title.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+	return [
+		"<!doctype html>",
+		'<html lang="en">',
+		"<head>",
+		'<meta charset="utf-8">',
+		'<meta name="viewport" content="width=device-width, initial-scale=1">',
+		`<title>${esc}</title>`,
+		"<style>",
+		":root{color-scheme:light dark}",
+		"body{margin:0 auto;max-width:64rem;padding:1rem 1.25rem;font:16px/1.6 system-ui,sans-serif;background:#fff;color:#1c1c1c}",
+		".md img{max-width:100%;height:auto;border-radius:6px}",
+		".md table{border-collapse:collapse;margin:1rem 0}",
+		".md th,.md td{border:1px solid #d4d4d4;padding:.35rem .6rem;text-align:left;vertical-align:top}",
+		".md code{background:#f2f2f2;border-radius:4px;padding:.1rem .3rem;font-size:.9em}",
+		".md pre{background:#f2f2f2;padding:.75rem;border-radius:6px;overflow:auto}",
+		".md pre code{background:none;padding:0}",
+		".md blockquote{border-left:3px solid #d4d4d4;margin:1rem 0;padding:0 1rem}",
+		".md a{color:#06c}",
+		"@media (prefers-color-scheme:dark){body{background:#161616;color:#e4e4e4}.md th,.md td,.md blockquote{border-color:#3a3a3a}.md code,.md pre{background:#242424}}",
+		"</style>",
+		"</head>",
+		`<body>${body}</body>`,
+		"</html>",
+	].join("\n");
+}
+
 function Drawer({
 	task: row,
 	project,
@@ -5398,6 +5439,8 @@ function Drawer({
 	);
 	// Collapsed Follow-ups list in this drawer; the head button toggles it.
 	const [kidsOpen, setKidsOpen] = useState(true);
+	/** The rendered research report node; the HTML download serializes its DOM. */
+	const mdRef = useRef<HTMLDivElement | null>(null);
 	// Arrow keys page a multi-image lightbox; a window listener, since the modal dialog owns focus.
 	useEffect(() => {
 		if (viewing === null || viewing.list.length < 2) return;
@@ -6325,28 +6368,51 @@ function Drawer({
 						<section>
 							<div className="section-head">
 								<h3>Research report</h3>
-								<button
-									type="button"
-									className="ghost"
-									title="Download research-report.md"
-									onClick={() => {
-										const url = URL.createObjectURL(
-											// The section guard proves non-null; closures lose the narrowing.
-											new Blob([task.report ?? ""], { type: "text/markdown" }),
-										);
-										const a = document.createElement("a");
-										a.href = url;
-										a.download = "research-report.md";
-										a.click();
-										// Delay the revoke: some browsers cancel a download whose URL dies too early.
-										setTimeout(() => URL.revokeObjectURL(url), 10_000);
-									}}
-								>
-									<Icon name="download" />
-									Download
-								</button>
+								<div style={{ display: "flex", gap: 8 }}>
+									<button
+										type="button"
+										className="ghost"
+										title="Download research-report.html"
+										onClick={() => {
+											downloadBlob(
+												"research-report.html",
+												// The section guard proves non-null; closures lose the narrowing.
+												new Blob(
+													[
+														reportHtml(
+															task.title,
+															mdRef.current?.innerHTML ?? "",
+														),
+													],
+													{ type: "text/html" },
+												),
+											);
+										}}
+									>
+										<Icon name="download" />
+										HTML
+									</button>
+									<button
+										type="button"
+										className="ghost"
+										title="Download research-report.md"
+										onClick={() => {
+											downloadBlob(
+												"research-report.md",
+												new Blob([task.report ?? ""], {
+													type: "text/markdown",
+												}),
+											);
+										}}
+									>
+										<Icon name="download" />
+										Download
+									</button>
+								</div>
 							</div>
-							<Markdown text={task.report} />
+							<div ref={mdRef}>
+								<Markdown text={task.report} />
+							</div>
 						</section>
 					)}
 
