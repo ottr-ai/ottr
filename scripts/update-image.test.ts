@@ -1685,6 +1685,35 @@ describe("envFileValues", () => {
 		dropBunDotenv(["-f", "docker-compose.yml"], env);
 		expect(env).toEqual({ ALATE_IMAGE: "x" });
 	});
+
+	test("dropBunDotenv keeps the OS variables a bare child gets (Windows USERPROFILE, PATH)", () => {
+		// A Windows child holds the OS user variables even with an empty env, so the fix
+		// asks a second child in tmpdir, which has them without .env. The mock fakes the
+		// two children: cwd child with the .env key, tmpdir child without it.
+		const real = Bun.spawnSync;
+		try {
+			Bun.spawnSync = ((_cmd: string[], opts?: { cwd?: string }) => ({
+				exitCode: 0,
+				stdout: Buffer.from(
+					JSON.stringify(
+						opts?.cwd === undefined
+							? { PATH: "/win", USERPROFILE: "C:\\u", ALATE_IMAGE: "img" }
+							: { PATH: "/win", USERPROFILE: "C:\\u" },
+					),
+				),
+				stderr: Buffer.from(""),
+			})) as typeof Bun.spawnSync;
+			const env: Record<string, string> = {
+				PATH: "/win",
+				USERPROFILE: "C:\\u",
+				ALATE_IMAGE: "img",
+			};
+			dropBunDotenv(["--env-file", "stack.env"], env);
+			expect(env).toEqual({ PATH: "/win", USERPROFILE: "C:\\u" });
+		} finally {
+			Bun.spawnSync = real;
+		}
+	});
 });
 
 describe("helpers survivor kills", () => {

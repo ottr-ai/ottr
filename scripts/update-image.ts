@@ -121,8 +121,10 @@ function envFiles(args: string[]): string[] {
  * Bun loads the cwd's `.env` files into process.env before the script starts, and every
  * compose child would pass them on as shell values that beat `--env-file`. Compose ignores
  * `.env` when `--env-file` is given, so this removes what Bun loaded: it asks a bare Bun
- * child (same cwd, empty env) what it loads, and deletes each key that still holds that
- * value. A shell key with another value stays.
+ * child (empty env) what it loads in the cwd and in tmpdir, and deletes each key that only
+ * the cwd child shows. On Windows a child gets the OS user variables (PATH, USERPROFILE,
+ * ...) even with an empty env, so the cwd child alone cannot tell .env keys from OS keys.
+ * A shell key with another value stays.
  */
 export function dropBunDotenv(
 	args: string[],
@@ -133,17 +135,21 @@ export function dropBunDotenv(
 	const base: Record<string, string> = {};
 	for (const k of ["SYSTEMROOT", "NODE_ENV"])
 		if (env[k] !== undefined) base[k] = env[k];
-	const r = Bun.spawnSync(
-		[process.execPath, "-e", "console.log(JSON.stringify(process.env))"],
-		{ env: base },
-	);
-	if (r.exitCode !== 0)
-		throw new Error(`bun could not list its .env values: ${r.stderr}`);
-	const loaded: Record<string, string> = JSON.parse(r.stdout.toString());
+	const probe = (cwd?: string) => {
+		const r = Bun.spawnSync(
+			[process.execPath, "-e", "console.log(JSON.stringify(process.env))"],
+			{ env: base, cwd },
+		);
+		if (r.exitCode !== 0)
+			throw new Error(`bun could not list its .env values: ${r.stderr}`);
+		return JSON.parse(r.stdout.toString()) as Record<string, string>;
+	};
+	const loaded = probe();
+	const bare = probe(tmpdir());
 	// ponytail: a shell key with the same value as `.env` goes too; compose then reads it
 	// from --env-file. Read the start env (/proc/self/environ) if that case matters.
 	for (const [k, v] of Object.entries(loaded))
-		if (!(k in base) && env[k] === v) delete env[k];
+		if (!(k in base) && !(k in bare) && env[k] === v) delete env[k];
 }
 
 /**
