@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { TaskCard, UpdateRow } from "../types.ts";
+import type { ProjectView, TaskCard, UpdateRow } from "../types.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -24,6 +24,7 @@ const {
 	serverLine,
 	workerNote,
 	reportHtml,
+	Drawer,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl } = await import("./kit.tsx");
 const {
@@ -897,5 +898,75 @@ describe("reportHtml", () => {
 		const html = reportHtml('a<b>&"c', '<div class="md">x</div>');
 		expect(html).toContain("<title>a&#60;b&#62;&#38;&#34;c</title>");
 		expect(html).toContain('<div class="md">x</div>');
+	});
+});
+
+describe("Drawer parent chip", () => {
+	// The drawer's done view reads the list fields during render.
+	const childCard = (over: Partial<TaskCard>): TaskCard =>
+		cardFixture({
+			workCheckLog: [],
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			updateIds: [],
+			...over,
+		});
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: false,
+		onMarkUnread: () => {},
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("a parent still on the board renders as a button naming it", () => {
+		const parent = cardFixture({
+			id: "P-1",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Parent work",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-1",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={child} tasks={[parent]} />,
+		);
+		expect(html).toContain('class="fu-parent"');
+		expect(html).toContain("Follow-up of");
+		expect(html).toContain("Parent work");
+	});
+
+	test("a parent the state dropped (cancelled) keeps the chip on the bare id", () => {
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-9",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={child} tasks={[]} />,
+		);
+		expect(html).toContain("fu-parent-gone");
+		expect(html).toContain("Follow-up of");
+		expect(html).toContain("P-9");
+		expect(html).toContain('title="P-9 is not on the board"');
 	});
 });

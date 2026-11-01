@@ -5448,7 +5448,7 @@ export function reportHtml(title: string, body: string): string {
 	].join("\n");
 }
 
-function Drawer({
+export function Drawer({
 	open = true,
 	task: row,
 	project,
@@ -5883,18 +5883,30 @@ function Drawer({
 							</dl>
 						</section>
 					)}
-					{parent !== null && (
-						<button
-							type="button"
-							className="fu-parent"
-							title={parent.sessionTitle ?? parent.title}
-							onClick={() => onOpenTask(parent.id)}
-						>
-							<Icon name="corner-up-left" size={12} />
-							<span className="fu-parent-label">Follow-up of</span>
-							<span className="fu-parent-title">{parent.id}</span>
-						</button>
-					)}
+					{row.followUpOf !== null &&
+						(parent === null ? (
+							// The state no longer carries the parent (a cancelled card): the
+							// chip keeps the lineage on the bare id, inert like the card's.
+							<span
+								className="fu-parent fu-parent-gone"
+								title={`${row.followUpOf} is not on the board`}
+							>
+								<Icon name="corner-up-left" size={12} />
+								<span className="fu-parent-label">Follow-up of</span>
+								<span className="fu-parent-title">{row.followUpOf}</span>
+							</span>
+						) : (
+							<button
+								type="button"
+								className="fu-parent"
+								title={parent.sessionTitle ?? parent.title}
+								onClick={() => onOpenTask(parent.id)}
+							>
+								<Icon name="corner-up-left" size={12} />
+								<span className="fu-parent-label">Follow-up of</span>
+								<span className="fu-parent-title">{parent.id}</span>
+							</button>
+						))}
 					{waiting.length > 0 && (
 						<>
 							<h3>Waiting for</h3>

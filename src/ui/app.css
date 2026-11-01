@@ -3948,6 +3948,19 @@ dialog.drawer[open]::backdrop {
 .fu-parent:hover .fu-parent-title {
 	color: var(--accent-hover);
 }
+/* A parent the state no longer carries (a cancelled card): a span, so the button
+   base styles do not apply; the id reads dim, not link-steel, and hover is dead. */
+span.fu-parent {
+	display: inline-flex;
+	cursor: default;
+}
+.fu-parent-gone:hover {
+	background: none;
+	border-color: var(--line-soft);
+}
+.fu-parent-gone .fu-parent-title {
+	color: var(--dim);
+}
 .st {
 	color: var(--dim);
 }
