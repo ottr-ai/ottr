@@ -33,7 +33,7 @@ export async function alateHealth(
 		};
 	let res: Response;
 	try {
-		res = await fetch(alate.url + "/health", {
+		res = await fetch(`${alate.url}/health`, {
 			signal: AbortSignal.timeout(5000),
 		});
 	} catch (err) {
@@ -66,6 +66,18 @@ export async function alateHealth(
 export type AlateOut<T> =
 	| { ok: true; body: T }
 	| { ok: false; status: number; error: string };
+function outError(
+	body: Record<string, unknown> | null,
+	status: number,
+): { ok: false; status: number; error: string } {
+	return {
+		ok: false,
+		// 404 and 409 keep their status; any other alate failure is 502.
+		status: status === 404 || status === 409 ? status : 502,
+		error:
+			typeof body?.error === "string" ? body.error : `alate returned ${status}`,
+	};
+}
 /** One bearer call to alate's file editor API. 404 and 409 keep their status; any other
  *  alate failure is 502 (docs/specs/model-roles-editor.md). */
 export async function alateApi(
@@ -91,7 +103,7 @@ export async function alateApi(
 		res = await noRedirectFetch(alate.url + path, {
 			method: init?.method ?? "GET",
 			headers: {
-				authorization: "Bearer " + alate.key,
+				authorization: `Bearer ${alate.key}`,
 				...(init ? { "content-type": "application/json" } : {}),
 			},
 			...(init ? { body: JSON.stringify(init.body) } : {}),
@@ -115,15 +127,7 @@ export async function alateApi(
 		string,
 		unknown
 	> | null;
-	if (!res.ok)
-		return {
-			ok: false,
-			status: res.status === 404 || res.status === 409 ? res.status : 502,
-			error:
-				typeof body?.error === "string"
-					? body.error
-					: `alate returned ${res.status}`,
-		};
+	if (!res.ok) return outError(body, res.status);
 	if (body === null || typeof body !== "object")
 		return {
 			ok: false,

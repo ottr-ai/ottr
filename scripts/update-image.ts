@@ -70,6 +70,20 @@ const SCRIPT_KEYS = new Set([
 	"GH_TOKEN",
 ]);
 
+/** Parses one env-file line for a SCRIPT_KEYS key: key and value, or null to skip. */
+function parseEnvLine(line: string): [string, string] | null {
+	const t = line.trim();
+	if (t === "" || t.startsWith("#")) return null;
+	const eq = t.indexOf("=");
+	if (eq <= 0) return null;
+	const key = t.slice(0, eq).trim();
+	if (!SCRIPT_KEYS.has(key)) return null;
+	const raw = t.slice(eq + 1).trim();
+	const end = raw[0] === '"' || raw[0] === "'" ? raw.indexOf(raw[0], 1) : -1;
+	// ponytail: no escapes inside double quotes; add them when a key needs one.
+	return [key, end > 0 ? raw.slice(1, end) : raw.replace(/\s+#.*$/, "")];
+}
+
 /**
  * The script's own keys (SCRIPT_KEYS) from the env files a run passes as `--env-file`,
  * else from the repo root's `.env` (cwd-relative), as compose does. Later files win;
@@ -89,17 +103,9 @@ export function envFileValues(args: string[]): Record<string, string> {
 			continue; // a named file that is gone must not fail the run
 		}
 		for (const line of text.split("\n")) {
-			const t = line.trim();
-			if (t === "" || t.startsWith("#")) continue;
-			const eq = t.indexOf("=");
-			if (eq <= 0) continue;
-			const key = t.slice(0, eq).trim();
-			if (!SCRIPT_KEYS.has(key)) continue;
-			const raw = t.slice(eq + 1).trim();
-			const end =
-				raw[0] === '"' || raw[0] === "'" ? raw.indexOf(raw[0], 1) : -1;
-			// ponytail: no escapes inside double quotes; add them when a key needs one.
-			values[key] = end > 0 ? raw.slice(1, end) : raw.replace(/\s+#.*$/, "");
+			const parsed = parseEnvLine(line);
+			if (parsed === null) continue;
+			values[parsed[0]] = parsed[1];
 		}
 	}
 	return values;
@@ -406,6 +412,68 @@ async function preflightStop(g: (...args: string[]) => Promise<GitResult>) {
 }
 
 /**
+ * The ALATE_DATA_REPO branch of seedSource: ls-remote the wanted ref and probe the seed
+ * token's expiry. The probe is advisory: it logs a failure and never fails the run, and
+ * only the date leaves this function, never the token.
+ */
+async function repoSeed(
+	d: Deps,
+	env: Record<string, string | undefined>,
+	repo: string,
+	ALATE_DATA_REPO: string,
+): Promise<
+	| { wanted: string; args: string[]; tokenExpires?: string | null }
+	| { failed: string }
+> {
+	const { GH_TOKEN } = env;
+	const [name, ref = "main"] = ALATE_DATA_REPO.split("@");
+	const auth =
+		GH_TOKEN === undefined
+			? []
+			: [
+					"-c",
+					"credential.helper=!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f",
+				];
+	const r = await git(
+		[...auth, "ls-remote", `https://github.com/${name}`, `refs/heads/${ref}`],
+		repo,
+	);
+	const wanted = r.stdout.trim().split(/\s+/)[0] ?? "";
+	if (r.code !== 0 || wanted === "")
+		return { failed: `git ls-remote ${name} failed` };
+	// Advisory probe: the seed token's expiry from the REST response header. Never
+	// fails the run, and only the date leaves this function, never the token.
+	let tokenExpires: string | null | undefined;
+	if (GH_TOKEN !== undefined) {
+		const api =
+			d.githubApi ??
+			((path: string, token: string) =>
+				fetch(`https://api.github.com${path}`, {
+					headers: {
+						authorization: `Bearer ${token}`,
+						accept: "application/vnd.github+json",
+					},
+				}));
+		try {
+			const res = await api(`/repos/${name}`, GH_TOKEN);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const h = res.headers.get("github-authentication-token-expiration");
+			tokenExpires =
+				h === null
+					? "none"
+					: new Date(h.replace(" ", "T").replace(/ UTC$/, "Z")).toISOString();
+		} catch {
+			d.log("board seed token expiry check failed");
+		}
+	}
+	return {
+		wanted,
+		args: ["run", "--rm", "--no-deps", "board-seed", "--repo", ALATE_DATA_REPO],
+		tokenExpires,
+	};
+}
+
+/**
  * What seeds the board's agent layer, and the board-seed args for it: ALATE_DATA (a local
  * checkout of the data repo, its HEAD is wanted) or ALATE_DATA_REPO (`owner/name[@ref]`
  * on GitHub, with the token in the child env, never in argv). ALATE_DATA wins when both
@@ -421,7 +489,7 @@ async function seedSource(
 	| { failed: string }
 	| null
 > {
-	const { ALATE_DATA, ALATE_DATA_REPO, GH_TOKEN } = env;
+	const { ALATE_DATA, ALATE_DATA_REPO } = env;
 	if (ALATE_DATA === undefined) {
 		if (ALATE_DATA_REPO === undefined) {
 			d.log(
@@ -429,58 +497,7 @@ async function seedSource(
 			);
 			return null;
 		}
-		const [name, ref = "main"] = ALATE_DATA_REPO.split("@");
-		const auth =
-			GH_TOKEN === undefined
-				? []
-				: [
-						"-c",
-						"credential.helper=!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f",
-					];
-		const r = await git(
-			[...auth, "ls-remote", `https://github.com/${name}`, `refs/heads/${ref}`],
-			repo,
-		);
-		const wanted = r.stdout.trim().split(/\s+/)[0] ?? "";
-		if (r.code !== 0 || wanted === "")
-			return { failed: `git ls-remote ${name} failed` };
-		// Advisory probe: the seed token's expiry from the REST response header. Never
-		// fails the run, and only the date leaves this function, never the token.
-		let tokenExpires: string | null | undefined;
-		if (GH_TOKEN !== undefined) {
-			const api =
-				d.githubApi ??
-				((path: string, token: string) =>
-					fetch(`https://api.github.com${path}`, {
-						headers: {
-							authorization: `Bearer ${token}`,
-							accept: "application/vnd.github+json",
-						},
-					}));
-			try {
-				const res = await api(`/repos/${name}`, GH_TOKEN);
-				if (!res.ok) throw new Error(`HTTP ${res.status}`);
-				const h = res.headers.get("github-authentication-token-expiration");
-				tokenExpires =
-					h === null
-						? "none"
-						: new Date(h.replace(" ", "T").replace(/ UTC$/, "Z")).toISOString();
-			} catch {
-				d.log("board seed token expiry check failed");
-			}
-		}
-		return {
-			wanted,
-			args: [
-				"run",
-				"--rm",
-				"--no-deps",
-				"board-seed",
-				"--repo",
-				ALATE_DATA_REPO,
-			],
-			tokenExpires,
-		};
+		return repoSeed(d, env, repo, ALATE_DATA_REPO);
 	}
 	if (ALATE_DATA_REPO !== undefined)
 		d.log("board seed: ALATE_DATA wins over ALATE_DATA_REPO");
@@ -541,6 +558,24 @@ async function alateImage(
 }
 
 /**
+ * Ends the hold once the next poll would end past HOLD_LIMIT_MS: the hold ends (FREE_TURNS),
+ * and the restart waits for a later run (exit code 0).
+ */
+async function releaseHold(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	turns: string,
+): Promise<0> {
+	const freed = await exec(FREE_TURNS);
+	d.log(
+		freed.code === 0
+			? `${turns} turns run after ${HOLD_LIMIT_MS / 60_000} min of hold: the hold ends, and the restart waits for a later run`
+			: `${turns} turns run after ${HOLD_LIMIT_MS / 60_000} min of hold, and the board cannot end the hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
+	);
+	return 0;
+}
+
+/**
  * Waits out the running turns on the live board. Returns an early exit code
  * (1 via stop, 0 when the restart waits for a later run), or null to proceed
  * to `compose up`. `pending` says what makes the coming restart worth the hold: a new
@@ -580,15 +615,8 @@ async function drainRunningBoard(
 				`${turns} turns run: the board holds new turns, and the restart follows when they finish`,
 			);
 		// The next poll would end past the limit.
-		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) {
-			const freed = await exec(FREE_TURNS);
-			d.log(
-				freed.code === 0
-					? `${turns} turns run after ${HOLD_LIMIT_MS / 60_000} min of hold: the hold ends, and the restart waits for a later run`
-					: `${turns} turns run after ${HOLD_LIMIT_MS / 60_000} min of hold, and the board cannot end the hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
-			);
-			return 0;
-		}
+		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS)
+			return releaseHold(d, exec, turns);
 		await d.wait(POLL_MS);
 		held = await hold();
 	}
@@ -599,18 +627,15 @@ async function drainRunningBoard(
 	return null;
 }
 
-/** The run's exit code: 1 when it stopped early or failed, else 0. */
-export async function updateImage(
+/** What the run deploys, read once before the build and reused by the later phases. */
+type RunMeta = { head: string; omp: string; commits: string[] };
+
+/** Deploys exactly origin/main and reads the deploy metadata; a number stops the run. */
+async function preflightAndRead(
 	repo: string,
-	compose: string[],
-	d: Deps,
-	env: Record<string, string | undefined> = process.env,
-): Promise<number> {
-	const stop = (why: string): number => {
-		d.log(`stopped: ${why}`);
-		return 1;
-	};
-	const g = (...args: string[]) => git(args, repo);
+	g: (...args: string[]) => Promise<GitResult>,
+	stop: (why: string) => number,
+): Promise<RunMeta | number> {
 	const stopped = await preflightStop(g);
 	if (stopped !== null) return stop(stopped);
 	// Before the merge: HEAD is what the running stack was built from, so its subjects
@@ -633,7 +658,16 @@ export async function updateImage(
 					.map((s) => s.trim().slice(0, 200))
 					.filter(Boolean)
 					.slice(0, 50);
+	return { head, omp, commits };
+}
 
+/** Builds the server image and deploys the sidecar checkouts; a number stops the run. */
+async function buildAndSidecars(
+	d: Deps,
+	compose: string[],
+	repo: string,
+	stop: (why: string) => number,
+): Promise<number | null> {
 	const build = await d.docker("compose", ...compose, "build", "server");
 	if (build.code !== 0) {
 		d.log(build.out.trim().split("\n").slice(-10).join("\n"));
@@ -643,8 +677,15 @@ export async function updateImage(
 	// files in this repo name none) deploy on their own (deploySidecar).
 	for (const s of await sidecarCheckouts(d, compose, repo))
 		await deploySidecar(d, compose, s);
-	// One ps lists the running services. A board that does not run cannot be counted,
-	// and that must not block every later deploy; a failed ps fails closed.
+	return null;
+}
+
+/** One ps of the running services; a ps that fails stops the run (fails closed). */
+async function runningServices(
+	d: Deps,
+	compose: string[],
+	stop: (why: string) => number,
+): Promise<string[] | number> {
 	const running = await d.docker(
 		"compose",
 		...compose,
@@ -655,98 +696,187 @@ export async function updateImage(
 	);
 	if (running.code !== 0)
 		return stop(`docker compose ps failed: ${running.out.trim()}`);
-	const serverWasRunning = running.out.trim().split("\n").includes("server");
-	// The board's agent layer comes from the data repo, and the board-seed service is its
-	// only writer (never the worker-writable shared home). A commit the volume has not
-	// recorded yet seeds once, before the drain. A failed seed never blocks the deploy,
-	// but the run exits 1: after the normal success line, or when the drain ends it early.
-	let seeded = false;
-	let seedFailed = false;
-	let wantedSha = "";
-	let seedExpires: string | null | undefined;
-	const seed = await seedSource(d, env, repo);
-	if (seed === null) {
-		// seedSource already logged the skip.
-	} else if ("failed" in seed) {
-		d.log(`board seed failed: ${seed.failed}`);
-		seedFailed = true;
-	} else {
-		seedExpires = seed.tokenExpires;
-		wantedSha = seed.wanted;
-		let record: string | null = null;
-		if (serverWasRunning) {
-			const r = await d.docker(
-				"compose",
-				...compose,
-				"exec",
-				"-T",
-				"server",
-				"sh",
-				"-c",
-				"cat /etc/ottr/seed-commit",
+	return running.out.trim().split("\n");
+}
+
+/** What the seed phase leaves for the later phases. */
+type SeedOutcome = {
+	seeded: boolean;
+	failed: boolean;
+	wantedSha: string;
+	expires: string | null | undefined;
+};
+
+/** The board's current seed-commit record, or null when absent or the board is down. */
+async function readSeedRecord(
+	d: Deps,
+	compose: string[],
+	serverWasRunning: boolean,
+): Promise<string | null> {
+	if (!serverWasRunning) return null;
+	const r = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		"server",
+		"sh",
+		"-c",
+		"cat /etc/ottr/seed-commit",
+	);
+	const read = r.code === 0 ? r.out.trim() : "";
+	return read !== "" ? read : null;
+}
+
+/** Runs the board-seed service once, discovering ALATE_IMAGE for the child when needed. */
+async function runSeed(
+	d: Deps,
+	compose: string[],
+	env: Record<string, string | undefined>,
+	seed: { wanted: string; args: string[] },
+	outcome: SeedOutcome,
+): Promise<SeedOutcome> {
+	const found = await alateImage(d, compose, env);
+	if (found === null) {
+		d.log(
+			"board seed failed: no alate image found; set ALATE_IMAGE in the env file",
+		);
+		return { ...outcome, failed: true };
+	}
+	// A discovered image must reach the compose child, or the board-seed service
+	// interpolates the ghcr default and pulls an image that may not exist.
+	const prev = process.env.ALATE_IMAGE;
+	if (found.discovered) process.env.ALATE_IMAGE = found.image;
+	try {
+		const run = await d.docker("compose", ...compose, ...seed.args);
+		if (run.code !== 0) {
+			d.log(
+				`board seed failed: ${run.out.trim().split("\n").slice(-3).join("\n")}`,
 			);
-			const read = r.code === 0 ? r.out.trim() : "";
-			if (read !== "") record = read;
+			return { ...outcome, failed: true };
 		}
-		if (record === seed.wanted) {
-			d.log(`board agent layer current at ${seed.wanted.slice(0, 12)}`);
-		} else {
-			const found = await alateImage(d, compose, env);
-			if (found === null) {
-				d.log(
-					"board seed failed: no alate image found; set ALATE_IMAGE in the env file",
-				);
-				seedFailed = true;
-			} else {
-				// A discovered image must reach the compose child, or the board-seed service
-				// interpolates the ghcr default and pulls an image that may not exist.
-				const prev = process.env.ALATE_IMAGE;
-				if (found.discovered) process.env.ALATE_IMAGE = found.image;
-				try {
-					const run = await d.docker("compose", ...compose, ...seed.args);
-					if (run.code !== 0) {
-						d.log(
-							`board seed failed: ${run.out.trim().split("\n").slice(-3).join("\n")}`,
-						);
-						seedFailed = true;
-					} else {
-						d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
-						seeded = true;
-					}
-				} finally {
-					if (found.discovered) {
-						if (prev === undefined) delete process.env.ALATE_IMAGE;
-						else process.env.ALATE_IMAGE = prev;
-					}
-				}
-			}
+		d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
+		return { ...outcome, seeded: true };
+	} finally {
+		if (found.discovered) {
+			if (prev === undefined) delete process.env.ALATE_IMAGE;
+			else process.env.ALATE_IMAGE = prev;
 		}
 	}
+}
+
+/**
+ * Seeds the board's agent layer when the data source moved. The board-seed service is
+ * its only writer (never the worker-writable shared home). A failed seed never blocks
+ * the deploy, but the run exits 1: after the normal success line, or when the drain
+ * ends it early.
+ */
+async function seedBoard(
+	d: Deps,
+	compose: string[],
+	repo: string,
+	env: Record<string, string | undefined>,
+	serverWasRunning: boolean,
+): Promise<SeedOutcome> {
+	const untouched: SeedOutcome = {
+		seeded: false,
+		failed: false,
+		wantedSha: "",
+		expires: undefined,
+	};
+	const seed = await seedSource(d, env, repo);
+	if (seed === null) return untouched; // seedSource already logged the skip.
+	if ("failed" in seed) {
+		d.log(`board seed failed: ${seed.failed}`);
+		return { ...untouched, failed: true };
+	}
+	const outcome: SeedOutcome = {
+		seeded: false,
+		failed: false,
+		wantedSha: seed.wanted,
+		expires: seed.tokenExpires,
+	};
+	if ((await readSeedRecord(d, compose, serverWasRunning)) === seed.wanted) {
+		d.log(`board agent layer current at ${seed.wanted.slice(0, 12)}`);
+		return outcome;
+	}
+	return runSeed(d, compose, env, seed, outcome);
+}
+
+/**
+ * Waits out the running board's turns before the restart. Returns the early exit
+ * code, or null when `compose up` may proceed. serverImageChanged says whether the
+ * running server's image differs from the build, so up must not restart it again.
+ */
+async function drainTurns(
+	d: Deps,
+	compose: string[],
+	commits: string[],
+	seeded: boolean,
+	seedFailed: boolean,
+	serverWasRunning: boolean,
+	wantedSha: string,
+	stop: (why: string) => number,
+): Promise<{ early: number | null; serverImageChanged: boolean }> {
+	if (!serverWasRunning) {
+		d.log("no running board to count turns in; restarting anyway");
+		return { early: null, serverImageChanged: false };
+	}
+	// The build tags the server's image name; a server on another image means that the
+	// restart brings a new image. imageChanged compares the platform manifests where
+	// the containerd image store reports them: the image ids differ on every build.
+	const r = await imageChanged(d, compose, "server");
+	if ("error" in r)
+		return {
+			early: stop(
+				`the server's image cannot be compared with the build: ${r.error}`,
+			),
+			serverImageChanged: false,
+		};
+	const holdCommits = seeded
+		? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
+		: commits;
+	const early = await drainRunningBoard(
+		d,
+		compose,
+		holdCommits,
+		r.changed || seeded,
+		stop,
+	);
+	return {
+		early: early === 0 && seedFailed ? 1 : early,
+		serverImageChanged: r.changed,
+	};
+}
+
+/**
+ * Waits out the running turns and brings the stack up with --wait, and restarts a
+ * running server that keeps its image but took a seed. Returns the early exit code,
+ * or null when the stack is up.
+ */
+async function drainAndRestart(
+	d: Deps,
+	compose: string[],
+	commits: string[],
+	seeded: boolean,
+	seedFailed: boolean,
+	serverWasRunning: boolean,
+	wantedSha: string,
+	stop: (why: string) => number,
+): Promise<number | null> {
 	// No running board, no turn can run: merge turns die with the board and workers
 	// kill a turn when the board's request drops. Skip counting and go straight to up.
-	let serverImageChanged = false;
-	if (serverWasRunning) {
-		// The build tags the server's image name; a server on another image means that the
-		// restart brings a new image. imageChanged compares the platform manifests where
-		// the containerd image store reports them: the image ids differ on every build.
-		const r = await imageChanged(d, compose, "server");
-		if ("error" in r)
-			return stop(
-				`the server's image cannot be compared with the build: ${r.error}`,
-			);
-		serverImageChanged = r.changed;
-		const holdCommits = seeded
-			? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
-			: commits;
-		const early = await drainRunningBoard(
-			d,
-			compose,
-			holdCommits,
-			r.changed || seeded,
-			stop,
-		);
-		if (early !== null) return early === 0 && seedFailed ? 1 : early;
-	} else d.log("no running board to count turns in; restarting anyway");
+	const drained = await drainTurns(
+		d,
+		compose,
+		commits,
+		seeded,
+		seedFailed,
+		serverWasRunning,
+		wantedSha,
+		stop,
+	);
+	if (drained.early !== null) return drained.early;
 	// --wait fails the run when the recreated board never turns healthy, so the script
 	// never logs success for a crash-loop.
 	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
@@ -754,11 +884,26 @@ export async function updateImage(
 		return stop(`docker compose up --wait failed: ${up.out.trim()}`);
 	// The recreate already rebooted a server whose image changed, and up started a board
 	// that was down with the seed. Only a running board that keeps its image restarts.
-	if (seeded && serverWasRunning && !serverImageChanged) {
+	if (seeded && serverWasRunning && !drained.serverImageChanged) {
 		const rs = await d.docker("compose", ...compose, "restart", "server");
 		if (rs.code !== 0)
 			return stop(`docker compose restart server failed: ${rs.out.trim()}`);
 	}
+	return null;
+}
+
+/**
+ * Records the seed commit and the token expiry on the running board. Returns true when
+ * the seed record failed, so the run exits 1.
+ */
+async function recordSeed(
+	d: Deps,
+	compose: string[],
+	seeded: boolean,
+	wantedSha: string,
+	seedExpires: string | null | undefined,
+): Promise<boolean> {
+	let seedFailed = false;
 	// The record lands only after the board took the seed (recreate or restart): a run
 	// that ends early — turns still run past the hold — leaves it unwritten, so the
 	// next run seeds again and retries the restart. up has the server running here.
@@ -796,6 +941,54 @@ export async function updateImage(
 		if (w.code !== 0) d.log("board seed token expiry check failed");
 		else d.log(`board seed token expires ${seedExpires ?? "none"}`);
 	}
+	return seedFailed;
+}
+
+/** The run's exit code: 1 when it stopped early or failed, else 0. */
+export async function updateImage(
+	repo: string,
+	compose: string[],
+	d: Deps,
+	env: Record<string, string | undefined> = process.env,
+): Promise<number> {
+	const stop = (why: string): number => {
+		d.log(`stopped: ${why}`);
+		return 1;
+	};
+	const g = (...args: string[]) => git(args, repo);
+	const meta = await preflightAndRead(repo, g, stop);
+	if (typeof meta === "number") return meta;
+
+	const built = await buildAndSidecars(d, compose, repo, stop);
+	if (built !== null) return built;
+
+	// One ps lists the running services. A board that does not run cannot be counted,
+	// and that must not block every later deploy; a failed ps fails closed.
+	const services = await runningServices(d, compose, stop);
+	if (typeof services === "number") return services;
+	const serverWasRunning = services.includes("server");
+
+	const seed = await seedBoard(d, compose, repo, env, serverWasRunning);
+
+	const early = await drainAndRestart(
+		d,
+		compose,
+		meta.commits,
+		seed.seeded,
+		seed.failed,
+		serverWasRunning,
+		seed.wantedSha,
+		stop,
+	);
+	if (early !== null) return early;
+
+	const recordFailed = await recordSeed(
+		d,
+		compose,
+		seed.seeded,
+		seed.wantedSha,
+		seed.expires,
+	);
 	await d.docker(
 		"image",
 		"prune",
@@ -803,10 +996,10 @@ export async function updateImage(
 		"--filter",
 		"label=ottr.image=worker",
 	);
-	d.log(`the stack runs main at ${head} with omp ${omp}`);
+	d.log(`the stack runs main at ${meta.head} with omp ${meta.omp}`);
 	// ponytail: a dirty ALATE_DATA checkout records HEAD, so uncommitted edits do not
 	// retrigger a seed; the next pushed commit does.
-	return seedFailed ? 1 : 0;
+	return seed.failed || recordFailed ? 1 : 0;
 }
 
 if (import.meta.main) {

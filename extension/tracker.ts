@@ -171,6 +171,24 @@ export function runGitSecrets(env: NodeJS.ProcessEnv = process.env): string[] {
 }
 
 /** One pass, longest secret first: "[REDACTED]" is never rescanned (mirrors src/worktree.ts redact). */
+function scrubArray(
+	v: readonly unknown[],
+	scrub: (x: unknown) => unknown,
+): unknown {
+	const out = v.map((x) => scrub(x));
+	return out.some((x, i) => x !== v[i]) ? out : v;
+}
+function scrubRecord(
+	v: Record<string, unknown>,
+	scrub: (x: unknown) => unknown,
+): unknown {
+	const entries = Object.entries(v);
+	const out = entries.map(([k, x]) => [k, scrub(x)] as const);
+	return out.some(([, x], i) => x !== entries[i]?.[1])
+		? Object.fromEntries(out)
+		: v;
+}
+
 export function redactText(text: string, secrets: readonly string[]): string {
 	const live = secrets
 		.filter((s) => s !== "")
@@ -181,6 +199,24 @@ export function redactText(text: string, secrets: readonly string[]): string {
 		"g",
 	);
 	return text.replace(re, "[REDACTED]");
+}
+
+const trimmed = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+
+function requireBoardEnv():
+	| { error: string }
+	| { base: string; project: string; parent: string; token: string } {
+	const base = (process.env.OTTR_BOARD_URL ?? "").trim();
+	const project = (process.env.OTTR_PROJECT ?? "").trim();
+	const parent = (process.env.OTTR_TASK_ID ?? "").trim();
+	const token = (process.env.OTTR_BOARD_TOKEN ?? "").trim();
+	if (base === "" || project === "" || parent === "") {
+		return {
+			error:
+				"Error: create_task is unavailable — the tracker did not inject OTTR_BOARD_URL/OTTR_PROJECT/OTTR_TASK_ID into this session. File no cards; finish the turn and report the blocker.",
+		};
+	}
+	return { base, project, parent, token };
 }
 
 export default function (pi: Pi) {
@@ -199,17 +235,9 @@ export default function (pi: Pi) {
 		// their identity, so a result without a secret goes back to omp unchanged.
 		const scrub = (v: unknown): unknown => {
 			if (typeof v === "string") return redactText(v, secrets);
-			if (Array.isArray(v)) {
-				const out = v.map(scrub);
-				return out.some((x, i) => x !== v[i]) ? out : v;
-			}
-			if (typeof v === "object" && v !== null && v.constructor === Object) {
-				const entries = Object.entries(v);
-				const out = entries.map(([k, x]) => [k, scrub(x)] as const);
-				return out.some(([, x], i) => x !== entries[i]?.[1])
-					? Object.fromEntries(out)
-					: v;
-			}
+			if (Array.isArray(v)) return scrubArray(v, scrub);
+			if (typeof v === "object" && v !== null && v.constructor === Object)
+				return scrubRecord(v as Record<string, unknown>, scrub);
 			return v;
 		};
 		const content = scrub(e.content);
@@ -468,21 +496,13 @@ export default function (pi: Pi) {
 		loadMode: "essential",
 		approval: "read",
 		async execute(_toolCallId: string, params: CreateTaskParams) {
-			const base = (process.env.OTTR_BOARD_URL ?? "").trim();
-			const project = (process.env.OTTR_PROJECT ?? "").trim();
-			const parent = (process.env.OTTR_TASK_ID ?? "").trim();
-			const token = (process.env.OTTR_BOARD_TOKEN ?? "").trim();
-			if (base === "" || project === "" || parent === "") {
-				return textResult(
-					"Error: create_task is unavailable — the tracker did not inject OTTR_BOARD_URL/OTTR_PROJECT/OTTR_TASK_ID into this session. File no cards; finish the turn and report the blocker.",
-				);
-			}
-			const prompt =
-				typeof params.prompt === "string" ? params.prompt.trim() : "";
+			const env = requireBoardEnv();
+			if ("error" in env) return textResult(env.error);
+			const { base, project, parent, token } = env;
+			const prompt = trimmed(params.prompt);
 			if (prompt === "" || prompt.length > 20000) {
 				return textResult("Error: prompt must be 1-20000 characters.");
 			}
-			const model = typeof params.model === "string" ? params.model.trim() : "";
 			const dependsOn = parseDependsOn(params);
 			const filed = await fileCard({
 				base,
@@ -490,7 +510,7 @@ export default function (pi: Pi) {
 				parent,
 				token,
 				prompt,
-				model,
+				model: trimmed(params.model),
 				dependsOn,
 			});
 			if (!filed.ok) return textResult(filed.text);

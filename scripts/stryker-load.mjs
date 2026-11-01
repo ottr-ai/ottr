@@ -45,6 +45,18 @@ function lockHolderAlive(lockPath) {
 	}
 }
 
+function tryCreateLock(lockPath) {
+	try {
+		const fd = openSync(lockPath, "wx");
+		writeSync(fd, JSON.stringify({ pid: process.pid }));
+		closeSync(fd);
+		return true;
+	} catch (err) {
+		if (err?.code !== "EEXIST") throw err;
+		return false;
+	}
+}
+
 /**
  * Lets one mutation run at a time use a Stryker temp root: creates `<tempDirName>.lock` and
  * returns the release function, which the process exit hook calls. A second run waits and logs
@@ -58,31 +70,23 @@ export function acquireMutationLock(
 	const lockPath = `${tempDirName}.lock`;
 	const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Infinity;
 	let waited = false;
-	for (;;) {
-		try {
-			const fd = openSync(lockPath, "wx");
-			writeSync(fd, JSON.stringify({ pid: process.pid }));
-			closeSync(fd);
-			break;
-		} catch (err) {
-			if (err?.code !== "EEXIST") throw err;
-			if (!lockHolderAlive(lockPath)) {
-				rmSync(lockPath, { force: true });
-				continue;
-			}
-			if (Date.now() >= deadline) {
-				throw new Error(
-					`mutation lock ${lockPath} is still held by pid ${lockPid(lockPath)} after ${timeoutMs} ms`,
-				);
-			}
-			if (!waited) {
-				log(
-					`[stryker] waiting for the mutation lock ${lockPath} (pid ${lockPid(lockPath)})`,
-				);
-				waited = true;
-			}
-			sleepSync(500);
+	while (!tryCreateLock(lockPath)) {
+		if (!lockHolderAlive(lockPath)) {
+			rmSync(lockPath, { force: true });
+			continue;
 		}
+		if (Date.now() >= deadline) {
+			throw new Error(
+				`mutation lock ${lockPath} is still held by pid ${lockPid(lockPath)} after ${timeoutMs} ms`,
+			);
+		}
+		if (!waited) {
+			log(
+				`[stryker] waiting for the mutation lock ${lockPath} (pid ${lockPid(lockPath)})`,
+			);
+			waited = true;
+		}
+		sleepSync(500);
 	}
 	if (waited) log(`[stryker] mutation lock ${lockPath} acquired`);
 	const release = () => {
