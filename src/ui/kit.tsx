@@ -606,3 +606,22 @@ export function ProjectTag({ project }: { project: ProjectView }) {
 		</span>
 	);
 }
+
+/** The board header's logo, linked to the git(hub) origin: the GitHub view first, else the
+ * HTTPS origin remote; plain tag when the project has neither. */
+export function ProjectLogo({ project }: { project: ProjectView }) {
+	const url = project.github ?? project.remote;
+	return url === null ? (
+		<ProjectTag project={project} />
+	) : (
+		<a
+			href={url}
+			target="_blank"
+			rel="noopener noreferrer"
+			title="Repository origin"
+			aria-label="Repository origin"
+		>
+			<ProjectTag project={project} />
+		</a>
+	);
+}

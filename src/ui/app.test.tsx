@@ -26,7 +26,7 @@ const {
 	reportHtml,
 	Drawer,
 } = await import("./app.tsx");
-const { monogram, sourceIconUrl } = await import("./kit.tsx");
+const { monogram, sourceIconUrl, ProjectLogo } = await import("./kit.tsx");
 const {
 	alateHint,
 	provisionWatchStep,
@@ -90,6 +90,36 @@ describe("sourceIconUrl", () => {
 	});
 	test("a GitHub URL without an owner: nothing to adopt from", () => {
 		expect(sourceIconUrl(p("https://github.com/"))).toBe(null);
+	});
+});
+
+describe("ProjectLogo", () => {
+	const p = (github: string | null, remote: string | null) =>
+		({
+			remote,
+			icon: null,
+			name: "demo",
+			github,
+			// projectLabel reads settings.displayName; the monogram branch renders when no icon/remote exists.
+			settings: { displayName: null },
+		}) as Parameters<typeof ProjectLogo>[0]["project"];
+	const html = (x: Parameters<typeof ProjectLogo>[0]["project"]) =>
+		renderToStaticMarkup(<ProjectLogo project={x} />);
+	test("the GitHub view wins and opens in a new tab", () => {
+		const out = html(p("https://github.com/octo/repo", "https://x.test/r"));
+		expect(out).toContain('href="https://github.com/octo/repo"');
+		expect(out).toContain('rel="noopener noreferrer"');
+		expect(out).toContain("<img");
+	});
+	test("no GitHub: the HTTPS origin remote is the link", () => {
+		expect(html(p(null, "https://gitlab.com/octo/repo"))).toContain(
+			'href="https://gitlab.com/octo/repo"',
+		);
+	});
+	test("neither: a plain tag, no anchor", () => {
+		const out = html(p(null, null));
+		expect(out).not.toContain("<a ");
+		expect(out).toContain('class="ptag"');
 	});
 });
 

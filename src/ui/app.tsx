@@ -73,6 +73,7 @@ import {
 	Mark,
 	Meter,
 	Modal,
+	ProjectLogo,
 	ProjectTag,
 	post,
 	projectLabel,
@@ -2249,7 +2250,7 @@ function ProjectBoard({
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
 				<div className="project-id">
-					<ProjectTag project={project} />
+					<ProjectLogo project={project} />
 					<div className="project-id-text">
 						<h1 id="project-title">{projectLabel(project)}</h1>
 						<p className="project-meta">
