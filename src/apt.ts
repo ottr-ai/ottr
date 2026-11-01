@@ -28,16 +28,6 @@ export function aptListPath(project: string, home = homedir()): string {
 	return join(home, ".ottr", "workers", project, "apt.txt");
 }
 
-/** Every provisioned project folder with a safe name, sorted. */
-export function workerProjects(home = homedir()): string[] {
-	const dir = join(home, ".ottr", "workers");
-	return existsSync(dir)
-		? readdirSync(dir)
-				.sort()
-				.filter((p) => PROJECT.test(p))
-		: [];
-}
-
 /**
  * Runs `ensure` for every worker project in turn and joins its log lines. A project that
  * throws adds `<prefix><project>: <error>`, and the other projects still run.
