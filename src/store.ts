@@ -21,7 +21,7 @@ import {
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
 import { queueOrder } from "./scheduler.ts";
-import { firstSessionTitle, readTranscript } from "./session.ts";
+import { cleanTitle, firstSessionTitle, readTranscript } from "./session.ts";
 import { assignTopics } from "./topics.ts";
 import type {
 	AskQuestion,
@@ -1196,15 +1196,17 @@ export class ProjectStore {
 	}
 
 	/** The task's own session title: the stored one, or the first title in the session
-	 * transcript; null when neither exists yet. */
+	 * transcript; null when neither exists yet. Markdown from the titler is stripped on
+	 * read, so rows written before the cleaning also display clean. */
 	sessionTitle(task: Task): string | null {
 		const row = this.db
 			.query<{ session_title: string | null }, [string]>(
 				"SELECT session_title FROM tasks WHERE id = ?",
 			)
 			.get(task.id);
-		if (row?.session_title) return row.session_title;
-		return firstSessionTitle(this.sessionsDir, task.sessionId);
+		if (row?.session_title) return cleanTitle(row.session_title);
+		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
+		return fromSession === null ? null : cleanTitle(fromSession);
 	}
 
 	/** Persists a title once: `IS NULL` keeps the first name authoritative even if two writes race. */

@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	cleanTitle,
 	firstSessionTitle,
 	sessionContext,
 	sessionFile,
@@ -246,5 +247,21 @@ describe("sessionContext", () => {
 			sessionContext(d, "bbbb0000-0000-0000-0000-00000000000n"),
 		).toBeNull(); // no file
 		expect(sessionContext(d, null)).toBeNull();
+	});
+});
+
+describe("cleanTitle", () => {
+	test("strips Markdown a titler model echoes; mid-title marks and plain titles stay", () => {
+		expect(cleanTitle("**Task Name: OTTR-292**")).toBe("Task Name: OTTR-292");
+		expect(cleanTitle("## Set up agent rules")).toBe("Set up agent rules");
+		expect(cleanTitle("__Ship the fix__")).toBe("Ship the fix");
+		expect(cleanTitle("`Fix` the gate")).toBe("Fix` the gate"); // leading backtick only
+		// Mid-title marks are real code (`__init__`, `*args`): never stripped.
+		expect(cleanTitle("Fix __init__ override")).toBe("Fix __init__ override");
+		expect(cleanTitle("Handle *args forwarding")).toBe(
+			"Handle *args forwarding",
+		);
+		expect(cleanTitle("  spaced   out  ")).toBe("spaced out");
+		expect(cleanTitle("Plain title")).toBe("Plain title");
 	});
 });

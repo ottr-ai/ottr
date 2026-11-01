@@ -238,6 +238,21 @@ export function readTranscript(
 	return { sessionText, subagentTexts, complete };
 }
 
+/**
+ * Strips the Markdown a titler model echoes into a card title: leading heading marks and
+ * emphasis runs at the string edges (`**bold**`, `__ul__`, `*em*`, `` `code` ``). Marks in the
+ * middle stay: `_` and `*` are real in identifiers like `__init__` or `*args`, and a board
+ * title is prose, so only wrapped noise needs removing.
+ */
+export function cleanTitle(raw: string): string {
+	return raw
+		.replace(/^\s*#+\s*/, "")
+		.replace(/^[*_`]+/, "")
+		.replace(/[*_`]+$/, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 /** omp's per-file pieces of firstSessionTitle: the latest title from line 1, and the first title_change record. */
 function latestTitle(file: string): string | null {
 	try {

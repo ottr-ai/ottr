@@ -73,7 +73,12 @@ import {
 	WORK_CHECK_THIRD_BLOCK,
 	workCheckAsk,
 } from "./scheduler.ts";
-import { sessionFile, sessionHoldsPrompt, sessionModel } from "./session.ts";
+import {
+	cleanTitle,
+	sessionFile,
+	sessionHoldsPrompt,
+	sessionModel,
+} from "./session.ts";
 import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
 import type {
 	ArchReview,
@@ -145,13 +150,11 @@ export async function generateTitle(
 			spawn,
 			30_000,
 		);
-		// Same normalization as the extension's rename tool: one line, collapsed, ≤80 chars.
-		const title = raw
-			.split("\n")[0]
-			?.replace(/\s+/g, " ")
-			.trim()
-			.replace(/^["']+|["']+$/g, "")
-			.slice(0, 80);
+		// Same normalization as the extension's rename tool: one line, collapsed, ≤80 chars,
+		// with the Markdown a titler model echoes stripped.
+		const title = cleanTitle(
+			(raw.split("\n")[0] ?? "").trim().replace(/^["']+|["']+$/g, ""),
+		).slice(0, 80);
 		return title || null;
 	} catch {
 		return null;

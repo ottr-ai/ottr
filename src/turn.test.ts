@@ -10124,6 +10124,7 @@ describe("turn survivor round 5 — helpers", () => {
 			[`"Don't break 'quoted' words"`, "Don't break 'quoted' words"],
 			["Plain title", "Plain title"],
 			[`  'Spaced quote'  `, "Spaced quote"],
+			["**Task Name: OTTR-292**", "Task Name: OTTR-292"],
 		];
 		for (const [reply, title] of cases)
 			expect(await generateTitle("name me", gateway(reply).spawn)).toBe(title);

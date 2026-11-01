@@ -192,6 +192,28 @@ describe("frozenTitle", () => {
 		expect(store.frozenTitle(task)).toBe("Persisted"); // the first write stays authoritative
 		store.close();
 	});
+
+	test("a Markdown-wrapped title displays and persists clean, from transcript and stored row", () => {
+		const store = open(join(root, "frozen-title-markdown"));
+		const sid = "bbbb0000-0000-0000-0000-000000000201";
+		const task = store.updateTask(store.createTask("still untitled").id, {
+			sessionId: sid,
+		});
+		mkdirSync(store.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			'{"type":"title","v":1,"title":"**Task Name: OTTR-292**"}\n{"type":"session"}\n{"type":"title_change","title":"**Task Name: OTTR-292**"}\n',
+		);
+		expect(store.frozenTitle(task)).toBe("Task Name: OTTR-292");
+
+		// A row written dirty before the cleaning reads clean too — no migration needed.
+		const legacy = store.createTask("legacy dirty row");
+		store.nameTask(legacy.id, "**Task Name: OTTR-292**");
+		expect(store.sessionTitle(store.getTask(legacy.id)!)).toBe(
+			"Task Name: OTTR-292",
+		);
+		store.close();
+	});
 });
 
 describe("shortTitle", () => {
