@@ -514,6 +514,7 @@ describe("handoffMarkdown research report", () => {
 		details: "the answer",
 		report: null,
 		research: true,
+		starred: false,
 		createdAt: 1,
 		updatedAt: 1,
 		queuedAt: null,

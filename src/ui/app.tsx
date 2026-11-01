@@ -537,6 +537,7 @@ function Card({
 	hold,
 	drain,
 	locked,
+	onStar,
 }: {
 	task: TaskCard;
 	hasRules: boolean;
@@ -553,6 +554,8 @@ function Card({
 	drain?: boolean;
 	/** A reorder request for this card is in flight; the card dims and cannot start another drag. */
 	locked?: boolean;
+	/** Done research cards only: renders the star toggle; the handler posts and never opens the drawer. */
+	onStar?: () => void;
 }) {
 	const release = releaseOf(task);
 	const commits = task.stage === "done" ? task.commits : null;
@@ -690,22 +693,40 @@ function Card({
 					</span>
 				)}
 			</button>
-			{release !== null && (
+			{(release !== null ||
+				(task.stage === "done" && task.research && onStar)) && (
 				<span className="card-tags">
-					{github !== null ? (
-						<a
-							className="release"
-							href={`${github}/releases/tag/${release}`}
-							target="_blank"
-							rel="noopener noreferrer"
-							title={`GitHub release ${release}`}
+					{release !== null &&
+						(github !== null ? (
+							<a
+								className="release"
+								href={`${github}/releases/tag/${release}`}
+								target="_blank"
+								rel="noopener noreferrer"
+								title={`GitHub release ${release}`}
+							>
+								{release}
+							</a>
+						) : (
+							<span className="release" title={`Released ${release}`}>
+								{release}
+							</span>
+						))}
+					{task.stage === "done" && task.research && onStar && (
+						<button
+							type="button"
+							className="card-star"
+							aria-pressed={task.starred}
+							title={task.starred ? "Starred" : "Star this report"}
+							onClick={(e) => {
+								// The card body is a stretched open button: keep the click off it.
+								e.preventDefault();
+								e.stopPropagation();
+								onStar();
+							}}
 						>
-							{release}
-						</a>
-					) : (
-						<span className="release" title={`Released ${release}`}>
-							{release}
-						</span>
+							<Icon name="star" size={12} />
+						</button>
 					)}
 				</span>
 			)}
@@ -2577,12 +2598,16 @@ function ProjectBoard({
 					const doneGroups =
 						c.key === "done" && q === "" && grouped
 							? doneTopicPages(
-									col.filter((t) => !unread(t)),
+									col.filter((t) => !unread(t) && !t.starred),
 									topicLimits,
 								)
 							: null;
 					if (c.key === "done" && q === "" && !grouped) {
-						const page = donePage(col, unread, doneLimit);
+						const page = donePage(
+							col,
+							(t) => unread(t) || t.starred,
+							doneLimit,
+						);
 						col = page.shown;
 						doneHidden = page.hidden;
 					}
@@ -2693,6 +2718,18 @@ function ProjectBoard({
 											(prev.get(key) ?? DONE_PAGE) + DONE_PAGE,
 										),
 									)
+								}
+								onStar={
+									c.key === "done"
+										? (t) => {
+												void act(async () => {
+													await post(
+														`/api/projects/${encodeURIComponent(project.name)}/tasks/${t.id}/star`,
+														{ starred: !t.starred },
+													);
+												});
+											}
+										: undefined
 								}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -3469,6 +3506,7 @@ export function LaneCol({
 	more = 0,
 	onMore,
 	onTopicMore,
+	onStar,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
@@ -3489,6 +3527,8 @@ export function LaneCol({
 		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
 		| null;
 	onTopicMore?: (key: string) => void;
+	/** Done lane only: toggles a done research card's star; the socket frame refreshes the card. */
+	onStar?: (t: TaskCard) => void;
 	collapsed: Record<string, boolean>;
 	onToggle: (key: string) => void;
 	hasRules: boolean;
@@ -3637,6 +3677,7 @@ export function LaneCol({
 			fuOf={t.followUpOf}
 			onOpen={() => open(t.id)}
 			unread={unread(t)}
+			onStar={onStar ? () => onStar(t) : undefined}
 			locked={pending?.id === t.id}
 			drag={
 				dnd && !busy && t.state === "queued"
@@ -3664,6 +3705,9 @@ export function LaneCol({
 	);
 	// Done lane: unseen answers pin above a divider; read cards keep landing order (stable partition).
 	const fresh = stage === "done" ? tasks.filter((t) => unread(t)) : [];
+	// Done lane: starred research cards get their own collapsible section; unread wins over starred.
+	const starred =
+		stage === "done" ? tasks.filter((t) => t.starred && !unread(t)) : [];
 	return (
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop target for queued cards; keyboard users act through the card buttons
 		<div
@@ -3755,7 +3799,33 @@ export function LaneCol({
 			)}
 			{fresh.length > 0 && <p className="lane-label">Unread</p>}
 			{fresh.map(card)}
-			{fresh.length > 0 && fresh.length < tasks.length && (
+			{fresh.length > 0 && fresh.length + starred.length < tasks.length && (
+				<hr className="lane-divider" />
+			)}
+			{starred.length > 0 && (
+				<section
+					className="topic"
+					data-collapsed={collapsed.starred === true || undefined}
+				>
+					<button
+						type="button"
+						className="topic-head"
+						aria-expanded={collapsed.starred !== true}
+						aria-controls={`${uid}-topic-starred`}
+						onClick={() => onToggle("starred")}
+					>
+						<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+							<path d="M2 3l2 2 2-2" />
+						</svg>
+						<span className="lane-label">Starred</span>
+						<span className="topic-count">{starred.length}</span>
+					</button>
+					<div className="topic-body" id={`${uid}-topic-starred`}>
+						<div className="topic-cards">{starred.map(card)}</div>
+					</div>
+				</section>
+			)}
+			{starred.length > 0 && fresh.length + starred.length < tasks.length && (
 				<hr className="lane-divider" />
 			)}
 			{groups !== null
@@ -3804,7 +3874,7 @@ export function LaneCol({
 						);
 					})
 				: tasks
-						.filter((t) => !unread(t))
+						.filter((t) => !unread(t) && !t.starred)
 						.flatMap((t) => [
 							// The spinner slot stands in for the card while its reorder request is in flight.
 							pending?.before === t.id ? slot : null,
@@ -6925,6 +6995,26 @@ function Drawer({
 							>
 								<Icon name="eye-off" />
 								Mark unread
+							</BusyButton>
+						)}
+						{task.stage === "done" && task.research && (
+							<BusyButton
+								title={
+									task.starred
+										? "Removes this report from the Starred section"
+										: "Pins this report in the Starred section of the done lane"
+								}
+								run={() =>
+									act(async () => {
+										await post(
+											`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
+											{ starred: !task.starred },
+										);
+									})
+								}
+							>
+								<Icon name="star" />
+								{task.starred ? "Starred" : "Star"}
 							</BusyButton>
 						)}
 						<BusyButton

@@ -122,6 +122,7 @@ function task(p: Partial<Task> = {}): Task {
 		details: null,
 		report: null,
 		research: false,
+		starred: false,
 		createdAt: now,
 		updatedAt: now,
 		queuedAt: now,

@@ -198,6 +198,7 @@ interface TaskRow {
 	details: string | null;
 	report: string | null;
 	research: number;
+	starred: number;
 	created_at: number;
 	updated_at: number;
 	queued_at: number | null;
@@ -346,6 +347,7 @@ function toTask(project: string, r: TaskRow): Task {
 		details: r.details,
 		report: r.report,
 		research: r.research === 1,
+		starred: r.starred === 1,
 		createdAt: r.created_at,
 		updatedAt: r.updated_at,
 		queuedAt: r.queued_at,
@@ -533,6 +535,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	details: "details",
 	report: "report",
 	research: "research",
+	starred: "starred",
 	queuedAt: "queued_at",
 	cancelledAt: "cancelled_at",
 	commits: "commits",
@@ -1184,6 +1187,10 @@ export class ProjectStore {
 		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
 		if (!cols.includes("hold_until"))
 			db.exec("ALTER TABLE tasks ADD COLUMN hold_until INTEGER");
+		if (!cols.includes("starred"))
+			db.exec(
+				"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
+			);
 		return new ProjectStore(root, db);
 	}
 

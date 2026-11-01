@@ -445,6 +445,111 @@ describe("LaneCol backlog divider", () => {
 	});
 });
 
+describe("done lane star section", () => {
+	const base = {
+		projectTasks: [] as TaskCard[],
+		groups: null,
+		collapsed: {},
+		onToggle: () => {},
+		hasRules: true,
+		github: null,
+		deltas: new Map<string, number>(),
+		open: () => {},
+		unread: () => false,
+		onReorder: async () => {},
+		filtering: false,
+		draining: false,
+		onStar: () => {},
+	} as const;
+
+	test("a starred done research card renders the star pressed, a plain done card none", () => {
+		const research = cardFixture({
+			id: "r1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[research]} />,
+		);
+		expect(html).toContain("card-star");
+		expect(html).toContain('aria-pressed="true"');
+		expect(html).toContain('title="Starred"');
+		const plain = cardFixture({ id: "w1", stage: "done", state: "idle" });
+		const bare = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[plain]} />,
+		);
+		expect(bare).not.toContain("card-star");
+	});
+
+	test("the Starred section sits below Unread and above normal done cards", () => {
+		const freshCard = cardFixture({
+			id: "u1",
+			stage: "done",
+			state: "idle",
+			answered: true,
+		});
+		const starredCard = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[starredCard, normal, freshCard]}
+				unread={(t) => t.id === "u1"}
+			/>,
+		);
+		const unreadAt = html.indexOf(">Unread</p>");
+		const starredAt = html.indexOf(">Starred</span>");
+		const normalAt = html.indexOf('data-task-id="n1"');
+		expect(unreadAt).toBeGreaterThanOrEqual(0);
+		expect(starredAt).toBeGreaterThan(unreadAt);
+		expect(normalAt).toBeGreaterThan(starredAt);
+		// The starred card left the normal list.
+		expect(html.match(/data-task-id="s1"/g)?.length).toBe(1);
+	});
+
+	test("no Starred section renders without a starred card", () => {
+		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[normal]} />,
+		);
+		expect(html).not.toContain(">Starred</span>");
+	});
+
+	test("the Starred head toggles collapsed state", () => {
+		const starredCard = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const open = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[starredCard]} />,
+		);
+		expect(open).toContain('aria-expanded="true"');
+		expect(open).not.toContain("data-collapsed");
+		const shut = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[starredCard]}
+				collapsed={{ starred: true }}
+			/>,
+		);
+		expect(shut).toContain('aria-expanded="false"');
+		expect(shut).toContain('data-collapsed="true"');
+	});
+});
+
 describe("alateHint", () => {
 	test("a pending import is named; a provisioned server is not", () => {
 		expect(

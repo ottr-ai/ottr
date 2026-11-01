@@ -24,6 +24,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		details: null,
 		report: null,
 		research: false,
+		starred: false,
 		createdAt: 0,
 		updatedAt: 0,
 		queuedAt: null,

@@ -670,6 +670,20 @@ describe("task routes", () => {
 		expect(refusal.status).toBe(409);
 		expect(await errorOf(refusal)).toBe("task is not waiting for you");
 	});
+
+	test("star toggles the flag and rejects a non-boolean body", async () => {
+		const t = store.createTask("pin me");
+		expect(store.getTask(t.id)?.starred).toBe(false);
+		const res = await post(`/api/projects/p1/tasks/${t.id}/star`, {
+			starred: true,
+		});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)?.starred).toBe(true);
+		const bad = await post(`/api/projects/p1/tasks/${t.id}/star`, {
+			starred: "yes",
+		});
+		expect(bad.status).toBe(400);
+	});
 });
 
 describe("interview routes", () => {

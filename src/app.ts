@@ -4847,6 +4847,24 @@ export function createApp(deps: AppDeps) {
 					return json(taskView(e, e.store.updateTask(task.id, { model })));
 				}),
 		},
+		"/api/projects/:project/tasks/:id/star": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { e, task } = found;
+					if (typeof r.body.starred !== "boolean")
+						return json({ error: "starred must be a boolean" }, 400);
+					return json(
+						taskView(
+							e,
+							e.store.updateTask(task.id, { starred: r.body.starred }),
+						),
+					);
+				}),
+		},
 		"/api/projects/:project/tasks/:id/restart-session": {
 			POST: (req) =>
 				api(req, async () => {

@@ -2530,3 +2530,41 @@ describe("learnings", () => {
 		store.close();
 	});
 });
+
+describe("starred flag", () => {
+	test("a fresh task defaults to unstarred and updateTask persists the flag across reopen", () => {
+		const store = open(join(root, "starred"));
+		const task = store.createTask("pin me");
+		expect(task.starred).toBe(false);
+		store.updateTask(task.id, { starred: true });
+		expect(store.getTask(task.id)?.starred).toBe(true);
+		store.close();
+		const reopened = open(join(root, "starred"));
+		expect(reopened.getTask(task.id)?.starred).toBe(true);
+		reopened.close();
+	});
+
+	test("an old database without the starred column gains it with default 0 on open", () => {
+		const dir = join(root, "starred-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const ref = open(join(root, "starred-schema-ref"));
+		ref.close();
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(
+			`ATTACH '${join(root, "starred-schema-ref", ".tasks", "tasks.db")}' AS ref`,
+		);
+		db.exec("CREATE TABLE tasks AS SELECT * FROM ref.tasks WHERE 0");
+		db.exec("DETACH ref");
+		db.exec("ALTER TABLE tasks DROP COLUMN starred");
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'old card', 'todo', 'queued', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		const seed = store.getTask("seed1");
+		expect(seed?.title).toBe("old card");
+		expect(seed?.starred).toBe(false);
+		store.close();
+	});
+});

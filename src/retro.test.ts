@@ -56,6 +56,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		details: null,
 		report: null,
 		research: false,
+		starred: false,
 		createdAt: 1,
 		updatedAt: 1,
 		queuedAt: 1,

@@ -224,6 +224,8 @@ export interface Task {
 	report: string | null;
 	/** Research card: answers a question instead of changing code; ends answered with a report file, never integrates. */
 	research: boolean;
+	/** Pinned by the user on a done research card so its report stays findable; UI-only, no pipeline effect. */
+	starred: boolean;
 	/** Epoch milliseconds. */
 	createdAt: number;
 	updatedAt: number;

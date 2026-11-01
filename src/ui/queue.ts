@@ -95,15 +95,15 @@ export function laneCounts<T extends LaneTask>(
 	return { shown, counts };
 }
 
-/** The done lane's visible page: the newest `limit` cards, grown to cover every unread answer so
- * a pinned card can never sit behind the cut. Returns the slice and how many cards stay hidden
- * behind the "Show more" button (0 renders no button). */
+/** The done lane's visible page: the newest `limit` cards, grown to cover every pinned card (unread
+ * answers and starred cards) so a pinned card never sits behind the cut. Returns the slice and how
+ * many cards stay hidden behind the "Show more" button (0 renders no button). */
 export function donePage<T>(
 	tasks: readonly T[],
-	unread: (t: T) => boolean,
+	pinned: (t: T) => boolean,
 	limit: number,
 ): { shown: T[]; hidden: number } {
-	const lastFresh = tasks.reduce((last, t, i) => (unread(t) ? i : last), -1);
+	const lastFresh = tasks.reduce((last, t, i) => (pinned(t) ? i : last), -1);
 	const cut = Math.max(limit, lastFresh + 1);
 	const hidden = Math.max(0, tasks.length - cut);
 	// The caller treats the returned array as read-only, so the uncropped branch hands back

@@ -18,6 +18,9 @@ export function clamp(n: number, lo: number, hi: number): number {
 // satisfies keeps `keyof typeof ICON_PATHS` a literal union: an unknown <Icon name> fails tsc.
 const ICON_PATHS = {
 	plus: <path d="M12 5v14M5 12h14" />,
+	star: (
+		<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+	),
 	x: <path d="M18 6L6 18M6 6l12 12" />,
 	stop: <rect x="6" y="6" width="12" height="12" rx="1.5" />,
 	folder: (

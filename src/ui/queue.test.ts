@@ -331,4 +331,12 @@ describe("donePage", () => {
 		expect(page.shown).toEqual(n(20));
 		expect(page.hidden).toBe(25);
 	});
+
+	test("a starred card older than the limit grows the cut to include it", () => {
+		const tasks = n(45);
+		// A starred card among the old ones pins like an unread answer: the cut covers it.
+		const page = donePage(tasks, (t) => t === "t5" || t === "t30", 20);
+		expect(page.shown).toEqual(n(31));
+		expect(page.hidden).toBe(14);
+	});
 });
