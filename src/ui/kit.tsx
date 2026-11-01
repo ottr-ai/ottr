@@ -385,9 +385,8 @@ const MARK_SHAPES: Record<MarkKind, ReactNode> = {
 		</>
 	),
 	running: <circle cx="8" cy="8" r="4.5" />,
-	preparing: (
-		<circle cx="8" cy="8" r="4.5" strokeDasharray="2.5 2.5" fill="none" />
-	),
+	// A preparing task has been started (the tracker is provisioning): full dot like running, not the queued ring.
+	preparing: <circle cx="8" cy="8" r="4.5" />,
 	queued: <circle cx="8" cy="8" r="4" />,
 	done: <path d="M3.2 8.4l3.1 3.1 6.5-7" />,
 };

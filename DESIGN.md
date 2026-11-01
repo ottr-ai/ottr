@@ -134,7 +134,7 @@ Flat by default. Panels, cards, and the active area are separated by 1px lines (
 
 ## Shapes
 
-Small radii, technical not friendly: 3px for chips and micro-badges, 4px for buttons, inputs, cards, and area rows, 6px for large containers (stages, overview table, dialogs, popover). State marks are exact: filled dot (running), ring (queued), check (done), triangle (needs-you), square (critical) — all 16px viewBox, 12–14px rendered, with dark "!" ink strokes; on the red square the ink flips to near-white. The single exception: the phone-only New task FAB is a 56px full circle — a floating action only reads as a primary target when it is a circle.
+Small radii, technical not friendly: 3px for chips and micro-badges, 4px for buttons, inputs, cards, and area rows, 6px for large containers (stages, overview table, dialogs, popover). State marks are exact: filled dot (running, preparing), ring (queued), check (done), triangle (needs-you), square (critical) — all 16px viewBox, 12–14px rendered, with dark "!" ink strokes; on the red square the ink flips to near-white. The single exception: the phone-only New task FAB is a 56px full circle — a floating action only reads as a primary target when it is a circle.
 
 **The Shape-Says-It Rule.** State marks are a closed set of five glyphs. New states pick a glyph, not a colour.
 

@@ -409,17 +409,13 @@ textarea {
 .mark-crit .mark-ink {
 	stroke: #fff4f2;
 }
-.mark-running {
+.mark-running,
+.mark-preparing {
 	fill: var(--text-strong);
 	/* Slow breath so live tasks stand out at a glance; silent design keeps it opacity-only. */
 	animation: mark-breathe 3.2s ease-in-out infinite;
 }
 .mark-queued {
-	fill: none;
-	stroke: var(--dim);
-	stroke-width: 1.6;
-}
-.mark-preparing {
 	fill: none;
 	stroke: var(--dim);
 	stroke-width: 1.6;
