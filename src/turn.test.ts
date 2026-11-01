@@ -5898,6 +5898,35 @@ describe("turn ownership, cap and settle regressions", () => {
 		expect(store.listTurns(task.id)[0]!.input).toBe("also bump the chart");
 	});
 
+	test("the delivered input keeps the park's authorship: supervisor parks vs user steers", async () => {
+		const { store, loop } = setup();
+		const held = store.createTask("merge please");
+		store.updateTask(held.id, {
+			stage: "merging",
+			branch: "ott/x",
+			base: "sha0",
+			worktree: "wt-x",
+			sessionId: "s1",
+			pendingPrompt: "the check sent this back",
+			pendingBy: "supervisor",
+		});
+		await loop.runTurn(store.name, held.id);
+		expect(store.listTurns(held.id)[0]!.inputBy).toBe("supervisor");
+
+		const steered = store.createTask("merge please two");
+		store.updateTask(steered.id, {
+			stage: "merging",
+			branch: "ott/y",
+			base: "sha0",
+			worktree: "wt-y",
+			sessionId: "s2",
+			pendingPrompt: "also bump the chart",
+			pendingBy: "user",
+		});
+		await loop.runTurn(store.name, steered.id);
+		expect(store.listTurns(steered.id)[0]!.inputBy).toBe("user");
+	});
+
 	test("a pending reply reaches a fresh interview session", async () => {
 		const { store, record, loop } = setup();
 		const task = store.createTask(

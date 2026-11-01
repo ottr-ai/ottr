@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS turns (
   kind TEXT NOT NULL CHECK (kind IN ('work','merge')),
   prompt TEXT NOT NULL,
   input TEXT,
+  input_by TEXT,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
   pid INTEGER,
@@ -191,6 +192,7 @@ interface TaskRow {
 	state: string;
 	needs_reason: string | null;
 	pending_prompt: string | null;
+	pending_by: string | null;
 	branch: string | null;
 	base: string | null;
 	worktree: string | null;
@@ -297,6 +299,7 @@ interface TurnRow {
 	kind: string;
 	prompt: string;
 	input: string | null;
+	input_by: string | null;
 	started_at: number;
 	ended_at: number | null;
 	pid: number | null;
@@ -342,6 +345,7 @@ function toTask(project: string, r: TaskRow): Task {
 		state: r.state as RunState,
 		needsReason: r.needs_reason,
 		pendingPrompt: r.pending_prompt,
+		pendingBy: r.pending_by as "user" | "supervisor" | null,
 		branch: r.branch,
 		base: r.base,
 		worktree: r.worktree,
@@ -500,6 +504,7 @@ function toTurn(r: TurnRow): Turn {
 		kind: r.kind as TurnKind,
 		prompt: r.prompt,
 		input: r.input,
+		inputBy: r.input_by as "user" | "supervisor" | null,
 		startedAt: r.started_at,
 		endedAt: r.ended_at,
 		pid: r.pid,
@@ -530,6 +535,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	state: "state",
 	needsReason: "needs_reason",
 	pendingPrompt: "pending_prompt",
+	pendingBy: "pending_by",
 	branch: "branch",
 	base: "base",
 	worktree: "worktree",
@@ -579,6 +585,7 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	error: "error",
 	model: "model",
 	input: "input",
+	inputBy: "input_by",
 };
 
 /**
@@ -1138,6 +1145,10 @@ export class ProjectStore {
 		for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
 			if (!cols.includes(col))
 				db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
+		// Who authored pending_prompt ("user" | "supervisor"): ALTER-only after the
+		// rebuilds, same reason as priority above; null behaves as "user" on old rows.
+		if (!cols.includes("pending_by"))
+			db.exec("ALTER TABLE tasks ADD COLUMN pending_by TEXT");
 		const turnCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
 			.all()
@@ -1146,6 +1157,9 @@ export class ProjectStore {
 			db.exec("ALTER TABLE turns ADD COLUMN model TEXT");
 		if (!turnCols.includes("input"))
 			db.exec("ALTER TABLE turns ADD COLUMN input TEXT");
+		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
+		if (!turnCols.includes("input_by"))
+			db.exec("ALTER TABLE turns ADD COLUMN input_by TEXT");
 		// Cost capture columns: nullable, so plain ADD COLUMN converges like the
 		// tasks columns above; the backfill below fills what the transcripts still allow.
 		for (const col of [
@@ -1794,11 +1808,12 @@ export class ProjectStore {
 		pid: number | null,
 		input: string | null = null,
 		model: string | null = null,
+		inputBy: "user" | "supervisor" | null = null,
 	): Turn {
 		const now = Date.now();
 		const { lastInsertRowid } = this.db.run(
-			"INSERT INTO turns (task_id, kind, prompt, input, started_at, pid, model) VALUES (?, ?, ?, ?, ?, ?, ?)",
-			[taskId, kind, prompt, input, now, pid, model],
+			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			[taskId, kind, prompt, input, inputBy, now, pid, model],
 		);
 		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 		const row = this.db

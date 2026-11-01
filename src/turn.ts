@@ -539,6 +539,9 @@ export function createTurnLoop(
 				cur.pendingPrompt === null
 					? hold.pendingPrompt
 					: `${cur.pendingPrompt}\n\n${hold.pendingPrompt}`,
+			// A hold appended under queued user text keeps that text's authorship; a fresh
+			// hold park is the board's own voice.
+			pendingBy: cur.pendingPrompt === null ? "supervisor" : cur.pendingBy,
 		};
 	}
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
@@ -613,6 +616,8 @@ export function createTurnLoop(
 				!sessionHoldsPrompt(store.sessionsDir, cur.sessionId, lost.prompt)
 					? `${lost.prompt}\n\n${base}`
 					: base,
+			// Queued user text keeps its authorship; the board's own resume text is supervisor.
+			pendingBy: cur.pendingPrompt !== null ? cur.pendingBy : "supervisor",
 		});
 	}
 
@@ -1484,7 +1489,17 @@ export function createTurnLoop(
 				live.pendingImages.every((n, i) => restImages[i] === n)
 			)
 				restImages = restImages.slice(live.pendingImages.length);
-			store.updateTask(id, { pendingPrompt: rest, pendingImages: restImages });
+			store.updateTask(id, {
+				pendingPrompt: rest,
+				pendingImages: restImages,
+				// rest holds only steering that landed mid-run (user); a full consume clears.
+				pendingBy: rest === null ? null : "user",
+			});
+			const turnInput =
+				pending &&
+				(plan.resumeId !== null || (plan.note !== null && pending !== "."))
+					? pending
+					: null;
 			turn = store.startTurn(
 				id,
 				kind,
@@ -1493,13 +1508,13 @@ export function createTurnLoop(
 				// The user text this turn delivered (steer or reply) — the timeline shows it on the turn.
 				// A fresh session that folded the reply into its prompt records it here too; the "."
 				// continue marker is not user text.
-				pending &&
-					(plan.resumeId !== null || (plan.note !== null && pending !== "."))
-					? pending
-					: null,
+				turnInput,
 				// The dispatch snapshot: the --model this turn starts with, so the card states the
 				// selected model while it runs; the settled row keeps what the stream served.
 				runModel,
+				// live was read with raw, so its pendingBy is raw's authorship (a mid-run steer
+				// lands after this read and rides the next turn).
+				turnInput !== null ? live.pendingBy : null,
 			);
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
@@ -1923,6 +1938,8 @@ export function createTurnLoop(
 				next = {
 					...next,
 					pendingPrompt: sent.join("\n\n") || (raw ?? undefined),
+					// raw's authorship leads the re-park; a null behaves as user.
+					pendingBy: live.pendingBy ?? "user",
 				};
 			}
 			// Steering queued while the turn ran: deliver it as the next turn instead of settling
@@ -1973,6 +1990,7 @@ export function createTurnLoop(
 								dependsOn: merged,
 							}),
 							pendingPrompt: DEP_HELD_PROMPT,
+							pendingBy: "supervisor",
 						};
 				}
 			}
@@ -2042,6 +2060,7 @@ export function createTurnLoop(
 								needsReason:
 									"no screenshot attached - resuming automatically to capture one. Cancel to stop it instead.",
 								pendingPrompt: uiShotReprompt(ui),
+								pendingBy: "supervisor",
 							};
 						else
 							next = {
@@ -2203,6 +2222,11 @@ export function createTurnLoop(
 						}),
 				shots,
 				pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
+				// Authorship rides only when the prompt is actually written; classify's
+				// automatic continue is the board's own voice.
+				...(next.pendingPrompt !== undefined
+					? { pendingBy: next.pendingBy ?? "supervisor" }
+					: {}),
 				asked: next.asked ?? null, // updateTask stringifies arrays; null clears — cleared whenever the turn did not end on a fresh ask
 				summary:
 					releaseCard && next.stage === "done"
@@ -2520,6 +2544,7 @@ export function createTurnLoop(
 									attempt: sendbacks + 1,
 									max: 2,
 								}),
+								pendingBy: "supervisor",
 								needsReason: null,
 								workCheckLog: runs,
 								workCheckHead: head,

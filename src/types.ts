@@ -208,6 +208,9 @@ export interface Task {
 	needsReason: string | null;
 	/** Reply text waiting to be sent with the next turn. */
 	pendingPrompt: string | null;
+	/** Who authored pendingPrompt: "user" (steer/reply routes) or "supervisor" (tracker-parked:
+	 * holds, check send-backs, auto-resumes, tend replies). null behaves as "user". */
+	pendingBy: "user" | "supervisor" | null;
 	/** Image file names (in the task's images folder) pasted with the original prompt; sent with every work turn that sends the original prompt. */
 	images: string[];
 	/** Image file names pasted with the pending reply; sent with the next turn only. */
@@ -345,6 +348,8 @@ export interface Turn {
 	prompt: string;
 	/** User text this turn delivered (reply or steering); null for turns started from the task prompt. */
 	input: string | null;
+	/** Who authored input: "user" or "supervisor" (tracker-parked text the turn delivered). null behaves as "user". */
+	inputBy: "user" | "supervisor" | null;
 	startedAt: number;
 	endedAt: number | null;
 	pid: number | null;
@@ -424,6 +429,8 @@ export interface Next {
 	needsReason: string | null;
 	/** Automatic continue, sent as the next turn's reply. */
 	pendingPrompt?: string;
+	/** Who authored pendingPrompt; defaults to "supervisor" when the settle writes it. */
+	pendingBy?: "user" | "supervisor" | null;
 	/** Outstanding agent ask to store on the task (the "?" state); absent/undefined clears nothing by itself. */
 	asked?: AskQuestion[];
 	/** The turn died in the provider-rejects-images shape: the caller moves the attached files to

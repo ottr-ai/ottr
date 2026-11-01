@@ -90,6 +90,7 @@ describe("mergeAnywayPatch", () => {
 			state: "queued",
 			queuedAt: patch.queuedAt,
 			pendingPrompt: null,
+			pendingBy: null,
 			needsReason: null,
 			asked: null,
 		});
@@ -111,6 +112,7 @@ function task(p: Partial<Task> = {}): Task {
 		state: "queued",
 		needsReason: null,
 		pendingPrompt: null,
+		pendingBy: null,
 		images: [],
 		pendingImages: [],
 		shots: [],

@@ -463,6 +463,7 @@ export function createSupervisor(
 				needsReason: null,
 				queuedAt: ops.now(),
 				pendingPrompt: ".",
+				pendingBy: "supervisor",
 			});
 			ops.appendLog(
 				e.store,
@@ -703,6 +704,7 @@ export function createSupervisor(
 		// The reply path a human uses (mirrors POST /tasks/:id/reply), attributed [supervisor].
 		e.store.updateTask(c.id, {
 			pendingPrompt: c.plan.reply,
+			pendingBy: "supervisor",
 			pendingImages: [],
 			state: "queued",
 			queuedAt: now,

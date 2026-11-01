@@ -558,6 +558,7 @@ export function mergeAnywayPatch(
 		state: "queued" as const,
 		queuedAt: Date.now(),
 		pendingPrompt: null,
+		pendingBy: null,
 		needsReason: null,
 		asked: null,
 	};

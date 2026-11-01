@@ -4631,6 +4631,7 @@ export function createApp(deps: AppDeps) {
 									attempt: n,
 									max: n,
 								}),
+								pendingBy: "supervisor",
 								workCheckSendbacks: n,
 								state: "queued",
 								queuedAt: Date.now(),
@@ -4669,6 +4670,7 @@ export function createApp(deps: AppDeps) {
 					e.store.updateTask(task.id, {
 						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
 						pendingPrompt: trimmed || ".",
+						pendingBy: "user",
 						pendingImages: names,
 						state: "queued",
 						queuedAt: Date.now(),
@@ -4850,6 +4852,9 @@ export function createApp(deps: AppDeps) {
 							task.pendingPrompt === null
 								? prompt
 								: `${task.pendingPrompt}\n\n${prompt}`,
+						// ponytail: user text appended under supervisor text keeps "supervisor" —
+						// a combined park is never titled as the human's words alone.
+						pendingBy: task.pendingBy === "supervisor" ? "supervisor" : "user",
 						pendingImages: [...task.pendingImages, ...names],
 						// A message on a card held for a usage limit runs it now.
 						holdUntil: null,
@@ -4882,6 +4887,7 @@ export function createApp(deps: AppDeps) {
 						task.state === "queued" && task.stage !== "todo";
 					const t = e.store.updateTask(task.id, {
 						pendingPrompt: null,
+						pendingBy: null,
 						pendingImages: [],
 						...(queuedOnlyForTheSteer
 							? {
@@ -4963,6 +4969,7 @@ export function createApp(deps: AppDeps) {
 						pendingImages: [],
 						asked: null, // a fresh session knows nothing of the old ask
 						pendingPrompt: LOST_SESSION,
+						pendingBy: "supervisor",
 						state: "queued",
 						queuedAt: Date.now(),
 						needsReason: null,

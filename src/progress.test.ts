@@ -13,6 +13,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		state: "idle",
 		needsReason: null,
 		pendingPrompt: null,
+		pendingBy: null,
 		images: [],
 		pendingImages: [],
 		shots: [],

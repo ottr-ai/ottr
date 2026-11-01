@@ -6659,7 +6659,9 @@ export function Drawer({
 									    turn below, and it is display-only (the row's click-to-toggle skips it). */}
 									{t.input !== null && (
 										<div className="you">
-											<span className="you-head">You</span>
+											<span className="you-head">
+												{t.inputBy === "supervisor" ? "Supervisor" : "You"}
+											</span>
 											<div className="you-bubble">
 												{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
 												{t.input.trim() === "." ? (

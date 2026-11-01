@@ -543,6 +543,7 @@ describe("handoffMarkdown research report", () => {
 		workCheckHead: null,
 		priority: null,
 		closeCandidate: null,
+		pendingBy: null,
 	};
 
 	test("carries the full report markdown", () => {

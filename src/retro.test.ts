@@ -29,6 +29,7 @@ function turn(p: Partial<Turn> = {}): Turn {
 		question: null,
 		error: null,
 		model: null,
+		inputBy: null,
 		...p,
 	};
 }
@@ -45,6 +46,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		state: "idle",
 		needsReason: null,
 		pendingPrompt: null,
+		pendingBy: null,
 		images: [],
 		pendingImages: [],
 		shots: [],

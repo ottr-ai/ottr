@@ -596,6 +596,33 @@ describe("diff capture columns", () => {
 	});
 });
 
+describe("speaker attribution", () => {
+	test("pendingBy and turn inputBy persist across a reopen; legacy rows read as null", () => {
+		const dir = join(root, "pending-by");
+		const store = open(dir);
+		const task = store.createTask("hold me");
+		expect(task.pendingBy).toBe(null);
+		store.updateTask(task.id, { pendingBy: "supervisor" });
+		expect(store.getTask(task.id)!.pendingBy).toBe("supervisor");
+		const turn = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			"the board parked this",
+			null,
+			"supervisor",
+		);
+		expect(turn.inputBy).toBe("supervisor");
+		store.updateTask(task.id, { pendingBy: null });
+		store.close();
+		const reopened = open(dir);
+		expect(reopened.getTask(task.id)!.pendingBy).toBe(null);
+		expect(reopened.listTurns(task.id)[0]!.inputBy).toBe("supervisor");
+		reopened.close();
+	});
+});
+
 describe("keptFiles", () => {
 	test("updateTask stores and clears the list; fresh stores default to empty", () => {
 		const store = open(join(root, "kept"));
