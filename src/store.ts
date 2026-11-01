@@ -1766,11 +1766,12 @@ export class ProjectStore {
 		prompt: string,
 		pid: number | null,
 		input: string | null = null,
+		model: string | null = null,
 	): Turn {
 		const now = Date.now();
 		const { lastInsertRowid } = this.db.run(
-			"INSERT INTO turns (task_id, kind, prompt, input, started_at, pid) VALUES (?, ?, ?, ?, ?, ?)",
-			[taskId, kind, prompt, input, now, pid],
+			"INSERT INTO turns (task_id, kind, prompt, input, started_at, pid, model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			[taskId, kind, prompt, input, now, pid, model],
 		);
 		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 		const row = this.db
@@ -1851,6 +1852,17 @@ export class ProjectStore {
 			)
 			.all(taskId)
 			.map(toTurn);
+	}
+
+	/** Model of the task's newest turn that saw one (a run's snapshot); null when no turn recorded a model. */
+	lastTurnModel(taskId: string): string | null {
+		return (
+			this.db
+				.query<{ model: string | null }, [string]>(
+					"SELECT model FROM turns WHERE task_id = ? AND model IS NOT NULL ORDER BY id DESC LIMIT 1",
+				)
+				.get(taskId)?.model ?? null
+		);
 	}
 
 	/** Appends one lifecycle event; every stat derives from this log plus the tasks and turns tables. */

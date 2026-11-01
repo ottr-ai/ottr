@@ -1675,6 +1675,10 @@ export function createApp(deps: AppDeps) {
 								t.stage === "done" &&
 								!isRetro(t) &&
 								answeredCard(e.store.listTurns(t.id)),
+							// A default card pins no model; the chip states what the last run actually used.
+							...(t.model === null
+								? { lastModel: e.store.lastTurnModel(t.id) }
+								: {}),
 							...(progress ? { progress } : {}),
 							...(silent !== null ? { silentSince: silent } : {}),
 						});

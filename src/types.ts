@@ -605,6 +605,8 @@ export type TaskCard = Omit<
 	answered: boolean;
 	/** Live progress of a long tool run in the card's running turn (a Stryker run today); absent otherwise. */
 	progress?: string;
+	/** Model of the card's last run; present only when the card pins no model, so the chip can state what actually ran. */
+	lastModel?: string | null;
 	/** Epoch ms of the last log write, present only while a preparing or running card's log has been
 	 * silent past the board's limit (SILENT_LOG_MS in src/scheduler.ts): the agent may wait on a hung command. */
 	silentSince?: number;

@@ -86,6 +86,23 @@ describe("turn model", () => {
 		store.close();
 	});
 
+	test("lastTurnModel returns the newest turn that recorded a model", () => {
+		const store = open(join(root, "last-model"));
+		const task = store.createTask("snapshot");
+		expect(store.lastTurnModel(task.id)).toBeNull(); // nothing ran
+		const first = store.startTurn(task.id, "work", "p", null);
+		store.finishTurn(first.id, { endedAt: Date.now(), model: "a/one" });
+		// A running turn records its dispatch model at start, so the chip states it while it runs.
+		const second = store.startTurn(task.id, "work", "p", null, null, "a/two");
+		expect(store.lastTurnModel(task.id)).toBe("a/two");
+		store.finishTurn(second.id, { endedAt: Date.now(), model: "a/two" });
+		expect(store.lastTurnModel(task.id)).toBe("a/two");
+		// A running turn without a model leaves the last recorded one standing.
+		store.startTurn(task.id, "work", "p", null);
+		expect(store.lastTurnModel(task.id)).toBe("a/two");
+		store.close();
+	});
+
 	test("open backfills turns.model on a pre-existing database", () => {
 		const dir = join(root, "legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });

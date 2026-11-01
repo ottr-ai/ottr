@@ -1497,6 +1497,9 @@ export function createTurnLoop(
 					(plan.resumeId !== null || (plan.note !== null && pending !== "."))
 					? pending
 					: null,
+				// The dispatch snapshot: the --model this turn starts with, so the card states the
+				// selected model while it runs; the settled row keeps what the stream served.
+				runModel,
 			);
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
@@ -2156,7 +2159,8 @@ export function createTurnLoop(
 				endedAt: now,
 				exitCode: result.exitCode,
 				// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
-				model: turnModel(result.model, runModel),
+				// Without a served model (a crash before message_start) the dispatch snapshot stands.
+				model: turnModel(result.model, runModel) ?? turn.model,
 				outcome: result.outcome?.status ?? null,
 				summary: result.outcome?.summary ?? null,
 				details: result.outcome?.details ?? (result.finalText || null),

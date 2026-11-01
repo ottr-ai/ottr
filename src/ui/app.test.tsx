@@ -264,6 +264,45 @@ describe("LaneCol backlog divider", () => {
 		expect(work).toContain('title="Answered; not opened yet"');
 	});
 
+	test("a default card's chip states the model its last run used", () => {
+		const ran = cardFixture({
+			id: "t1",
+			stage: "todo",
+			state: "running",
+			model: null,
+			lastModel: "zai/glm-5.3-flash",
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[ran]} />,
+		);
+		expect(html).toContain(">zai/glm-5.3-flash</span>");
+		expect(html).toContain("Main loop model: zai/glm-5.3-flash (last run)");
+		// No run recorded a model yet: the chip stays on the literal default.
+		const fresh = cardFixture({
+			id: "t2",
+			stage: "todo",
+			state: "queued",
+			model: null,
+		});
+		const bare = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[fresh]} />,
+		);
+		expect(bare).toContain(">default</span>");
+		// A pinned model wins over the run history.
+		const pinned = cardFixture({
+			id: "t3",
+			stage: "todo",
+			state: "queued",
+			model: "a/big",
+			lastModel: "a/one",
+		});
+		const pin = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[pinned]} />,
+		);
+		expect(pin).toContain(">a/big</span>");
+		expect(pin).toContain('title="Main loop model: a/big"');
+	});
+
 	test("a lane with only backlog cards still renders", () => {
 		const parked = cardFixture({ id: "b1", stage: "backlog", state: "idle" });
 		const html = renderToStaticMarkup(

@@ -660,9 +660,9 @@ function Card({
 					{task.stage !== "done" && (
 						<span
 							className="model"
-							title={`Main loop model: ${task.model ?? "default"}`}
+							title={`Main loop model: ${task.model ?? task.lastModel ?? "default"}${task.model === null && task.lastModel ? " (last run)" : ""}`}
 						>
-							{task.model ?? "default"}
+							{task.model ?? task.lastModel ?? "default"}
 						</span>
 					)}
 					{commits !== null && (

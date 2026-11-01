@@ -608,21 +608,28 @@ describe("task routes", () => {
 	test("state cards omit details and report", async () => {
 		const t = store.createTask("card shape");
 		store.updateTask(t.id, { details: "secret", report: "finding" });
+		// A default card carries the model its last run used.
+		store.finishTurn(store.startTurn(t.id, "work", "p", null).id, {
+			model: "zai/glm-5.3-flash",
+		});
 		const res = await get("/api/state");
 		const b: unknown = await res.json();
 		if (typeof b !== "object" || b === null || !("tasks" in b)) {
 			expect.unreachable("state response missing tasks");
 		}
 		const { tasks } = b as { tasks: unknown };
-		const cards = Array.isArray(tasks) ? tasks : [];
-		const card = cards.find(
-			(c) => typeof c === "object" && c !== null && "id" in c && c.id === t.id,
-		);
-		if (typeof card !== "object" || card === null) {
+		// The server's own state payload; only the fields this test reads are named.
+		const cards = (Array.isArray(tasks) ? tasks : []) as Array<{
+			id: string;
+			lastModel?: string | null;
+		}>;
+		const card = cards.find((c) => c.id === t.id);
+		if (card === undefined) {
 			expect.unreachable("card for created task missing");
 		}
 		expect(card).not.toHaveProperty("details");
 		expect(card).not.toHaveProperty("report");
+		expect(card.lastModel).toBe("zai/glm-5.3-flash");
 	});
 
 	test("edit persists a new prompt on a todo task and rejects bad ids", async () => {
