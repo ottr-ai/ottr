@@ -994,3 +994,83 @@ describe("Drawer parent chip", () => {
 		expect(html).toContain('title="P-9 is not on the board"');
 	});
 });
+
+describe("Drawer prompt markdown", () => {
+	// ponytail: render test reads only these fields; the cast keeps the fixture short.
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("the prompt section renders markdown instead of raw text", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			prompt: "# Rules\n\nfix the `align` flow, **then** commit",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('class="prompt-text"');
+		expect(html).toContain("<h1>Rules</h1>");
+		expect(html).toContain("<code>align</code>");
+		expect(html).toContain("<strong>then</strong>");
+	});
+
+	test("the editable prompt of an unstarted card renders markdown", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "idle",
+			prompt: "fix the `align` flow",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('class="task-prompt"');
+		expect(html).toContain("<code>align</code>");
+	});
+
+	test("queued steering renders markdown in the you bubble", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			pendingPrompt: "run `bun test`, **not** the full suite",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('class="you-msg"');
+		expect(html).toContain("<code>bun test</code>");
+		expect(html).toContain("<strong>not</strong>");
+	});
+});

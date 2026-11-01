@@ -6273,14 +6273,16 @@ export function Drawer({
 					{!editable && (
 						<>
 							<h3>Prompt</h3>
-							<p className="prompt-text">{task.prompt}</p>
+							<div className="prompt-text">
+								<Markdown text={task.prompt} />
+							</div>
 						</>
 					)}
 					{editable && edit === null && (
 						<>
 							<h3>Prompt</h3>
 							<div className="task-prompt">
-								<p>{task.prompt}</p>
+								<Markdown text={task.prompt} />
 								<button type="button" onClick={() => setEdit(task.prompt)}>
 									<Icon name="plus" />
 									Edit task
@@ -6663,12 +6665,9 @@ export function Drawer({
 												{t.input.trim() === "." ? (
 													<span className="you-chip">Resume</span>
 												) : (
-													t.input.split("\n\n").map((msg, i) => (
-														// biome-ignore lint/suspicious/noArrayIndexKey: static split of one prompt; paragraphs are positional
-														<p key={i} className="you-msg">
-															{msg}
-														</p>
-													))
+													<div className="you-msg">
+														<Markdown text={t.input} />
+													</div>
 												)}
 											</div>
 										</div>
@@ -6759,12 +6758,9 @@ export function Drawer({
 											{task.pendingPrompt.trim() === "." ? (
 												<span className="you-chip">Resume</span>
 											) : (
-												task.pendingPrompt.split("\n\n").map((msg, i) => (
-													// biome-ignore lint/suspicious/noArrayIndexKey: static split of one prompt; paragraphs are positional
-													<p key={i} className="you-msg">
-														{msg}
-													</p>
-												))
+												<div className="you-msg">
+													<Markdown text={task.pendingPrompt} />
+												</div>
 											)}
 											{task.pendingImages.length > 0 && (
 												<p className="you-msg dim">
