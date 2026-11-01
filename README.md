@@ -14,6 +14,8 @@
 
 Ottr (**O**hMyPi **T**ask **Tr**acker) is a local kanban board that runs omp coding agents on your git projects. You type a task in plain language. Ottr gives it a git worktree, runs the agent in it, checks the result, and merges through a per-project queue. It enforces the process; your project's `AGENTS.md` enforces quality. Everything runs on your machine; the board binds `127.0.0.1` by default.
 
+Ottr is mainly built with Ottr itself.
+
 <p align="center">
   <img alt="The Ottr board: tasks move from Todo through In progress and Merging to Done" src=".github/assets/screenshot.png" width="100%"/>
 </p>
@@ -180,6 +182,20 @@ For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
 - [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md): the **Review due** feature.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
+
+## Built with Ottr badge
+
+Did you build a project with Ottr? Add this badge to its README:
+
+```html
+<p align="center">
+  <a href="https://github.com/ottr-ai/ottr"><img src="https://raw.githubusercontent.com/ottr-ai/ottr/main/.github/assets/built-with-ottr.png" alt="Built with Ottr"></a>
+</p>
+```
+
+<p align="center">
+  <a href="https://github.com/ottr-ai/ottr"><img src="https://raw.githubusercontent.com/ottr-ai/ottr/main/.github/assets/built-with-ottr.png" alt="Built with Ottr"></a>
+</p>
 
 ## License
 
