@@ -21,6 +21,8 @@ const {
 	WarningLines,
 	doneTopicPages,
 	recommendsSteps,
+	serverLine,
+	workerNote,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl } = await import("./kit.tsx");
 const {
@@ -458,6 +460,79 @@ describe("alateHint", () => {
 				running: true,
 			}),
 		).toBe("provision running");
+	});
+});
+
+describe("serverLine", () => {
+	const healthy = {
+		url: "http://x",
+		keySet: true,
+		lastError: null,
+		health: {
+			state: "ok",
+			version: "1.2.3",
+			behind: false,
+			pending: false,
+			running: false,
+		},
+	} as const;
+
+	test("not configured is a warning with the settings hint", () => {
+		expect(serverLine(null)).toEqual({
+			text: "Agent server: not configured.",
+			kind: "warn",
+		});
+	});
+
+	test("a clean probe is ok", () => {
+		expect(serverLine(healthy)).toEqual({ text: "version 1.2.3", kind: "ok" });
+	});
+
+	test("a running provision replaces the pending flag, still ok", () => {
+		expect(
+			serverLine({
+				...healthy,
+				health: { ...healthy.health, running: true, pending: true },
+			}),
+		).toEqual({ text: "version 1.2.3 · provision running", kind: "ok" });
+	});
+
+	test("a missing key is a warning", () => {
+		const line = serverLine({ ...healthy, keySet: false });
+		expect(line.kind).toBe("warn");
+		expect(line.text.endsWith(" · no API key")).toBe(true);
+	});
+
+	test("a down probe is a warning", () => {
+		expect(
+			serverLine({ ...healthy, keySet: false, health: { state: "down" } }),
+		).toEqual({
+			text: "server unreachable · no API key",
+			kind: "warn",
+		});
+	});
+
+	test("a recorded provision failure is critical and wins", () => {
+		const line = serverLine({ ...healthy, lastError: "boom" });
+		expect(line.kind).toBe("crit");
+		expect(line.text).toContain("last provision failed: boom");
+	});
+});
+
+describe("workerNote", () => {
+	test("no lists", () => {
+		expect(
+			workerNote({ name: "p", apt: false, tools: false, env: false }),
+		).toBe("no lists");
+	});
+
+	test("lists the present lists in order", () => {
+		expect(workerNote({ name: "p", apt: true, tools: true, env: false })).toBe(
+			"packages · tools",
+		);
+		expect(workerNote({ name: "p", apt: true, tools: true, env: true })).toBe(
+			"packages · tools · env",
+		);
 	});
 });
 

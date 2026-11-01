@@ -21,6 +21,7 @@ import {
 	noRedirectFetch,
 	refreshAlateSnapshot,
 } from "./alate.ts";
+import { aptListPath, workerProjects } from "./apt.ts";
 import {
 	clearSessionCookie,
 	hashPassword,
@@ -140,7 +141,12 @@ import {
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { ProjectStore } from "./store.ts";
-import { ENV_NAME, listedEnvNames } from "./tools.ts";
+import {
+	ENV_NAME,
+	envListPath,
+	listedEnvNames,
+	toolsListPath,
+} from "./tools.ts";
 import {
 	type CancelOutcome,
 	errmsg,
@@ -161,6 +167,7 @@ import {
 	type Priority,
 	type ProjectSettings,
 	type ProjectView,
+	type ProvisioningResponse,
 	type QuotaState,
 	type ServerMessage,
 	type StateResponse,
@@ -3476,6 +3483,48 @@ export function createApp(deps: AppDeps) {
 					// Accepted, not an error — the health poll delivers the outcome.
 					if (!r.ok && r.running) return json({ running: true }, 202);
 					return r.ok ? json(r.body, 200) : json({ error: r.error }, r.status);
+				}),
+		},
+		// Read-only view of the alate integration and the workers' provisioned lists.
+		"/api/provisioning": {
+			GET: (req) =>
+				api(req, async () => {
+					let server: ProvisioningResponse["server"] = null;
+					if (alate.url !== null) {
+						const h = await alateHealth(alate);
+						const upd = h.ok ? h.body.update : undefined;
+						server = {
+							url: alate.url,
+							keySet: alate.key !== null,
+							lastError: alateProvisionError,
+							health: h.ok
+								? {
+										state: "ok",
+										version:
+											typeof h.body.version === "string"
+												? h.body.version
+												: null,
+										behind:
+											typeof upd === "object" &&
+											upd !== null &&
+											"behind" in upd &&
+											upd.behind === true,
+										pending: h.body.pending === true,
+										running: h.body.running === true,
+									}
+								: { state: "down" },
+						};
+					}
+					// One home, the same one the env routes read: the shared workers home
+					// when the deploy passes one, else the board's own home (R5-1: never a
+					// worker-writable directory for the env list).
+					const workers = workerProjects(workersHome).map((name) => ({
+						name,
+						apt: existsSync(aptListPath(name, workersHome)),
+						tools: existsSync(toolsListPath(name, workersHome)),
+						env: existsSync(envListPath(name, workersHome)),
+					}));
+					return json({ server, workers } satisfies ProvisioningResponse);
 				}),
 		},
 		"/api/model-roles": {

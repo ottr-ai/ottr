@@ -662,6 +662,29 @@ export interface UpdatesView {
 	rows: UpdateRow[];
 }
 
+/** GET /api/provisioning: the agent server's (alate) state and the workers' provisioned lists. */
+export interface ProvisioningResponse {
+	/** The configured alate integration, or null when no URL is set. */
+	server: null | {
+		url: string;
+		keySet: boolean;
+		/** Why the last (manual or automatic) provision attempt failed; null when none is recorded. */
+		lastError: string | null;
+		/** One live probe; `down` when alate did not answer. */
+		health:
+			| {
+					state: "ok";
+					version: string | null;
+					behind: boolean;
+					pending: boolean;
+					running: boolean;
+			  }
+			| { state: "down" };
+	};
+	/** Projects alate provisioned lists for, sorted; booleans say which lists exist. */
+	workers: { name: string; apt: boolean; tools: boolean; env: boolean }[];
+}
+
 export interface StateResponse {
 	projects: ProjectView[];
 	/** Non-cancelled tasks of all projects, newest first. */

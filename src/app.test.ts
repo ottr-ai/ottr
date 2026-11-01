@@ -1901,6 +1901,116 @@ describe("alate routes", () => {
 			}
 		});
 	});
+
+	// GET /api/provisioning reads the workers lists from the shared app's workersHome
+	// (`root`, injected at boot). Each row test provisions its own fixture lists and
+	// removes them after, so later describes that list the same directory see only
+	// their own rows.
+	const provList = (project: string, file: string, body: string): void => {
+		mkdirSync(join(root, ".ottr", "workers", project), { recursive: true });
+		writeFileSync(join(root, ".ottr", "workers", project, file), body);
+	};
+	const provCleanup = (): void => {
+		for (const p of ["p-a", "p-b"])
+			rmSync(join(root, ".ottr", "workers", p), {
+				recursive: true,
+				force: true,
+			});
+	};
+
+	test("no alate config: server null and the worker rows list lists", async () => {
+		await post("/api/alate", { url: null, key: null });
+		provList("p-a", "apt.txt", "curl\n");
+		provList("p-a", "tools.json", "[]\n");
+		provList("p-b", "env.txt", "FOO\n");
+		try {
+			const res = await get("/api/provisioning");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				server: null,
+				workers: [
+					{ name: "p-a", apt: true, tools: true, env: false },
+					{ name: "p-b", apt: false, tools: false, env: true },
+				],
+			});
+		} finally {
+			provCleanup();
+		}
+	});
+
+	test("configured alate reports its health probe", async () => {
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+		provList("p-a", "apt.txt", "curl\n");
+		provList("p-a", "tools.json", "[]\n");
+		provList("p-b", "env.txt", "FOO\n");
+		const prev = alateBody;
+		alateStatus = 200;
+		alateBody = {
+			version: "1.2.3",
+			update: { behind: true },
+			pending: true,
+			running: false,
+		};
+		try {
+			const res = await get("/api/provisioning");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				server: {
+					url: alateUrl,
+					keySet: true,
+					lastError: null,
+					health: {
+						state: "ok",
+						version: "1.2.3",
+						behind: true,
+						pending: true,
+						running: false,
+					},
+				},
+				workers: [
+					{ name: "p-a", apt: true, tools: true, env: false },
+					{ name: "p-b", apt: false, tools: false, env: true },
+				],
+			});
+		} finally {
+			alateStatus = 200;
+			alateBody = prev;
+			provCleanup();
+		}
+	});
+
+	test("alate health failure still answers 200 with state down", async () => {
+		const prev = alateStatus;
+		alateStatus = 500;
+		alateBody = { error: "boom" };
+		try {
+			const res = await get("/api/provisioning");
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { server: { health: unknown } };
+			expect(body.server!.health).toEqual({ state: "down" });
+		} finally {
+			alateStatus = prev;
+		}
+	});
+
+	test("garbage health fields classify to null version and false flags", async () => {
+		const prev = alateBody;
+		alateBody = { version: 7, pending: "yes", update: "x" };
+		try {
+			const res = await get("/api/provisioning");
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { server: { health: unknown } };
+			expect(body.server!.health).toEqual({
+				state: "ok",
+				version: null,
+				behind: false,
+				pending: false,
+				running: false,
+			});
+		} finally {
+			alateBody = prev;
+		}
+	});
 });
 
 describe("alate provision trigger (U9)", () => {

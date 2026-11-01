@@ -2351,6 +2351,33 @@ a.release:hover {
 	color: var(--dim);
 	font-size: 13px;
 }
+.prov {
+	margin-top: 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.prov > p {
+	margin: 0;
+	color: var(--dim);
+	font-size: 13px;
+}
+.prov table {
+	width: 100%;
+	max-width: 560px;
+}
+.prov-error {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 0;
+	padding: 10px 14px;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	color: var(--dim);
+	font-size: 13px;
+}
 
 /* ---- Overview sections (Option A): triage list, KPI strip, per-project inline bars. ---- */
 

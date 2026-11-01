@@ -37,6 +37,7 @@ import type {
 	PerfResponse,
 	PerfStat,
 	ProjectView,
+	ProvisioningResponse,
 	PrReviewView,
 	QuotaState,
 	ReleasePlan,
@@ -129,6 +130,7 @@ import {
 } from "./queue.ts";
 import { readHash, SETTINGS_HASH, settingsSub } from "./route.ts";
 import {
+	alateHint,
 	asError,
 	asTrust,
 	type GitHostsView,
@@ -2844,6 +2846,7 @@ function Overview({
 		<section className="overview" aria-labelledby="overview-title">
 			<h1 id="overview-title">Overview</h1>
 			<Triage projects={projects} tasks={tasks} openTask={openTask} />
+			<Provisioning />
 			<section aria-labelledby="perf-title" className="perf">
 				<div className="ov-head">
 					<h2 className="ov-sec" id="perf-title">
@@ -2985,6 +2988,131 @@ function Overview({
 				</table>
 			</div>
 			{perf !== null && <PerfTable perf={perf} projects={projects} />}
+		</section>
+	);
+}
+
+/** One line for the Overview server row: alate's hint text, plus key and error alarms.
+    kind is the alarm level: ok (nothing wrong), warn (not configured, no API key or server down),
+    crit (a recorded provision failure). */
+export function serverLine(s: ProvisioningResponse["server"]): {
+	text: string;
+	kind: "ok" | "warn" | "crit";
+} {
+	if (s === null)
+		return { text: "Agent server: not configured.", kind: "warn" };
+	let text = alateHint(s.health);
+	let kind: "ok" | "warn" | "crit" = s.health.state === "down" ? "warn" : "ok";
+	if (!s.keySet) {
+		text += " · no API key";
+		kind = "warn";
+	}
+	if (s.lastError !== null) {
+		text += ` · last provision failed: ${s.lastError}`;
+		kind = "crit";
+	}
+	return { text, kind };
+}
+
+/** The workers row cell text: which lists alate provisioned, or "no lists" when none. */
+export function workerNote(w: ProvisioningResponse["workers"][number]): string {
+	const lists = [
+		w.apt ? "packages" : null,
+		w.tools ? "tools" : null,
+		w.env ? "env" : null,
+	].filter((l) => l !== null);
+	return lists.length === 0 ? "no lists" : lists.join(" · ");
+}
+
+/** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must
+ *  not ride the 1 s state push) and shows the alate server state and worker lists. */
+function Provisioning() {
+	const [data, setData] = useState<ProvisioningResponse | null>(null);
+	const [err, setErr] = useState<string | null>(null);
+	useEffect(() => {
+		let alive = true;
+		const load = () => {
+			setErr(null); // a later successful load clears an earlier failure
+			fetch("/api/provisioning")
+				.then((res) => unwrap<ProvisioningResponse>(res))
+				.then((r) => {
+					if (alive) setData(r);
+				})
+				.catch((e) => {
+					if (alive) setErr(e instanceof Error ? e.message : String(e));
+				});
+		};
+		load();
+		const t = setInterval(load, 60_000);
+		return () => {
+			alive = false;
+			clearInterval(t);
+		};
+	}, []);
+	return (
+		<section className="prov" aria-labelledby="prov-title">
+			<h2 className="ov-sec" id="prov-title">
+				Provisioning
+			</h2>
+			{err !== null && (
+				<p className="prov-error" role="alert">
+					<Mark kind="crit" />
+					<span>Provisioning data unavailable: {err}</span>
+				</p>
+			)}
+			{data === null && err === null && (
+				<p className="loading" role="status">
+					<span className="spinner" aria-hidden="true" />
+					Loading provisioning…
+				</p>
+			)}
+			{data !== null && (
+				<>
+					{data.server === null ? (
+						<p>
+							{serverLine(null).text}{" "}
+							<button
+								type="button"
+								onClick={() => openSettingsSection("alate-section")}
+							>
+								Open Settings → Alate
+							</button>
+						</p>
+					) : (
+						(() => {
+							const line = serverLine(data.server);
+							return (
+								<p>
+									{line.kind !== "ok" && (
+										<Mark kind={line.kind === "crit" ? "crit" : "warn"} />
+									)}
+									{line.text}
+								</p>
+							);
+						})()
+					)}
+					{data.workers.length === 0 ? (
+						<p>No provisioned worker lists.</p>
+					) : (
+						<table>
+							<thead>
+								<tr>
+									<th scope="col">Project</th>
+									<th scope="col">Lists</th>
+								</tr>
+							</thead>
+							<tbody>
+								{data.workers.map((w) => (
+									<tr key={w.name}>
+										<th scope="row">{w.name}</th>
+										<td>{workerNote(w)}</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					)}
+				</>
+			)}
 		</section>
 	);
 }
