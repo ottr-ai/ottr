@@ -5192,6 +5192,57 @@ function KeptFilesPanel({
 	);
 }
 
+/** Collapsible drawer section: the caps head is the toggle, the chevron mirrors the
+ * Follow-ups head. `head` rides right of the label (Edit button, meters, downloads).
+ * The body stays mounted and only `hidden` toggles, so its scroll and inputs survive. */
+function DrawerSec({
+	id,
+	label,
+	defaultOpen = true,
+	head,
+	className,
+	children,
+}: {
+	id: string;
+	label: string;
+	defaultOpen?: boolean;
+	head?: ReactNode;
+	className?: string;
+	children: ReactNode;
+}) {
+	const [open, setOpen] = useState(defaultOpen);
+	const h3 = (
+		<h3 className="fu-head" data-collapsed={!open || undefined}>
+			<button
+				type="button"
+				aria-expanded={open}
+				aria-controls={id}
+				onClick={() => setOpen(!open)}
+			>
+				<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+					<path d="M2 3l2 2 2-2" />
+				</svg>
+				{label}
+			</button>
+		</h3>
+	);
+	return (
+		<section className={"dsec" + (className ? ` ${className}` : "")}>
+			{head ? (
+				<div className="section-head">
+					{h3}
+					{head}
+				</div>
+			) : (
+				h3
+			)}
+			<div id={id} hidden={!open}>
+				{children}
+			</div>
+		</section>
+	);
+}
+
 /** The ask: a single question answers in one click; several collect answers first so one reply covers them all. */
 function AskPanel({
 	asked,
@@ -5393,8 +5444,7 @@ function PrReviewSection({
 							: null));
 	const shownError = error ?? pr.postError;
 	return (
-		<section>
-			<h3>PR review</h3>
+		<>
 			<p>
 				<a href={pr.url} target="_blank" rel="noopener noreferrer">
 					PR #{pr.number}
@@ -5451,7 +5501,7 @@ function PrReviewSection({
 					{shownError}
 				</p>
 			)}
-		</section>
+		</>
 	);
 }
 
@@ -5558,12 +5608,8 @@ export function Drawer({
 	const [diffView, setDiffView] = useState<string[] | null | undefined>(
 		undefined,
 	);
-	// Collapsed Follow-ups list in this drawer; the head button toggles it.
-	const [kidsOpen, setKidsOpen] = useState(true);
 	/** The rendered research report node; the HTML download serializes its DOM. */
 	const mdRef = useRef<HTMLDivElement | null>(null);
-	// Collapsed Triage section in this drawer; open by default.
-	const [triageOpen, setTriageOpen] = useState(true);
 	// Arrow keys page a multi-image lightbox; a window listener, since the modal dialog owns focus.
 	useEffect(() => {
 		if (viewing === null || viewing.list.length < 2) return;
@@ -5906,8 +5952,11 @@ export function Drawer({
 						)}
 					</p>
 					{mut !== null && (
-						<section className="drawer-mut">
-							<h3>Mutation run</h3>
+						<DrawerSec
+							id="drawer-mut"
+							label="Mutation run"
+							className="drawer-mut"
+						>
 							<Meter
 								label={mut.tool}
 								pct={mut.pct}
@@ -5929,7 +5978,7 @@ export function Drawer({
 									</div>
 								))}
 							</dl>
-						</section>
+						</DrawerSec>
 					)}
 					{row.followUpOf !== null &&
 						(parent === null ? (
@@ -5956,8 +6005,7 @@ export function Drawer({
 							</button>
 						))}
 					{waiting.length > 0 && (
-						<>
-							<h3>Waiting for</h3>
+						<DrawerSec id="drawer-waiting" label="Waiting for">
 							<RelatedTasks
 								items={waiting}
 								project={project}
@@ -5965,128 +6013,18 @@ export function Drawer({
 								onOpenTask={onOpenTask}
 								draining={draining}
 							/>
-						</>
+						</DrawerSec>
 					)}
 					{kids.length > 0 && (
-						<>
-							{/* Collapsible head: the h3 keeps the drawer's caps label look, the button
-							    inside toggles the list; the chevron mirrors the done-lane topic heads. */}
-							<h3 className="fu-head" data-collapsed={!kidsOpen || undefined}>
-								<button
-									type="button"
-									aria-expanded={kidsOpen}
-									aria-controls="drawer-follow-ups"
-									onClick={() => setKidsOpen(!kidsOpen)}
-								>
-									<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-										<path d="M2 3l2 2 2-2" />
-									</svg>
-									Follow-ups
-								</button>
-							</h3>
-							<div id="drawer-follow-ups" hidden={!kidsOpen}>
-								<RelatedTasks
-									items={kids}
-									project={project}
-									tasks={tasks}
-									onOpenTask={onOpenTask}
-									draining={draining}
-								/>
-							</div>
-						</>
-					)}
-					{/* Collapsible Triage, open by default: the head mirrors the Follow-ups
-					    head, the button inside toggles the controls below. Done tasks hide it
-					    entirely: rank and close-candidate nomination have no effect there. */}
-					{task.stage !== "done" && (
-						<section className="drawer-triage">
-							<h3 className="fu-head" data-collapsed={!triageOpen || undefined}>
-								<button
-									type="button"
-									aria-expanded={triageOpen}
-									aria-controls="drawer-triage-body"
-									onClick={() => setTriageOpen(!triageOpen)}
-								>
-									<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-										<path d="M2 3l2 2 2-2" />
-									</svg>
-									Triage
-								</button>
-							</h3>
-							<div id="drawer-triage-body" hidden={!triageOpen}>
-								<div className="triage-row">
-									<label className="triage-rank">
-										<span>Rank</span>
-										<select
-											value={task.priority ?? ""}
-											disabled={triageSave.busy}
-											onChange={(e) => setRank(e.target.value)}
-										>
-											<option value="">Default</option>
-											{PRIORITIES.map((p) => (
-												<option key={p} value={p}>
-													{p}
-												</option>
-											))}
-										</select>
-									</label>
-									{task.closeCandidate === null ? (
-										<form
-											className="triage-nominate"
-											onSubmit={(e) => {
-												e.preventDefault();
-												if (triageReason.trim() !== "") nominateCandidate();
-											}}
-										>
-											<input
-												value={triageReason}
-												maxLength={200}
-												required
-												placeholder="Close candidate: duplicate, superseded…"
-												aria-label="Close candidate reason"
-												disabled={triageSave.busy}
-												onChange={(e) => setTriageReason(e.target.value)}
-											/>
-											<button
-												type="submit"
-												disabled={triageSave.busy || triageReason.trim() === ""}
-												aria-busy={triageSave.busy || undefined}
-											>
-												{triageSave.busy && (
-													<span className="spinner" aria-hidden="true" />
-												)}
-												Nominate
-											</button>
-										</form>
-									) : (
-										<span className="triage-set">
-											<span className="close-badge" title={task.closeCandidate}>
-												Close
-											</span>
-											<span
-												className="triage-reason"
-												title={task.closeCandidate}
-											>
-												{task.closeCandidate}
-											</span>
-											<button
-												type="button"
-												disabled={triageSave.busy}
-												aria-busy={triageSave.busy || undefined}
-												onClick={clearCandidate}
-											>
-												Clear
-											</button>
-										</span>
-									)}
-								</div>
-								{triageError !== null && (
-									<p className="auth-error" role="alert">
-										{triageError}
-									</p>
-								)}
-							</div>
-						</section>
+						<DrawerSec id="drawer-follow-ups" label="Follow-ups">
+							<RelatedTasks
+								items={kids}
+								project={project}
+								tasks={tasks}
+								onOpenTask={onOpenTask}
+								draining={draining}
+							/>
+						</DrawerSec>
 					)}
 					{/* A live ask round hides its reason: the runner echoes the first question into
 					    it, and the ask panel below already carries the full questions. */}
@@ -6114,63 +6052,67 @@ export function Drawer({
 						<KeptFilesPanel task={task} act={act} onClose={onClose} />
 					)}
 					{(task.worktreeFiles?.length ?? 0) > 0 && (
-						<section className="wt-files">
-							<h3>Worktree files</h3>
-							<p className="hint">
-								Uncommitted files this task produced. Open them before the
-								worktree is removed.
-							</p>
-							{task.worktreeFiles!.slice(0, 50).map((f) => (
-								<a
-									key={f}
-									className="wt-file"
-									href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
-									target="_blank"
-									rel="noreferrer"
-								>
-									{f}
-								</a>
-							))}
-							{task.worktreeFiles!.length > 50 && (
+						<DrawerSec id="drawer-wt" label="Worktree files">
+							<div className="wt-files">
 								<p className="hint">
-									…and {task.worktreeFiles!.length - 50} more
+									Uncommitted files this task produced. Open them before the
+									worktree is removed.
 								</p>
-							)}
-						</section>
+								{task.worktreeFiles!.slice(0, 50).map((f) => (
+									<a
+										key={f}
+										className="wt-file"
+										href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
+										target="_blank"
+										rel="noreferrer"
+									>
+										{f}
+									</a>
+								))}
+								{task.worktreeFiles!.length > 50 && (
+									<p className="hint">
+										…and {task.worktreeFiles!.length - 50} more
+									</p>
+								)}
+							</div>
+						</DrawerSec>
 					)}
 					{diffFiles.length > 0 && (
-						<section className="wt-files">
-							<h3>Changed files</h3>
-							<p className="hint">
-								+{diffPlus} −{diffMinus} across {diffFiles.length} file
-								{diffFiles.length === 1 ? "" : "s"} ·{" "}
-								<button
-									type="button"
-									className="diff-link"
-									onClick={() => setDiffView(null)}
-								>
-									View diff
-								</button>
-							</p>
-							{diffFiles.slice(0, 50).map((f) => (
-								<div key={f.file} className="diff-file">
+						<DrawerSec id="drawer-diff" label="Changed files">
+							<div className="wt-files">
+								<p className="hint">
+									+{diffPlus} −{diffMinus} across {diffFiles.length} file
+									{diffFiles.length === 1 ? "" : "s"} ·{" "}
 									<button
 										type="button"
-										className="diff-path"
-										title="View this file's diff"
-										onClick={() => setDiffView([f.file])}
+										className="diff-link"
+										onClick={() => setDiffView(null)}
 									>
-										{f.file}
+										View diff
 									</button>
-									<span className="diff-num">
-										{f.plus === null ? "binary" : `+${f.plus} −${f.minus ?? 0}`}
-									</span>
-								</div>
-							))}
-							{diffFiles.length > 50 && (
-								<p className="hint">…and {diffFiles.length - 50} more</p>
-							)}
-						</section>
+								</p>
+								{diffFiles.slice(0, 50).map((f) => (
+									<div key={f.file} className="diff-file">
+										<button
+											type="button"
+											className="diff-path"
+											title="View this file's diff"
+											onClick={() => setDiffView([f.file])}
+										>
+											{f.file}
+										</button>
+										<span className="diff-num">
+											{f.plus === null
+												? "binary"
+												: `+${f.plus} −${f.minus ?? 0}`}
+										</span>
+									</div>
+								))}
+								{diffFiles.length > 50 && (
+									<p className="hint">…and {diffFiles.length - 50} more</p>
+								)}
+							</div>
+						</DrawerSec>
 					)}
 					{task.asked !== null && task.state === "needs_you" && (
 						<AskPanel
@@ -6188,13 +6130,13 @@ export function Drawer({
 							}}
 						/>
 					)}
-					{task.releaseVersion !== null && (
-						<section>
-							{/* While the editor is open the form's label titles it; a kept h3 would double the heading. */}
-							{notesEdit === null && (
-								<div className="section-head">
-									<h3>Release notes</h3>
-									{notesEditable && (
+					{task.releaseVersion !== null &&
+						(notesEdit === null ? (
+							<DrawerSec
+								id="drawer-notes"
+								label="Release notes"
+								head={
+									notesEditable && (
 										<button
 											type="button"
 											className="ghost"
@@ -6205,18 +6147,20 @@ export function Drawer({
 											<Icon name="plus" />
 											Edit
 										</button>
-									)}
-								</div>
-							)}
-							{notesEdit === null ? (
-								task.releaseNotes === null || task.releaseNotes === "" ? (
+									)
+								}
+							>
+								{task.releaseNotes === null || task.releaseNotes === "" ? (
 									<p className="dim">No notes yet.</p>
 								) : (
 									<div className="release-notes">
 										<Markdown text={task.releaseNotes} />
 									</div>
-								)
-							) : (
+								)}
+							</DrawerSec>
+						) : (
+							<section className="dsec">
+								{/* The editor replaces the section body; the form's label titles it. */}
 								<form
 									className="reply-form"
 									onSubmit={(e) => {
@@ -6268,20 +6212,17 @@ export function Drawer({
 										</button>
 									</div>
 								</form>
-							)}
-						</section>
-					)}
+							</section>
+						))}
 					{!editable && (
-						<>
-							<h3>Prompt</h3>
+						<DrawerSec id="drawer-prompt" label="Prompt">
 							<div className="prompt-text">
 								<Markdown text={task.prompt} />
 							</div>
-						</>
+						</DrawerSec>
 					)}
 					{editable && edit === null && (
-						<>
-							<h3>Prompt</h3>
+						<DrawerSec id="drawer-prompt" label="Prompt">
 							<div className="task-prompt">
 								<Markdown text={task.prompt} />
 								<button type="button" onClick={() => setEdit(task.prompt)}>
@@ -6289,7 +6230,7 @@ export function Drawer({
 									Edit task
 								</button>
 							</div>
-						</>
+						</DrawerSec>
 					)}
 					{editable && edit !== null && (
 						<form
@@ -6356,29 +6297,36 @@ export function Drawer({
 					{/* A done research card renders the full report once, in the Research report section below; the Result keeps the summary (tldr) only. */}
 					{(report.summary !== null ||
 						(report.details !== null && !hideDetails)) && (
-						<>
-							<h3>{task.stage === "done" ? "Result" : "Report"}</h3>
+						<DrawerSec
+							id="drawer-result"
+							label={task.stage === "done" ? "Result" : "Report"}
+						>
 							{report.summary !== null && (
 								<p className="summary">{report.summary}</p>
 							)}
 							{report.details !== null && !hideDetails && (
 								<Markdown text={report.details} />
 							)}
-						</>
+						</DrawerSec>
 					)}
 					{task.kind === "pr_review" && task.prReview !== undefined && (
-						<PrReviewSection
-							key={task.prReview.reviewedHead ?? ""}
-							task={task}
-							pr={task.prReview}
-							draft={prDraft}
-							act={act}
-							onLoaded={setDetail}
-						/>
+						<DrawerSec id="drawer-pr" label="PR review">
+							<PrReviewSection
+								key={task.prReview.reviewedHead ?? ""}
+								task={task}
+								pr={task.prReview}
+								draft={prDraft}
+								act={act}
+								onLoaded={setDetail}
+							/>
+						</DrawerSec>
 					)}
 					{task.workCheckLog.length > 0 && (
-						<section className="work-checks">
-							<h3>Work check</h3>
+						<DrawerSec
+							id="drawer-wc"
+							label="Work check"
+							className="work-checks"
+						>
 							<ul>
 								{task.workCheckLog.map((run, i) => (
 									// biome-ignore lint/suspicious/noArrayIndexKey: append-only log, runs are positional
@@ -6431,7 +6379,7 @@ export function Drawer({
 									</li>
 								))}
 							</ul>
-						</section>
+						</DrawerSec>
 					)}
 					{mergeOpen && (
 						<Modal
@@ -6497,8 +6445,7 @@ export function Drawer({
 						</Modal>
 					)}
 					{shotUrls.length > 0 && (
-						<>
-							<h3>Screenshots</h3>
+						<DrawerSec id="drawer-shots" label="Screenshots">
 							<div className="thumbs">
 								{task.shots.map((name, i) => {
 									const url = imgUrl(name);
@@ -6522,12 +6469,13 @@ export function Drawer({
 									);
 								})}
 							</div>
-						</>
+						</DrawerSec>
 					)}
 					{task.research && task.report !== null && (
-						<section>
-							<div className="section-head">
-								<h3>Research report</h3>
+						<DrawerSec
+							id="drawer-research"
+							label="Research report"
+							head={
 								<div style={{ display: "flex", gap: 8 }}>
 									<button
 										type="button"
@@ -6569,219 +6517,300 @@ export function Drawer({
 										Download
 									</button>
 								</div>
-							</div>
+							}
+						>
 							<div ref={mdRef}>
 								<Markdown text={task.report} />
 							</div>
-						</section>
+						</DrawerSec>
 					)}
 
-					{ctx === null ? (
-						<h3>Work steps</h3>
-					) : (
-						<div className="section-head">
-							<h3>Work steps</h3>
-							<Meter
-								label="Context"
-								pct={windowTok ? (ctx.promptTokens / windowTok) * 100 : null}
-								band={windowTok !== null}
-								value={
-									fmtTokens(ctx.promptTokens) +
-									(windowTok !== null ? ` / ${fmtTokens(windowTok)}` : "")
-								}
-								title={
-									windowTok === null
-										? ctx.model === null
-											? "Context window"
-											: `Context window — ${ctx.model}`
-										: `Context window — ${ctx.model}` +
-											(ctx.compactions > 0
-												? `, compacted ${ctx.compactions}×`
-												: "")
-								}
-							/>
-						</div>
-					)}
-					{detail === null ? (
-						<p className="dim" role="status">
-							<span className="spinner" aria-hidden="true" />
-							Loading…
-						</p>
-					) : (
-						task.turns.length === 0 && <p className="dim">No turns yet.</p>
-					)}
-					<ul className="turns">
-						{task.turns.map((t) => {
-							// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
-							const model =
-								t.model ??
-								(t.endedAt === null
-									? (task.model ?? catalog?.defaultModel ?? null)
-									: null);
-							return (
-								<li
-									key={t.id}
-									className="turn"
-									// Keyboard support without a second tab stop: the turn-head button
-									// is the only stop, and its Enter/Space keydown bubbles to the
-									// handlers here (preventDefault stops the button's own click).
-									onKeyDown={(e) => {
-										if (e.key !== "Enter" && e.key !== " ") return;
-										e.preventDefault();
-										setOpenTurn(openTurn === t.id ? null : t.id);
-									}}
-									onClick={(e) => {
-										// The log stays open while scrolling/selecting in it; selecting summary text must not toggle either.
-										// The input bubble is display-only: clicking or selecting it never toggles the log.
-										if (
-											(e.target as Element).closest(".log, .you") ||
-											!window.getSelection()?.isCollapsed
-										)
-											return;
-										setOpenTurn(openTurn === t.id ? null : t.id);
-									}}
-								>
-									{/* Shape carries state on the rail: check = ended, filled dot = live, triangle = needs you (steel when the turn asked a question). */}
-									{t.endedAt === null ? (
-										<span className="turn-node live" aria-hidden="true" />
-									) : t.outcome === "needs_you" ? (
-										<span
-											className={
-												"turn-node ask" + (t.question !== null ? " asked" : "")
-											}
-											aria-hidden="true"
-										/>
-									) : (
-										<span className="turn-node">
-											<Icon name="check" size={11} />
-										</span>
-									)}
-									{/* The steer/reply this turn delivered speaks first: it is what started the
+					<DrawerSec
+						id="drawer-steps"
+						label="Work steps"
+						head={
+							ctx === null ? undefined : (
+								<Meter
+									label="Context"
+									pct={windowTok ? (ctx.promptTokens / windowTok) * 100 : null}
+									band={windowTok !== null}
+									value={
+										fmtTokens(ctx.promptTokens) +
+										(windowTok !== null ? ` / ${fmtTokens(windowTok)}` : "")
+									}
+									title={
+										windowTok === null
+											? ctx.model === null
+												? "Context window"
+												: `Context window — ${ctx.model}`
+											: `Context window — ${ctx.model}` +
+												(ctx.compactions > 0
+													? `, compacted ${ctx.compactions}×`
+													: "")
+									}
+								/>
+							)
+						}
+					>
+						{detail === null ? (
+							<p className="dim" role="status">
+								<span className="spinner" aria-hidden="true" />
+								Loading…
+							</p>
+						) : (
+							task.turns.length === 0 && <p className="dim">No turns yet.</p>
+						)}
+						<ul className="turns">
+							{task.turns.map((t) => {
+								// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
+								const model =
+									t.model ??
+									(t.endedAt === null
+										? (task.model ?? catalog?.defaultModel ?? null)
+										: null);
+								return (
+									<li
+										key={t.id}
+										className="turn"
+										// Keyboard support without a second tab stop: the turn-head button
+										// is the only stop, and its Enter/Space keydown bubbles to the
+										// handlers here (preventDefault stops the button's own click).
+										onKeyDown={(e) => {
+											if (e.key !== "Enter" && e.key !== " ") return;
+											e.preventDefault();
+											setOpenTurn(openTurn === t.id ? null : t.id);
+										}}
+										onClick={(e) => {
+											// The log stays open while scrolling/selecting in it; selecting summary text must not toggle either.
+											// The input bubble is display-only: clicking or selecting it never toggles the log.
+											if (
+												(e.target as Element).closest(".log, .you") ||
+												!window.getSelection()?.isCollapsed
+											)
+												return;
+											setOpenTurn(openTurn === t.id ? null : t.id);
+										}}
+									>
+										{/* Shape carries state on the rail: check = ended, filled dot = live, triangle = needs you (steel when the turn asked a question). */}
+										{t.endedAt === null ? (
+											<span className="turn-node live" aria-hidden="true" />
+										) : t.outcome === "needs_you" ? (
+											<span
+												className={
+													"turn-node ask" +
+													(t.question !== null ? " asked" : "")
+												}
+												aria-hidden="true"
+											/>
+										) : (
+											<span className="turn-node">
+												<Icon name="check" size={11} />
+											</span>
+										)}
+										{/* The steer/reply this turn delivered speaks first: it is what started the
 									    turn below, and it is display-only (the row's click-to-toggle skips it). */}
-									{t.input !== null && (
+										{t.input !== null && (
+											<div className="you">
+												<span className="you-head">
+													{t.inputBy === "supervisor" ? "Supervisor" : "You"}
+												</span>
+												<div className="you-bubble">
+													{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
+													{t.input.trim() === "." ? (
+														<span className="you-chip">Resume</span>
+													) : (
+														<div className="you-msg">
+															<Markdown text={t.input} />
+														</div>
+													)}
+												</div>
+											</div>
+										)}
+										{/* The agent's part: the one hover-glow target. The steer/reply bubble
+									    above stays outside it — display-only, like the click. */}
+										<div className="turn-body">
+											<button
+												type="button"
+												className="turn-head"
+												aria-expanded={openTurn === t.id}
+											>
+												<Icon name="chevron-right" size={13} />
+												<strong>{t.kind}</strong>
+												{t.outcome !== null && (
+													<span
+														className={
+															"outcome o-" +
+															t.outcome +
+															(t.outcome === "needs_you" && t.question !== null
+																? " asked"
+																: "")
+														}
+													>
+														{t.outcome === "needs_you" && t.question !== null
+															? "question"
+															: t.outcome.replace("_", " ")}
+													</span>
+												)}
+												{model !== null && (
+													<span className="turn-model" title="model">
+														{model}
+													</span>
+												)}
+												<span className="turn-time">
+													{new Date(t.startedAt).toLocaleTimeString()}
+												</span>
+												<span className="turn-dur">{turnDuration(t)}</span>
+											</button>
+											{t.summary !== null && (
+												<div className="dim turn-sum">{t.summary}</div>
+											)}
+											{t.error !== null && (
+												<div
+													className={
+														"needs-reason" +
+														(t.question !== null ? " asked" : "")
+													}
+												>
+													{t.question !== null && <Mark kind="asked" />}
+													{t.error}
+												</div>
+											)}
+											{openTurn === t.id && (
+												<LogView project={project} taskId={task.id} />
+											)}
+										</div>
+									</li>
+								);
+							})}
+							{/* A queued steer speaks in the timeline under the last turn: it is the
+						    next input the agent will get, not part of the composer below.
+						    Same visibility as before (running/queued): other states never showed it. */}
+							{task.pendingPrompt !== null &&
+								(task.state === "running" || task.state === "queued") && (
+									<li className="turn">
+										<span className="turn-node">
+											<Mark kind="queued" />
+										</span>
 										<div className="you">
 											<span className="you-head">
-												{t.inputBy === "supervisor" ? "Supervisor" : "You"}
+												Queued
+												{task.pendingPrompt.trim() !== "." && (
+													<BusyButton
+														className="ghost"
+														ariaLabel="Cancel the queued steering"
+														run={() =>
+															window.confirm("Discard the queued steering?")
+																? cancelSteer()
+																: Promise.resolve(true)
+														}
+													>
+														Cancel
+													</BusyButton>
+												)}
 											</span>
 											<div className="you-bubble">
 												{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-												{t.input.trim() === "." ? (
+												{task.pendingPrompt.trim() === "." ? (
 													<span className="you-chip">Resume</span>
 												) : (
 													<div className="you-msg">
-														<Markdown text={t.input} />
+														<Markdown text={task.pendingPrompt} />
 													</div>
+												)}
+												{task.pendingImages.length > 0 && (
+													<p className="you-msg dim">
+														+{task.pendingImages.length} image
+														{task.pendingImages.length === 1 ? "" : "s"}
+													</p>
+												)}
+												{task.state === "queued" && (
+													<p className="you-msg dim">
+														Sends when an agent slot frees.
+													</p>
 												)}
 											</div>
 										</div>
-									)}
-									{/* The agent's part: the one hover-glow target. The steer/reply bubble
-									    above stays outside it — display-only, like the click. */}
-									<div className="turn-body">
+									</li>
+								)}
+						</ul>
+					</DrawerSec>
+
+					{/* Collapsible Triage between the turn tree and the Steer composer,
+					    collapsed by default: rank and close-candidate nomination are triage
+					    controls, not the card's story. Done tasks hide it entirely: the
+					    controls have no effect there. */}
+					{task.stage !== "done" && (
+						<DrawerSec id="drawer-triage" label="Triage" defaultOpen={false}>
+							<div className="triage-row">
+								<label className="triage-rank">
+									<span>Rank</span>
+									<select
+										value={task.priority ?? ""}
+										disabled={triageSave.busy}
+										onChange={(e) => setRank(e.target.value)}
+									>
+										<option value="">Default</option>
+										{PRIORITIES.map((p) => (
+											<option key={p} value={p}>
+												{p}
+											</option>
+										))}
+									</select>
+								</label>
+								{task.closeCandidate === null ? (
+									<form
+										className="triage-nominate"
+										onSubmit={(e) => {
+											e.preventDefault();
+											if (triageReason.trim() !== "") nominateCandidate();
+										}}
+									>
+										<input
+											value={triageReason}
+											maxLength={200}
+											required
+											placeholder="Close candidate: duplicate, superseded…"
+											aria-label="Close candidate reason"
+											disabled={triageSave.busy}
+											onChange={(e) => setTriageReason(e.target.value)}
+										/>
+										<button
+											type="submit"
+											disabled={triageSave.busy || triageReason.trim() === ""}
+											aria-busy={triageSave.busy || undefined}
+										>
+											{triageSave.busy && (
+												<span className="spinner" aria-hidden="true" />
+											)}
+											Nominate
+										</button>
+									</form>
+								) : (
+									<span className="triage-set">
+										<span className="close-badge" title={task.closeCandidate}>
+											Close
+										</span>
+										<span className="triage-reason" title={task.closeCandidate}>
+											{task.closeCandidate}
+										</span>
 										<button
 											type="button"
-											className="turn-head"
-											aria-expanded={openTurn === t.id}
+											disabled={triageSave.busy}
+											aria-busy={triageSave.busy || undefined}
+											onClick={clearCandidate}
 										>
-											<Icon name="chevron-right" size={13} />
-											<strong>{t.kind}</strong>
-											{t.outcome !== null && (
-												<span
-													className={
-														"outcome o-" +
-														t.outcome +
-														(t.outcome === "needs_you" && t.question !== null
-															? " asked"
-															: "")
-													}
-												>
-													{t.outcome === "needs_you" && t.question !== null
-														? "question"
-														: t.outcome.replace("_", " ")}
-												</span>
-											)}
-											{model !== null && (
-												<span className="turn-model" title="model">
-													{model}
-												</span>
-											)}
-											<span className="turn-time">
-												{new Date(t.startedAt).toLocaleTimeString()}
-											</span>
-											<span className="turn-dur">{turnDuration(t)}</span>
+											Clear
 										</button>
-										{t.summary !== null && (
-											<div className="dim turn-sum">{t.summary}</div>
-										)}
-										{t.error !== null && (
-											<div
-												className={
-													"needs-reason" + (t.question !== null ? " asked" : "")
-												}
-											>
-												{t.question !== null && <Mark kind="asked" />}
-												{t.error}
-											</div>
-										)}
-										{openTurn === t.id && (
-											<LogView project={project} taskId={task.id} />
-										)}
-									</div>
-								</li>
-							);
-						})}
-						{/* A queued steer speaks in the timeline under the last turn: it is the
-						    next input the agent will get, not part of the composer below.
-						    Same visibility as before (running/queued): other states never showed it. */}
-						{task.pendingPrompt !== null &&
-							(task.state === "running" || task.state === "queued") && (
-								<li className="turn">
-									<span className="turn-node">
-										<Mark kind="queued" />
 									</span>
-									<div className="you">
-										<span className="you-head">
-											Queued
-											{task.pendingPrompt.trim() !== "." && (
-												<BusyButton
-													className="ghost"
-													ariaLabel="Cancel the queued steering"
-													run={() =>
-														window.confirm("Discard the queued steering?")
-															? cancelSteer()
-															: Promise.resolve(true)
-													}
-												>
-													Cancel
-												</BusyButton>
-											)}
-										</span>
-										<div className="you-bubble">
-											{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-											{task.pendingPrompt.trim() === "." ? (
-												<span className="you-chip">Resume</span>
-											) : (
-												<div className="you-msg">
-													<Markdown text={task.pendingPrompt} />
-												</div>
-											)}
-											{task.pendingImages.length > 0 && (
-												<p className="you-msg dim">
-													+{task.pendingImages.length} image
-													{task.pendingImages.length === 1 ? "" : "s"}
-												</p>
-											)}
-											{task.state === "queued" && (
-												<p className="you-msg dim">
-													Sends when an agent slot frees.
-												</p>
-											)}
-										</div>
-									</div>
-								</li>
+								)}
+							</div>
+							{triageError !== null && (
+								<p className="auth-error" role="alert">
+									{triageError}
+								</p>
 							)}
-					</ul>
-
+						</DrawerSec>
+					)}
 					{followUp ? (
 						<div className="followup-cta">
 							<button

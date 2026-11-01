@@ -2519,17 +2519,7 @@ a.release:hover {
 	border-radius: 3px;
 	cursor: help;
 }
-/* Drawer triage row: the rank picker and the close-candidate control share one line.
-   The section carries the drawer's hairline itself: its head is an fu-head button
-   inside the section, so the `.drawer-body > h3` boundary no longer applies. */
-.drawer-triage {
-	margin: 18px 0 0;
-	padding-top: 14px;
-	border-top: 1px solid var(--line-soft);
-}
-.drawer-triage h3 {
-	margin: 0 0 6px;
-}
+/* Drawer triage row: the rank picker and the close-candidate control share one line. */
 .triage-row {
 	display: flex;
 	flex-wrap: wrap;
@@ -3891,14 +3881,6 @@ dialog.drawer[open]::backdrop {
 }
 /* Live mutation run: a running card's Stryker/mutate progress as a drawer section —
    the same data the board card's meter row shows, with room for the full readout. */
-.drawer-mut {
-	margin: 18px 0 16px;
-	padding-top: 14px;
-	border-top: 1px solid var(--line-soft);
-}
-.drawer-mut h3 {
-	margin: 0 0 10px;
-}
 .drawer-mut .meter-track {
 	width: 200px;
 }
@@ -4088,13 +4070,18 @@ span.fu-parent {
 	text-transform: uppercase;
 	color: var(--dim);
 }
-/* Section boundary: the same hairline the ask round uses between its questions,
-   one spacing step on both sides. The first head hangs from the title row unwrapped. */
-.drawer-body > h3:not(:first-of-type),
-.drawer-body > .section-head {
+/* Every drawer section is a .dsec wrapper: one hairline boundary between neighbours,
+   one spacing step on both sides. Collapsible heads (fu-head) toggle the body below. */
+.drawer-body > .dsec {
 	margin-top: 18px;
 	padding-top: 14px;
 	border-top: 1px solid var(--line-soft);
+}
+/* Inside a section the boundary rule owns the top spacing; the head keeps only its
+   label-to-content gap. */
+.dsec > h3,
+.dsec > .section-head {
+	margin: 0 0 8px;
 }
 /* A section head with a trailing action: caps label left, one quiet ghost button right. */
 .section-head {
@@ -4255,14 +4242,11 @@ span.fu-parent {
 	font-size: 12px;
 }
 .wt-files {
-	margin: 8px 0;
+	margin: 8px 0 0;
 	padding: 10px 12px;
 	background: var(--card);
 	border: 1px solid var(--line);
 	border-radius: 4px;
-}
-.wt-files h3 {
-	margin: 0 0 4px;
 }
 .wt-files .hint {
 	color: var(--dim);
