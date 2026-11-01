@@ -1045,13 +1045,18 @@ function MermaidDiagram({ code }: { code: string }) {
 }
 
 /** The board's Diagrams button: the project's docs/how-it-works.md as committed on its target,
- *  with each ```mermaid block drawn. */
+ *  with each ```mermaid block drawn, plus a Create/update diagrams button that creates the
+ *  task which writes that file. */
 function HowItWorksModal({
 	project,
 	onClose,
+	act,
+	open,
 }: {
 	project: string;
 	onClose: () => void;
+	act: Act;
+	open: (id: string) => void;
 }) {
 	const [result, setResult] = useState<
 		{ text: string } | { missing: true } | { failed: true } | null
@@ -1081,14 +1086,37 @@ function HowItWorksModal({
 		>
 			<div className="wf-head">
 				<h3>docs/how-it-works.md</h3>
-				<CloseButton />
+				<span className="hiw-actions">
+					<button
+						type="button"
+						className="ghost"
+						onClick={() =>
+							window.confirm(
+								"Create/update diagrams? This creates a task that writes docs/how-it-works.md with Mermaid diagrams.",
+							) &&
+							act(async () => {
+								const t = await post<TaskView>(
+									`/api/projects/${encodeURIComponent(project)}/tasks`,
+									{ prompt: EXPLAIN_PROJECT },
+								);
+								onClose();
+								open(t.id);
+							})
+						}
+						title="Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project"
+					>
+						<Icon name="grid" />
+						Create/update diagrams
+					</button>
+					<CloseButton />
+				</span>
 			</div>
 			{result === null ? (
 				<p className="hint">Loading…</p>
 			) : "missing" in result ? (
 				<p className="hint">
-					The target branch has no docs/how-it-works.md yet. Use Explain project
-					to create it.
+					The target branch has no docs/how-it-works.md yet. Use Create/update
+					diagrams to create it.
 				</p>
 			) : "failed" in result ? (
 				<p className="hint" role="alert">
@@ -2142,7 +2170,7 @@ function ArchReviewDialog({
 	);
 }
 
-/** Prompt behind the board header's "Explain project" button. */
+/** Prompt behind the Diagrams window's "Create/update diagrams" button. */
 const EXPLAIN_PROJECT =
 	"Explain how this project works: load the explain-project skill and follow it. Write docs/how-it-works.md with Mermaid diagrams (architecture, the main use case, and the life cycle if the project has one). Map every node to its source path. If docs/how-it-works.md already exists, update it to match the code. Commit the file.";
 
@@ -2404,29 +2432,6 @@ function ProjectBoard({
 							<button
 								type="button"
 								className="ghost"
-								aria-label="Explain project"
-								onClick={() =>
-									window.confirm(
-										"Explain project? This creates a task that writes docs/how-it-works.md with Mermaid diagrams.",
-									) &&
-									act(async () => {
-										const t = await post<TaskView>(
-											`/api/projects/${encodeURIComponent(project.name)}/tasks`,
-											{ prompt: EXPLAIN_PROJECT },
-										);
-										open(t.id);
-									})
-								}
-								title="Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project"
-							>
-								<Icon name="grid" />
-								<span className="seg-label">Explain project</span>
-							</button>
-						)}
-						{!project.gitless && (
-							<button
-								type="button"
-								className="ghost"
 								aria-label="Diagrams"
 								onClick={() => setShowDiagrams(true)}
 								title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
@@ -2466,6 +2471,8 @@ function ProjectBoard({
 				<HowItWorksModal
 					project={project.name}
 					onClose={() => setShowDiagrams(false)}
+					act={act}
+					open={open}
 				/>
 			)}
 			{project.dirty && (

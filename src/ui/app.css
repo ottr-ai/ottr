@@ -3832,6 +3832,12 @@ dialog.drawer[open]::backdrop {
 	font-weight: 600;
 	color: var(--text-strong);
 }
+/* The Diagrams modal's right-side head group: the create/update button plus the close X. */
+.hiw-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
 .wf-view svg {
 	display: block;
 	width: 100%;
