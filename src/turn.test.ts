@@ -8397,7 +8397,10 @@ describe("turn update-card merge hold (U7)", () => {
 		});
 		const task = store.createTask("rebuild me");
 		store.updateTask(task.id, {
-			worktree: "/nonexistent/ottr-347-worktree",
+			// A path whose missing parents sit under a writable root: the fake createWorktree
+			// mkdirs the path, and "/nonexistent/..." throws EACCES for a non-root runner,
+			// which parked the turn as "Tracker error" and left record.runs empty on CI.
+			worktree: join(tmpdir(), "ottr-347-rebuild-worktree"),
 			branch: "ott/rebuild-me",
 		});
 
