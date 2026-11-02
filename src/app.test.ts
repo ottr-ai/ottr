@@ -5616,6 +5616,17 @@ describe("PR review routes", () => {
 			expect(postCall.url).toBe(
 				"https://api.acme.ghe.com/repos/acme/widget/pulls/24/reviews",
 			);
+			// The stored drawer link keeps the host's own html_url; a github.com-only
+			// check would drop it and the card would lose its review link.
+			const view = (await (
+				await m.call(`/api/projects/pg/tasks/${t.id}`)
+			).json()) as {
+				prReview: { postedLogin: string | null; postedUrl: string | null };
+			};
+			expect(view.prReview.postedLogin).toBe("ottr[bot]");
+			expect(view.prReview.postedUrl).toBe(
+				"https://acme.ghe.com/acme/widget/pull/24#review-1",
+			);
 		} finally {
 			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = savedHost;

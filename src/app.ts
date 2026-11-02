@@ -5390,8 +5390,9 @@ export function createApp(deps: AppDeps) {
 						}
 						stdout = res.stdout;
 					}
-					// GitHub's response body is untrusted: only an https github URL becomes the
-					// drawer link, and only a plausible login names the posting identity.
+					// GitHub's response body is untrusted: only an https URL on the configured
+					// host becomes the drawer link, and only a plausible login names the
+					// posting identity.
 					let url: string | null = null;
 					let login: string | null = null;
 					try {
@@ -5399,11 +5400,18 @@ export function createApp(deps: AppDeps) {
 						if (typeof body === "object" && body !== null) {
 							if ("html_url" in body) {
 								const u: unknown = body.html_url;
-								if (
-									typeof u === "string" &&
-									u.startsWith("https://github.com/")
-								)
-									url = u;
+								if (typeof u === "string") {
+									try {
+										const parsed = new URL(u);
+										if (
+											parsed.protocol === "https:" &&
+											parsed.hostname === githubHost().host
+										)
+											url = u;
+									} catch {
+										// Not a URL: the drawer shows the posted head without a link.
+									}
+								}
 							}
 							if ("user" in body) {
 								const user: unknown = body.user;
