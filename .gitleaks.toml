@@ -5,9 +5,23 @@
 # sends the published RFC 6455 sample key ("the sample nonce" in base64).
 # Commit 45d34b8 (src/tokens.ts) held omp's public Anthropic OAuth client id.
 # A public OAuth client id is no secret: omp ships it in its own source.
+#
+# CI checks out with fetch-depth: 0, so the gitleaks history walk covers every
+# branch, not just main. The impeccable design loop injects a live-reload
+# marker (`<script src="http://localhost:8400/live.js?token=<uuid>">`) into
+# src/ui/index.html; commit 7046295 on ui/lineage-rail committed it, and that
+# uuid fails main's Scan on every push. The marker only ever talks to the
+# developer's own localhost server, so the file is allowlisted, not the uuid
+# (a real uuid-shaped secret elsewhere stays flagged).
 [extend]
 useDefault = true
 
-[allowlist]
+# gitleaks ORs the conditions inside one allowlist block, so scoping rides on
+# paths alone; [allowlist] (singular) is deprecated next to [[allowlists]].
+[[allowlists]]
 description = "fake token fixtures, the RFC 6455 sample key, and a public OAuth client id"
 regexes = ['''\bglpat-[a-z-]+-0{3,}\b''', '''dGhlIHNhbXBsZSBub25jZQ==''', '''9d1c250a-e61b-44d9-88ed-594fedd48592''']
+
+[[allowlists]]
+description = "impeccable live-reload dev marker injected into the UI entry html"
+paths = ['''(^|/)src/ui/index\.html$''']
