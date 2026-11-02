@@ -15,6 +15,31 @@
       if (t === "light" || (t !== "dark" && matchMedia("(prefers-color-scheme: light)").matches))
         document.documentElement.dataset.theme = "light";
     </script>
+    <script>
+      // Design-work switch: with ?pin-popovers in the URL, light-dismiss popovers become manual
+      // ones, so a click elsewhere (the impeccable live picker) leaves them open. Their own
+      // buttons still close them. Open ones are remembered for the tab session, so a dev-server
+      // reload opens them again. Without the parameter, nothing changes.
+      if (new URLSearchParams(location.search).has("pin-popovers")) {
+        const key = "ottr.pinned-popovers";
+        const open = new Set(JSON.parse(sessionStorage.getItem(key) ?? "[]"));
+        // beforetoggle fires in sync, before the observer can reopen a popover that is closing;
+        // it does not bubble, but the capture phase still passes the document.
+        document.addEventListener("beforetoggle", (e) => {
+          if (!e.target.id || e.target.popover === null) return;
+          if (e.newState === "open") open.add(e.target.id);
+          else open.delete(e.target.id);
+          sessionStorage.setItem(key, JSON.stringify([...open]));
+        }, true);
+        new MutationObserver(() => {
+          for (const p of document.querySelectorAll('[popover="auto"]')) p.popover = "manual";
+          for (const id of open) {
+            const p = document.getElementById(id);
+            if (p?.popover && !p.matches(":popover-open")) p.showPopover();
+          }
+        }).observe(document.documentElement, { subtree: true, childList: true, attributeFilter: ["popover"] });
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
