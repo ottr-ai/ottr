@@ -167,7 +167,23 @@ export interface GitHubAppView {
 	id: string;
 	/** `SHA256:` + unpadded base64 over the public key's SPKI DER digest. */
 	fingerprint: string;
+	/** The last name + install check; null before the first check finishes. */
+	check: AppCheck | null;
 }
+
+/** What the board knows about the configured app: its name and the board repos it cannot see. */
+export type AppCheck = {
+	at: number;
+	name: string | null;
+	/** The app's GitHub page; its install link is `${url}/installations/new`. */
+	url: string | null;
+	/** Board repos ("owner/repo") checked. */
+	repos: string[];
+	/** Board repos without an installation of the app (lookup 404). */
+	missing: string[];
+	/** First failure other than a 404; never holds the key. */
+	error: string | null;
+};
 
 /** One pr_review row: the watch state of one PR of the project's GitHub repo. */
 export interface PrReviewRow {

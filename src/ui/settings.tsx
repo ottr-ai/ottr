@@ -3,6 +3,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import { forProvider } from "../quota.ts";
 import type {
+	AppCheck,
 	GitHubAppView,
 	GithubFacts,
 	Learning,
@@ -1128,6 +1129,63 @@ export const asTrust = (d: Record<string, unknown>): TrustNeeded | null =>
 export const asError = (d: Record<string, unknown>, status: number): string =>
 	typeof d.error === "string" ? d.error : `HTTP ${status}`;
 
+/** The app's GitHub name and its installs on the board repos, from the server's last check. */
+export function AppCheckLines({ check }: { check: AppCheck | null }) {
+	if (check === null)
+		return <p className="hint">Checking the app name and installs…</p>;
+	if (check.error !== null)
+		return (
+			<p className="hint notif-line">
+				<Mark kind="warn" />
+				<span>Check failed: {check.error}.</span>
+			</p>
+		);
+	return (
+		<>
+			<div className="settings-field">
+				Name{" "}
+				{check.url === null ? (
+					<code>{check.name ?? "unknown"}</code>
+				) : (
+					<a href={check.url} target="_blank" rel="noopener noreferrer">
+						{check.name ?? check.url}
+					</a>
+				)}
+			</div>
+			{check.missing.length === 0 ? (
+				<p className="hint notif-line">
+					<Mark kind="done" />
+					<span>
+						{check.repos.length === 0
+							? "No board project has a GitHub repo."
+							: `Installed on all ${check.repos.length} board repos.`}
+					</span>
+				</p>
+			) : (
+				<p className="hint notif-line">
+					<Mark kind="warn" />
+					<span>
+						Not installed on {check.missing.join(", ")}. Reviews there post
+						under your own identity.
+						{check.url !== null && (
+							<>
+								{" "}
+								<a
+									href={`${check.url}/installations/new`}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									Install the app
+								</a>
+							</>
+						)}
+					</span>
+				</p>
+			)}
+		</>
+	);
+}
+
 /** The one trust+test prompt, shared by the add form, the global key and a project key.
  *  `send` performs the call (with the confirmed fingerprints as `trust` on a retry); this
  *  component renders the action, an aria-live result, and on a 409 the host's fingerprints
@@ -1456,6 +1514,7 @@ function GitHostsSection() {
 						<div className="settings-field">
 							App ID <code>{state.githubApp.id}</code>
 						</div>
+						<AppCheckLines check={state.githubApp.check} />
 						<p className="hint">
 							Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
 						</p>

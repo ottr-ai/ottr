@@ -19,7 +19,7 @@ person clicked Post. Spec: [pr-reviews.md](pr-reviews.md).
 
 ## API
 
-- `gitHostsView()` gains `githubApp: { id: string; fingerprint: string } | null`.
+- `gitHostsView()` gains `githubApp: { id: string; fingerprint: string; check: AppCheck | null } | null`.
   It never returns the key. The fingerprint is `SHA256:` plus base64 without padding over
   the SHA-256 digest of the public key's SPKI DER encoding.
 - `POST /api/git-hosts/github-app` with `{ id, key }`. A non-numeric `id` gets 400
@@ -34,7 +34,8 @@ person clicked Post. Spec: [pr-reviews.md](pr-reviews.md).
   claims `iat = now - 60` and `exp = iat + 600` (lifetime 10 minutes at most),
   `iss = appId`. Signed with node:crypto over `RSA-SHA256`.
 - `AppTokenSource.tokenFor(owner, repo)`:
-  1. Returns the cached token while `now < expiresAt - 5 min`.
+  1. Returns the cached token of this `owner/repo` while `now < expiresAt - 5 min`. Each
+     token is scoped to one repo, so the cache holds one entry per repo.
   2. `GET https://api.github.com/repos/{owner}/{repo}/installation` with the app JWT.
      A 404 answers `null` (no installation). Another failure throws an error whose text
      holds only the status and GitHub's `message` field, never the key.
@@ -44,6 +45,24 @@ person clicked Post. Spec: [pr-reviews.md](pr-reviews.md).
      means no cache entry.
 - Fetches go through one injectable seam (`githubAppFetch`, default `noRedirectFetch`).
 - Concurrency: two simultaneous posts may each mint; the cache only saves calls.
+
+## Install check (`checkAppInstalls`, `appCheckWarning`)
+
+- The board's 30-second sampler (`sampleStats`) runs the check when an app is set and the
+  last check is older than 10 minutes, or when the set of board repos changed. A save of
+  the pair runs it before the answer; a delete clears it.
+- Board repos: `ownerRepo(e.github)` of each project with a GitHub remote, sorted, unique.
+- `GET /app` with the app JWT gives `name` and `html_url` (https only, else null). A non-2xx
+  answer stops the check with `app lookup answered <status>`.
+- `GET /repos/{owner}/{repo}/installation` for each repo: 404 adds the repo to `missing`.
+  Another non-2xx answer stops the check with `installation lookup for <repo> answered <status>`.
+- `AppCheck = { at, name, url, repos, missing, error }`. No field holds the key.
+- `state.warnings` gains one line while the app is set and the check has an error or a
+  missing repo. The error line wins. The missing line names the app, the repos and
+  `<url>/installations/new`.
+- Settings → Git hosts shows the app name (a link to `url`), then one line: "Installed on all
+  N board repos", "Not installed on …" with an install link, or "Check failed: …".
+- Cost: 1 + one call per repo every 10 minutes, far below the app rate limit.
 
 ## Post route
 

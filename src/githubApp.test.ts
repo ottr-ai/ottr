@@ -7,6 +7,8 @@ import {
 } from "node:crypto";
 import {
 	AppTokenSource,
+	appCheckWarning,
+	checkAppInstalls,
 	parseAppPem,
 	signAppJwt,
 	validateAppCredentials,
@@ -223,6 +225,27 @@ describe("AppTokenSource", () => {
 		expect(calls.length).toBe(2);
 	});
 
+	test("a cached token never serves another repo", async () => {
+		const fresh = (token: string) =>
+			okResponse({
+				token,
+				expires_at: new Date(NOW + 50 * 60_000).toISOString(),
+			});
+		const { calls, source } = makeSource([
+			okResponse(INSTALLATION),
+			fresh("t-widget"),
+			okResponse({ id: 888 }),
+			fresh("t-gadget"),
+		]);
+		expect(await source.tokenFor(OWNER, REPO)).toBe("t-widget");
+		expect(await source.tokenFor("other", "gadget")).toBe("t-gadget");
+		expect(await source.tokenFor(OWNER, REPO)).toBe("t-widget");
+		expect(calls.length).toBe(4);
+		expect(calls[3]!.url).toBe(
+			"https://api.github.com/app/installations/888/access_tokens",
+		);
+	});
+
 	test("a token expiring within 5 minutes is not cached", async () => {
 		let now = NOW;
 		const { calls, source } = makeSource(
@@ -271,5 +294,100 @@ describe("AppTokenSource", () => {
 		} catch (e) {
 			expect((e as Error).message).toContain("500");
 		}
+	});
+});
+
+describe("checkAppInstalls", () => {
+	const run = (responses: Array<Response | { status: number }>) => {
+		const { calls, fetchImpl } = recordingFetch(responses);
+		return {
+			calls,
+			check: checkAppInstalls({
+				appId: APP_ID,
+				keyObject: privateKey,
+				repos: ["octo/a", "octo/b", "skare/c"],
+				fetchImpl,
+				now: () => NOW,
+			}),
+		};
+	};
+	const APP = { name: "ottr-ai", html_url: "https://github.com/apps/ottr-ai" };
+
+	test("reads the name and lists each 404 repo as missing", async () => {
+		const { calls, check } = run([
+			okResponse(APP),
+			okResponse(INSTALLATION),
+			{ status: 404 },
+			{ status: 404 },
+		]);
+		expect(await check).toEqual({
+			at: NOW,
+			name: "ottr-ai",
+			url: "https://github.com/apps/ottr-ai",
+			repos: ["octo/a", "octo/b", "skare/c"],
+			missing: ["octo/b", "skare/c"],
+			error: null,
+		});
+		expect(calls.map((c) => c.url)).toEqual([
+			"https://api.github.com/app",
+			"https://api.github.com/repos/octo/a/installation",
+			"https://api.github.com/repos/octo/b/installation",
+			"https://api.github.com/repos/skare/c/installation",
+		]);
+		expect(headerOf(calls[0]).authorization).toMatch(/^Bearer /);
+	});
+
+	test("a failed app lookup stops before the repos", async () => {
+		const { calls, check } = run([{ status: 401 }]);
+		const c = await check;
+		expect(c.error).toBe("app lookup answered 401");
+		expect(c.missing).toEqual([]);
+		expect(calls.length).toBe(1);
+	});
+
+	test("a non-404 repo failure stops with an error and no key", async () => {
+		const { check } = run([okResponse(APP), { status: 500 }]);
+		const c = await check;
+		expect(c.error).toBe("installation lookup for octo/a answered 500");
+		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
+	});
+
+	test("a non-https html_url is dropped", async () => {
+		const { check } = run([
+			okResponse({ name: "x", html_url: "javascript:alert(1)" }),
+			okResponse(INSTALLATION),
+			okResponse(INSTALLATION),
+			okResponse(INSTALLATION),
+		]);
+		expect((await check).url).toBeNull();
+	});
+});
+
+describe("appCheckWarning", () => {
+	const base = {
+		at: NOW,
+		name: "ottr-ai",
+		url: "https://github.com/apps/ottr-ai",
+		repos: ["octo/a", "octo/b"],
+		missing: [] as string[],
+		error: null,
+	};
+	test("no check or no missing repo gives no warning", () => {
+		expect(appCheckWarning(null)).toBeNull();
+		expect(appCheckWarning(base)).toBeNull();
+	});
+	test("missing repos name the app, the repos and the install link", () => {
+		expect(appCheckWarning({ ...base, missing: ["octo/b"] })).toBe(
+			"ottr-ai is not installed on octo/b. PR reviews there post under your own identity. Install it at https://github.com/apps/ottr-ai/installations/new.",
+		);
+	});
+	test("an error wins over missing repos", () => {
+		expect(
+			appCheckWarning({
+				...base,
+				missing: ["octo/b"],
+				error: "app lookup answered 401",
+			}),
+		).toContain("The GitHub App check failed (app lookup answered 401)");
 	});
 });

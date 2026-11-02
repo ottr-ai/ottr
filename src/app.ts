@@ -70,6 +70,8 @@ import {
 } from "./gitHosts.ts";
 import {
 	AppTokenSource,
+	appCheckWarning,
+	checkAppInstalls,
 	parseAppPem,
 	validateAppCredentials,
 } from "./githubApp.ts";
@@ -172,6 +174,7 @@ import {
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
 import {
+	type AppCheck,
 	answeredCard,
 	type MachineStats,
 	type PerfRange,
@@ -698,6 +701,9 @@ export function createApp(deps: AppDeps) {
 	let githubApp: { id: string; key: string; fingerprint: string } | null = null;
 	/** Installation-token mint for githubApp; null whenever the app is unset. Memory only. */
 	let appTokens: AppTokenSource | null = null;
+	/** Last app name + install check; null while no app is set or before the first check. */
+	let appCheck: AppCheck | null = null;
+	let checkingApp = false;
 	/**
 	 * Server-side git, gh and merge turns read the token from GH_TOKEN; the worker image's git
 	 * credential helper hands it to git. Work turns never get it: runner strips it from the env
@@ -1863,7 +1869,12 @@ export function createApp(deps: AppDeps) {
 			keptWorktrees: { held: keptHeld, stale: keptStale },
 			drainUntil: drainUntil > now ? drainUntil : null,
 			drainCommits: drainUntil > now ? drainCommits : null,
-			warnings: boardWarnings(list, roles),
+			warnings: [
+				...boardWarnings(list, roles),
+				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
+					(w) => w !== null,
+				),
+			],
 			updates: updatesView(),
 			alatePendingSince,
 			deadSignIns: dead,
@@ -2169,7 +2180,11 @@ export function createApp(deps: AppDeps) {
 			githubApp:
 				githubApp === null
 					? null
-					: { id: githubApp.id, fingerprint: githubApp.fingerprint },
+					: {
+							id: githubApp.id,
+							fingerprint: githubApp.fingerprint,
+							check: appCheck,
+						},
 			githubHost: githubHostView(),
 		};
 	}
@@ -2679,6 +2694,32 @@ export function createApp(deps: AppDeps) {
 		));
 	}
 
+	/** Board repos ("owner/repo") the app install check covers, sorted. */
+	function boardRepos(): string[] {
+		const out = new Set<string>();
+		for (const e of deps.projects.values()) {
+			const r = e.github === null ? null : ownerRepo(e.github);
+			if (r !== null) out.add(r);
+		}
+		return [...out].sort();
+	}
+
+	/** Read the app's name and its installs on the board repos; drops a result for a replaced pair. */
+	async function refreshAppCheck(): Promise<void> {
+		const app = githubApp;
+		if (app === null) {
+			appCheck = null;
+			return;
+		}
+		const check = await checkAppInstalls({
+			appId: app.id,
+			keyObject: parseAppPem(app.key)!.keyObject,
+			repos: boardRepos(),
+			fetchImpl: githubAppFetch,
+		});
+		if (githubApp === app) appCheck = check;
+	}
+
 	function sampleStats(): void {
 		if (sampling) return;
 		sampling = true;
@@ -2713,6 +2754,21 @@ export function createApp(deps: AppDeps) {
 				})
 				.finally(() => {
 					refreshingBehind = false;
+				});
+		}
+		// Ten minutes, or at once when the board repos changed: 1 + one call per repo each time.
+		if (
+			githubApp !== null &&
+			!checkingApp &&
+			(appCheck === null ||
+				Date.now() - appCheck.at > 600_000 ||
+				appCheck.repos.join() !== boardRepos().join())
+		) {
+			checkingApp = true;
+			void refreshAppCheck()
+				.then(publishState)
+				.finally(() => {
+					checkingApp = false;
 				});
 		}
 		// Five minutes, like omp's own per-account usage cache; the 1 s state diff ships the result.
@@ -3110,12 +3166,15 @@ export function createApp(deps: AppDeps) {
 						fetchImpl: githubAppFetch,
 					});
 					applyGitSecrets();
+					// The answer shows the app name and installs at once; the check never throws.
+					await refreshAppCheck();
 					return json(await gitHostsView());
 				}),
 			DELETE: (req) =>
 				api(req, async () => {
 					githubApp = null;
 					appTokens = null;
+					appCheck = null;
 					saveConfig();
 					applyGitSecrets();
 					return json(await gitHostsView());

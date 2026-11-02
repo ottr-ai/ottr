@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import { noRedirectFetch } from "./alate.ts";
 import { githubHost } from "./githubHost.ts";
+import type { AppCheck } from "./types.ts";
 
 export type ParsedAppKey = { keyObject: KeyObject; fingerprint: string };
 
@@ -90,7 +91,8 @@ export class AppTokenSource {
 	) => Promise<Response>;
 	private readonly now: () => number;
 	private readonly apiBase: string | undefined;
-	private cached: CacheEntry | null = null;
+	/** One token per "owner/repo": each mint is scoped to one repo of one installation. */
+	private readonly cached = new Map<string, CacheEntry>();
 
 	constructor(deps: {
 		appId: string;
@@ -109,8 +111,9 @@ export class AppTokenSource {
 	async tokenFor(owner: string, repo: string): Promise<string | null> {
 		const base = this.apiBase ?? githubHost().apiBase;
 		const now = this.now();
-		if (this.cached !== null && now < this.cached.until)
-			return this.cached.token;
+		const key = `${owner}/${repo}`;
+		const hit = this.cached.get(key);
+		if (hit !== undefined && now < hit.until) return hit.token;
 		const { jwt } = signAppJwt(this.appId, this.keyObject, now);
 		const lookup = await this.fetchImpl(
 			`${base}/repos/${owner}/${repo}/installation`,
@@ -163,8 +166,80 @@ export class AppTokenSource {
 		if (typeof body.expires_at !== "string") return token;
 		const until = Date.parse(body.expires_at) - 5 * 60_000;
 		if (Number.isFinite(until) && until > this.now()) {
-			this.cached = { token, until };
+			this.cached.set(key, { token, until });
 		}
 		return token;
 	}
+}
+
+/**
+ * Reads the app's name (GET /app) and looks up its installation on each repo. A 404 marks the
+ * repo missing. Any other answer stops the check with an error that holds only the status.
+ */
+export async function checkAppInstalls(deps: {
+	appId: string;
+	keyObject: KeyObject;
+	repos: string[];
+	apiBase?: string;
+	fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
+	now?: () => number;
+}): Promise<AppCheck> {
+	const base = deps.apiBase ?? githubHost().apiBase;
+	const fetchImpl = deps.fetchImpl ?? noRedirectFetch;
+	const now = deps.now ?? (() => Date.now());
+	const out: AppCheck = {
+		at: now(),
+		name: null,
+		url: null,
+		repos: deps.repos,
+		missing: [],
+		error: null,
+	};
+	const get = (path: string) =>
+		fetchImpl(`${base}${path}`, {
+			headers: {
+				authorization: `Bearer ${signAppJwt(deps.appId, deps.keyObject, now()).jwt}`,
+				accept: "application/vnd.github+json",
+				"user-agent": "Ottr",
+			},
+		});
+	try {
+		const app = await get("/app");
+		if (!app.ok) {
+			out.error = `app lookup answered ${app.status}`;
+			return out;
+		}
+		const body = (await app.json()) as { name?: unknown; html_url?: unknown };
+		out.name = typeof body.name === "string" ? body.name : null;
+		out.url =
+			typeof body.html_url === "string" && /^https:\/\//.test(body.html_url)
+				? body.html_url
+				: null;
+		for (const repo of deps.repos) {
+			const res = await get(`/repos/${repo}/installation`);
+			if (res.status === 404) out.missing.push(repo);
+			else if (!res.ok) {
+				out.error = `installation lookup for ${repo} answered ${res.status}`;
+				return out;
+			}
+		}
+	} catch (err) {
+		// Network failures only; the key never reaches an error text from here.
+		out.error = err instanceof Error ? err.message : String(err);
+	}
+	return out;
+}
+
+/** The board warning for a check, or null when the app sees every board repo. Pure. */
+export function appCheckWarning(check: AppCheck | null): string | null {
+	if (check === null) return null;
+	if (check.error !== null)
+		return `The GitHub App check failed (${check.error}). PR reviews can post under your own identity: check the App ID and key under Settings - Git hosts.`;
+	if (check.missing.length === 0) return null;
+	const app = check.name ?? "The GitHub App";
+	const install =
+		check.url === null
+			? "Install it from the app's page on GitHub."
+			: `Install it at ${check.url}/installations/new.`;
+	return `${app} is not installed on ${check.missing.join(", ")}. PR reviews there post under your own identity. ${install}`;
 }
