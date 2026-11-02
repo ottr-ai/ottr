@@ -212,6 +212,7 @@ interface TaskRow {
 	done_at: number | null;
 	cancelled_at: number | null;
 	commits: number | null;
+	merge_head: string | null;
 	images: string;
 	pending_images: string;
 	shots: string;
@@ -361,6 +362,7 @@ function toTask(project: string, r: TaskRow): Task {
 		report: r.report,
 		research: r.research === 1,
 		starred: r.starred === 1,
+		mergeHead: r.merge_head,
 		createdAt: r.created_at,
 		updatedAt: r.updated_at,
 		queuedAt: r.queued_at,
@@ -551,6 +553,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	report: "report",
 	research: "research",
 	starred: "starred",
+	mergeHead: "merge_head",
 	queuedAt: "queued_at",
 	cancelledAt: "cancelled_at",
 	commits: "commits",
@@ -1219,6 +1222,8 @@ export class ProjectStore {
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
 			);
+		if (!cols.includes("merge_head"))
+			db.exec("ALTER TABLE tasks ADD COLUMN merge_head TEXT");
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 		// updates a live table, so converge additively like the tasks columns above.
 		const prCols = db

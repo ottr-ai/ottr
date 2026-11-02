@@ -127,6 +127,7 @@ import { createPrWatcher, prUrl } from "./prs.ts";
 import { fetchQuota } from "./quota.ts";
 import {
 	includedTasks,
+	lateCommits,
 	ownerRepo,
 	planRelease,
 	releaseBlocked,
@@ -148,6 +149,7 @@ import {
 	mergeAnywayPatch,
 	openWorkBlockers,
 	reviewBlocked,
+	reviewFindings,
 	silentSince,
 	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_SEND_BACK,
@@ -4537,6 +4539,37 @@ export function createApp(deps: AppDeps) {
 										task.base ?? "HEAD",
 										e.target,
 									).catch(() => null);
+					if (
+						task.releaseVersion !== null &&
+						task.state === "needs_you" &&
+						task.cancelledAt === null &&
+						task.base !== null &&
+						e.target !== null
+					) {
+						// The commits the publish will ship past the reviewed commit, with the review's finding
+						// merges marked: the anchors are the mergeHeads the finding cards stamped at Done.
+						const findings = reviewFindings(e.store.listTasks(), task)
+							.filter((f) => f.cancelledAt === null && f.mergeHead !== null)
+							.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
+							.map((f) => f.mergeHead!);
+						const head = await resolveTarget(e.path, false)
+							.then((r) => r.sha)
+							.catch(() => null);
+						if (head !== null) {
+							const marked = await lateCommits(
+								e.path,
+								task.base,
+								head,
+								findings,
+							).catch(() => null);
+							if (marked !== null)
+								view.lateCommits = marked.map(({ sha, subject, reviewed }) => ({
+									sha,
+									subject,
+									reviewed,
+								}));
+						}
+					}
 					return json(view);
 				}),
 		},

@@ -291,6 +291,8 @@ export interface Task {
 	followUpOf: string | null;
 	/** CI watch: sha of the merge push whose GitHub Actions verdict the supervisor awaits; null once checked, skipped, or given up on. */
 	pushSha: string | null;
+	/** Integration target head when the task finished (stamped with `commits`); the anchor that attributes a release's late commits to the card that merged them. null when unmeasured or not done. */
+	mergeHead: string | null;
 	/** Coarse board topic: the last turn report's `topic:` line (max 40 chars), else a keyword label backfilled for done cards; null = unclassified. */
 	topic: string | null;
 	/** Task ids this card waits for: the scheduler starts it only when each is stage done (cancelled counts as satisfied). */
@@ -636,6 +638,18 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	worktreeFiles?: string[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
+	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
+	lateCommits?: LateCommit[];
+}
+
+/** One commit in a waiting release card's late range, as shown on the drawer. */
+export interface LateCommit {
+	/** Full commit sha. */
+	sha: string;
+	/** First line of the commit message. */
+	subject: string;
+	/** true: the merge of a card the review filed (a finding card). */
+	reviewed: boolean;
 }
 
 /** A turn as shipped over the API: everything but the prompt text. */

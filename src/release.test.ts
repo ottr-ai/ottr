@@ -14,6 +14,8 @@ import {
 	computeRelease,
 	highestTag,
 	includedTasks,
+	lateCommits,
+	lateNotes,
 	latestImage,
 	ownerRepo,
 	parseCommit,
@@ -790,7 +792,7 @@ describe("against real repos", () => {
 		);
 	}, 60_000);
 
-	test("publishRelease tags a head past the reviewed commit and lists the later commits as late fixes", async () => {
+	test("publishRelease tags a head past the reviewed commit and groups the later commits into the notes", async () => {
 		// The fake gh is a sh script: off Windows it also records the notes the release gets.
 		const sh = process.platform !== "win32";
 		const bin = mkdtempSync(join(tmpdir(), "ott-fakegh-"));
@@ -820,12 +822,109 @@ describe("against real repos", () => {
 			);
 			if (sh)
 				expect(readFileSync(`${script}.notes`, "utf8")).toBe(
-					"## New features\n\n- X\n\n## Late fixes\n\n- fix: y",
+					"## New features\n\n- X\n\n## Bug fixes\n\n- fix: y (not reviewed)",
 				);
 		} finally {
 			process.env.PATH = saved;
 			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
 		}
+	}, 60_000);
+
+	test("publishRelease marks a finding merge reviewed and a later outside commit not reviewed", async () => {
+		// The fake gh is a sh script: off Windows it also records the notes the release gets.
+		const sh = process.platform !== "win32";
+		const bin = mkdtempSync(join(tmpdir(), "ott-fakegh-"));
+		const script = join(bin, "gh");
+		writeFileSync(
+			script,
+			'#!/bin/sh\n[ "$2" = view ] && exit 1\nwhile [ $# -gt 0 ]; do [ "$1" = --notes ] && printf %s "$2" > "$0.notes"; shift; done\n',
+		);
+		chmodSync(script, 0o755);
+		const saved = process.env.PATH;
+		if (sh) process.env.PATH = `${bin}:${saved}`;
+		try {
+			// Reviewed commit, then the finding card's merge, then an outside commit on top.
+			await must(main, "commit", "-q", "--allow-empty", "-m", "fix: y2");
+			const finding = await must(main, "rev-parse", "HEAD");
+			await must(main, "commit", "-q", "--allow-empty", "-m", "feat: z");
+			const outside = await must(main, "rev-parse", "HEAD");
+			const log = await publishRelease({
+				mainPath: main,
+				reviewed: head,
+				sha: outside,
+				version: "v9.9.9",
+				notes: "Planned.\n\n## Changes\n\n- Planned thing",
+				findings: [finding],
+				github: sh ? "https://github.com/o/r" : null,
+			});
+			expect(log).toStartWith(
+				`tagged v9.9.9 at ${outside.slice(0, 7)} (late fixes: 2), pushed`,
+			);
+			expect(await must(main, "rev-parse", "refs/tags/v9.9.9^{commit}")).toBe(
+				outside,
+			);
+			if (sh)
+				expect(readFileSync(`${script}.notes`, "utf8")).toBe(
+					"Planned.\n\n## Changes\n\n- Planned thing\n\n## New features\n\n- feat: z (not reviewed)\n\n## Bug fixes\n\n- fix: y2",
+				);
+		} finally {
+			process.env.PATH = saved;
+			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+
+	test("publishRelease keeps notes unchanged when nothing is late", async () => {
+		const log = await publishRelease({
+			mainPath: main,
+			reviewed: head,
+			sha: head,
+			version: "v9.9.8",
+			notes: "Planned.\n\n## Changes\n\n- Planned thing",
+			github: null,
+		});
+		expect(log).toBe(`tagged v9.9.8 at ${head.slice(0, 7)}, pushed`);
+		const marked = await lateCommits(main, head, head, []);
+		expect(marked).toEqual([]);
+		expect(
+			lateNotes("Planned.\n\n## Changes\n\n- Planned thing", marked!),
+		).toBe("Planned.\n\n## Changes\n\n- Planned thing");
+	}, 60_000);
+
+	test("a late Supersedes trailer drops the superseded commit's bullet", async () => {
+		const base = await must(main, "rev-parse", "HEAD");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "feat: a");
+		const superseded = await must(main, "rev-parse", "HEAD");
+		const msg = `feat: b\n\nSupersedes: ${superseded.slice(0, 7)}`;
+		await must(main, "commit", "-q", "--allow-empty", "-m", msg);
+		const tip = await must(main, "rev-parse", "HEAD");
+		const marked = await lateCommits(main, base, tip, []);
+		expect(marked?.map((c) => [c.subject, c.reviewed])).toEqual([
+			["feat: b", false],
+			["feat: a", false],
+		]);
+		expect(lateNotes("", marked!)).toBe(
+			"## New features\n\n- feat: b (not reviewed)",
+		);
+	}, 60_000);
+
+	test("lateCommits marks each finding segment and leaves gaps unmarked", async () => {
+		// From the current tip: finding 1's merge, an outside commit, finding 2's merge, an
+		// outside commit on top. findings are given in done (oldest first) order.
+		const base = await must(main, "rev-parse", "HEAD");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "fix: f1");
+		const f1 = await must(main, "rev-parse", "HEAD");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "chore: gap1");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "fix: f2");
+		const f2 = await must(main, "rev-parse", "HEAD");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "chore: gap2");
+		const gap2 = await must(main, "rev-parse", "HEAD");
+		const marked = await lateCommits(main, base, gap2, [f1, f2]);
+		expect(marked?.map((c) => [c.subject, c.reviewed])).toEqual([
+			["chore: gap2", false],
+			["fix: f2", true],
+			["chore: gap1", true],
+			["fix: f1", true],
+		]);
 	}, 60_000);
 
 	test("publishRelease refuses a head without the reviewed commit and tags nothing", async () => {

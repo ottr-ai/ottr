@@ -3073,6 +3073,67 @@ describe("release notes route", () => {
 	});
 });
 
+describe("drawer late commits route", () => {
+	const run = (cmd: string): string =>
+		execSync(cmd, { cwd: projectDir, stdio: "pipe" }).toString().trim();
+	const commit = (file: string, msg: string): string => {
+		writeFileSync(join(projectDir, file), "x");
+		run(`git add ${file} && git commit -qm '${msg}'`);
+		return run("git rev-parse HEAD");
+	};
+
+	test("a waiting release card lists the commits past its base, finding merges marked", async () => {
+		// The route reads the target head without a fetch, so a local branch without upstream
+		// resolves to itself; the repo lives only for this test and is removed afterwards.
+		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		try {
+			run("git config user.email t@t && git config user.name t");
+			commit("seed.txt", "seed");
+			const reviewed = run("git rev-parse HEAD");
+			const fix = commit("fix.txt", "fix: y");
+			const feat = commit("feat.txt", "feat: z");
+			const e = projects.get("p1")!;
+			const prevTarget = e.target;
+			e.target = "main";
+			try {
+				const release = store.createTask("release card");
+				store.updateTask(release.id, {
+					releaseVersion: "v1.2.3",
+					state: "needs_you",
+					stage: "merging",
+					base: reviewed,
+				});
+				const finding = store.createTask("fix finding");
+				store.updateTask(finding.id, {
+					followUpOf: release.id,
+					stage: "done",
+					state: "idle",
+					mergeHead: fix,
+				});
+				// The parked release card has no doneAt, so reviewFindings counts every
+				// card it filed, this one included.
+				const res = await get(`/api/projects/p1/tasks/${release.id}`);
+				expect(res.status).toBe(200);
+				const view = (await res.json()) as { lateCommits?: unknown };
+				expect(view.lateCommits).toEqual([
+					{ sha: feat, subject: "feat: z", reviewed: false },
+					{ sha: fix, subject: "fix: y", reviewed: true },
+				]);
+				const plain = store.createTask("plain card");
+				const plainRes = await get(`/api/projects/p1/tasks/${plain.id}`);
+				expect(plainRes.status).toBe(200);
+				expect(
+					((await plainRes.json()) as { lateCommits?: unknown }).lateCommits,
+				).toBeUndefined();
+			} finally {
+				e.target = prevTarget;
+			}
+		} finally {
+			rmSync(join(projectDir, ".git"), { recursive: true, force: true });
+		}
+	});
+});
+
 describe("github token", () => {
 	// Own global store: creating the admin here must not end onboarding for the shared app.
 	const g = GlobalStore.open(join(root, "g-token"));

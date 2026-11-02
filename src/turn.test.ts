@@ -830,12 +830,16 @@ describe("turn loop", () => {
 			proposal: null,
 			recorded: [],
 		};
-		const shas: string[] = ["abc123", "abc123", "abc123"];
 		const projects = new Map([[store.name, fakeProject(store)]]);
 		const loop = createTurnLoop(
 			projects,
 			fakeOps(record, {
-				targetSha: async () => shas.shift() ?? null,
+				// The Done path also reads the branch tip (OTTR-326 gate) and the mergeHead
+				// anchor, so the stub answers by ref: the pin needs local === origin.
+				targetSha: async (_mainPath: string, ref: string) =>
+					ref === "origin/main" || ref === "refs/remotes/origin/main"
+						? "abc123"
+						: "branch-tip",
 				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
 					o.onSession?.("sess-1");
@@ -881,12 +885,17 @@ describe("turn loop", () => {
 			proposal: null,
 			recorded: [],
 		};
-		const shas: string[] = ["abc123", "def456"];
 		const projects = new Map([[store.name, fakeProject(store)]]);
 		const loop = createTurnLoop(
 			projects,
 			fakeOps(record, {
-				targetSha: async () => shas.shift() ?? null,
+				// The local target tip and the origin tip differ, so the CI pin stays unset.
+				targetSha: async (_mainPath: string, ref: string) =>
+					ref === "origin/main"
+						? "abc123"
+						: ref === "refs/remotes/origin/main"
+							? "def456"
+							: "branch-tip",
 				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
 					o.onSession?.("sess-1");
@@ -3870,8 +3879,10 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(shaCalls).toEqual([
-			// The push refusal reads the local tip first (OTTR-326), then CI watch pins.
+			// The push refusal reads the local tip first (OTTR-326), then the Done write stamps
+			// the mergeHead anchor, then CI watch pins from the local and origin tips.
 			[store.path, "refs/heads/main"],
+			[store.path, "origin/main"],
 			[store.path, "origin/main"],
 			[store.path, "refs/remotes/origin/main"],
 		]);
@@ -11274,6 +11285,29 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		// No target warning: the card log carries no stray line for it.
 		expect(logText(store, task.id).split("\n")).not.toContain("null");
 		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a parked release passes the finding merges as the publish anchors", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const task = parkedRelease(store);
+		// A finding card the review filed, done and stamped with its merge head.
+		const finding = store.createTask("fix the found bug");
+		store.updateTask(finding.id, {
+			followUpOf: task.id,
+			stage: "done",
+			state: "idle",
+			mergeHead: "shaF",
+		});
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(record.publishRelease).toHaveLength(1);
+		expect(record.publishRelease[0]).toMatchObject({ findings: ["shaF"] });
 	});
 
 	test("a target warning at publish reaches the release card's log", async () => {

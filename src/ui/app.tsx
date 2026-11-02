@@ -6048,6 +6048,15 @@ export function Drawer({
 				if (!res.ok) throw new Error(String(res.status));
 				const v = (await res.json()) as TaskView;
 				if (alive) setDetail(v);
+				// A waiting release card's late-commit list follows the target head, which moves without a
+				// row change of this card; repoll so the list stays fresh while the card waits for approval.
+				if (
+					alive &&
+					v.releaseVersion !== null &&
+					v.state === "needs_you" &&
+					v.cancelledAt === null
+				)
+					retry = setTimeout(() => void load(0), 5000);
 			} catch {
 				// Fetch failed or hiccuped: retry with backoff while the drawer is open. A done row never
 				// changes again, so without a retry a blip at open time would show "No turns yet." forever.
@@ -6582,6 +6591,27 @@ export function Drawer({
 							</div>
 						</DrawerSec>
 					)}
+					{task.releaseVersion !== null &&
+						task.state === "needs_you" &&
+						!cancelled &&
+						task.lateCommits !== undefined &&
+						task.lateCommits.length > 0 && (
+							<DrawerSec id="drawer-late" label="Commits since the review">
+								<ul className="late-commits">
+									{task.lateCommits.map((c) => (
+										<li key={c.sha}>
+											<code>{c.sha.slice(0, 7)}</code>
+											<span className="late-subject">{c.subject}</span>
+											<span
+												className={c.reviewed ? "late-mark" : "late-mark warn"}
+											>
+												{c.reviewed ? "review fix" : "not reviewed"}
+											</span>
+										</li>
+									))}
+								</ul>
+							</DrawerSec>
+						)}
 					{task.asked !== null && task.state === "needs_you" && (
 						<AskPanel
 							asked={task.asked}

@@ -1,7 +1,7 @@
 import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
-import type { LatestImage, ReleasePlan, Task } from "./types.ts";
+import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
 import { checkPinnedRemote, git, spawnPiped } from "./worktree.ts";
 
 export interface ConventionalCommit {
@@ -423,6 +423,71 @@ export async function runGh(
 	}
 }
 
+/** One late commit with its full message body, the shape `lateNotes` groups into notes sections. */
+export interface LateCommitInfo extends LateCommit {
+	body: string;
+}
+
+/**
+ * Commits in `reviewed..sha` (the range publishRelease tags), newest first; null when git fails.
+ * Marking: the findings' mergeHeads, in done order, anchor the range — commits after the previous
+ * anchor (the reviewed commit for the first segment) up to and including a finding head are that
+ * finding's merge (reviewed: true); commits before the first anchor or between segments are not.
+ */
+export async function lateCommits(
+	mainPath: string,
+	reviewed: string,
+	sha: string,
+	findings: readonly string[],
+): Promise<LateCommitInfo[] | null> {
+	const log = await git(
+		["log", "--format=%H%x1f%s%x1f%b%x1e", `${reviewed}..${sha}`],
+		mainPath,
+	);
+	if (log.code !== 0) return null;
+	const all = log.stdout
+		.split("\x1e")
+		.filter((rec) => rec.trim() !== "")
+		.map((rec) => {
+			const [sha = "", subject = "", body = ""] = rec.trimStart().split("\x1f");
+			return { sha, subject, body };
+		});
+	// Newest first from git; walk from the tip back to each anchor, so every commit after the
+	// previous anchor and up to (and including) the finding head lands in that finding's segment.
+	const anchors = new Set([reviewed, ...findings]);
+	let marked = false;
+	const out: LateCommitInfo[] = [];
+	for (const c of all) {
+		if (!marked && anchors.has(c.sha) && c.sha !== reviewed) marked = true;
+		out.push({ ...c, reviewed: marked });
+	}
+	return out;
+}
+
+/** Groups the late commits under Conventional Commit headings and appends them to the planned notes. */
+export function lateNotes(notes: string, marked: LateCommitInfo[]): string {
+	const dropped = droppedCommits(marked);
+	const kept = marked.filter((_, i) => !dropped.has(i));
+	const sections: Record<string, string[]> = {};
+	for (const c of kept) {
+		const type = parseCommit(c.subject, c.body)?.type;
+		const head =
+			type === "feat"
+				? "New features"
+				: type === "fix"
+					? "Bug fixes"
+					: "Other changes";
+		const list = sections[head] ?? [];
+		list.push(`- ${c.subject}${c.reviewed ? "" : " (not reviewed)"}`);
+		sections[head] = list;
+	}
+	const body = Object.entries(sections)
+		.map(([head, bullets]) => `## ${head}\n\n${bullets.join("\n")}`)
+		.join("\n\n");
+	if (body === "") return notes;
+	return [notes.trim(), body].filter(Boolean).join("\n\n");
+}
+
 export async function publishRelease(o: {
 	mainPath: string;
 	/** The commit the review saw. */
@@ -431,6 +496,8 @@ export async function publishRelease(o: {
 	sha: string;
 	version: string;
 	notes: string;
+	/** Ordered mergeHeads of the review's finding cards: the anchors that mark which late commits are review fixes. */
+	findings?: string[];
 	github: string | null;
 	archReview?: { delta: number } | null;
 	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the push. */
@@ -438,9 +505,9 @@ export async function publishRelease(o: {
 }): Promise<string> {
 	const parts: string[] = [];
 	// The release waits for its review's fixes, and the merge hold keeps every other card off the
-	// target, so the commits after `reviewed` are those fixes: the tag holds them, the notes list them.
-	// ponytail: a commit pushed outside the board during the review ships too (it is listed); match
-	// the late commits against the findings' merges if that ever bites.
+	// target, so the commits after `reviewed` are those fixes: the tag holds them, the notes list
+	// them. The findings' mergeHeads anchor the attribution; a commit pushed outside the board
+	// before the first finding's merge sits in its segment (ponytail; later segments are exact).
 	const anc = await git(
 		["merge-base", "--is-ancestor", o.reviewed, o.sha],
 		o.mainPath,
@@ -449,20 +516,14 @@ export async function publishRelease(o: {
 		throw new Error(
 			`${o.sha.slice(0, 7)} does not contain the reviewed commit ${o.reviewed.slice(0, 7)}`,
 		);
-	const late = await git(
-		["log", "--format=- %s", `${o.reviewed}..${o.sha}`],
+	const marked = await lateCommits(
 		o.mainPath,
+		o.reviewed,
+		o.sha,
+		o.findings ?? [],
 	);
-	if (late.code !== 0)
-		throw new Error(`git log for the late fixes failed: ${late.stderr.trim()}`);
-	const fixes = late.stdout.trim();
-	const lateCount = fixes === "" ? 0 : fixes.split("\n").length;
-	const notes =
-		fixes === ""
-			? o.notes
-			: [o.notes.trim(), `## Late fixes\n\n${fixes}`]
-					.filter(Boolean)
-					.join("\n\n");
+	if (marked === null) throw new Error("git log for the late fixes failed");
+	const notes = lateNotes(o.notes, marked);
 	// Every step is idempotent so a failed publish can be retried by replying to the release card.
 	const cur = await git(
 		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],
@@ -486,7 +547,7 @@ export async function publishRelease(o: {
 		if (t.code !== 0)
 			throw new Error(`git tag ${o.version} failed: ${t.stderr.trim()}`);
 		parts.push(
-			`tagged ${o.version} at ${o.sha.slice(0, 7)}${lateCount > 0 ? ` (late fixes: ${lateCount})` : ""}`,
+			`tagged ${o.version} at ${o.sha.slice(0, 7)}${marked.length > 0 ? ` (late fixes: ${marked.length})` : ""}`,
 		);
 	}
 	if (await hasOrigin(o.mainPath)) {

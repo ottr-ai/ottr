@@ -40,6 +40,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		keptFiles: [],
 		followUpOf: null,
 		pushSha: null,
+		mergeHead: null,
 		topic: null,
 		dependsOn: [],
 		updateIds: [],

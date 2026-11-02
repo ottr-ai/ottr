@@ -706,6 +706,21 @@ describe("keptFiles", () => {
 		reopened.close();
 	});
 
+	test("updateTask stores mergeHead and it survives a reopen", () => {
+		const store = open(join(root, "merge-head-link"));
+		const task = store.createTask("merge me");
+		expect(task.mergeHead).toBe(null);
+		const updated = store.updateTask(task.id, { mergeHead: "abc12345" });
+		expect(updated.mergeHead).toBe("abc12345");
+		store.close();
+		const reopened = open(join(root, "merge-head-link"));
+		expect(reopened.getTask(task.id)?.mergeHead).toBe("abc12345");
+		expect(reopened.updateTask(task.id, { mergeHead: null }).mergeHead).toBe(
+			null,
+		);
+		reopened.close();
+	});
+
 	test("updateTask stores research and report and they survive a reopen", () => {
 		const store = open(join(root, "research-link"));
 		const task = store.createTask("research this");

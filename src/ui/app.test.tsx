@@ -1372,6 +1372,55 @@ describe("Drawer approve button", () => {
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).not.toContain("Approve merge");
 	});
+
+	const releaseFields = {
+		...drawerFields,
+		releaseVersion: "v1.2.3",
+		releaseNotes: null,
+		stage: "merging",
+		state: "needs_you",
+		asked: [
+			{
+				question: "Approve the release?",
+				options: [],
+				multi: false,
+				recommended: null,
+			},
+		],
+	} satisfies Partial<TaskCard>;
+
+	test("a waiting release card lists late commits above the Approve action", () => {
+		// lateCommits rides the drawer's TaskView, not the board row's TaskCard.
+		const task = cardFixture({
+			...releaseFields,
+			lateCommits: [
+				{
+					sha: "aaaaaaaaaaaaaaaa",
+					subject: "feat: outside work",
+					reviewed: false,
+				},
+				{ sha: "bbbbbbbbbbbbbbbb", subject: "fix: y", reviewed: true },
+			],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Commits since the review");
+		expect(html).toContain("feat: outside work");
+		expect(html).toContain("fix: y");
+		expect(html).toContain("not reviewed");
+		expect(html).toContain("review fix");
+		const approve = html.indexOf(
+			'title="Replies &quot;Approve&quot; to the waiting session"',
+		);
+		const section = html.indexOf("Commits since the review");
+		expect(section).toBeGreaterThanOrEqual(0);
+		expect(section).toBeLessThan(approve);
+	});
+
+	test("a waiting release card without late commits renders no section", () => {
+		const task = cardFixture(releaseFields);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain("Commits since the review");
+	});
 });
 
 describe("cancelled cards on the board", () => {

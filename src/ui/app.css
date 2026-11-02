@@ -2122,6 +2122,37 @@ button.notif-link {
 	border: 1px solid var(--line-soft);
 	border-radius: 4px;
 }
+/* Late commits between a release's reviewed commit and the target head: sha, subject, and the
+mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 1.4.1). */
+.late-commits {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	gap: 4px;
+}
+.late-commits li {
+	display: flex;
+	gap: 8px;
+	align-items: baseline;
+}
+.late-commits code {
+	color: var(--dim);
+	font-size: 12px;
+}
+.late-subject {
+	flex: 1;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.late-mark {
+	color: var(--dim);
+	white-space: nowrap;
+	font-size: 12px;
+}
+.late-mark.warn {
+	color: var(--alarm);
+}
 .advisory {
 	display: flex;
 	flex-wrap: wrap;

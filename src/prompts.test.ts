@@ -538,6 +538,7 @@ describe("handoffMarkdown research report", () => {
 		keptFiles: [],
 		followUpOf: null,
 		pushSha: null,
+		mergeHead: null,
 		kind: "work" as const,
 		topic: null,
 		dependsOn: [],

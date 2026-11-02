@@ -69,6 +69,7 @@ import {
 	parseCheckVerdicts,
 	parseWorkCheck,
 	pickRunnable,
+	reviewFindings,
 	selectFindings,
 	WORK_CHECK_THIRD_BLOCK,
 	workCheckAsk,
@@ -970,6 +971,12 @@ export function createTurnLoop(
 				.archReviewDelta(e.path, target, lastReviewBase(store.listTasks()))
 				.catch(() => null);
 			const archReview = archDelta !== null ? { delta: archDelta.delta } : null;
+			// The finding cards' mergeHeads, in done order: the anchors that mark which late
+			// commits are review fixes in the published notes.
+			const findings = reviewFindings(store.listTasks(), task)
+				.filter((f) => f.cancelledAt === null && f.mergeHead !== null)
+				.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
+				.map((f) => f.mergeHead!);
 			let line: string;
 			if (settings.releaseCommand === null) {
 				// Tag the target's head: the review's fixes landed there after the reviewed commit, and
@@ -983,6 +990,7 @@ export function createTurnLoop(
 					sha: head.sha,
 					version: task.releaseVersion!,
 					notes: task.releaseNotes ?? "",
+					findings,
 					github: e.github,
 					archReview,
 					originUrl: settings.originUrl,
@@ -1077,12 +1085,16 @@ export function createTurnLoop(
 					if (t.releaseVersion === null) {
 						// The Review button's card has nothing to publish.
 						const commits = await ops.targetCommits(e.path, target);
+						const mergeHead = await ops
+							.targetSha(e.path, target)
+							.catch(() => null);
 						if (cancelled()) continue;
 						e.store.updateTask(t.id, {
 							stage: "done",
 							state: "idle",
 							needsReason: null,
 							commits,
+							mergeHead,
 						});
 						continue;
 					}
@@ -1105,6 +1117,9 @@ export function createTurnLoop(
 						continue;
 					}
 					const commits = await ops.targetCommits(e.path, target);
+					const mergeHead = await ops
+						.targetSha(e.path, target)
+						.catch(() => null);
 					if (cancelled()) continue;
 					e.store.updateTask(t.id, {
 						stage: "done",
@@ -1112,6 +1127,7 @@ export function createTurnLoop(
 						needsReason: null,
 						summary: `Released ${t.releaseVersion}`,
 						commits,
+						mergeHead,
 					});
 				} finally {
 					settling.delete(key);
@@ -1284,6 +1300,7 @@ export function createTurnLoop(
 						pendingImages: [],
 						holdHead: null,
 						commits: await ops.targetCommits(e.path, target).catch(() => 0),
+						mergeHead: await ops.targetSha(e.path, target).catch(() => null),
 					});
 					return;
 				}
@@ -2295,6 +2312,12 @@ export function createTurnLoop(
 				next.stage === "done"
 					? await ops.targetCommits(e.path, target)
 					: undefined;
+			// Stamped with `commits`: the target head at Done anchors the release's late-commit
+			// attribution to this card's merge.
+			const mergeHead =
+				next.stage === "done"
+					? await ops.targetSha(e.path, target).catch(() => null)
+					: undefined;
 			const keptFiles =
 				!releaseCard && next.stage === "done"
 					? []
@@ -2452,6 +2475,7 @@ export function createTurnLoop(
 						result.outcome?.details ?? (result.finalText || task.details),
 					) ?? undefined,
 				commits,
+				mergeHead,
 				report,
 				keptFiles,
 				holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
@@ -3247,6 +3271,7 @@ export function createTurnLoop(
 			needsReason: null,
 			keptFiles: [],
 			commits: await ops.targetCommits(e.path, target),
+			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
 		});
 		return { ok: true };
 	}
