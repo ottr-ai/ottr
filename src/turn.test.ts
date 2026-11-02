@@ -4211,9 +4211,28 @@ describe("turn ci watch pinning", () => {
 
 	test("a merge agent that removed its worktree still gets the server push", async () => {
 		const calls: string[] = [];
+		// The worktree is alive when the turn dispatches; the merge agent removes it during
+		// its run, so the husk only shows at the settle (OTTR-341 never dispatches into one).
+		let removed = false;
 		const { store, loop, task } = mergeDoneSetup({
-			worktreeHusk: async () => true,
+			worktreeHusk: async () => removed,
 			branchMergedOrGone: async () => true,
+			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+				removed = true;
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "integrated",
+								summary: "landed",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
 			serverMergePush: async (
 				_m: string,
 				_w: string,
@@ -8211,6 +8230,113 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 	});
+
+	// OTTR-341: an approval whose worktree is already gone must not dispatch a turn into
+	// the dead cwd (AGEN-24: every worker refused the turn with a 400, and the card stayed
+	// needs_you forever on a lost-worker reason).
+	test("an approved update card with no worktree and its head on the target settles done with no dispatch", async () => {
+		const { store, record, loop } = setup({
+			// The worktree was removed after the agent merged by itself (AGEN-24); the target
+			// proves the approved head landed.
+			worktreeHusk: async () => true,
+			targetContains: async () => true,
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, {
+			updateIds: ["a@1"],
+			worktree: "/nonexistent/ottr-341-worktree",
+			branch: "ott/update-pins",
+		});
+		// What POST /reply does (U7): queue the card and approve the parked head.
+		store.updateTask(task.id, {
+			pendingPrompt: "Approved.",
+			pendingBy: "user",
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			updateMergeHead: "sha-1",
+			holdHead: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		// The turn never ran, so its queued reply is consumed and no worker saw the dead cwd.
+		expect(after.pendingPrompt).toBeNull();
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a fork-born card approved with its worktree gone and its head on the target settles done", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			targetContains: async () => true,
+		});
+		const task = store.createTask("fork follow-up");
+		store.updateTask(task.id, {
+			worktree: "/nonexistent/ottr-341-worktree",
+			branch: "ott/fork-follow-up",
+		});
+		store.updateTask(task.id, {
+			pendingPrompt: "Approved.",
+			pendingBy: "user",
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			forkMergeHead: "sha-2",
+			holdHead: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("an approved card with no worktree and its head not on the target parks with the worktree-gone reason", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// Fails closed like the real git read: containment must be proven, never assumed.
+			targetContains: async () => false,
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, {
+			updateIds: ["a@1"],
+			worktree: "/nonexistent/ottr-341-worktree",
+			branch: "ott/update-pins",
+		});
+		store.updateTask(task.id, {
+			pendingPrompt: "Approved.",
+			pendingBy: "user",
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			updateMergeHead: "sha-1",
+			holdHead: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"The card's worktree is gone; its work is not on origin/main. Cancel the card or recreate the work.",
+		);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a queued card whose worktree still exists dispatches as before", async () => {
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+		});
+		const task = store.createTask("do a thing");
+		store.updateTask(task.id, {
+			worktree: "/fake/ottr-341-worktree",
+			branch: "ott/do-a-thing",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.needsReason).toBeNull();
+	});
 });
 
 // Survivor round 4 (2026-10-14): exact-output kills for the src/turn.ts survivors of the
@@ -8263,9 +8389,12 @@ describe("turn survivor round 4", () => {
 
 	test("a husk merge turn proves integration from the main repo with the task branch", async () => {
 		const bmgCalls: unknown[][] = [];
+		// The worktree dies during the run: the first husk read is OTTR-341's dispatch
+		// guard (alive), the settle's later reads see the husk and read the main repo.
+		let huskReads = 0;
 		const { store, loop } = setup({
 			maxTotalRuns: () => 0, // hold the chained merge turn; each settle runs via a direct runTurn
-			worktreeHusk: async () => true,
+			worktreeHusk: async () => huskReads++ > 0,
 			branchMergedOrGone: async (...args: unknown[]) => {
 				bmgCalls.push(args);
 				return true;
@@ -12351,10 +12480,13 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a husk merge whose branch proof fails is not integrated", async () => {
+		// The worktree dies during the run: the first husk read is OTTR-341's dispatch
+		// guard (alive), the settle's later reads see the husk and read the main repo.
+		let huskReads = 0;
 		const { store, loop } = withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
-				worktreeHusk: async () => true,
+				worktreeHusk: async () => huskReads++ > 0,
 				branchMergedOrGone: async () => {
 					throw new Error("git missing");
 				},
@@ -12429,11 +12561,16 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("a husk worktree keeps a non-integrated reason that is not the integrated bounce", async () => {
 		const record = baseRecord();
+		// The worktree dies during the run: alive at dispatch (OTTR-341 never dispatches
+		// into a husk), a husk by the settle, so classify reads its facts from the main repo.
+		let husked = false;
 		const { store, loop } = setupWith(record, {
 			maxTotalRuns: () => 0,
-			worktreeHusk: async () => true,
+			worktreeHusk: async () => husked,
 			branchMergedOrGone: async () => false,
-			startRun: runWith(record, {}),
+			startRun: runWith(record, {}, () => {
+				husked = true;
+			}),
 		});
 		const task = store.createTask("work please");
 		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });
@@ -12444,10 +12581,20 @@ describe("turn survivor round 5 — classify wiring", () => {
 	});
 
 	test("a husk worktree with an answered report and an unmerged branch settles done", async () => {
-		const { store, loop } = setup({
+		const record = baseRecord();
+		// Same mid-run removal: alive at dispatch, a husk at the settle.
+		let husked = false;
+		const { store, loop } = setupWith(record, {
 			maxTotalRuns: () => 0,
-			worktreeHusk: async () => true,
+			worktreeHusk: async () => husked,
 			branchMergedOrGone: async () => false,
+			startRun: runWith(
+				record,
+				{ outcome: { status: "answered", summary: "did it" } },
+				() => {
+					husked = true;
+				},
+			),
 		});
 		const task = store.createTask("work please");
 		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });

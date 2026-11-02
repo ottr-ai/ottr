@@ -1233,6 +1233,59 @@ export function createTurnLoop(
 				}
 			}
 
+			// OTTR-341: never dispatch a turn into a missing worktree. A card whose agent merged
+			// and removed the worktree (AGEN-24) stays queued at a dead cwd: every worker refuses
+			// the turn with a 400 and the card parks on a lost-worker reason forever. When the
+			// approved hold head (U7) or, when unknown, the branch head is already an ancestor of
+			// the target, the work landed: settle done here, the same containment proof the hold
+			// settle accepts for a turn that removed its own worktree. Otherwise the work is not
+			// on the target and only the user can cancel the card or recreate the work.
+			if (
+				!interview &&
+				!grill &&
+				task.worktree !== null &&
+				task.branch !== null &&
+				wt === task.worktree &&
+				(await ops.worktreeHusk(wt).catch(() => false))
+			) {
+				const approvedHead = task.updateMergeHead ?? task.forkMergeHead;
+				const head =
+					approvedHead ??
+					(await ops
+						.targetSha(e.path, `refs/heads/${branch}`)
+						.catch(() => null));
+				const landed =
+					head !== null &&
+					(await ops.targetContains(e.path, head, target).catch(() => false));
+				// A cancel that landed while the git reads ran owns the card; never write over it.
+				const cur = store.getTask(id);
+				if (cur === null || cur.cancelledAt !== null) return;
+				if (landed) {
+					log(
+						`- worktree is gone; head ${head} is already on ${target}: the card settles done`,
+					);
+					// Same end state as the hold settle for a landed approval; the turn never ran,
+					// so there is no row to finish and its queued reply is consumed unread.
+					store.updateTask(id, {
+						stage: "done",
+						state: "idle",
+						needsReason: null,
+						asked: null,
+						pendingPrompt: null,
+						pendingImages: [],
+						holdHead: null,
+						commits: await ops.targetCommits(e.path, target).catch(() => 0),
+					});
+				} else {
+					log(`! worktree is gone; its work is not on ${target}`);
+					store.updateTask(id, {
+						state: "needs_you",
+						needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
+					});
+				}
+				return;
+			}
+
 			// Capture the card's diff now: once the ff-merge lands, the branch tip sits on the target
 			// and no later git view can separate this branch's files from its siblings'. Skipped when
 			// the branch is already integrated (a retried merge turn): the first capture stands.
