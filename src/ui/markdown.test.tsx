@@ -185,6 +185,16 @@ describe("Markdown", () => {
 		expect(out).toContain("![x](//evil.test/a.png)");
 	});
 
+	test("tab or newline after the leading slash never reaches an img src", () => {
+		// Browsers strip tab/newline from URLs (WHATWG URL parser), so "/\t/evil.test"
+		// resolves to "//evil.test" — protocol-relative. The raw <img> tag admits both
+		// characters; the gate must reject them outright.
+		const out = render(
+			'<img src="/\t/evil.test/b.png" alt="box">\n\n<img src="/\n/evil.test/c.png" alt="box">',
+		);
+		expect(out).not.toContain("<img");
+	});
+
 	test("images with unsafe sources never render as img", () => {
 		const out = render(
 			'![x](javascript:alert(1))\n\n![x](https://x.test/x.png)\n\n<img src=x onerror=alert(1)>\n\n<img src="javascript:alert(2)" onerror="alert(3)">',
