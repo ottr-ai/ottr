@@ -8324,6 +8324,99 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(record.runs).toHaveLength(0);
 	});
 
+	// OTTR-349: a branch whose tip still sits at its base proves nothing — review, release
+	// and retro cards never commit, and base is always an ancestor of the target. The guard
+	// must not settle such a card done on that vacuous proof; it rebuilds the worktree instead.
+	test("a husk worktree whose branch has no commits past base recreates the worktree and dispatches", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// The zero-commit branch tip sits at base (sha0), which is always an ancestor of the
+			// target: containment holds vacuously and must not settle the card done unheard.
+			targetSha: async (_p, ref) =>
+				ref === "refs/heads/ott/do-a-thing" ? "sha0" : null,
+			targetContains: async () => true,
+		});
+		const task = store.createTask("do a thing");
+		store.updateTask(task.id, {
+			worktree: join(tmpdir(), "ottr-349-worktree"),
+			branch: "ott/do-a-thing",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.createWorktree).toHaveLength(1);
+		expect(record.createWorktree[0]).toMatchObject({
+			worktreePath: join(tmpdir(), "ottr-349-worktree"),
+			branch: "ott/do-a-thing",
+			base: "sha0",
+		});
+		// The turn ran in the rebuilt worktree; no done settle consumed it unheard.
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.needsReason).toBeNull();
+	});
+
+	test("a review card's husk worktree on its frozen base recreates and runs instead of settling done", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// The review card's branch sits at its frozen base: containment is vacuous.
+			targetSha: async (_p, ref) =>
+				ref === "refs/heads/ott/review-the-board" ? "sha0" : null,
+			targetContains: async () => true,
+		});
+		const task = store.createTask("review the board", null, "review");
+		store.updateTask(task.id, {
+			base: "sha0",
+			worktree: join(tmpdir(), "ottr-349-review-worktree"),
+			branch: "ott/review-the-board",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.createWorktree).toHaveLength(1);
+		// The review ran; the buggy guard settled the card done with zero runs here.
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.needsReason).toBeNull();
+	});
+
+	test("a husk worktree whose branch is gone recreates the worktree from base", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// The branch ref is gone: no proof either way, and a husk holds nothing recoverable.
+			targetSha: async () => null,
+		});
+		const task = store.createTask("do a thing");
+		store.updateTask(task.id, {
+			worktree: join(tmpdir(), "ottr-349-gone-branch-worktree"),
+			branch: "ott/do-a-thing",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(record.createWorktree).toHaveLength(1);
+		expect(record.createWorktree[0]).toMatchObject({
+			branch: "ott/do-a-thing",
+			base: "sha0",
+		});
+		expect(record.runs).toHaveLength(1);
+	});
+
+	test("a husk worktree whose branch has commits past base but not on the target parks", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// Commits past base but not contained: real unlanded work, so no rebuild happens.
+			targetSha: async (_p, ref) =>
+				ref === "refs/heads/ott/do-a-thing" ? "sha9" : null,
+			targetContains: async () => false,
+		});
+		const task = store.createTask("do a thing");
+		store.updateTask(task.id, {
+			worktree: join(tmpdir(), "ottr-349-diverged-worktree"),
+			branch: "ott/do-a-thing",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"The card's worktree is gone; its work is not on origin/main. Cancel the card or recreate the work.",
+		);
+		expect(record.runs).toHaveLength(0);
+		expect(record.createWorktree).toHaveLength(0);
+	});
+
 	test("a queued card whose worktree still exists dispatches as before", async () => {
 		const { store, record, loop } = setup({
 			commitsAhead: async () => 0,

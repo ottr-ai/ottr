@@ -1236,15 +1236,20 @@ export function createTurnLoop(
 			// OTTR-341: never dispatch a turn into a missing worktree. A card whose agent merged
 			// and removed the worktree (AGEN-24) stays queued at a dead cwd: every worker refuses
 			// the turn with a 400 and the card parks on a lost-worker reason forever. When the
-			// approved hold head (U7) or, when unknown, the branch head is already an ancestor of
-			// the target, the work landed: settle done here, the same containment proof the hold
-			// settle accepts for a turn that removed its own worktree. Otherwise the work is not
-			// on the target and only the user can cancel the card or recreate the work.
+			// approved hold head (U7) or the branch head is already an ancestor of the target,
+			// the work landed: settle done here, the same containment proof the hold settle
+			// accepts for a turn that removed its own worktree. A branch-head proof only counts
+			// when the branch has commits past base (OTTR-349): review, release-review and retro
+			// cards never commit, and base is always an ancestor of the target, so a tip at base
+			// would settle every unrun card done on a vacuous proof. Such a card owns nothing (a
+			// husk holds no checkout), so its worktree is rebuilt instead and the turn runs.
+			// Otherwise the work is not on the target and only the user can cancel the card or
+			// recreate the work.
 			if (
 				!interview &&
 				!grill &&
-				task.worktree !== null &&
-				task.branch !== null &&
+				wt !== null &&
+				branch !== null &&
 				wt === task.worktree &&
 				(await ops.worktreeHusk(wt).catch(() => false))
 			) {
@@ -1256,6 +1261,7 @@ export function createTurnLoop(
 						.catch(() => null));
 				const landed =
 					head !== null &&
+					head !== base &&
 					(await ops.targetContains(e.path, head, target).catch(() => false));
 				// A cancel that landed while the git reads ran owns the card; never write over it.
 				const cur = store.getTask(id);
@@ -1276,14 +1282,42 @@ export function createTurnLoop(
 						holdHead: null,
 						commits: await ops.targetCommits(e.path, target).catch(() => 0),
 					});
-				} else {
+					return;
+				}
+				if (head !== null && head !== base) {
 					log(`! worktree is gone; its work is not on ${target}`);
 					store.updateTask(id, {
 						state: "needs_you",
 						needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
 					});
+					return;
 				}
-				return;
+				// Nothing approved and nothing committed past base: a husk holds no checkout, so
+				// rebuild the worktree on the same branch (createWorktree reuses the branch at its
+				// tip) and let the turn run from base.
+				log(
+					`- worktree is gone; ${branch} has no commits past ${base}: recreating the worktree`,
+				);
+				await ops.createWorktree({
+					mainPath: e.path,
+					worktreePath: wt,
+					branch,
+					base,
+					copyExtra: settings.copyExtra,
+					log,
+				});
+				store.updateTask(id, { branch, base, worktree: wt });
+				if (store.getTask(id)?.cancelledAt) {
+					// fresh worktree: the agent never ran, so there is nothing to lose
+					await ops
+						.removeWorktree({
+							mainPath: e.path,
+							worktreePath: wt,
+							branch,
+						})
+						.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+					return;
+				}
 			}
 
 			// Capture the card's diff now: once the ff-merge lands, the branch tip sits on the target

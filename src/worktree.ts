@@ -1188,13 +1188,37 @@ export async function worktreeLinked(path: string): Promise<boolean> {
  * A deregistered-but-undeleted worktree (Windows: a process held the dir while `git worktree remove` ran) counts too:
  * it keeps every checkout file plus a `.git` file whose gitdir is gone, so git there cannot speak for any branch and
  * the husk proof comes from the main repo (branchMergedOrGone). The same shape with the `.git` file gone entirely
- * counts: git there climbs out to the enclosing repo, so it still cannot speak for its old branch. */
+ * counts: git there climbs out to the enclosing repo, so it still cannot speak for its old branch.
+ * A `.git` file whose gitdir still lives is NOT a husk (OTTR-349): git failed above for another reason (an index
+ * lock, dubious ownership) and the worktree may be healthy — a husk verdict there would let the pre-dispatch guard
+ * settle a zero-commit card done on a vacuous proof or rebuild a live checkout. */
 export async function worktreeHusk(dir: string): Promise<boolean> {
 	if (await worktreeLinked(dir)) return false;
+	// worktreeLinked's git read already failed, so the `.git` file alone proves nothing: read
+	// the gitdir it names and let that decide. An unreadable or malformed `.git` file leaves
+	// gitdir null and the climbing-git and empty-dir checks below decide instead.
+	let gitdir: string | null = null;
 	try {
-		if (statSync(path.join(dir, ".git")).isFile()) return true;
+		if (statSync(path.join(dir, ".git")).isFile()) {
+			const m = readFileSync(path.join(dir, ".git"), "utf8").match(
+				/^gitdir:\s*(.+)$/m,
+			);
+			const named = m === null ? "" : (m[1] ?? "").trim();
+			if (named !== "") {
+				gitdir = path.isAbsolute(named) ? named : path.resolve(dir, named);
+			}
+		}
 	} catch {
-		// no .git file here: a climbing-git dir or only an empty dir is a husk
+		// no readable .git link here: a climbing-git dir or only an empty dir is a husk
+	}
+	if (gitdir !== null) {
+		let alive = false;
+		try {
+			alive = statSync(gitdir).isDirectory();
+		} catch {
+			// gitdir gone: the deregistered-but-undeleted husk
+		}
+		return !alive;
 	}
 	const r = await git(
 		["rev-parse", "--is-inside-work-tree", "--show-prefix"],

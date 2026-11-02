@@ -1937,6 +1937,36 @@ describe("unlinked worktree guards", () => {
 		expect(await branchMergedOrGone(main, "side", "main")).toBe(true);
 	}, 60_000);
 
+	test("a healthy worktree whose git read fails is not a husk; the dead gitdir still is", async () => {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		writeFileSync(join(main, "a.txt"), "a");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "init");
+		const wt = join(main, "wt");
+		await must(main, "worktree", "add", "-b", "side", wt);
+		writeFileSync(join(wt, "b.txt"), "b");
+		// A transient git failure inside the dir (an index lock, dubious ownership): the .git
+		// file's gitdir is alive, so the worktree is not a husk (OTTR-349 — a husk verdict
+		// here let the pre-dispatch guard settle a zero-commit card done on a vacuous proof).
+		const previous = process.env.GIT_DIR;
+		process.env.GIT_DIR = join(main, "no-such-gitdir");
+		try {
+			expect(await worktreeLinked(wt)).toBe(false);
+			expect(await worktreeHusk(wt)).toBe(false);
+		} finally {
+			if (previous === undefined) delete process.env.GIT_DIR;
+			else process.env.GIT_DIR = previous;
+		}
+		expect(await worktreeHusk(wt)).toBe(false);
+		// The deregistered shape keeps its husk verdict: the gitdir is gone.
+		rmSync(join(main, ".git", "worktrees", "wt"), {
+			recursive: true,
+			force: true,
+		});
+		expect(await worktreeHusk(wt)).toBe(true);
+	}, 60_000);
+
 	test("branchMergedOrGone: gone or contained counts as merged, diverged does not", async () => {
 		const main = repo();
 		await must(main, "init", "-q", "-b", "main");
