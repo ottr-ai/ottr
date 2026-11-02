@@ -331,6 +331,31 @@ interface AppDeps {
 	githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 }
 
+/** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
+ *  development tool: only a checkout on branch main sees it. A release tag (detached HEAD), any
+ *  other branch, or a folder without git (the Docker image) reports 0, so a release never offers
+ *  to move to main. */
+export async function behindMain(
+	dir: string,
+): Promise<{ behind: number; commits: string[] }> {
+	const none = { behind: 0, commits: [] };
+	const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], dir);
+	if (branch.code !== 0 || branch.stdout.trim() !== "main") return none;
+	if ((await git(["fetch", "origin", "main"], dir)).code !== 0) return none;
+	const c = await git(["rev-list", "--count", "HEAD..origin/main"], dir);
+	if (c.code !== 0) return none;
+	// Subjects for the banner's bullet list. ponytail: capped at 50 so a long
+	// divergence cannot blow up the WS frame; the count above stays authoritative.
+	const l = await git(
+		["log", "--format=%s", "-n", "50", "HEAD..origin/main"],
+		dir,
+	);
+	return {
+		behind: Number(c.stdout.trim()) || 0,
+		commits: l.code === 0 ? l.stdout.trim().split("\n").filter(Boolean) : [],
+	};
+}
+
 /** The persisted removed/added project paths; boot discovery needs them before createApp runs. */
 export function storedProjectPaths(gstore: GlobalStore): {
 	removedPaths: string[];
@@ -2630,30 +2655,9 @@ export function createApp(deps: AppDeps) {
 		// Stamped on every attempt, failures included: a checkout without upstream must not re-run
 		// `git fetch` on every check.
 		behindAt = Date.now();
-		const f = await git(
-			["fetch", "origin", "main"],
+		({ behind, commits: behindCommits } = await behindMain(
 			resolve(import.meta.dir, ".."),
-		);
-		if (f.code !== 0) {
-			behind = 0; // no upstream (dev checkout): the button stays hidden
-			behindCommits = [];
-			return;
-		}
-		const c = await git(
-			["rev-list", "--count", "HEAD..origin/main"],
-			resolve(import.meta.dir, ".."),
-		);
-		behind = c.code === 0 ? Number(c.stdout.trim()) || 0 : 0;
-		// Subjects for the banner's bullet list. ponytail: capped at 50 so a long
-		// divergence cannot blow up the WS frame; the count above stays authoritative.
-		const l = await git(
-			["log", "--format=%s", "-n", "50", "HEAD..origin/main"],
-			resolve(import.meta.dir, ".."),
-		);
-		behindCommits =
-			c.code === 0 && l.code === 0
-				? l.stdout.trim().split("\n").filter(Boolean)
-				: [];
+		));
 	}
 
 	function sampleStats(): void {

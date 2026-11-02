@@ -29,7 +29,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
-import { boardWarnings, type Entry } from "./app.ts";
+import { behindMain, boardWarnings, type Entry } from "./app.ts";
 import { hashPassword } from "./auth.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
@@ -6709,5 +6709,38 @@ describe("token expiry reminders", () => {
 		};
 		expect(withNone.seed.expiresAt).toBeNull();
 		fake.stop(true);
+	});
+});
+
+describe("behindMain", () => {
+	// Fixtures come from execSync here, never from the code under test.
+	const run = (cmd: string, cwd: string) =>
+		execSync(cmd, { cwd, stdio: "ignore" });
+	const setup = () => {
+		const origin = makeFixture(`behind-${Math.random().toString(36).slice(2)}`);
+		const clone = mkdtempSync(join(tmpdir(), "ottr-behind-"));
+		run(`git clone -q "${origin}" .`, clone);
+		run('git commit -q --allow-empty -m "feat: newer"', origin);
+		return clone;
+	};
+	const none = { behind: 0, commits: [] };
+
+	test("a checkout on main sees the commits origin/main has", async () => {
+		expect(await behindMain(setup())).toEqual({
+			behind: 1,
+			commits: ["feat: newer"],
+		});
+	});
+
+	test("a release tag, another branch or a folder without git sees no update", async () => {
+		const tag = setup();
+		run("git checkout -q --detach", tag);
+		const branch = setup();
+		run("git switch -q -c feature", branch);
+		expect(await behindMain(tag)).toEqual(none);
+		expect(await behindMain(branch)).toEqual(none);
+		expect(
+			await behindMain(mkdtempSync(join(tmpdir(), "ottr-nogit-"))),
+		).toEqual(none);
 	});
 });
