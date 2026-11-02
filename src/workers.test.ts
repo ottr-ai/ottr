@@ -22,7 +22,7 @@ const dir = mkdtempSync(join(tmpdir(), "ottr-workers-"));
 const echoPath = join(dir, "echo-omp.js");
 writeFileSync(
 	echoPath,
-	`process.stdout.write(JSON.stringify({ argv: process.argv, cwd: process.cwd(), env: { FOO: process.env.FOO, OTTR_WORKER_TOKEN: process.env.OTTR_WORKER_TOKEN } }) + "\\n");
+	`process.stdout.write(JSON.stringify({ argv: process.argv, cwd: process.cwd(), env: { FOO: process.env.FOO, OTTR_WORKER_TOKEN: process.env.OTTR_WORKER_TOKEN, ALATE_API_KEY: process.env.ALATE_API_KEY } }) + "\\n");
 process.exit(3);`,
 );
 
@@ -210,7 +210,11 @@ describe("serveWorker", () => {
 
 	test("omp never sees the worker's own token, from its env or the request", async () => {
 		const saved = process.env.OTTR_WORKER_TOKEN;
+		const savedAlate = process.env.ALATE_API_KEY;
 		process.env.OTTR_WORKER_TOKEN = "worker-secret";
+		// Same class of credential as the worker token: the daemon env can hold the
+		// alate bearer key (compose passes it through), and a turn must never inherit it.
+		process.env.ALATE_API_KEY = "alate-secret";
 		try {
 			const url = start({ ompPath: process.execPath });
 			const res = await fetch(`${url}/run`, {
@@ -221,7 +225,11 @@ describe("serveWorker", () => {
 					argv: [echoPath],
 					cwd: dir,
 					stdin: "",
-					env: { FOO: "bar", OTTR_WORKER_TOKEN: "forwarded" },
+					env: {
+						FOO: "bar",
+						OTTR_WORKER_TOKEN: "forwarded",
+						ALATE_API_KEY: "forwarded",
+					},
 				}),
 			});
 			const echoed = JSON.parse((await readLines(res))[0] ?? "") as {
@@ -231,6 +239,8 @@ describe("serveWorker", () => {
 		} finally {
 			if (saved === undefined) delete process.env.OTTR_WORKER_TOKEN;
 			else process.env.OTTR_WORKER_TOKEN = saved;
+			if (savedAlate === undefined) delete process.env.ALATE_API_KEY;
+			else process.env.ALATE_API_KEY = savedAlate;
 		}
 	}, 30_000);
 

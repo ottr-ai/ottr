@@ -69,6 +69,10 @@ export function childEnv(o: {
 	delete env.OTTR_SERVER_DATA_DIR;
 	delete env.OTTR_WORKER_URLS;
 	delete env.OTTR_WORKER_TOKEN;
+	// The alate bearer key drives provisioning of the agent layer every turn executes;
+	// no turn ever calls alate (only the board's server-side client does), so a turn
+	// that held it could rewrite the fleet's rules, skills and plugins (R5-1 class).
+	delete env.ALATE_API_KEY;
 	if (o.sessionName) env.OTTR_SESSION_NAME = o.sessionName;
 	if (o.board) {
 		if (!env.OTTR_BOARD_URL) env.OTTR_BOARD_URL = o.board.url;

@@ -111,6 +111,8 @@ export function serveWorker(opts: {
 			};
 			stripGitAuthEnv(env);
 			delete env.OTTR_WORKER_TOKEN;
+			// Same strip as childEnv on the server: no turn ever needs the alate key.
+			delete env.ALATE_API_KEY;
 			let child: ChildProcess;
 			// The tools link dir is per tool set: project pins, then _all pins, then the container
 			// PATH. The daemon's own PATH never changes, and two projects never see each

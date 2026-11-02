@@ -156,6 +156,7 @@ describe("childEnv", () => {
 					PATH: "/bin",
 					OTTR_WORKER_URLS: "http://w:1",
 					OTTR_WORKER_TOKEN: "worker-secret",
+					ALATE_API_KEY: "alate-secret",
 					GH_TOKEN: "ghp_x",
 				},
 			}),

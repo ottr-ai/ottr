@@ -279,7 +279,8 @@ config"). Until a seed runs, turns get no env values.
   key, and a value saved there wins at every boot. Set both in the env file,
   for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
   hex bytes); the alate container itself requires the same key. The board
-  never logs the key. A user whose Alate server already runs on another host
+  never logs the key, and the runner strips it from every turn's env, since
+  no turn calls alate. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
 
 ## Scaling
