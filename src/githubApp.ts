@@ -60,7 +60,9 @@ export function signAppJwt(
 	keyObject: KeyObject,
 	now: number,
 ): { jwt: string; iat: number; exp: number } {
-	const iat = now - 60;
+	// JWT NumericDate claims are seconds; callers pass epoch milliseconds.
+	const sec = Math.floor(now / 1000);
+	const iat = sec - 60;
 	const exp = iat + 600;
 	const header = Buffer.from(
 		JSON.stringify({ alg: "RS256", typ: "JWT" }),

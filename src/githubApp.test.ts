@@ -48,9 +48,10 @@ describe("signAppJwt", () => {
 		const [h, p, s] = jwt.split(".");
 		expect(b64json(h!)).toEqual({ alg: "RS256", typ: "JWT" });
 		expect(b64json(p!)).toEqual({ iat, exp, iss: "1234" });
-		expect(iat).toBe(now - 60);
+		expect(iat).toBe(1_700_000_000 - 60);
 		expect(exp).toBe(iat + 600);
 		expect(exp - iat).toBeLessThanOrEqual(600);
+		expect(exp).toBeLessThan(Date.now() / 1000 + 660);
 		const signed = Buffer.from(`${h}.${p}`);
 		const sig = Buffer.from(s!, "base64url");
 		expect(
