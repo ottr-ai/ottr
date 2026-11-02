@@ -97,6 +97,14 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   update_ids TEXT NOT NULL DEFAULT '[]',
   update_merge_approved INTEGER NOT NULL DEFAULT 0
 )`;
+/** The pr_review_runs table DDL, kept separate so the shape migration below reuses the exact shape. */
+const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  number INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  head TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0
+)`;
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ${TASKS_DDL};
@@ -165,13 +173,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   title TEXT NOT NULL,
   post_error TEXT
 );
-CREATE TABLE IF NOT EXISTS pr_review_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  number INTEGER NOT NULL,
-  started_at INTEGER NOT NULL,
-  head TEXT NOT NULL,
-  done INTEGER NOT NULL DEFAULT 0
-);
+${PR_REVIEW_RUNS_DDL};
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1216,6 +1218,61 @@ export class ProjectStore {
 			.map((c) => c.name);
 		if (!prCols.includes("posted_url"))
 			db.exec("ALTER TABLE pr_review ADD COLUMN posted_url TEXT");
+		// pr_review_runs changed shape twice inside the first pr_review releases (head, then
+		// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
+		// prHeadReviewed and the done update then throw "no such column" and the watcher
+		// only logs it. NOT NULL and the new primary key have no additive form: rebuild,
+		// same pattern as the stage rebuilds above — copy rows explicitly, verify the count,
+		// swap, one transaction, so a failure leaves the old table untouched.
+		const runCols = db
+			.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
+			.all()
+			.map((c) => c.name);
+		if (
+			runCols.length > 0 &&
+			!["id", "number", "started_at", "head", "done"].every((c) =>
+				runCols.includes(c),
+			)
+		) {
+			const count = (table: string): number =>
+				db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
+					?.n ?? 0;
+			const before = count("pr_review_runs");
+			db.exec("BEGIN");
+			try {
+				db.exec(
+					PR_REVIEW_RUNS_DDL.replace(
+						"CREATE TABLE IF NOT EXISTS pr_review_runs",
+						"CREATE TABLE pr_review_runs_migrating",
+					),
+				);
+				if (runCols.includes("head")) {
+					// The head-era build wrote each row after its review finished, so done = 1
+					// keeps the one-review-per-head gate for heads already reviewed there.
+					db.exec(
+						"INSERT INTO pr_review_runs_migrating (number, started_at, head, done) SELECT number, started_at, head, 1 FROM pr_review_runs",
+					);
+					const after = count("pr_review_runs_migrating");
+					if (after !== before)
+						throw Error(
+							`pr_review_runs migration would lose rows: ${before} -> ${after}`,
+						);
+					// The first shape holds no head, so its rows cannot satisfy head NOT NULL
+					// and drop: they only carry the daily rate-limit window, never review content.
+				}
+				db.exec("DROP TABLE pr_review_runs");
+				db.exec(
+					"ALTER TABLE pr_review_runs_migrating RENAME TO pr_review_runs",
+				);
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at)",
+				);
+				db.exec("COMMIT");
+			} catch (err) {
+				db.exec("ROLLBACK");
+				throw err;
+			}
+		}
 		return new ProjectStore(root, db);
 	}
 

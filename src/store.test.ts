@@ -2505,6 +2505,79 @@ describe("pr review store methods", () => {
 		expect(store.getPrReview(7)?.postedUrl).toBeNull();
 		store.close();
 	});
+
+	const runShape = (dir: string) => {
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		const cols = db
+			.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
+			.all()
+			.map((c) => c.name);
+		const indexes = db
+			.query<{ name: string }, []>("PRAGMA index_list(pr_review_runs)")
+			.all()
+			.map((c) => c.name);
+		db.close();
+		return { cols, indexes };
+	};
+
+	test("a first-release pr_review_runs without head converges on open and the run methods work", () => {
+		const dir = join(root, "pr-runs-no-head");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE pr_review_runs (
+  number INTEGER NOT NULL,
+  started_at INTEGER NOT NULL
+)`);
+		old.run("INSERT INTO pr_review_runs (number, started_at) VALUES (7, 1000)");
+		old.close();
+		const store = open(dir);
+		// The headless first-release row cannot satisfy head NOT NULL and drops; it only
+		// held the daily rate-limit window. The rebuilt table serves the run methods again.
+		expect(store.prReviewRunsSince(0)).toBe(0);
+		store.savePrReview({ ...row, number: 7 });
+		const run = store.startPrRun(7, "abc", 2000);
+		expect(store.prHeadReviewed(7, "abc")).toBe(false);
+		store.savePrDraft({ run, number: 7, head: "abc", draft: "d", prompt: "p" });
+		expect(store.prHeadReviewed(7, "abc")).toBe(true);
+		store.close();
+		const shape = runShape(dir);
+		expect(shape.cols).toEqual(["id", "number", "started_at", "head", "done"]);
+		expect(shape.indexes).toContain("idx_pr_review_runs_at");
+	});
+
+	test("a head-era pr_review_runs without id and done keeps its rows through the rebuild", () => {
+		const dir = join(root, "pr-runs-head-era");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE pr_review_runs (
+  number INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  head TEXT NOT NULL
+)`);
+		old.run(
+			"INSERT INTO pr_review_runs (number, started_at, head) VALUES (7, 1000, 'abc')",
+		);
+		old.run(
+			"INSERT INTO pr_review_runs (number, started_at, head) VALUES (8, 2000, 'def')",
+		);
+		old.close();
+		const store = open(dir);
+		// That build wrote each row after its review finished, so the copy counts the old
+		// heads as reviewed and keeps the daily-cap window.
+		expect(store.prReviewRunsSince(0)).toBe(2);
+		expect(store.prReviewRunsSince(1500)).toBe(1);
+		expect(store.prHeadReviewed(7, "abc")).toBe(true);
+		expect(store.prHeadReviewed(8, "xyz")).toBe(false);
+		store.close();
+		const shape = runShape(dir);
+		expect(shape.cols).toEqual(["id", "number", "started_at", "head", "done"]);
+	});
 });
 
 describe("triage columns", () => {
