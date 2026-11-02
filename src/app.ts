@@ -665,6 +665,8 @@ export function createApp(deps: AppDeps) {
 					},
 				},
 			);
+			// A 401/403/5xx has no expiration header; null would wrongly clear the stored date.
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
 			return parseGithubExpiry(
 				res.headers.get("github-authentication-token-expiration"),
 			);

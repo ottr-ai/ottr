@@ -6302,6 +6302,39 @@ describe("token expiry reminders", () => {
 		expect(kept.board.expiresAt).toBe(EXP);
 	});
 
+	test("the default probe keeps the stored value on a 401", async () => {
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: EXP, lastPushDay: null },
+				seed: { expiresAt: null, lastPushDay: null },
+			}),
+		);
+		// mount() injects no githubTokenExpiry, so the POST runs the default probe;
+		// an expired token makes GitHub answer 401 without the expiration header.
+		const m = mount();
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.github.com/repos/ottr-ai/ottr")
+				return new Response(null, { status: 401 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			const save = await m.call("/api/settings/github-token", { token: TOKEN });
+			expect(await save.json()).toEqual({ tokenSet: true, expiresAt: EXP });
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+		expect(await (await m.call("/api/settings/github-token")).json()).toEqual({
+			tokenSet: true,
+			expiresAt: EXP,
+		});
+	});
+
 	test("an expired token warns with the effect text and no push", async () => {
 		setSystemTime(dayAt(5));
 		probeExpiry = "2026-09-01T00:00:00.000Z";
