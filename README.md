@@ -92,6 +92,7 @@ curl -fsSLo docker-compose.yml "https://raw.githubusercontent.com/ottr-ai/ottr/$
 export OTTR_IMAGE=ghcr.io/ottr-ai/ottr:$TAG             # the image of the same release
 export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
+mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
@@ -109,6 +110,7 @@ $env:OTTR_IMAGE = "ghcr.io/ottr-ai/ottr:$TAG"       # the image of the same rele
 $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
 $env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
 $env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
+New-Item -ItemType Directory -Force $env:OTTR_OAUTH_DIR | Out-Null   # Podman refuses a missing mount source
 $env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
@@ -116,7 +118,9 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]` and `Test-Path` guards keep the existing `agent.db` snapshot, and the named volumes keep the board data. To keep the env values for the next shell, put them in an env file and pass it with `docker compose --env-file <file> …`.
+The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]` and `Test-Path` guards keep the existing `agent.db` snapshot, and the named volumes keep the board data.
+
+The `export` and `$env:` values live only in the current shell. Compose also reads a `.env` file in the same folder by itself, so put the values there (one `NAME=value` per line, for example `OTTR_WORKER_TOKEN=...`) and a new shell needs no exports.
 
 ### From source (main branch)
 
@@ -127,6 +131,7 @@ git clone git@github.com:ottr-ai/ottr.git ottr
 cd ottr
 export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
+mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
@@ -142,6 +147,7 @@ Set-Location ottr
 $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
 $env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
 $env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
+New-Item -ItemType Directory -Force $env:OTTR_OAUTH_DIR | Out-Null   # Podman refuses a missing mount source
 $env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
@@ -150,6 +156,15 @@ docker compose up -d
 ```
 
 PowerShell 5.1 drops double quotes inside the arguments of native programs, so the PowerShell `bun -e` line uses only single quotes in its JavaScript.
+
+### Podman
+
+Podman runs the stack too, with four differences:
+
+- `podman compose` needs a compose provider. Use Docker Compose v2 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`), or `pip install podman-compose`.
+- Podman has no `local` log driver. Set `OTTR_LOG_DRIVER=k8s-file` (env or `.env`).
+- podman-compose cannot parse Windows paths in volume mounts (`C:\...`). Either use Docker Compose v2 as the provider, or give the Podman machine's paths: `OTTR_OAUTH_DIR=/mnt/c/Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=/mnt/c/Users/<you>/.omp/ottr-agent.db`.
+- The default Podman machine has 2 GiB of RAM, and the server and each worker may use up to 8 GiB. Raise it: `podman machine stop; podman machine set --memory 16384; podman machine start`.
 
 ### After the first start
 

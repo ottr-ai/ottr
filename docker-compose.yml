@@ -8,8 +8,9 @@
 name: ottr
 
 # json-file never rotates; `local` rotates and compresses. 3 x 10m caps each container at 30 MB.
+# Podman has no `local` driver: set OTTR_LOG_DRIVER=k8s-file there (README, Podman).
 x-logging: &logging
-  driver: local
+  driver: ${OTTR_LOG_DRIVER:-local}
   options: { max-size: "10m", max-file: "3" }
 
 x-worker: &worker
