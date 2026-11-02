@@ -6567,6 +6567,31 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 		expect(unsavedCalls).toBe(0);
 		expect(record.removeWorktree).toHaveLength(1);
+		// The default branchMergedOrGone mock returns true: the branch is merged, so it goes too.
+		expect(record.removeWorktree[0]).toMatchObject({
+			branch: `ott/${task.id}`,
+		});
+	});
+
+	test("a husk cancel keeps the branch whose commits never reached the target", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			branchMergedOrGone: async () => false,
+		});
+		const task = seed(store);
+		const e = fakeProject(store);
+
+		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
+			removed: true,
+		});
+
+		// The husk holds no checkout, but the branch holds the work: the cancel keeps it.
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(record.removeWorktree[0]).toMatchObject({ branch: null });
+		expect(logText(store, task.id)).toContain(
+			`! cancel kept the branch ott/${task.id}: it holds commits that never reached abc`,
+		);
+		expect(store.getTask(task.id)!.state).toBe("idle");
 	});
 
 	test("finish-kept applies move/ignore/delete choices", async () => {
@@ -8353,6 +8378,32 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(store.getTask(task.id)!.needsReason).toBeNull();
 	});
 
+	// OTTR-347: a husk whose branch survives holds the work; the tracker rebuilds the
+	// worktree from the branch and dispatches instead of parking.
+	test("a queued card whose husk worktree can be rebuilt from its branch recreates and dispatches", async () => {
+		const { store, record, loop } = setup({
+			worktreeHusk: async () => true,
+			// The branch exists with a head the target does not contain.
+			targetSha: async (_p: string, ref: string) =>
+				ref === "refs/heads/ott/rebuild-me" ? "branch-sha" : null,
+		});
+		const task = store.createTask("rebuild me");
+		store.updateTask(task.id, {
+			worktree: "/nonexistent/ottr-347-worktree",
+			branch: "ott/rebuild-me",
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.createWorktree).toHaveLength(1);
+		expect(record.createWorktree[0]).toMatchObject({
+			branch: "ott/rebuild-me",
+			base: "branch-sha",
+		});
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.needsReason).toBeNull();
+	});
+
 	test("a review card's husk worktree on its frozen base recreates and runs instead of settling done", async () => {
 		const { store, record, loop } = setup({
 			worktreeHusk: async () => true,
@@ -8394,18 +8445,19 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(record.runs).toHaveLength(1);
 	});
 
-	test("a husk worktree whose branch has commits past base but not on the target parks", async () => {
+	test("a husk worktree whose branch is gone and whose approved head is not on the target parks", async () => {
 		const { store, record, loop } = setup({
 			worktreeHusk: async () => true,
-			// Commits past base but not contained: real unlanded work, so no rebuild happens.
-			targetSha: async (_p, ref) =>
-				ref === "refs/heads/ott/do-a-thing" ? "sha9" : null,
+			// The branch ref is gone and the approved head never reached the target: nothing
+			// to rebuild from, so the card parks for the user.
+			targetSha: async () => null,
 			targetContains: async () => false,
 		});
 		const task = store.createTask("do a thing");
 		store.updateTask(task.id, {
-			worktree: join(tmpdir(), "ottr-349-diverged-worktree"),
+			worktree: join(tmpdir(), "ottr-347-park-worktree"),
 			branch: "ott/do-a-thing",
+			updateMergeHead: "sha9",
 		});
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;

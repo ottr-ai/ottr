@@ -1241,10 +1241,11 @@ export function createTurnLoop(
 			// accepts for a turn that removed its own worktree. A branch-head proof only counts
 			// when the branch has commits past base (OTTR-349): review, release-review and retro
 			// cards never commit, and base is always an ancestor of the target, so a tip at base
-			// would settle every unrun card done on a vacuous proof. Such a card owns nothing (a
-			// husk holds no checkout), so its worktree is rebuilt instead and the turn runs.
-			// Otherwise the work is not on the target and only the user can cancel the card or
-			// recreate the work.
+			// would settle every unrun card done on a vacuous proof. Nothing on the branch is
+			// thrown away (OTTR-347): a tip past base rebuilds the worktree from the branch and
+			// dispatches, a tip at base rebuilds from base (the husk holds no checkout); only a
+			// card whose approved head is not on the target and whose branch cannot speak for
+			// the work parks for the user.
 			if (
 				!interview &&
 				!grill &&
@@ -1254,11 +1255,10 @@ export function createTurnLoop(
 				(await ops.worktreeHusk(wt).catch(() => false))
 			) {
 				const approvedHead = task.updateMergeHead ?? task.forkMergeHead;
-				const head =
-					approvedHead ??
-					(await ops
-						.targetSha(e.path, `refs/heads/${branch}`)
-						.catch(() => null));
+				const branchHead = await ops
+					.targetSha(e.path, `refs/heads/${branch}`)
+					.catch(() => null);
+				const head = approvedHead ?? branchHead;
 				const landed =
 					head !== null &&
 					head !== base &&
@@ -1284,38 +1284,56 @@ export function createTurnLoop(
 					});
 					return;
 				}
-				if (head !== null && head !== base) {
+				if (branchHead !== null && branchHead !== base) {
+					// OTTR-347: the branch holds commits the target never got; rebuild the
+					// worktree from its tip so the turn resumes the branch's work.
+					log(
+						`+ worktree is gone; recreating ${branch} at its head ${branchHead}`,
+					);
+					await ops.createWorktree({
+						mainPath: e.path,
+						worktreePath: wt,
+						branch,
+						base: branchHead,
+						copyExtra: settings.copyExtra,
+						log,
+					});
+					// A cancel that landed while the worktree was rebuilt owns the card; the
+					// branch holds the work, so nothing is deleted here.
+					if (store.getTask(id)?.cancelledAt) return;
+				} else if (head === null || head === base) {
+					// Nothing approved and nothing committed past base: a husk holds no checkout,
+					// so rebuild the worktree on the same branch (createWorktree reuses the branch
+					// at its tip) and let the turn run from base.
+					log(
+						`- worktree is gone; ${branch} has no commits past ${base}: recreating the worktree`,
+					);
+					await ops.createWorktree({
+						mainPath: e.path,
+						worktreePath: wt,
+						branch,
+						base,
+						copyExtra: settings.copyExtra,
+						log,
+					});
+					store.updateTask(id, { branch, base, worktree: wt });
+					if (store.getTask(id)?.cancelledAt) {
+						// fresh worktree: the agent never ran, so there is nothing to lose
+						await ops
+							.removeWorktree({
+								mainPath: e.path,
+								worktreePath: wt,
+								branch,
+							})
+							.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+						return;
+					}
+				} else {
 					log(`! worktree is gone; its work is not on ${target}`);
 					store.updateTask(id, {
 						state: "needs_you",
 						needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
 					});
-					return;
-				}
-				// Nothing approved and nothing committed past base: a husk holds no checkout, so
-				// rebuild the worktree on the same branch (createWorktree reuses the branch at its
-				// tip) and let the turn run from base.
-				log(
-					`- worktree is gone; ${branch} has no commits past ${base}: recreating the worktree`,
-				);
-				await ops.createWorktree({
-					mainPath: e.path,
-					worktreePath: wt,
-					branch,
-					base,
-					copyExtra: settings.copyExtra,
-					log,
-				});
-				store.updateTask(id, { branch, base, worktree: wt });
-				if (store.getTask(id)?.cancelledAt) {
-					// fresh worktree: the agent never ran, so there is nothing to lose
-					await ops
-						.removeWorktree({
-							mainPath: e.path,
-							worktreePath: wt,
-							branch,
-						})
-						.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
 					return;
 				}
 			}
@@ -3089,15 +3107,25 @@ export function createTurnLoop(
 		const task = store.getTask(id);
 		if (task?.worktree) {
 			let unsaved: string | null = null;
+			// OTTR-347: a husk holds no checkout, but its branch can still hold commits the
+			// target never got. Such a cancel keeps the branch instead of deleting it.
+			let keepBranch = false;
 			// A Done task passed the delete check when its worktree was removed; only its record is left.
 			// A release card's worktree is disposable: cancel it like a forced cancel.
 			if (!force && task.stage !== "done" && task.releaseVersion === null) {
 				const into = e.target ?? task.base;
-				unsaved = (await ops.worktreeHusk(task.worktree))
-					? null // an unlinked husk holds no checkout: nothing to keep
-					: into
+				if (await ops.worktreeHusk(task.worktree)) {
+					// Fail closed: with no target to prove against, the branch stays.
+					keepBranch =
+						task.branch !== null &&
+						!(
+							into && (await ops.branchMergedOrGone(e.path, task.branch, into))
+						);
+				} else {
+					unsaved = into
 						? await ops.unsavedWork(task.worktree, into)
 						: "its base commit is unknown";
+				}
 			}
 			if (unsaved) {
 				appendLog(store, id, `! cancel kept the worktree: ${unsaved}`);
@@ -3116,11 +3144,17 @@ export function createTurnLoop(
 				await ops.removeWorktree({
 					mainPath: e.path,
 					worktreePath: task.worktree,
-					branch: task.branch,
+					branch: keepBranch ? null : task.branch,
 				});
 			} catch (err) {
 				appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
 			}
+			if (keepBranch && task.branch)
+				appendLog(
+					store,
+					id,
+					`! cancel kept the branch ${task.branch}: it holds commits that never reached ${e.target ?? task.base}`,
+				);
 		}
 		store.updateTask(id, { state: "idle" });
 		return { removed: true };
