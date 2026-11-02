@@ -206,7 +206,9 @@ each worker turn, the board resolves one **execution model**, in this order:
 
 1. the card's model (trimmed; empty counts as none);
 2. else, on a resume, the model of the saved session (the `model` of its last
-   `model_change` record, `sessionModel` in `src/session.ts`);
+   default-role `model_change` record, `sessionModel` in `src/session.ts`; a
+   record with a set non-default `role`, or with `resolvedModelIsFallback:
+   true`, names a model omp does not restore on resume and does not count);
 3. else the `default` role of the board's `config.yml` (`modelRoles` in
    `src/models.ts`).
 
@@ -425,10 +427,12 @@ pasted line (address or code). `.../cancel` stops. `.../logout` returns
 
 ## Ceilings
 
-- The session model comes from the last `model_change` record of the saved
-  session. A worker turn always passes `--model`, so a resume also writes one.
-  An older session that omp saved without such a record (none seen in omp
-  18.12.3) falls back to the board's `default` role.
+- The session model comes from the last default-role `model_change` record of
+  the saved session; records with a set non-default `role`, or with
+  `resolvedModelIsFallback: true`, do not count. A worker turn always passes
+  `--model`, so a resume also writes one. An older session that omp saved
+  without such a record (none seen in omp 18.12.3) falls back to the board's
+  `default` role.
 - A turn that runs longer than the remaining token life fails with an auth
   error part-way through (anthropic tokens live hours; codex days). The board
   does nothing mid-turn. The next turn refreshes first and resumes the work.

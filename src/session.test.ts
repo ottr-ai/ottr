@@ -16,6 +16,7 @@ import {
 	sessionContext,
 	sessionFile,
 	sessionHoldsPrompt,
+	sessionModel,
 } from "./session.ts";
 
 const root = mkdtempSync(join(tmpdir(), "session-parser-"));
@@ -64,6 +65,47 @@ describe("sessionFile", () => {
 				"11110000-0000-0000-0000-000000000001",
 			),
 		).toBe(null); // missing sessions dir
+	});
+});
+
+describe("sessionModel", () => {
+	const sid = "11110000-0000-0000-0000-000000000003";
+	const model = (name: string, extra: Record<string, unknown> = {}) =>
+		`${JSON.stringify({ type: "model_change", model: name, ...extra })}\n`;
+
+	test("takes the last plain or default-role record; skips fallback and temporary switches", () => {
+		const d = dir("model");
+		writeFileSync(
+			join(d, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			model("zai/glm-5.3-flash") +
+				model("zai/glm-5.3-air", { role: "temporary" }) +
+				model("anthropic/claude-haiku-4-5", {
+					role: "fallback",
+					resolvedModelIsFallback: true,
+				}),
+		);
+		expect(sessionModel(d, sid)).toBe("zai/glm-5.3-flash");
+	});
+
+	test("a default-role record after a fallback record counts", () => {
+		const d = dir("model-default");
+		writeFileSync(
+			join(d, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			model("zai/glm-5.3-flash", { role: "fallback" }) +
+				model("zai/glm-5.3-flash", { role: "default" }),
+		);
+		expect(sessionModel(d, sid)).toBe("zai/glm-5.3-flash");
+	});
+
+	test("no model_change record, null id, or missing file gives null", () => {
+		const d = dir("model-empty");
+		writeFileSync(
+			join(d, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			'{"type":"session"}\n{"type":"message"}\n',
+		);
+		expect(sessionModel(d, sid)).toBe(null);
+		expect(sessionModel(d, null)).toBe(null);
+		expect(sessionModel(root, sid)).toBe(null); // missing sessions dir
 	});
 });
 

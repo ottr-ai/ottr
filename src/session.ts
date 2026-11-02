@@ -30,9 +30,11 @@ export function sessionFile(
 }
 
 /**
- * The model the saved session runs: the `model` of its last `model_change` record (omp writes
- * one at the start and on each switch, as `provider/id`). Null when the session file is missing,
- * unreadable, or names no model.
+ * The model the saved session runs: the `model` of its last default-role `model_change` record
+ * (omp writes one at the start and on each switch, as `provider/id`). Records with a set
+ * non-default `role`, or with `resolvedModelIsFallback: true`, name a model omp does not restore
+ * on resume, so they do not count. Null when the session file is missing, unreadable, or names
+ * no model.
  */
 export function sessionModel(
 	dir: string,
@@ -53,6 +55,10 @@ export function sessionModel(
 			const rec: unknown = JSON.parse(line);
 			if (typeof rec !== "object" || rec === null || !("model" in rec))
 				continue;
+			const r = rec as { role?: unknown; resolvedModelIsFallback?: unknown };
+			// Fallback and temporary switches name a model omp will not restore on resume.
+			if (r.role !== undefined && r.role !== "default") continue;
+			if (r.resolvedModelIsFallback === true) continue;
 			if (typeof rec.model === "string" && rec.model.trim() !== "")
 				model = rec.model.trim();
 		} catch {}
