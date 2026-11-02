@@ -3051,7 +3051,7 @@ function Triage({
 		<section aria-labelledby="triage-title">
 			<div className="ov-head">
 				<h2 className="ov-sec" id="triage-title">
-					Needs you
+					Your turn
 				</h2>
 				<span className="ov-count">
 					{`${cards.length} ${cards.length === 1 ? "card" : "cards"} · ${warns.length} ${warns.length === 1 ? "warning" : "warnings"}`}
@@ -3140,47 +3140,49 @@ function Overview({
 			</section>
 		);
 	}
-	return (
-		<section className="overview" aria-labelledby="overview-title">
-			<h1 id="overview-title">Overview</h1>
-			<Triage projects={projects} tasks={tasks} openTask={openTask} />
-			<Provisioning />
-			<section aria-labelledby="perf-title" className="perf">
-				<div className="ov-head">
-					<h2 className="ov-sec" id="perf-title">
-						Performance
-					</h2>
-					<div className="perf-range">
-						{refreshing && <span className="spinner" aria-hidden="true" />}
-						{PERF_RANGES.map((r) => (
-							<button
-								key={r}
-								type="button"
-								aria-pressed={range === r}
-								onClick={() => setRange(r)}
-							>
-								{r === "all" ? "All" : r}
-							</button>
-						))}
-					</div>
+	// Performance is one section: the range buttons drive the KPI strip and the per-project
+	// table below it, so both sit in one panel.
+	const performance = (
+		<section aria-labelledby="perf-title" className="perf perf-panel">
+			<div className="ov-head">
+				<h2 className="ov-sec" id="perf-title">
+					Performance
+				</h2>
+				<div className="perf-range">
+					{refreshing && <span className="spinner" aria-hidden="true" />}
+					{PERF_RANGES.map((r) => (
+						<button
+							key={r}
+							type="button"
+							aria-pressed={range === r}
+							onClick={() => setRange(r)}
+						>
+							{r === "all" ? "All" : r}
+						</button>
+					))}
 				</div>
-				{err !== null && (
-					<p className="perf-error" role="alert">
-						<Mark kind="crit" />
-						<span>Performance data unavailable: {err}</span>
+			</div>
+			{err !== null && (
+				<p className="perf-error" role="alert">
+					<Mark kind="crit" />
+					<span>Performance data unavailable: {err}</span>
+				</p>
+			)}
+			{perf !== null ? (
+				<KpiStrip fleet={perf.fleet} />
+			) : (
+				err === null && (
+					<p className="loading" role="status">
+						<span className="spinner" aria-hidden="true" />
+						Loading performance…
 					</p>
-				)}
-				{perf !== null ? (
-					<KpiStrip fleet={perf.fleet} />
-				) : (
-					err === null && (
-						<p className="loading" role="status">
-							<span className="spinner" aria-hidden="true" />
-							Loading performance…
-						</p>
-					)
-				)}
-			</section>
+				)
+			)}
+			{perf !== null && <PerfTable perf={perf} projects={projects} />}
+		</section>
+	);
+	const projectsNow = (
+		<>
 			<h2 className="ov-sec" id="live-title">
 				Projects now
 			</h2>
@@ -3205,8 +3207,6 @@ function Overview({
 						{projects.map((p) => {
 							const own = tasks.filter((t) => t.project === p.name);
 							const split = splitAlarms(own);
-							const needs = split.needs.length;
-							const asks = split.asks.length;
 							const last = Math.max(0, ...own.map((t) => t.updatedAt));
 							return (
 								<tr
@@ -3231,17 +3231,17 @@ function Overview({
 										)}
 									</th>
 									<td>
-										{needs > 0 && (
+										{split.needs.length > 0 && (
 											<span className="needs-count">
 												<Mark kind="needs" />
-												{needs}
+												{split.needs.length}
 												<span className="sr"> need action</span>
 											</span>
 										)}
-										{asks > 0 && (
+										{split.asks.length > 0 && (
 											<span className="needs-count ask-n">
 												<Mark kind="asked" />
-												{asks}
+												{split.asks.length}
 												<span className="sr"> asked</span>
 											</span>
 										)}
@@ -3285,7 +3285,25 @@ function Overview({
 					</tbody>
 				</table>
 			</div>
-			{perf !== null && <PerfTable perf={perf} projects={projects} />}
+		</>
+	);
+	// Order by urgency: what waits on the user, the live projects, the numbers, and setup last.
+	return (
+		<section className="overview" aria-labelledby="overview-title">
+			<h1 id="overview-title">Overview</h1>
+			<Triage projects={projects} tasks={tasks} openTask={openTask} />
+			{projectsNow}
+			{performance}
+			<details className="ov-setup">
+				<summary>
+					<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+						<path d="M2 3l2 2 2-2" />
+					</svg>
+					Setup
+					<small>Provisioning of the workers</small>
+				</summary>
+				<Provisioning />
+			</details>
 		</section>
 	);
 }
@@ -3483,7 +3501,7 @@ function usePerf(range: PerfRange): {
 	return { perf, err, refreshing };
 }
 
-/** Heading label for the per-project table, e.g. "Projects, last 7 days". */
+/** Sub-heading label for the per-project table, e.g. "By project, last 7 days". */
 const PERF_RANGE_LABELS: Record<PerfRange, string> = {
 	"1h": "last hour",
 	"24h": "last 24 hours",
@@ -3665,11 +3683,12 @@ function PerfTable({
 	// Column max for the bar scaling; a silent column scales by 1 so its bars stay empty.
 	const maxOf = (get: (m: PerfMetrics) => number | null) =>
 		Math.max(...rows.map((r) => get(r) ?? 0), 0) || 1;
+	// A sub-block of the Performance section: the same range buttons drive it.
 	return (
-		<section aria-labelledby="perf-projects-title" className="perf">
-			<h2 className="ov-sec" id="perf-projects-title">
-				Projects, {PERF_RANGE_LABELS[perf.range]}
-			</h2>
+		<section aria-labelledby="perf-projects-title" className="perf-by">
+			<h3 className="perf-sub" id="perf-projects-title">
+				By project, {PERF_RANGE_LABELS[perf.range]}
+			</h3>
 			<div className="ov-wrap">
 				<table className="ov">
 					<thead>

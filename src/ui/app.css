@@ -2714,6 +2714,63 @@ a.release:hover {
 .perf td:last-child {
 	padding: 10px 14px;
 }
+/* Performance is one panel: the range buttons drive the KPI strip and the per-project table
+   below it, so both sit in the same frame. */
+.perf-panel {
+	padding: 12px 14px 14px;
+	background: var(--chrome);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.perf-by {
+	margin-top: 12px;
+}
+.perf-sub {
+	margin: 0 0 6px;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--dim);
+}
+/* Setup (provisioning) folds at the end of the Overview: it rarely needs a look. */
+.ov-setup {
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.ov-setup > summary {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 10px 14px;
+	font-size: 13px;
+	color: var(--text);
+	list-style: none;
+	cursor: pointer;
+}
+.ov-setup > summary::-webkit-details-marker {
+	display: none;
+}
+.ov-setup > summary .chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.4;
+	transform: rotate(-90deg);
+	transition: transform 0.16s var(--ease);
+}
+.ov-setup[open] > summary .chev {
+	transform: none;
+}
+.ov-setup > summary small {
+	margin-left: auto;
+	font-size: 12px;
+	color: var(--dim);
+}
+.ov-setup > .prov {
+	margin: 0;
+	padding: 0 14px 14px;
+}
 .perf-error {
 	display: flex;
 	align-items: center;
