@@ -3111,15 +3111,12 @@ export function serverLine(s: ProvisioningResponse["server"]): {
 	return { text, kind };
 }
 
-/** The workers row cell text: which lists alate provisioned, or "no lists" when none. */
-export function workerNote(w: ProvisioningResponse["workers"][number]): string {
-	const lists = [
-		w.apt ? "packages" : null,
-		w.tools ? "tools" : null,
-		w.env ? "env" : null,
-	].filter((l) => l !== null);
-	return lists.length === 0 ? "no lists" : lists.join(" · ");
-}
+/** The worker lists alate provisions, in column order. */
+const PROV_LISTS = [
+	{ key: "apt", label: "Packages" },
+	{ key: "tools", label: "Tools" },
+	{ key: "env", label: "Env" },
+] as const;
 
 /** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must
  *  not ride the 1 s state push) and shows the alate server state and worker lists. */
@@ -3148,9 +3145,39 @@ function Provisioning() {
 	}, []);
 	return (
 		<section className="prov" aria-labelledby="prov-title">
-			<h2 className="ov-sec" id="prov-title">
-				Provisioning
-			</h2>
+			<div className="prov-head">
+				<h2 className="ov-sec" id="prov-title">
+					Provisioning
+				</h2>
+				{data !== null && (
+					<p className="prov-server">
+						{data.server === null ? (
+							<>
+								<Mark kind="warn" />
+								Agent server not configured.{" "}
+								<button
+									type="button"
+									onClick={() => openSettingsSection("alate-section")}
+								>
+									Set it up
+								</button>
+							</>
+						) : (
+							(() => {
+								const line = serverLine(data.server);
+								return (
+									<>
+										{line.kind !== "ok" && (
+											<Mark kind={line.kind === "crit" ? "crit" : "warn"} />
+										)}
+										{line.text}
+									</>
+								);
+							})()
+						)}
+					</p>
+				)}
+			</div>
 			{err !== null && (
 				<p className="prov-error" role="alert">
 					<Mark kind="crit" />
@@ -3164,51 +3191,60 @@ function Provisioning() {
 				</p>
 			)}
 			{data !== null && (
-				<>
-					{data.server === null ? (
-						<p>
-							{serverLine(null).text}{" "}
-							<button
-								type="button"
-								onClick={() => openSettingsSection("alate-section")}
-							>
-								Open Settings → Alate
-							</button>
-						</p>
-					) : (
-						(() => {
-							const line = serverLine(data.server);
-							return (
-								<p>
-									{line.kind !== "ok" && (
-										<Mark kind={line.kind === "crit" ? "crit" : "warn"} />
-									)}
-									{line.text}
-								</p>
-							);
-						})()
-					)}
-					{data.workers.length === 0 ? (
-						<p>No provisioned worker lists.</p>
-					) : (
-						<table>
-							<thead>
-								<tr>
-									<th scope="col">Project</th>
-									<th scope="col">Lists</th>
-								</tr>
-							</thead>
-							<tbody>
-								{data.workers.map((w) => (
-									<tr key={w.name}>
-										<th scope="row">{w.name}</th>
-										<td>{workerNote(w)}</td>
-									</tr>
+				// One row per project, one column per list alate provisions; a check marks a list.
+				<div className="ov-wrap">
+					<table className="ov prov-matrix">
+						<thead>
+							<tr>
+								<th scope="col">Project</th>
+								{PROV_LISTS.map((l) => (
+									<th key={l.key} scope="col">
+										{l.label}
+									</th>
 								))}
-							</tbody>
-						</table>
-					)}
-				</>
+							</tr>
+						</thead>
+						<tbody>
+							{data.workers.length === 0 ? (
+								<tr>
+									<th
+										scope="row"
+										colSpan={PROV_LISTS.length + 1}
+										className="prov-none"
+									>
+										No provisioned worker lists.
+									</th>
+								</tr>
+							) : (
+								data.workers.map((w) => (
+									<tr key={w.name}>
+										<th scope="row">
+											{w.name === "_all" ? (
+												<span className="prov-all">All projects</span>
+											) : (
+												w.name
+											)}
+										</th>
+										{PROV_LISTS.map((l) => (
+											<td key={l.key}>
+												{w[l.key] ? (
+													<span className="prov-yes">
+														<Icon name="check" size={14} />
+														<span className="sr">provisioned</span>
+													</span>
+												) : (
+													<span className="prov-none">
+														–<span className="sr">none</span>
+													</span>
+												)}
+											</td>
+										))}
+									</tr>
+								))
+							)}
+						</tbody>
+					</table>
+				</div>
 			)}
 		</section>
 	);

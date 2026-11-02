@@ -24,7 +24,6 @@ const {
 	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
-	workerNote,
 	reportHtml,
 	Drawer,
 } = await import("./app.tsx");
@@ -720,23 +719,6 @@ describe("serverLine", () => {
 		const line = serverLine({ ...healthy, lastError: "boom" });
 		expect(line.kind).toBe("crit");
 		expect(line.text).toContain("last provision failed: boom");
-	});
-});
-
-describe("workerNote", () => {
-	test("no lists", () => {
-		expect(
-			workerNote({ name: "p", apt: false, tools: false, env: false }),
-		).toBe("no lists");
-	});
-
-	test("lists the present lists in order", () => {
-		expect(workerNote({ name: "p", apt: true, tools: true, env: false })).toBe(
-			"packages · tools",
-		);
-		expect(workerNote({ name: "p", apt: true, tools: true, env: true })).toBe(
-			"packages · tools · env",
-		);
 	});
 });
 
