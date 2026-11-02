@@ -2125,6 +2125,75 @@ describe("alate routes", () => {
 	});
 });
 
+// The compose `alate` profile pairs the board with a bundled alate service through
+// ALATE_URL and ALATE_API_KEY (docker-compose.yml): an install without saved
+// Settings boots with the pair in effect, and a saved Settings value wins over the
+// env at the next boot.
+describe("alate env seeding", () => {
+	const saved = {
+		ALATE_URL: process.env.ALATED_URL,
+		ALATE_API_KEY: process.env.ALATE_API_KEY,
+	};
+	afterAll(() => {
+		for (const [k, v] of Object.entries(saved))
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+	});
+
+	test("empty settings seed both fields from the env, and the seeded pair drives provision", async () => {
+		// The stand-in proves both seeded fields work: the provision reaches the
+		// seeded URL and hands it the seeded key as the bearer.
+		const standIn = Bun.serve({
+			port: 0,
+			fetch: (req) =>
+				req.method === "POST" && new URL(req.url).pathname === "/provision"
+					? Response.json({ seen: req.headers.get("authorization") })
+					: new Response(null, { status: 404 }),
+		});
+		try {
+			// Trailing slash: the seed stores the URL stripped, like a Settings save.
+			process.env.ALATED_URL = `${standIn.url.origin}/`;
+			process.env.ALATE_API_KEY = "seed-key";
+			const m = mount();
+			expect(await (await m.call("/api/alate")).json()).toEqual({
+				url: standIn.url.origin,
+				keySet: true,
+				lastProvisionError: null,
+			});
+			// Write-only: the view says the key is set, never what it is.
+			expect(await (await m.call("/api/alate")).text()).not.toContain(
+				"seed-key",
+			);
+			const res = await m.call("/api/alate/provision", {});
+			expect(res.status).toBe(200);
+			// The stand-in echoes the authorization header it saw.
+			const seen = (await res.json()) as { seen: string | null };
+			expect(seen.seen).toBe("Bearer seed-key");
+		} finally {
+			standIn.stop(true);
+		}
+	});
+
+	test("a saved Settings value wins over the env seed at the next boot", async () => {
+		process.env.ALATED_URL = "http://alate:4570";
+		process.env.ALATE_API_KEY = "seed-key";
+		const m = mount();
+		await m.call("/api/alate", {
+			url: "http://127.0.0.1:9",
+			key: "saved-key",
+		});
+		// A restart on the same store with a different env pair replaces nothing;
+		// provision still reaches the saved URL (connection refused -> 502).
+		const m2 = mount({ gstore: m.g });
+		expect(await (await m2.call("/api/alate")).json()).toEqual({
+			url: "http://127.0.0.1:9",
+			keySet: true,
+			lastProvisionError: null,
+		});
+		expect((await m2.call("/api/alate/provision", {})).status).toBe(502);
+	});
+});
+
 describe("alate provision trigger (U9)", () => {
 	// Fake provider: /health reports a mutable pending flag; /provision flips it like the
 	// real server and can be told to fail.

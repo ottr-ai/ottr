@@ -94,6 +94,10 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Turn Alate on (skip all three when an Alate server already runs).
+export COMPOSE_PROFILES=alate                      # run the bundled alate service
+export ALATE_URL=http://alate:4570                 # the board seeds Settings -> Alate from it
+export ALATE_API_KEY=$(openssl rand -hex 32)       # the key the board and alate share
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose pull
@@ -133,6 +137,10 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Turn Alate on (skip all three when an Alate server already runs).
+export COMPOSE_PROFILES=alate                      # run the bundled alate service
+export ALATE_URL=http://alate:4570                 # the board seeds Settings -> Alate from it
+export ALATE_API_KEY=$(openssl rand -hex 32)       # the key the board and alate share
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose build
@@ -174,7 +182,9 @@ The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot doe
 
 No data repo yet? Alate's `create-data-repo` skill builds a private one from the omp setup on your machine: install it with `npx skills add ottr-ai/alate --skill create-data-repo`, then ask your agent to run it. It scans for secrets first and asks before every step that leaves your machine (see [Alate, Start from your current setup](https://github.com/ottr-ai/alate#start-from-your-current-setup)).
 
-The board never takes its config from the worker-writable home volume. Seed the board's own agent layer from your data repo once, then restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). Replace `OWNER/NAME` with your data repo. The lines are the same in bash and PowerShell:
+The three Alate export lines start the bundled Alate server (compose profile `alate`) together with the board. The board reads `ALATE_URL` and `ALATE_API_KEY` at boot and seeds **Settings → Alate** with them. A value saved under Settings wins over the env at every boot. A user whose Alate server already runs omits the three lines and pairs the board under **Settings → Alate** instead.
+
+The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570> and set the data repo there. Then seed the board's own agent layer from your data repo once, and restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). Replace `OWNER/NAME` with your data repo. The lines are the same in bash and PowerShell:
 
 ```sh
 docker compose run --rm board-seed --repo OWNER/NAME

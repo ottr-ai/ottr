@@ -269,6 +269,18 @@ config"). Until a seed runs, turns get no env values.
   its refresh token with the host, and a provider that rotates refresh tokens
   (Anthropic does) accepts only the side that refreshes first: omp disables the
   other side's login (`invalid_grant`), on the host or in the stack.
+- The `alate` profile runs a bundled Alate server next to the stack:
+  `docker compose --profile alate up -d` (or `COMPOSE_PROFILES=alate` in the
+  env file). The service serves its dashboard on `127.0.0.1:4570` on the host
+  and `http://alate:4570` on the compose network. Its state lives on the
+  `alate-state` volume, and it provisions the workers through the shared
+  `home` volume. `ALATE_URL` and `ALATE_API_KEY` pair the board with it: the
+  board reads the two values only while **Settings -> Alate** holds no URL or
+  key, and a value saved there wins at every boot. Set both in the env file,
+  for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
+  hex bytes); the alate container itself requires the same key. The board
+  never logs the key. A user whose Alate server already runs on another host
+  omits the profile and saves the URL and key under **Settings -> Alate**.
 
 ## Scaling
 

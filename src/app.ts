@@ -1410,6 +1410,19 @@ export function createApp(deps: AppDeps) {
 			deps.shared.envValues = vals;
 		}
 	}
+	// Compose pairing (docker-compose.yml, the `alate` profile): with empty Settings the
+	// boot seeds the Alate URL and key from ALATE_URL and ALATE_API_KEY, the way
+	// HINDSIGHT_API_URL seeds the memory backend. A value saved under Settings -> Alate
+	// wins at every boot, and a saved null clears the seed until the next boot. The key
+	// never reaches a log or a view: alateView reports keySet only.
+	if (alate.url === null) {
+		const seedUrl = process.env.ALATED_URL?.trim();
+		if (seedUrl) alate.url = seedUrl.replace(/\/+$/, "");
+	}
+	if (alate.key === null) {
+		const seedKey = process.env.ALATE_API_KEY?.trim();
+		if (seedKey) alate.key = seedKey;
+	}
 	applyGithubToken();
 	// Every git/ssh/env output the board logs or shows passes redact() with these: the stored
 	// tokens, the ssh dir (which holds every key path, in both slash forms, since

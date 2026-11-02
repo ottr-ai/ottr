@@ -169,6 +169,11 @@ services:
       # direct spawns outside compose.
       HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
       HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
+      # Alate pairing (the `alate` profile below): these seed Settings -> Alate while it
+      # holds no URL or key, and a value saved there wins at the next boot. With the
+      # profile on, http://alate:4570 is the bundled service; the key never reaches a log.
+      ALATE_URL: ${ALATE_URL:-}
+      ALATE_API_KEY: ${ALATE_API_KEY:-}
       # Provider keys pass through from the host env. Extend this list for
       # other providers (e.g. OPENROUTER_API_KEY, ZAI_API_KEY).
       ANTHROPIC_API_KEY:
@@ -214,9 +219,31 @@ services:
   # Memory lives in the shared Hindsight server named by HINDSIGHT_API_URL
   # (tenant-key auth); set the URL in the compose env file or in Settings.
 
+  # Alate, the provisioning side of the pair, bundled for the quick start: the profile
+  # keeps the service off unless the env sets COMPOSE_PROFILES=alate, so a user whose
+  # Alate server already runs keeps today's setup. The board reaches it at
+  # http://alate:4570 on the default network; the dashboard is loopback-only on the
+  # host. ALATE_URL and ALATE_API_KEY (server env above) seed Settings -> Alate, and a
+  # value saved there wins. The key never reaches a log.
+  alate:
+    image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
+    profiles: [alate]
+    command: node server.ts --host 0.0.0.0 --config /state/server-config.json --db /state/alate.db
+    restart: unless-stopped
+    logging: *logging
+    volumes:
+      - home:/root # alate provisions the workers' shared agent layer here
+      - alate-state:/state
+    environment:
+      # The key alate itself requires on every request.
+      ALATE_API_KEY: ${ALATE_API_KEY:-}
+    ports:
+      - "127.0.0.1:4570:4570"
+
 volumes:
   workspace:
   home:
   ottr-state:
   ottr-data:
   board-config:
+  alate-state:
