@@ -81,7 +81,9 @@ Docker Compose is the preferred way to run Ottr: the board and its worker contai
 
 ### Latest release (no clone, no build)
 
-Each GitHub release publishes the image as `ghcr.io/ottr-ai/ottr` (amd64), with the tags `<version>`, `v<version>` and `latest`. The image is public, so the pull needs no login. These lines fetch the compose file of the latest release and run that release's image:
+Each GitHub release publishes the image as `ghcr.io/ottr-ai/ottr` (amd64), with the tags `<version>`, `v<version>` and `latest`. The image is public, so the pull needs no login. These lines fetch the compose file of the latest release and run that release's image.
+
+Linux and macOS (bash, zsh):
 
 ```sh
 mkdir -p ottr && cd ottr
@@ -97,9 +99,28 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]` guard keeps the existing `agent.db` snapshot, and the named volumes keep the board data. To keep the `export` values for the next shell, put them in an env file and pass it with `docker compose --env-file <file> …`.
+Windows (PowerShell 5.1 or 7):
+
+```powershell
+New-Item -ItemType Directory -Force ottr | Out-Null; Set-Location ottr
+$TAG = (Invoke-RestMethod https://api.github.com/repos/ottr-ai/ottr/releases/latest).tag_name
+Invoke-WebRequest -UseBasicParsing -OutFile docker-compose.yml "https://raw.githubusercontent.com/ottr-ai/ottr/$TAG/docker-compose.yml"
+$env:OTTR_IMAGE = "ghcr.io/ottr-ai/ottr:$TAG"       # the image of the same release
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
+$env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
+$env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
+docker compose pull
+docker compose up -d --no-build
+```
+
+The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]` and `Test-Path` guards keep the existing `agent.db` snapshot, and the named volumes keep the board data. To keep the env values for the next shell, put them in an env file and pass it with `docker compose --env-file <file> …`.
 
 ### From source (main branch)
+
+Linux and macOS (bash, zsh):
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -113,14 +134,31 @@ docker compose build
 docker compose up -d
 ```
 
+Windows (PowerShell 5.1 or 7):
+
+```powershell
+git clone git@github.com:ottr-ai/ottr.git ottr
+Set-Location ottr
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
+$env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
+$env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
+docker compose build
+docker compose up -d
+```
+
+PowerShell 5.1 drops double quotes inside the arguments of native programs, so the PowerShell `bun -e` line uses only single quotes in its JavaScript.
+
 ### After the first start
 
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
 
-The board never takes its config from the worker-writable home volume. Seed the board's own agent layer from your data repo once, then restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)):
+The board never takes its config from the worker-writable home volume. Seed the board's own agent layer from your data repo once, then restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). Replace `OWNER/NAME` with your data repo. The lines are the same in bash and PowerShell:
 
 ```sh
-docker compose run --rm board-seed --repo <owner/name>
+docker compose run --rm board-seed --repo OWNER/NAME
 docker compose restart server
 ```
 
@@ -131,6 +169,8 @@ The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_
 Hindsight is the preferred way to share memory between workers. Without `HINDSIGHT_API_URL`, omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only containers on the same host see it. Set the URL to a [Hindsight](https://github.com/vectorize-io/hindsight) server, and every worker on every machine reads and writes the same memory. See [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
 
 ### Bare metal
+
+The lines are the same in bash and PowerShell:
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -175,6 +215,8 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 Public hostnames need a login (first visit creates the admin user) or the API key from **Settings**. Loopback access needs no login. Serve HTTPS with `tailscale serve --bg --https=443 http://127.0.0.1:4747`, set `OMP_TRACKER_PUBLIC_HOSTS`, and the board installs to a phone's home screen; Web Push (**Settings → Push**) then delivers "needs you" and "done" alerts. **Sign out everywhere** rotates the session secret and revokes all login sessions. Non-GET API requests must send an `Origin` header matching the board URL.
 
 ## Development
+
+The commands are the same in bash and PowerShell:
 
 ```sh
 bun run check          # tsc, biome, boot smoke, license allowlist
