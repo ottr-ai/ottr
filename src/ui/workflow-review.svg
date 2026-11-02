@@ -38,7 +38,7 @@
   <rect id="wf-st-in_progress" x="330" y="88" width="208" height="84" rx="6" fill="#3a3f45" stroke="#4a5057"/>
   <text x="344" y="117" class="n">Verification</text>
   <text x="344" y="137" class="m">bun run check · bun test</text>
-  <text x="344" y="153" class="m">mutation tests — Stryker</text>
+  <text x="344" y="153" class="m">mutation tests</text>
   <text x="344" y="168" class="s">full security audit</text>
 
   <line x1="540" y1="130" x2="552" y2="130" stroke="#8fb0d0" stroke-width="1.5" marker-end="url(#a)"/>

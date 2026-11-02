@@ -706,14 +706,14 @@ function Card({
 					)}
 				</span>
 				{sp !== null && (
-					<span className="card-stryker" title={task.progress ?? undefined}>
+					<span className="card-mutation" title={task.progress ?? undefined}>
 						<Meter
-							label={sp.tool}
+							label="Mutation testing"
 							pct={sp.pct}
 							value={`${sp.tested}/${sp.total}`}
 							band={false}
 						/>
-						<span className="stryker-stats">{sp.rest}</span>
+						<span className="mutation-stats">{sp.rest}</span>
 					</span>
 				)}
 			</button>
@@ -6384,7 +6384,7 @@ export function Drawer({
 							className="drawer-mut"
 						>
 							<Meter
-								label={mut.tool}
+								label="Mutation testing"
 								pct={mut.pct}
 								value={`${Math.round(mut.pct)}%`}
 								band={false}

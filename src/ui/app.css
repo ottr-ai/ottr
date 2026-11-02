@@ -2153,15 +2153,15 @@ textarea {
 .card-meta .model {
 	margin-left: auto;
 }
-/* Stryker meter row: a running card's live mutation-test progress under the meta line.
+/* Mutation testing meter row: a running card's live progress under the meta line.
    Stacked, so the stats tail keeps whole words on the narrow board card. */
-.card-stryker {
+.card-mutation {
 	display: grid;
 	gap: 2px;
 	font-size: 12px;
 	color: var(--dim);
 }
-.stryker-stats {
+.mutation-stats {
 	overflow: hidden;
 }
 /* Arrival: when a card lands in a column its status mark traces itself once and the meta line follows;
@@ -4349,7 +4349,7 @@ dialog.drawer[open]::backdrop {
 .drawer-sub .sub-dim {
 	color: var(--dim);
 }
-/* Live mutation run: a running card's Stryker/mutate progress as a drawer section —
+/* Live mutation run: a running card's mutation-tool progress as a drawer section —
    the same data the board card's meter row shows, with room for the full readout. */
 .drawer-mut .meter-track {
 	width: 200px;

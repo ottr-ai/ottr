@@ -554,6 +554,27 @@ describe("LaneCol backlog divider", () => {
 		expect(g!.tasks).toHaveLength(20);
 		expect(g!.hidden).toBe(5);
 	});
+
+	test("a running card's mutation meter reads the tool-neutral label", () => {
+		const run = cardFixture({
+			id: "m1",
+			stage: "in_progress",
+			state: "running",
+			progress:
+				"Stryker 68% · 4454/6523 · 38 survived (0.9%) · ~2h 59m elapsed · ~1h 23m left",
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
+		);
+		expect(html).toContain("Mutation testing");
+		expect(html).toContain("card-mutation");
+		expect(html).toContain("mutation-stats");
+		// The stats tail keeps the tool's own words; the raw line stays on the row's title.
+		expect(html).toContain("38 survived (0.9%)");
+		expect(html).toContain('title="Stryker 68%');
+		expect(html).not.toContain(">Stryker<");
+		expect(html).not.toContain("card-stryker");
+	});
 });
 
 describe("done lane star section", () => {
