@@ -3029,16 +3029,19 @@ function Triage({
 	projects,
 	tasks,
 	openTask,
+	setup,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	openTask: (id: string) => void;
+	/** Board-wide setup problems (setupHints); each row opens Settings → Alate. */
+	setup: SetupHint[];
 }) {
 	const { needs, asks } = splitAlarms(tasks);
 	// Rank first (P0 before P3, unrated last), then updatedAt is when the card
 	// last changed, i.e. when it started waiting on you.
 	const cards = [...needs, ...asks].sort(triageWait);
-	const warns = projects.flatMap((p) =>
+	const projectWarns = projects.flatMap((p) =>
 		[
 			!p.hasRules && "No AGENTS.md, tasks wait",
 			p.dirty && "Uncommitted changes",
@@ -3047,6 +3050,7 @@ function Triage({
 			.filter((w): w is string => w !== false)
 			.map((text) => ({ project: p, text })),
 	);
+	const warns = [...setup, ...projectWarns];
 	return (
 		<section aria-labelledby="triage-title">
 			<div className="ov-head">
@@ -3085,7 +3089,24 @@ function Triage({
 						{cards.length > 0 && warns.length > 0 && (
 							<div className="tri-sep" />
 						)}
-						{warns.map(({ project, text }) => (
+						{setup.map((h) => (
+							<button
+								type="button"
+								className="tri warn"
+								key={`setup:${h.text}`}
+								onClick={() => openSettingsSection("alate-section")}
+							>
+								<Mark kind={h.kind} />
+								<span className="tri-setup" aria-hidden="true">
+									<Icon name="gear" size={14} />
+								</span>
+								<span className="t">{h.text}</span>
+								<span className="rank-badges" />
+								<span className="k">Setup</span>
+								<span className="w" />
+							</button>
+						))}
+						{projectWarns.map(({ project, text }) => (
 							<a
 								className="tri warn"
 								key={`${project.name}:${text}`}
@@ -3124,6 +3145,7 @@ function Overview({
 }) {
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
+	const prov = useProvisioning();
 	if (projects.length === 0) {
 		return (
 			<section className="empty">
@@ -3291,7 +3313,12 @@ function Overview({
 	return (
 		<section className="overview" aria-labelledby="overview-title">
 			<h1 id="overview-title">Overview</h1>
-			<Triage projects={projects} tasks={tasks} openTask={openTask} />
+			<Triage
+				projects={projects}
+				tasks={tasks}
+				openTask={openTask}
+				setup={setupHints(prov.data, prov.err)}
+			/>
 			{projectsNow}
 			{performance}
 			<details className="ov-setup">
@@ -3302,7 +3329,7 @@ function Overview({
 					Setup
 					<small>Provisioning of the workers</small>
 				</summary>
-				<Provisioning />
+				<Provisioning data={prov.data} err={prov.err} />
 			</details>
 		</section>
 	);
@@ -3337,9 +3364,29 @@ const PROV_LISTS = [
 	{ key: "env", label: "Env" },
 ] as const;
 
-/** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must
- *  not ride the 1 s state push) and shows the alate server state and worker lists. */
-function Provisioning() {
+/** One "Your turn" row per board-wide setup problem: the alate server line when it is not ok,
+ *  or the failed provisioning fetch. A healthy setup gives no row. */
+export interface SetupHint {
+	text: string;
+	kind: "warn" | "crit";
+}
+export function setupHints(
+	data: ProvisioningResponse | null,
+	err: string | null,
+): SetupHint[] {
+	if (err !== null)
+		return [{ text: `Provisioning data unavailable: ${err}`, kind: "warn" }];
+	if (data === null) return [];
+	const line = serverLine(data.server);
+	return line.kind === "ok" ? [] : [{ text: line.text, kind: line.kind }];
+}
+
+/** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must not ride
+ *  the 1 s state push). The Overview reads it once for both Your turn and the Setup section. */
+function useProvisioning(): {
+	data: ProvisioningResponse | null;
+	err: string | null;
+} {
 	const [data, setData] = useState<ProvisioningResponse | null>(null);
 	const [err, setErr] = useState<string | null>(null);
 	useEffect(() => {
@@ -3362,6 +3409,17 @@ function Provisioning() {
 			clearInterval(t);
 		};
 	}, []);
+	return { data, err };
+}
+
+/** The alate server state and the worker lists, from the Overview's useProvisioning. */
+function Provisioning({
+	data,
+	err,
+}: {
+	data: ProvisioningResponse | null;
+	err: string | null;
+}) {
 	return (
 		<section className="prov" aria-labelledby="prov-title">
 			<div className="prov-head">

@@ -2922,6 +2922,13 @@ a.release:hover {
 .tri.warn .t {
 	color: var(--text);
 }
+/* A setup row has no project: a gear stands in the project tag's place. */
+.tri-setup {
+	display: inline-flex;
+	justify-content: center;
+	width: 22px;
+	color: var(--dim);
+}
 .tri .k {
 	color: var(--dim);
 	font-family: var(--mono);

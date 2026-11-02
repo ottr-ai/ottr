@@ -24,6 +24,7 @@ const {
 	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
+	setupHints,
 	reportHtml,
 	Drawer,
 	windowGone,
@@ -714,6 +715,41 @@ describe("alateHint", () => {
 				running: true,
 			}),
 		).toBe("provision running");
+	});
+});
+
+describe("setupHints", () => {
+	const server = {
+		url: "http://x",
+		keySet: true,
+		lastError: null,
+		health: {
+			state: "ok",
+			version: "1",
+			behind: false,
+			pending: false,
+			running: false,
+		},
+	} as const;
+	test("a missing server, a failed provision and a failed fetch each give one row", () => {
+		expect(setupHints({ server: null, workers: [] }, null)).toEqual([
+			{ text: "Agent server: not configured.", kind: "warn" },
+		]);
+		expect(
+			setupHints(
+				{ server: { ...server, lastError: "boom" }, workers: [] },
+				null,
+			),
+		).toEqual([
+			{ text: "version 1 · last provision failed: boom", kind: "crit" },
+		]);
+		expect(setupHints(null, "HTTP 500")).toEqual([
+			{ text: "Provisioning data unavailable: HTTP 500", kind: "warn" },
+		]);
+	});
+	test("a healthy server and a load still in flight give no row", () => {
+		expect(setupHints({ server, workers: [] }, null)).toEqual([]);
+		expect(setupHints(null, null)).toEqual([]);
 	});
 });
 
