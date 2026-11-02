@@ -659,6 +659,48 @@ describe("done lane star section", () => {
 		expect(shut).toContain('aria-expanded="false"');
 		expect(shut).toContain('data-collapsed="true"');
 	});
+
+	test("a collapsed Starred section leaves one divider, an open one two", () => {
+		const freshCard = cardFixture({
+			id: "u1",
+			stage: "done",
+			state: "idle",
+			answered: true,
+		});
+		const starredCard = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		const tasks = [starredCard, normal, freshCard];
+		const open = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={tasks}
+				unread={(t) => t.id === "u1"}
+			/>,
+		);
+		// One rule between Unread and Starred, one between Starred and the rest.
+		expect(open.match(/lane-divider/g)?.length).toBe(2);
+		const shut = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={tasks}
+				unread={(t) => t.id === "u1"}
+				collapsed={{ starred: true }}
+			/>,
+		);
+		// The head's own border-bottom replaces the vanished trailing rule.
+		expect(shut.match(/lane-divider/g)?.length).toBe(1);
+		expect(shut.indexOf("lane-divider")).toBeLessThan(
+			shut.indexOf(">Starred</span>"),
+		);
+	});
 });
 
 describe("alateHint", () => {

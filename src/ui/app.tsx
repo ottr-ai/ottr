@@ -4221,9 +4221,13 @@ export function LaneCol({
 					</div>
 				</section>
 			)}
-			{starred.length > 0 && fresh.length + starred.length < tasks.length && (
-				<hr className="lane-divider" />
-			)}
+			{/* A collapsed section is just its head, whose own border-bottom already
+			    draws the single divider; the extra rule would double it. */}
+			{starred.length > 0 &&
+				collapsed.starred !== true &&
+				fresh.length + starred.length < tasks.length && (
+					<hr className="lane-divider" />
+				)}
 			{groups !== null
 				? groups.map((g) => {
 						const bodyId = `${uid}-topic-${g.key}`;

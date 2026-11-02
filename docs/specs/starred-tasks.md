@@ -17,7 +17,10 @@ pinned cards above the normal done cards.
   2. **Starred** — collapsible section, like the topic sections: a head button
      with a chevron, the label `Starred`, and a count. Renders only when at
      least one starred card exists. Collapse state joins the existing
-     collapsed-record persistence under the key `starred`.
+     collapsed-record persistence under the key `starred`. The section keeps
+     exactly one rule between it and the next content in either state: open,
+     the trailing `lane-divider`; collapsed, the head's own border-bottom
+     (the trailing divider unmounts, so the two never stack).
   3. the normal done cards, then **Show more**, then Backlog.
 - Pagination (`donePage`) never hides a starred card behind the cut, the same
   rule unread answers already follow. Grouped (topic) view partitions starred
