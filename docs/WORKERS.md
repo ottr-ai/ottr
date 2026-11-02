@@ -684,3 +684,40 @@ connection (`workerLost`) and the card auto-resumes by starting a new turn —
 the same recovery path as a tracker restart. `restart: always` revives a
 crashed or OOM-killed worker container; note Docker suppresses that policy
 after a manual `docker stop`/`docker kill` — `docker start` brings it back.
+
+## Troubleshooting
+
+### Podman Desktop shows no containers (Windows)
+
+Symptom: `podman ps` lists the stack, but Podman Desktop shows no containers.
+
+Cause: `podman machine start` failed halfway, so the Windows API pipe `\\.\pipe\docker_engine` does not exist and `win-sshproxy.exe` does not run. The start output shows:
+
+```
+failed creating the cgroupfs config file: ... /usr/share/containers/containers.conf.d/999-podman-machine-wsl-cgroupfs.conf: No such file or directory
+```
+
+The machine image lacks that directory. Fix (PowerShell):
+
+```powershell
+wsl -u root -d podman-machine-default mkdir -p /usr/share/containers/containers.conf.d
+podman machine stop; podman machine start
+```
+
+The start output must then include `API forwarding listening on: npipe:////./pipe/docker_engine`. Keep the CLI default connection on the same side as Podman Desktop: with a rootful machine, use `podman-machine-default-root`.
+
+### The board times out after the stack was recreated (WSL mirrored networking)
+
+Symptom: after the containers were removed and created again, `http://127.0.0.1:8080` times out, and the network shows `No route to host`.
+
+Cause: with WSL `networkingMode=mirrored`, netavark's nftables DNAT rules for the removed containers survive `podman machine stop`, because the WSL kernel keeps running. The old rule matches `127.0.0.1:8080` first and sends the traffic to a dead container IP.
+
+Fix, one of:
+
+- Stop all WSL distros, which clears the rules: `wsl --shutdown`, then `podman machine start` and start the stack again.
+- Delete only the stale rules inside the Podman machine. List them, then delete each stale one by its handle:
+
+  ```sh
+  nft -a list chain ip nat NETAVARK-DN-<id>
+  nft delete rule ip nat NETAVARK-DN-<id> handle <n>
+  ```
