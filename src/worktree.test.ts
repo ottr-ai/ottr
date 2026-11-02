@@ -889,6 +889,45 @@ describe("pinned origin URL (OTTR-348)", () => {
 		}
 	}, 60_000);
 
+	test("a relative local pin with a slash before its colon gets the root check", async () => {
+		const f = fixture();
+		try {
+			// git reads ./x:y.git as a local path (first slash before the first colon),
+			// so the guard must too: under a worker root it is refused before git runs.
+			setWorkerRoots([f.dir]);
+			try {
+				const r = await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					null,
+					"./x:y.git",
+				);
+				expect(r.status).toBe("failed");
+				expect(
+					r.status === "failed" && r.error.includes("worker-writable"),
+				).toBe(true);
+				expect(existsSync(f.marker)).toBe(false);
+			} finally {
+				setWorkerRoots([]);
+			}
+			// The same reading without a boundary: a relative local pin resolves against
+			// the repo (the cwd git runs in) and pushes the bare next to it.
+			const ok = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				"../origin.git",
+			);
+			expect(ok.status).toBe("pushed");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	test("the pinned target fetch ignores a planted origin URL and rigged refspecs", async () => {
 		const f = fixture();
 		try {

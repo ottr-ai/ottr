@@ -1051,7 +1051,9 @@ export function setWorkerRoots(roots: readonly string[]): void {
 
 /** The local path a pinned URL names, resolved; null when the URL is not local
  * (https/ssh and other schemes, scp-style ssh). A `file://` URL is local when its
- * authority is empty or `localhost`. */
+ * authority is empty or `localhost`. Without a scheme, git reads scp-style ssh only when
+ * the first colon precedes the first slash (connect.c url_is_local_not_ssh) — `./x:y.git`
+ * and `../bare.git` are local paths and get the worker-root check. */
 function localPinPath(mainPath: string, pinned: string): string | null {
 	const file = /^file:\/\/(?:localhost)?(\/.*)$/i.exec(pinned);
 	if (file !== null)
@@ -1060,8 +1062,10 @@ function localPinPath(mainPath: string, pinned: string): string | null {
 		return path.resolve(pinned);
 	if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(pinned)) return null; // https:, ssh:, ext::, …
 	if (pinned.startsWith("/")) return path.resolve(pinned);
-	// No scheme, no leading slash: a relative path when it holds no colon, else scp-style ssh.
-	return pinned.includes(":") ? null : path.resolve(mainPath, pinned);
+	const colon = pinned.indexOf(":");
+	if (colon === -1) return path.resolve(mainPath, pinned);
+	const slash = pinned.indexOf("/");
+	return slash !== -1 && slash < colon ? path.resolve(mainPath, pinned) : null;
 }
 
 const sameOrUnder = (child: string, root: string): boolean => {

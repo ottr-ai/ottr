@@ -51,13 +51,16 @@ from `origin` by name.
    - the pin must look like a URL or path: a value whose first character is `-`
      (it would parse as a git option and could drop the repository argument,
      falling back to the planted default remote) is refused;
-   - a local pin (plain path, Windows drive/UNC path, or `file://` URL whose
-     authority is empty or `localhost`) must resolve outside every
-     worker-writable root. The roots are the project roots
-     (`OMP_TRACKER_ROOTS`), `OTTR_DATA_DIR`, and the server's own home (the
-     compose shared `home` volume at `/root`), set at boot when `OTTR_DATA_DIR`
-     is configured — that is, when a worker boundary exists at all. Native
-     single-user boards (no `OTTR_DATA_DIR`) check nothing, as before.
+   - a local pin must resolve outside every worker-writable root. Local forms:
+     a plain absolute path, a Windows drive/UNC path, a `file://` URL whose
+     authority is empty or `localhost`, and any no-scheme value that git reads
+     as a path (no colon, or the first slash before the first colon —
+     `./x:y.git` is a path, `host:path` is scp-ssh). The roots are the project
+     roots (`OMP_TRACKER_ROOTS`), `OTTR_DATA_DIR`, and the server's own home
+     (the compose shared `home` volume at `/root`), set at boot when
+     `OTTR_DATA_DIR` is configured — that is, when a worker boundary exists at
+     all. Native single-user boards (no `OTTR_DATA_DIR`) check nothing, as
+     before.
    - no `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` entry from any
      config scope may match the pin (prefix match, git's own rule,
      over-approximated to fail closed). A rewrite would redirect the push or
@@ -99,6 +102,9 @@ from `origin` by name.
 - A planted `url.<evil>.pushInsteadOf` entry matching the pin fails the push
   closed.
 - A pin that starts with `-` (a git option, not a URL) fails closed.
+- A relative pin git reads as a local path (`./x:y.git`: first slash before the
+  first colon) gets the worker-root check and fails closed under a configured
+  root; the same reading without roots pushes a relative bare.
 - A pin under a configured worker root fails closed; with no roots configured
   the same pin works (native behavior unchanged).
 - A planted `remote.origin.fetch` refspec is ignored by the pinned
