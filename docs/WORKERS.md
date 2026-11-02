@@ -415,6 +415,9 @@ worktree only through a stub gitdir that it writes for each call (`sealedGit` in
 - For a partial clone, the stub gets a copy of the promisor remote (name, `url`,
   `partialclonefilter`). Thus git can still fetch a missing blob. That fetch also reads only
   the stub, and never reads a planted `uploadpack`, `sshCommand` or credential helper.
+  The fetch's ssh runs as `ssh -F /dev/null -o BatchMode=yes`. So it never reads the shared
+  home's `~/.ssh/config`, and a planted `ProxyCommand` never runs. `GIT_ALLOW_PROTOCOL`
+  pins the fetch transports to `https` and `ssh`.
 
 No board git call merges, rebases or cherry-picks in a checkout that a worker can write.
 Thus no call reaches a planted `merge.<driver>.driver` or `merge.default`.
@@ -576,7 +579,9 @@ whatever the turn's env holds. Closing the board's repo-config reads fully is co
 work in `src/worktree.ts` (per-call `-c` overrides and the `sealedGit` stub gitdir), not
 topology. The stub copies only these probed keys from the repo config:
 `core.filemode`, `symlinks`, `ignorecase`, `precomposeunicode`, `autocrlf` and `eol`. These
-keys control only the builtin conversion of git. A new board call that merges in a worker
+keys control only the builtin conversion of git. For a partial clone, the stub also copies
+the promisor remote keys, which only the lazy blob fetch reads (pinned, see above). A new
+board call that merges in a worker
 checkout must use the stub or pin the merge driver. On the omp side, omp
 writes the http-400 dump directory under `$HOME/.omp/logs` of the HOME it runs with,
 because its state root does not follow `PI_CODING_AGENT_DIR`. The reader in

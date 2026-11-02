@@ -2555,21 +2555,137 @@ describe("git", () => {
 			`file://${up}`,
 			main,
 		);
-		const wt = join(main, ".worktrees", "p");
-		// Both the checkout and the diff need blobs the clone has not fetched yet.
-		await createWorktree({
-			mainPath: main,
-			worktreePath: wt,
-			branch: "ott/p",
-			base: "origin/main",
-			copyExtra: [],
-			log: () => {},
-		});
-		expect(readFileSync(join(wt, "f.txt"), "utf8")).toBe("new\n");
-		expect(await diffStat(wt, base, base)).toEqual([
-			{ file: "f.txt", plus: 1, minus: 1 },
-		]);
-		expect(await diffText(wt, base, base)).toContain("-old\n+new\n");
+		// The board pins the sealed fetch's ssh (`ssh -F /dev/null`); a fake ssh on PATH
+		// answers the git ssh protocol, so the lazy fetches run over the pinned command.
+		await must(
+			main,
+			"config",
+			"remote.origin.url",
+			`ssh://ottr-fixture.invalid/${up}`,
+		);
+		const bin = join(main, "bin");
+		mkdirSync(bin);
+		writeFileSync(
+			join(bin, "ssh"),
+			`#!/bin/sh\nfor a in "$@"; do case "$a" in git-upload-pack*) exec sh -c "git upload-pack \${a#git-upload-pack}";; esac; done\nexit 255\n`,
+		);
+		chmodSync(join(bin, "ssh"), 0o755);
+		const prevPath = process.env.PATH;
+		process.env.PATH = `${bin}:${prevPath ?? ""}`;
+		try {
+			const wt = join(main, ".worktrees", "p");
+			// Both the checkout and the diff need blobs the clone has not fetched yet.
+			await createWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/p",
+				base: "origin/main",
+				copyExtra: [],
+				log: () => {},
+			});
+			expect(readFileSync(join(wt, "f.txt"), "utf8")).toBe("new\n");
+			expect(await diffStat(wt, base, base)).toEqual([
+				{ file: "f.txt", plus: 1, minus: 1 },
+			]);
+			expect(await diffText(wt, base, base)).toContain("-old\n+new\n");
+		} finally {
+			if (prevPath === undefined) delete process.env.PATH;
+			else process.env.PATH = prevPath;
+		}
+	}, 60_000);
+
+	test("a lazy promisor fetch runs pinned ssh, never a planted sshCommand (R5-1)", async () => {
+		const up = repo();
+		await must(up, "init", "-q", "-b", "main");
+		await must(up, "config", "uploadpack.allowFilter", "true");
+		writeFileSync(join(up, "f.txt"), "old\n");
+		await must(up, "add", ".");
+		await must(up, "commit", "-q", "-m", "one");
+		const base = await must(up, "rev-parse", "HEAD");
+		writeFileSync(join(up, "f.txt"), "new\n");
+		await must(up, "commit", "-q", "-am", "two");
+		const main = join(repo(), "clone");
+		await must(
+			tmpdir(),
+			"clone",
+			"-q",
+			"--no-checkout",
+			"--filter=blob:none",
+			`file://${up}`,
+			main,
+		);
+		// The worker's plants: the promisor url points at ssh (the stub copies it) and a
+		// global core.sshCommand. On the board ssh also reads ~/.ssh/config from the passwd
+		// home, which the shared home volume makes worker-writable; -F /dev/null closes it.
+		await must(
+			main,
+			"config",
+			"remote.origin.url",
+			`ssh://ottr-fixture.invalid/${up}`,
+		);
+		const marker = join(main, "planted.sshCommand");
+		const script = join(main, "sshCommand.sh");
+		writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+		chmodSync(script, 0o755);
+		const globalCfg = join(main, ".git", "planted-global.gitconfig");
+		writeFileSync(globalCfg, `[core]\n\tsshCommand = ${script}\n`);
+		// A fake ssh on PATH logs how the fetch calls it and answers the git ssh protocol,
+		// so the pinned command still fetches (no network, no real ssh config read).
+		const log = join(main, "ssh-invocation.log");
+		const bin = join(main, "bin");
+		mkdirSync(bin);
+		writeFileSync(
+			join(bin, "ssh"),
+			`#!/bin/sh\n{ echo "$@"; env; } >> '${log}'\nfor a in "$@"; do case "$a" in git-upload-pack*) exec sh -c "git upload-pack \${a#git-upload-pack}";; esac; done\nexit 255\n`,
+		);
+		chmodSync(join(bin, "ssh"), 0o755);
+		const prevGlobal = process.env.GIT_CONFIG_GLOBAL;
+		const prevPath = process.env.PATH;
+		process.env.GIT_CONFIG_GLOBAL = globalCfg;
+		process.env.PATH = `${bin}:${prevPath ?? ""}`;
+		try {
+			// Control: without the pin, plain git runs the planted sshCommand.
+			const plain = { ...process.env } as Record<string, string>;
+			delete plain.GIT_SSH_COMMAND;
+			const ctl = Bun.spawnSync(
+				[gitExe(), "ls-remote", `ssh://ottr-fixture.invalid/${up}`],
+				{
+					cwd: main,
+					env: plain,
+					stdout: "ignore",
+					stderr: "ignore",
+					windowsHide: true,
+				},
+			);
+			expect(ctl.exitCode).not.toBe(0);
+			expect(existsSync(marker)).toBe(true);
+			rmSync(marker);
+			// Board path: the checkout and the diff lazy-fetch blobs through the pinned ssh,
+			// and the planted sshCommand never runs.
+			const wt = join(main, ".worktrees", "p");
+			await createWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: "ott/p",
+				base: "origin/main",
+				copyExtra: [],
+				log: () => {},
+			});
+			expect(readFileSync(join(wt, "f.txt"), "utf8")).toBe("new\n");
+			expect(await diffStat(wt, base, base)).toEqual([
+				{ file: "f.txt", plus: 1, minus: 1 },
+			]);
+			expect(await diffText(wt, base, base)).toContain("-old\n+new\n");
+			expect(existsSync(marker)).toBe(false);
+			const lines = readFileSync(log, "utf8").split("\n");
+			expect(lines[0]?.startsWith("-F /dev/null -o BatchMode=yes")).toBe(true);
+			expect(lines).toContain("GIT_ALLOW_PROTOCOL=https:ssh");
+		} finally {
+			if (prevGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = prevGlobal;
+			if (prevPath === undefined) delete process.env.PATH;
+			else process.env.PATH = prevPath;
+		}
 	}, 60_000);
 
 	test("never runs planted diff.external, textconv, uploadpack or receivepack (R5-1)", async () => {

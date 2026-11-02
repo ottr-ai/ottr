@@ -298,7 +298,9 @@ const PROBED_CORE =
  * .gitattributes still apply, but they can only name drivers of system, global or
  * command-line config (git-lfs). A partial clone's promisor remote (name, url, filter) is
  * copied, so a missing blob still fetches lazily; that fetch reads the stub too, never the
- * planted remote keys (uploadpack, sshCommand, helpers). Callers pass
+ * planted remote keys (uploadpack, sshCommand, helpers), and its ssh runs pinned
+ * (`ssh -F /dev/null -o BatchMode=yes`, transports https:ssh), so the shared home ssh
+ * config never reaches it. Callers pass
  * `--ignore-submodules=dirty`: a submodule status runs git in the submodule's own gitdir,
  * which is planted the same way. dirtySubmodules probes each submodule through this stub.
  */
@@ -412,6 +414,12 @@ async function sealedGit(
 				GIT_WORK_TREE: worktreePath,
 				GIT_INDEX_FILE: path.join(gitDir, "index"),
 				GIT_OBJECT_DIRECTORY: path.join(common, "objects"),
+				// The lazy promisor fetch shells out to ssh (gitEnv stripped GIT_SSH_COMMAND), and
+				// ssh reads ~/.ssh/config from the passwd home (/root), which the shared home
+				// volume makes worker-writable: a planted ProxyCommand would run here. gitAuthEnv
+				// pins the same way (OTTR-264); GIT_ALLOW_PROTOCOL pins the fetch transport.
+				GIT_SSH_COMMAND: "ssh -F /dev/null -o BatchMode=yes",
+				GIT_ALLOW_PROTOCOL: "https:ssh",
 			},
 		);
 	} finally {
