@@ -708,6 +708,9 @@ textarea {
 	min-width: 172px;
 }
 .theme-choice {
+	/* Block-level rows: as inline-flex buttons they sat side by side in the menu's max-content
+	   width, so the auto-width popover grew to the sum of all three rows. */
+	display: flex;
 	width: 100%;
 	min-height: 28px;
 	padding: 0 8px;
