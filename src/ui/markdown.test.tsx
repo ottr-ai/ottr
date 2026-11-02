@@ -148,21 +148,34 @@ describe("Markdown", () => {
 	});
 
 	test("markdown images and raw <img> tags render as img elements", () => {
-		// react-dom/server prepends <link rel="preload"> for images; assert the rendered subtree.
-		expect(render("![logo](https://x.test/a.png)")).toContain(
-			'<p><img src="https://x.test/a.png" alt="logo"/></p>',
+		// Only same-origin (root-relative) srcs render; react-dom/server prepends
+		// <link rel="preload"> for images, so assert the rendered subtree.
+		expect(render("![logo](/api/projects/p/tasks/t/images/a.png)")).toContain(
+			'<p><img src="/api/projects/p/tasks/t/images/a.png" alt="logo"/></p>',
 		);
 		const raw = render(
-			'<img src="https://x.test/b.png" alt="box" width="220">',
+			'<img src="/api/projects/p/tasks/t/images/b.png" alt="box" width="220">',
 		);
-		expect(raw).toContain('src="https://x.test/b.png"');
+		expect(raw).toContain('src="/api/projects/p/tasks/t/images/b.png"');
 		expect(raw).toContain('alt="box"');
 		expect(raw).toContain('width="220"');
 	});
 
+	test("remote images render as links, never as img", () => {
+		// Untrusted card text must not make the browser fetch a remote URL on view.
+		const out = render(
+			'![logo](https://x.test/a.png)\n\n<img src="https://x.test/b.png" alt="box" width="220">',
+		);
+		expect(out).toContain('<a href="https://x.test/a.png"');
+		expect(out).toContain(">logo</a>");
+		expect(out).toContain('<a href="https://x.test/b.png"');
+		expect(out).toContain(">box</a>");
+		expect(out).not.toContain("<img");
+	});
+
 	test("images with unsafe sources never render as img", () => {
 		const out = render(
-			'![x](javascript:alert(1))\n\n<img src=x onerror=alert(1)>\n\n<img src="javascript:alert(2)" onerror="alert(3)">',
+			'![x](javascript:alert(1))\n\n![x](https://x.test/x.png)\n\n<img src=x onerror=alert(1)>\n\n<img src="javascript:alert(2)" onerror="alert(3)">',
 		);
 		expect(out).not.toContain("<img");
 		expect(out).not.toContain("onerror");
@@ -170,9 +183,9 @@ describe("Markdown", () => {
 
 	test("raw <img> tags render inside table cells", () => {
 		const out = render(
-			'| <img src="https://x.test/c.png" alt="pc" width="220"> | box |\n|---|---|\n| a | b |',
+			'| <img src="/api/projects/p/tasks/t/images/c.png" alt="pc" width="220"> | box |\n|---|---|\n| a | b |',
 		);
-		expect(out).toContain('src="https://x.test/c.png"');
+		expect(out).toContain('src="/api/projects/p/tasks/t/images/c.png"');
 		expect(out).toContain('width="220"');
 		expect(out).toContain("<td>a</td>");
 	});

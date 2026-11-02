@@ -110,6 +110,8 @@ describe("ProjectLogo", () => {
 		expect(out).toContain('href="https://github.com/octo/repo"');
 		expect(out).toContain('rel="noopener noreferrer"');
 		expect(out).toContain("<img");
+		// The adopted icon is the one legit remote image; it must not leak the board origin.
+		expect(out).toContain('referrerPolicy="no-referrer"');
 	});
 	test("no GitHub: the HTTPS origin remote is the link", () => {
 		expect(html(p(null, "https://gitlab.com/octo/repo"))).toContain(

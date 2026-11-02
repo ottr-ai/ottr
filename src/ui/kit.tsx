@@ -598,6 +598,7 @@ export function ProjectTag({ project }: { project: ProjectView }) {
 					src={src}
 					alt=""
 					loading="lazy"
+					referrerPolicy="no-referrer"
 					onError={() => setFailedSrc(src)}
 				/>
 			) : (

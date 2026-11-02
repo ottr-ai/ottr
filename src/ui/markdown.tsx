@@ -2,7 +2,8 @@ import { Fragment, type ReactNode } from "react";
 
 // ponytail: subset markdown — headings, paragraphs, fenced code, lists (nested),
 // blockquotes, hr, tables (GFM pipe), bold/italic/code/strike, links, bare URLs,
-// images (markdown syntax and raw <img> tags, http(s) src only).
+// images (markdown syntax and raw <img> tags; same-origin srcs render,
+// remote http(s) srcs render as links).
 // No reference links; swap in a real parser if reports start needing them.
 
 /** Inline tokens; alternation order is precedence: code first so markup inside stays literal. */
@@ -14,8 +15,9 @@ function safeHref(url: string): string | null {
 	return /^https?:\/\//i.test(url) ? url : null;
 }
 
-/** Copies only safe attributes out of a raw <img> tag: http(s) src, alt, numeric width.
- *  Everything else (on* handlers, style, srcset) is dropped; a tag without a safe src is dropped. */
+/** Copies only safe attributes out of a raw <img> tag: src, alt, numeric width.
+ *  Everything else (on* handlers, style, srcset) is dropped; a tag without a src attribute
+ *  is dropped. Whether the src itself renders is imageNode's call. */
 function parseImg(tag: string): {
 	src: string;
 	alt: string;
@@ -28,13 +30,34 @@ function parseImg(tag: string): {
 		return m?.[1] ?? m?.[2] ?? m?.[3] ?? null;
 	};
 	const src = attr("src");
-	if (src === null || safeHref(src) === null) return null;
+	if (src === null) return null;
 	const width = attr("width");
 	return {
 		src,
 		alt: attr("alt") ?? "",
 		width: width !== null && /^\d+$/.test(width) ? width : undefined,
 	};
+}
+
+/** Images: same-origin (root-relative) srcs render; remote http(s) srcs become links, so
+ *  untrusted card text (PR titles, agent output) cannot make the viewer's browser call the
+ *  attacker's server (tracking, Referer/secret exfiltration) just by opening the card.
+ *  Other srcs (javascript:, protocol-relative, empty) render nothing. */
+function imageNode(
+	src: string,
+	alt: string,
+	key: string,
+	width?: string,
+): ReactNode {
+	if (src.startsWith("/"))
+		return <img key={key} src={src} alt={alt} width={width} />;
+	if (safeHref(src) !== null)
+		return (
+			<a key={key} href={src} target="_blank" rel="noreferrer">
+				{alt === "" ? src : alt}
+			</a>
+		);
+	return null;
 }
 
 function inline(text: string, keyPrefix: string): ReactNode[] {
@@ -64,16 +87,12 @@ function inline(text: string, keyPrefix: string): ReactNode[] {
 				),
 			);
 		} else if (tok.startsWith("!")) {
-			const src = safeHref(m[13] ?? "");
-			out.push(
-				src === null ? tok : <img key={key} src={src} alt={m[12] ?? ""} />,
-			);
+			out.push(imageNode(m[13] ?? "", m[12] ?? "", key) ?? tok);
 		} else if (tok.startsWith("<img")) {
 			const img = parseImg(tok);
 			if (img !== null) {
-				out.push(
-					<img key={key} src={img.src} alt={img.alt} width={img.width} />,
-				);
+				const node = imageNode(img.src, img.alt, key, img.width);
+				if (node !== null) out.push(node);
 			}
 		} else if (tok.startsWith("http")) {
 			out.push(
@@ -291,7 +310,8 @@ function parseBlocks(src: string, fence?: Fence): ReactNode[] {
 	return out;
 }
 
-/** Renders markdown text as React elements; all text stays escaped, no raw HTML. */
+/** Renders markdown text as React elements; all text stays escaped, no raw HTML except
+ *  same-origin <img> srcs — remote image srcs render as links, never as loaded images. */
 export function Markdown({
 	text,
 	fence,
