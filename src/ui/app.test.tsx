@@ -21,6 +21,7 @@ const {
 	WarningLines,
 	doneTopicPages,
 	cancelledTopic,
+	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
 	workerNote,

@@ -4163,6 +4163,18 @@ export function visibleUpdateRows(
 		: rows.filter((r) => r.target !== null || r.removed === true);
 }
 
+/** Update ids an open card already carries (U6): a done card covers nothing, and a cancelled
+ * card covers nothing — its row stays pending for the user. The updates panel and the inbox
+ * entry read the same map, so a row can never be actionable in one and covered in the other. */
+export function coveredUpdateIds(tasks: TaskCard[]): Map<string, TaskCard> {
+	const covered = new Map<string, TaskCard>();
+	for (const t of tasks) {
+		if (t.cancelledAt !== null || t.stage === "done") continue;
+		for (const id of t.updateIds) covered.set(id, t);
+	}
+	return covered;
+}
+
 /** Upstream updates from the Alate provider (U5): rows grouped by repo, optional Skip per row.
  * The WS state frame owns the data; the panel only fires a refresh and skip POSTs. */
 function UpdatesPanel({
@@ -4184,11 +4196,7 @@ function UpdatesPanel({
 		void act(() => post("/api/updates/refresh", {}));
 	}, [act]);
 	// U6: a row an open (non-done, non-cancelled) update card already carries is not actionable here.
-	const covered = new Map<string, TaskCard>();
-	for (const t of tasks) {
-		if (t.cancelledAt !== null || t.stage === "done") continue;
-		for (const id of t.updateIds) covered.set(id, t);
-	}
+	const covered = coveredUpdateIds(tasks);
 	const [selected, setSelected] = useState<Set<string>>(() => new Set());
 	// G21: a young release (no qualified target) hides until "ignore 7-day rule" is ticked.
 	const [showYoung, setShowYoung] = useState(false);
@@ -7766,11 +7774,7 @@ function App() {
 	// Hoisted above markSeen/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
 	const tasks = state?.tasks ?? [];
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
-	const coveredUpdates = new Set<string>();
-	for (const t of tasks) {
-		if (t.cancelledAt !== null || t.stage === "done") continue;
-		for (const id of t.updateIds) coveredUpdates.add(id);
-	}
+	const coveredUpdates = coveredUpdateIds(tasks);
 	/** Actionable upstream updates (rows with a pin target); drives the inbox entry (U5). */
 	const updateIds =
 		state?.updates?.rows

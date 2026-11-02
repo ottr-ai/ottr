@@ -352,6 +352,38 @@ describe("pickRunnable", () => {
 		expect(pickRunnable([done, cancelled, merge], opts)).toEqual([merge]);
 	});
 
+	test("a cancelled review holds no merge, however open it looks", () => {
+		const cancelledReview = task({
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			cancelledAt: 5,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		// The open review above holds `other`; its cancelled twin must not.
+		expect(mergeHold([cancelledReview, other], other)).toBeNull();
+		expect(pickRunnable([cancelledReview, other], opts)).toEqual([other]);
+	});
+
+	test("a review with only a cancelled finding holds no merge", () => {
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const finding = task({
+			followUpOf: review.id,
+			createdAt: 300,
+			stage: "merging",
+			queuedAt: 600,
+			cancelledAt: 700,
+		});
+		const byHand = task({ createdAt: 300, stage: "merging", queuedAt: 800 });
+		expect(mergeHold([review, finding, byHand], byHand)).toBeNull();
+	});
+
 	test("an open review holds every merge but its findings'", () => {
 		// The Review button's card reviews its frozen base read-only and never merges itself.
 		const review = task({
