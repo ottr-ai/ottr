@@ -73,6 +73,12 @@ import {
 	parseAppPem,
 	validateAppCredentials,
 } from "./githubApp.ts";
+import {
+	DEFAULT_GITHUB_HOST,
+	GITHUB_HOST_ENV,
+	githubHost,
+	parseGithubHost,
+} from "./githubHost.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import {
 	decodeImages,
@@ -320,8 +326,9 @@ interface AppDeps {
 	models?: () => Promise<ModelOption[]>;
 	/**
 	 * GitHub token expiry probe seam; defaults to GET https://api.github.com/repos/ottr-ai/ottr
-	 * with the token, reading `github-authentication-token-expiration`. ISO date or null (no
-	 * expiry). A throw keeps the stored value (advisory; retried on the next tick).
+	 * on the default host, or GET <apiBase>/user on another host, with the token, reading
+	 * `github-authentication-token-expiration`. ISO date or null (no expiry). A throw keeps
+	 * the stored value (advisory; retried on the next tick).
 	 */
 	githubTokenExpiry?: (token: string) => Promise<string | null>;
 	/**
@@ -699,12 +706,15 @@ export function createApp(deps: AppDeps) {
 	function applyGithubToken(): void {
 		if (githubToken !== null) process.env.GH_TOKEN = githubToken;
 	}
-	// Default probe: the board's own repo answers with the expiry header when the token expires.
+	/** Default probe: the board's own repo answers with the expiry header when the token expires. */
 	const githubTokenExpiry =
 		deps.githubTokenExpiry ??
 		(async (token: string): Promise<string | null> => {
+			const h = githubHost();
 			const res = await noRedirectFetch(
-				"https://api.github.com/repos/ottr-ai/ottr",
+				h.isDefault
+					? "https://api.github.com/repos/ottr-ai/ottr"
+					: `${h.apiBase}/user`,
 				{
 					headers: {
 						authorization: `Bearer ${token}`,
@@ -2138,6 +2148,14 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 
+	/** The configured GitHub host for the view; null when the setting is invalid. */
+	function githubHostView(): string | null {
+		const raw = process.env[GITHUB_HOST_ENV];
+		if (raw === undefined || raw.trim() === "") return DEFAULT_GITHUB_HOST;
+		const parsed = parseGithubHost(raw);
+		return "error" in parsed ? null : parsed.host;
+	}
+
 	/** The Settings git-hosts view: per-host token flags and the global key — never a secret itself. */
 	async function gitHostsView() {
 		return {
@@ -2152,6 +2170,7 @@ export function createApp(deps: AppDeps) {
 				githubApp === null
 					? null
 					: { id: githubApp.id, fingerprint: githubApp.fingerprint },
+			githubHost: githubHostView(),
 		};
 	}
 
@@ -5284,8 +5303,7 @@ export function createApp(deps: AppDeps) {
 					const prev = e.store.claimPrPost(row.number, head);
 					if (prev === undefined)
 						return json({ error: "already posted for this head" }, 409);
-					const repo =
-						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
+					const repo = ownerRepo(e.github) ?? e.github;
 					const slash = repo.indexOf("/");
 					const owner = repo.slice(0, slash);
 					const repoName = repo.slice(slash + 1);
@@ -5309,7 +5327,7 @@ export function createApp(deps: AppDeps) {
 							// Direct fetch, no gh: the review posts as the app, not the board token.
 							try {
 								const res = await githubAppFetch(
-									`https://api.github.com/repos/${repo}/pulls/${row.number}/reviews`,
+									`${githubHost().apiBase}/repos/${repo}/pulls/${row.number}/reviews`,
 									{
 										method: "POST",
 										headers: {

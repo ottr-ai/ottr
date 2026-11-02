@@ -23,6 +23,7 @@ import {
 	removeBelow,
 	trustedAnchor,
 } from "./confine.ts";
+import { githubHost, hostMatcher } from "./githubHost.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -573,16 +574,23 @@ export function hasRules(mainPath: string): boolean {
 	return existsSync(path.join(mainPath, "AGENTS.md"));
 }
 
-/** HTTPS URL of the main checkout's GitHub remote (origin preferred); null when it has none. */
-export async function githubUrl(mainPath: string): Promise<string | null> {
+/** HTTPS URL of the main checkout's GitHub remote on the configured host (origin preferred);
+ * null when it has none. */
+export async function githubUrl(
+	mainPath: string,
+	host: string = githubHost().host,
+): Promise<string | null> {
 	const r = await git(["remote", "-v"], mainPath);
 	if (r.code !== 0) return null;
+	const hostRe = new RegExp(
+		hostMatcher(host).source + "(.+?)(?:\\.git)?$",
+		"i",
+	);
 	const byName = new Map<string, string>();
 	for (const line of r.stdout.split("\n")) {
 		const [name = "", url = "", kind = ""] = line.trim().split(/\s+/);
-		const m =
-			kind === "(push)" ? /github\.com[:/](.+?)(?:\.git)?$/i.exec(url) : null;
-		if (m?.[1]) byName.set(name, `https://github.com/${m[1]}`);
+		const m = kind === "(push)" ? hostRe.exec(url) : null;
+		if (m?.[1]) byName.set(name, `https://${host}/${m[1]}`);
 	}
 	return byName.get("origin") ?? [...byName.values()][0] ?? null;
 }
@@ -604,7 +612,7 @@ export function httpsRemote(raw: string): string | null {
 
 /** HTTPS URL of the main checkout's origin push remote on any host (GitHub, GitLab,
  * self-hosted); null when it has none. Icon adoption reads this; githubUrl stays the
- * github.com-only view the release flow uses. */
+ * configured-host view the release flow uses. */
 export async function remoteUrl(mainPath: string): Promise<string | null> {
 	const r = await git(["remote", "-v"], mainPath);
 	if (r.code !== 0) return null;

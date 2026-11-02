@@ -7,6 +7,7 @@ import {
 	renderReport,
 	stripInvisible,
 } from "./forkAnalysis.ts";
+import { githubHost } from "./githubHost.ts";
 import {
 	FORK_PROPOSED_REASON_PREFIX,
 	forkProposedReason,
@@ -54,7 +55,7 @@ export type GitFn = (
 
 /** URL built only from validated ForkInfo fields; never from data-supplied strings. */
 export function forkUrl(f: ForkInfo): string {
-	return `https://github.com/${f.owner}/${f.name}.git`;
+	return `${githubHost().webBase}/${f.owner}/${f.name}.git`;
 }
 
 /** Validates one GitHub /forks page; invalid entries are skipped, never thrown. */

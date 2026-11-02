@@ -2163,6 +2163,19 @@ describe("dependabotPrompt", () => {
 		);
 	});
 
+	test("links to the configured GitHub host", () => {
+		const oldHost = process.env.OTTR_GITHUB_HOST;
+		try {
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			expect(dependabotPrompt(7, "o/r", "Bump vite").split("\n", 1)[0]).toBe(
+				"Dependabot PR #7 (https://acme.ghe.com/o/r/pull/7): Bump vite",
+			);
+		} finally {
+			if (oldHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = oldHost;
+		}
+	});
+
 	test("collapses control characters to spaces, trims, caps the title at 200 chars", () => {
 		expect(
 			dependabotPrompt(1, "o/r", "  a\nb\u0000c  ").split("\n", 1)[0],

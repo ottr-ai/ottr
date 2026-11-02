@@ -11,6 +11,7 @@ import { newSecret } from "./auth.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { defaultSshDir } from "./gitHosts.ts";
+import { githubHost } from "./githubHost.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
@@ -86,6 +87,9 @@ const HOST = process.env.OMP_TRACKER_HOST ?? "127.0.0.1";
 const PUBLIC_HOSTS = publicHosts();
 /** Production mode: the board is static (no WebSocket); UI bundles/minifies via Bun. */
 const PROD = process.env.NODE_ENV === "production";
+// Refuse an invalid OTTR_GITHUB_HOST at boot: every GitHub feature would otherwise aim at
+// the wrong host. githubHost() throws the same message at every later use.
+githubHost();
 const EXTENSION = resolve(import.meta.dir, "..", "extension", "tracker.ts");
 const ROOTS = process.env.OMP_TRACKER_ROOTS
 	? process.env.OMP_TRACKER_ROOTS.split(delimiter)

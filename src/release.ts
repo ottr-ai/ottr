@@ -1,3 +1,4 @@
+import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LatestImage, ReleasePlan, Task } from "./types.ts";
@@ -402,7 +403,10 @@ export async function runGh(
 	timeoutMs = 2 * 60_000,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	try {
-		return await spawnPiped(["gh", ...args], undefined, timeoutMs);
+		return await spawnPiped(["gh", ...args], undefined, timeoutMs, {
+			...process.env,
+			...ghEnvFor(githubHost(), process.env.GH_TOKEN),
+		});
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code === "ENOENT")
 			throw new Error(GH_MISSING);
@@ -509,7 +513,7 @@ export async function publishRelease(o: {
 					`gh release create ${o.version} failed: ${c.stderr.trim()}`,
 				);
 			parts.push(
-				`GitHub release https://github.com/${repo}/releases/tag/${o.version}`,
+				`GitHub release ${githubHost().webBase}/${repo}/releases/tag/${o.version}`,
 			);
 		}
 	}

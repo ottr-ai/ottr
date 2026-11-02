@@ -1101,3 +1101,43 @@ describe("runGh timeout", () => {
 		}
 	});
 });
+
+// runGh must hand gh the env for the configured host: GH_HOST plus GH_ENTERPRISE_TOKEN on
+// another host, GH_TOKEN only on the default (no new names, ambient gh auth keeps working).
+describe("runGh env", () => {
+	test("serves the configured host's gh env", async () => {
+		if (process.platform === "win32") return; // the fake is a sh script
+		const bin = mkdtempSync(join(tmpdir(), "ott-fakegh-"));
+		const script = join(bin, "gh");
+		writeFileSync(script, '#!/bin/sh\nenv > "$0.env"\nexit 0\n');
+		chmodSync(script, 0o755);
+		const savedPath = process.env.PATH;
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		const savedToken = process.env.GH_TOKEN;
+		process.env.PATH = `${bin}:${savedPath}`;
+		try {
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			process.env.GH_TOKEN = "t";
+			await runGh(["api", "x"]);
+			let dumped = readFileSync(`${script}.env`, "utf8");
+			expect(dumped).toContain("GH_HOST=acme.ghe.com");
+			expect(dumped).toContain("GH_ENTERPRISE_TOKEN=t");
+			// The board token still rides the inherited env; gh applies GH_ENTERPRISE_TOKEN
+			// to the GH_HOST host, so the extra GH_TOKEN is inert there.
+			expect(dumped).toContain("GH_TOKEN=t");
+			process.env.OTTR_GITHUB_HOST = "";
+			await runGh(["api", "x"]);
+			dumped = readFileSync(`${script}.env`, "utf8");
+			expect(dumped).toContain("GH_TOKEN=t");
+			expect(dumped).not.toMatch(/^GH_HOST=/m);
+			expect(dumped).not.toMatch(/^GH_ENTERPRISE_TOKEN=/m);
+		} finally {
+			process.env.PATH = savedPath;
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+			if (savedToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = savedToken;
+			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+});

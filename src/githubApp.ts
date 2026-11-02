@@ -6,6 +6,7 @@ import {
 	sign as cryptoSign,
 } from "node:crypto";
 import { noRedirectFetch } from "./alate.ts";
+import { githubHost } from "./githubHost.ts";
 
 export type ParsedAppKey = { keyObject: KeyObject; fingerprint: string };
 
@@ -88,27 +89,31 @@ export class AppTokenSource {
 		init?: RequestInit,
 	) => Promise<Response>;
 	private readonly now: () => number;
+	private readonly apiBase: string | undefined;
 	private cached: CacheEntry | null = null;
 
 	constructor(deps: {
 		appId: string;
 		keyObject: KeyObject;
+		apiBase?: string;
 		fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 		now?: () => number;
 	}) {
 		this.appId = deps.appId;
 		this.keyObject = deps.keyObject;
+		this.apiBase = deps.apiBase;
 		this.fetchImpl = deps.fetchImpl ?? noRedirectFetch;
 		this.now = deps.now ?? (() => Date.now());
 	}
 
 	async tokenFor(owner: string, repo: string): Promise<string | null> {
+		const base = this.apiBase ?? githubHost().apiBase;
 		const now = this.now();
 		if (this.cached !== null && now < this.cached.until)
 			return this.cached.token;
 		const { jwt } = signAppJwt(this.appId, this.keyObject, now);
 		const lookup = await this.fetchImpl(
-			`https://api.github.com/repos/${owner}/${repo}/installation`,
+			`${base}/repos/${owner}/${repo}/installation`,
 			{
 				headers: {
 					authorization: `Bearer ${jwt}`,
@@ -129,7 +134,7 @@ export class AppTokenSource {
 		}
 		const fresh = signAppJwt(this.appId, this.keyObject, this.now());
 		const created = await this.fetchImpl(
-			`https://api.github.com/app/installations/${installation.id}/access_tokens`,
+			`${base}/app/installations/${installation.id}/access_tokens`,
 			{
 				method: "POST",
 				headers: {

@@ -425,6 +425,34 @@ describe("renderReport", () => {
 	});
 });
 
+describe("commit links follow the configured host", () => {
+	test("renders acme.ghe.com links when OTTR_GITHUB_HOST is set", () => {
+		const saved = process.env.OTTR_GITHUB_HOST;
+		try {
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			const hostReport = renderReport(range(), VALID_RESULT);
+			expect(hostReport).toContain(
+				`https://acme.ghe.com/octo/proj/commit/${SHA1}`,
+			);
+			expect(hostReport).not.toContain("https://github.com/octo/proj/commit/");
+			const prompt = proposalPrompt("octo", "proj", {
+				title: "Dark mode",
+				goal: "g",
+				comparison: "c",
+				change: "h",
+				checks: "k",
+				risk: "r",
+				effort: "M",
+				commits: [SHA1],
+			});
+			expect(prompt).toContain(`https://acme.ghe.com/octo/proj/commit/${SHA1}`);
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved;
+		}
+	});
+});
+
 describe("proposalPrompt", () => {
 	test("includes all six fixed sections and stays under the cap with 2000-char fields", () => {
 		const big = (c: string) =>

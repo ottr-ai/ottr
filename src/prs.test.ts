@@ -9,9 +9,26 @@ import {
 	PR_GATES,
 	parseDraft,
 	parsePullPage,
+	prUrl,
 	reviewUserMessage,
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
+
+describe("prUrl", () => {
+	const oldHost = process.env.OTTR_GITHUB_HOST;
+
+	afterAll(() => {
+		if (oldHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = oldHost;
+	});
+
+	test("links to the configured GitHub host", () => {
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		expect(prUrl("o/r", 7)).toBe("https://acme.ghe.com/o/r/pull/7");
+		delete process.env.OTTR_GITHUB_HOST;
+		expect(prUrl("o/r", 7)).toBe("https://github.com/o/r/pull/7");
+	});
+});
 
 let root: string;
 let seq = 0;

@@ -140,6 +140,19 @@ describe("forkUrl", () => {
 			"https://github.com/o/r.git",
 		);
 	});
+
+	test("follows OTTR_GITHUB_HOST", () => {
+		const saved = process.env.OTTR_GITHUB_HOST;
+		try {
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			expect(forkUrl(parseForkPage([forkPageEntry(9)])[0]!)).toBe(
+				"https://acme.ghe.com/o/r.git",
+			);
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved;
+		}
+	});
 });
 
 describe("branchHash", () => {

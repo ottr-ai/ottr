@@ -1,5 +1,6 @@
 // Pure fork-analysis prompt/parse layer. Untrusted fork content: never instructions, always data.
 
+import { githubHost } from "./githubHost.ts";
 import { boardOmpEnv } from "./login.ts";
 import type {
 	ForkAnalysisResult,
@@ -428,7 +429,7 @@ export function renderReport(range: ForkRange, r: ForkAnalysisResult): string {
 			[
 				"Evidence",
 				f.commits
-					.map((s) => `https://github.com/${owner}/${name}/commit/${s}`)
+					.map((s) => `${githubHost().webBase}/${owner}/${name}/commit/${s}`)
 					.join(" "),
 			],
 		]) {
@@ -454,7 +455,7 @@ export function renderReport(range: ForkRange, r: ForkAnalysisResult): string {
 				`- Effort: ${p.effort}`,
 			);
 			lines.push(
-				`- Commits: ${p.commits.map((s) => `https://github.com/${owner}/${name}/commit/${s}`).join(" ")}`,
+				`- Commits: ${p.commits.map((s) => `${githubHost().webBase}/${owner}/${name}/commit/${s}`).join(" ")}`,
 				"",
 			);
 		}
@@ -478,7 +479,7 @@ export function proposalPrompt(
 ): string {
 	const first = `Implement ${p.title.slice(0, 49)} (from fork research)`;
 	const links = p.commits
-		.map((s) => `https://github.com/${owner}/${name}/commit/${s}`)
+		.map((s) => `${githubHost().webBase}/${owner}/${name}/commit/${s}`)
 		.join(" ");
 	const body = [
 		`Goal: ${p.goal}`,

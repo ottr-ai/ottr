@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { writeBelow } from "./confine.ts";
+import { githubHost } from "./githubHost.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
 import { ownerRepo } from "./release.ts";
 import { collectRetroFacts, factsMarkdown, frictionFilter } from "./retro.ts";
@@ -104,7 +105,7 @@ export function failedCheckNames(prompt: string): string[] {
 
 /** First line prefix of a Dependabot card prompt; also the dedupe key, so #1 never matches #12. Pure. */
 function dependabotHead(n: number, repo: string): string {
-	return `Dependabot PR #${n} (https://github.com/${repo}/pull/${n})`;
+	return `Dependabot PR #${n} (${githubHost().webBase}/${repo}/pull/${n})`;
 }
 
 /** Full card prompt for an open Dependabot PR; the title comes from GitHub JSON, so it is

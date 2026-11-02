@@ -1097,6 +1097,7 @@ export type GitHostsView = {
 	tokens: { host: string; username: string; tokenSet: boolean }[];
 	globalKey: KeyInfo | null;
 	githubApp: GitHubAppView | null;
+	githubHost: string | null;
 };
 
 /** Fetch that keeps the status with the parsed body, so a caller can read a 409's trust data
@@ -1434,6 +1435,15 @@ function GitHostsSection() {
 					captionUnknown="Unknown: the check failed"
 					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
+				{state !== null && (
+					<p className="hint">
+						{state.githubHost === null
+							? "GitHub host: OTTR_GITHUB_HOST is invalid — use a bare hostname, for example acme.ghe.com"
+							: state.githubHost === "github.com"
+								? "GitHub host: github.com (default)"
+								: `GitHub host: ${state.githubHost} (GitHub Enterprise)`}
+					</p>
+				)}
 			</div>
 			<div className="sec-block">
 				<h4>GitHub App</h4>

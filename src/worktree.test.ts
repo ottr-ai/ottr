@@ -1154,6 +1154,35 @@ describe("against real repos", () => {
 		}
 	}, 60_000);
 
+	test("githubUrl follows OTTR_GITHUB_HOST and ignores other hosts", async () => {
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		try {
+			await must(main, "remote", "add", "gh", "git@acme.ghe.com:o/r.git");
+			await must(
+				main,
+				"remote",
+				"add",
+				"other",
+				"https://github.com/octo/demo-app.git",
+			);
+			expect(await githubUrl(main)).toBe("https://acme.ghe.com/o/r");
+			await must(main, "remote", "remove", "gh");
+			expect(await githubUrl(main)).toBeNull();
+		} finally {
+			await must(main, "remote", "remove", "other");
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+		}
+		// Without the setting, only github.com counts.
+		await must(main, "remote", "add", "ghe", "git@ghe.example.com:o/r.git");
+		try {
+			expect(await githubUrl(main)).toBeNull();
+		} finally {
+			await must(main, "remote", "remove", "ghe");
+		}
+	}, 60_000);
+
 	test("remoteUrl returns the https origin on any host, null for local paths", async () => {
 		// The fixture's origin is a local path: no host, no icon source.
 		expect(await remoteUrl(main)).toBeNull();

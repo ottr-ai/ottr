@@ -141,11 +141,13 @@ function recordingFetch(responses: Array<Response | { status: number }>) {
 function makeSource(
 	responses: Array<Response | { status: number }>,
 	now: () => number = () => NOW,
+	apiBase?: string,
 ) {
 	const { calls, fetchImpl } = recordingFetch(responses);
 	const source = new AppTokenSource({
 		appId: APP_ID,
 		keyObject: privateKey,
+		apiBase,
 		fetchImpl,
 		now,
 	});
@@ -185,6 +187,27 @@ describe("AppTokenSource", () => {
 			repositories: [REPO],
 			permissions: { pull_requests: "write" },
 		});
+	});
+
+	test("an injected apiBase puts both URLs on that base", async () => {
+		const { calls, source } = makeSource(
+			[
+				okResponse(INSTALLATION),
+				okResponse({
+					token: "t1",
+					expires_at: new Date(NOW + 50 * 60_000).toISOString(),
+				}),
+			],
+			undefined,
+			"https://api.acme.ghe.com",
+		);
+		await source.tokenFor(OWNER, REPO);
+		expect(calls[0]!.url).toBe(
+			`https://api.acme.ghe.com/repos/${OWNER}/${REPO}/installation`,
+		);
+		expect(calls[1]!.url).toBe(
+			"https://api.acme.ghe.com/app/installations/777/access_tokens",
+		);
 	});
 
 	test("a cached token serves the second lookup without fetches", async () => {

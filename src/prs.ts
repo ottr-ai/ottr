@@ -6,6 +6,7 @@ import {
 	stripInvisible,
 } from "./forkAnalysis.ts";
 import type { ForkProject, GhFn } from "./forks.ts";
+import { githubHost } from "./githubHost.ts";
 import { ownerRepo, runGh } from "./release.ts";
 
 export type ReviewFn = (
@@ -33,7 +34,7 @@ const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 
 export function prUrl(repo: string, n: number): string {
-	return `https://github.com/${repo}/pull/${n}`;
+	return `${githubHost().webBase}/${repo}/pull/${n}`;
 }
 
 /** GitHub data is untrusted: malformed entries are skipped, never thrown on. */
@@ -181,7 +182,8 @@ export function createPrWatcher(deps: {
 	async function scanProject(project: ForkProject): Promise<void> {
 		const store = project.store;
 		const repo =
-			ownerRepo(`https://github.com/${project.github}.git`) ?? project.github!;
+			ownerRepo(`${githubHost().webBase}/${project.github}.git`) ??
+			project.github!;
 		if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
 		let pulls: PullInfo[];
 		try {

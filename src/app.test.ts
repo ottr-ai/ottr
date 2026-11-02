@@ -5587,6 +5587,42 @@ describe("PR review routes", () => {
 		await removeApp();
 	});
 
+	test("on another host the app mint and the review post sit on that host's API base", async () => {
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		await saveApp();
+		try {
+			appHappyPath({
+				html_url: "https://acme.ghe.com/acme/widget/pull/24#review-1",
+				user: { login: "ottr[bot]" },
+			});
+			const t = reviewed(24, H1);
+			const res = await postReview(t.id, { body: "Ship it." });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				ok: true,
+				login: "ottr[bot]",
+				via: "app",
+			});
+			const mint = appCalls.find((c) => c.url.endsWith("/installation"))!;
+			expect(mint.url).toBe(
+				"https://api.acme.ghe.com/repos/acme/widget/installation",
+			);
+			const tokenCall = appCalls.find((c) => c.url.includes("/access_tokens"))!;
+			expect(tokenCall.url).toBe(
+				"https://api.acme.ghe.com/app/installations/77/access_tokens",
+			);
+			const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+			expect(postCall.url).toBe(
+				"https://api.acme.ghe.com/repos/acme/widget/pulls/24/reviews",
+			);
+		} finally {
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+			await removeApp();
+		}
+	});
+
 	test("a failed token mint is a 502: the claim is released, post_error set, no key leaks", async () => {
 		await saveApp();
 		appFetchImpl = async (url) =>
@@ -5846,6 +5882,7 @@ type HostsView = {
 	tokens: Array<{ host: string; username: string; tokenSet: boolean }>;
 	globalKey: KeyBody | null;
 	githubApp: { id: string; fingerprint: string } | null;
+	githubHost: string | null;
 };
 
 describe("git-host urls on add project", () => {
@@ -6187,6 +6224,30 @@ describe("git-host tokens", () => {
 			testUrl: "https://gitlab.com/g/sub/tokened",
 		});
 		expect(badToken.status).toBe(400);
+	});
+});
+
+describe("git-hosts view github host", () => {
+	test("the view names the configured host, the default, and null for an invalid value", async () => {
+		const m = mount({ sshDir: join(root, "ssh-host-view") });
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		try {
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+				"acme.ghe.com",
+			);
+			delete process.env.OTTR_GITHUB_HOST;
+			expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+				"github.com",
+			);
+			process.env.OTTR_GITHUB_HOST = "https://x";
+			expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+				null,
+			);
+		} finally {
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+		}
 	});
 });
 
@@ -6598,6 +6659,44 @@ describe("token expiry reminders", () => {
 			tokenSet: true,
 			expiresAt: EXP,
 		});
+	});
+
+	test("on another host the default probe calls <apiBase>/user, never api.github.com", async () => {
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: EXP, lastPushDay: null },
+				seed: { expiresAt: null, lastPushDay: null },
+			}),
+		);
+		const m = mount();
+		const urls: string[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			urls.push(url);
+			// Only the probe answers here; the board's own HTTP stays on the real fetch.
+			if (url === "https://api.acme.ghe.com/user")
+				return new Response(null, { status: 401 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			const save = await m.call("/api/settings/github-token", { token: TOKEN });
+			expect(await save.json()).toEqual({ tokenSet: true, expiresAt: EXP });
+		} finally {
+			globalThis.fetch = realFetch;
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+		}
+		expect(urls).toContain("https://api.acme.ghe.com/user");
+		expect(urls.some((u) => u.startsWith("https://api.github.com"))).toBe(
+			false,
+		);
 	});
 
 	test("an expired token warns with the effect text and no push", async () => {
