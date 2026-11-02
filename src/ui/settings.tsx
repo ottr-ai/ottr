@@ -1416,7 +1416,7 @@ function gitHostsChip(
 
 /** Settings "Git hosts" section: per-host HTTPS tokens and the server-side global SSH key.
  *  Token values are write-only: the server never returns them and the UI never shows one. */
-function GitHostsSection() {
+export function GitHostsSection() {
 	const [state, setState] = useState<GitHostsView | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	// Add-token form; `replace` pre-fills it from a listed token.
@@ -1429,6 +1429,7 @@ function GitHostsSection() {
 	const [appFormOpen, setAppFormOpen] = useState(false);
 	const [appId, setAppId] = useState("");
 	const [appKey, setAppKey] = useState("");
+	const appBusy = useBusy();
 	// Global-key flow: a pending key, then the save call that also runs the test.
 	const [pending, setPending] = useState<PendingKeyInfo | null>(null);
 	const [gUrl, setGUrl] = useState("");
@@ -1496,20 +1497,27 @@ function GitHostsSection() {
 			await load();
 			return true;
 		});
-	const saveApp = async (): Promise<boolean> => {
-		const id = appId.trim();
-		if (!/^\d+$/.test(id)) throw new Error("App ID must be numeric");
-		if (appKey === "") throw new Error("Private key is required");
-		const { status, data } = await gitReq("POST", "/api/git-hosts/github-app", {
-			id,
-			key: appKey,
-		});
-		if (status !== 200) throw new Error(asError(data, status));
-		setAppId("");
-		setAppKey("");
-		setAppFormOpen(false);
-		await load();
-		return true;
+	// One guarded call for the Save button and the form's Enter: `start` blocks a
+	// second POST while busy, `run` lands every failure on the section's error line.
+	const saveApp = (): void => {
+		appBusy.start(() =>
+			run(async () => {
+				const id = appId.trim();
+				if (!/^\d+$/.test(id)) throw new Error("App ID must be numeric");
+				if (appKey === "") throw new Error("Private key is required");
+				const { status, data } = await gitReq(
+					"POST",
+					"/api/git-hosts/github-app",
+					{ id, key: appKey },
+				);
+				if (status !== 200) throw new Error(asError(data, status));
+				setAppId("");
+				setAppKey("");
+				setAppFormOpen(false);
+				await load();
+				return true;
+			}),
+		);
 	};
 	const removeApp = (): Promise<boolean> =>
 		run(async () => {
@@ -1593,7 +1601,7 @@ function GitHostsSection() {
 						className="settings-form"
 						onSubmit={(e) => {
 							e.preventDefault();
-							void saveApp();
+							saveApp();
 						}}
 					>
 						<label className="settings-field">
@@ -1618,7 +1626,15 @@ function GitHostsSection() {
 								required
 							/>
 						</label>
-						<BusyButton run={saveApp}>Save</BusyButton>
+						<button
+							type="submit"
+							disabled={appBusy.busy}
+							aria-busy={appBusy.busy || undefined}
+							className={appBusy.failed ? "failed" : ""}
+						>
+							{appBusy.busy && <span className="spinner" aria-hidden="true" />}
+							Save
+						</button>
 						{state !== null && state.githubApp !== null && (
 							<>
 								{" "}
