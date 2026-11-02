@@ -26,6 +26,7 @@ const {
 	serverLine,
 	reportHtml,
 	Drawer,
+	windowGone,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo } = await import("./kit.tsx");
 const {
@@ -36,6 +37,56 @@ const {
 	SETTINGS_TOC,
 	SettingsPage,
 } = await import("./settings.tsx");
+
+describe("windowGone", () => {
+	const H = 3_600_000;
+	const now = 1_000 * H;
+	const lim = (o: {
+		window?: string | null;
+		label?: string;
+		resetsAt?: number | null;
+	}) => ({
+		provider: "p",
+		label: o.label ?? "x",
+		window: o.window ?? null,
+		plan: null,
+		usedPct: 10,
+		resetsAt: o.resetsAt === undefined ? now + H : o.resetsAt,
+	});
+	test("reads omp's window id", () => {
+		expect(windowGone(lim({ window: "5h", resetsAt: now + 4 * H }), now)).toBe(
+			20,
+		);
+		expect(windowGone(lim({ window: "7d", resetsAt: now + 84 * H }), now)).toBe(
+			50,
+		);
+	});
+	test("falls back to the label when omp names no window", () => {
+		expect(
+			windowGone(
+				lim({ label: "ZAI 5 Hours Credit Quota", resetsAt: now + H }),
+				now,
+			),
+		).toBe(80);
+		expect(
+			windowGone(lim({ label: "Claude 7 Day", resetsAt: now + 168 * H }), now),
+		).toBe(0);
+		expect(
+			windowGone(
+				lim({ label: "ZAI Weekly Credit Quota", resetsAt: now + 42 * H }),
+				now,
+			),
+		).toBe(75);
+	});
+	test("unknown length or reset gives null; a past reset clamps to 100", () => {
+		expect(windowGone(lim({ label: "Monthly" }), now)).toBeNull();
+		expect(windowGone(lim({ window: "5h", resetsAt: null }), now)).toBeNull();
+		expect(windowGone(lim({ window: "5h", resetsAt: now - H }), now)).toBe(100);
+		expect(windowGone(lim({ window: "5h", resetsAt: now + 9 * H }), now)).toBe(
+			0,
+		);
+	});
+});
 
 describe("monogram", () => {
 	test("initials of the first two words, else the first two characters", () => {

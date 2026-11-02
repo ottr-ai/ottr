@@ -48,6 +48,19 @@ const ICON_PATHS = {
 	),
 	"chevron-left": <path d="M15 18l-6-6 6-6" />,
 	"chevron-right": <path d="M9 18l6-6-6-6" />,
+	clock: (
+		<>
+			<circle cx="12" cy="12" r="10" />
+			<polyline points="12 6 12 12 16 14" />
+		</>
+	),
+	"git-merge": (
+		<>
+			<circle cx="18" cy="18" r="3" />
+			<circle cx="6" cy="6" r="3" />
+			<path d="M6 21V9a9 9 0 0 0 9 9" />
+		</>
+	),
 	bell: (
 		<>
 			<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />

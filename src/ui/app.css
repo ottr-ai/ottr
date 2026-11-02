@@ -851,8 +851,22 @@ textarea {
 	font-variant-numeric: tabular-nums;
 }
 .ag-nums dt {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
 	font-size: 12px;
 	color: var(--dim);
+}
+.ag-nums dt .icon-svg,
+.ag-nums dt .mark {
+	flex: none;
+	width: 13px;
+	height: 13px;
+	color: var(--dim);
+}
+.ag-nums div:not([data-zero]) dt .icon-svg,
+.ag-nums div:not([data-zero]) dt .mark {
+	color: var(--text);
 }
 .ag-nums div[data-zero] dd {
 	font-weight: 400;
@@ -885,6 +899,117 @@ textarea {
 .mach b {
 	font-weight: 400;
 	color: var(--text);
+}
+/* Quota windows in the system popover: one grid row per window. The time line and the quota bar
+   differ in shape and weight (a thin bright line with an end dot, a boxed grey bar), not only tone. */
+.qt {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 96px 3.2em 4.6em;
+	align-items: center;
+	gap: 5px 10px;
+	font-size: 12.5px;
+	font-variant-numeric: tabular-nums;
+}
+.qt-head,
+.qt-row {
+	display: contents;
+}
+.qt-head > span {
+	font-size: 11.5px;
+	color: var(--dim);
+}
+.qt-num,
+.qt-val,
+.qt-reset {
+	text-align: right;
+}
+.qt-key {
+	display: flex;
+	gap: 10px;
+}
+.qt-key > span {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.qt h3 {
+	grid-column: 1 / -1;
+	margin: 4px 0 0;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text);
+}
+.qt-label {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	color: var(--dim);
+}
+.qt-bars {
+	display: grid;
+	gap: 2px;
+}
+.qt-time {
+	position: relative;
+	height: 2px;
+	background: var(--line-soft);
+}
+.qt-time i {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	background: var(--text);
+}
+.qt-time i::after {
+	content: "";
+	position: absolute;
+	top: -2px;
+	right: -3px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--text);
+}
+.qt-used {
+	position: relative;
+	height: 7px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 1px;
+}
+.qt-used i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
+.qt-row[data-level="high"] .qt-used i {
+	background: var(--alarm);
+}
+.qt-row[data-level="crit"] .qt-used i {
+	background: var(--crit);
+}
+.qt-val {
+	color: var(--text-strong);
+}
+.qt-row[data-level="high"] .qt-val {
+	color: var(--alarm);
+}
+.qt-row[data-level="crit"] .qt-val {
+	color: var(--crit-text);
+}
+.qt-reset {
+	color: var(--dim);
+}
+.qt-key .qt-time,
+.qt-key .qt-used {
+	width: 14px;
+}
+.qt-key .qt-time i {
+	right: 3px;
 }
 /* Provider quota: one grid for every provider, so tracks and values line up; Meter parts become cells. */
 .quota {

@@ -64,6 +64,7 @@ import {
 	BAND_LIMIT,
 	BusyButton,
 	CloseButton,
+	clamp,
 	copyText,
 	Icon,
 	interviewMsg,
@@ -77,7 +78,6 @@ import {
 	ProjectTag,
 	post,
 	projectLabel,
-	QuotaRow,
 	unwrap,
 	useBusy,
 	useFlash,
@@ -760,6 +760,34 @@ function useStats(): MachineStats | null {
 	return stats;
 }
 
+const WINDOW_UNIT_MS = {
+	m: 60_000,
+	h: 3_600_000,
+	d: 86_400_000,
+	w: 604_800_000,
+} as const;
+
+/** Share of a quota window that has passed, 0-100, from omp's window id ("5h", "7d") or, when omp
+ *  names none, the label ("5 Hours", "7 Day", "Weekly"). Null when the length or the reset is unknown. */
+export function windowGone(
+	l: QuotaState["limits"][number],
+	now: number,
+): number | null {
+	if (l.resetsAt === null) return null;
+	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
+	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
+	const ms = id
+		? Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS]
+		: named
+			? Number(named[1]) *
+				WINDOW_UNIT_MS[named[2]![0]!.toLowerCase() as "h" | "d" | "w"]
+			: /weekly/i.test(l.label)
+				? WINDOW_UNIT_MS.w
+				: null;
+	if (ms === null || ms <= 0) return null;
+	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
+}
+
 /** Overview indicators in the app bar; the button opens the detail popover (15-minute machine averages, quota, agents). */
 function SystemBar({
 	tasks,
@@ -834,15 +862,24 @@ function SystemBar({
 					<h2>Agents</h2>
 					<dl className="ag-nums">
 						<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
-							<dt>Running</dt>
+							<dt>
+								<Mark kind="running" />
+								Running
+							</dt>
 							<dd>{slots.in_progress + slots.todo}</dd>
 						</div>
 						<div data-zero={slots.merging === 0 || undefined}>
-							<dt>Merging</dt>
+							<dt>
+								<Icon name="git-merge" size={13} />
+								Merging
+							</dt>
 							<dd>{slots.merging}</dd>
 						</div>
 						<div data-zero={waiting === 0 || undefined}>
-							<dt>Waiting</dt>
+							<dt>
+								<Icon name="clock" size={13} />
+								Waiting
+							</dt>
 							<dd>{waiting}</dd>
 						</div>
 					</dl>
@@ -871,21 +908,83 @@ function SystemBar({
 						</p>
 					) : (
 						<>
-							<div className="quota">
+							{/* One row per window: a thin time line over the quota bar, so a quota bar
+							    longer than its time line means the window burns faster than it runs. */}
+							<div className="qt">
+								<div className="qt-head" aria-hidden="true">
+									<span />
+									<span className="qt-key">
+										<span>
+											<span className="qt-time">
+												<i />
+											</span>
+											time
+										</span>
+										<span>
+											<span className="qt-used">
+												<i />
+											</span>
+											quota
+										</span>
+									</span>
+									<span className="qt-num">used</span>
+									<span className="qt-num">resets</span>
+								</div>
 								{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
 									([provider, limits]) => (
-										<div key={provider} className="quota-group">
+										<Fragment key={provider}>
 											<h3>{provider}</h3>
-											{limits.map((l) => (
-												<QuotaRow key={l.label} limit={l} />
-											))}
-										</div>
+											{limits.map((l) => {
+												const gone = windowGone(l, Date.now());
+												return (
+													<div
+														key={l.label}
+														className="qt-row"
+														data-level={loadLevel(l.usedPct)}
+													>
+														<span className="qt-label" title={l.label}>
+															{l.label}
+														</span>
+														<span
+															className="qt-bars"
+															role="img"
+															aria-label={`${Math.round(l.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
+														>
+															{gone !== null && (
+																<span className="qt-time">
+																	<i style={{ width: `${gone}%` }} />
+																</span>
+															)}
+															<span className="qt-used">
+																<i
+																	style={{
+																		transform: `scaleX(${clamp(l.usedPct, 0, 100) / 100})`,
+																	}}
+																/>
+															</span>
+														</span>
+														<span className="qt-val">
+															{Math.round(l.usedPct)} %
+														</span>
+														<span
+															className="qt-reset"
+															title={
+																l.resetsAt === null
+																	? undefined
+																	: `Resets ${stamp(l.resetsAt)}`
+															}
+														>
+															{l.resetsAt === null ? "–" : until(l.resetsAt)}
+														</span>
+													</div>
+												);
+											})}
+										</Fragment>
 									),
 								)}
 							</div>
 							<p className="caption">
-								From omp usage, checked {age(quota.at)}. Amber from {BAND_LIMIT}{" "}
-								% used.
+								Checked {age(quota.at)}. Amber from {BAND_LIMIT} % used.
 							</p>
 						</>
 					)}
