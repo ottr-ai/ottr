@@ -1266,6 +1266,12 @@ textarea {
 	flex: none; /* .notif-line > span { flex: 1 } would stretch the chip */
 	margin-top: 2px;
 }
+/* An inline text link: the base button's inline-flex and 32px min-height would grow the
+   first line box and push the text below its leading icon. */
+button.notif-link {
+	display: inline;
+	min-height: 0;
+}
 /* The desktop-notifications switch under the entries; .notify-toggle hides it on coarse pointers. */
 .inbox-foot {
 	margin-top: 12px;
