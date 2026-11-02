@@ -1712,31 +1712,32 @@ export function createApp(deps: AppDeps) {
 						keptHeld += 1;
 						if (now - t.updatedAt > days * 86_400_000) keptStale += 1;
 					}
-					if (t.cancelledAt === null) {
-						const {
-							details: _details,
-							report: _report,
-							diffFiles: _diffFiles,
-							diffText: _diffText,
-							...card
-						} = t;
-						const progress = deps.progressOf?.(e.store.name, t.id);
-						const silent = silentSince(t, e.store.logPath(t.id), now);
-						tasks.push({
-							...card,
-							sessionTitle: e.store.frozenTitle(t),
-							answered:
-								t.stage === "done" &&
-								!isRetro(t) &&
-								answeredCard(e.store.listTurns(t.id)),
-							// A default card pins no model; the chip states what the last run actually used.
-							...(t.model === null
-								? { lastModel: e.store.lastTurnModel(t.id) }
-								: {}),
-							...(progress ? { progress } : {}),
-							...(silent !== null ? { silentSince: silent } : {}),
-						});
-					}
+					// Cancelled cards ride in the list too: the done lane shows them with a
+					// "Cancelled" chip. Every counter (slots, alarms, holds, coverage) either
+					// filters cancelledAt or reads state/stage facts a cancelled card no longer has.
+					const {
+						details: _details,
+						report: _report,
+						diffFiles: _diffFiles,
+						diffText: _diffText,
+						...card
+					} = t;
+					const progress = deps.progressOf?.(e.store.name, t.id);
+					const silent = silentSince(t, e.store.logPath(t.id), now);
+					tasks.push({
+						...card,
+						sessionTitle: e.store.frozenTitle(t),
+						answered:
+							t.stage === "done" &&
+							!isRetro(t) &&
+							answeredCard(e.store.listTurns(t.id)),
+						// A default card pins no model; the chip states what the last run actually used.
+						...(t.model === null
+							? { lastModel: e.store.lastTurnModel(t.id) }
+							: {}),
+						...(progress ? { progress } : {}),
+						...(silent !== null ? { silentSince: silent } : {}),
+					});
 				}
 			} catch (err) {
 				// A sick store skips its own cards; the rest of the board still renders.

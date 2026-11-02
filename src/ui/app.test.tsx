@@ -20,6 +20,7 @@ const {
 	triageWait,
 	WarningLines,
 	doneTopicPages,
+	cancelledTopic,
 	recommendsSteps,
 	serverLine,
 	workerNote,
@@ -1115,6 +1116,7 @@ describe("Drawer approve button", () => {
 		sessionsDir: "/tmp/proj/.tasks/sessions",
 		settings: {},
 	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
 	const drawerFields = {
 		kind: "work",
 		research: false,
@@ -1168,5 +1170,229 @@ describe("Drawer approve button", () => {
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).not.toContain("Approve merge");
+	});
+});
+
+describe("cancelled cards on the board", () => {
+	const base = {
+		projectTasks: [] as TaskCard[],
+		groups: null,
+		collapsed: {},
+		onToggle: () => {},
+		hasRules: true,
+		github: null,
+		deltas: new Map<string, number>(),
+		open: () => {},
+		unread: () => false,
+		onReorder: async () => {},
+		filtering: false,
+		draining: false,
+	} as const;
+
+	test("a cancelled done card wears the Cancelled chip with its cancel time", () => {
+		const dead = cardFixture({
+			id: "d1",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1760000000000,
+			answered: true,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[dead]} more={0} />,
+		);
+		expect(html).toContain('data-cancelled=""');
+		expect(html).toContain('class="cancelled"');
+		// The chip keeps the word and a relative cancel time; the exact stamp is its title.
+		expect(html).toContain("Cancelled · ");
+		expect(html).toContain('title="Cancelled ');
+		// The status word says cancelled, and the final answer earns no unread badge.
+		expect(html).toContain("· cancelled");
+		expect(html).not.toContain('class="unread"');
+	});
+
+	test("a cancelled card never joins the Starred section or the Unread lane", () => {
+		const deadStar = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 5,
+			starred: true,
+			research: true,
+		});
+		const html = renderToStaticMarkup(
+			// The unread callback answers true, like a stale seen set would: the cancelled
+			// card must still stay out of both pinned sections.
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[deadStar]}
+				unread={() => true}
+				more={0}
+			/>,
+		);
+		expect(html).not.toContain("Unread");
+		expect(html).not.toContain("Starred");
+		expect(html).toContain('data-task-id="s1"');
+	});
+
+	test("the topic view lists cancelled cards in a Cancelled section, outside every topic", () => {
+		const done = cardFixture({
+			id: "t1",
+			stage: "done",
+			state: "idle",
+			topic: "Cut",
+		});
+		const dead = cardFixture({
+			id: "d1",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1000,
+		});
+		const groups = [
+			...doneTopicPages([done], new Map()),
+			...cancelledTopic([done, dead], new Map()),
+		];
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[done, dead]}
+				groups={groups}
+				onTopicMore={() => {}}
+			/>,
+		);
+		expect(html).toContain("Cut");
+		// The cancelled card's null topic must not open an Everything else section.
+		expect(html).not.toContain("Everything else");
+		expect(html).toContain('data-task-id="d1"');
+		// Both sections count their own card only.
+		expect(html.match(/>1\/1<\/span>/g)?.length).toBe(2);
+	});
+
+	test("cancelledTopic pages its section and stays empty without cancelled cards", () => {
+		const dead = cardFixture({
+			id: "d1",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1000,
+		});
+		const fresh = cardFixture({ id: "t1", stage: "done", state: "idle" });
+		expect(cancelledTopic([fresh], new Map())).toEqual([]);
+		const page = cancelledTopic([dead], new Map());
+		expect(page).toHaveLength(1);
+		expect(page[0]!.key).toBe("__cancelled");
+		expect(page[0]!.label).toBe("Cancelled");
+		expect(page[0]!.tasks.map((t) => t.id)).toEqual(["d1"]);
+		// A grown limit stops the paging: no hidden cards, no Show more.
+		const grown = cancelledTopic([dead], new Map([["__cancelled", 40]]));
+		expect(grown[0]!.hidden).toBe(0);
+	});
+
+	test("a cancelled update card covers nothing, so its rows stay actionable", () => {
+		// The same updateIds sets the updates panel's Skip button and the inbox entry read.
+		const open = cardFixture({
+			id: "u-open",
+			stage: "in_progress",
+			state: "running",
+			updateIds: ["u1", "u2"],
+		});
+		const dead = cardFixture({
+			id: "u-dead",
+			stage: "in_progress",
+			state: "idle",
+			cancelledAt: 5,
+			updateIds: ["u2", "u3"],
+		});
+		const done = cardFixture({
+			id: "u-done",
+			stage: "done",
+			state: "idle",
+			updateIds: ["u4"],
+		});
+		const covered = coveredUpdateIds([open, dead, done]);
+		// The cancelled card's u2 does not steal the open card's coverage, and u3 stays free.
+		expect(covered.get("u1")?.id).toBe("u-open");
+		expect(covered.get("u2")?.id).toBe("u-open");
+		expect(covered.has("u3")).toBe(false);
+		// A done card covers nothing either: its rows are pending again.
+		expect(covered.has("u4")).toBe(false);
+	});
+});
+
+describe("Drawer of a cancelled card opens read-only", () => {
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("a cancelled done card keeps its story and loses every action", () => {
+		const dead = cardFixture({
+			...drawerFields,
+			id: "D-1",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1760000000000,
+			prompt: "the original ask, kept readable",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={dead} />);
+		// Read-only does not mean blind: prompt, cancel stamp, summary and log stay.
+		expect(html).toContain("the original ask, kept readable");
+		expect(html).toContain("cancelled");
+		expect(html).toContain('class="turns"');
+		// No action button survives: follow-up, cancel/delete, unread flip.
+		expect(html).not.toContain("Follow up");
+		expect(html).not.toContain("Implement recommendations");
+		expect(html).not.toContain("Cancel task");
+		expect(html).not.toContain("Delete task");
+		expect(html).not.toContain("Mark unread");
+		expect(html).not.toContain("Merge anyway");
+	});
+
+	test("a cancelled non-done card hides triage, editing and the cancel button", () => {
+		const dead = cardFixture({
+			...drawerFields,
+			id: "D-2",
+			stage: "in_progress",
+			state: "idle",
+			cancelledAt: 1760000000000,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={dead} />);
+		expect(html).not.toContain("drawer-triage");
+		expect(html).not.toContain("Cancel task");
+		// The reply and steer forms key off state needs_you/running; idle shows none.
+		expect(html).not.toContain('id="drawer-reply"');
+		expect(html).not.toContain('label="Steer"');
 	});
 });

@@ -14,6 +14,7 @@ import {
 const t = (
 	overrides: Partial<Parameters<typeof statusLine>[0]> = {},
 ): Parameters<typeof statusLine>[0] => ({
+	cancelledAt: null,
 	state: "queued",
 	stage: "todo",
 	needsReason: null,
@@ -125,6 +126,17 @@ test("cardMark: only a done card earns the check; a parked release waits", () =>
 	expect(cardMark(t({ state: "needs_you", asked: [] }))).toBe("asked");
 	expect(cardMark(t({ state: "needs_you" }))).toBe("needs");
 	expect(cardMark(t({ state: "preparing" }))).toBe("preparing");
+});
+
+test("statusLine and cardMark word a cancelled card", () => {
+	// The cancel leaves state idle and the old stage; both word it as cancelled.
+	const dead = t({ cancelledAt: 5, state: "idle", stage: "in_progress" });
+	expect(statusLine(dead, false)).toBe("cancelled");
+	expect(cardMark(dead)).toBe("cancelled");
+	// A cancelled done card too: never the plain "done" word or the check.
+	const deadDone = t({ cancelledAt: 5, state: "idle", stage: "done" });
+	expect(statusLine(deadDone, false)).toBe("cancelled");
+	expect(cardMark(deadDone)).toBe("cancelled");
 });
 
 const card = (over: Partial<TaskCard>): TaskCard =>

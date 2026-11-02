@@ -48,6 +48,7 @@ export function strykerStats(rest: string): Array<{
 export function statusLine(
 	t: Pick<
 		TaskCard,
+		| "cancelledAt"
 		| "state"
 		| "stage"
 		| "needsReason"
@@ -61,6 +62,8 @@ export function statusLine(
 	/** True while an update holds new turns (POST /api/drain): every queued card waits for the restart. */
 	drain = false,
 ): string {
+	// A cancelled card is final; the card's "Cancelled" chip carries the time.
+	if (t.cancelledAt !== null) return "cancelled";
 	// A queued card that keeps a reason was queued again by the tracker (restart, background-job exit).
 	if (t.state === "queued")
 		return t.stage === "backlog"
@@ -95,10 +98,18 @@ export function statusLine(
 }
 
 /** The card's state mark. A card idle short of done (a review parked while its findings land)
- * waits like a queued one: only a done card earns the check. */
+ * waits like a queued one: only a done card earns the check; a cancelled card earns the x. */
 export function cardMark(
-	t: Pick<Task, "state" | "stage" | "asked">,
-): "needs" | "asked" | "running" | "preparing" | "queued" | "done" {
+	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked">,
+):
+	| "needs"
+	| "asked"
+	| "running"
+	| "preparing"
+	| "queued"
+	| "done"
+	| "cancelled" {
+	if (t.cancelledAt !== null) return "cancelled";
 	if (t.state === "needs_you") return t.asked !== null ? "asked" : "needs";
 	if (t.state === "running" || t.state === "preparing") return t.state;
 	return t.state === "queued" || t.stage !== "done" ? "queued" : "done";

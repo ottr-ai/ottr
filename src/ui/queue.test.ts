@@ -3,10 +3,12 @@ import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
 	donePage,
 	dropBeforeId,
+	isUnread,
 	laneCounts,
 	laneOrder,
 	laneStage,
 	reorderIds,
+	seenable,
 	slotUse,
 	spliceColumn,
 } from "./queue.ts";
@@ -31,6 +33,7 @@ const card = (
 			| "sessionTitle"
 			| "prompt"
 			| "summary"
+			| "cancelledAt"
 			| "asked"
 			| "answered"
 			| "kind"
@@ -40,6 +43,7 @@ const card = (
 	id,
 	stage,
 	state,
+	cancelledAt: over.cancelledAt ?? null,
 	title: over.title ?? `Task ${id}`,
 	sessionTitle: over.sessionTitle ?? "",
 	prompt: over.prompt ?? "",
@@ -133,10 +137,71 @@ test("laneCounts counts a backlog card under counts.backlog", () => {
 	expect(filtered.counts.todo.shown).toBe(0);
 });
 
+test("laneStage parks a cancelled card in the done lane, whatever its old stage", () => {
+	expect(
+		laneStage({ stage: "in_progress", state: "idle", cancelledAt: 5 }),
+	).toBe("done");
+	expect(laneStage({ stage: "merging", state: "idle", cancelledAt: 5 })).toBe(
+		"done",
+	);
+	expect(laneStage({ stage: "backlog", state: "idle", cancelledAt: 5 })).toBe(
+		"done",
+	);
+	expect(laneStage({ stage: "done", state: "idle", cancelledAt: 5 })).toBe(
+		"done",
+	);
+});
+
+test("a cancelled card counts in no lane total but the done one, and never as fresh", () => {
+	const tasks = [
+		card("live", "in_progress", "running"),
+		card("dead", "in_progress", "idle", { cancelledAt: 5, answered: true }),
+	];
+	const { shown, counts } = laneCounts(tasks, "", new Set());
+	// The live card keeps its lane; the cancelled one rides with done only.
+	expect(counts.in_progress.total).toBe(1);
+	expect(counts.done.total).toBe(1);
+	// An answer on a cancelled card is final: no unread badge, no alarm.
+	expect(counts.done.fresh).toBe(0);
+	expect(counts.in_progress.waiting).toBe(0);
+	expect(shown).toHaveLength(2);
+});
+
+test("a cancelled card is never seenable, so never unread", () => {
+	const dead = card("dead", "done", "idle", { cancelledAt: 5, answered: true });
+	expect(seenable(dead)).toBe(false);
+	expect(isUnread(dead, new Set())).toBe(false);
+	// The live twin keeps its badge behavior.
+	const live = card("live", "done", "idle", { answered: true });
+	expect(seenable(live)).toBe(true);
+	expect(isUnread(live, new Set())).toBe(true);
+});
+
+test("slotUse frees the slot of a cancelled running card", () => {
+	expect(
+		slotUse([
+			{ stage: "in_progress", state: "running", cancelledAt: 5 },
+			{ stage: "merging", state: "running", cancelledAt: null },
+		]),
+	).toEqual({ todo: 0, in_progress: 0, merging: 1 });
+});
+
 test("laneStage moves a started backlog card into the todo flow", () => {
-	const parked = { stage: "backlog", state: "idle" } as const;
-	const running = { stage: "backlog", state: "running" } as const;
-	const waiting = { stage: "backlog", state: "needs_you" } as const;
+	const parked = {
+		stage: "backlog",
+		state: "idle",
+		cancelledAt: null,
+	} as const;
+	const running = {
+		stage: "backlog",
+		state: "running",
+		cancelledAt: null,
+	} as const;
+	const waiting = {
+		stage: "backlog",
+		state: "needs_you",
+		cancelledAt: null,
+	} as const;
 	expect(laneStage(parked)).toBe("backlog");
 	expect(laneStage(running)).toBe("todo");
 	expect(laneStage(waiting)).toBe("todo");

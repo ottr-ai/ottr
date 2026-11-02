@@ -351,7 +351,8 @@ type MarkKind =
 	| "running"
 	| "preparing"
 	| "queued"
-	| "done";
+	| "done"
+	| "cancelled";
 
 // Redundant state coding (ISA-101): shape carries the state; colour is spent only on alarms (amber, red).
 // Ask rounds are the exception: the question mark rides the steel accent — input requested, not a stall.
@@ -389,6 +390,8 @@ const MARK_SHAPES: Record<MarkKind, ReactNode> = {
 	preparing: <circle cx="8" cy="8" r="4.5" />,
 	queued: <circle cx="8" cy="8" r="4" />,
 	done: <path d="M3.2 8.4l3.1 3.1 6.5-7" />,
+	// A cancelled card: the x closes the story; the "Cancelled" chip beside it carries the word.
+	cancelled: <path d="M4.6 4.6l6.8 6.8M11.4 4.6l-6.8 6.8" />,
 };
 
 export function Mark({ kind }: { kind: MarkKind }) {

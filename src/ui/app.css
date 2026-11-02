@@ -427,6 +427,12 @@ textarea {
 	stroke-linecap: round;
 	stroke-linejoin: round;
 }
+.mark-cancelled {
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.8;
+	stroke-linecap: round;
+}
 /* A new alarm arrives once, like an unacknowledged HMI alarm; it never blinks. */
 .card .mark-needs,
 .area-ind .mark-needs,
@@ -1951,6 +1957,22 @@ a.release:hover {
 /* Research chip: same shape as the .model chip, muted to read as metadata. Right-aligned
    on the head line, the way .model right-aligns the meta line. */
 .card .research {
+	flex-shrink: 0;
+	margin-left: auto;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	line-height: 18px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--dim); /* at least 4.5:1 on --card */
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+
+/* Cancelled chip: the research chip's metadata shape; the text label carries the fact
+   (WCAG 2.1 AA: never color alone), the title holds the exact cancel stamp. */
+.card .cancelled {
 	flex-shrink: 0;
 	margin-left: auto;
 	padding: 0 6px;

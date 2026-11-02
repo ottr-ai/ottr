@@ -632,6 +632,21 @@ describe("task routes", () => {
 		expect(card.lastModel).toBe("zai/glm-5.3-flash");
 	});
 
+	test("state lists a cancelled card with its cancelledAt", async () => {
+		const t = store.createTask("cancelled card stays visible");
+		store.updateTask(t.id, { cancelledAt: 1760000000000, state: "idle" });
+		const res = await get("/api/state");
+		const b = (await res.json()) as {
+			tasks: Array<{ id: string; cancelledAt: number | null; state: string }>;
+		};
+		const card = b.tasks.find((c) => c.id === t.id);
+		if (card === undefined) {
+			expect.unreachable("cancelled card missing from the state task list");
+		}
+		expect(card.cancelledAt).toBe(1760000000000);
+		expect(card.state).toBe("idle");
+	});
+
 	test("edit persists a new prompt on a todo task and rejects bad ids", async () => {
 		const created = store.createTask("first draft");
 		const res = await post(`/api/projects/p1/tasks/${created.id}/edit`, {

@@ -573,6 +573,7 @@ function Card({
 			data-state={task.state}
 			data-task-id={task.id}
 			data-stage={task.stage}
+			data-cancelled={task.cancelledAt !== null ? "" : undefined}
 			data-asked={
 				task.state === "needs_you" && task.asked !== null ? "" : undefined
 			}
@@ -617,6 +618,14 @@ function Card({
 							research
 						</span>
 					)}
+					{task.cancelledAt !== null && (
+						<span
+							className="cancelled"
+							title={`Cancelled ${stamp(task.cancelledAt)}`}
+						>
+							Cancelled · {landed(task.cancelledAt)}
+						</span>
+					)}
 					<RankBadges task={task} />
 				</span>
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
@@ -652,14 +661,17 @@ function Card({
 				<span
 					className="card-meta"
 					title={stamp(
-						task.stage === "done" && task.doneAt !== null
-							? task.doneAt
-							: task.createdAt,
+						task.cancelledAt ??
+							(task.stage === "done" && task.doneAt !== null
+								? task.doneAt
+								: task.createdAt),
 					)}
 				>
-					{task.stage === "done" && task.doneAt !== null
-						? landed(task.doneAt)
-						: age(task.createdAt)}{" "}
+					{task.cancelledAt !== null
+						? landed(task.cancelledAt)
+						: task.stage === "done" && task.doneAt !== null
+							? landed(task.doneAt)
+							: age(task.createdAt)}{" "}
 					{sp === null && <>· {statusLine(task, hasRules, hold, drain)}</>}
 					{task.stage !== "done" && (
 						<span
@@ -2177,9 +2189,11 @@ const EXPLAIN_PROJECT =
 /** Done lane page size: the cards shown before "Show more", and the step each click adds. */
 const DONE_PAGE = 20;
 
-/** Done order: latest landing first. doneAt stamps each entry into Done (the done clock). */
+/** Done order: latest landing first. doneAt stamps each entry into Done (the done clock);
+ * a cancelled card orders by its cancel time. */
 const newestLanded = (a: TaskCard, b: TaskCard): number =>
-	(b.doneAt ?? b.updatedAt) - (a.doneAt ?? a.updatedAt);
+	(b.cancelledAt ?? b.doneAt ?? b.updatedAt) -
+	(a.cancelledAt ?? a.doneAt ?? a.updatedAt);
 
 /** The done lane's topic view: every topic, each cut to its newest page. `limits` holds the
  * page size of each topic its "Show more" grew; other topics show DONE_PAGE cards. */
@@ -2197,6 +2211,37 @@ export function doneTopicPages(
 		);
 		return { ...g, tasks: page.shown, hidden: page.hidden };
 	});
+}
+
+/** Section key of the done lane's cancelled section (topic view). No real topic key starts
+ * with "__" (keys are lowercased topic text), so a topic can never share this section's
+ * collapse or page state. */
+export const CANCELLED_KEY = "__cancelled";
+
+/** The done lane's cancelled section (topic view): every cancelled card, newest cancel
+ * first, paged like a topic under its own "Show more". Cancelled cards stay out of the
+ * topic groups, so no topic count includes them. Empty while nothing is cancelled. */
+export function cancelledTopic(
+	tasks: TaskCard[],
+	limits: ReadonlyMap<string, number>,
+): { key: string; label: string; tasks: TaskCard[]; hidden: number }[] {
+	const cancelled = tasks
+		.filter((t) => t.cancelledAt !== null)
+		.sort(newestLanded);
+	if (cancelled.length === 0) return [];
+	const page = donePage(
+		cancelled,
+		() => false,
+		limits.get(CANCELLED_KEY) ?? DONE_PAGE,
+	);
+	return [
+		{
+			key: CANCELLED_KEY,
+			label: "Cancelled",
+			tasks: page.shown,
+			hidden: page.hidden,
+		},
+	];
 }
 
 /** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
@@ -2602,18 +2647,25 @@ function ProjectBoard({
 					// instead if boards grow into the thousands of done cards.
 					let doneHidden = 0;
 					// Empty search only: the done lane groups into topic sections under sticky heads,
-					// every topic loaded and each one paged by its own "Show more".
+					// every topic loaded and each one paged by its own "Show more". Cancelled cards
+					// stay out of every topic (no topic count includes one) and ride in their own
+					// trailing "Cancelled" section, paged like a topic.
 					const doneGroups =
 						c.key === "done" && q === "" && grouped
-							? doneTopicPages(
-									col.filter((t) => !unread(t) && !t.starred),
-									topicLimits,
-								)
+							? [
+									...doneTopicPages(
+										col.filter(
+											(t) => t.cancelledAt === null && !unread(t) && !t.starred,
+										),
+										topicLimits,
+									),
+									...cancelledTopic(col, topicLimits),
+								]
 							: null;
 					if (c.key === "done" && q === "" && !grouped) {
 						const page = donePage(
 							col,
-							(t) => unread(t) || t.starred,
+							(t) => unread(t) || (t.starred && t.cancelledAt === null),
 							doneLimit,
 						);
 						col = page.shown;
@@ -3711,11 +3763,19 @@ export function LaneCol({
 			}
 		/>
 	);
-	// Done lane: unseen answers pin above a divider; read cards keep landing order (stable partition).
-	const fresh = stage === "done" ? tasks.filter((t) => unread(t)) : [];
-	// Done lane: starred research cards get their own collapsible section; unread wins over starred.
+	// Done lane: unseen answers pin above a divider; read cards keep landing order (stable
+	// partition). A cancelled card never pins: its answer is final.
+	const fresh =
+		stage === "done"
+			? tasks.filter((t) => t.cancelledAt === null && unread(t))
+			: [];
+	// Done lane: starred research cards get their own collapsible section; unread wins over
+	// starred. A cancelled card never lands here: it pages in the main list (flat view) or
+	// the trailing "Cancelled" section (topic view).
 	const starred =
-		stage === "done" ? tasks.filter((t) => t.starred && !unread(t)) : [];
+		stage === "done"
+			? tasks.filter((t) => t.cancelledAt === null && t.starred && !unread(t))
+			: [];
 	return (
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop target for queued cards; keyboard users act through the card buttons
 		<div
@@ -3882,7 +3942,7 @@ export function LaneCol({
 						);
 					})
 				: tasks
-						.filter((t) => !unread(t) && !t.starred)
+						.filter((t) => t.cancelledAt !== null || (!unread(t) && !t.starred))
 						.flatMap((t) => [
 							// The spinner slot stands in for the card while its reorder request is in flight.
 							pending?.before === t.id ? slot : null,
@@ -5691,8 +5751,10 @@ export function Drawer({
 	const diffFiles = task.diffFiles ?? [];
 	const diffPlus = diffFiles.reduce((n, f) => n + (f.plus ?? 0), 0);
 	const diffMinus = diffFiles.reduce((n, f) => n + (f.minus ?? 0), 0);
-	/** Done tasks answer with a follow-up task (handoff + fresh session) instead of a reply. */
-	const followUp = task.stage === "done";
+	/** Done tasks answer with a follow-up task (handoff + fresh session) instead of a reply.
+	 * A cancelled card's drawer is read-only: no follow-up, no edit, no action. */
+	const cancelled = task.cancelledAt !== null;
+	const followUp = task.stage === "done" && !cancelled;
 	// Ask round live right now: drives the accent status word, mark and panel tint (stalls stay amber).
 	const askedNow = task.state === "needs_you" && task.asked !== null;
 	// Live mutation run on a running card: the same parse the board card's meter row uses.
@@ -5746,6 +5808,7 @@ export function Drawer({
 	/** Release cards show the notes section; only needs_you and not-yet-published idle ones may edit. */
 	const notesEditable =
 		task.releaseVersion !== null &&
+		!cancelled &&
 		(task.state === "needs_you" ||
 			(task.state === "idle" && task.stage !== "done"));
 	const notesSubmit = (mode: "save" | "append"): void => {
@@ -5767,7 +5830,8 @@ export function Drawer({
 	};
 	// Non-null while the prompt editor is open; only unstarted todo tasks get one.
 	const [edit, setEdit] = useState<string | null>(null);
-	const editable = task.stage === "todo" && task.turns.length === 0;
+	const editable =
+		task.stage === "todo" && task.turns.length === 0 && !cancelled;
 	const editValid =
 		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
 	/** Done tasks lead with the implementation's report; the merge turn's integration output stays in its work step. */
@@ -5928,6 +5992,14 @@ export function Drawer({
 						>
 							created {stamp(task.createdAt)}
 						</span>
+						{task.cancelledAt !== null && (
+							<span
+								className="sub-dim"
+								title={new Date(task.cancelledAt).toLocaleString()}
+							>
+								cancelled {stamp(task.cancelledAt)}
+							</span>
+						)}
 						{task.stage === "done" && task.doneAt !== null && (
 							<span
 								className="sub-dim"
@@ -6759,8 +6831,9 @@ export function Drawer({
 					{/* Collapsible Triage between the turn tree and the Steer composer,
 					    collapsed by default: rank and close-candidate nomination are triage
 					    controls, not the card's story. Done tasks hide it entirely: the
-					    controls have no effect there. */}
-					{task.stage !== "done" && (
+					    controls have no effect there. A cancelled card hides it too: its
+					    drawer is read-only. */}
+					{task.stage !== "done" && !cancelled && (
 						<DrawerSec id="drawer-triage" label="Triage" defaultOpen={false}>
 							<div className="triage-row">
 								<label className="triage-rank">
@@ -7055,26 +7128,28 @@ export function Drawer({
 
 					{/* The actions row (Cancel task and stage-specific actions) sits between the steer form and meta. */}
 					<div className="drawer-actions">
-						{task.stage === "backlog" && task.state === "idle" && (
-							<>
-								<button
-									type="button"
-									title="Asks rounds of questions to refine the idea before it runs"
-									onClick={() => setPick("grill")}
-								>
-									<Icon name="send" />
-									Grill with the agent
-								</button>
-								<button
-									type="button"
-									title="Puts the card in the todo lane so the agent can start it"
-									onClick={() => setPick("todo")}
-								>
-									<Icon name="plus" />
-									Move to todo
-								</button>
-							</>
-						)}
+						{task.stage === "backlog" &&
+							task.state === "idle" &&
+							!cancelled && (
+								<>
+									<button
+										type="button"
+										title="Asks rounds of questions to refine the idea before it runs"
+										onClick={() => setPick("grill")}
+									>
+										<Icon name="send" />
+										Grill with the agent
+									</button>
+									<button
+										type="button"
+										title="Puts the card in the todo lane so the agent can start it"
+										onClick={() => setPick("todo")}
+									>
+										<Icon name="plus" />
+										Move to todo
+									</button>
+								</>
+							)}
 						{task.stage === "todo" &&
 							task.state === "queued" &&
 							task.pendingPrompt === null && (
@@ -7093,7 +7168,7 @@ export function Drawer({
 									Not ready — park in backlog
 								</BusyButton>
 							)}
-						{task.stage === "done" && read && (
+						{task.stage === "done" && read && !cancelled && (
 							<BusyButton
 								title="Puts the new badge back on this card: it counts as not opened again"
 								run={async () => {
@@ -7105,7 +7180,7 @@ export function Drawer({
 								Mark unread
 							</BusyButton>
 						)}
-						{task.stage === "done" && task.research && (
+						{task.stage === "done" && task.research && !cancelled && (
 							<BusyButton
 								title={
 									task.starred
@@ -7125,38 +7200,42 @@ export function Drawer({
 								{task.starred ? "Starred" : "Star"}
 							</BusyButton>
 						)}
-						<BusyButton
-							className="danger"
-							run={() =>
-								(
-									task.stage === "done"
-										? // A done task has no run, worktree or branch left; this only removes the card from the board.
-											window.confirm("Delete this done task from the board?")
-										: window.confirm(
-												"Cancel this task? It stops the run and deletes its worktree and branch.",
-											)
-								)
-									? act(async () => {
-											const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
-											const r = await post<{ kept?: string }>(url, {});
-											// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
-											if (r.kept !== undefined) {
-												if (
-													!window.confirm(
-														`The worktree was kept: ${r.kept}.\n\nDelete the worktree and its branch anyway?`,
-													)
+						{/* A cancelled card is final: its drawer is read-only, so the delete
+						    action goes too (an uncancel does not exist). */}
+						{!cancelled && (
+							<BusyButton
+								className="danger"
+								run={() =>
+									(
+										task.stage === "done"
+											? // A done task has no run, worktree or branch left; this only removes the card from the board.
+												window.confirm("Delete this done task from the board?")
+											: window.confirm(
+													"Cancel this task? It stops the run and deletes its worktree and branch.",
 												)
-													return;
-												await post(url, { force: true });
-											}
-											onClose();
-										})
-									: Promise.resolve(true)
-							}
-						>
-							<Icon name={task.stage === "done" ? "trash" : "x"} />
-							{task.stage === "done" ? "Delete task" : "Cancel task"}
-						</BusyButton>
+									)
+										? act(async () => {
+												const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
+												const r = await post<{ kept?: string }>(url, {});
+												// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
+												if (r.kept !== undefined) {
+													if (
+														!window.confirm(
+															`The worktree was kept: ${r.kept}.\n\nDelete the worktree and its branch anyway?`,
+														)
+													)
+														return;
+													await post(url, { force: true });
+												}
+												onClose();
+											})
+										: Promise.resolve(true)
+								}
+							>
+								<Icon name={task.stage === "done" ? "trash" : "x"} />
+								{task.stage === "done" ? "Delete task" : "Cancel task"}
+							</BusyButton>
+						)}
 					</div>
 
 					{/* The meta section is the drawer's last element: it sits below everything else. */}
@@ -7168,7 +7247,7 @@ export function Drawer({
 									<dt>Research</dt>
 									<dd>
 										yes
-										{task.state !== "running" && (
+										{task.state !== "running" && !cancelled && (
 											<button
 												type="button"
 												className="unmark-research"
@@ -7330,14 +7409,17 @@ export function Drawer({
 					onClose={() => setDiffView(undefined)}
 				/>
 			)}
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			<FollowUpDialog
-				task={task}
-				open={followOpen}
-				onClose={() => setFollowOpen(false)}
-				act={act}
-				onFollowed={onFollowed}
-			/>
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both.
+			    A cancelled card's drawer is read-only: it never opens a follow-up. */}
+			{!cancelled && (
+				<FollowUpDialog
+					task={task}
+					open={followOpen}
+					onClose={() => setFollowOpen(false)}
+					act={act}
+					onFollowed={onFollowed}
+				/>
+			)}
 		</>
 	);
 }
@@ -7580,9 +7662,11 @@ function AreasNav({
 					const needs = split.needs.length;
 					const asks = split.asks.length;
 					const running = split.running.length;
-					// Same filter as queueOrder (StateResponse.tasks never carries cancelled cards).
-					// Queued and running/preparing are exclusive states, so no card counts in two
-					// badges; Merging cards appear in none (the Merging lane and Agents meter cover them).
+					// StateResponse.tasks carries cancelled cards too, but a cancel leaves the
+					// row state "idle": none of the splits below (needs_you, running, queued)
+					// counts one. Queued and running/preparing are exclusive states, so no card
+					// counts in two badges; Merging cards appear in none (the Merging lane and
+					// Agents meter cover them).
 					const waiting = own.filter((t) => t.state === "queued").length;
 					return (
 						<li key={p.name}>

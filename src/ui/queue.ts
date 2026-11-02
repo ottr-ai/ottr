@@ -11,19 +11,25 @@ type LaneTask = Pick<
 	| "summary"
 	| "stage"
 	| "state"
+	| "cancelledAt"
 	| "asked"
 	| "answered"
 	| "kind"
 >;
 
-/** Cards a read mark can stick to: answered question cards and PR review cards. */
-export function seenable(t: Pick<TaskCard, "answered" | "kind">): boolean {
-	return t.answered === true || t.kind === "pr_review";
+/** Cards a read mark can stick to: answered question cards and PR review cards. A cancelled
+ * card is final: no read mark, no unread badge (the server's seenableIds drops it too). */
+export function seenable(
+	t: Pick<TaskCard, "answered" | "cancelledAt" | "kind">,
+): boolean {
+	return (
+		t.cancelledAt === null && (t.answered === true || t.kind === "pr_review")
+	);
 }
 
 /** Unread: has something to read and no read mark yet. */
 export function isUnread(
-	t: Pick<TaskCard, "id" | "answered" | "kind">,
+	t: Pick<TaskCard, "id" | "answered" | "cancelledAt" | "kind">,
 	seen: ReadonlySet<string>,
 ): boolean {
 	return seenable(t) && !seen.has(t.id);
@@ -51,8 +57,12 @@ export type LaneCount = {
 	alarm: "needs" | "asked" | null;
 };
 
-/** The lane a card shows in: a kicked backlog card (grill session queued/running/needs_you) joins the todo flow; the backlog row keeps parked ideas only. */
-export function laneStage(t: Pick<Task, "stage" | "state">): Stage {
+/** The lane a card shows in: a kicked backlog card (grill session queued/running/needs_you) joins the todo flow; the backlog row keeps parked ideas only.
+ * A cancelled card settles in the done lane with its "Cancelled" chip; no other lane shows it. */
+export function laneStage(
+	t: Pick<Task, "cancelledAt" | "stage" | "state">,
+): Stage {
+	if (t.cancelledAt !== null) return "done";
 	return t.stage === "backlog" && t.state !== "idle" ? "todo" : t.stage;
 }
 
