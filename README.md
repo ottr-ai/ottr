@@ -166,6 +166,8 @@ Podman runs the stack too, with four differences:
 - podman-compose cannot parse Windows paths in volume mounts (`C:\...`). Either use Docker Compose v2 as the provider, or give the Podman machine's paths: `OTTR_OAUTH_DIR=/mnt/c/Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=/mnt/c/Users/<you>/.omp/ottr-agent.db`.
 - The default Podman machine has 2 GiB of RAM, and the server and each worker may use up to 8 GiB. Raise it: `podman machine stop; podman machine set --memory 16384; podman machine start`.
 
+Podman Desktop shows no containers, or the board times out after you recreate the stack? See [docs/WORKERS.md, Troubleshooting](docs/WORKERS.md#troubleshooting).
+
 ### After the first start
 
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
