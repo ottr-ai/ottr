@@ -1416,7 +1416,7 @@ export function createApp(deps: AppDeps) {
 	// wins at every boot, and a saved null clears the seed until the next boot. The key
 	// never reaches a log or a view: alateView reports keySet only.
 	if (alate.url === null) {
-		const seedUrl = process.env.ALATED_URL?.trim();
+		const seedUrl = process.env.ALATE_URL?.trim();
 		if (seedUrl) alate.url = seedUrl.replace(/\/+$/, "");
 	}
 	if (alate.key === null) {

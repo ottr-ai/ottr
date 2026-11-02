@@ -2131,7 +2131,7 @@ describe("alate routes", () => {
 // env at the next boot.
 describe("alate env seeding", () => {
 	const saved = {
-		ALATE_URL: process.env.ALATED_URL,
+		ALATE_URL: process.env.ALATE_URL,
 		ALATE_API_KEY: process.env.ALATE_API_KEY,
 	};
 	afterAll(() => {
@@ -2152,7 +2152,7 @@ describe("alate env seeding", () => {
 		});
 		try {
 			// Trailing slash: the seed stores the URL stripped, like a Settings save.
-			process.env.ALATED_URL = `${standIn.url.origin}/`;
+			process.env.ALATE_URL = `${standIn.url.origin}/`;
 			process.env.ALATE_API_KEY = "seed-key";
 			const m = mount();
 			expect(await (await m.call("/api/alate")).json()).toEqual({
@@ -2175,7 +2175,7 @@ describe("alate env seeding", () => {
 	});
 
 	test("a saved Settings value wins over the env seed at the next boot", async () => {
-		process.env.ALATED_URL = "http://alate:4570";
+		process.env.ALATE_URL = "http://alate:4570";
 		process.env.ALATE_API_KEY = "seed-key";
 		const m = mount();
 		await m.call("/api/alate", {
