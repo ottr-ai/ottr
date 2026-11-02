@@ -1007,9 +1007,10 @@ describe("Drawer parent chip", () => {
 		const html = renderToStaticMarkup(
 			<Drawer {...base} task={child} tasks={[parent]} />,
 		);
-		expect(html).toContain('class="fu-parent"');
-		expect(html).toContain("Follow-up of");
+		expect(html).toContain('class="lineage-row"');
+		expect(html).toContain("parent");
 		expect(html).toContain("Parent work");
+		expect(html).toContain('aria-current="true"');
 	});
 
 	test("a parent the state dropped (cancelled) keeps the chip on the bare id", () => {
@@ -1022,10 +1023,31 @@ describe("Drawer parent chip", () => {
 		const html = renderToStaticMarkup(
 			<Drawer {...base} task={child} tasks={[]} />,
 		);
-		expect(html).toContain("fu-parent-gone");
-		expect(html).toContain("Follow-up of");
+		expect(html).toContain("lineage-gone");
+		expect(html).toContain("Not on the board");
 		expect(html).toContain("P-9");
 		expect(html).toContain('title="P-9 is not on the board"');
+	});
+
+	test("follow-ups list oldest first, whatever order the state sends", () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const kid = (id: string, createdAt: number) =>
+			cardFixture({ id, followUpOf: "S-1", createdAt });
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={self}
+				tasks={[kid("K-3", 3000), kid("K-1", 1000), kid("K-2", 2000)]}
+			/>,
+		);
+		const at = (id: string) => html.indexOf(`>${id}<`);
+		expect(at("K-1")).toBeGreaterThan(at("S-1"));
+		expect(at("K-2")).toBeGreaterThan(at("K-1"));
+		expect(at("K-3")).toBeGreaterThan(at("K-2"));
+		// Parallel, not chained: all three hang in one branch under this card's row.
+		const branch = html.slice(html.indexOf('class="lineage-branch"'));
+		expect(html.indexOf('class="lineage-branch"')).toBeGreaterThan(at("S-1"));
+		for (const id of ["K-1", "K-2", "K-3"]) expect(branch).toContain(`>${id}<`);
 	});
 });
 

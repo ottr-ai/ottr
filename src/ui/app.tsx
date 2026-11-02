@@ -5661,7 +5661,10 @@ export function Drawer({
 		row.followUpOf === null
 			? null
 			: (tasks.find((t) => t.id === row.followUpOf) ?? null);
-	const kids = tasks.filter((t) => t.followUpOf === row.id);
+	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
+	const kids = tasks
+		.filter((t) => t.followUpOf === row.id)
+		.sort((a, b) => a.createdAt - b.createdAt);
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	const [reply, setReply] = useState("");
@@ -6067,45 +6070,95 @@ export function Drawer({
 							</dl>
 						</DrawerSec>
 					)}
-					{row.followUpOf !== null &&
-						(parent === null ? (
-							// The state no longer carries the parent (a cancelled card): the
-							// chip keeps the lineage on the bare id, inert like the card's.
-							<span
-								className="fu-parent fu-parent-gone"
-								title={`${row.followUpOf} is not on the board`}
-							>
-								<Icon name="corner-up-left" size={12} />
-								<span className="fu-parent-label">Follow-up of</span>
-								<span className="fu-parent-title">{row.followUpOf}</span>
-							</span>
-						) : (
-							<button
-								type="button"
-								className="fu-parent"
-								title={parent.sessionTitle ?? parent.title}
-								onClick={() => onOpenTask(parent.id)}
-							>
-								<Icon name="corner-up-left" size={12} />
-								<span className="fu-parent-label">Follow-up of</span>
-								<span className="fu-parent-title">{parent.id}</span>
-							</button>
-						))}
+					{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
+					    parallel, so they hang one level in off this card's node, each on its own elbow. */}
+					{(row.followUpOf !== null || kids.length > 0) && (
+						<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
+							<ol className="lineage-rail">
+								{row.followUpOf !== null &&
+									(parent === null ? (
+										// The state no longer carries the parent (a cancelled card): the
+										// row keeps the lineage on the bare id, inert like the card's.
+										<li className="lineage-gone">
+											<span
+												className="lineage-row"
+												title={`${row.followUpOf} is not on the board`}
+											>
+												<span className="lineage-key">{row.followUpOf}</span>
+												<span className="lineage-title">Not on the board</span>
+												<span className="lineage-tag">parent</span>
+											</span>
+										</li>
+									) : (
+										<li>
+											<button
+												type="button"
+												className="lineage-row"
+												title={parent.sessionTitle ?? parent.title}
+												onClick={() => onOpenTask(parent.id)}
+											>
+												<span className="lineage-key">{parent.id}</span>
+												<span className="lineage-title">
+													{parent.sessionTitle ?? parent.title}
+												</span>
+												<span className="lineage-tag">parent</span>
+											</button>
+										</li>
+									))}
+								<li className="lineage-self" aria-current="true">
+									<span className="lineage-row">
+										<span className="lineage-key">{row.id}</span>
+										<span className="lineage-title">
+											{row.sessionTitle ?? row.title}
+										</span>
+										<span className="lineage-tag">this card</span>
+									</span>
+									{kids.length > 0 && (
+										<ol className="lineage-branch" aria-label="Follow-ups">
+											{kids.map((k) => (
+												<li key={k.id}>
+													<button
+														type="button"
+														className="lineage-row"
+														title={k.sessionTitle ?? k.title}
+														onClick={() => onOpenTask(k.id)}
+													>
+														<span className="lineage-key">{k.id}</span>
+														<span className="lineage-title">
+															{k.sessionTitle ?? k.title}
+														</span>
+														<span
+															className={
+																k.state === "needs_you"
+																	? "st st-needs_you" +
+																		(k.asked !== null ? " st-asked" : "")
+																	: "st"
+															}
+														>
+															{/* Same alarm marks as the meta line: markup, not ::before. */}
+															{k.state === "needs_you" && (
+																<Mark kind={cardMark(k)} />
+															)}
+															{statusLine(
+																k,
+																project.hasRules,
+																holdFor(k, tasks),
+																draining,
+															)}
+														</span>
+													</button>
+												</li>
+											))}
+										</ol>
+									)}
+								</li>
+							</ol>
+						</DrawerSec>
+					)}
 					{waiting.length > 0 && (
 						<DrawerSec id="drawer-waiting" label="Waiting for">
 							<RelatedTasks
 								items={waiting}
-								project={project}
-								tasks={tasks}
-								onOpenTask={onOpenTask}
-								draining={draining}
-							/>
-						</DrawerSec>
-					)}
-					{kids.length > 0 && (
-						<DrawerSec id="drawer-follow-ups" label="Follow-ups">
-							<RelatedTasks
-								items={kids}
 								project={project}
 								tasks={tasks}
 								onOpenTask={onOpenTask}

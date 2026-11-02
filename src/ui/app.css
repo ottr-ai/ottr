@@ -3929,53 +3929,157 @@ dialog.drawer[open]::backdrop {
 	background: none;
 	color: var(--text-strong);
 }
-/* Parent lineage chip: the origin task as one quiet bordered chip. The title carries the
-   steel link colour (the only interaction colour); the label and glyph stay dim grey. */
-.fu-parent {
-	max-width: 100%;
-	margin: 8px 0 0;
-	padding: 3px 9px;
-	border-color: var(--line-soft);
+/* Drawer lineage rail: parent, this card and follow-ups as nodes on one 1px thread, inside a
+   .dsec section. Titles carry the steel link colour (the only interaction colour); keys and tags
+   stay dim grey; this card is the one filled node. */
+.lineage-rail {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+.lineage-rail li {
+	position: relative;
+	padding-left: 22px;
+}
+/* The thread runs from the first node's centre to the last node's centre. */
+.lineage-rail li::before {
+	content: "";
+	position: absolute;
+	left: 6px;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--line);
+}
+.lineage-rail li:first-child::before {
+	top: 50%;
+}
+.lineage-rail li:last-child::before {
+	bottom: 50%;
+}
+.lineage-rail li:only-child::before {
+	display: none;
+}
+.lineage-rail li::after {
+	content: "";
+	position: absolute;
+	left: 2px;
+	top: 50%;
+	width: 9px;
+	height: 9px;
+	margin-top: -4.5px;
+	box-sizing: border-box;
+	border: 1px solid var(--line-hover);
+	border-radius: 50%;
+	background: var(--well);
+}
+/* This card is always the rail's last item: its node and thread end at its own row (15px, half a
+   30px row), not at the middle of the item, which also holds the follow-up branch. */
+.lineage-rail .lineage-self::after {
+	top: 15px;
+	border-color: var(--accent);
+	background: var(--accent);
+}
+.lineage-rail > .lineage-self::before {
+	top: 0;
+	bottom: auto;
+	height: 15px;
+}
+.lineage-rail > .lineage-self:first-child::before {
+	display: none;
+}
+/* Follow-ups run in parallel: one level in, a shared stem from this card's node, one elbow each. */
+.lineage-branch {
+	position: relative;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+.lineage-branch::before {
+	content: "";
+	position: absolute;
+	left: -16px;
+	top: -15px;
+	width: 1px;
+	height: 15px;
+	background: var(--line);
+}
+.lineage-rail .lineage-branch li::before {
+	display: block;
+	left: -16px;
+	top: 0;
+	bottom: 0;
+}
+.lineage-rail .lineage-branch li:last-child::before {
+	bottom: 50%;
+}
+.lineage-branch li > .lineage-row::before {
+	content: "";
+	position: absolute;
+	left: -16px;
+	top: 50%;
+	width: 18px;
+	height: 1px;
+	background: var(--line);
+}
+.lineage-row {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	align-items: baseline;
+	justify-content: stretch;
+	gap: 10px;
+	width: 100%;
+	min-height: 30px;
+	padding: 4px 8px;
+	border: 1px solid transparent;
 	border-radius: 4px;
 	background: none;
-	font-size: 12.5px;
-	gap: 6px;
-	justify-content: flex-start;
+	font: inherit;
+	font-size: 13px;
+	color: var(--text);
+	text-align: left;
 }
-.fu-parent .icon-svg {
-	flex: none;
-	margin-top: 0;
+button.lineage-row {
+	cursor: pointer;
+}
+button.lineage-row:hover {
+	background: var(--card);
+}
+button.lineage-row:hover .lineage-title {
+	color: var(--accent-hover);
+}
+.lineage-key {
+	font-family: var(--mono);
+	font-size: 11.5px;
 	color: var(--dim);
+	font-variant-numeric: tabular-nums;
 }
-.fu-parent-label {
-	flex: none;
-	color: var(--dim);
-}
-.fu-parent-title {
+.lineage-title {
 	min-width: 0;
 	overflow: hidden;
 	white-space: nowrap;
 	text-overflow: ellipsis;
 	color: var(--accent);
 }
-.fu-parent:hover {
-	background: var(--card);
-	border-color: var(--line);
+.lineage-tag,
+.lineage-row .st {
+	font-size: 12px;
+	color: var(--dim);
 }
-.fu-parent:hover .fu-parent-title {
-	color: var(--accent-hover);
+.lineage-row .st-needs_you {
+	color: var(--alarm);
 }
-/* A parent the state no longer carries (a cancelled card): a span, so the button
-   base styles do not apply; the id reads dim, not link-steel, and hover is dead. */
-span.fu-parent {
-	display: inline-flex;
-	cursor: default;
+.lineage-row .st-needs_you.st-asked {
+	color: var(--accent);
 }
-.fu-parent-gone:hover {
-	background: none;
-	border-color: var(--line-soft);
+.lineage-self > .lineage-row .lineage-key,
+.lineage-self > .lineage-row .lineage-title {
+	color: var(--text-strong);
 }
-.fu-parent-gone .fu-parent-title {
+.lineage-self > .lineage-row .lineage-title {
+	font-weight: 600;
+}
+.lineage-gone .lineage-title {
 	color: var(--dim);
 }
 .st {
