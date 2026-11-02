@@ -224,6 +224,7 @@ import {
 	githubUrl,
 	hasRules,
 	isGitRepoWithCommit,
+	originRemoteUrl,
 	remoteUrl,
 	resolveTarget,
 	setNetworkGitAuth,
@@ -2536,6 +2537,14 @@ export function createApp(deps: AppDeps) {
 		}
 		await refreshRemote(e);
 
+		// R5-1 (docs/specs/pinned-origin-url.md): pin the origin URL before the project can
+		// dispatch a turn — the board's fetch and push name this server-owned URL, never the
+		// remote name the worker-writable .git/config resolves. Never refreshed while the
+		// board runs; a re-add or the settings API re-pins.
+		const pin = await originRemoteUrl(p);
+		if (pin !== null && e.store.getSettings().originUrl === null)
+			e.store.setSettings({ originUrl: pin });
+
 		// The wizard/checklist opens for every newly added project.
 		e.store.setSettings({ setupChecklist: true });
 		// A gitless project has no HEAD to create a worktree from; the turn machinery would
@@ -4194,7 +4203,11 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "init a git repository first" }, 409);
 					let resolved: { target: string; sha: string };
 					try {
-						resolved = await resolveTarget(e.path, true);
+						resolved = await resolveTarget(
+							e.path,
+							true,
+							e.store.getSettings().originUrl,
+						);
 					} catch (err) {
 						return json({ error: errmsg(err) }, 409);
 					}
@@ -4202,6 +4215,7 @@ export function createApp(deps: AppDeps) {
 						mainPath: e.path,
 						target: resolved.target,
 						sha: resolved.sha,
+						originUrl: e.store.getSettings().originUrl,
 					}).catch((err) => json({ error: errmsg(err) }, 409));
 					if (plan instanceof Response) return plan;
 					// Window start: the last release tag's commit time; merges are serialized, so a
@@ -4240,7 +4254,11 @@ export function createApp(deps: AppDeps) {
 						);
 					let resolved: { target: string; sha: string };
 					try {
-						resolved = await resolveTarget(e.path, true);
+						resolved = await resolveTarget(
+							e.path,
+							true,
+							e.store.getSettings().originUrl,
+						);
 					} catch (err) {
 						return json({ error: errmsg(err) }, 409);
 					}
@@ -4248,6 +4266,7 @@ export function createApp(deps: AppDeps) {
 						mainPath: e.path,
 						target: resolved.target,
 						sha,
+						originUrl: e.store.getSettings().originUrl,
 					}).catch((err) => json({ error: errmsg(err) }, 409));
 					if (plan instanceof Response) return plan;
 					// The dialog may override the agent's semver pick; validate the shape and

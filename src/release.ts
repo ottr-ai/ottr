@@ -2,7 +2,7 @@ import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LatestImage, ReleasePlan, Task } from "./types.ts";
-import { git, spawnPiped } from "./worktree.ts";
+import { checkPinnedRemote, git, spawnPiped } from "./worktree.ts";
 
 export interface ConventionalCommit {
 	type: string;
@@ -307,9 +307,18 @@ export async function planRelease(o: {
 	mainPath: string;
 	target: string;
 	sha: string;
+	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null skips the fetch. */
+	originUrl: string | null;
 }): Promise<Omit<ReleasePlan, "tasks">> {
-	if (await hasOrigin(o.mainPath))
-		await git(["fetch", "--tags", "origin"], o.mainPath);
+	// R5-1: the fetch names the pinned origin URL, never the remote name a work turn can
+	// re-point. No pin (or a refused one): skip — the plan reads the tags already fetched,
+	// the same degraded state as a failed fetch.
+	if (
+		o.originUrl !== null &&
+		(await hasOrigin(o.mainPath)) &&
+		(await checkPinnedRemote(o.mainPath, o.originUrl)) === null
+	)
+		await git(["fetch", "--tags", o.originUrl], o.mainPath);
 	let sha: string;
 	let blocked: string | null = null;
 	const v = await git(
@@ -424,6 +433,8 @@ export async function publishRelease(o: {
 	notes: string;
 	github: string | null;
 	archReview?: { delta: number } | null;
+	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the push. */
+	originUrl: string | null;
 }): Promise<string> {
 	const parts: string[] = [];
 	// The release waits for its review's fixes, and the merge hold keeps every other card off the
@@ -479,8 +490,16 @@ export async function publishRelease(o: {
 		);
 	}
 	if (await hasOrigin(o.mainPath)) {
+		// R5-1: the push names the pinned origin URL, never the remote name a work turn can
+		// re-point (the named repo's hooks would run here). No pin: fail loudly, never skip.
+		if (o.originUrl === null)
+			throw new Error(
+				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
+			);
+		const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
+		if (guard !== null) throw new Error(guard);
 		const p = await git(
-			["push", "origin", `refs/tags/${o.version}`],
+			["push", o.originUrl, `refs/tags/${o.version}`],
 			o.mainPath,
 		);
 		if (p.code !== 0)
@@ -530,6 +549,8 @@ export async function runReleaseCommand(o: {
 	/** The release card's worktree, checked out at the reviewed commit. */
 	cwd: string;
 	mainPath: string;
+	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the check. */
+	originUrl: string | null;
 	target: string;
 	sha: string;
 	version: string;
@@ -613,9 +634,19 @@ export async function runReleaseCommand(o: {
 
 	let at: string;
 	if (await hasOrigin(o.mainPath)) {
-		const ls = await git(["ls-remote", "--tags", "origin"], o.mainPath);
+		// R5-1: the claim check reads the pinned origin URL, never the remote name a work
+		// turn can re-point. No pin: fail loudly, never fall back to the local tag.
+		if (o.originUrl === null)
+			throw new Error(
+				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
+			);
+		const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
+		if (guard !== null) throw new Error(guard);
+		const ls = await git(["ls-remote", "--tags", o.originUrl], o.mainPath);
 		if (ls.code !== 0)
-			throw new Error(`git ls-remote origin failed: ${ls.stderr.trim()}`);
+			throw new Error(
+				`git ls-remote ${o.originUrl} failed: ${ls.stderr.trim()}`,
+			);
 		const refs = new Map(
 			ls.stdout.split("\n").map((l) => {
 				const [hash = "", ref = ""] = l.trim().split(/\s+/);
@@ -629,9 +660,12 @@ export async function runReleaseCommand(o: {
 		if (remote === undefined)
 			throw new Error(`the release command did not push tag ${o.version}`);
 		at = remote;
-		const f = await git(["fetch", "--quiet", "--tags", "origin"], o.mainPath);
+		const f = await git(
+			["fetch", "--quiet", "--tags", o.originUrl],
+			o.mainPath,
+		);
 		if (f.code !== 0)
-			throw new Error(`git fetch origin failed: ${f.stderr.trim()}`);
+			throw new Error(`git fetch ${o.originUrl} failed: ${f.stderr.trim()}`);
 	} else {
 		const t = await git(
 			["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],

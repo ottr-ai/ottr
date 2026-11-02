@@ -387,8 +387,28 @@ the child git of a submodule, so board git also never recurses into submodules
 `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees
-them. For a project without a GitHub remote, the server pushes the merged target
-to `origin` after the merge turn ends.
+them.
+
+The merge push, the merge-hold gate fetch and the release fetch/push never take
+a remote name. They name the origin URL the server pinned once in the project
+settings (`originUrl`, docs/specs/pinned-origin-url.md): the server reads it
+from the origin remote at boot or add time, before any turn runs, because a
+work turn can re-point a remote name through the worker-writable `.git/config`
+— and the pre-receive hook of the repo it names runs in the server's git next
+to these tokens (the `core.hooksPath=/dev/null` pin does not reach the local
+`receive-pack` child of a `file://` push). Every pinned call also refuses to
+run when the repo config holds an `url.<base>.insteadOf` entry that matches the
+pin (a rewrite would send the call to a repo the pin never named), and when a
+local pin sits under a worker-writable root (the project roots and
+`OTTR_DATA_DIR`, set when a worker boundary exists). A local pinned URL outside
+those roots keeps working, which is why `file` stays in `GIT_ALLOW_PROTOCOL`.
+Residuals: a pin captured at boot can adopt a remote URL that a turn planted
+before that boot — the worker-root check refuses the workspace-local form, and
+a planted https URL carries no matching credential, so such a push fails
+closed; an `url.<base>.insteadOf` rewrite to a foreign https host can feed a
+fetch of a public repo, but no token matches the rewritten host. For a project
+without a GitHub remote, the server pushes the merged target to the pinned
+origin URL after the merge turn ends.
 
 The card of the dev-only **Check the board** button also runs in the server container.
 Only loopback there reaches the full board API. On the turns' host (`OTTR_BOARD_URL`), a
@@ -406,7 +426,11 @@ environment. The board hardens against all three on two layers.
 Code: every board git call overrides `core.fsmonitor=false` and `core.hooksPath=/dev/null`
 on the command line (command-line config outranks repo and global config), and `GH_TOKEN`
 reaches only the network subcommands (`clone`, `fetch`, `ls-remote`, `pull`, `push`);
-local subcommands such as `status` run without it. Every board git call also sets
+local subcommands such as `status` run without it. One limit: on a push to a local
+(`file://`) repo, the `-c` pins do not reach the local `receive-pack` child, so its
+`pre-receive` hook would run in the server's git — the merge push therefore never takes a
+remote name, only the server-pinned origin URL (docs/specs/pinned-origin-url.md). Every
+board git call also sets
 `commit.gpgSign=false` and `tag.gpgSign=false`, and sets `gpg.program`, `gpg.x509.program`
 and `gpg.ssh.program` to `false`. Thus a planted signing or `log.showSignature` setting
 cannot run a program.

@@ -584,6 +584,7 @@ describe("against real repos", () => {
 	test("planRelease without tags: the first release", async () => {
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: a,
 		});
@@ -607,6 +608,7 @@ describe("against real repos", () => {
 		await must(main, "push", "-q", "origin", "main");
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: head,
 		});
@@ -623,6 +625,7 @@ describe("against real repos", () => {
 	test("an explicit sha behind the head keeps that sha and drops the later commit", async () => {
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: feat,
 		});
@@ -643,6 +646,7 @@ describe("against real repos", () => {
 		await must(main, "switch", "-q", "main");
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: fold,
 		});
@@ -660,6 +664,7 @@ describe("against real repos", () => {
 		await must(main, "switch", "-q", "main");
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: tip,
 		});
@@ -676,6 +681,7 @@ describe("against real repos", () => {
 		await must(main, "switch", "-q", "main");
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: sup,
 		});
@@ -689,6 +695,7 @@ describe("against real repos", () => {
 		await must(main, "switch", "-q", "main");
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: side,
 		});
@@ -702,6 +709,7 @@ describe("against real repos", () => {
 		await must(main, "tag", "-a", "v0.2.0", "-m", "v0.2.0", side);
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: head,
 		});
@@ -712,6 +720,7 @@ describe("against real repos", () => {
 		const bad = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 		const plan = await planRelease({
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha: bad,
 		});
@@ -724,6 +733,7 @@ describe("against real repos", () => {
 	test("publishRelease tags the given sha, pushes it, and is idempotent", async () => {
 		const log = await publishRelease({
 			mainPath: main,
+			originUrl: origin,
 			reviewed: feat,
 			sha: feat,
 			version: "v0.9.0",
@@ -751,6 +761,7 @@ describe("against real repos", () => {
 		// A second identical call succeeds and changes nothing.
 		await publishRelease({
 			mainPath: main,
+			originUrl: origin,
 			reviewed: feat,
 			sha: feat,
 			version: "v0.9.0",
@@ -766,6 +777,7 @@ describe("against real repos", () => {
 		await expect(
 			publishRelease({
 				mainPath: main,
+				originUrl: origin,
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.0",
@@ -793,6 +805,7 @@ describe("against real repos", () => {
 		try {
 			const log = await publishRelease({
 				mainPath: main,
+				originUrl: origin,
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.1",
@@ -819,6 +832,7 @@ describe("against real repos", () => {
 		await expect(
 			publishRelease({
 				mainPath: main,
+				originUrl: origin,
 				reviewed: side,
 				sha: head,
 				version: "v0.9.2",
@@ -860,6 +874,7 @@ if (mode === "ok" || mode === "offmain" || mode === "local") {
 
 describe("runReleaseCommand against real repos", () => {
 	let root = "";
+	let origin = "";
 	let main = "";
 	let fake = "";
 	let record = "";
@@ -870,8 +885,9 @@ describe("runReleaseCommand against real repos", () => {
 		process.env.OTT_GIT_EXE = gitExe();
 		sweepStaleFixtures("ott-release-command-test-");
 		root = mkdtempSync(join(tmpdir(), "ott-release-command-test-"));
+		origin = join(root, "origin.git");
 		main = join(root, "main");
-		must(root, "init", "-q", "--bare", "-b", "main", join(root, "origin.git"));
+		must(root, "init", "-q", "--bare", "-b", "main", origin);
 		must(root, "init", "-q", "-b", "main", main);
 		must(main, "commit", "-q", "--allow-empty", "-m", "a");
 		must(main, "remote", "add", "origin", join(root, "origin.git"));
@@ -916,6 +932,7 @@ describe("runReleaseCommand against real repos", () => {
 			command: `"${process.execPath}" "${fake}" ${mode} "${record}"`,
 			cwd: wt,
 			mainPath: extra.mainPath ?? main,
+			originUrl: extra.mainPath ? null : origin,
 			target: extra.target ?? "origin/main",
 			sha,
 			version,
@@ -963,6 +980,7 @@ describe("runReleaseCommand against real repos", () => {
 			command: "ott-no-such-release-command --ottr",
 			cwd: wt,
 			mainPath: main,
+			originUrl: origin,
 			target: "origin/main",
 			sha,
 			version: "v1.0.2",

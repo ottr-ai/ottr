@@ -974,7 +974,7 @@ export function createTurnLoop(
 			if (settings.releaseCommand === null) {
 				// Tag the target's head: the review's fixes landed there after the reviewed commit, and
 				// settleReviews waited for them. publishRelease refuses a head without that commit.
-				const head = await ops.resolveTarget(e.path, true);
+				const head = await ops.resolveTarget(e.path, true, settings.originUrl);
 				if (head.warning !== null) log(head.warning);
 				if (!claimPublish()) return null;
 				line = await ops.publishRelease({
@@ -985,6 +985,7 @@ export function createTurnLoop(
 					notes: task.releaseNotes ?? "",
 					github: e.github,
 					archReview,
+					originUrl: settings.originUrl,
 				});
 			} else {
 				// Outside the worktree: the command may refuse a dirty tree.
@@ -999,6 +1000,7 @@ export function createTurnLoop(
 						command: settings.releaseCommand,
 						cwd: wt,
 						mainPath: e.path,
+						originUrl: settings.originUrl,
 						target,
 						sha: base,
 						version: task.releaseVersion!,
@@ -1158,6 +1160,7 @@ export function createTurnLoop(
 			const { target, sha, warning } = await ops.resolveTarget(
 				e.path,
 				!task.worktree || !task.branch,
+				settings.originUrl,
 			);
 			if (warning) log(`! ${warning}`);
 			e.target = target;
@@ -1914,7 +1917,7 @@ export function createTurnLoop(
 					} else {
 						for (const ah of approvedHeads) {
 							const { mismatch, pushDiff, auditedTip } = await ops
-								.mergeHoldMismatch(e.path, target, base, ah)
+								.mergeHoldMismatch(e.path, target, base, ah, settings.originUrl)
 								.catch(() => ({
 									mismatch: true,
 									pushDiff: null,
@@ -1977,6 +1980,7 @@ export function createTurnLoop(
 										target,
 										task.branch ?? "",
 										holdTip,
+										settings.originUrl,
 									)
 									.catch((err: unknown) => ({
 										status: "failed" as const,

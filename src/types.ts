@@ -149,6 +149,13 @@ export interface ProjectSettings {
 	prReviews: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
+	/**
+	 * The origin URL the board's own network git pushes and fetches (docs/specs/pinned-origin-url.md).
+	 * Pinned once by the server from the origin remote, at boot or add time; a work turn can
+	 * rewrite `.git/config` (R5-1), so fetch and push never take the remote name. null fails
+	 * closed at the next push until the server pins again.
+	 */
+	originUrl: string | null;
 }
 
 /** One task's touched file with its +/- line counts; null counts mark a binary file. */

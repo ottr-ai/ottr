@@ -40,6 +40,7 @@ import {
 	isClean,
 	isIntegrated,
 	mergeHoldMismatch,
+	originRemoteUrl,
 	parseKeptChoices,
 	parseNumstat,
 	planKeptFinish,
@@ -53,6 +54,7 @@ import {
 	serverMergePush,
 	setGitSecrets,
 	setNetworkGitAuth,
+	setWorkerRoots,
 	slugify,
 	spawnPiped,
 	statusFiles,
@@ -188,12 +190,28 @@ describe("serverMergePush", () => {
 			const local = run(f.main, "rev-parse", "refs/heads/main");
 			expect(run(f.bare, "rev-parse", "main")).not.toBe(local);
 			expect(
-				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+					)
+				).status,
 			).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(local);
 			// Already on origin: a second call has nothing to do.
 			expect(
-				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+				await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					null,
+					f.bare,
+				),
 			).toEqual({
 				status: "skipped",
 			});
@@ -209,7 +227,16 @@ describe("serverMergePush", () => {
 			run(f.dir, "init", "-q", "--bare", "-b", "main", up);
 			run(f.main, "remote", "add", "upstream", up);
 			expect(
-				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+					)
+				).status,
 			).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(
 				run(f.main, "rev-parse", "refs/heads/main"),
@@ -230,7 +257,14 @@ describe("serverMergePush", () => {
 			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
 			const before = run(f.bare, "rev-parse", "main");
 			expect(
-				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+				await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					null,
+					f.bare,
+				),
 			).toEqual({
 				status: "skipped",
 			});
@@ -245,13 +279,31 @@ describe("serverMergePush", () => {
 		try {
 			run(f.main, "worktree", "remove", f.wt);
 			expect(
-				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+					)
+				).status,
 			).toBe("pushed");
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
 			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "next");
 			run(f.main, "branch", "-q", "-D", "ott/x");
 			expect(
-				(await serverMergePush(f.main, f.wt, "origin/main", "ott/x")).status,
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+					)
+				).status,
 			).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(
 				run(f.main, "rev-parse", "refs/heads/main"),
@@ -269,7 +321,14 @@ describe("serverMergePush", () => {
 			run(f.main, "worktree", "remove", f.wt);
 			const before = run(f.bare, "rev-parse", "main");
 			expect(
-				await serverMergePush(f.main, f.wt, "origin/main", "ott/x"),
+				await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					null,
+					f.bare,
+				),
 			).toEqual({
 				status: "skipped",
 			});
@@ -282,15 +341,16 @@ describe("serverMergePush", () => {
 	test("a failed push reports git's last stderr line", async () => {
 		const f = fixture();
 		try {
-			run(
+			// The pin itself is broken (a gone path): the planted origin config is ignored,
+			// so the failure must come from the pinned push, not from a name lookup.
+			const r = await serverMergePush(
 				f.main,
-				"remote",
-				"set-url",
-				"--push",
-				"origin",
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
 				join(f.dir, "gone.git"),
 			);
-			const r = await serverMergePush(f.main, f.wt, "origin/main", "ott/x");
 			expect(r.status).toBe("failed");
 			expect("error" in r && r.error.length > 0).toBe(true);
 		} finally {
@@ -308,6 +368,7 @@ describe("serverMergePush", () => {
 				"origin/main",
 				"ott/x",
 				tip,
+				f.bare,
 			);
 			expect(r.status).toBe("pushed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(
@@ -335,6 +396,7 @@ describe("serverMergePush", () => {
 				"origin/main",
 				"ott/x",
 				stale,
+				f.bare,
 			);
 			expect(r.status).toBe("failed");
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
@@ -357,6 +419,7 @@ describe("serverMergePush", () => {
 				"origin/main",
 				"ott/x",
 				run(f.wt, "rev-parse", "HEAD"),
+				f.bare,
 			);
 			expect(r.status).toBe("failed");
 			expect(r.status === "failed" && r.error.includes("not contained")).toBe(
@@ -382,9 +445,9 @@ describe("mergeHoldMismatch", () => {
 	};
 	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
 	const mismatch = async (
-		f: { main: string; base: string; approvedHead: string },
+		f: { main: string; base: string; approvedHead: string; bare: string },
 		approvedHead = f.approvedHead,
-	) => mergeHoldMismatch(f.main, "origin/main", f.base, approvedHead);
+	) => mergeHoldMismatch(f.main, "origin/main", f.base, approvedHead, f.bare);
 	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
 	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1,
 	 * which rewrites o.txt — a file the branch never touches, so rebases stay clean), so a merge
@@ -608,6 +671,212 @@ describe("mergeHoldMismatch", () => {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("pinned origin URL (OTTR-348)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	/** A bare origin with base+work merged on main, a clone, a merged worktree branch — and
+	 * an evil bare whose pre-receive hook writes a marker when it runs, with the clone's
+	 * origin name re-aimed at it (url and pushurl), the work-turn plant of the audit. */
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-pin-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const evil = join(dir, "evil.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", evil);
+		const marker = join(dir, "planted.pre-receive");
+		writeFileSync(
+			join(evil, "hooks", "pre-receive"),
+			`#!/bin/sh\ntouch '${marker}'\n`,
+		);
+		chmodSync(join(evil, "hooks", "pre-receive"), 0o755);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		run(main, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+		run(main, "push", "-q", "origin", "main");
+		const wt = join(dir, "wt");
+		run(main, "worktree", "add", "-q", "-b", "ott/x", wt);
+		run(wt, ...id, "commit", "-q", "--allow-empty", "-m", "work");
+		run(main, "merge", "-q", "--ff-only", "ott/x");
+		run(main, "remote", "set-url", "origin", `file://${evil}`);
+		run(main, "config", "remote.origin.pushurl", `file://${evil}`);
+		return { dir, bare, evil, marker, main, wt };
+	};
+
+	test("originRemoteUrl reads the planted origin verbatim for the pin", async () => {
+		const f = fixture();
+		try {
+			expect(await originRemoteUrl(f.main)).toBe(`file://${f.evil}`);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a merge push without a pin fails closed instead of pushing by remote name", async () => {
+		const f = fixture();
+		try {
+			const r = await serverMergePush(f.main, f.wt, "origin/main", "ott/x");
+			expect(r.status).toBe("failed");
+			expect(r.status === "failed" && r.error.includes("pinned")).toBe(true);
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a planted file:// origin never receives the merge push; the pinned bare does", async () => {
+		const f = fixture();
+		try {
+			// Control: the plant is live — plain git runs the evil pre-receive.
+			run(f.main, "push", "-q", "origin", "main:planted");
+			expect(existsSync(f.marker)).toBe(true);
+			rmSync(f.marker);
+			const local = run(f.main, "rev-parse", "refs/heads/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(local);
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("the gate fetch audits the pinned bare, not a planted file:// origin", async () => {
+		const f = fixture();
+		try {
+			const base = run(f.main, "rev-parse", "main~1");
+			const approvedHead = run(f.main, "rev-parse", "refs/heads/ott/x");
+			const m = await mergeHoldMismatch(
+				f.main,
+				"origin/main",
+				base,
+				approvedHead,
+				f.bare,
+			);
+			expect(m.mismatch).toBe(false);
+			expect(m.auditedTip).toBe(run(f.bare, "rev-parse", "main"));
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("an url.<…>.insteadOf entry matching the pin fails the push and the gate closed", async () => {
+		const f = fixture();
+		try {
+			// The rewrite turns the pinned bare into the evil repo; the guard must refuse
+			// before git runs, so the hook never fires.
+			run(f.main, "config", `url.${f.evil}.insteadOf`, f.bare);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(r.status).toBe("failed");
+			expect(r.status === "failed" && r.error.includes("insteadOf")).toBe(true);
+			const base = run(f.main, "rev-parse", "main~1");
+			const approvedHead = run(f.main, "rev-parse", "refs/heads/ott/x");
+			const m = await mergeHoldMismatch(
+				f.main,
+				"origin/main",
+				base,
+				approvedHead,
+				f.bare,
+			);
+			expect(m.mismatch).toBe(true);
+			expect(m.auditedTip).toBeNull();
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a local pin under a worker-writable root fails closed; without roots it works", async () => {
+		const f = fixture();
+		try {
+			setWorkerRoots([f.dir]);
+			try {
+				const r = await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					null,
+					f.bare,
+				);
+				expect(r.status).toBe("failed");
+				expect(
+					r.status === "failed" && r.error.includes("worker-writable"),
+				).toBe(true);
+				expect(existsSync(f.marker)).toBe(false);
+			} finally {
+				setWorkerRoots([]);
+			}
+			const ok = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(ok.status).toBe("pushed");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("the pinned target fetch ignores a planted origin URL and rigged refspecs", async () => {
+		const f = fixture();
+		try {
+			// The real bare's main moves on without the clone knowing.
+			const b = run(
+				f.bare,
+				...id,
+				"commit-tree",
+				"-p",
+				"main",
+				"-m",
+				"b",
+				"main^{tree}",
+			);
+			run(f.bare, "update-ref", "refs/heads/main", b);
+			// A name fetch would follow this rigged refspec; the pinned fetch must not.
+			run(
+				f.main,
+				"config",
+				"remote.origin.fetch",
+				"+refs/heads/*:refs/remotes/rigged/*",
+			);
+			expect(await resolveTarget(f.main, true, f.bare)).toEqual({
+				target: "origin/main",
+				sha: b,
+				warning: null,
+			});
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
 });
 
 describe("resetBranchTo", () => {
@@ -1035,7 +1304,7 @@ describe("against real repos", () => {
 			sha: a,
 			warning: null,
 		});
-		expect(await resolveTarget(main, true)).toEqual({
+		expect(await resolveTarget(main, true, origin)).toEqual({
 			target: "origin/main",
 			sha: b,
 			warning: null,
@@ -1045,7 +1314,7 @@ describe("against real repos", () => {
 	test("resolveTarget stops on an upstream missing from origin instead of using the local branch", async () => {
 		await must(main, "config", "branch.main.merge", "refs/heads/gone");
 		try {
-			await expect(resolveTarget(main, true)).rejects.toThrow(
+			await expect(resolveTarget(main, true, origin)).rejects.toThrow(
 				"upstream origin/gone of main not found",
 			);
 		} finally {
@@ -1057,11 +1326,32 @@ describe("against real repos", () => {
 		const last = await must(main, "rev-parse", "origin/main");
 		await must(main, "remote", "set-url", "origin", join(root, "missing.git"));
 		try {
-			const r = await resolveTarget(main, true);
+			const r = await resolveTarget(main, true, join(root, "missing.git"));
 			expect(r).toMatchObject({ target: "origin/main", sha: last });
 			expect(r.warning).toBeTruthy();
 		} finally {
 			await must(main, "remote", "set-url", "origin", origin);
+		}
+	}, 60_000);
+
+	test("resolveTarget skips a fetch with a warning while the origin URL is not pinned", async () => {
+		const last = await must(main, "rev-parse", "origin/main");
+		const b = await must(
+			origin,
+			"commit-tree",
+			"-p",
+			"main",
+			"-m",
+			"b2",
+			"main^{tree}",
+		);
+		await must(origin, "update-ref", "refs/heads/main", b);
+		try {
+			const r = await resolveTarget(main, true);
+			expect(r).toMatchObject({ target: "origin/main", sha: last });
+			expect(r.warning).toContain("not pinned");
+		} finally {
+			await must(origin, "update-ref", "refs/heads/main", last);
 		}
 	}, 60_000);
 

@@ -733,10 +733,16 @@ export function archReviewDue(
  * Upstream of the main checkout's branch, else the branch itself; sha of target.
  * fetch (before a new worktree): refresh the upstream first. A failed fetch only warns, but an upstream
  * that still doesn't resolve stops, instead of silently basing the work on the local branch.
+ * An origin upstream is fetched from the server-pinned originUrl with an explicit refspec
+ * (R5-1, docs/specs/pinned-origin-url.md): a work turn can re-point the remote name and the
+ * configured refspecs through the worker-writable .git/config. No pin yet skips the fetch
+ * with a warning (never a name fetch); a non-origin upstream (a fork remote) keeps the
+ * legacy name fetch.
  */
 export async function resolveTarget(
 	mainPath: string,
 	fetch = false,
+	originUrl: string | null = null,
 ): Promise<{ target: string; sha: string; warning: string | null }> {
 	const head = await git(
 		["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -757,13 +763,49 @@ export async function resolveTarget(
 	const [upstream = "", remote = "", remoteRef = ""] = up.stdout
 		.trim()
 		.split(" ");
-	const target = upstream || branch;
+	// R5-1 (docs/specs/pinned-origin-url.md): the board names its integration target
+	// canonically (`origin/<branch>`); the `upstream:short` rendering follows a planted
+	// remote.origin.fetch refspec, which would point the target into a planted namespace.
+	// An upstream on another remote (a fork) keeps its own name.
+	const short = remoteRef.startsWith("refs/heads/")
+		? remoteRef.slice("refs/heads/".length)
+		: null;
+	const target =
+		remote === "origin" && short !== null
+			? `origin/${short}`
+			: upstream || branch;
 	let fetchError: string | null = null;
 	if (fetch && remote !== "") {
 		// ponytail: a remote branch deleted since the last fetch only warns (its stale ref still resolves); add `git ls-remote --exit-code` if that bites
-		const f = await git(["fetch", "--quiet", remote, remoteRef], mainPath);
-		if (f.code !== 0)
-			fetchError = `git fetch ${remote} ${remoteRef} failed: ${f.stderr.trim()}`;
+		if (remote === "origin" && short !== null) {
+			// R5-1: fetch the pinned origin URL with an explicit refspec into the canonical
+			// tracking ref — a planted remote.origin.url and the configured refspecs stay
+			// irrelevant. No pin yet: skip (same degraded state as a failed fetch), never a
+			// fetch by the worker-writable name.
+			if (originUrl === null) {
+				fetchError = `the origin URL is not pinned yet; using the last fetched ${target}`;
+			} else {
+				const guard = await checkPinnedRemote(mainPath, originUrl);
+				if (guard !== null) fetchError = `not fetching ${target}: ${guard}`;
+				else {
+					const f = await git(
+						[
+							"fetch",
+							"--quiet",
+							originUrl,
+							`+${remoteRef}:refs/remotes/origin/${short}`,
+						],
+						mainPath,
+					);
+					if (f.code !== 0)
+						fetchError = `git fetch ${originUrl} ${remoteRef} failed: ${f.stderr.trim()}`;
+				}
+			}
+		} else {
+			const f = await git(["fetch", "--quiet", remote, remoteRef], mainPath);
+			if (f.code !== 0)
+				fetchError = `git fetch ${remote} ${remoteRef} failed: ${f.stderr.trim()}`;
+		}
 	}
 	const sha = await git(
 		["rev-parse", "--verify", "--quiet", `${target}^{commit}`],
@@ -995,9 +1037,84 @@ export async function isIntegrated(
 }
 
 /**
+ * Worker-writable roots for the pinned-origin check (R5-1): compose mounts the project roots
+ * (OMP_TRACKER_ROOTS, /workspace) and OTTR_DATA_DIR into every worker read-write, so a repo
+ * under them is a repo a work turn can rewrite, and a push runs its pre-receive hook in the
+ * server's git next to the tokens. Set once at boot, only when OTTR_DATA_DIR names a worker
+ * boundary; empty (native single-user boards, tests) allows every local pin.
+ */
+let workerRoots: readonly string[] = [];
+export function setWorkerRoots(roots: readonly string[]): void {
+	workerRoots = roots.map((r) => path.resolve(r));
+}
+
+/** The local path a pinned URL names, resolved; null when the URL is not local
+ * (https/ssh and other schemes, scp-style ssh). A `file://` URL is local when its
+ * authority is empty or `localhost`. */
+function localPinPath(mainPath: string, pinned: string): string | null {
+	const file = /^file:\/\/(?:localhost)?(\/.*)$/i.exec(pinned);
+	if (file !== null)
+		return path.resolve(mainPath, decodeURIComponent(file[1]!));
+	if (/^[A-Za-z]:[\\/]/.test(pinned) || pinned.startsWith("\\\\"))
+		return path.resolve(pinned);
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(pinned)) return null; // https:, ssh:, ext::, …
+	if (pinned.startsWith("/")) return path.resolve(pinned);
+	// No scheme, no leading slash: a relative path when it holds no colon, else scp-style ssh.
+	return pinned.includes(":") ? null : path.resolve(mainPath, pinned);
+}
+
+const sameOrUnder = (child: string, root: string): boolean => {
+	const rel = path.relative(root, child);
+	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+};
+
+/**
+ * Refuses to run network git for a pinned origin URL that a work turn could have bent (R5-1,
+ * docs/specs/pinned-origin-url.md): a local pin under a worker-writable root would push into
+ * a repo the turn can rewrite, and an `url.<base>.insteadOf` entry matching the pin (any
+ * config scope — the repo config is worker-writable) would redirect the call to a repo the
+ * pin never named. git's rewrite rule is over-approximated to fail closed: any matching
+ * prefix refuses, whatever the longest-match outcome would be. The config read is a local
+ * subcommand: gitEnv strips the auth env from it. Returns the error text, else null.
+ */
+export async function checkPinnedRemote(
+	mainPath: string,
+	pinned: string,
+): Promise<string | null> {
+	const local = localPinPath(mainPath, pinned);
+	if (local !== null) {
+		const root = workerRoots.find((root) => sameOrUnder(local, root));
+		if (root !== undefined)
+			return `the pinned origin ${pinned} sits under worker-writable ${root}; the board never pushes or fetches a repo a work turn can rewrite`;
+	}
+	const r = await git(["config", "--list", "-z"], mainPath);
+	for (const entry of r.stdout.split("\0")) {
+		const nl = entry.indexOf("\n");
+		if (nl === -1) continue;
+		if (!/^url\..*\.insteadof$/i.test(entry.slice(0, nl))) continue;
+		if (pinned.startsWith(entry.slice(nl + 1)))
+			return `repo config rewrites the pinned origin: an url.<…>.insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
+	}
+	return null;
+}
+
+/**
+ * The raw URL of the origin remote, read once to pin it (docs/specs/pinned-origin-url.md);
+ * null when origin is missing or git cannot read it. `get-url` applies `insteadOf`, so a
+ * rewrite planted before the pin lands is stored rewritten — and every use still runs
+ * checkPinnedRemote, which refuses while that entry exists.
+ */
+export async function originRemoteUrl(
+	mainPath: string,
+): Promise<string | null> {
+	const r = await git(["remote", "get-url", "origin"], mainPath);
+	return r.code === 0 ? r.stdout.trim() || null : null;
+}
+
+/**
  * The server's merge push (no agent holds git host credentials; the merge prompt tells the
- * agent not to push). Pushes the local target branch to origin when origin lacks its tip and
- * the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
+ * agent not to push). Pushes the local target branch to the pinned origin when origin lacks
+ * its tip and the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
  * in the local branch. A merge agent may remove both before it reports (a project's AGENTS.md
  * can say so). Then the local branch ahead of origin is the proof: only merge turns move it.
  * git() adds the host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local
@@ -1006,6 +1123,10 @@ export async function isIntegrated(
  * gate fetched. The push then requires the local target to contain that tip, and pins the
  * remote with --force-with-lease, so a merge agent cannot aim the gate's fetch at one remote
  * and the push at another: the real remote rejects any push whose lease does not match.
+ * The push names `originUrl` — the server-pinned URL (project settings), never the remote
+ * name: a work turn can re-point a name through the worker-writable .git/config, and the
+ * named repo's pre-receive hook would run here. A null pin, or one checkPinnedRemote
+ * refuses, fails closed.
  */
 export async function serverMergePush(
 	mainPath: string,
@@ -1013,6 +1134,7 @@ export async function serverMergePush(
 	target: string,
 	taskBranch: string,
 	leaseTip: string | null = null,
+	originUrl: string | null = null,
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
@@ -1053,6 +1175,14 @@ export async function serverMergePush(
 		);
 		if (merged.code !== 0) return { status: "skipped" };
 	}
+	if (originUrl === null)
+		return {
+			status: "failed",
+			error:
+				"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before merging",
+		};
+	const guard = await checkPinnedRemote(mainPath, originUrl);
+	if (guard !== null) return { status: "failed", error: guard };
 	const r = await git(
 		[
 			"push",
@@ -1062,13 +1192,18 @@ export async function serverMergePush(
 			...(leaseTip !== null
 				? [`--force-with-lease=refs/heads/${branch}:${leaseTip}`]
 				: []),
-			"origin",
+			originUrl,
 			`refs/heads/${branch}:refs/heads/${branch}`,
 		],
 		mainPath,
 	);
-	if (r.code === 0)
+	if (r.code === 0) {
+		// A push by URL moves no remote-tracking ref (and a planted fetch refspec could point
+		// it anywhere), so record the tip this push landed: the next merge's skip check and
+		// the gate's `refs/remotes/origin/<branch>` compare stay exact (R5-1).
+		await git(["update-ref", `refs/remotes/origin/${branch}`, local], mainPath);
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
+	}
 	const last = r.stderr.trim().split("\n").filter(Boolean).pop();
 	return { status: "failed", error: last ?? `git push exited ${r.code}` };
 }
@@ -1083,7 +1218,8 @@ export async function serverMergePush(
  * combined diff hides — only the total effect against the target shows a smuggled revert. The
  * merge agent can rewrite any local ref and the repo's remote config, so the fetch uses a
  * gate-owned refspec into refs/ottr/gate/<branch> (configured refspecs and the remote-tracking
- * ref stay irrelevant) and serverMergePush pins the real remote to the returned auditedTip. Any
+ * ref stay irrelevant), names the server-pinned origin URL, not the remote name (R5-1), and
+ * serverMergePush pins the real remote to the returned auditedTip. Any
  * git trouble mismatches: the hold fails closed. Runs in the main repo, where the target refs
  * live.
  */
@@ -1092,6 +1228,7 @@ export async function mergeHoldMismatch(
 	target: string,
 	base: string,
 	approvedHead: string,
+	originUrl: string | null = null,
 ): Promise<{
 	mismatch: boolean;
 	pushDiff: string | null;
@@ -1125,8 +1262,15 @@ export async function mergeHoldMismatch(
 		);
 		return r.code === 0 ? r.stdout : null;
 	};
+	// The gate names the pinned origin URL, never the remote name a work turn can re-point
+	// (R5-1). No pin, or one the pinned-URL check refuses: the hold fails closed.
+	if (
+		originUrl === null ||
+		(await checkPinnedRemote(mainPath, originUrl)) !== null
+	)
+		return failClosed();
 	const fetch = await git(
-		["fetch", "origin", `+refs/heads/${branch}:refs/ottr/gate/${branch}`],
+		["fetch", originUrl, `+refs/heads/${branch}:refs/ottr/gate/${branch}`],
 		mainPath,
 	);
 	if (fetch.code !== 0) return failClosed();

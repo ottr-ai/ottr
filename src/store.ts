@@ -60,6 +60,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	forkResearch: false,
 	prReviews: false,
 	setupChecklist: false,
+	originUrl: null,
 };
 
 /** The tasks table DDL, kept separate so the CHECK migration below reuses the exact shape. */
@@ -810,6 +811,7 @@ const SETTINGS_SHAPES = {
 	forkResearch: "boolean",
 	prReviews: "boolean",
 	setupChecklist: "boolean",
+	originUrl: "string|null",
 } as const satisfies Record<keyof ProjectSettings, string>;
 
 /** Validates one stored settings value; undefined when corrupt or of the wrong shape (keep default). */
@@ -823,6 +825,10 @@ function parseSetting(
 		return Array.isArray(value) ? value.map(String) : undefined;
 	if (shape === "number|null")
 		return value === null || typeof value === "number"
+			? (value as ProjectSettings[keyof ProjectSettings])
+			: undefined;
+	if (shape === "string|null")
+		return value === null || typeof value === "string"
 			? (value as ProjectSettings[keyof ProjectSettings])
 			: undefined;
 	if (typeof value !== shape) return undefined;

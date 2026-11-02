@@ -278,6 +278,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			setupChecklist: false,
+			originUrl: null,
 		});
 		store.setSettings({ displayName: null, releaseCommand: null });
 		expect(store.getSettings()).toEqual({
@@ -297,6 +298,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			setupChecklist: false,
+			originUrl: null,
 		});
 		store.close();
 	});
@@ -314,6 +316,27 @@ describe("settings", () => {
 		store.setSettings({ archReviewCap: 300 });
 		expect(store.getSettings().archReviewCap).toBe(300);
 		expect(store.getSettings().maxImages).toBe(8);
+		store.close();
+	});
+
+	test("originUrl persists across a reopen, resets to null, and a corrupt row keeps the default", () => {
+		const dir = join(root, "settings-origin-url");
+		let store = open(dir);
+		expect(store.getSettings().originUrl).toBeNull();
+		store.setSettings({ originUrl: "/srv/git/proj.git" });
+		store.close();
+		store = open(dir);
+		expect(store.getSettings().originUrl).toBe("/srv/git/proj.git");
+		store.close();
+		// A wrong-shape row (a worker, an old bug) must not surface as a pin: parseSetting
+		// keeps the null default, which fails closed at the next push (OTTR-348).
+		const db = new Database(join(tasksDirFor(dir), "tasks.db"));
+		db.run("UPDATE settings SET value = '3' WHERE key = 'originUrl'");
+		db.close();
+		store = open(dir);
+		expect(store.getSettings().originUrl).toBeNull();
+		store.setSettings({ originUrl: null });
+		expect(store.getSettings().originUrl).toBeNull();
 		store.close();
 	});
 

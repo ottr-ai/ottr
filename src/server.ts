@@ -64,12 +64,14 @@ import {
 	isGitRepoWithCommit,
 	isIntegrated,
 	mergeHoldMismatch,
+	originRemoteUrl,
 	quarantineUntracked,
 	remoteUrl,
 	removeWorktree,
 	resetBranchTo,
 	resolveTarget,
 	serverMergePush,
+	setWorkerRoots,
 	statusFiles,
 	statusRows,
 	targetCommits,
@@ -267,6 +269,14 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 	);
 }
 
+// R5-1 (docs/specs/pinned-origin-url.md): when a worker boundary exists (OTTR_DATA_DIR is
+// the shared volume the workers mount read-write), a local pinned origin under the project
+// roots or the data dir would let the board push into a repo a work turn can rewrite. The
+// pinned-URL check refuses those pins at every use. Native single-user boards (no
+// OTTR_DATA_DIR) check nothing, as before.
+if (process.env.OTTR_DATA_DIR)
+	setWorkerRoots([...ROOTS, resolve(process.env.OTTR_DATA_DIR)]);
+
 for (const p of discoverProjects(
 	ROOTS,
 	shared.projectPaths,
@@ -301,6 +311,14 @@ for (const p of discoverProjects(
 		archReview: null,
 	};
 	projects.set(store.name, e);
+
+	// R5-1 (docs/specs/pinned-origin-url.md): pin the origin URL before the loop starts and
+	// any turn can run — awaited, so a merge cannot dispatch against an unpinned origin.
+	if (!e.gitless) {
+		const pin = await originRemoteUrl(p).catch(() => null);
+		if (pin !== null && store.getSettings().originUrl === null)
+			store.setSettings({ originUrl: pin });
+	}
 
 	resolveTarget(p)
 		.then((r) => {
