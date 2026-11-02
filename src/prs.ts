@@ -204,6 +204,7 @@ export function createPrWatcher(deps: {
 					reviewedHead: null,
 					postedHead: null,
 					postedUrl: null,
+					postedLogin: null,
 					state: "open",
 					draft: p.draft,
 					title: p.title,

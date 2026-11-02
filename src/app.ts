@@ -68,6 +68,11 @@ import {
 	type TrustNeeded,
 	testRemote,
 } from "./gitHosts.ts";
+import {
+	AppTokenSource,
+	parseAppPem,
+	validateAppCredentials,
+} from "./githubApp.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import {
 	decodeImages,
@@ -319,6 +324,11 @@ interface AppDeps {
 	 * expiry). A throw keeps the stored value (advisory; retried on the next tick).
 	 */
 	githubTokenExpiry?: (token: string) => Promise<string | null>;
+	/**
+	 * Fetch seam for the GitHub App installation-token mint and the direct review post;
+	 * defaults to noRedirectFetch. Tests inject a stub.
+	 */
+	githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 }
 
 /** The persisted removed/added project paths; boot discovery needs them before createApp runs. */
@@ -505,6 +515,8 @@ export function boardWarnings(
 }
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
+	// GitHub App mint and review post; the seam keeps both off the real network in tests.
+	const githubAppFetch = deps.githubAppFetch ?? noRedirectFetch;
 	const prod = deps.prod === true;
 	// Server-only ssh material: a data dir outside every checkout.
 	const sshDir = deps.sshDir ?? defaultSshDir();
@@ -647,6 +659,13 @@ export function createApp(deps: AppDeps) {
 	 * credential helper env, never through a URL or .git/config.
 	 */
 	let gitTokens: GitToken[] = [];
+	/**
+	 * GitHub App for PR review posts; stored plaintext in the config file like githubToken
+	 * (same trust level), never served back after save. The key joins the git secret set.
+	 */
+	let githubApp: { id: string; key: string; fingerprint: string } | null = null;
+	/** Installation-token mint for githubApp; null whenever the app is unset. Memory only. */
+	let appTokens: AppTokenSource | null = null;
 	/**
 	 * Server-side git, gh and merge turns read the token from GH_TOKEN; the worker image's git
 	 * credential helper hands it to git. Work turns never get it: runner strips it from the env
@@ -1231,6 +1250,8 @@ export function createApp(deps: AppDeps) {
 			alate,
 			githubToken,
 			gitTokens,
+			githubApp:
+				githubApp === null ? null : { id: githubApp.id, key: githubApp.key },
 			envValues: deps.shared.envValues,
 			hindsightToken,
 			hindsightUrl,
@@ -1249,6 +1270,7 @@ export function createApp(deps: AppDeps) {
 		alate?: unknown;
 		githubToken?: unknown;
 		gitTokens?: unknown;
+		githubApp?: unknown;
 		envValues?: unknown;
 		hindsightToken?: unknown;
 		hindsightUrl?: unknown;
@@ -1318,6 +1340,21 @@ export function createApp(deps: AppDeps) {
 			}
 			gitTokens = toks;
 		}
+		if (
+			typeof parsed.githubApp === "object" &&
+			parsed.githubApp !== null &&
+			"id" in parsed.githubApp &&
+			"key" in parsed.githubApp
+		) {
+			// A saved pair re-runs validateAppCredentials; a key that no longer parses is
+			// dropped like a malformed git token row. The log names the drop, never the key.
+			const v = validateAppCredentials(parsed.githubApp);
+			if ("error" in v) {
+				logError("dropping stored GitHub App credentials", new Error(v.error));
+			} else {
+				githubApp = v;
+			}
+		}
 		if (typeof parsed.hindsightToken === "string")
 			hindsightToken = parsed.hindsightToken;
 		if (typeof parsed.hindsightUrl === "string")
@@ -1340,12 +1377,22 @@ export function createApp(deps: AppDeps) {
 	function applyGitSecrets(): void {
 		setGitSecrets([
 			...gitTokens.map((t) => t.token),
+			// The app's PEM key redacts out of every git/gh log line and error text.
+			...(githubApp === null ? [] : [githubApp.key]),
 			...Object.values(deps.shared.envValues),
 			sshDir,
 			sshDir.replaceAll("\\", "/"),
 		]);
 	}
 	applyGitSecrets();
+	// A boot-adopted app pair gets its token mint here; a route save/reset rebuilds it.
+	if (githubApp !== null) {
+		appTokens = new AppTokenSource({
+			appId: githubApp.id,
+			keyObject: parseAppPem(githubApp.key)!.keyObject,
+			fetchImpl: githubAppFetch,
+		});
+	}
 	// D6: every network git call (clone/fetch/ls-remote/pull/push, merge turns included) picks
 	// up the auth of the project that owns cwd. Workers get none of these names: the runner
 	// strips them from the env it forwards (GIT_AUTH_ENV_RE in src/worktree.ts).
@@ -1811,6 +1858,7 @@ export function createApp(deps: AppDeps) {
 							reviewedHead: pr.reviewedHead,
 							postedHead: pr.postedHead,
 							postedUrl: pr.postedUrl,
+							postedLogin: pr.postedLogin,
 							postError: pr.postError,
 						},
 					}
@@ -2074,6 +2122,11 @@ export function createApp(deps: AppDeps) {
 				tokenSet: true,
 			})),
 			globalKey: await keyInfo(sshPaths(sshDir).global),
+			// Never the key: the fingerprint is what the user compares against GitHub's.
+			githubApp:
+				githubApp === null
+					? null
+					: { id: githubApp.id, fingerprint: githubApp.fingerprint },
 		};
 	}
 
@@ -3015,6 +3068,34 @@ export function createApp(deps: AppDeps) {
 				api(req, async () => {
 					removeKey(sshPaths(sshDir).global);
 					return json({ ok: true });
+				}),
+		},
+		// The GitHub App that posts PR reviews as ottr[bot]. No answer holds the key.
+		"/api/git-hosts/github-app": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const v = validateAppCredentials(r.body);
+					if ("error" in v) return json({ error: v.error }, 400);
+					githubApp = v;
+					saveConfig();
+					// A fresh pair invalidates any cached installation token for the old one.
+					appTokens = new AppTokenSource({
+						appId: v.id,
+						keyObject: parseAppPem(v.key)!.keyObject,
+						fetchImpl: githubAppFetch,
+					});
+					applyGitSecrets();
+					return json(await gitHostsView());
+				}),
+			DELETE: (req) =>
+				api(req, async () => {
+					githubApp = null;
+					appTokens = null;
+					saveConfig();
+					applyGitSecrets();
+					return json(await gitHostsView());
 				}),
 		},
 		"/api/projects/:project/ssh-key": {
@@ -5201,49 +5282,122 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "already posted for this head" }, 409);
 					const repo =
 						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
-					// argv array, no shell: body and head never reach a command line parser.
-					let res: { code: number; stdout: string; stderr: string };
-					try {
-						res = await gh([
-							"api",
-							`repos/${repo}/pulls/${row.number}/reviews`,
-							"-X",
-							"POST",
-							"-f",
-							"event=COMMENT",
-							"-f",
-							`body=${body}${REVIEW_FOOTER}`,
-							"-f",
-							`commit_id=${head}`,
-						]);
-					} catch (err) {
-						// A spawn failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
-						res = { code: -1, stdout: "", stderr: errmsg(err) };
+					const slash = repo.indexOf("/");
+					const owner = repo.slice(0, slash);
+					const repoName = repo.slice(slash + 1);
+					const appSecrets = [...gitSecrets()];
+					let via: "app" | "token" = "token";
+					let stdout: string | null = null;
+					if (githubApp !== null && appTokens !== null) {
+						// Mint an installation token; without an installation (null) fall through
+						// to the board token. Any other mint failure is a 502, no fallback post.
+						let tok: string | null = null;
+						try {
+							tok = await appTokens.tokenFor(owner, repoName);
+						} catch (err) {
+							const error = redact(errmsg(err), appSecrets)
+								.trim()
+								.slice(0, 300);
+							e.store.releasePrPost(row.number, head, prev, error);
+							return json({ error }, 502);
+						}
+						if (tok !== null) {
+							// Direct fetch, no gh: the review posts as the app, not the board token.
+							try {
+								const res = await githubAppFetch(
+									`https://api.github.com/repos/${repo}/pulls/${row.number}/reviews`,
+									{
+										method: "POST",
+										headers: {
+											authorization: `Bearer ${tok}`,
+											accept: "application/vnd.github+json",
+											"content-type": "application/json",
+											"user-agent": "Ottr",
+										},
+										body: JSON.stringify({
+											event: "COMMENT",
+											body: `${body}${REVIEW_FOOTER}`,
+											commit_id: head,
+										}),
+									},
+								);
+								const text = await res.text();
+								if (!res.ok) {
+									const error =
+										redact(text.trim().slice(0, 300), appSecrets) ||
+										`GitHub answered ${res.status}`;
+									e.store.releasePrPost(row.number, head, prev, error);
+									return json({ error }, 502);
+								}
+								stdout = text;
+								via = "app";
+							} catch (err) {
+								const error = redact(errmsg(err), appSecrets)
+									.trim()
+									.slice(0, 300);
+								e.store.releasePrPost(row.number, head, prev, error);
+								return json({ error }, 502);
+							}
+						}
 					}
-					if (res.code !== 0) {
-						const error =
-							res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
-						e.store.releasePrPost(row.number, head, prev, error);
-						return json({ error }, 502);
+					if (stdout === null) {
+						// argv array, no shell: body and head never reach a command line parser.
+						let res: { code: number; stdout: string; stderr: string };
+						try {
+							res = await gh([
+								"api",
+								`repos/${repo}/pulls/${row.number}/reviews`,
+								"-X",
+								"POST",
+								"-f",
+								"event=COMMENT",
+								"-f",
+								`body=${body}${REVIEW_FOOTER}`,
+								"-f",
+								`commit_id=${head}`,
+							]);
+						} catch (err) {
+							// A spawn failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
+							res = { code: -1, stdout: "", stderr: errmsg(err) };
+						}
+						if (res.code !== 0) {
+							const error =
+								res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
+							e.store.releasePrPost(row.number, head, prev, error);
+							return json({ error }, 502);
+						}
+						stdout = res.stdout;
 					}
-					// GitHub's response body is untrusted: only an https github URL becomes the drawer link.
+					// GitHub's response body is untrusted: only an https github URL becomes the
+					// drawer link, and only a plausible login names the posting identity.
 					let url: string | null = null;
+					let login: string | null = null;
 					try {
-						const body: unknown = JSON.parse(res.stdout);
-						if (
-							typeof body === "object" &&
-							body !== null &&
-							"html_url" in body
-						) {
-							const u: unknown = body.html_url;
-							if (typeof u === "string" && u.startsWith("https://github.com/"))
-								url = u;
+						const body: unknown = JSON.parse(stdout);
+						if (typeof body === "object" && body !== null) {
+							if ("html_url" in body) {
+								const u: unknown = body.html_url;
+								if (
+									typeof u === "string" &&
+									u.startsWith("https://github.com/")
+								)
+									url = u;
+							}
+							if ("user" in body) {
+								const user: unknown = body.user;
+								const l =
+									typeof user === "object" && user !== null && "login" in user
+										? user.login
+										: null;
+								if (typeof l === "string" && l.length >= 1 && l.length <= 100)
+									login = l;
+							}
 						}
 					} catch {
 						// No parseable body: the drawer just shows the posted head without a link.
 					}
-					e.store.setPrPostedUrl(row.number, url);
-					return json({ ok: true });
+					e.store.setPrPostedUrl(row.number, url, login);
+					return json({ ok: true, login, via });
 				}),
 		},
 		"/api/projects/:project/github": {

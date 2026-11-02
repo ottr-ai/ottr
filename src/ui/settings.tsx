@@ -2,7 +2,13 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import { forProvider } from "../quota.ts";
-import type { GithubFacts, Learning, ProjectView, TaskCard } from "../types.ts";
+import type {
+	GitHubAppView,
+	GithubFacts,
+	Learning,
+	ProjectView,
+	TaskCard,
+} from "../types.ts";
 import {
 	type Act,
 	BusyButton,
@@ -1090,6 +1096,7 @@ export type PendingKeyInfo = {
 export type GitHostsView = {
 	tokens: { host: string; username: string; tokenSet: boolean }[];
 	globalKey: KeyInfo | null;
+	githubApp: GitHubAppView | null;
 };
 
 /** Fetch that keeps the status with the parsed body, so a caller can read a 409's trust data
@@ -1304,6 +1311,10 @@ function GitHostsSection() {
 	const [tToken, setTToken] = useState("");
 	const [tUrl, setTUrl] = useState("");
 	const tBusy = useBusy();
+	// GitHub App flow: the key is write-only, the server never returns it.
+	const [appFormOpen, setAppFormOpen] = useState(false);
+	const [appId, setAppId] = useState("");
+	const [appKey, setAppKey] = useState("");
 	// Global-key flow: a pending key, then the save call that also runs the test.
 	const [pending, setPending] = useState<PendingKeyInfo | null>(null);
 	const [gUrl, setGUrl] = useState("");
@@ -1371,6 +1382,37 @@ function GitHostsSection() {
 			await load();
 			return true;
 		});
+	const saveApp = async (): Promise<boolean> => {
+		const id = appId.trim();
+		if (!/^\d+$/.test(id)) throw new Error("App ID must be numeric");
+		if (appKey === "") throw new Error("Private key is required");
+		const { status, data } = await gitReq("POST", "/api/git-hosts/github-app", {
+			id,
+			key: appKey,
+		});
+		if (status !== 200) throw new Error(asError(data, status));
+		setAppId("");
+		setAppKey("");
+		setAppFormOpen(false);
+		await load();
+		return true;
+	};
+	const removeApp = (): Promise<boolean> =>
+		run(async () => {
+			if (
+				!window.confirm(
+					"Remove the GitHub App? Reviews then post under your own identity.",
+				)
+			)
+				return true;
+			const { status, data } = await gitReq(
+				"DELETE",
+				"/api/git-hosts/github-app",
+			);
+			if (status !== 200) throw new Error(asError(data, status));
+			await load();
+			return true;
+		});
 	return (
 		<SettingsCard
 			id="git-hosts-section"
@@ -1392,6 +1434,69 @@ function GitHostsSection() {
 					captionUnknown="Unknown: the check failed"
 					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
+			</div>
+			<div className="sec-block">
+				<h4>GitHub App</h4>
+				{state !== null && state.githubApp !== null && !appFormOpen ? (
+					<div>
+						<p className="hint">
+							The app posts PR reviews as ottr[bot]; without it reviews post
+							under your own identity.
+						</p>
+						<div className="settings-field">
+							App ID <code>{state.githubApp.id}</code>
+						</div>
+						<p className="hint">
+							Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
+						</p>
+						<button type="button" onClick={() => setAppFormOpen(true)}>
+							Replace
+						</button>{" "}
+						<BusyButton className="danger" run={removeApp}>
+							Remove
+						</BusyButton>
+					</div>
+				) : (
+					<form
+						className="settings-form"
+						onSubmit={(e) => {
+							e.preventDefault();
+							void saveApp();
+						}}
+					>
+						<label className="settings-field">
+							App ID
+							<input
+								value={appId}
+								onChange={(e) => setAppId(e.target.value)}
+								placeholder="123456"
+								required
+								pattern="\d+"
+							/>
+						</label>
+						<label className="settings-field">
+							Private key
+							<textarea
+								rows={8}
+								value={appKey}
+								onChange={(e) => setAppKey(e.target.value)}
+								spellCheck={false}
+								autoComplete="off"
+								placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+								required
+							/>
+						</label>
+						<BusyButton run={saveApp}>Save</BusyButton>
+						{state !== null && state.githubApp !== null && (
+							<>
+								{" "}
+								<button type="button" onClick={() => setAppFormOpen(false)}>
+									Cancel
+								</button>
+							</>
+						)}
+					</form>
+				)}
 			</div>
 			<div className="sec-block">
 				<h4>Other host tokens</h4>

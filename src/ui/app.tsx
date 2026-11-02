@@ -5826,7 +5826,11 @@ function PrReviewSection({
 		pr.state === "open" &&
 		pr.postedHead !== null &&
 		pr.postedHead === pr.reviewedHead
-			? `Posted for ${pr.postedHead.slice(0, 7)}`
+			? `Posted for ${pr.postedHead.slice(0, 7)}${
+					pr.postedLogin !== null && pr.postedLogin !== ""
+						? ` · Posted as ${pr.postedLogin}`
+						: ""
+				}`
 			: null;
 	const blocked =
 		pr.state !== "open"

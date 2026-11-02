@@ -13,6 +13,7 @@ import {
 	test,
 } from "bun:test";
 import { execSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import {
 	appendFileSync,
 	existsSync,
@@ -52,6 +53,7 @@ import {
 	workCheckAsk,
 } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
+import fc from "./test/properties.ts";
 import {
 	cancelKeptReason,
 	FORK_HOLD_REASON,
@@ -300,6 +302,7 @@ function mount(
 		projects?: Map<string, Entry>;
 		defaultDir?: string;
 		gh?: GhFn;
+		githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 		sshDir?: string;
 		keyscan?: Keyscan;
 		models?: Parameters<typeof createApp>[0]["models"];
@@ -343,6 +346,7 @@ function mount(
 		},
 		defaultDir: input.defaultDir ?? root,
 		gh: input.gh,
+		githubAppFetch: input.githubAppFetch,
 		sshDir: input.sshDir,
 		keyscan: input.keyscan,
 		models: input.models,
@@ -4694,6 +4698,7 @@ describe("read marks (/api/seen)", () => {
 			reviewedHead: null,
 			postedHead: null,
 			postedUrl: null,
+			postedLogin: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -5188,6 +5193,10 @@ describe("PR review routes", () => {
 	let ghResult = { code: 0, stdout: "{}", stderr: "" };
 	/** Runs inside the fake gh call, after the route's checks: a race window for tests. */
 	let ghHook: (() => Promise<void>) | null = null;
+	/** GitHub App fetch stub, swappable per test; the mount closes over this indirection. */
+	let appFetchImpl: (url: string, init?: RequestInit) => Promise<Response> =
+		async () => new Response("{}", { status: 404 });
+	const appCalls: Array<{ url: string; init?: RequestInit }> = [];
 	const m = mount({
 		projects: prProjects,
 		gh: async (args) => {
@@ -5195,11 +5204,17 @@ describe("PR review routes", () => {
 			await ghHook?.();
 			return ghResult;
 		},
+		githubAppFetch: async (url, init) => {
+			appCalls.push({ url, init });
+			return appFetchImpl(url, init);
+		},
 	});
 	beforeEach(() => {
 		ghCalls.length = 0;
 		ghResult = { code: 0, stdout: "{}", stderr: "" };
 		ghHook = null;
+		appCalls.length = 0;
+		appFetchImpl = async () => new Response("{}", { status: 404 });
 	});
 	const row = (n: number): PrReviewRow => {
 		const r = prStore.getPrReview(n);
@@ -5217,6 +5232,7 @@ describe("PR review routes", () => {
 			reviewedHead: prev?.reviewedHead ?? null,
 			postedHead: prev?.postedHead ?? null,
 			postedUrl: prev?.postedUrl ?? null,
+			postedLogin: prev?.postedLogin ?? null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -5450,8 +5466,219 @@ describe("PR review routes", () => {
 			reviewedHead: H1,
 			postedHead: null,
 			postedUrl: null,
+			postedLogin: null,
 			postError: null,
 		});
+	});
+
+	// --- GitHub App posts (OTTR-340): old code always posted with the board token via gh,
+	// and no route/view exposed the app, so every test below fails on that old behavior.
+	const { privateKey: appKeyPair } = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+	});
+	const APP_PEM = appKeyPair
+		.export({ format: "pem", type: "pkcs8" })
+		.toString();
+	const APP_ID = "1234";
+	const saveApp = () =>
+		m.call("/api/git-hosts/github-app", { id: APP_ID, key: APP_PEM });
+	const removeApp = () =>
+		m.call("/api/git-hosts/github-app", undefined, { method: "DELETE" });
+	/** App-path stub: installation 77, installation token INSTA, one review answer. */
+	const appHappyPath = (review: unknown): void => {
+		appFetchImpl = async (url) => {
+			if (url.endsWith("/installation")) return Response.json({ id: 77 });
+			if (url.includes("/access_tokens"))
+				return Response.json({
+					token: "INSTA",
+					expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+				});
+			if (url.endsWith("/reviews")) return Response.json(review);
+			return Response.json({ message: "no route" }, { status: 404 });
+		};
+	};
+
+	test("no app configured: the post falls back to gh and reports the person's login", async () => {
+		await removeApp();
+		const t = reviewed(20, H1);
+		ghResult = {
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/20#pullrequestreview-1",
+				user: { login: "octocat" },
+			}),
+			stderr: "",
+		};
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "octocat",
+			via: "token",
+		});
+		expect(ghCalls).toEqual([expectedArgv(20, "Looks good.", H1)]);
+		expect(appCalls).toEqual([]);
+		expect(row(20).postedLogin).toBe("octocat");
+	});
+
+	test("an app without an installation falls back to gh with via token", async () => {
+		await saveApp();
+		// Default appFetchImpl answers 404 for the installation lookup.
+		const t = reviewed(21, H1);
+		ghResult = {
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/21#pullrequestreview-1",
+				user: { login: "octocat" },
+			}),
+			stderr: "",
+		};
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "octocat",
+			via: "token",
+		});
+		expect(appCalls.some((c) => c.url.endsWith("/installation"))).toBe(true);
+		expect(ghCalls).toEqual([expectedArgv(21, "Looks good.", H1)]);
+		await removeApp();
+	});
+
+	test("an app post carries the installation token and never runs gh", async () => {
+		await saveApp();
+		appHappyPath({
+			html_url: "https://github.com/acme/widget/pull/22#review-1",
+			user: { login: "ottr[bot]" },
+		});
+		const t = reviewed(22, H1);
+		const res = await postReview(t.id, { body: "Ship it." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "ottr[bot]",
+			via: "app",
+		});
+		expect(ghCalls).toEqual([]);
+		const mint = appCalls.find((c) => c.url.endsWith("/installation"))!;
+		expect(
+			(mint.init!.headers as Record<string, string>).authorization,
+		).toContain("eyJ");
+		const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+		expect(postCall.url).toBe(
+			"https://api.github.com/repos/acme/widget/pulls/22/reviews",
+		);
+		const headers = postCall.init!.headers as Record<string, string>;
+		expect(headers.authorization).toBe("Bearer INSTA");
+		expect(JSON.parse(postCall.init!.body as string)).toEqual({
+			event: "COMMENT",
+			body: `Ship it.${REVIEW_FOOTER}`,
+			commit_id: H1,
+		});
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as {
+			prReview: { postedLogin: string | null; postedUrl: string | null };
+		};
+		expect(view.prReview.postedLogin).toBe("ottr[bot]");
+		expect(view.prReview.postedUrl).toBe(
+			"https://github.com/acme/widget/pull/22#review-1",
+		);
+		await removeApp();
+	});
+
+	test("a failed token mint is a 502: the claim is released, post_error set, no key leaks", async () => {
+		await saveApp();
+		appFetchImpl = async (url) =>
+			url.endsWith("/installation")
+				? Response.json({ id: 77 })
+				: Response.json({ message: "nope" }, { status: 500 });
+		const t = reviewed(23, H1);
+		const res = await postReview(t.id, { body: "x" });
+		expect(res.status).toBe(502);
+		const text = await res.text();
+		expect(text).not.toContain(APP_PEM);
+		// The claim is released: the task view shows the head as not posted.
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as {
+			prReview: { postedHead: string | null; postError: string | null };
+		};
+		expect(view.prReview.postedHead).toBeNull();
+		expect(view.prReview.postError).not.toBeNull();
+		expect(view.prReview.postError).not.toContain(APP_PEM);
+		expect(ghCalls).toEqual([]);
+		await removeApp();
+	});
+
+	test("github-app settings save, view and errors never expose the key", async () => {
+		await removeApp();
+		const badId = await m.call("/api/git-hosts/github-app", {
+			id: "abc",
+			key: APP_PEM,
+		});
+		expect(badId.status).toBe(400);
+		expect(await errorOf(badId)).toBe(
+			"app id must be the numeric GitHub App ID",
+		);
+		const badKey = await m.call("/api/git-hosts/github-app", {
+			id: APP_ID,
+			key: "not a key",
+		});
+		expect(badKey.status).toBe(400);
+		expect(await errorOf(badKey)).toBe(
+			"the private key must be a PEM RSA private key",
+		);
+		const res = await saveApp();
+		expect(res.status).toBe(200);
+		const text = await res.text();
+		expect(text).not.toContain(APP_PEM);
+		const view = JSON.parse(text) as {
+			githubApp: { id: string; fingerprint: string } | null;
+		};
+		expect(view.githubApp).not.toBeNull();
+		expect(view.githubApp!.id).toBe(APP_ID);
+		expect(view.githubApp!.fingerprint.startsWith("SHA256:")).toBe(true);
+		const hosts = await m.call("/api/git-hosts", undefined);
+		expect(await hosts.text()).not.toContain(APP_PEM);
+		const del = await removeApp();
+		expect(((await del.json()) as { githubApp: unknown }).githubApp).toBeNull();
+	});
+
+	test("properties: random credentials never leak the key, and a throwing mint 502s without it", async () => {
+		const creds = fc.record({
+			id: fc.oneof(fc.string(), fc.constant(APP_ID)),
+			key: fc.oneof(fc.string(), fc.constant(APP_PEM)),
+		});
+		await fc.assert(
+			fc.asyncProperty(creds, fc.string(), async (body, message) => {
+				const saved = await m.call("/api/git-hosts/github-app", body);
+				expect([200, 400]).toContain(saved.status);
+				expect(await saved.text()).not.toContain(APP_PEM);
+				if (saved.status !== 200) return;
+				const t = reviewed(24, H1);
+				// Reopen the claim every run: the previous property run may have posted.
+				const r = prStore.getPrReview(24)!;
+				prStore.savePrReview({
+					...r,
+					postedHead: null,
+					postError: null,
+					postedLogin: null,
+				});
+				appFetchImpl = async () => {
+					throw new Error(message.slice(0, 50));
+				};
+				const res = await postReview(t.id, { body: "x" });
+				expect(res.status).toBe(502);
+				expect(await res.text()).not.toContain(APP_PEM);
+				const after = prStore.getPrReview(24)!;
+				expect(after.postedHead).toBeNull();
+				expect(after.postError).not.toContain(APP_PEM);
+				await removeApp();
+			}),
+			// Gate: the shared fixed-seed helper; 100 runs here, below the 200 gate.
+			{ numRuns: 100 },
+		);
 	});
 });
 
@@ -5618,6 +5845,7 @@ type KeyBody = { publicKey: string; fingerprint: string };
 type HostsView = {
 	tokens: Array<{ host: string; username: string; tokenSet: boolean }>;
 	globalKey: KeyBody | null;
+	githubApp: { id: string; fingerprint: string } | null;
 };
 
 describe("git-host urls on add project", () => {

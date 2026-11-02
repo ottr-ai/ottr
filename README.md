@@ -196,6 +196,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
 | Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |
 | GitHub token | none | asked at onboarding; **Settings → Git hosts → GitHub token** replaces it; stored in `.tasks/tracker.db`. Settings shows the expiry date of this token and of the compose seed token, and the board pushes a reminder from 30 days before an expiry (spec: [docs/specs/token-expiry.md](docs/specs/token-expiry.md)) |
+| GitHub App | none | optional; **Settings → Git hosts → GitHub App**; when set, posted PR reviews show as the app identity (`ottr[bot]` with a bot badge) instead of your own account; stored in `.tasks/tracker.db`; the key is write-only. Spec: [docs/specs/github-app.md](docs/specs/github-app.md); setup steps below |
 | Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Git hosts**: per-host HTTPS tokens (optional username) and a global SSH key; a project can set its own key in its **Settings**. Projects on other hosts clone with any `https://…`, `git@host:…` or `ssh://host[:port]/…` URL and work with plain git; the GitHub extras stay GitHub-only. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. |
 | Running agents | 3 total, 2 per project | **Settings**; empty = no cap |
 | Extra paths per worktree | none | **Settings** |
@@ -204,11 +205,25 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Model roles | the data repo's `user/omp/agent/config.yml` | **Settings → Model roles**: set the model and the thinking level of each omp role, or add and remove a role. A save commits `config.yml` to Alate's GitHub data repo with the board's GitHub token (**Settings → Git hosts → GitHub token**; it needs write access to that repo). The commit has the loaded commit as its parent, and the branch moves only as a fast-forward, so a moved data repo gives a conflict. Alate then imports the commit and provisions the workers. On compose, the board copy changes at the next hourly seed. Needs **Settings → Alate** with a GitHub repo source. Spec: [docs/specs/model-roles-editor.md](docs/specs/model-roles-editor.md) |
 | Retro | off | **Settings**, per project: files one retro card after each Done card |
 | Fork research | off | **Settings**, per project: hourly watch of the project's GitHub forks; findings arrive as proposals you accept |
-| PR reviews | off | **Settings**, per project: hourly watch of the project's open GitHub pull requests. For each new head, the server asks the model for a draft review in one tool-free call and files it on a review card, which wears the unread `new` badge until you open it; a new review of the same PR re-badges the card. No agent runs over the PR code. You edit the draft in the card and click **Post** to send one GitHub review with the `COMMENT` event; after a post the card links the posted review. Spec: [docs/specs/pr-reviews.md](docs/specs/pr-reviews.md) |
+| PR reviews | off | **Settings**, per project: hourly watch of the project's open GitHub pull requests. For each new head, the server asks the model for a draft review in one tool-free call and files it on a review card, which wears the unread `new` badge until you open it; a new review of the same PR re-badges the card. No agent runs over the PR code. You edit the draft in the card and click **Post** to send one GitHub review with the `COMMENT` event; with the GitHub App configured the post goes out as `ottr[bot]`, without it under your own identity; after a post the card links the posted review. Spec: [docs/specs/pr-reviews.md](docs/specs/pr-reviews.md) |
 | Hindsight server | env on compose | **Settings → Hindsight**: URL and API key for omp's memory backend |
 | Review due | 150 commits | **Settings**, per project; see [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
 | Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
 | Kept-worktree quarantine | 7 days | **Settings** |
+
+### GitHub App setup
+
+Do these steps once, so posted PR reviews show as `ottr[bot]`:
+
+1. On GitHub, go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
+2. Name the app `Ottr`. When the name is taken, use `Ottr-<owner>`.
+3. Leave the webhook off.
+4. Set the permissions: **Pull requests: Read and write** and **Metadata: Read**.
+5. Generate a private key and download the PEM file.
+6. Install the app on the repositories to review.
+7. Paste the App ID and the PEM into Ottr under **Settings → Git hosts → GitHub App**.
+
+Spec: [docs/specs/github-app.md](docs/specs/github-app.md).
 
 ### Remote access
 

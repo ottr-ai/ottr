@@ -162,6 +162,13 @@ export type TaskKind = "work" | "retro" | "review" | "interview" | "pr_review";
 
 export type PrState = "open" | "closed" | "merged";
 
+/** The registered GitHub App as the Settings git-hosts view shows it — never the key. */
+export interface GitHubAppView {
+	id: string;
+	/** `SHA256:` + unpadded base64 over the public key's SPKI DER digest. */
+	fingerprint: string;
+}
+
 /** One pr_review row: the watch state of one PR of the project's GitHub repo. */
 export interface PrReviewRow {
 	number: number;
@@ -173,6 +180,8 @@ export interface PrReviewRow {
 	postedHead: string | null;
 	/** html_url of the posted review; null until a Post succeeds. */
 	postedUrl: string | null;
+	/** GitHub login the review was posted as (app bot or person); null when unknown. */
+	postedLogin: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;
@@ -188,6 +197,8 @@ export interface PrReviewView {
 	postedHead: string | null;
 	/** html_url of the posted review; null until a Post succeeds. */
 	postedUrl: string | null;
+	/** GitHub login the review was posted as (app bot or person); null when unknown. */
+	postedLogin: string | null;
 	postError: string | null;
 }
 

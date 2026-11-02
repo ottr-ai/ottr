@@ -2341,6 +2341,7 @@ describe("pr review store methods", () => {
 		reviewedHead: null,
 		postedHead: null,
 		postedUrl: null,
+		postedLogin: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -2364,6 +2365,7 @@ describe("pr review store methods", () => {
 			reviewedHead: "abc",
 			postedHead: "abc",
 			postedUrl: "https://github.com/acme/widget/pull/12#pullrequestreview-1",
+			postedLogin: "ottr[bot]",
 			state: "merged" as const,
 			draft: true,
 			title: "Fix it",
@@ -2499,10 +2501,51 @@ describe("pr review store methods", () => {
 		const store = open(dir);
 		expect(store.getPrReview(7)).toMatchObject({ postedUrl: null });
 		const url = "https://github.com/acme/widget/pull/7#pullrequestreview-2";
-		store.setPrPostedUrl(7, url);
+		store.setPrPostedUrl(7, url, "ottr[bot]");
 		expect(store.getPrReview(7)?.postedUrl).toBe(url);
+		expect(store.getPrReview(7)?.postedLogin).toBe("ottr[bot]");
 		store.setPrPostedUrl(7, null);
 		expect(store.getPrReview(7)?.postedUrl).toBeNull();
+		expect(store.getPrReview(7)?.postedLogin).toBeNull();
+		store.close();
+	});
+
+	test("a pre-posted_login pr_review (with posted_url) converges on open and setPrPostedUrl round-trips", () => {
+		const dir = join(root, "pr-posted-login");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE pr_review (
+  number INTEGER PRIMARY KEY,
+  task_id TEXT,
+  head TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  reviewed_head TEXT,
+  posted_head TEXT,
+  posted_url TEXT,
+  state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
+  draft INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  post_error TEXT
+)`);
+		old.run(
+			"INSERT INTO pr_review (number, head, first_seen_at, posted_head, posted_url, state, draft, title) VALUES (7, 'abc', 1, 'abc', 'https://github.com/acme/widget/pull/7#pullrequestreview-2', 'open', 0, 'Old row')",
+		);
+		old.close();
+		const store = open(dir);
+		expect(store.getPrReview(7)).toMatchObject({
+			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
+			postedLogin: null,
+		});
+		store.setPrPostedUrl(7, null, "octocat");
+		expect(store.getPrReview(7)?.postedLogin).toBe("octocat");
+		store.setPrPostedUrl(7, null);
+		expect(store.getPrReview(7)).toMatchObject({
+			postedUrl: null,
+			postedLogin: null,
+		});
 		store.close();
 	});
 

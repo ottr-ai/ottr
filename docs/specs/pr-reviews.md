@@ -43,7 +43,7 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 Each project has its own store, so the PR number is the key inside it.
 
-- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
+- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
 - Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
 - `savePrDraft({ run, number, head, draft, prompt })` runs in one transaction:
@@ -54,16 +54,18 @@ Each project has its own store, so the PR number is the key inside it.
 
 ### Post
 
-- `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postedUrl, postError }` for a `pr_review` card.
-- The drawer shows the draft (the card's `details`) in an editable text box and a Post button. When the head is posted, the drawer shows `Posted for <head>`; with a stored `posted_url` it links to the posted review on GitHub.
+- `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postedUrl, postedLogin, postError }` for a `pr_review` card.
+- The drawer shows the draft (the card's `details`) in an editable text box and a Post button. When the head is posted, the drawer shows `Posted for <head>`; with a stored `posted_url` it links to the posted review on GitHub. When a `posted_login` is stored, the drawer appends `· Posted as <login>` after the posted head label. `ottr[bot]` marks an app post, the user's login marks a fallback post.
 - `POST /api/projects/:project/tasks/:id/pr-review/post { body }`:
   - `body` must be a non-empty string of at most `REVIEW_BODY_MAX` characters (65536 minus the footer), else 400.
   - The card must be kind `pr_review`, in `done/idle`, and have `details`, else 409.
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
-  - Before the gh call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
-  - Ottr runs `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body + REVIEW_FOOTER> -f commit_id=<reviewedHead>`. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
-  - On success Ottr parses the response body and stores its `html_url` in `posted_url`; a body without an `https://github.com/` URL stores null.
+  - Before the GitHub call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
+  - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with event `COMMENT`, the body plus `REVIEW_FOOTER`, and `commit_id` set to the reviewed head.
+  - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`.
+  - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body + REVIEW_FOOTER> -f commit_id=<reviewedHead>`. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
+  - On success Ottr parses the response body and stores its `html_url` in `posted_url`, and its `user.login` in `posted_login`; a body without an `https://github.com/` URL stores null for the URL. `setPrPostedUrl(number, url, login = null)` writes both columns in one statement. `PrReviewRow` and `PrReviewView` gain `postedLogin: string | null` (additive, the `posted_url` pattern).
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
@@ -74,6 +76,7 @@ Each project has its own store, so the PR number is the key inside it.
 - The only GitHub write is the Post click. The watcher reads only.
 - No agent runs over PR code. The model gets the PR only as data and has no tools.
 - `event` is always `COMMENT`. Ottr never sends `APPROVE` or `REQUEST_CHANGES`.
+- Only the PR review post uses the GitHub App. Merge pushes, releases and CI reads keep the board token.
 - Schema changes are additive only.
 
 ## Acceptance checks
@@ -88,6 +91,10 @@ Each project has its own store, so the PR number is the key inside it.
 - The model message holds the PR fields only as DATA blocks after the fixed system prompt.
 - Post sends one `COMMENT` review with the edited body and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
 - A closed or merged PR disables Post and stops new reviews.
+- The app JWT has the right header, `iss = appId`, `iat = now - 60`, and an `exp` of at most 10 minutes; a test verifies the signature with the test key pair's public key.
+- With the app configured and an installation found, the post call carries the installation token, and the board token's `gh` path stays unused.
+- With no app, or with an installation 404, the post uses the board token and the response reports `via: "token"`.
+- The private key never appears in any API response, log line or error text: a fixed-seed fast-check property over random error paths asserts this against the responses and the git-hosts view.
 
 ## Non-goals
 

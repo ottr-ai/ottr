@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   reviewed_head TEXT,
   posted_head TEXT,
   posted_url TEXT,
+  posted_login TEXT,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
@@ -273,6 +274,7 @@ interface PrReviewDbRow {
 	reviewed_head: string | null;
 	posted_head: string | null;
 	posted_url: string | null;
+	posted_login: string | null;
 	state: string;
 	draft: number;
 	title: string;
@@ -288,6 +290,7 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		reviewedHead: r.reviewed_head,
 		postedHead: r.posted_head,
 		postedUrl: r.posted_url,
+		postedLogin: r.posted_login,
 		state: r.state as PrState,
 		draft: r.draft !== 0,
 		title: r.title,
@@ -1218,6 +1221,10 @@ export class ProjectStore {
 			.map((c) => c.name);
 		if (!prCols.includes("posted_url"))
 			db.exec("ALTER TABLE pr_review ADD COLUMN posted_url TEXT");
+		// posted_login landed with the GitHub App posts: same additive convergence, so an
+		// older database still reads and posts without a rebuild.
+		if (!prCols.includes("posted_login"))
+			db.exec("ALTER TABLE pr_review ADD COLUMN posted_login TEXT");
 		// pr_review_runs changed shape twice inside the first pr_review releases (head, then
 		// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
 		// prHeadReviewed and the done update then throw "no such column" and the watcher
@@ -1542,11 +1549,12 @@ export class ProjectStore {
 	/** Upserts one PR watch row by PR number. */
 	savePrReview(row: PrReviewRow): void {
 		this.db.run(
-			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, posted_url, state, draft, title, post_error)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, posted_url, posted_login, state, draft, title, post_error)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(number) DO UPDATE SET
 			   task_id = excluded.task_id, head = excluded.head, first_seen_at = excluded.first_seen_at,
 			   reviewed_head = excluded.reviewed_head, posted_head = excluded.posted_head, posted_url = excluded.posted_url,
+			   posted_login = excluded.posted_login,
 			   state = excluded.state, draft = excluded.draft, title = excluded.title, post_error = excluded.post_error`,
 			[
 				row.number,
@@ -1556,6 +1564,7 @@ export class ProjectStore {
 				row.reviewedHead,
 				row.postedHead,
 				row.postedUrl,
+				row.postedLogin,
 				row.state,
 				row.draft ? 1 : 0,
 				row.title,
@@ -1572,12 +1581,16 @@ export class ProjectStore {
 		]);
 	}
 
-	/** Stores the posted review's html_url after a successful Post; null clears it. */
-	setPrPostedUrl(number: number, url: string | null): void {
-		this.db.run("UPDATE pr_review SET posted_url = ? WHERE number = ?", [
-			url,
-			number,
-		]);
+	/** Stores the posted review's html_url and posting login after a successful Post; null clears both. */
+	setPrPostedUrl(
+		number: number,
+		url: string | null,
+		login: string | null = null,
+	): void {
+		this.db.run(
+			"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
+			[url, login, number],
+		);
 	}
 
 	/**
