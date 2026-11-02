@@ -1038,10 +1038,11 @@ export async function isIntegrated(
 
 /**
  * Worker-writable roots for the pinned-origin check (R5-1): compose mounts the project roots
- * (OMP_TRACKER_ROOTS, /workspace) and OTTR_DATA_DIR into every worker read-write, so a repo
- * under them is a repo a work turn can rewrite, and a push runs its pre-receive hook in the
- * server's git next to the tokens. Set once at boot, only when OTTR_DATA_DIR names a worker
- * boundary; empty (native single-user boards, tests) allows every local pin.
+ * (OMP_TRACKER_ROOTS, /workspace), OTTR_DATA_DIR (/data) and the shared home volume (/root)
+ * into every worker read-write, so a repo under them is a repo a work turn can rewrite, and
+ * a push runs its pre-receive hook in the server's git next to the tokens. Set once at boot,
+ * only when OTTR_DATA_DIR names a worker boundary; empty (native single-user boards, tests)
+ * allows every local pin.
  */
 let workerRoots: readonly string[] = [];
 export function setWorkerRoots(roots: readonly string[]): void {
@@ -1071,16 +1072,20 @@ const sameOrUnder = (child: string, root: string): boolean => {
 /**
  * Refuses to run network git for a pinned origin URL that a work turn could have bent (R5-1,
  * docs/specs/pinned-origin-url.md): a local pin under a worker-writable root would push into
- * a repo the turn can rewrite, and an `url.<base>.insteadOf` entry matching the pin (any
- * config scope — the repo config is worker-writable) would redirect the call to a repo the
- * pin never named. git's rewrite rule is over-approximated to fail closed: any matching
- * prefix refuses, whatever the longest-match outcome would be. The config read is a local
- * subcommand: gitEnv strips the auth env from it. Returns the error text, else null.
+ * a repo the turn can rewrite; a pin that is not a URL or path (a leading `-` would parse as
+ * a git option and could drop the repository argument, falling back to the planted default
+ * remote) is refused; and an `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` entry
+ * matching the pin (any config scope — the repo config is worker-writable) would redirect the
+ * call to a repo the pin never named. git's rewrite rule is over-approximated to fail closed:
+ * any matching prefix refuses, whatever the longest-match outcome would be. The config read is
+ * a local subcommand: gitEnv strips the auth env from it. Returns the error text, else null.
  */
 export async function checkPinnedRemote(
 	mainPath: string,
 	pinned: string,
 ): Promise<string | null> {
+	if (pinned.startsWith("-"))
+		return `the pinned origin ${pinned} is not a URL or path; re-pin the origin remote`;
 	const local = localPinPath(mainPath, pinned);
 	if (local !== null) {
 		const root = workerRoots.find((root) => sameOrUnder(local, root));
@@ -1091,9 +1096,11 @@ export async function checkPinnedRemote(
 	for (const entry of r.stdout.split("\0")) {
 		const nl = entry.indexOf("\n");
 		if (nl === -1) continue;
-		if (!/^url\..*\.insteadof$/i.test(entry.slice(0, nl))) continue;
+		// Both rewrite keys: insteadOf bends fetches, pushInsteadOf bends pushes only —
+		// either would send the pinned call to a repo the pin never named.
+		if (!/^url\..*\.(?:push)?insteadof$/i.test(entry.slice(0, nl))) continue;
 		if (pinned.startsWith(entry.slice(nl + 1)))
-			return `repo config rewrites the pinned origin: an url.<…>.insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
+			return `repo config rewrites the pinned origin: an url.<…>.(push)insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
 	}
 	return null;
 }

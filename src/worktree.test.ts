@@ -811,6 +811,49 @@ describe("pinned origin URL (OTTR-348)", () => {
 		}
 	}, 60_000);
 
+	test("an url.<…>.pushInsteadOf entry matching the pin fails the push closed", async () => {
+		const f = fixture();
+		try {
+			// pushInsteadOf bends pushes only, so an insteadOf-only scan misses it: the
+			// rewrite turns the pinned bare into the evil repo at push time.
+			run(f.main, "config", `url.${f.evil}.pushInsteadOf`, f.bare);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(r.status).toBe("failed");
+			expect(r.status === "failed" && r.error.includes("insteadOf")).toBe(true);
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a pin that is a git option, not a URL, fails closed", async () => {
+		const f = fixture();
+		try {
+			// A leading `-` would parse as a git option and could drop the repository
+			// argument, falling back to the planted default remote.
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				"--upload-pack=evil:x",
+			);
+			expect(r.status).toBe("failed");
+			expect(r.status === "failed" && r.error.includes("not a URL")).toBe(true);
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	test("a local pin under a worker-writable root fails closed; without roots it works", async () => {
 		const f = fixture();
 		try {

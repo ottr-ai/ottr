@@ -48,16 +48,21 @@ from `origin` by name.
    fails closed (mismatch). `resolveTarget` skips the fetch with its warning
    (same as a failed fetch today). `planRelease` skips the tag fetch.
 5. `checkPinnedRemote` guards every pinned call, in the repo, before git runs:
+   - the pin must look like a URL or path: a value whose first character is `-`
+     (it would parse as a git option and could drop the repository argument,
+     falling back to the planted default remote) is refused;
    - a local pin (plain path, Windows drive/UNC path, or `file://` URL whose
      authority is empty or `localhost`) must resolve outside every
      worker-writable root. The roots are the project roots
-     (`OMP_TRACKER_ROOTS`) and `OTTR_DATA_DIR`, set at boot when
-     `OTTR_DATA_DIR` is configured — that is, when a worker boundary exists at
-     all. Native single-user boards (no `OTTR_DATA_DIR`) check nothing, as
-     before.
-   - no `url.<base>.insteadOf` entry from any config scope may match the pin
-     (prefix match, git's own rule, over-approximated to fail closed). A
-     rewrite would redirect the push or fetch to a repo the pin never named.
+     (`OMP_TRACKER_ROOTS`), `OTTR_DATA_DIR`, and the server's own home (the
+     compose shared `home` volume at `/root`), set at boot when `OTTR_DATA_DIR`
+     is configured — that is, when a worker boundary exists at all. Native
+     single-user boards (no `OTTR_DATA_DIR`) check nothing, as before.
+   - no `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` entry from any
+     config scope may match the pin (prefix match, git's own rule,
+     over-approximated to fail closed). A rewrite would redirect the push or
+     fetch to a repo the pin never named; `pushInsteadOf` rewrites push
+     destinations only, so both keys are scanned for every call.
 6. `GIT_ALLOW_PROTOCOL` stays `https:ssh:file`. After this change a `file`
    transport can only be reached through the pinned URL (clone only accepts
    https/ssh URLs from the admin), and a local pin under a worker-writable root
@@ -67,13 +72,15 @@ from `origin` by name.
 
 - A pin is captured from the same worker-writable `.git/config` once, at boot
   or add time. A plant that already sits there before the first post-upgrade
-  boot can be adopted — but the worker-root check refuses the workspace-local
-  form of the attack at every use, and a planted https URL carries no matching
-  credential, so the push fails closed. The residual window is no wider than
-  the pre-fix state and closes after the first capture.
-- `url.<base>.insteadOf` rewriting to a foreign https host stays possible for
-  fetches of public repos; no token matches the rewritten host. The code it
-  could feed the board is code the worker already holds.
+  boot can be adopted — but the worker-root check refuses any local plant under
+  a worker-writable root (workspace, data dir, shared home) at every use, and a
+  planted https URL carries no matching credential, so the push fails closed.
+  The residual window is no wider than the pre-fix state and closes after the
+  first capture.
+- `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` rewriting to a foreign
+  https host stays possible for fetches of public repos; no token matches the
+  rewritten host. The code it could feed the board is code the worker already
+  holds.
 - Residuals documented before this change stand: a planted `http.<url>.proxy`
   with `sslVerify=false` can see a token; board git never recurses into
   submodules.
@@ -88,7 +95,10 @@ from `origin` by name.
   not exist. A control run proves plain git runs the hook.
 - The same plant against `mergeHoldMismatch` audits the real bare's tip.
 - A planted `url.<evil>.insteadOf` entry matching the pin fails the push and
-  the gate fetch closed, with the entry named in the error.
+  the gate closed, with the entry named in the error.
+- A planted `url.<evil>.pushInsteadOf` entry matching the pin fails the push
+  closed.
+- A pin that starts with `-` (a git option, not a URL) fails closed.
 - A pin under a configured worker root fails closed; with no roots configured
   the same pin works (native behavior unchanged).
 - A planted `remote.origin.fetch` refspec is ignored by the pinned

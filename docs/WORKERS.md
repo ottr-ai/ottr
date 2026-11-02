@@ -397,18 +397,21 @@ work turn can re-point a remote name through the worker-writable `.git/config`
 — and the pre-receive hook of the repo it names runs in the server's git next
 to these tokens (the `core.hooksPath=/dev/null` pin does not reach the local
 `receive-pack` child of a `file://` push). Every pinned call also refuses to
-run when the repo config holds an `url.<base>.insteadOf` entry that matches the
-pin (a rewrite would send the call to a repo the pin never named), and when a
-local pin sits under a worker-writable root (the project roots and
-`OTTR_DATA_DIR`, set when a worker boundary exists). A local pinned URL outside
+run when the repo config holds an `url.<base>.insteadOf` or
+`url.<base>.pushInsteadOf` entry that matches the pin (a rewrite would send the
+call to a repo the pin never named), when the pin itself is not a URL or path
+(a leading `-` would parse as a git option), and when a local pin sits under a
+worker-writable root (the project roots, `OTTR_DATA_DIR`, and the server's own
+home — compose mounts the shared `home` volume at `/root` into the server and
+every worker), set when a worker boundary exists. A local pinned URL outside
 those roots keeps working, which is why `file` stays in `GIT_ALLOW_PROTOCOL`.
 Residuals: a pin captured at boot can adopt a remote URL that a turn planted
-before that boot — the worker-root check refuses the workspace-local form, and
-a planted https URL carries no matching credential, so such a push fails
-closed; an `url.<base>.insteadOf` rewrite to a foreign https host can feed a
-fetch of a public repo, but no token matches the rewritten host. For a project
-without a GitHub remote, the server pushes the merged target to the pinned
-origin URL after the merge turn ends.
+before that boot — the worker-root check refuses any local plant under those
+roots at every use, and a planted https URL carries no matching credential, so
+such a push fails closed; an `url.<base>.(push)insteadOf` rewrite to a foreign
+https host can feed a fetch of a public repo, but no token matches the
+rewritten host. For a project without a GitHub remote, the server pushes the
+merged target to the pinned origin URL after the merge turn ends.
 
 The card of the dev-only **Check the board** button also runs in the server container.
 Only loopback there reaches the full board API. On the turns' host (`OTTR_BOARD_URL`), a

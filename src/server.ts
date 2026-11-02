@@ -2,7 +2,7 @@
 // Startup and wiring only: routes live in createApp() (src/app.ts), the turn
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
-import { constants } from "node:os";
+import { constants, homedir } from "node:os";
 import { delimiter, resolve } from "node:path";
 import type { Server } from "bun";
 import { createApp, storedProjectPaths } from "./app.ts";
@@ -270,12 +270,14 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 }
 
 // R5-1 (docs/specs/pinned-origin-url.md): when a worker boundary exists (OTTR_DATA_DIR is
-// the shared volume the workers mount read-write), a local pinned origin under the project
-// roots or the data dir would let the board push into a repo a work turn can rewrite. The
+// the shared volume the workers mount read-write), a local pinned origin under a
+// worker-writable root would let the board push into a repo a work turn can rewrite. The
+// roots are the project roots, the data dir, and the server's own home — compose mounts the
+// shared `home` volume at /root into the server and every worker (docker-compose.yml). The
 // pinned-URL check refuses those pins at every use. Native single-user boards (no
 // OTTR_DATA_DIR) check nothing, as before.
 if (process.env.OTTR_DATA_DIR)
-	setWorkerRoots([...ROOTS, resolve(process.env.OTTR_DATA_DIR)]);
+	setWorkerRoots([...ROOTS, resolve(process.env.OTTR_DATA_DIR), homedir()]);
 
 for (const p of discoverProjects(
 	ROOTS,
