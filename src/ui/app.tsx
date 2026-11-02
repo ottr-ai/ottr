@@ -48,7 +48,12 @@ import type {
 	UpdateRow,
 	UpdatesView,
 } from "../types.ts";
-import { PERF_RANGES, PRIORITIES, VERSION_RE } from "../types.ts";
+import {
+	PERF_RANGES,
+	PRIORITIES,
+	REVIEW_BODY_MAX,
+	VERSION_RE,
+} from "../types.ts";
 import { mapRepo } from "../updates.ts";
 import {
 	type AttachedImage,
@@ -5849,7 +5854,7 @@ function PrReviewSection({
 				<textarea
 					id="pr-review-text"
 					rows={10}
-					maxLength={65536}
+					maxLength={REVIEW_BODY_MAX}
 					value={body}
 					onChange={(e) => setBody(e.target.value)}
 				/>

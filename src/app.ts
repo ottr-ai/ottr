@@ -170,6 +170,8 @@ import {
 	type ProjectView,
 	type ProvisioningResponse,
 	type QuotaState,
+	REVIEW_BODY_MAX,
+	REVIEW_FOOTER,
 	type ServerMessage,
 	type StateResponse,
 	type Task,
@@ -5167,7 +5169,7 @@ export function createApp(deps: AppDeps) {
 					const body = r.body.body;
 					if (typeof body !== "string" || body.trim() === "")
 						return json({ error: "body must be a non-empty string" }, 400);
-					if (body.length > 65536)
+					if (body.length > REVIEW_BODY_MAX)
 						return json({ error: "body is too long" }, 400);
 					const found = resolveTask(req.params.project, req.params.id);
 					if (found instanceof Response) return found;
@@ -5210,7 +5212,7 @@ export function createApp(deps: AppDeps) {
 							"-f",
 							"event=COMMENT",
 							"-f",
-							`body=${body}`,
+							`body=${body}${REVIEW_FOOTER}`,
 							"-f",
 							`commit_id=${head}`,
 						]);

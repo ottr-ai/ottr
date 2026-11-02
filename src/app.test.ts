@@ -58,7 +58,13 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
-import type { AddProjectResponse, PrReviewRow, Task } from "./types.ts";
+import {
+	type AddProjectResponse,
+	type PrReviewRow,
+	REVIEW_BODY_MAX,
+	REVIEW_FOOTER,
+	type Task,
+} from "./types.ts";
 import { loadSkips } from "./updates.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
@@ -5240,7 +5246,7 @@ describe("PR review routes", () => {
 		"-f",
 		"event=COMMENT",
 		"-f",
-		`body=${body}`,
+		`body=${body}${REVIEW_FOOTER}`,
 		"-f",
 		`commit_id=${head}`,
 	];
@@ -5262,6 +5268,22 @@ describe("PR review routes", () => {
 		expect(await errorOf(res)).toBe("project has no GitHub remote");
 		const unknown = await post("/api/projects/nope/prs/check", {});
 		expect(unknown.status).toBe(404);
+	});
+
+	test("post appends the AI footer and keeps the whole body inside GitHub's 65536 characters", async () => {
+		// Its own PR number: the routes share one store, and PR 1 is posted by the next test.
+		const t = reviewed(41, H1);
+		const tooLong = await postReview(t.id, {
+			body: "x".repeat(REVIEW_BODY_MAX + 1),
+		});
+		expect(tooLong.status).toBe(400);
+		expect(ghCalls).toEqual([]);
+		const full = "x".repeat(REVIEW_BODY_MAX);
+		expect((await postReview(t.id, { body: full })).status).toBe(200);
+		const sent = ghCalls[0]!.find((a) => a.startsWith("body="))!.slice(5);
+		expect(sent).toBe(full + REVIEW_FOOTER);
+		expect(sent.length).toBe(65536);
+		expect(REVIEW_FOOTER).toContain("Ottr");
 	});
 
 	test("post sends one COMMENT review at the reviewed head, then refuses the same head", async () => {

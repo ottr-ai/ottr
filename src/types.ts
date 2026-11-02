@@ -836,6 +836,13 @@ export interface MachineStats {
 	}[];
 }
 
+/** Appended to every posted PR review: the review goes out under the poster's own GitHub
+ *  identity, so the body itself says that an AI agent drafted it and a person posted it. */
+export const REVIEW_FOOTER =
+	"\n\n---\n<sub>Drafted by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker. A person read the draft and posted it.</sub>";
+/** GitHub's limit on a review body (65536 characters) minus the footer: the editable draft's limit. */
+export const REVIEW_BODY_MAX = 65536 - REVIEW_FOOTER.length;
+
 /** Time ranges the performance dashboard can filter by. */
 export const PERF_RANGES = ["1h", "24h", "7d", "30d", "90d", "all"] as const;
 export type PerfRange = (typeof PERF_RANGES)[number];

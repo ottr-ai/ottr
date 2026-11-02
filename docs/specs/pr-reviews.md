@@ -57,12 +57,12 @@ Each project has its own store, so the PR number is the key inside it.
 - `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postedUrl, postError }` for a `pr_review` card.
 - The drawer shows the draft (the card's `details`) in an editable text box and a Post button. When the head is posted, the drawer shows `Posted for <head>`; with a stored `posted_url` it links to the posted review on GitHub.
 - `POST /api/projects/:project/tasks/:id/pr-review/post { body }`:
-  - `body` must be a non-empty string of at most 65536 characters, else 400.
+  - `body` must be a non-empty string of at most `REVIEW_BODY_MAX` characters (65536 minus the footer), else 400.
   - The card must be kind `pr_review`, in `done/idle`, and have `details`, else 409.
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the gh call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
-  - Ottr runs `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body> -f commit_id=<reviewedHead>`.
+  - Ottr runs `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body + REVIEW_FOOTER> -f commit_id=<reviewedHead>`. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
   - On success Ottr parses the response body and stores its `html_url` in `posted_url`; a body without an `https://github.com/` URL stores null.
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
