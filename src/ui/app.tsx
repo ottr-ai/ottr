@@ -3068,7 +3068,7 @@ function Triage({
 								<button
 									key={t.id}
 									type="button"
-									className={t.asked === null ? "tri alarm" : "tri"}
+									className="tri"
 									onClick={() => openTask(t.id)}
 								>
 									<Mark kind={cardMark(t)} />

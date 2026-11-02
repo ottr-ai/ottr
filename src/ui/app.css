@@ -2886,8 +2886,9 @@ a.release:hover {
 	font-variant-numeric: tabular-nums;
 }
 
-/* Triage: one full-width row per waiting card, then project warnings; the amber edge marks
-   needs_you cards, questions and warnings stay grey. Rows are links and buttons. */
+/* Triage: one full-width row per waiting card, then project warnings. The mark at the row start
+   carries the state (amber "!" for needs-you, steel "?" for a question); no coloured edge.
+   Rows are links and buttons. */
 .triage {
 	padding: 4px 0;
 }
@@ -2906,15 +2907,11 @@ a.release:hover {
 	text-decoration: none;
 	background: none;
 	border: 0;
-	border-left: 3px solid transparent;
 	border-radius: 0;
 	cursor: pointer;
 }
 .tri:hover {
 	background: var(--card-hover);
-}
-.tri.alarm {
-	border-left-color: var(--alarm);
 }
 .tri .t {
 	overflow: hidden;
