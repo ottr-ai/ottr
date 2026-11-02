@@ -825,6 +825,67 @@ textarea {
 	color: var(--text-strong);
 	font-variant-numeric: tabular-nums;
 }
+/* Agents in the system popover: three large figures read at a glance; a zero drops to dim. */
+.ag-nums {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 8px;
+	margin: 0;
+}
+.ag-nums div {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 10px;
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	background: var(--panel);
+}
+.ag-nums dd {
+	order: -1;
+	margin: 0;
+	font-size: 24px;
+	font-weight: 600;
+	line-height: 1.1;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+}
+.ag-nums dt {
+	font-size: 12px;
+	color: var(--dim);
+}
+.ag-nums div[data-zero] dd {
+	font-weight: 400;
+	color: var(--dim);
+}
+.ag-cap {
+	display: flex;
+	margin-top: 8px;
+	font-size: 12.5px;
+}
+.ag-cap .caption {
+	margin: 0;
+}
+.ag-cap .meter {
+	display: flex;
+	flex: 1;
+}
+/* Outranks the stacked-shell rule that hides bar tracks, like .quota .meter-track. */
+.ag-cap .meter-track {
+	display: block;
+	flex: 1;
+	width: auto;
+}
+.mach {
+	margin: 0;
+	font-size: 12px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.mach b {
+	font-weight: 400;
+	color: var(--text);
+}
 /* Provider quota: one grid for every provider, so tracks and values line up; Meter parts become cells. */
 .quota {
 	display: grid;

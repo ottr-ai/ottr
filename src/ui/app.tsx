@@ -828,25 +828,36 @@ function SystemBar({
 				</span>
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
+				{/* Order by urgency: agents first (big figures, no table to read), quota second,
+				    the machine averages last on one line. Running counts preparing todo slots too. */}
 				<section>
-					<h2>Machine</h2>
-					<dl className="readout">
-						<div>
-							<dt>CPU</dt>
-							<dd>{stats === null ? "n/a" : `${stats.cpu} %`}</dd>
+					<h2>Agents</h2>
+					<dl className="ag-nums">
+						<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
+							<dt>Running</dt>
+							<dd>{slots.in_progress + slots.todo}</dd>
 						</div>
-						<div>
-							<dt>RAM</dt>
-							<dd>
-								{stats === null
-									? "n/a"
-									: `${stats.ram.usedGiB} / ${stats.ram.totalGiB} GiB`}
-							</dd>
+						<div data-zero={slots.merging === 0 || undefined}>
+							<dt>Merging</dt>
+							<dd>{slots.merging}</dd>
+						</div>
+						<div data-zero={waiting === 0 || undefined}>
+							<dt>Waiting</dt>
+							<dd>{waiting}</dd>
 						</div>
 					</dl>
-					<p className="caption">
-						Averages over the last 15 minutes, for sizing the runner caps.
-					</p>
+					<div className="ag-cap">
+						{maxTotal === null ? (
+							<span className="caption">No cap on agents across projects.</span>
+						) : (
+							<Meter
+								label="Slots"
+								pct={maxTotal > 0 ? (used / maxTotal) * 100 : null}
+								value={`${used}/${maxTotal}`}
+								band={false}
+							/>
+						)}
+					</div>
 				</section>
 				<section>
 					<h2>Provider quota</h2>
@@ -880,23 +891,15 @@ function SystemBar({
 					)}
 				</section>
 				<section>
-					<h2>Agents</h2>
-					<dl className="readout">
-						{SLOT_STAGES.map((s) => (
-							<div key={s}>
-								<dt>{COLUMNS.find((c) => c.key === s)!.label}</dt>
-								<dd>{slots[s]}</dd>
-							</div>
-						))}
-						<div>
-							<dt>Waiting</dt>
-							<dd>{waiting}</dd>
-						</div>
-						<div>
-							<dt>Limit</dt>
-							<dd>{maxTotal ?? "no cap"}</dd>
-						</div>
-					</dl>
+					<p className="mach">
+						Machine, 15-min average · CPU{" "}
+						<b>{stats === null ? "n/a" : `${stats.cpu} %`}</b> · RAM{" "}
+						<b>
+							{stats === null
+								? "n/a"
+								: `${stats.ram.usedGiB} / ${stats.ram.totalGiB} GiB`}
+						</b>
+					</p>
 				</section>
 			</div>
 		</>
