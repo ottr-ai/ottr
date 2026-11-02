@@ -5,7 +5,9 @@ import base from "./stryker.config.mjs";
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
   ...base,
-  commandRunner: { command: "ulimit -d 2097152 && bun test --bail scripts/update-image.test.ts" },
+  // scripts/mutant-run.ts gives each run a private TMPDIR and removes it afterwards: no fixture or
+  // mutant touches the worker's shared /tmp.
+  commandRunner: { command: "ulimit -d 2097152 && bun scripts/mutant-run.ts bun test --bail scripts/update-image.test.ts" },
   mutate: ["scripts/update-image.ts"],
   // 8, not the main config's 24, with the git-heavy configs' budget (timeoutMS + timeoutFactor x
   // dry-run net time). The comment here said "Pinned at 8" while the field was missing, so the run

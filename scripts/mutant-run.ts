@@ -5,6 +5,9 @@
 // mutated file; a map miss skips stage 1 and only the full suite runs — slower,
 // never wrong. The parent shell runs under `ulimit -d 2097152`; children inherit
 // it. Linux-only: relies on POSIX grep and the ulimit.
+// With arguments (`bun scripts/mutant-run.ts bun test --bail src/turn.test.ts`), it runs only that
+// command, in the same private TMPDIR: the isolated configs use this, so a mutant's file
+// operations stay off the worker's shared /tmp.
 import {
 	type Dirent,
 	existsSync,
@@ -227,7 +230,8 @@ async function mutantRun(mutant: string, flags: string[]): Promise<void> {
 	process.exit(await run(["bun", "test", "--bail", "--parallel=8", ...flags]));
 }
 
-export async function main(): Promise<void> {
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+	if (argv.length > 0) process.exit(await run(argv));
 	const flags = IGNORED.map((f) => `--path-ignore-patterns=${f}`);
 	const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;
 	if (mutant) await mutantRun(mutant, flags);

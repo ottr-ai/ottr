@@ -116,6 +116,23 @@ describe("run", () => {
 		expect(code).not.toBe(0);
 		expect(leftOver()).toEqual([]);
 	});
+
+	test("command mode: an isolated config's test command gets a private TMPDIR, its exit code, no leftover", () => {
+		const r = Bun.spawnSync(
+			[
+				process.execPath,
+				join(import.meta.dir, "mutant-run.ts"),
+				"bun",
+				"-e",
+				"console.log(process.env.TMPDIR); process.exit(3)",
+			],
+			{ env: { ...process.env, TMPDIR: runRoot }, stdout: "pipe" },
+		);
+		expect(r.exitCode).toBe(3);
+		const seen = r.stdout.toString().trim();
+		expect(seen.startsWith(join(runRoot, "ott-mutant-run-"))).toBe(true);
+		expect(leftOver()).toEqual([]);
+	});
 });
 
 describe("findMutatedFile", () => {

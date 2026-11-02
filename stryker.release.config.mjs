@@ -8,9 +8,10 @@ import { mutationConcurrency } from "./scripts/stryker-load.mjs";
 export default {
   ...base,
   // The ulimit prefix matches the main config's cap, so a runaway aborts instead of OOMing the
-  // host. --bail: a killed mutant needs only the first failing test, not the whole ~84 s git suite. Bun
-  // skips afterAll on bail, but each fixture dir is swept by the next run (see sweepStaleFixtures).
-  commandRunner: { command: "ulimit -d 2097152 && bun test --bail src/release.test.ts" },
+  // host. --bail: a killed mutant needs only the first failing test, not the whole ~84 s git suite.
+  // scripts/mutant-run.ts runs it in a private TMPDIR and removes it afterwards, also after a bail
+  // that skips afterAll: no fixture or mutant touches the worker's shared /tmp.
+  commandRunner: { command: "ulimit -d 2097152 && bun scripts/mutant-run.ts bun test --bail src/release.test.ts" },
   mutate: ["src/release.ts"],
   // 8, not the base cap: this git-spawn-heavy suite inflated every run past any timeout
   // budget at higher concurrency (80/80 timed out at 16-way, 2026-09-30); 8 keeps runs within the
