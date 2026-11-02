@@ -814,51 +814,92 @@ function SystemBar({
 		quota?.limits ?? [],
 		catalog?.defaultModel ?? null,
 	);
+	const quotaPct = tightest?.usedPct ?? null;
+	const quotaLevel = loadLevel(quotaPct);
+	const quotaGone = tightest === null ? null : windowGone(tightest, Date.now());
+	const cpu = stats?.cpu ?? null;
+	const ram = stats?.ram.pct ?? null;
+	const machineLevel = loadLevel(
+		cpu === null || ram === null ? null : Math.max(cpu, ram),
+	);
+	const machineWord =
+		machineLevel === "na"
+			? "Machine n/a"
+			: machineLevel === "high"
+				? "Machine busy"
+				: machineLevel === "crit"
+					? "Machine overloaded"
+					: "Machine ok";
 	return (
 		<>
+			{/* Quiet line: the running count first, the tightest quota as a time-over-quota twin bar,
+			    one dot for machine health. Every number and the 24 h history live in the popover. */}
 			<button
 				type="button"
 				className="meters"
 				popoverTarget="system-detail"
-				aria-label={
-					waiting > 0
-						? `${waiting} waiting, all projects. Machine, quota and agent details`
-						: "Machine, quota and agent details"
-				}
-				title="Machine, quota and agent details"
+				aria-label={`${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}, ${machineWord}. Agent, quota and machine details`}
+				title="Agent, quota and machine details"
 			>
-				<Meter label="CPU" pct={stats?.cpu ?? null} />
-				<Meter label="RAM" pct={stats?.ram.pct ?? null} />
-				{(tightest !== null || quota === null || quota.error !== null) && (
-					<Meter
-						label="Quota"
-						pct={tightest?.usedPct ?? null}
-						title={
-							tightest === null
-								? undefined
-								: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used`
-						}
-					/>
-				)}
-				<Meter
-					label="Agents"
-					pct={
-						maxTotal !== null && maxTotal > 0 ? (used / maxTotal) * 100 : null
-					}
-					value={maxTotal === null ? `${used}/∞` : `${used}/${maxTotal}`}
-					band={false}
-				/>
-				{/* Mobile: the bar hides every meter but the quota, so the running count
-				    rides the mark icon instead of the Agents meter's text. */}
-				<span className="agents-count">
+				<span className="sb-grp">
 					<Mark kind="running" />
-					{used}
-					<span className="sr"> running</span>
+					<span className="sb-big">{used}</span>
+					{/* role=status, mounted even at zero: a live region must exist before a change
+					    for screen readers to announce the 0→1 step. */}
+					<span className="sb-lbl sb-hide-phone" role="status">
+						{waiting > 0 ? `+${waiting} waiting` : "running"}
+					</span>
 				</span>
-				{/* role=status, mounted even at zero: a live region must exist before a change
-				    for screen readers to announce the 0→1 step. */}
-				<span className="meter-note" role="status">
-					{waiting > 0 ? `${waiting} waiting · all projects` : ""}
+				<span className="sb-sep" aria-hidden="true" />
+				<span
+					className="sb-grp"
+					title={
+						tightest === null
+							? undefined
+							: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used${quotaGone === null ? "" : `, ${Math.round(quotaGone)}% of the window gone`}`
+					}
+				>
+					<span className="sb-lbl sb-hide-phone">Quota</span>
+					{quotaPct !== null && (
+						<span
+							className="sb-twin sb-hide-phone"
+							data-level={quotaLevel}
+							aria-hidden="true"
+						>
+							{quotaGone !== null && (
+								<span className="t">
+									<i style={{ width: `${quotaGone}%` }} />
+								</span>
+							)}
+							<span className="q">
+								<i
+									style={{
+										transform: `scaleX(${clamp(quotaPct, 0, 100) / 100})`,
+									}}
+								/>
+							</span>
+						</span>
+					)}
+					<span className="sb-val" data-level={quotaLevel}>
+						{quotaLevel === "high" && <Mark kind="needs" />}
+						{quotaLevel === "crit" && <Mark kind="crit" />}
+						{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
+					</span>
+				</span>
+				<span className="sb-sep" aria-hidden="true" />
+				<span
+					className="sb-grp"
+					title={`CPU ${cpu ?? "n/a"} %, RAM ${ram ?? "n/a"} %, 15-minute averages`}
+				>
+					{/* A pulse glyph, not a dot: the running mark is already a grey dot. */}
+					<span
+						className="sb-mach"
+						data-level={machineLevel}
+						aria-hidden="true"
+					>
+						<Icon name="activity" size={14} />
+					</span>
+					<span className="sb-lbl sb-hide-mid">{machineWord}</span>
 				</span>
 			</button>
 			<div id="system-detail" popover="auto" className="popover">

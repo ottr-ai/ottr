@@ -479,7 +479,7 @@ textarea {
 	border-radius: 50%;
 }
 .meters {
-	gap: 18px;
+	gap: 14px;
 	min-height: 36px;
 	padding: 0 10px;
 	/* Pushes the trailing icons (notification bell, theme, logout) to the bar's right edge;
@@ -551,23 +551,100 @@ textarea {
 .meter[data-level="crit"] .meter-value {
 	color: var(--crit-text);
 }
-.meter-note {
-	color: var(--dim);
+/* App bar quiet line: running count, tightest quota as a time-over-quota twin bar, machine dot.
+   The twin bar uses the popover's .qt shapes: a thin bright time line, a boxed quota bar. */
+.sb-grp {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+}
+.sb-sep {
+	width: 1px;
+	height: 18px;
+	background: var(--line-soft);
+}
+.sb-big {
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--text-strong);
 	font-variant-numeric: tabular-nums;
+}
+.sb-lbl {
+	color: var(--dim);
 	white-space: nowrap;
 }
-/* Running-agent count in the bar; the full Agents meter covers wide viewports,
-   the narrow one hides it and shows this instead (the areas-pop legend explains the mark). */
-.agents-count {
-	display: none;
+.sb-val {
+	display: inline-flex;
 	align-items: center;
 	gap: 4px;
-	color: var(--dim);
+	color: var(--text-strong);
 	font-variant-numeric: tabular-nums;
 }
-.agents-count .mark {
-	width: 9px;
-	height: 9px;
+.sb-val .mark {
+	width: 12px;
+	height: 12px;
+}
+.sb-val[data-level="high"] {
+	color: var(--alarm);
+}
+.sb-val[data-level="crit"] {
+	color: var(--crit-text);
+}
+.sb-twin {
+	display: inline-grid;
+	gap: 2px;
+	width: 56px;
+}
+.sb-twin .t {
+	position: relative;
+	height: 2px;
+	background: var(--line-soft);
+}
+.sb-twin .t i {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	background: var(--text);
+}
+.sb-twin .t i::after {
+	content: "";
+	position: absolute;
+	top: -2px;
+	right: -3px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--text);
+}
+.sb-twin .q {
+	position: relative;
+	height: 7px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+}
+.sb-twin .q i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
+.sb-twin[data-level="high"] .q i {
+	background: var(--alarm);
+}
+.sb-twin[data-level="crit"] .q i {
+	background: var(--crit);
+}
+.sb-mach {
+	display: inline-flex;
+	color: var(--normal-fill);
+}
+.sb-mach[data-level="high"] {
+	color: var(--alarm);
+}
+.sb-mach[data-level="crit"] {
+	color: var(--crit);
 }
 /* Phone-only bar chrome: the areas popout trigger; at wide viewports the rail takes its
    place. The notification bell is the same on every viewport. */
@@ -5339,26 +5416,16 @@ button.diff-path {
 	display: none;
 }
 
-/* Mid-width windows: the meters drop the note, then fold to the phone summary,
-   so the bar never outgrows the window and widens the page. */
-@media (max-width: 1340px) {
-	.meter-note {
+/* Mid-width windows and phones: the bar drops words first, then the twin bar, so it never
+   outgrows the window. The figures and the machine dot always stay. */
+@media (max-width: 1140px) {
+	.sb-hide-mid {
 		display: none;
 	}
 }
-@media (max-width: 1140px) {
-	/* Stats collapse to one inline number: the third meter, the quota (falls
-	   back to agent occupancy when no quota meter renders).
-	   The detail popover (the whole .meters button) still carries every meter. */
-	.meters .meter {
+@media (max-width: 720px) {
+	.sb-hide-phone {
 		display: none;
-	}
-	.meters .meter:nth-of-type(3) {
-		display: inline-flex;
-	}
-	/* The icon and the running count stand in for the hidden Agents meter. */
-	.agents-count {
-		display: inline-flex;
 	}
 }
 @media (max-width: 720px) {
