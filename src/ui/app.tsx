@@ -208,6 +208,12 @@ function GhMark() {
 const sessionLost = (status: number): boolean =>
 	status === 401 || status === 403;
 
+/** The gate after a lost-session check: login, except on a board still in setup. A fresh board
+ *  has no admin yet, so its walled /api/state answers 401 too; showing login there would strand
+ *  the user (the socket's onOffline check raced the boot's "setup"). */
+export const gateAfterLostSession = (
+	g: "setup" | "login" | null,
+): "setup" | "login" => (g === "setup" ? g : "login");
 /** Version the task released, e.g. "v0.28.2": stamped onto the row by the tracker when the merge integrated; release cards carry theirs from creation. */
 function releaseOf(t: TaskCard): string | null {
 	return t.stage === "done" ? t.releaseVersion : null;
@@ -8241,7 +8247,7 @@ function App() {
 				else if (localStorage.getItem(LOGOUT_KEY) !== null) setGate("login");
 				else
 					void fetch("/api/state").then((r) => {
-						if (sessionLost(r.status)) setGate("login");
+						if (sessionLost(r.status)) setGate(gateAfterLostSession);
 					});
 			})
 			.catch(() => {
@@ -8359,7 +8365,7 @@ function App() {
 				setOffline(true);
 				void fetch("/api/state")
 					.then((r) => {
-						if (sessionLost(r.status)) setGate("login");
+						if (sessionLost(r.status)) setGate(gateAfterLostSession);
 					})
 					.catch(() => {}); // server down: the banner already says so
 			},

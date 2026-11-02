@@ -24,6 +24,7 @@ const {
 	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
+	gateAfterLostSession,
 	setupHints,
 	reportHtml,
 	Drawer,
@@ -715,6 +716,15 @@ describe("alateHint", () => {
 				running: true,
 			}),
 		).toBe("provision running");
+	});
+});
+
+describe("gateAfterLostSession", () => {
+	test("a board still in setup keeps the setup gate; every other gate turns to login", () => {
+		// A fresh compose board walls /api/state (401) before any admin exists: login there strands the user.
+		expect(gateAfterLostSession("setup")).toBe("setup");
+		expect(gateAfterLostSession(null)).toBe("login");
+		expect(gateAfterLostSession("login")).toBe("login");
 	});
 });
 
