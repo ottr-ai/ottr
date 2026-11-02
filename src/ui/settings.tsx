@@ -1,5 +1,12 @@
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+	Fragment,
+	useCallback,
+	useEffect,
+	useId,
+	useRef,
+	useState,
+} from "react";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import { forProvider } from "../quota.ts";
 import type {
@@ -580,6 +587,11 @@ function TotalRunnersForm({
 		<SettingsCard
 			id="runners-section"
 			title="Runners"
+			status={
+				maxTotal === null
+					? { label: "No cap", tone: "off" }
+					: { label: `Cap ${maxTotal}`, tone: "ok" }
+			}
 			hint={
 				maxTotal === null
 					? "No cap: agents start whenever projects need them."
@@ -618,7 +630,13 @@ function TotalRunnersForm({
 				<div className="alate-def-rows">
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Runner cap</b>
+							<b>
+								Runner cap
+								<Help
+									label="Runner cap"
+									text="The most agent turns that run at the same time on this board. Other tasks wait in Todo until a slot is free. Each project can also set its own cap."
+								/>
+							</b>
 							<span>How many agents may run at once, across all projects</span>
 							<code>empty = no cap · autosaves</code>
 						</div>
@@ -634,7 +652,13 @@ function TotalRunnersForm({
 					</div>
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Review check</b>
+							<b>
+								Review check
+								<Help
+									label="Review check"
+									text="A second model reads each finding of a review before Ottr files it as a card, so weak findings do not reach the board."
+								/>
+							</b>
 							<span>
 								Check a review's findings with a second model before they become
 								cards
@@ -651,7 +675,13 @@ function TotalRunnersForm({
 					</div>
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Work check</b>
+							<b>
+								Work check
+								<Help
+									label="Work check"
+									text="When a work turn reports ready, a second model without the turn's memory checks the result before the card enters the merge queue."
+								/>
+							</b>
 							<span>
 								Check a work card with a second model before it enters the merge
 								queue
@@ -740,6 +770,7 @@ function PushSection() {
 		<SettingsCard
 			id="push-section"
 			title="Push"
+			help="Sends a phone notification when a card needs you, also when the board is closed. Turn it on in each browser or phone. It needs HTTPS."
 			status={
 				enabled ? { label: "On", tone: "ok" } : { label: "Off", tone: "off" }
 			}
@@ -840,6 +871,7 @@ function ApiKeySection() {
 		<SettingsCard
 			id="api-key-section"
 			title="API key"
+			help="Lets scripts and integrations call the board's API without a login. If the key leaks, regenerate it. Integrations with the old key then stop working."
 			hint="A public host or a board in Docker needs this API key or your login session. Direct local access needs neither."
 		>
 			<div className="access-row">
@@ -919,6 +951,7 @@ function SessionSection() {
 		<SettingsCard
 			id="session-section"
 			title="Session"
+			help="Sign out everywhere ends every login session on every device. Use it when you lose a device or a session cookie leaks."
 			hint="Logout in the top bar signs out only this browser. If a device is lost or a cookie escaped, sign out everywhere: every login session is revoked."
 		>
 			<button
@@ -958,6 +991,7 @@ export function expiryLine(expiresAt: string | null): string | null {
 function SecretTokenForm<T extends { tokenSet: boolean }>({
 	endpoint,
 	title,
+	help,
 	label,
 	captionSet,
 	captionUnset,
@@ -968,6 +1002,8 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 	endpoint: string;
 	/** Row name shown above the field. */
 	title: string;
+	/** Short "?" explanation beside the row name. */
+	help?: string;
 	/** Accessible name of the password input (may add the section, e.g. "Hindsight API key"). */
 	label: string;
 	captionSet: string;
@@ -1031,7 +1067,10 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 				<div className="alate-def-rows">
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>{title}</b>
+							<b>
+								{title}
+								{help !== undefined && <Help label={title} text={help} />}
+							</b>
 							<span>
 								{tokenSet === true
 									? captionSet
@@ -1359,6 +1398,21 @@ export function PendingKeyRow({
 	);
 }
 
+/** Git hosts chip: saved HTTPS tokens plus the global SSH key; none while loading. */
+function gitHostsChip(
+	s: GitHostsView | null,
+): { label: string; tone: ChipTone } | undefined {
+	if (s === null) return undefined;
+	const n = s.tokens.filter((t) => t.tokenSet).length;
+	const parts = [
+		...(n > 0 ? [`${n} token${n === 1 ? "" : "s"}`] : []),
+		...(s.globalKey !== null ? ["SSH key"] : []),
+	];
+	return parts.length === 0
+		? { label: "None", tone: "off" }
+		: { label: parts.join(" · "), tone: "ok" };
+}
+
 /** Settings "Git hosts" section: per-host HTTPS tokens and the server-side global SSH key.
  *  Token values are write-only: the server never returns them and the UI never shows one. */
 function GitHostsSection() {
@@ -1476,9 +1530,10 @@ function GitHostsSection() {
 		<SettingsCard
 			id="git-hosts-section"
 			title="Git hosts"
+			status={gitHostsChip(state)}
 			hint="The GitHub token serves the board's own git and releases. Other HTTPS tokens and the server-side SSH key serve clones, fetches and pushes on any git host. Agents on workers never receive them."
 		>
-			<div className="sec-block">
+			<div className="sec-block" id="github-token-block" tabIndex={-1}>
 				<h4>GitHub token</h4>
 				<p className="hint">
 					The board's git fetches, pushes and publishes releases with this
@@ -1487,6 +1542,7 @@ function GitHostsSection() {
 				<SecretTokenForm<{ tokenSet: boolean; expiresAt: string | null }>
 					endpoint="/api/settings/github-token"
 					title="GitHub token"
+					help="The board uses this token for its own git fetches, pushes and GitHub releases. Agents on workers never get it."
 					label="GitHub token"
 					captionSet="Set. Paste a new token to replace it"
 					captionUnset="Not set: fetch and push fail"
@@ -1503,8 +1559,14 @@ function GitHostsSection() {
 					</p>
 				)}
 			</div>
-			<div className="sec-block">
-				<h4>GitHub App</h4>
+			<div className="sec-block" id="github-app-block" tabIndex={-1}>
+				<h4>
+					GitHub App
+					<Help
+						label="GitHub App"
+						text="Optional. When it is set, posted PR reviews show as the app (a bot account) instead of your own GitHub account."
+					/>
+				</h4>
 				{state !== null && state.githubApp !== null && !appFormOpen ? (
 					<div>
 						<p className="hint">
@@ -1567,8 +1629,14 @@ function GitHostsSection() {
 					</form>
 				)}
 			</div>
-			<div className="sec-block">
-				<h4>Other host tokens</h4>
+			<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
+				<h4>
+					Other host tokens
+					<Help
+						label="Other host tokens"
+						text="HTTPS tokens for git hosts other than GitHub, one for each host. Ottr tests each token with git ls-remote before it saves the token."
+					/>
+				</h4>
 				{state !== null && state.tokens.length > 0 && (
 					<table>
 						<tbody>
@@ -1654,8 +1722,14 @@ function GitHostsSection() {
 					</button>
 				</form>
 			</div>
-			<div className="sec-block">
-				<h4>Global SSH key</h4>
+			<div className="sec-block" id="ssh-key-block" tabIndex={-1}>
+				<h4>
+					Global SSH key
+					<Help
+						label="Global SSH key"
+						text="The server-side SSH key for clones, fetches and pushes over SSH. Each project without its own key uses this key."
+					/>
+				</h4>
 				{state !== null &&
 					(state.globalKey === null ? (
 						<p className="hint">No global key.</p>
@@ -1773,7 +1847,16 @@ function SshKeySection({ project }: { project: ProjectView }) {
 		})();
 	return (
 		<SettingsCard
+			id="project-ssh-section"
 			title="SSH key"
+			help="This project's own SSH key for git over SSH. Without one, the project uses the global key from the General settings."
+			status={
+				own === undefined
+					? undefined
+					: own === null
+						? { label: "Global key", tone: "off" }
+						: { label: "Own key", tone: "ok" }
+			}
 			hint={
 				own === undefined ? (
 					"Loading…"
@@ -1870,6 +1953,15 @@ function EnvSection() {
 		<SettingsCard
 			id="env-section"
 			title="Env"
+			help="Secret values for the names in the data repo's env.txt files. Workers get each value as an environment variable. Ottr never shows a value again after you save it."
+			status={
+				rows === null || rows.length === 0
+					? undefined
+					: {
+							label: `${rows.filter((r) => r.set).length} of ${rows.length} set`,
+							tone: rows.every((r) => r.set) ? "ok" : "warn",
+						}
+			}
 			hint={
 				<>
 					Names come from the data repo's{" "}
@@ -2065,6 +2157,7 @@ function ProviderLoginSection() {
 			id="signin-section"
 			className="providers"
 			title="Provider sign-in"
+			help="The omp sign-ins on the board's machine, one for each provider. Each bar shows how much of a quota window is used. The thin line above it shows how much of the window's time has passed."
 			status={
 				state === null
 					? undefined
@@ -2165,7 +2258,13 @@ function ProviderLoginSection() {
 					<div className="providers-finish">
 						<div className="alate-def-row">
 							<div className="alate-def-name">
-								<b>Code or address</b>
+								<b>
+									Code or address
+									<Help
+										label="Code or address"
+										text="After you finish the provider's sign-in page, paste the address that the page ends on or the code that it shows."
+									/>
+								</b>
 								<span>
 									Finish the provider's page. Copy the address it ends on (it
 									starts with http://localhost), or the code it shows, and paste
@@ -2210,7 +2309,13 @@ function ProviderLoginSection() {
 				>
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Provider</b>
+							<b>
+								Provider
+								<Help
+									label="Provider"
+									text="The omp provider to sign in to. Pick one from the list, or type any id that omp login shows."
+								/>
+							</b>
 							<span>Pick one, or type any id that omp login lists</span>
 							<code>omp provider id</code>
 						</div>
@@ -2449,6 +2554,17 @@ function ModelRolesSection() {
 			id="model-roles-section"
 			className="model-roles"
 			title="Model roles"
+			help="The model and the thinking level that omp uses for each role. Save commits the change to Alate's data repo, and then Alate provisions the workers."
+			status={
+				loadErr !== null
+					? { label: "Unavailable", tone: "warn" }
+					: state === null
+						? undefined
+						: {
+								label: `${Object.keys(state.roles).length} roles`,
+								tone: "ok",
+							}
+			}
 			hint={
 				<>
 					omp runs each role with its model. Save commits{" "}
@@ -2755,7 +2871,13 @@ function HindsightSection() {
 				<div className="alate-def-rows">
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Server URL</b>
+							<b>
+								Server URL
+								<Help
+									label="Server URL"
+									text="The Hindsight memory server that the omp of each turn uses. Empty: turns use the HINDSIGHT_API_URL environment variable."
+								/>
+							</b>
 							<span>
 								{view?.url == null
 									? "Not set: turns use HINDSIGHT_API_URL"
@@ -2798,6 +2920,7 @@ function HindsightSection() {
 				<SecretTokenForm<HindsightView>
 					endpoint="/api/settings/hindsight"
 					title="API key"
+					help="The key that the omp of each turn sends to the Hindsight server. Without a key, turns have no memory."
 					label="Hindsight API key"
 					captionSet="Set. Paste a new key to replace it"
 					captionUnset="Not set: turns have no memory"
@@ -2826,6 +2949,21 @@ type AlateHealthState =
 			running?: boolean;
 	  }
 	| { state: "down" };
+
+/** Alate state chip: configuration first (URL, API key), then the health probe, then the last provision. */
+export function alateChip(
+	conn: string,
+	keySet: boolean,
+	health: AlateHealthState | null,
+	lastErr: string | null,
+): { label: string; tone: ChipTone } {
+	if (conn === "") return { label: "Not configured", tone: "off" };
+	if (!keySet) return { label: "No API key", tone: "warn" };
+	if (health === null) return { label: "Checking…", tone: "off" };
+	if (health.state === "down") return { label: "Unreachable", tone: "warn" };
+	if (lastErr !== null) return { label: "Provision failed", tone: "warn" };
+	return { label: "Connected", tone: "ok" };
+}
 
 /** One-line hint for the connected alate instance: its version when the server reports one, else its data-repo update state; names a pending import or a running provision. */
 export function alateHint(h: AlateHealthState): string {
@@ -2862,13 +3000,16 @@ export function provisionWatchStep(
 /** Opens Settings and scrolls to the given section; the page remounts on the hash change, so the
  *  poll waits out the mount instead of racing it, and a second pass re-scrolls after the async
  *  sections above finish loading. Advisory link only — it never runs provisioning. */
-export function openSettingsSection(sectionId: string): void {
+export function openSettingsSection(
+	sectionId: string,
+	hash: string = SETTINGS_HASH,
+): void {
 	const scroll = () => {
 		const el = document.getElementById(sectionId);
 		el?.scrollIntoView({ block: "start" });
 		el?.focus({ preventScroll: true });
 	};
-	location.hash = `#${SETTINGS_HASH}`;
+	location.hash = `#${hash}`;
 	let tries = 0;
 	const t = setInterval(() => {
 		if (document.getElementById(sectionId) !== null) {
@@ -2901,6 +3042,8 @@ function AlateSection() {
 	// HTTP wait ended at its transport bound; the health probe below, not the abandoned
 	// wait, reports the outcome. `null` while no watch runs.
 	const [watchSince, setWatchSince] = useState<number | null>(null);
+	// False until GET /api/alate answers: the chip must not claim "Not configured" before it knows.
+	const [loaded, setLoaded] = useState(false);
 	const awaiting = watchSince !== null;
 	// Consecutive `down` probes during the watch.
 	const watchDowns = useRef(0);
@@ -2974,6 +3117,7 @@ function AlateSection() {
 				setUrl(cfg.url ?? "");
 				setConn(cfg.url ?? "");
 				setKeySet(cfg.keySet);
+				setLoaded(true);
 				setLastErr(cfg.lastProvisionError);
 				loadHealth(cfg.url ?? "", () => live);
 			})
@@ -3063,6 +3207,7 @@ function AlateSection() {
 		<SettingsCard
 			id="alate-section"
 			title="Alate"
+			status={loaded ? alateChip(conn, keySet, health, lastErr) : undefined}
 			hint="alate provisions omp rules, settings, skills and plugins from the data repo it is configured with; provisioning asks the alate server API, so the server must be running."
 		>
 			{conn !== "" && (
@@ -3088,7 +3233,13 @@ function AlateSection() {
 				<div className="alate-def-rows">
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Alate server URL</b>
+							<b>
+								Alate server URL
+								<Help
+									label="Alate server URL"
+									text="Where the alate server runs. The board asks this server to provision rules, settings, skills and plugins to the workers."
+								/>
+							</b>
 							<span>Where the alate server runs</span>
 							<code>http(s) URL</code>
 						</div>
@@ -3105,7 +3256,13 @@ function AlateSection() {
 					</div>
 					<div className="alate-def-row">
 						<div className="alate-def-name">
-							<b>Alate API key</b>
+							<b>
+								Alate API key
+								<Help
+									label="Alate API key"
+									text="The key that the alate server prints at its first start. The board sends it with each provisioning request."
+								/>
+							</b>
 							<span>Printed by the alate server at first start</span>
 							<code>secret · stored, never shown</code>
 						</div>
@@ -3219,8 +3376,18 @@ function LearningsSection({
 	};
 	return (
 		<SettingsCard
+			id="project-learnings-section"
 			className="learnings-sec"
 			title="Review learnings"
+			help="Standing review rules. The prompt of each review card includes them, so a finding that only repeats a rule counts as noise."
+			status={
+				items === null
+					? undefined
+					: {
+							label: `${items.length} learning${items.length === 1 ? "" : "s"}`,
+							tone: items.length > 0 ? "ok" : "off",
+						}
+			}
 			hint="Standing review conventions, stated once. Every Review card's prompt carries them, so a finding that only restates one is treated as noise."
 		>
 			{items !== null && items.length === 0 && (
@@ -3301,11 +3468,76 @@ function LearningsSection({
 
 type ChipTone = "ok" | "warn" | "off";
 
+/** "?" badge: one short explanation in a native popover. Click, Enter or Space opens it; Esc or a click outside closes it. */
+function Help({ label, text }: { label: string; text: string }) {
+	const id = useId();
+	return (
+		<>
+			<button
+				type="button"
+				className="help-badge"
+				popoverTarget={id}
+				aria-label={`About ${label}`}
+				title={`About ${label}`}
+			>
+				<Icon name="help" size={13} />
+			</button>
+			<span id={id} popover="auto" className="help-pop">
+				{text}
+			</span>
+		</>
+	);
+}
+
+/** One definition row: name (with an optional "?" explanation), purpose and value shape on the left, the value on the right. */
+function DefRow({
+	name,
+	desc,
+	shape,
+	help,
+	children,
+}: {
+	name: string;
+	desc?: string;
+	shape?: string;
+	help?: string;
+	children: ReactNode;
+}) {
+	return (
+		<div className="alate-def-row">
+			<div className="alate-def-name">
+				<b>
+					{name}
+					{help !== undefined && <Help label={name} text={help} />}
+				</b>
+				{desc !== undefined && <span>{desc}</span>}
+				{shape !== undefined && <code>{shape}</code>}
+			</div>
+			{children}
+		</div>
+	);
+}
+
+/** Updates chip: how many of the project's four automations are on (saved values, not the draft). */
+function updatesChip(s: ProjectView["settings"]): {
+	label: string;
+	tone: ChipTone;
+} {
+	const on = [
+		s.holdUpdateMerges,
+		s.retroSince !== null,
+		s.forkResearch,
+		s.prReviews,
+	].filter(Boolean).length;
+	return { label: `${on} of 4 on`, tone: on > 0 ? "ok" : "off" };
+}
+
 /** One settings card: title, optional state chip and hint, body, optional Save footer. */
 function SettingsCard({
 	id,
 	title,
 	hint,
+	help,
 	status,
 	footer,
 	className,
@@ -3314,6 +3546,8 @@ function SettingsCard({
 	id?: string;
 	title: string;
 	hint?: ReactNode;
+	/** Short "?" explanation beside the title, for cards without their own setting rows. */
+	help?: string;
 	status?: { label: string; tone: ChipTone };
 	footer?: ReactNode;
 	className?: string;
@@ -3332,6 +3566,7 @@ function SettingsCard({
 			<div className="sec-head">
 				<div className="sec-title">
 					<h3 id={titleId}>{title}</h3>
+					{help !== undefined && <Help label={title} text={help} />}
 					{status !== undefined && (
 						<span className={`state-chip ${status.tone}`}>{status.label}</span>
 					)}
@@ -3344,7 +3579,7 @@ function SettingsCard({
 	);
 }
 
-/** General settings: topic groups and their cards, in page order; the TOC and scroll-spy read it. */
+/** General settings: topic groups, their cards and a card's sub-blocks, in page order; the TOC and scroll-spy read it. */
 export const SETTINGS_TOC = [
 	{
 		id: "board-group",
@@ -3366,7 +3601,16 @@ export const SETTINGS_TOC = [
 		id: "git-group",
 		label: "Git and secrets",
 		sections: [
-			{ id: "git-hosts-section", label: "Git hosts" },
+			{
+				id: "git-hosts-section",
+				label: "Git hosts",
+				blocks: [
+					{ id: "github-token-block", label: "GitHub token" },
+					{ id: "github-app-block", label: "GitHub App" },
+					{ id: "host-tokens-block", label: "Other host tokens" },
+					{ id: "ssh-key-block", label: "Global SSH key" },
+				],
+			},
 			{ id: "env-section", label: "Env" },
 		],
 	},
@@ -3382,48 +3626,123 @@ export const SETTINGS_TOC = [
 	},
 ] as const;
 
-/** The General page's table of contents; `active` is the card the scroll-spy sees. */
-function SettingsToc({
-	active,
-	onPick,
-}: {
+/** One-project page: its cards in page order. */
+const PROJECT_TOC = [
+	{ id: "project-icon-section", label: "Icon" },
+	{ id: "project-identity-section", label: "Identity" },
+	{ id: "project-runners-section", label: "Runners" },
+	{ id: "project-worktrees-section", label: "Worktrees" },
+	{ id: "project-releases-section", label: "Releases" },
+	{ id: "project-reviews-section", label: "Reviews" },
+	{ id: "project-messages-section", label: "Messages" },
+	{ id: "project-updates-section", label: "Updates" },
+	{ id: "project-learnings-section", label: "Review learnings" },
+	{ id: "project-ssh-section", label: "SSH key" },
+	{ id: "project-remove-section", label: "Remove project" },
+] as const;
+
+type TocSection = {
+	readonly id: string;
+	readonly label: string;
+	readonly blocks?: readonly { readonly id: string; readonly label: string }[];
+};
+
+/** Every TOC target in page order: each card, then its sub-blocks. */
+const tocIds = (sections: readonly TocSection[]): string[] =>
+	sections.flatMap((s) => [s.id, ...(s.blocks ?? []).map((b) => b.id)]);
+
+type TocProps = {
+	/** The page's hash, so a pick scrolls without leaving the page. */
+	hash: string;
 	active: string | null;
 	onPick: (id: string) => void;
-}) {
+};
+
+type TocGroup = {
+	readonly id: string;
+	readonly label: string;
+	readonly sections: readonly TocSection[];
+};
+
+/** The settings map: a path line names the current card, then one line of stops (groups as
+ *  rings, cards as dots, sub-blocks as small dots). The line is darker up to the current stop,
+ *  which is the one steel dot. One group (a project page) drops the group stops. */
+function SettingsMap({
+	groups,
+	hash,
+	active,
+	onPick,
+}: TocProps & { groups: readonly TocGroup[] }) {
+	const named = groups.length > 1;
+	const flat = groups.flatMap((g) =>
+		g.sections.flatMap((s) => [
+			{ g, s, id: s.id, label: s.label, depth: 1 },
+			...(s.blocks ?? []).map((b) => ({
+				g,
+				s,
+				id: b.id,
+				label: b.label,
+				depth: 2,
+			})),
+		]),
+	);
+	const hi = Math.max(
+		0,
+		flat.findIndex((x) => x.id === active),
+	);
+	const here = flat[hi];
+	if (here === undefined) return null;
+	const state = (i: number) => (i < hi ? "past" : i === hi ? "here" : "ahead");
+	const stops = groups.flatMap((g) => {
+		const first = flat.findIndex((x) => x.g === g);
+		const head = named
+			? [
+					{
+						id: g.sections[0]?.id ?? "",
+						key: g.id,
+						label: g.label,
+						depth: 0,
+						state: first <= hi ? "past" : "ahead",
+					},
+				]
+			: [];
+		return [
+			...head,
+			...flat.flatMap((x, i) =>
+				x.g === g ? [{ ...x, key: x.id, state: state(i) }] : [],
+			),
+		];
+	});
 	return (
-		<ul className="settings-toc" aria-label="On this page">
-			{SETTINGS_TOC.map((g) => (
-				<li key={g.id}>
-					<button
-						type="button"
-						className="toc-group"
-						onClick={() => {
-							onPick(g.sections[0].id);
-							openSettingsSection(g.id);
-						}}
+		<div className="smap">
+			<p className="smap-path">
+				{named ? `${here.g.label} / ` : ""}
+				{here.depth === 2 ? `${here.s.label} / ` : ""}
+				<b>{here.label}</b>
+			</p>
+			<ol className="smap-line" aria-label="On this page">
+				{stops.map((st) => (
+					<li
+						key={st.key}
+						className="smap-stop"
+						data-depth={st.depth}
+						data-state={st.state}
 					>
-						{g.label}
-					</button>
-					<ul>
-						{g.sections.map((s) => (
-							<li key={s.id}>
-								<button
-									type="button"
-									className="toc-item"
-									aria-current={s.id === active ? "location" : undefined}
-									onClick={() => {
-										onPick(s.id);
-										openSettingsSection(s.id);
-									}}
-								>
-									{s.label}
-								</button>
-							</li>
-						))}
-					</ul>
-				</li>
-			))}
-		</ul>
+						<span className="smap-dot" aria-hidden="true" />
+						<button
+							type="button"
+							aria-current={st.state === "here" ? "location" : undefined}
+							onClick={() => {
+								onPick(st.id);
+								openSettingsSection(st.id, hash);
+							}}
+						>
+							{st.label}
+						</button>
+					</li>
+				))}
+			</ol>
+		</div>
 	);
 }
 
@@ -3464,10 +3783,11 @@ export function SettingsPage({
 	// Scroll-spy: the last card whose top passed a reading line near the scroll root's top is current; at the bottom, the last card.
 	// The line stays above the shortest card's height, so a short card scrolled to the top never hands over to the next one.
 	useEffect(() => {
-		if (!general) return;
 		pinned.current = null;
-		const ids: string[] = SETTINGS_TOC.flatMap((g) =>
-			g.sections.map((s) => s.id),
+		const ids = tocIds(
+			general
+				? SETTINGS_TOC.flatMap((g): readonly TocSection[] => g.sections)
+				: PROJECT_TOC,
 		);
 		const pick = () => {
 			if (pinned.current !== null) return;
@@ -3512,7 +3832,25 @@ export function SettingsPage({
 			for (const t of ["wheel", "touchstart", "keydown"])
 				document.removeEventListener(t, unpin, { capture: true });
 		};
-	}, [general]);
+	}, [general, view]);
+	const map = (
+		<SettingsMap
+			groups={
+				project === null
+					? SETTINGS_TOC
+					: [
+							{
+								id: "project-head",
+								label: projectLabel(project),
+								sections: PROJECT_TOC,
+							},
+						]
+			}
+			hash={general ? SETTINGS_HASH : view}
+			active={active}
+			onPick={onPick}
+		/>
+	);
 	return (
 		<div className="settings-page">
 			<nav className="settings-nav" aria-label="Settings sections">
@@ -3520,21 +3858,23 @@ export function SettingsPage({
 				<a
 					className="snb"
 					href={`#${SETTINGS_HASH}`}
-					aria-current={project === null ? "page" : undefined}
+					aria-current={general ? "page" : undefined}
 				>
 					General
 				</a>
-				{general && <SettingsToc active={active} onPick={onPick} />}
+				{general && map}
 				<p className="snb-label">Projects</p>
 				{projects.map((p) => (
-					<a
-						key={p.name}
-						className="snb"
-						href={`#${SETTINGS_HASH}/${encodeURIComponent(p.name)}`}
-						aria-current={project?.name === p.name ? "page" : undefined}
-					>
-						{projectLabel(p)}
-					</a>
+					<Fragment key={p.name}>
+						<a
+							className="snb"
+							href={`#${SETTINGS_HASH}/${encodeURIComponent(p.name)}`}
+							aria-current={project?.name === p.name ? "page" : undefined}
+						>
+							{projectLabel(p)}
+						</a>
+						{project?.name === p.name && map}
+					</Fragment>
 				))}
 			</nav>
 			<div className="settings-content" key={view}>
@@ -3546,7 +3886,7 @@ export function SettingsPage({
 								On this page
 								<Icon name="chevron-right" size={16} />
 							</summary>
-							<SettingsToc active={active} onPick={onPick} />
+							{map}
 						</details>
 						<section
 							className="settings-group"
@@ -3606,12 +3946,21 @@ export function SettingsPage({
 						</section>
 					</>
 				) : (
-					<ProjectSettingsForm
-						key={project.name}
-						project={project}
-						tasks={tasks}
-						act={act}
-					/>
+					<>
+						<details className="settings-toc-mobile">
+							<summary>
+								On this page
+								<Icon name="chevron-right" size={16} />
+							</summary>
+							{map}
+						</details>
+						<ProjectSettingsForm
+							key={project.name}
+							project={project}
+							tasks={tasks}
+							act={act}
+						/>
+					</>
 				)}
 			</div>
 		</div>
@@ -3680,7 +4029,7 @@ function ProjectSettingsForm({
 		prRev !== project.settings.prReviews;
 	return (
 		<>
-			<div className="settings-head">
+			<div className="settings-head" id="project-head" tabIndex={-1}>
 				<h2>{projectLabel(project)}</h2>
 				<SaveStateChip
 					dirty={dirty}
@@ -3738,253 +4087,385 @@ function ProjectSettingsForm({
 					);
 				}}
 			>
-				<SettingsCard title="Icon">
-					<div className="icon-row">
-						<span className="icon-preview">
-							<ProjectTag project={project} />
-						</span>
-						{/* The label keeps the hidden input keyboard-operable: tab to it, Enter opens the picker. */}
-						<label className="icon-upload ghost">
-							Upload
-							<input
-								type="file"
-								accept="image/png,image/jpeg,image/webp,image/gif"
-								onChange={(e) => {
-									const file = e.target.files?.[0];
-									e.target.value = "";
-									if (!file) return;
-									save.start(() =>
-										act(async () => {
-											const res = await fetch(
-												`/api/projects/${encodeURIComponent(project.name)}/icon`,
-												{ method: "POST", body: file },
+				<SettingsCard
+					id="project-icon-section"
+					title="Icon"
+					status={
+						project.icon !== null
+							? { label: "Uploaded", tone: "ok" }
+							: { label: "Default", tone: "off" }
+					}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Project icon"
+							help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
+							desc="Replaces the letters on the board"
+							shape="PNG, JPEG, WebP or GIF"
+						>
+							<div className="icon-row">
+								<span className="icon-preview">
+									<ProjectTag project={project} />
+								</span>
+								{/* The label keeps the hidden input keyboard-operable: tab to it, Enter opens the picker. */}
+								<label className="icon-upload ghost">
+									Upload
+									<input
+										type="file"
+										accept="image/png,image/jpeg,image/webp,image/gif"
+										onChange={(e) => {
+											const file = e.target.files?.[0];
+											e.target.value = "";
+											if (!file) return;
+											save.start(() =>
+												act(async () => {
+													const res = await fetch(
+														`/api/projects/${encodeURIComponent(project.name)}/icon`,
+														{ method: "POST", body: file },
+													);
+													if (!res.ok) {
+														let error = `HTTP ${res.status}`;
+														try {
+															const data = (await res.json()) as {
+																error?: string;
+															};
+															if (typeof data.error === "string")
+																error = data.error;
+														} catch {
+															// non-JSON error body; keep the HTTP status text
+														}
+														throw new Error(error);
+													}
+													flashSaved();
+												}),
 											);
-											if (!res.ok) {
-												let error = `HTTP ${res.status}`;
-												try {
-													const data = (await res.json()) as { error?: string };
-													if (typeof data.error === "string")
-														error = data.error;
-												} catch {
-													// non-JSON error body; keep the HTTP status text
-												}
-												throw new Error(error);
-											}
-											flashSaved();
-										}),
-									);
-								}}
-							/>
-						</label>
-						{project.icon !== null && (
-							<button
-								type="button"
-								className="ghost"
-								disabled={save.busy}
-								onClick={() =>
-									save.start(() =>
-										act(async () => {
-											const res = await fetch(
-												`/api/projects/${encodeURIComponent(project.name)}/icon`,
-												{ method: "DELETE" },
-											);
-											if (!res.ok) throw new Error(`HTTP ${res.status}`);
-											flashSaved();
-										}),
-									)
-								}
+										}}
+									/>
+								</label>
+								{project.icon !== null && (
+									<button
+										type="button"
+										className="ghost"
+										disabled={save.busy}
+										onClick={() =>
+											save.start(() =>
+												act(async () => {
+													const res = await fetch(
+														`/api/projects/${encodeURIComponent(project.name)}/icon`,
+														{ method: "DELETE" },
+													);
+													if (!res.ok) throw new Error(`HTTP ${res.status}`);
+													flashSaved();
+												}),
+											)
+										}
+									>
+										Remove
+									</button>
+								)}
+							</div>
+						</DefRow>
+					</div>
+				</SettingsCard>
+				<SettingsCard
+					id="project-identity-section"
+					title="Identity"
+					status={
+						project.github !== null
+							? { label: "GitHub", tone: "ok" }
+							: project.gitless
+								? { label: "No git", tone: "off" }
+								: { label: "Local git", tone: "off" }
+					}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Display name"
+							help="A friendly name for the board. The folder and the repo keep their real names."
+							desc="Shown on the board instead of the folder name"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={60}
+									value={label}
+									onChange={(e) => setLabel(e.target.value)}
+									placeholder={project.name}
+									aria-label="Display name"
+								/>
+							</label>
+						</DefRow>
+						{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+						<DefRow
+							name="Folder path"
+							desc="Fixed when the project was added"
+							help="Where the project lives on the board's machine. Ottr sets it when you add the project."
+						>
+							<code>{project.path}</code>
+						</DefRow>
+						{project.github !== null && (
+							<DefRow
+								name="GitHub"
+								desc="Fixed when the project was added"
+								help="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
 							>
-								Remove
-							</button>
+								<a
+									href={project.github}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{project.github}
+								</a>
+							</DefRow>
 						)}
 					</div>
 				</SettingsCard>
-				<SettingsCard title="Identity">
-					<label className="settings-field">
-						Display name
-						<input
-							type="text"
-							maxLength={60}
-							value={label}
-							onChange={(e) => setLabel(e.target.value)}
-							placeholder={project.name}
-						/>
-					</label>
-					{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-					<div className="settings-field">
-						Folder path
-						<code>{project.path}</code>
-					</div>
-					{project.github !== null && (
-						<div className="settings-field">
-							GitHub
-							<a
-								href={project.github}
-								target="_blank"
-								rel="noopener noreferrer"
-							>
-								{project.github}
-							</a>
-						</div>
-					)}
-				</SettingsCard>
-				<SettingsCard title="Runners">
-					<label className="settings-field">
-						Max tasks of this project running at once (empty = no cap)
-						<input
-							type="number"
-							min={1}
-							value={mp}
-							onChange={(e) => setMp(e.target.value)}
-						/>
-					</label>
-				</SettingsCard>
-				<SettingsCard title="Worktrees">
-					<label className="settings-field">
-						Extra paths copied into new worktrees (one per line)
-						<textarea
-							rows={3}
-							value={extra}
-							onChange={(e) => setExtra(e.target.value)}
-							placeholder="scripts/release.mjs"
-						/>
-					</label>
-					<label className="settings-field">
-						Quarantine kept worktrees after this many idle days
-						<input
-							type="number"
-							min={0}
-							max={365}
-							required
-							value={kwd}
-							onChange={(e) => setKwd(e.target.value)}
-						/>
-						<span className="hint">
-							A card that kept its worktree ("Kept the worktree: …" after a
-							turn, "Cancel kept the worktree: …" after a cancel) sits until you
-							answer it. After this many days (0 = immediately) the supervisor
-							quarantines its untracked files into .tasks/quarantine and removes
-							the worktree — but only when no tracked change or unpushed commit
-							would be lost.
-						</span>
-					</label>
-				</SettingsCard>
-				<SettingsCard title="Releases">
-					<label className="settings-field">
-						Release command
-						<input
-							type="text"
-							maxLength={300}
-							value={relcmd}
-							onChange={(e) => setRelcmd(e.target.value)}
-							placeholder="node scripts/release.mjs --ottr"
-						/>
-						<span className="hint">
-							Runs in the release worktree after the review approves, instead of
-							Ottr's tag and GitHub release. It gets OTTR_RELEASE_VERSION,
-							OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW
-							(commits since the last review). Must push the tag. Empty: Ottr
-							tags and publishes itself.
-						</span>
-					</label>
-				</SettingsCard>
-				<SettingsCard title="Reviews">
-					<div className="settings-numbers">
-						<label>
-							Review due after this many commits on the target
-							<input
-								type="number"
-								min={1}
-								max={10000}
-								required
-								value={cap}
-								onChange={(e) => setCap(e.target.value)}
-							/>
-						</label>
+				<SettingsCard
+					id="project-runners-section"
+					title="Runners"
+					status={
+						project.settings.maxParallel === null
+							? { label: "No cap", tone: "off" }
+							: { label: `Cap ${project.settings.maxParallel}`, tone: "ok" }
+					}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Runner cap"
+							help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
+							desc="Tasks of this project that may run at once"
+							shape="empty = no cap"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									value={mp}
+									onChange={(e) => setMp(e.target.value)}
+									aria-label="Max tasks of this project running at once (empty = no cap)"
+								/>
+							</label>
+						</DefRow>
 					</div>
 				</SettingsCard>
-				<SettingsCard title="Messages">
-					<label className="settings-field">
-						Max images per message
-						<input
-							type="number"
-							min={1}
-							required
-							value={mi}
-							onChange={(e) => setMi(e.target.value)}
-						/>
-						<span className="hint">
-							Applies to new tasks, replies, follow-ups, and steers.
-						</span>
-					</label>
+				<SettingsCard
+					id="project-worktrees-section"
+					title="Worktrees"
+					status={
+						project.settings.copyExtra.length > 0
+							? {
+									label: `${project.settings.copyExtra.length} extra path${project.settings.copyExtra.length === 1 ? "" : "s"}`,
+									tone: "ok",
+								}
+							: { label: "No extra paths", tone: "off" }
+					}
+					hint={
+						'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
+					}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Extra paths"
+							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
+							desc="Copied into each new worktree"
+							shape="one path per line"
+						>
+							<label>
+								<textarea
+									rows={3}
+									value={extra}
+									onChange={(e) => setExtra(e.target.value)}
+									placeholder="scripts/release.mjs"
+									aria-label="Extra paths copied into new worktrees (one per line)"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Quarantine after"
+							help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
+							desc="Idle days before a kept worktree is quarantined"
+							shape="days · 0 = immediately"
+						>
+							<label>
+								<input
+									type="number"
+									min={0}
+									max={365}
+									required
+									value={kwd}
+									onChange={(e) => setKwd(e.target.value)}
+									aria-label="Quarantine kept worktrees after this many idle days"
+								/>
+							</label>
+						</DefRow>
+					</div>
 				</SettingsCard>
-				<SettingsCard title="Updates">
-					{/* U7: hold update-card merges at needs_you until a reply approves them. */}
-					<label className="add-check">
-						<input
-							type="checkbox"
-							checked={hold}
-							onChange={(e) => setHold(e.target.checked)}
-						/>
-						Hold merges of update cards until you approve
-						<span className="hint">
-							Update cards wait at needs_you after a ready turn; your reply
-							approves the merge.
-						</span>
-					</label>
-					<label className="add-check">
-						<input
-							type="checkbox"
-							checked={retro}
-							onChange={(e) => setRetro(e.target.checked)}
-						/>
-						Retro
-						<span className="hint">
-							After each done task the supervisor proposes follow-up cards from
-							its retro.
-						</span>
-					</label>
-					<label className="add-check setup-sub">
-						<input
-							type="checkbox"
-							checked={retroFilter}
-							disabled={!retro}
-							onChange={(e) => setRetroFilter(e.target.checked)}
-						/>
-						Friction filter
-						<span className="hint">
-							Keep only retro proposals that fix a friction the task hit.
-						</span>
-					</label>
-					<label
-						className="add-check"
-						title="Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval."
-					>
-						<input
-							type="checkbox"
-							checked={forkRes}
-							onChange={(e) => setForkRes(e.target.checked)}
-						/>
-						Fork research
-						<span className="hint">
-							Hourly watch of the project's GitHub forks; analysis files held
-							proposals; fork-born merges need approval.
-						</span>
-					</label>
-					<label className="add-check">
-						<input
-							type="checkbox"
-							checked={prRev}
-							disabled={project.github === null && !prRev}
-							onChange={(e) => setPrRev(e.target.checked)}
-						/>
-						PR reviews
-						<span className="hint">
-							{project.github === null ? "Needs a GitHub remote. " : ""}
-							Hourly watch of open pull requests on GitHub; each new head gets a
-							read-only review draft you can post as a comment.
-						</span>
-					</label>
+				<SettingsCard
+					id="project-releases-section"
+					title="Releases"
+					status={
+						project.settings.releaseCommand !== null
+							? { label: "Own command", tone: "ok" }
+							: { label: "Ottr publishes", tone: "off" }
+					}
+					hint="Runs in the release worktree after the review approves, instead of Ottr's tag and GitHub release. It gets OTTR_RELEASE_VERSION, OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW (commits since the last review). Must push the tag. Empty: Ottr tags and publishes itself."
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Release command"
+							help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
+							desc="Runs after the review approves"
+							shape="empty = Ottr tags and publishes"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={300}
+									value={relcmd}
+									onChange={(e) => setRelcmd(e.target.value)}
+									placeholder="node scripts/release.mjs --ottr"
+									aria-label="Release command"
+								/>
+							</label>
+						</DefRow>
+					</div>
+				</SettingsCard>
+				<SettingsCard
+					id="project-reviews-section"
+					title="Reviews"
+					status={{
+						label: `Every ${project.settings.archReviewCap} commits`,
+						tone: "off",
+					}}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Review interval"
+							help="Ottr marks a review as due after this many new commits on the target branch."
+							desc="Commits on the target before a review is due"
+							shape="1 to 10000"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									max={10000}
+									required
+									value={cap}
+									onChange={(e) => setCap(e.target.value)}
+									aria-label="Review due after this many commits on the target"
+								/>
+							</label>
+						</DefRow>
+					</div>
+				</SettingsCard>
+				<SettingsCard
+					id="project-messages-section"
+					title="Messages"
+					status={{
+						label: `${project.settings.maxImages} image${project.settings.maxImages === 1 ? "" : "s"}`,
+						tone: "off",
+					}}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Max images"
+							help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
+							desc="Per message: new tasks, replies, follow-ups and steers"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									required
+									value={mi}
+									onChange={(e) => setMi(e.target.value)}
+									aria-label="Max images per message"
+								/>
+							</label>
+						</DefRow>
+					</div>
+				</SettingsCard>
+				<SettingsCard
+					id="project-updates-section"
+					title="Updates"
+					status={updatesChip(project.settings)}
+				>
+					<div className="alate-def-rows">
+						{/* U7: hold update-card merges at needs_you until a reply approves them. */}
+						<DefRow
+							name="Hold update merges"
+							help="Update cards stop at needs-you after a ready turn. They merge only after your reply approves it."
+							desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
+						>
+							<label>
+								<input
+									type="checkbox"
+									checked={hold}
+									onChange={(e) => setHold(e.target.checked)}
+									aria-label="Hold merges of update cards until you approve"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Retro"
+							help="After each card lands in Done, Ottr files one retro card that proposes follow-up work."
+							desc="After each done task the supervisor proposes follow-up cards from its retro"
+						>
+							<label>
+								<input
+									type="checkbox"
+									checked={retro}
+									onChange={(e) => setRetro(e.target.checked)}
+									aria-label="Retro"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Friction filter"
+							help="Keeps only the retro proposals that fix a friction the task hit. It works only when Retro is on."
+							desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
+						>
+							<label>
+								<input
+									type="checkbox"
+									checked={retroFilter}
+									disabled={!retro}
+									onChange={(e) => setRetroFilter(e.target.checked)}
+									aria-label="Friction filter"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Fork research"
+							help="Every hour, Ottr checks the project's GitHub forks. Findings arrive as proposals that you accept or decline."
+							desc="Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval"
+						>
+							<label>
+								<input
+									type="checkbox"
+									checked={forkRes}
+									onChange={(e) => setForkRes(e.target.checked)}
+									aria-label="Fork research"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="PR reviews"
+							help="Every hour, Ottr drafts a read-only review for each new head of an open pull request. You edit the draft and post it as a comment."
+							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+						>
+							<label>
+								<input
+									type="checkbox"
+									checked={prRev}
+									disabled={project.github === null && !prRev}
+									onChange={(e) => setPrRev(e.target.checked)}
+									aria-label="PR reviews"
+								/>
+							</label>
+						</DefRow>
+					</div>
 				</SettingsCard>
 			</form>
 			<LearningsSection project={project} act={act} />
@@ -3997,8 +4478,13 @@ function ProjectSettingsForm({
 			)}
 			<SshKeySection project={project} />
 			<SettingsCard
+				id="project-remove-section"
 				className="settings-danger"
 				title="Remove project"
+				help="Takes the project off this board. The folder, the repo and the task history stay on disk. Add the folder again to bring the project back."
+				status={
+					removable ? undefined : { label: "Tasks running", tone: "warn" }
+				}
 				hint={
 					<>
 						Removes the project {projectLabel(project)} from this Ottr board.

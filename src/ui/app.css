@@ -1137,10 +1137,12 @@ textarea {
 	transform-origin: left;
 	transition: transform 0.4s var(--ease);
 }
-.qt-row[data-level="high"] .qt-used i {
+.qt-row[data-level="high"] .qt-used i,
+.meter[data-level="high"] .qt-used i {
 	background: var(--alarm);
 }
-.qt-row[data-level="crit"] .qt-used i {
+.qt-row[data-level="crit"] .qt-used i,
+.meter[data-level="crit"] .qt-used i {
 	background: var(--crit);
 }
 .qt-val {
@@ -1546,6 +1548,184 @@ button.notif-link {
 .menu-brand:hover,
 .menu-release:hover {
 	text-decoration: underline;
+}
+/* Desktop rail: folds to its plates. Collapsed, a plate carries its project's most urgent
+   mark, every label stays for screen readers, and the footer keeps only the version. */
+@media (min-width: 721px) {
+	.shell {
+		transition: grid-template-columns 200ms cubic-bezier(0.2, 0.7, 0.3, 1);
+	}
+	.shell[data-rail="collapsed"] {
+		grid-template-columns: 56px minmax(0, 1fr);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.shell {
+		transition: none;
+	}
+}
+.rail {
+	padding: 8px 8px 6px;
+	gap: 4px;
+	background: var(--well);
+}
+/* Last item of the footer, so the arrow stays at the bottom in both widths. */
+.rail-fold {
+	flex: none;
+	display: grid;
+	place-items: center;
+	width: 32px;
+	height: 32px;
+	min-height: 0;
+	padding: 0;
+	color: var(--dim);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 4px;
+}
+/* Bare at rest; hover lifts it to a light fill and border, like the board's buttons. */
+.rail-fold:hover {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+.rail-fold .icon-svg {
+	transform: rotate(180deg);
+}
+/* Rows stay bare until hover; the open page is a raised button: fill plus border. */
+.rail .area {
+	gap: 10px;
+	min-height: 40px;
+	padding: 0 6px;
+}
+.rail .area:hover {
+	background: var(--card-hover);
+}
+.rail .area[aria-current="page"] {
+	background: var(--card);
+	border-color: var(--line-hover);
+}
+.rail-plate {
+	position: relative;
+	display: grid;
+	place-items: center;
+	flex: none;
+	border-radius: 4px;
+}
+.rail-plate.icon {
+	width: 22px;
+	height: 22px;
+	color: var(--text);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 3px;
+}
+.rail .area[aria-current="page"] .rail-plate {
+	outline: 1px solid var(--accent);
+	outline-offset: 2px;
+}
+.rail-badge {
+	display: none;
+	position: absolute;
+	top: -5px;
+	right: -6px;
+	padding: 1px;
+	line-height: 0;
+	background: var(--well);
+	border-radius: 50%;
+}
+.rail-badge .mark {
+	width: 9px;
+	height: 9px;
+}
+.rail .areas-label {
+	margin: 12px 6px 2px;
+}
+/* Two rows: the centered "Ottr <version>" line, then Settings left and the fold right.
+   Collapsed, the same order stacks in one centered column. */
+.rail-foot {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px 10px;
+	margin-top: auto;
+	padding: 8px 6px 0;
+	border-top: 1px solid var(--line-soft);
+	font-size: 12.5px;
+}
+.rail-ident {
+	display: flex;
+	flex-basis: 100%;
+	justify-content: center;
+	align-items: baseline;
+	gap: 8px;
+	margin: 0;
+}
+.rail-gear {
+	color: var(--text);
+	text-decoration: none;
+	border-radius: 4px;
+}
+/* Same 32px box and hover as .rail-fold. On Settings it stays raised to mark the page. */
+.rail-gear .rail-plate {
+	width: 32px;
+	height: 32px;
+	color: var(--dim);
+	border-radius: 4px;
+}
+.rail-gear:hover .rail-plate {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+.rail-gear[aria-current="page"] .rail-plate {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line-hover);
+}
+.rail-ver {
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.rail[data-collapsed] {
+	padding: 8px 4px 6px;
+}
+.rail[data-collapsed] .rail-fold .icon-svg {
+	transform: none;
+}
+.rail[data-collapsed] .area {
+	justify-content: center;
+	padding: 0;
+}
+.rail[data-collapsed] .rail-label {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+.rail[data-collapsed] .area-ind,
+.rail[data-collapsed] .areas-label,
+.rail[data-collapsed] .menu-brand {
+	display: none;
+}
+.rail[data-collapsed] .rail-badge {
+	display: block;
+}
+.rail[data-collapsed] .rail-foot {
+	flex-direction: column;
+	flex-wrap: nowrap;
+	gap: 8px;
+	padding: 8px 0 0;
+}
+.rail[data-collapsed] .rail-ident {
+	flex-basis: auto;
+}
+.rail[data-collapsed] .rail-ver {
+	font-size: 11px;
 }
 
 .main {
@@ -3506,7 +3686,7 @@ dialog.diff-view {
 /* Runners' Configured readout: label on the definition rows' name column, bar on the value column. */
 .settings-sec > .meter {
 	display: grid;
-	grid-template-columns: minmax(180px, 240px) 120px auto;
+	grid-template-columns: 260px minmax(0, 1fr) auto;
 	gap: 14px;
 	justify-content: start;
 	align-self: stretch;
@@ -3643,6 +3823,65 @@ dialog.diff-view {
 	font-weight: 600;
 	color: var(--text-strong);
 }
+/* "?" badge beside a setting's name: a ghost icon button that opens a short explanation. */
+.help-badge {
+	display: inline-grid;
+	place-items: center;
+	width: 18px;
+	height: 18px;
+	min-height: 0;
+	margin-left: 4px;
+	padding: 0;
+	vertical-align: -3px;
+	color: var(--dim);
+	background: transparent;
+	border: none;
+	border-radius: 50%;
+}
+.help-badge:hover,
+.help-badge:focus-visible {
+	color: var(--text-strong);
+	background: transparent;
+}
+.help-badge:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+.sec-title .help-badge {
+	margin-left: -4px;
+}
+/* The explanation is a top-layer popover: overlay shadow per DESIGN.md. Without anchor
+   positioning it keeps the popover's centered default. */
+.help-pop {
+	width: max-content;
+	max-width: min(320px, calc(100vw - 24px));
+	padding: 8px 10px;
+	font-size: 12.5px;
+	font-weight: 400;
+	line-height: 1.5;
+	white-space: normal;
+	color: var(--text);
+	background: var(--field);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	box-shadow: var(--shadow-overlay);
+}
+@supports (position-anchor: auto) {
+	.help-pop {
+		position-anchor: auto;
+		position-area: bottom span-right;
+		position-try-fallbacks: flip-block, flip-inline;
+		inset: auto;
+		margin: 4px 0 0;
+	}
+}
+@media (pointer: coarse) {
+	.help-badge {
+		width: 32px;
+		height: 32px;
+		margin: -7px -7px -7px -3px;
+	}
+}
 .state-chip {
 	padding: 1px 8px;
 	font-size: 11.5px;
@@ -3703,49 +3942,111 @@ dialog.diff-view {
 	text-transform: uppercase;
 	color: var(--dim);
 }
-/* TOC under the General link: text buttons, same steel-edge grammar as .snb. */
-.settings-toc,
-.settings-toc ul {
-	margin: 0;
-	padding: 0;
+/* Settings map under the current page link: a path line naming the current card, then one
+   line of stops. Groups are rings, cards dots, sub-blocks small dots; the line is darker up
+   to the current stop, and the current stop is the page's one steel mark (One-Edge Rule). */
+.smap-path {
+	margin: 8px 0 4px 12px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--dim);
+}
+.smap-path b {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.smap-line {
+	margin: 0 0 10px;
+	padding: 0 0 0 12px;
 	list-style: none;
 }
-.settings-nav .settings-toc {
-	padding-left: 12px;
+.smap-stop {
+	position: relative;
+	padding-left: 20px;
 }
-.settings-toc ul {
-	padding-left: 12px;
+.smap-stop::before {
+	content: "";
+	position: absolute;
+	left: 5px;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--line-soft);
 }
-.toc-group,
-.toc-item {
+.smap-stop:first-child::before {
+	top: 50%;
+}
+.smap-stop:last-child::before {
+	bottom: 50%;
+}
+.smap-stop[data-state="past"]::before {
+	background: var(--dim);
+}
+.smap-dot {
+	position: absolute;
+	left: 5px;
+	top: 50%;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--line);
+	transform: translate(-50%, -50%);
+}
+.smap-stop[data-depth="0"] .smap-dot {
+	width: 11px;
+	height: 11px;
+	background: var(--field);
+	border: 1px solid var(--line);
+}
+.smap-stop[data-depth="2"] .smap-dot {
+	width: 5px;
+	height: 5px;
+}
+.smap-stop[data-state="past"] .smap-dot {
+	background: var(--dim);
+	border-color: var(--dim);
+}
+.smap-stop[data-depth="0"][data-state="past"] .smap-dot {
+	background: var(--field);
+}
+.smap-stop[data-state="here"] .smap-dot {
+	width: 11px;
+	height: 11px;
+	background: var(--accent);
+	border: 2px solid var(--field);
+	box-shadow: 0 0 0 1px var(--accent);
+}
+.smap-stop button {
 	display: block;
 	width: 100%;
-	min-height: 24px;
-	padding: 3px 8px;
+	min-height: 26px;
+	padding: 3px 6px;
 	font: inherit;
 	font-size: 12.5px;
 	text-align: left;
 	color: var(--dim);
 	background: none;
 	border: 0;
-	border-left: 1px solid transparent;
-	border-radius: 0;
+	border-radius: 3px;
 	cursor: pointer;
 }
-.toc-group {
+.smap-stop[data-depth="0"] button {
+	margin-top: 6px;
 	font-weight: 500;
 	color: var(--text);
 }
-.toc-group:hover,
-.toc-item:hover,
-.toc-item[aria-current="location"] {
+.smap-stop[data-depth="2"] button {
+	padding-left: 16px;
+}
+.smap-stop button:hover {
+	color: var(--text-strong);
+	background: var(--panel);
+}
+.smap-stop[data-state="here"] > button {
+	font-weight: 600;
 	color: var(--text-strong);
 }
-.toc-item[aria-current="location"] {
-	border-left-color: var(--accent);
-}
-.toc-group:focus-visible,
-.toc-item:focus-visible,
+.smap-stop button:focus-visible,
 .settings-toc-mobile > summary:focus-visible {
 	outline: 2px solid var(--accent);
 	outline-offset: -2px;
@@ -3769,6 +4070,10 @@ dialog.diff-view {
 	max-width: 460px;
 	font-size: 12.5px;
 	color: var(--dim);
+}
+/* Git hosts blocks span the card like the definition rows. */
+.sec-block .settings-field {
+	max-width: none;
 }
 .settings-field input,
 .settings-field textarea {
@@ -3807,7 +4112,7 @@ dialog.diff-view {
 		max-height: none;
 		border-bottom: 1px solid var(--line-soft);
 	}
-	.settings-nav .settings-toc {
+	.settings-nav .smap {
 		display: none;
 	}
 	.settings-toc-mobile {
@@ -3832,11 +4137,10 @@ dialog.diff-view {
 	.settings-toc-mobile[open] > summary .icon-svg {
 		transform: rotate(90deg);
 	}
-	.settings-toc-mobile > .settings-toc {
+	.settings-toc-mobile > .smap {
 		padding-bottom: 8px;
 	}
-	.settings-toc-mobile .toc-group,
-	.settings-toc-mobile .toc-item {
+	.settings-toc-mobile .smap-stop button {
 		min-height: 44px;
 	}
 	.snb {
@@ -5849,14 +6153,14 @@ button.diff-path {
 /* Alate settings section: definition rows. Each row names the field, its purpose,
    and the value shape it wants; the input fills the rest. Theme vars keep the rows
    readable in the light theme too (these rules hardcoded dark-theme colors before). */
-/* Rows span the card like its foot rule; the value column caps at the field width (460px). */
+/* Rows span the card like its foot rule; the name column matches the provider table's, the value takes the rest. */
 .settings-sec .alate-def-rows {
 	display: grid;
 	align-self: stretch;
 }
 .settings-sec .alate-def-row {
 	display: grid;
-	grid-template-columns: minmax(180px, 240px) minmax(0, 460px);
+	grid-template-columns: 260px minmax(0, 1fr);
 	gap: 14px;
 	padding: 10px 0;
 	border-bottom: 1px solid var(--line-soft);
@@ -5865,7 +6169,8 @@ button.diff-path {
 .settings-sec .alate-def-row:first-child {
 	border-top: 1px solid var(--line-soft);
 }
-.settings-sec .alate-def-row > label > input:not([type="checkbox"]) {
+.settings-sec .alate-def-row > label > input:not([type="checkbox"]),
+.settings-sec .alate-def-row > label > textarea {
 	width: 100%;
 }
 .settings-sec .alate-def-name {
@@ -5965,11 +6270,8 @@ button.diff-path {
 	grid-area: meta;
 	justify-self: end;
 }
-/* display: block outranks the stacked-shell rule that hides bar tracks. */
-.providers-meters .meter-track {
-	display: block;
+.providers-meters .qt-bars {
 	grid-area: track;
-	width: auto;
 	min-width: 0;
 }
 .providers-meters .quota-reset {
@@ -5983,10 +6285,6 @@ button.diff-path {
 .settings-sec.providers .providers-form {
 	display: flex;
 	width: 100%;
-	background: var(--well);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
-	padding: 14px 16px;
 	margin-top: 12px;
 }
 .settings-sec.providers .providers-form .alate-def-row {

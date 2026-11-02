@@ -465,11 +465,63 @@ export function Meter({
 	);
 }
 
-/** One usage window: label bar, percent, reset countdown; the shared row of the app-bar popover and Settings. */
+const WINDOW_UNIT_MS = {
+	m: 60_000,
+	h: 3_600_000,
+	d: 86_400_000,
+	w: 604_800_000,
+} as const;
+
+/** Share of a quota window that has passed, 0-100, from omp's window id ("5h", "7d") or, when omp
+ *  names none, the label ("5 Hours", "7 Day", "Weekly"). Null when the length or the reset is unknown. */
+export function windowGone(l: QuotaLimit, now: number): number | null {
+	if (l.resetsAt === null) return null;
+	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
+	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
+	const ms = id
+		? Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS]
+		: named
+			? Number(named[1]) *
+				WINDOW_UNIT_MS[named[2]![0]!.toLowerCase() as "h" | "d" | "w"]
+			: /weekly/i.test(l.label)
+				? WINDOW_UNIT_MS.w
+				: null;
+	if (ms === null || ms <= 0) return null;
+	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
+}
+
+/** One usage window in Settings: label, percent, the app bar's time-over-quota twin bar, reset countdown. */
 export function QuotaRow({ limit }: { limit: QuotaLimit }) {
+	const level = loadLevel(limit.usedPct);
+	const gone = windowGone(limit, Date.now());
 	return (
 		<div className="quota-row">
-			<Meter label={limit.label} pct={limit.usedPct} title={limit.label} />
+			<span className="meter" data-level={level} title={limit.label}>
+				<span className="meter-label">{limit.label}</span>
+				<span
+					className="qt-bars"
+					role="img"
+					aria-label={`${Math.round(limit.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
+				>
+					{gone !== null && (
+						<span className="qt-time">
+							<i style={{ width: `${gone}%` }} />
+						</span>
+					)}
+					<span className="qt-used">
+						<i
+							style={{
+								transform: `scaleX(${clamp(limit.usedPct, 0, 100) / 100})`,
+							}}
+						/>
+					</span>
+				</span>
+				<span className="meter-value">
+					{level === "high" && <Mark kind="needs" />}
+					{level === "crit" && <Mark kind="crit" />}
+					{Math.round(limit.usedPct)}%
+				</span>
+			</span>
 			<span
 				className="quota-reset"
 				title={

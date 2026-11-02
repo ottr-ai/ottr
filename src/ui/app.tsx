@@ -87,6 +87,7 @@ import {
 	useBusy,
 	useFlash,
 	useQuota,
+	windowGone,
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
 import {
@@ -769,34 +770,6 @@ function useStats(): MachineStats | null {
 		return () => liveEvents.removeEventListener("stats", onStats);
 	}, []);
 	return stats;
-}
-
-const WINDOW_UNIT_MS = {
-	m: 60_000,
-	h: 3_600_000,
-	d: 86_400_000,
-	w: 604_800_000,
-} as const;
-
-/** Share of a quota window that has passed, 0-100, from omp's window id ("5h", "7d") or, when omp
- *  names none, the label ("5 Hours", "7 Day", "Weekly"). Null when the length or the reset is unknown. */
-export function windowGone(
-	l: QuotaState["limits"][number],
-	now: number,
-): number | null {
-	if (l.resetsAt === null) return null;
-	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
-	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
-	const ms = id
-		? Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS]
-		: named
-			? Number(named[1]) *
-				WINDOW_UNIT_MS[named[2]![0]!.toLowerCase() as "h" | "d" | "w"]
-			: /weekly/i.test(l.label)
-				? WINDOW_UNIT_MS.w
-				: null;
-	if (ms === null || ms <= 0) return null;
-	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
 }
 
 type MachineWindow = MachineStats["windows"][number];
@@ -7975,6 +7948,35 @@ function loadTheme(): Theme {
 /** Server version this tab last saw; sessionStorage keeps it across the one guarded reload. */
 let seenVersion: string | null = sessionStorage.getItem(SEEN_VERSION_KEY);
 
+/** One project's rail counts: the four exclusive states, the most urgent mark, and a spoken summary. */
+function railRow(p: ProjectView, tasks: TaskCard[]) {
+	const own = tasks.filter((t) => t.project === p.name);
+	const split = splitAlarms(own);
+	const running = split.running.length;
+	const needs = split.needs.length;
+	const asks = split.asks.length;
+	const waiting = own.filter((t) => t.state === "queued").length;
+	const top =
+		needs > 0
+			? ("needs" as const)
+			: asks > 0
+				? ("asked" as const)
+				: running > 0
+					? ("running" as const)
+					: waiting > 0
+						? ("queued" as const)
+						: null;
+	const summary = [
+		needs > 0 ? `${needs} need action` : "",
+		asks > 0 ? `${asks} asked` : "",
+		running > 0 ? `${running} running` : "",
+		waiting > 0 ? `${waiting} waiting` : "",
+	]
+		.filter((s) => s !== "")
+		.join(", ");
+	return { p, running, needs, asks, waiting, top, summary };
+}
+
 /** Project links with live indicators; the desktop rail renders it, and on phones the areas popout reuses it. */
 function AreasNav({
 	projects,
@@ -8233,6 +8235,20 @@ function App() {
 	/** "setup" until the admin exists, "login" when a public host demands credentials or the user logged out; null otherwise. */
 	const [gate, setGate] = useState<"setup" | "login" | null>(null);
 	const [bootVersion, setBootVersion] = useState<string | null>(null);
+	// The desktop rail folds to its icons; the choice survives reloads.
+	const [railCollapsed, setRailCollapsed] = useState(
+		() => localStorage.getItem("ottr.rail.collapsed") === "1",
+	);
+	const toggleRail = (): void =>
+		setRailCollapsed((c) => {
+			localStorage.setItem("ottr.rail.collapsed", c ? "0" : "1");
+			return !c;
+		});
+	// A dev build reports a full commit sha; the rail shows its 7-character short form.
+	const railVersion =
+		bootVersion !== null && /^[0-9a-f]{12,}$/.test(bootVersion)
+			? bootVersion.slice(0, 7)
+			: bootVersion;
 	const [live, setLive] = useState<boolean | null>(null);
 	useEffect(() => {
 		void fetch("/api/boot")
@@ -9189,15 +9205,150 @@ function App() {
 				)}
 			</header>
 
-			<div className="shell">
-				<nav className="areas" aria-label="Projects">
-					<AreasNav
-						projects={projects}
-						tasks={tasks}
-						project={project}
-						view={view}
-						onAdd={() => setShowAdd(true)}
-					/>
+			<div
+				className="shell"
+				data-rail={railCollapsed ? "collapsed" : undefined}
+			>
+				<nav
+					className="areas rail"
+					aria-label="Projects"
+					data-collapsed={railCollapsed || undefined}
+				>
+					<a
+						className="area"
+						aria-current={
+							project === null && !settingsRoute.onSettings ? "page" : undefined
+						}
+						// biome-ignore lint/a11y/useValidAnchor: the empty hash is the overview route; readHash() maps "" to no project
+						href="#"
+						title={railCollapsed ? "Overview" : undefined}
+					>
+						<span className="rail-plate icon">
+							<Icon name="grid" size={13} />
+						</span>
+						<span className="area-name rail-label">Overview</span>
+					</a>
+					<p className="areas-label">
+						PROJECTS
+						<span className="areas-rule" aria-hidden="true" />
+					</p>
+					<ul>
+						{projects.map((p) => {
+							const r = railRow(p, tasks);
+							return (
+								<li key={p.name}>
+									<a
+										className="area"
+										href={`#${encodeURIComponent(p.name)}`}
+										aria-current={project?.name === p.name ? "page" : undefined}
+										title={
+											railCollapsed
+												? `${projectLabel(p)}${r.summary === "" ? "" : `: ${r.summary}`}`
+												: undefined
+										}
+									>
+										<span className="rail-plate">
+											<ProjectTag project={p} />
+											{r.top !== null && (
+												<span className="rail-badge">
+													<Mark kind={r.top} />
+												</span>
+											)}
+										</span>
+										<span className="area-name rail-label">
+											{projectLabel(p)}
+										</span>
+										{r.needs > 0 && (
+											<span className="area-ind needs">
+												<Mark kind="needs" />
+												{r.needs}
+												<span className="sr"> need action</span>
+											</span>
+										)}
+										{r.asks > 0 && (
+											<span className="area-ind asked">
+												<Mark kind="asked" />
+												{r.asks}
+												<span className="sr"> asked</span>
+											</span>
+										)}
+										{r.running > 0 && (
+											<span className="area-ind">
+												<Mark kind="running" />
+												{r.running}
+												<span className="sr"> running</span>
+											</span>
+										)}
+										{r.waiting > 0 && (
+											<span className="area-ind waiting">
+												<Mark kind="queued" />
+												{r.waiting}
+												<span className="sr"> waiting</span>
+											</span>
+										)}
+										{railCollapsed && r.summary !== "" && (
+											<span className="sr">: {r.summary}</span>
+										)}
+									</a>
+								</li>
+							);
+						})}
+					</ul>
+					<button
+						type="button"
+						className="area area-add"
+						aria-label="Add project"
+						title={railCollapsed ? "Add project" : undefined}
+						onClick={() => setShowAdd(true)}
+					>
+						<span className="rail-plate icon">
+							<Icon name="plus" size={13} />
+						</span>
+						<span className="rail-label">Add project</span>
+					</button>
+					<footer className="rail-foot">
+						<p className="rail-ident">
+							<a
+								className="menu-brand"
+								href={REPO}
+								target="_blank"
+								rel="noopener noreferrer"
+								title="Ottr on GitHub"
+							>
+								Ottr
+							</a>
+							{railVersion !== null && (
+								<span className="rail-ver" title={bootVersion ?? undefined}>
+									{railVersion}
+								</span>
+							)}
+						</p>
+						<a
+							className="rail-gear"
+							href={`#${SETTINGS_HASH}`}
+							aria-label="Settings"
+							title="Settings"
+							aria-current={settingsRoute.onSettings ? "page" : undefined}
+						>
+							<span className="rail-plate icon">
+								<Icon name="gear" size={13} />
+							</span>
+						</a>
+						<button
+							type="button"
+							className="rail-fold"
+							aria-expanded={!railCollapsed}
+							aria-label={
+								railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
+							}
+							title={
+								railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
+							}
+							onClick={toggleRail}
+						>
+							<Icon name="chevron-right" size={14} />
+						</button>
+					</footer>
 				</nav>
 
 				<main className="main">

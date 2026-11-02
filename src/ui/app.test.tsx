@@ -28,10 +28,12 @@ const {
 	setupHints,
 	reportHtml,
 	Drawer,
-	windowGone,
 } = await import("./app.tsx");
-const { monogram, sourceIconUrl, ProjectLogo } = await import("./kit.tsx");
+const { monogram, sourceIconUrl, ProjectLogo, windowGone } = await import(
+	"./kit.tsx"
+);
 const {
+	alateChip,
 	alateHint,
 	provisionWatchStep,
 	ALATE_WATCH_MAX_DOWN,
@@ -724,6 +726,31 @@ describe("done lane star section", () => {
 	});
 });
 
+describe("alateChip", () => {
+	const ok = {
+		state: "ok",
+		version: null,
+		behind: false,
+		pending: false,
+	} as const;
+	test("configuration outranks the probe, the probe outranks the last provision", () => {
+		const label = (...a: Parameters<typeof alateChip>) => alateChip(...a).label;
+		expect(label("", false, { state: "down" }, "boom")).toBe("Not configured");
+		expect(label("http://a", false, { state: "down" }, "boom")).toBe(
+			"No API key",
+		);
+		expect(label("http://a", true, null, "boom")).toBe("Checking…");
+		expect(label("http://a", true, { state: "down" }, "boom")).toBe(
+			"Unreachable",
+		);
+		expect(label("http://a", true, ok, "boom")).toBe("Provision failed");
+		expect(alateChip("http://a", true, ok, null)).toEqual({
+			label: "Connected",
+			tone: "ok",
+		});
+	});
+});
+
 describe("alateHint", () => {
 	test("a pending import is named; a provisioned server is not", () => {
 		expect(
@@ -1035,9 +1062,11 @@ describe("settings TOC", () => {
 				view="settings"
 			/>,
 		);
+		const blocks = (s: (typeof SETTINGS_TOC)[number]["sections"][number]) =>
+			"blocks" in s ? s.blocks : [];
 		const ids = SETTINGS_TOC.flatMap((g) => [
 			g.id,
-			...g.sections.map((s) => s.id),
+			...g.sections.flatMap((s) => [s.id, ...blocks(s).map((b) => b.id)]),
 		]);
 		for (const id of ids) expect(html.split(`id="${id}"`).length - 1).toBe(1);
 		for (const id of ["signin-section", "model-roles-section", "alate-section"])
@@ -1046,10 +1075,18 @@ describe("settings TOC", () => {
 		const nav =
 			html.match(/<nav[^>]*class="[^"]*settings-nav[\s\S]*?<\/nav>/)?.[0] ?? "";
 		const tocLabels = [
-			...nav.matchAll(/class="toc-(?:group|item)"[^>]*>([^<]*)<\/button>/g),
+			...nav.matchAll(
+				/class="smap-stop"[^>]*><span[^>]*><\/span><button[^>]*>([^<]*)<\/button>/g,
+			),
 		].map((m) => m[1]);
 		expect(tocLabels).toEqual(
-			SETTINGS_TOC.flatMap((g) => [g.label, ...g.sections.map((s) => s.label)]),
+			SETTINGS_TOC.flatMap((g) => [
+				g.label,
+				...g.sections.flatMap((s) => [
+					s.label,
+					...blocks(s).map((b) => b.label),
+				]),
+			]),
 		);
 		expect(html).not.toMatch(/<h[23][^>]*>GitHub<\/h[23]>/);
 	});
