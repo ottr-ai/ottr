@@ -173,6 +173,18 @@ describe("Markdown", () => {
 		expect(out).not.toContain("<img");
 	});
 
+	test("protocol-relative and backslash srcs never render as img", () => {
+		// "//host" and "/\host" pass a naive startsWith("/") check but the browser
+		// resolves them against the page scheme, fetching the remote host on view.
+		const out = render(
+			'![x](//evil.test/a.png)\n\n<img src="//evil.test/b.png" alt="box">\n\n![x](/\\evil.test/c.png)',
+		);
+		expect(out).not.toContain("<img");
+		expect(out).not.toContain('src="//');
+		// The markdown forms stay as literal text; the raw tag is dropped.
+		expect(out).toContain("![x](//evil.test/a.png)");
+	});
+
 	test("images with unsafe sources never render as img", () => {
 		const out = render(
 			'![x](javascript:alert(1))\n\n![x](https://x.test/x.png)\n\n<img src=x onerror=alert(1)>\n\n<img src="javascript:alert(2)" onerror="alert(3)">',

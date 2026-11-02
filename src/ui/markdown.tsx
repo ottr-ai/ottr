@@ -49,7 +49,9 @@ function imageNode(
 	key: string,
 	width?: string,
 ): ReactNode {
-	if (src.startsWith("/"))
+	// Root-relative only: "//host" and "/\host" are protocol-relative and would fetch a
+	// remote server the moment the card is viewed.
+	if (/^\/[^/\\]/.test(src))
 		return <img key={key} src={src} alt={alt} width={width} />;
 	if (safeHref(src) !== null)
 		return (
