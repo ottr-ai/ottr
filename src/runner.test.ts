@@ -395,6 +395,9 @@ describe("worktree hardening against planted config (real omp)", () => {
 
 	testIfOmp(
 		"planted .omp extensions and project MCP servers do not execute under the built args",
+		// Two real omp boots sit near bun's 5 s default under the Stryker dry run's
+		// sandbox overhead, so the test carries its own budget.
+		60_000,
 		() => {
 			// Decisive but slow: two real omp boots over a planted worktree. The second
 			// drops the hardening args, so the test notices if the flags ever stop doing
