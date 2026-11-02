@@ -21,6 +21,7 @@ const {
 	WarningLines,
 	doneTopicPages,
 	cancelledTopic,
+	Overview,
 	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
@@ -1518,6 +1519,43 @@ describe("cancelled cards on the board", () => {
 		expect(covered.has("u3")).toBe(false);
 		// A done card covers nothing either: its rows are pending again.
 		expect(covered.has("u4")).toBe(false);
+	});
+
+	test("the Overview table counts a cancelled in-progress card under Done", () => {
+		const live = cardFixture({ id: "live-1", stage: "todo", state: "queued" });
+		const dead = cardFixture({
+			id: "dead-1",
+			stage: "in_progress",
+			state: "idle",
+			cancelledAt: 1760000000000,
+			updatedAt: 1760000000000,
+		});
+		const project = {
+			name: "proj",
+			icon: null,
+			hasRules: true,
+			gitless: false,
+			dirty: false,
+			settings: {},
+		} as unknown as ProjectView;
+		const html = renderToStaticMarkup(
+			<Overview
+				projects={[project]}
+				tasks={[live, dead]}
+				compose={() => {}}
+				onAdd={() => {}}
+				openTask={() => {}}
+			/>,
+		);
+		// The project row's stage cells in column order: the cancelled card leaves
+		// In progress empty and lands in Done, like the board lanes show it.
+		const body = /<tbody>[\s\S]*<\/tbody>/.exec(html)![0]!;
+		const cells = [...body.matchAll(/<td[^>]*>(\d+)<\/td>/g)].map((m) => m[1]);
+		expect(cells).toEqual(["1", "0", "0", "1"]);
+		// Last activity counts the cancel stamp: updateTask bumps updated_at, so the
+		// cell shows a relative time instead of the empty dash.
+		const ageCell = /<td class="age">([^<]*)<\/td>/.exec(body)![1]!;
+		expect(ageCell).not.toBe("–");
 	});
 });
 

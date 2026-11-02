@@ -3114,7 +3114,7 @@ function Triage({
 
 /** Every project in one table (the plant overview); clicking a row opens that project.
  * Option A order: triage, fleet KPIs, live table, per-project table. */
-function Overview({
+export function Overview({
 	projects,
 	tasks,
 	compose,
@@ -3226,6 +3226,9 @@ function Overview({
 						{projects.map((p) => {
 							const own = tasks.filter((t) => t.project === p.name);
 							const split = splitAlarms(own);
+							// Last activity reads every card, cancelled ones included: the cancel
+							// stamp is the project's latest event (updateTask bumps updated_at)
+							// and the card stays visible under Done.
 							const last = Math.max(0, ...own.map((t) => t.updatedAt));
 							return (
 								<tr
@@ -3266,7 +3269,9 @@ function Overview({
 										)}
 									</td>
 									{COLUMNS.map((c) => {
-										const inStage = own.filter((t) => t.stage === c.key);
+										// Count what the board lanes show: laneStage sends a cancelled
+										// card to Done, however old its stage column still reads.
+										const inStage = own.filter((t) => laneStage(t) === c.key);
 										const running = splitAlarms(inStage).running.length;
 										return (
 											<td
