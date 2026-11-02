@@ -69,6 +69,7 @@ describe("parseServerMessage", () => {
 					stats: {
 						cpu: 3,
 						ram: { usedGiB: 1, totalGiB: 2, pct: 50 },
+						windows: [],
 					},
 				}),
 			),
@@ -77,8 +78,18 @@ describe("parseServerMessage", () => {
 			stats: {
 				cpu: 3,
 				ram: { usedGiB: 1, totalGiB: 2, pct: 50 },
+				windows: [],
 			},
 		});
+		// A frame without the window list (an older server) is dropped, not half-rendered.
+		expect(
+			parseServerMessage(
+				JSON.stringify({
+					type: "stats",
+					stats: { cpu: 3, ram: { usedGiB: 1, totalGiB: 2, pct: 50 } },
+				}),
+			),
+		).toBeNull();
 		expect(
 			parseServerMessage(
 				JSON.stringify({ type: "update", behind: 2, commits: ["feat: a"] }),

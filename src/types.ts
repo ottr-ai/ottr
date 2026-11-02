@@ -822,6 +822,18 @@ export interface MachineStats {
 	cpu: number;
 	/** RAM usage; usedGiB and pct are 15-minute averages, totalGiB reads live. */
 	ram: { usedGiB: number; totalGiB: number; pct: number };
+	/** CPU and RAM per look-back window (15 min, 1 h, 24 h). The board keeps samples only since
+	 *  it started, so coveredMinutes can be shorter than minutes. */
+	windows: {
+		minutes: number;
+		coveredMinutes: number;
+		/** Average CPU in percent. */
+		cpu: number;
+		/** Highest single CPU sample in the window, in percent. */
+		cpuPeak: number;
+		/** Average RAM in percent of the live total. */
+		ramPct: number;
+	}[];
 }
 
 /** Time ranges the performance dashboard can filter by. */

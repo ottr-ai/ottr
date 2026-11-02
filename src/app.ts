@@ -88,6 +88,7 @@ import {
 	signIns,
 	signOutEverywhere,
 } from "./login.ts";
+import { STATS_KEEP_MS, type StatsSample, statsFrame } from "./machineStats.ts";
 import {
 	commitMessage,
 	editModelRoles,
@@ -2472,13 +2473,11 @@ export function createApp(deps: AppDeps) {
 		return json({ ok: true });
 	}
 
-	// Rolling 15-minute machine stats: CPU and RAM averaged over the window so a supervisor
-	// sizes runner caps from a slow number, not a live gauge. RAM total reads live.
-	const STATS_WINDOW_MS = 15 * 60_000;
-	const samples: { at: number; cpu: number; ramUsed: number }[] = [];
+	// Rolling machine stats: CPU and RAM averaged over 15 min, 1 h and 24 h (statsFrame) so a
+	// supervisor sizes runner caps from slow numbers, not a live gauge. RAM total reads live.
+	// ponytail: 24 h of 30 s samples in memory (2,880 entries); a restart starts the history over.
+	const samples: StatsSample[] = [];
 	let lastFrame: MachineStats | null = null;
-
-	const round = (n: number): number => Math.round(n * 10) / 10;
 
 	async function measureStats(): Promise<void> {
 		const before = cpus();
@@ -2493,24 +2492,15 @@ export function createApp(deps: AppDeps) {
 			idle += d("idle");
 			total += d("user") + d("nice") + d("sys") + d("idle") + d("irq");
 		}
-		const cutoff = Date.now() - STATS_WINDOW_MS;
-		while (samples.length > 0 && samples[0]!.at < cutoff) samples.shift();
+		const now = Date.now();
+		while (samples.length > 0 && samples[0]!.at < now - STATS_KEEP_MS)
+			samples.shift();
 		samples.push({
-			at: Date.now(),
-			cpu: round(total === 0 ? 0 : 100 * (1 - idle / total)),
+			at: now,
+			cpu: total === 0 ? 0 : 100 * (1 - idle / total),
 			ramUsed: totalmem() - freemem(),
 		});
-		const usedGiB =
-			samples.reduce((s, x) => s + x.ramUsed, 0) / samples.length / 1024 ** 3;
-		const totalGiB = totalmem() / 1024 ** 3;
-		lastFrame = {
-			cpu: round(samples.reduce((s, x) => s + x.cpu, 0) / samples.length),
-			ram: {
-				usedGiB: round(usedGiB),
-				totalGiB: round(totalGiB),
-				pct: round(totalGiB === 0 ? 0 : (100 * usedGiB) / totalGiB),
-			},
-		};
+		lastFrame = statsFrame(samples, now, totalmem());
 	}
 	let behind = 0;
 	let behindCommits: string[] = [];

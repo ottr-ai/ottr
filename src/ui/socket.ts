@@ -45,7 +45,8 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
 			if (
 				typeof st.cpu !== "number" ||
 				typeof st.ram !== "object" ||
-				st.ram === null
+				st.ram === null ||
+				!Array.isArray(st.windows)
 			)
 				return null;
 			const ram = st.ram as Record<string, unknown>;

@@ -788,7 +788,13 @@ export function windowGone(
 	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
 }
 
-/** Overview indicators in the app bar; the button opens the detail popover (15-minute machine averages, quota, agents). */
+type MachineWindow = MachineStats["windows"][number];
+
+/** "15 min", "1 h", "24 h": a machine-stats window length for labels. */
+const windowName = (minutes: number): string =>
+	minutes % 60 === 0 ? `${minutes / 60} h` : `${minutes} min`;
+
+/** Overview indicators in the app bar; the button opens the detail popover (agents, quota, and machine load over 15 min, 1 h and 24 h). */
 function SystemBar({
 	tasks,
 	maxTotal,
@@ -989,16 +995,68 @@ function SystemBar({
 						</>
 					)}
 				</section>
+				{/* Machine load: CPU and RAM side by side, one column per window (15 min, 1 h, 24 h)
+				    against the 85 % band line; the CPU columns carry a notch at the peak sample. */}
 				<section>
-					<p className="mach">
-						Machine, 15-min average · CPU{" "}
-						<b>{stats === null ? "n/a" : `${stats.cpu} %`}</b> · RAM{" "}
-						<b>
-							{stats === null
-								? "n/a"
-								: `${stats.ram.usedGiB} / ${stats.ram.totalGiB} GiB`}
-						</b>
-					</p>
+					<h2>Machine</h2>
+					{stats === null ? (
+						<p className="caption">No machine sample yet.</p>
+					) : (
+						<>
+							<div className="mc">
+								{(
+									[
+										["CPU", (w: MachineWindow) => w.cpu, true],
+										[
+											`RAM of ${stats.ram.totalGiB} GiB`,
+											(w: MachineWindow) => w.ramPct,
+											false,
+										],
+									] as const
+								).map(([name, pick, peak]) => (
+									<div key={name}>
+										<h3>{name}</h3>
+										<div
+											className="mc-cols"
+											role="img"
+											aria-label={`${name}: ${stats.windows.map((w) => `${Math.round(pick(w))} % over ${windowName(w.minutes)}`).join(", ")}`}
+										>
+											<span className="mc-band" />
+											{stats.windows.map((w) => (
+												<span
+													key={w.minutes}
+													className="mc-col"
+													data-level={loadLevel(pick(w))}
+												>
+													<i style={{ height: `${clamp(pick(w), 0, 100)}%` }} />
+													{peak && (
+														<s
+															style={{ bottom: `${clamp(w.cpuPeak, 0, 100)}%` }}
+														/>
+													)}
+												</span>
+											))}
+										</div>
+										<div className="mc-keys" aria-hidden="true">
+											{stats.windows.map((w) => (
+												<span key={w.minutes}>
+													<b data-level={loadLevel(pick(w))}>
+														{Math.round(pick(w))} %
+													</b>
+													{windowName(w.minutes)}
+												</span>
+											))}
+										</div>
+									</div>
+								))}
+							</div>
+							<p className="caption">
+								Line: the {BAND_LIMIT} % limit. CPU notch: the peak sample.
+								{stats.windows.some((w) => w.coveredMinutes < w.minutes) &&
+									` History since the board started: ${Math.max(...stats.windows.map((w) => w.coveredMinutes))} min.`}
+							</p>
+						</>
+					)}
 				</section>
 			</div>
 		</>
