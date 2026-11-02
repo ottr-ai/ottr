@@ -136,6 +136,9 @@ services:
       # Where turns file cards (create_task). Loopback in a worker is the worker itself; the
       # board opens this host to card filing only, with the token it gives each turn.
       OTTR_BOARD_URL: http://ottr:${OTTR_PORT:-8080}
+      # GitHub host pass-through (src/githubHost.ts): the board reads OTTR_GITHUB_HOST;
+      # empty keeps the default github.com. README "GitHub host" has the values.
+      OTTR_GITHUB_HOST: ${OTTR_GITHUB_HOST:-}
       # R5-1 config boundary: workers mount home:/root and workspace:/workspace read-write,
       # so a turn can plant /root/.gitconfig, /root/.config/gh or a main checkout's
       # .git/config for the board's own git and gh to execute (helper theft, insteadOf

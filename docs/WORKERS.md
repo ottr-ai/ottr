@@ -239,6 +239,10 @@ config"). Until a seed runs, turns get no env values.
   401, and every other route there answers 403, even with the token. A turn
   that outlives a board restart holds a stale token: its card filing fails
   with 401.
+- Server: `OTTR_GITHUB_HOST` names the GitHub host of the board. The default
+  is `github.com`, and an empty value keeps the default. Compose reads the
+  value from the host shell or the compose env file and passes it to the
+  server only; workers never use it. Refer to the README row "GitHub host".
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
   `runner.startRun` stays the reference implementation). When the variable is
   set, a work turn never runs on the server: if a worker is down or answers
