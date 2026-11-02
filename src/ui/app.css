@@ -2717,22 +2717,19 @@ a.release:hover {
 .perf td:last-child {
 	padding: 10px 14px;
 }
-/* Performance is one panel: the range buttons drive the KPI strip and the per-project table
-   below it, so both sit in the same frame. */
-.perf-panel {
-	padding: 12px 14px 14px;
-	background: var(--chrome);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+/* Performance is one card like Projects: the KPI strip, a hairline, then the per-project table.
+   The tiles drop their own frame inside the card; the card is the frame. */
+.perf > .ov-head {
+	margin-bottom: 8px;
 }
-.perf-by {
-	margin-top: 12px;
+.perf .ov-wrap .kpis {
+	border: 0;
+	border-bottom: 1px solid var(--line-soft);
+	border-radius: 0;
 }
-.perf-sub {
-	margin: 0 0 6px;
-	font-size: 12px;
-	font-weight: 600;
-	color: var(--dim);
+/* The first header names the range ("By project · all time"), so it reads a step brighter. */
+.perf .ov thead th:first-child {
+	color: var(--text);
 }
 /* Setup (provisioning) folds at the end of the Overview: it rarely needs a look. */
 .ov-setup {

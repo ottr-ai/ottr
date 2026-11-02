@@ -3162,51 +3162,64 @@ function Overview({
 			</section>
 		);
 	}
-	// Performance is one section: the range buttons drive the KPI strip and the per-project
-	// table below it, so both sit in one panel.
-	const performance = (
-		<section aria-labelledby="perf-title" className="perf perf-panel">
-			<div className="ov-head">
-				<h2 className="ov-sec" id="perf-title">
-					Performance
-				</h2>
-				<div className="perf-range">
-					{refreshing && <span className="spinner" aria-hidden="true" />}
-					{PERF_RANGES.map((r) => (
-						<button
-							key={r}
-							type="button"
-							aria-pressed={range === r}
-							onClick={() => setRange(r)}
-						>
-							{r === "all" ? "All" : r}
-						</button>
-					))}
-				</div>
-			</div>
+	const rangeButtons = (
+		<div className="perf-range">
+			{refreshing && <span className="spinner" aria-hidden="true" />}
+			{PERF_RANGES.map((r) => (
+				<button
+					key={r}
+					type="button"
+					aria-pressed={range === r}
+					onClick={() => setRange(r)}
+				>
+					{r === "all" ? "All" : r}
+				</button>
+			))}
+		</div>
+	);
+	const perfStatus = (
+		<>
 			{err !== null && (
 				<p className="perf-error" role="alert">
 					<Mark kind="crit" />
 					<span>Performance data unavailable: {err}</span>
 				</p>
 			)}
-			{perf !== null ? (
-				<KpiStrip fleet={perf.fleet} />
-			) : (
-				err === null && (
-					<p className="loading" role="status">
-						<span className="spinner" aria-hidden="true" />
-						Loading performance…
-					</p>
-				)
+			{perf === null && err === null && (
+				<p className="loading" role="status">
+					<span className="spinner" aria-hidden="true" />
+					Loading performance…
+				</p>
 			)}
-			{perf !== null && <PerfTable perf={perf} projects={projects} />}
+		</>
+	);
+	// One card, like Projects: the KPI strip, a hairline, then the per-project table, whose first
+	// header names the range. The same range buttons drive both.
+	const performance = (
+		<section aria-labelledby="perf-title" className="perf">
+			<div className="ov-head">
+				<h2 className="ov-sec" id="perf-title">
+					Performance
+				</h2>
+				{rangeButtons}
+			</div>
+			{perfStatus}
+			{perf !== null && (
+				<div className="ov-wrap">
+					<KpiStrip fleet={perf.fleet} />
+					<PerfTable
+						perf={perf}
+						projects={projects}
+						firstCol={`By project · ${PERF_RANGE_LABELS[perf.range]}`}
+					/>
+				</div>
+			)}
 		</section>
 	);
 	const projectsNow = (
 		<>
 			<h2 className="ov-sec" id="live-title">
-				Projects now
+				Projects
 			</h2>
 			<div className="ov-wrap">
 				<table className="ov">
@@ -3731,9 +3744,12 @@ function Spark({ series }: { series: (number | null)[] }) {
 function PerfTable({
 	perf,
 	projects,
+	firstCol = "Project",
 }: {
 	perf: PerfResponse;
 	projects: ProjectView[];
+	/** Header of the project column; the Performance card puts the range label here. */
+	firstCol?: string;
 }) {
 	const viewOf = (name: string) => projects.find((p) => p.name === name);
 	const labelOf = (name: string) => viewOf(name)?.settings.displayName ?? name;
@@ -3741,93 +3757,80 @@ function PerfTable({
 	// Column max for the bar scaling; a silent column scales by 1 so its bars stay empty.
 	const maxOf = (get: (m: PerfMetrics) => number | null) =>
 		Math.max(...rows.map((r) => get(r) ?? 0), 0) || 1;
-	// A sub-block of the Performance section: the same range buttons drive it.
+	// Bare table: the Performance section frames it, and the same range buttons drive it.
 	return (
-		<section aria-labelledby="perf-projects-title" className="perf-by">
-			<h3 className="perf-sub" id="perf-projects-title">
-				By project, {PERF_RANGE_LABELS[perf.range]}
-			</h3>
-			<div className="ov-wrap">
-				<table className="ov">
-					<thead>
-						<tr>
-							<th scope="col">Project</th>
-							<th scope="col">Throughput</th>
-							<th scope="col">Lead time (median / p90)</th>
-							<th scope="col">First-pass</th>
-							<th scope="col">Failure rate</th>
-							<th scope="col">Spend</th>
+		<table className="ov">
+			<thead>
+				<tr>
+					<th scope="col">{firstCol}</th>
+					<th scope="col">Throughput</th>
+					<th scope="col">Lead time (median / p90)</th>
+					<th scope="col">First-pass</th>
+					<th scope="col">Failure rate</th>
+					<th scope="col">Spend</th>
+				</tr>
+			</thead>
+			<tbody>
+				{rows.map((p) => {
+					const alarm = (p.failure.value ?? 0) > 0.1;
+					const view = viewOf(p.name);
+					return (
+						<tr key={p.name}>
+							<th scope="row">
+								<span className="p">
+									{view !== undefined && <ProjectTag project={view} />}
+									{labelOf(p.name)}
+								</span>
+							</th>
+							<td>
+								<CellBar
+									text={p.throughput.value ?? "–"}
+									ratio={
+										(p.throughput.value ?? 0) / maxOf((m) => m.throughput.value)
+									}
+								/>
+							</td>
+							<td>
+								<CellBar
+									text={
+										<>
+											{durFmt(p.leadMedianMs.value)}
+											<span className="sub">/ {durFmt(p.leadP90Ms.value)}</span>
+										</>
+									}
+									ratio={
+										(p.leadMedianMs.value ?? 0) /
+										maxOf((m) => m.leadMedianMs.value)
+									}
+								/>
+							</td>
+							<td>
+								<CellBar
+									text={pctFmt(p.firstPass.value)}
+									ratio={
+										(p.firstPass.value ?? 0) / maxOf((m) => m.firstPass.value)
+									}
+								/>
+							</td>
+							<td>
+								{alarm && <Mark kind="needs" />}
+								<CellBar
+									text={pctFmt(p.failure.value)}
+									ratio={(p.failure.value ?? 0) / maxOf((m) => m.failure.value)}
+									alarm={alarm}
+								/>
+							</td>
+							<td>
+								<CellBar
+									text={usdFmt(p.spend.value)}
+									ratio={(p.spend.value ?? 0) / maxOf((m) => m.spend.value)}
+								/>
+							</td>
 						</tr>
-					</thead>
-					<tbody>
-						{rows.map((p) => {
-							const alarm = (p.failure.value ?? 0) > 0.1;
-							const view = viewOf(p.name);
-							return (
-								<tr key={p.name}>
-									<th scope="row">
-										<span className="p">
-											{view !== undefined && <ProjectTag project={view} />}
-											{labelOf(p.name)}
-										</span>
-									</th>
-									<td>
-										<CellBar
-											text={p.throughput.value ?? "–"}
-											ratio={
-												(p.throughput.value ?? 0) /
-												maxOf((m) => m.throughput.value)
-											}
-										/>
-									</td>
-									<td>
-										<CellBar
-											text={
-												<>
-													{durFmt(p.leadMedianMs.value)}
-													<span className="sub">
-														/ {durFmt(p.leadP90Ms.value)}
-													</span>
-												</>
-											}
-											ratio={
-												(p.leadMedianMs.value ?? 0) /
-												maxOf((m) => m.leadMedianMs.value)
-											}
-										/>
-									</td>
-									<td>
-										<CellBar
-											text={pctFmt(p.firstPass.value)}
-											ratio={
-												(p.firstPass.value ?? 0) /
-												maxOf((m) => m.firstPass.value)
-											}
-										/>
-									</td>
-									<td>
-										{alarm && <Mark kind="needs" />}
-										<CellBar
-											text={pctFmt(p.failure.value)}
-											ratio={
-												(p.failure.value ?? 0) / maxOf((m) => m.failure.value)
-											}
-											alarm={alarm}
-										/>
-									</td>
-									<td>
-										<CellBar
-											text={usdFmt(p.spend.value)}
-											ratio={(p.spend.value ?? 0) / maxOf((m) => m.spend.value)}
-										/>
-									</td>
-								</tr>
-							);
-						})}
-					</tbody>
-				</table>
-			</div>
-		</section>
+					);
+				})}
+			</tbody>
+		</table>
 	);
 }
 
