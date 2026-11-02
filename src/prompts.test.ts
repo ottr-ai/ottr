@@ -92,6 +92,15 @@ describe("workPrompt research hatch", () => {
 			"[the diff](diff:src/prompts.ts)",
 		);
 	});
+
+	test("teaches the Supersedes trailer for a commit that replaces an earlier change", () => {
+		expect(workPrompt({ text: "t", branch: "b", siblings: [] })).toContain(
+			"reference the earlier commit with a `Supersedes: <sha>` body line",
+		);
+		expect(workPrompt({ text: "t", branch: "b", siblings: [] })).toContain(
+			"The release notes drop the named commit's bullet.",
+		);
+	});
 });
 
 describe("README rule", () => {

@@ -363,6 +363,32 @@ describe("computeRelease", () => {
 		).toEqual({ version: "v1.2.4", notes: "", releasable: false });
 	});
 
+	test("a later commit over the same feature without a trailer keeps both bullets", () => {
+		const c = (sha: string, subject: string, body = "") => ({
+			sha,
+			subject,
+			body,
+		});
+		// A partial rewrite of an earlier change carries no Supersedes line: both stay.
+		expect(
+			computeRelease("v1.0.0", [
+				c("bbbbbbb2", "feat: reshape the login"),
+				c("aaaaaaa1", "feat: two logins"),
+			]).notes,
+		).toBe("## New features\n\n- Reshape the login\n- Two logins");
+		// A breaking replacement keeps its bullet and the major step; only its target drops.
+		expect(
+			computeRelease("v1.2.3", [
+				c("bbbbbbb2", "feat!: one login", "Supersedes: aaaaaaa1"),
+				c("aaaaaaa1", "feat: two logins"),
+			]),
+		).toEqual({
+			version: "v2.0.0",
+			notes: "## New features\n\n- **Breaking:** One login",
+			releasable: true,
+		});
+	});
+
 	test("cancel chains, breaking folds and partly out-of-range trailers", () => {
 		const c = (sha: string, subject: string, body = "") => ({
 			sha,
@@ -640,6 +666,20 @@ describe("against real repos", () => {
 		expect(plan.notes).toBe(
 			"## New features\n\n- W\n- X\n\n## Bug fixes\n\n- Y",
 		);
+	}, 60_000);
+
+	test("planRelease reads bodies, so a Supersedes trailer drops the replaced commit", async () => {
+		await must(main, "switch", "-q", "-c", "supersede", head);
+		const msg = `feat: x2\n\nSupersedes: ${feat.slice(0, 7)}`;
+		await must(main, "commit", "-q", "--allow-empty", "-m", msg);
+		const sup = await must(main, "rev-parse", "HEAD");
+		await must(main, "switch", "-q", "main");
+		const plan = await planRelease({
+			mainPath: main,
+			target: "origin/main",
+			sha: sup,
+		});
+		expect(plan.notes).toBe("## New features\n\n- X2\n\n## Bug fixes\n\n- Y");
 	}, 60_000);
 
 	test("a sha not on the target is blocked", async () => {

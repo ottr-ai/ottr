@@ -54,6 +54,7 @@ export function workPrompt(o: {
 
 ---
 orchestrate this task following AGENTS.md: plan, implement, verify, and commit on branch ${o.branch}.
+When a commit replaces an earlier commit's change instead of fixing it, reference the earlier commit with a \`Supersedes: <sha>\` body line. The release notes drop the named commit's bullet.
 Do not merge, push, tag or release: the tracker runs integration as a separate turn when this project's merge slot is free.
 If this task only researches a topic or answers a question — no code changes needed — do not implement: write the complete report as a markdown file named ${RESEARCH_REPORT} at the repository root of your worktree, do not commit it, do not create or modify any other file except image files you pass in report_outcome's shots field, and report answered (never ready: there is nothing to integrate). The tracker archives the report with the card and removes the worktree.
 Other tasks in flight for this project:
