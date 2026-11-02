@@ -8200,9 +8200,10 @@ describe("turn update-card merge hold (U7)", () => {
 
 	test("an approved card whose worktree is gone and whose head is on the target settles done", async () => {
 		let head: string | null = "sha-1";
-		// After the approval the agent merged by itself and removed the worktree and the
-		// branch before it reported (AGEN-24): the HEAD read fails and the target proves
-		// the approved head landed.
+		// AGEN-24: the approving run merges by itself and removes the worktree before it
+		// reports. The worktree is alive at dispatch (the pre-dispatch husk guard must not
+		// settle the card) and gone by the settle: the HEAD read fails there and the target
+		// proves the approved head landed, so the hold settles done instead of parking.
 		let merged = false;
 		const { store, record, loop } = setup({
 			commitsAhead: async () => 0,
@@ -8215,6 +8216,12 @@ describe("turn update-card merge hold (U7)", () => {
 			targetContains: async () => merged,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
+				// The merge lands and the worktree disappears mid-run, only on the
+				// approving run: the first run still parks the hold normally.
+				if (record.runs.length === 2) {
+					merged = true;
+					head = null; // the worktree is gone: the HEAD read fails
+				}
 				o.onSession?.("sess-1");
 				return {
 					pid: 4242,
@@ -8246,14 +8253,15 @@ describe("turn update-card merge hold (U7)", () => {
 			updateMergeHead: store.getTask(task.id)!.holdHead,
 			holdHead: null,
 		});
-		merged = true;
-		head = null; // the worktree is gone: the HEAD read fails
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
 		// The approved head is contained in the target: done, never parked again.
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
+		// Both turns dispatched: the in-run hold settle settled the card, not the
+		// pre-dispatch guard (that one has its own no-dispatch test below).
+		expect(record.runs).toHaveLength(2);
 	});
 
 	// OTTR-341: an approval whose worktree is already gone must not dispatch a turn into
