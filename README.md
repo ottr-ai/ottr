@@ -77,7 +77,29 @@ While a review is open, only its finding cards merge — a release ships reviewe
 
 ## Quick start
 
-Docker Compose is the preferred way to run Ottr: the board and its worker containers share one image, so every turn gets the same pinned toolchain, and a restart of the host machine brings the whole stack back:
+Docker Compose is the preferred way to run Ottr: the board and its worker containers share one image, so every turn gets the same pinned toolchain, and a restart of the host machine brings the whole stack back. The stack is one file, [`docker-compose.yml`](docker-compose.yml).
+
+### Latest release (no clone, no build)
+
+Each GitHub release publishes the image as `ghcr.io/ottr-ai/ottr` (amd64), with the tags `<version>`, `v<version>` and `latest`. The image is public, so the pull needs no login. These lines fetch the compose file of the latest release and run that release's image:
+
+```sh
+mkdir -p ottr && cd ottr
+TAG=$(curl -fsSL https://api.github.com/repos/ottr-ai/ottr/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -fsSLo docker-compose.yml "https://raw.githubusercontent.com/ottr-ai/ottr/$TAG/docker-compose.yml"
+export OTTR_IMAGE=ghcr.io/ottr-ai/ottr:$TAG             # the image of the same release
+export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
+export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
+export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
+docker compose pull
+docker compose up -d --no-build
+```
+
+The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]` guard keeps the existing `agent.db` snapshot, and the named volumes keep the board data. To keep the `export` values for the next shell, put them in an env file and pass it with `docker compose --env-file <file> …`.
+
+### From source (main branch)
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -91,15 +113,9 @@ docker compose build
 docker compose up -d
 ```
 
+### After the first start
+
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
-
-Each GitHub release also publishes the image as `ghcr.io/ottr-ai/ottr` (amd64). A release publishes the tags `<version>`, `v<version>` and `latest`. To use it instead of a local build, replace the last two lines with:
-
-```sh
-export OTTR_IMAGE=ghcr.io/ottr-ai/ottr:latest
-docker compose pull
-docker compose up -d --no-build
-```
 
 The board never takes its config from the worker-writable home volume. Seed the board's own agent layer from your data repo once, then restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)):
 
