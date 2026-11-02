@@ -24,6 +24,7 @@ import {
 	classify,
 	createRunSink,
 	findHttp400Rejection,
+	NO_DISCOVERY_CONFIG,
 	newEventState,
 	rejectedReport,
 	renderEvent,
@@ -190,6 +191,10 @@ describe("buildOmpArgs", () => {
 			"E",
 			"--config",
 			"run.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 		]);
 	});
 
@@ -213,6 +218,10 @@ describe("buildOmpArgs", () => {
 			"run.yml",
 			"--model",
 			"openai/gpt-5.2",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 		]);
 	});
 
@@ -231,6 +240,10 @@ describe("buildOmpArgs", () => {
 			"run.yml",
 			"--resume",
 			"R",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 		]);
 	});
 
@@ -261,6 +274,10 @@ describe("buildOmpArgs", () => {
 			"ext/retro.yml",
 			"--skills",
 			"retro",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 			"@shot.png",
 		]);
 	});
@@ -285,6 +302,10 @@ describe("buildOmpArgs", () => {
 			"E",
 			"--config",
 			"run.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 		]);
 	});
 
@@ -307,7 +328,16 @@ describe("buildOmpArgs", () => {
 			"read,grep,glob",
 			"--config",
 			"ext/check.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 		]);
+	});
+
+	test("the no-discovery overlay ships next to the extension", () => {
+		// A missing file makes every run die at omp startup, so pin its presence.
+		expect(existsSync(NO_DISCOVERY_CONFIG)).toBe(true);
 	});
 
 	test("images become @ arguments after the flags", () => {
@@ -328,6 +358,10 @@ describe("buildOmpArgs", () => {
 			"E",
 			"--config",
 			"run.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
 			"@C:\\p\\1.png",
 			"@C:\\p\\2.jpg",
 		]);
@@ -340,9 +374,101 @@ describe("buildOmpArgs", () => {
 				extensionPath: "E",
 				resumeId: "R",
 				images: ["C:\\p\\3.gif"],
-			}).slice(-3),
-		).toEqual(["--resume", "R", "@C:\\p\\3.gif"]);
+			}).slice(-7),
+		).toEqual([
+			"--resume",
+			"R",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
+			"@C:\\p\\3.gif",
+		]);
 	});
+});
+
+describe("worktree hardening against planted config (real omp)", () => {
+	const ompPath = Bun.which("omp");
+	// The gate machines that run the board always have omp; a bare dev box may not.
+	const testIfOmp = test.skipIf(!ompPath);
+
+	testIfOmp(
+		"planted .omp extensions and project MCP servers do not execute under the built args",
+		() => {
+			// Decisive but slow: two real omp boots over a planted worktree. The second
+			// drops the hardening args, so the test notices if the flags ever stop doing
+			// anything. The bogus model makes both boots die at startup, right after
+			// discovery, so no provider is ever called.
+			const dir = mkdtempSync(join(tmpdir(), "ottr-plant-"));
+			const home = mkdtempSync(join(tmpdir(), "ottr-plant-home-"));
+			try {
+				mkdirSync(join(dir, ".omp", "extensions"), { recursive: true });
+				const extMarker = join(dir, "ext-marker.txt");
+				const mcpMarker = join(dir, "mcp-marker.txt");
+				writeFileSync(
+					join(dir, ".omp", "extensions", "planted.ts"),
+					`import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(extMarker)}, "loaded");
+export default {};`,
+				);
+				writeFileSync(
+					join(dir, ".omp", "mcp.json"),
+					JSON.stringify({
+						mcpServers: {
+							evil: {
+								type: "stdio",
+								command: process.execPath,
+								args: [
+									"-e",
+									`require("fs").writeFileSync(${JSON.stringify(mcpMarker)}, "x")`,
+								],
+							},
+						},
+					}),
+				);
+				const args = [
+					...buildOmpArgs({
+						sessionDir: join(dir, "sessions"),
+						extensionPath: null,
+						resumeId: null,
+					}),
+					"--model",
+					"ottr-no-such-provider/no-such-model",
+				];
+				const env = { ...process.env, HOME: home, USERPROFILE: home };
+				const spawn = (argv: string[]) =>
+					Bun.spawnSync([ompPath!, ...argv], {
+						cwd: dir,
+						env,
+						stdin: new Response("hi\n"),
+						timeout: 120_000,
+					});
+
+				const hardened = spawn(args);
+				expect(existsSync(extMarker)).toBe(false);
+				expect(existsSync(mcpMarker)).toBe(false);
+				// A null exitCode means the timeout killed the boot, not the model check.
+				expect(hardened.exitCode).not.toBe(null);
+				expect(hardened.exitCode).not.toBe(0);
+
+				const control = spawn(
+					args.filter(
+						(a) =>
+							a !== "--no-extensions" &&
+							a !== "--no-lsp" &&
+							a !== "--config" &&
+							a !== NO_DISCOVERY_CONFIG,
+					),
+				);
+				expect(existsSync(extMarker)).toBe(true);
+				expect(existsSync(mcpMarker)).toBe(true);
+				expect(control.exitCode).not.toBe(null);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(home, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("resumePlan", () => {
@@ -1961,6 +2087,37 @@ describe("startRun", () => {
 		} finally {
 			if (ambientBoardUrl !== undefined)
 				process.env.OTTR_BOARD_URL = ambientBoardUrl;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local run always passes --no-extensions, --no-lsp and the no-discovery overlay", async () => {
+		// The worktree cwd is worker-writable, so even a run with no explicit extension
+		// (a review check) must carry the hardening: the audit's vector rides in the cwd.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-hardening-"));
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			});
+			await handle.done;
+			expect(seen[0]).toContain("--no-extensions");
+			expect(seen[0]).toContain("--no-lsp");
+			expect(seen[0]).toContain(NO_DISCOVERY_CONFIG);
+		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

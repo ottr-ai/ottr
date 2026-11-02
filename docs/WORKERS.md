@@ -589,6 +589,11 @@ because its state root does not follow `PI_CODING_AGENT_DIR`. The reader in
 file names there, never the request bodies, so a plant forges a name in one failure message
 at worst. Project skills and context files (`.agents/skills`, `AGENTS.md` in the checkout
 and its parents) stay worker-writable, the same as the main checkout's `.git/config`.
+A worktree's own `.omp` tree is untrusted the same way, so every board-side omp run
+(`buildOmpArgs`) passes `--no-extensions --no-lsp` and the
+`extension/no-discovery.yml` overlay (`mcp.enableProjectConfig: false`): discovered
+extensions, plugins, language servers, and project MCP servers from the worktree never
+load, and the explicit tracker extension still does.
 
 ### The data boundary
 

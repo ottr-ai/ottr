@@ -5,7 +5,7 @@ import {
 } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { platform } from "./platform/index.ts";
@@ -87,6 +87,18 @@ export function childEnv(o: {
 	return env;
 }
 
+/**
+ * Overlay that turns off project MCP config for every run: the run's cwd is a
+ * worker-writable worktree, so nothing in it may steer the run. Rides in the extension
+ * dir, so the path resolves identically inside a worker container.
+ */
+export const NO_DISCOVERY_CONFIG = resolve(
+	import.meta.dir,
+	"..",
+	"extension",
+	"no-discovery.yml",
+);
+
 /** `images` are absolute paths; omp attaches each `@<path>` to the user message of the stdin prompt. */
 export function buildOmpArgs(o: {
 	sessionDir: string;
@@ -125,6 +137,14 @@ export function buildOmpArgs(o: {
 		...(o.config ? ["--config", o.config] : []),
 		...(o.skills ? ["--skills", o.skills] : []),
 		...(o.maxTime ? ["--max-time", o.maxTime] : []),
+		// Every run's cwd is a worker-writable worktree, so nothing in that tree may steer
+		// the run (audit ottr.board-runs.worktree-omp-extensions-execute-in-server):
+		// no discovered extensions/plugins, no LSP servers, no project MCP config. The
+		// explicit tracker extension (--extension) still loads under --no-extensions.
+		"--no-extensions",
+		"--no-lsp",
+		"--config",
+		NO_DISCOVERY_CONFIG,
 		...(o.images ?? []).map((p) => `@${p}`),
 	];
 }

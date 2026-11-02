@@ -1,0 +1,7 @@
+# Overlay for every board-side run (`--config extension/no-discovery.yml`, buildOmpArgs):
+# the run's cwd is a worker-writable worktree, so omp starts no MCP server from the
+# project's config files. `--no-extensions` and `--no-lsp` (also from buildOmpArgs) keep
+# discovered extensions, plugins, and language servers out; the explicit tracker
+# extension still loads.
+mcp:
+  enableProjectConfig: false
