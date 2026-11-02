@@ -1150,7 +1150,8 @@ describe("Drawer approve button", () => {
 			...drawerFields,
 			stage: "in_progress",
 			state: "needs_you",
-			needsReason: "Update card: read the summary, then reply to approve the merge.",
+			needsReason:
+				"Update card: read the summary, then reply to approve the merge.",
 			holdHead: "sha-parked",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);

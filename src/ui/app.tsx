@@ -6040,16 +6040,18 @@ export function Drawer({
 					)}
 					{/* A parked merge hold (update, fork, mismatch) approves by reply; the button
 					    sends that approving reply itself. The server still gates the approval. */}
-					{task.state === "needs_you" && task.holdHead !== null && !askedNow && (
-						<BusyButton
-							className="approve-hold"
-							title="Sends the approving reply, so the parked merge can land"
-							run={() => sendReply("approved")}
-						>
-							<Icon name="check" />
-							Approve merge
-						</BusyButton>
-					)}
+					{task.state === "needs_you" &&
+						task.holdHead !== null &&
+						!askedNow && (
+							<BusyButton
+								className="approve-hold"
+								title="Sends the approving reply, so the parked merge can land"
+								run={() => sendReply("approved")}
+							>
+								<Icon name="check" />
+								Approve merge
+							</BusyButton>
+						)}
 					{/* A stopped card only interacts through the composer at the very bottom;
 					    the jump link skips the report so no manual scrolling is needed. */}
 					{task.state === "needs_you" && !askedNow && !followUp && (
