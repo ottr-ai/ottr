@@ -140,7 +140,7 @@ const PINNED_ARGS: Record<string, readonly string[]> = {
  * cannot leak into them. `GIT_AUTH_ENV_NAME` must match gitHosts.ts `GIT_AUTH_ENV_RE`.
  */
 export const GIT_AUTH_ENV_NAME =
-	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
+	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROXY_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
 
 let networkAuthResolver: (cwd: string) => Record<string, string> = () => ({});
 export function setNetworkGitAuth(

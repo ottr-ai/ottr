@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { GIT_AUTH_ENV_RE } from "./gitHosts.ts";
+import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
 import fc from "./test/properties.ts";
 import {
 	archReviewDelta,
@@ -2328,6 +2328,38 @@ describe("git", () => {
 		// and the commit itself still succeeds.
 		const r = await git(["commit", "--allow-empty", "-m", "board"], main);
 		expect(r.code).toBe(0);
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	test("never runs a work-turn-planted core.gitProxy for a git:// remote (R5-1)", async () => {
+		if (process.platform === "win32") return; // the plant is a sh script
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		const script = join(main, "gitproxy.sh");
+		writeFileSync(script, "#!/bin/sh\ntouch planted.gitproxy\n");
+		chmodSync(script, 0o755);
+		await must(main, "config", "remote.origin.url", "git://127.0.0.1:9/x");
+		await must(main, "config", "core.gitProxy", script);
+		const marker = join(main, "planted.gitproxy");
+		// Control: the plant is live — plain git runs the proxy command for the git://
+		// transport. The fetch itself fails (the fake proxy speaks no git protocol).
+		Bun.spawnSync([gitExe(), "fetch", "--quiet", "origin"], {
+			cwd: main,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+		// Board git with the auth env: the git:// transport is not allowed, no proxy command
+		// runs, and the fetch fails closed — the tokens never reach a planted program.
+		const auth = gitAuthEnv({
+			tokens: [],
+			key: null,
+			knownHosts: "/nonexistent",
+		});
+		const r = await git(["fetch", "origin"], main, 30_000, auth);
+		expect(r.code).not.toBe(0);
 		expect(existsSync(marker)).toBe(false);
 	}, 60_000);
 

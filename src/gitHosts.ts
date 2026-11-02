@@ -503,7 +503,7 @@ const shq = (v: string): string =>
  * main checkout's .git/config (R5-1), and env config outranks it, so this env also neutralizes
  * the repo-config paths that could run a command while the call holds the tokens: credential
  * helpers (reset, then the ambient global/system ones and Ottr's re-added), ext:: transport,
- * signed pushes, askpass and core.sshCommand. A planted remote.<name>.uploadpack/receivepack
+ * signed pushes, askpass, core.sshCommand and core.gitProxy. A planted remote.<name>.uploadpack/receivepack
  * is first-wins in git, so env config cannot override it: `git()` in worktree.ts passes
  * explicit --upload-pack/--receive-pack instead.
  */
@@ -518,6 +518,14 @@ export function gitAuthEnv(o: {
 		GIT_TERMINAL_PROMPT: "0",
 		// Empty: git skips GIT_ASKPASS, core.askPass and SSH_ASKPASS alike.
 		GIT_ASKPASS: "",
+		// Ottr's transports are https (token), ssh (key) and file (a local bare remote);
+		// every other transport a planted remote.<name>.url names (git://, ext::, rsync)
+		// fails closed (R5-1).
+		GIT_ALLOW_PROTOCOL: "https:ssh:file",
+		// The git:// transport runs core.gitProxy — a key a work turn can plant in the shared
+		// repo config to execute a command next to these tokens. An empty -c value does not
+		// clear it (git keeps the planted one); the empty env var does.
+		GIT_PROXY_COMMAND: "",
 	};
 	const config: (readonly [string, string])[] = [
 		["protocol.ext.allow", "never"],
@@ -556,7 +564,7 @@ export function gitAuthEnv(o: {
 }
 
 export const GIT_AUTH_ENV_RE =
-	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
+	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROXY_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
 
 // git names these when it cannot authenticate; " 401"/" 403" cover raw HTTP status text.
 /** git's wording when it cannot authenticate (also for the merge push the server takes over). */

@@ -540,6 +540,10 @@ describe("gitAuthEnv", () => {
 
 	test("sets the helper config, the token env and the ssh command", () => {
 		expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+		// A planted core.gitProxy (R5-1) must never run next to the tokens, and a planted
+		// remote URL must stay on Ottr's own transports (https tokens, ssh keys).
+		expect(env.GIT_ALLOW_PROTOCOL).toBe("https:ssh:file");
+		expect(env.GIT_PROXY_COMMAND).toBe("");
 		const keys = Object.entries(env)
 			.filter(([k]) => k.startsWith("GIT_CONFIG_KEY_"))
 			.map(([, v]) => v);

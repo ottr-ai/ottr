@@ -357,7 +357,11 @@ Server-side git is the only holder of these credentials. Each network call also
 resets the repo-config credential helpers (then re-adds the global and system
 ones), disables `ext::` transport, signed pushes and askpass, and always sets
 `GIT_SSH_COMMAND`, so config that a turn plants in a main checkout's
-`.git/config` cannot run with the tokens. Every board git also passes explicit
+`.git/config` cannot run with the tokens. Each network call also sets
+`GIT_ALLOW_PROTOCOL=https:ssh:file` and empties `GIT_PROXY_COMMAND`: a planted
+remote URL on any other transport (`git://`, `rsync`, a second `ext::` form)
+fails closed, and a planted `core.gitProxy` — which the `git://` transport would
+run as a command — never does. Every board git also passes explicit
 `--upload-pack`/`--receive-pack` to network subcommands and `--no-ext-diff
 --no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
 `receivepack`, `diff.external` or textconv driver does not run. These flags do not reach
