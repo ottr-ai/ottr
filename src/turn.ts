@@ -113,6 +113,7 @@ import type {
 	resolveTarget,
 	serverMergePush,
 	statusFiles,
+	targetContains,
 	trackedFiles,
 	unsavedWork,
 	worktreeHusk,
@@ -308,6 +309,8 @@ export interface TurnOps {
 		target: string | null,
 	): Promise<number | null>;
 	targetSha(mainPath: string, ref: string): Promise<string | null>;
+	/** AGEN-24: true when target already contains sha (the approved hold head landed). */
+	targetContains: typeof targetContains;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
@@ -1297,19 +1300,28 @@ export function createTurnLoop(
 			// and mergePrompt get it appended. prompts.ts wording is untouched.
 			const withNote = (base: string) =>
 				plan.note === null ? base : `${base}\n\n${plan.note}`;
+			// startTurn runs after startRun, so the last turn here is the one this reply answers.
+			// A parked merge hold names its hold text as the turn error, so rejectedReport reads it
+			// as a rejected report (AGEN-24): agents read "reply to approve the merge" as an order
+			// and merged by themselves. A hold reason is never a rejection; the reply rides alone.
+			const rejected = rejectedReport(store.listTurns(id).at(-1));
+			const holdRejected =
+				rejected === UPDATE_HOLD_REASON ||
+				rejected === FORK_HOLD_REASON ||
+				rejected === MERGE_HOLD_MISMATCH_REASON;
+			const replyRejected = holdRejected ? null : rejected;
 			const prompt =
 				pending && plan.resumeId
 					? retroCard
 						? retroReplyPrompt({
 								text: pending,
-								rejected: rejectedReport(store.listTurns(id).at(-1)),
+								rejected: replyRejected,
 							})
 						: replyPrompt({
 								text: pending,
 								kind,
 								release: releaseCard,
-								// startTurn runs after startRun, so the last turn here is the one this reply answers.
-								rejected: rejectedReport(store.listTurns(id).at(-1)),
+								rejected: replyRejected,
 							})
 					: releaseCard || interview || retroCard || boardCheck || grill
 						? withNote(grill ? grillPrompt(task.prompt) : task.prompt)
@@ -2209,9 +2221,26 @@ export function createTurnLoop(
 				updateHold || forkHold
 					? await ops.targetSha(wt, "HEAD").catch(() => null)
 					: null;
+			// AGEN-24: the approving turn may integrate by itself (a project's AGENTS.md can tell it
+			// to merge) and remove the worktree before it reports; the HEAD read then returns null
+			// and the hold below parked the approved card again while the work already sat on the
+			// target. When the target already contains the head the reply approved, the merge
+			// landed: let the settle finish instead of parking again.
+			const approvedHead = updateHold
+				? task.updateMergeHead
+				: forkHold
+					? task.forkMergeHead
+					: null;
+			const holdLanded =
+				head === null &&
+				approvedHead !== null &&
+				(await ops
+					.targetContains(e.path, approvedHead, target)
+					.catch(() => false));
 			// A null head (git failed) never matches: the hold fails closed.
-			const holdReason =
-				updateHold && (head === null || task.updateMergeHead !== head)
+			const holdReason = holdLanded
+				? null
+				: updateHold && (head === null || task.updateMergeHead !== head)
 					? UPDATE_HOLD_REASON
 					: forkHold && (head === null || task.forkMergeHead !== head)
 						? FORK_HOLD_REASON

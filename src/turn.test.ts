@@ -203,6 +203,8 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		hasRules: () => true,
 		targetCommits: async () => 3,
 		targetSha: async () => null,
+		// Fails closed like the real git read: containment must be proven, never assumed.
+		targetContains: async () => false,
 		serverMergePush: async () => ({ status: "skipped" as const }),
 		mergeHoldMismatch: async () => ({
 			mismatch: false,
@@ -8114,6 +8116,100 @@ describe("turn update-card merge hold (U7)", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
 		expect(after.holdHead).toBeNull();
+	});
+
+	// AGEN-24: the parked hold text reached the approving turn as a rejected report and the
+	// agent read "reply to approve the merge" as an order to merge itself.
+	test("an approving reply's work-turn prompt carries no rejected-hold line", async () => {
+		const head = "sha-1";
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			targetSha: async (_p: string, ref: string) =>
+				ref === "HEAD" ? head : null,
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, { updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
+		saveSession(store, "sess-1");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		// What POST /reply does (U7): queue the card and approve the parked head.
+		store.updateTask(task.id, {
+			pendingPrompt: "Update approved",
+			pendingBy: "user",
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			updateMergeHead: store.getTask(task.id)!.holdHead,
+			holdHead: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const prompt = record.runs.at(-1)!.prompt;
+		// The agent sees the user's reply only: the hold text is not a rejection.
+		expect(prompt).toContain("Update approved");
+		expect(prompt).not.toContain(
+			"The tracker rejected your last report_outcome",
+		);
+		// The head the settle saw is the approved one: it integrates straight away.
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("an approved card whose worktree is gone and whose head is on the target settles done", async () => {
+		let head: string | null = "sha-1";
+		// After the approval the agent merged by itself and removed the worktree and the
+		// branch before it reported (AGEN-24): the HEAD read fails and the target proves
+		// the approved head landed.
+		let merged = false;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			targetSha: async (_p: string, ref: string) =>
+				ref === "HEAD" ? head : null,
+			worktreeHusk: async () => merged,
+			worktreeLinked: async () => !merged,
+			branchMergedOrGone: async () => merged,
+			isIntegrated: async () => merged,
+			targetContains: async () => merged,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: merged
+								? {
+										status: "integrated",
+										summary: "merged and removed the worktree",
+									}
+								: { status: "answered", summary: "did it" },
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("update pins");
+		store.updateTask(task.id, { updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		store.updateTask(task.id, {
+			pendingPrompt: "Update approved",
+			pendingBy: "user",
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			updateMergeHead: store.getTask(task.id)!.holdHead,
+			holdHead: null,
+		});
+		merged = true;
+		head = null; // the worktree is gone: the HEAD read fails
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		// The approved head is contained in the target: done, never parked again.
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
 	});
 });
 

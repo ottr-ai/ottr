@@ -1222,6 +1222,17 @@ export async function branchMergedOrGone(
 	return r.code === 0;
 }
 
+/** True when the main checkout's target already contains sha (AGEN-24: the approving turn
+ * merged by itself and removed the worktree; the settle then finishes instead of parking again). */
+export async function targetContains(
+	mainPath: string,
+	sha: string,
+	target: string,
+): Promise<boolean> {
+	const r = await git(["merge-base", "--is-ancestor", sha, target], mainPath);
+	return r.code === 0;
+}
+
 /** What deleting this worktree would lose (uncommitted changes, commits not on `target`); null if nothing. */
 export async function unsavedWork(
 	worktreePath: string,
