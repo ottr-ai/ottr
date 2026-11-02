@@ -8996,6 +8996,9 @@ function App() {
 						title="Check the board with the check-ottr-board skill (dev tool)"
 						aria-label="Check the board"
 						onClick={() =>
+							window.confirm(
+								"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
+							) &&
 							void act(async () => {
 								const card = await post<{ id: string }>(
 									`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
