@@ -1127,6 +1127,28 @@ export async function mergeHoldMismatch(
 }
 
 /**
+ * OTTR-326: a mismatch park must not leave the held patches on the local target branch — the
+ * next card's push has no approved heads, so it would ship them. Moves the branch the main
+ * checkout has checked out back to `tip` (the gate's audited origin fetch) with --keep, which
+ * refuses instead of overwriting uncommitted changes there. False when HEAD is another branch,
+ * the tip is unknown to git, or the reset refused: the caller parks the card anyway and logs
+ * that the patches stayed. Runs in the main repo, where the target branch lives.
+ */
+export async function resetBranchTo(
+	mainPath: string,
+	branch: string,
+	tip: string,
+): Promise<boolean> {
+	const head = await git(
+		["symbolic-ref", "--quiet", "--short", "HEAD"],
+		mainPath,
+	);
+	if (head.code !== 0 || head.stdout.trim() !== branch) return false;
+	const r = await git(["reset", "--keep", tip], mainPath);
+	return r.code === 0;
+}
+
+/**
  * True when path is itself the top of a checkout with its own git link. A plain directory inside
  * the main repo must not borrow the main repo's state: git climbs out of unlinked dirs, so status
  * and ancestor checks would silently report the main checkout (observed: an emptied worktree dir

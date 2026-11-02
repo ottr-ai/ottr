@@ -66,6 +66,7 @@ import {
 	quarantineUntracked,
 	remoteUrl,
 	removeWorktree,
+	resetBranchTo,
 	resolveTarget,
 	serverMergePush,
 	statusFiles,
@@ -395,6 +396,7 @@ const loop = createTurnLoop(projects, {
 	targetSha,
 	serverMergePush,
 	mergeHoldMismatch,
+	resetBranchTo,
 	pidAlive,
 	// OTTR_WORKER_URLS selects worker dispatch for work turns; unset (the default) and any
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).

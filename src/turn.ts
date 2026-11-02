@@ -109,6 +109,7 @@ import type {
 	isIntegrated,
 	mergeHoldMismatch,
 	removeWorktree,
+	resetBranchTo,
 	resolveTarget,
 	serverMergePush,
 	statusFiles,
@@ -172,6 +173,35 @@ export const FORK_HOLD_REASON =
 /** OTTR-274: a merge turn added changes beyond an approved hold head; the reply approves the exact parked push head. */
 export const MERGE_HOLD_MISMATCH_REASON =
 	"The merge added changes beyond the approved head. Read the diff, then reply to approve the merge, or cancel the card.";
+
+/** OTTR-326: refusal text while another live card parks a merge-hold mismatch whose held head is
+ * still the local target tip (its park could not reset the branch); null when the push may run. */
+async function heldMergeOnBranchTip(
+	store: ProjectStore,
+	self: string,
+	mainPath: string,
+	branch: string | null,
+	ops: TurnOps,
+): Promise<string | null> {
+	if (branch === null) return null;
+	const tip = await ops
+		.targetSha(mainPath, `refs/heads/${branch}`)
+		.catch(() => null);
+	if (tip === null) return null;
+	const parked = store
+		.listTasks()
+		.find(
+			(t) =>
+				t.id !== self &&
+				t.cancelledAt === null &&
+				t.holdHead !== null &&
+				t.needsReason === MERGE_HOLD_MISMATCH_REASON &&
+				t.holdHead === tip,
+		);
+	return parked === undefined
+		? null
+		: `card #${parked.id} parks a held merge that is still the local tip of refs/heads/${branch} (its park could not reset the branch); resolve that card and reset the branch to origin first`;
+}
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
 export const UI_SHOT_WARNING =
@@ -282,6 +312,8 @@ export interface TurnOps {
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
+	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
+	resetBranchTo: typeof resetBranchTo;
 	pidAlive: typeof pidAlive;
 	/** Parsed once at boot from OTTR_WORKER_URLS; null = local spawn. Merge turns never use it (D6). */
 	workerTarget?: WorkerTarget | null;
@@ -1788,6 +1820,20 @@ export function createTurnLoop(
 												.diffStat(e.path, target, `refs/heads/${branch}`)
 												.catch(() => null);
 								log("! held merge carries patches beyond the approved head");
+								// OTTR-326: the park resets the branch to the gate's audited tip so the
+								// held patches cannot ship with a later card's un-gated push; the
+								// reviewer still reads them from holdDiff/holdFiles. Without an audited
+								// tip (gate fetch failed) there is no trusted tip to reset to, and the
+								// push refusal below keeps the branch pinned instead.
+								const reset =
+									auditedTip !== null &&
+									(await ops
+										.resetBranchTo(e.path, branch, auditedTip)
+										.catch(() => false));
+								if (!reset)
+									log(
+										"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
+									);
 								break;
 							}
 							holdTip = auditedTip;
@@ -1795,12 +1841,30 @@ export function createTurnLoop(
 					}
 				}
 				if (holdMismatch === null) {
-					const p = await ops
-						.serverMergePush(e.path, wt, target, task.branch ?? "", holdTip)
-						.catch((err: unknown) => ({
-							status: "failed" as const,
-							error: errmsg(err),
-						}));
+					// OTTR-326: a park whose branch reset could not run leaves the held patches as
+					// the local tip; no other card may push the branch while that head sits there.
+					const refused = await heldMergeOnBranchTip(
+						store,
+						id,
+						e.path,
+						branch,
+						ops,
+					);
+					const p =
+						refused !== null
+							? { status: "failed" as const, error: refused }
+							: await ops
+									.serverMergePush(
+										e.path,
+										wt,
+										target,
+										task.branch ?? "",
+										holdTip,
+									)
+									.catch((err: unknown) => ({
+										status: "failed" as const,
+										error: errmsg(err),
+									}));
 					if (p.status === "pushed") {
 						log(`- pushed ${target} from the server`);
 						// The agent's own push has no credentials (D6). A merge agent that stopped at

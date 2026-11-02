@@ -209,6 +209,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			pushDiff: null,
 			auditedTip: null,
 		}),
+		resetBranchTo: async () => true,
 		pidAlive: () => true,
 		startRun: (o: {
 			cwd: string;
@@ -827,7 +828,7 @@ describe("turn loop", () => {
 			proposal: null,
 			recorded: [],
 		};
-		const shas: string[] = ["abc123", "abc123"];
+		const shas: string[] = ["abc123", "abc123", "abc123"];
 		const projects = new Map([[store.name, fakeProject(store)]]);
 		const loop = createTurnLoop(
 			projects,
@@ -3867,6 +3868,8 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(shaCalls).toEqual([
+			// The push refusal reads the local tip first (OTTR-326), then CI watch pins.
+			[store.path, "refs/heads/main"],
 			[store.path, "origin/main"],
 			[store.path, "refs/remotes/origin/main"],
 		]);
@@ -4055,6 +4058,104 @@ describe("turn ci watch pinning", () => {
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(t.diffText).toBeNull();
+	});
+
+	test("a mismatch park resets the branch, so the next card's push excludes the held patches", async () => {
+		// Fake branch state: card A's merge left the held patches as the local tip.
+		let branchTip = "sha-A-patches";
+		const resets: [string, string][] = [];
+		const pushes: string[] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref.startsWith("origin/")
+					? "sha-origin"
+					: ref === "refs/heads/main"
+						? branchTip
+						: null,
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: "diff --git a/evil.txt b/evil.txt",
+				auditedTip: "sha-origin",
+			}),
+			resetBranchTo: async (_m: string, branch: string, tip: string) => {
+				resets.push([branch, tip]);
+				branchTip = tip;
+				return true;
+			},
+			serverMergePush: async (_m: string, _w: string, target: string) => {
+				pushes.push(`${target}@${branchTip}`);
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const a = store.getTask(task.id)!;
+		expect(a.stage).toBe("in_progress");
+		expect(a.state).toBe("needs_you");
+		expect(a.holdHead).toBe("sha-A-patches");
+		// The park moved the local target branch back to the audited origin tip.
+		expect(resets).toEqual([["main", "sha-origin"]]);
+		expect(a.diffText).toBe("diff --git a/evil.txt b/evil.txt");
+
+		// Card B merges with no approved heads: its push carries only its own work.
+		const b = store.createTask("merge b please");
+		store.updateTask(b.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/b",
+		});
+		await loop.runTurn(store.name, b.id);
+		expect(pushes).toEqual(["origin/main@sha-origin"]);
+		expect(store.getTask(b.id)!.stage).toBe("done");
+	});
+
+	test("a park that cannot reset the branch pins later pushes of the held tip", async () => {
+		const pushes: string[] = [];
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref.startsWith("origin/")
+					? "sha-origin"
+					: ref === "refs/heads/main"
+						? "sha-A-patches"
+						: null,
+			mergeHoldMismatch: async () => ({
+				// The gate fetch failed: no audited tip, so the park cannot reset the branch.
+				mismatch: true,
+				pushDiff: "diff --git a/evil.txt b/evil.txt",
+				auditedTip: null,
+			}),
+			resetBranchTo: async () => {
+				throw new Error("must not reset without an audited tip");
+			},
+			serverMergePush: async () => {
+				pushes.push("origin/main");
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const a = store.getTask(task.id)!;
+		expect(a.state).toBe("needs_you");
+		expect(a.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+
+		const b = store.createTask("merge b please");
+		store.updateTask(b.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/b",
+		});
+		await loop.runTurn(store.name, b.id);
+		expect(pushes).toEqual([]);
+		const bt = store.getTask(b.id)!;
+		expect(bt.stage).toBe("merging");
+		expect(bt.state).toBe("needs_you");
+		expect(bt.needsReason).toContain(`card #${task.id} parks a held merge`);
 	});
 
 	test("a merge whose head is exactly the approved push head pushes without the patch compare", async () => {

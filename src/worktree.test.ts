@@ -48,6 +48,7 @@ import {
 	redactingWriter,
 	remoteUrl,
 	removeWorktree,
+	resetBranchTo,
 	resolveTarget,
 	serverMergePush,
 	setGitSecrets,
@@ -577,6 +578,92 @@ describe("mergeHoldMismatch", () => {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, "merge", "-q", "--ff-only", "ott/x");
 			expect((await mismatch(f, "0".repeat(40))).mismatch).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("resetBranchTo", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	/** A clone whose pushed main holds a.txt/b.txt; tip rewrites a.txt and adds p1.txt
+	 * unpushed. The fixture leaves main reset back at the pushed commit, as a park's
+	 * pre-reset state. */
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-rbt-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		writeFileSync(join(main, "b.txt"), "b");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "pushed");
+		run(main, "push", "-q", "origin", "main");
+		writeFileSync(join(main, "p1.txt"), "p1");
+		writeFileSync(join(main, "a.txt"), "A");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "held");
+		const tip = run(main, "rev-parse", "main");
+		run(main, "reset", "-q", "--hard", "origin/main");
+		return { dir, main, tip };
+	};
+
+	test("moves the checked-out branch back to the given tip", async () => {
+		const f = fixture();
+		try {
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(f.tip);
+			expect(await resetBranchTo(f.main, "main", f.tip)).toBe(true);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(f.tip);
+			expect(run(f.main, "status", "--porcelain")).toBe("");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps uncommitted edits to files the move does not touch", async () => {
+		const f = fixture();
+		try {
+			writeFileSync(join(f.main, "b.txt"), "edited");
+			expect(await resetBranchTo(f.main, "main", f.tip)).toBe(true);
+			expect(readFileSync(join(f.main, "b.txt"), "utf8")).toBe("edited");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(f.tip);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses when the move would overwrite an uncommitted edit", async () => {
+		const f = fixture();
+		try {
+			expect(await resetBranchTo(f.main, "main", f.tip)).toBe(true);
+			// a.txt differs between the two tips, so the dirty edit blocks the move back.
+			writeFileSync(join(f.main, "a.txt"), "hacked");
+			const pushed = run(f.main, "rev-parse", "origin/main");
+			expect(await resetBranchTo(f.main, "main", pushed)).toBe(false);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(f.tip);
+			expect(readFileSync(join(f.main, "a.txt"), "utf8")).toBe("hacked");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("another checked-out branch refuses the move", async () => {
+		const f = fixture();
+		try {
+			run(f.main, "checkout", "-q", "-b", "side");
+			expect(await resetBranchTo(f.main, "main", f.tip)).toBe(false);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(f.tip);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
