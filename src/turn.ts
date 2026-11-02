@@ -2266,15 +2266,26 @@ export function createTurnLoop(
 				!interview &&
 				!grill &&
 				!retroCard;
+			// A review that parked needs_you still files its findings (OTTR-322): a failed
+			// gate must not hide them. A later turn of the same review re-records its
+			// findings: skip by prompt text the ones that already have a card linked to it.
+			const reviewFindings =
+				reviewCard &&
+				result.recorded.length > 0 &&
+				(next.stage === "merging" || next.state === "needs_you")
+					? result.recorded.filter((f) => {
+							const linked = store
+								.listTasks()
+								.some((x) => x.followUpOf === id && x.prompt === f.prompt);
+							return !linked;
+						})
+					: [];
 			// A second-model check (review findings, work check) runs below while the card is still
 			// in_progress/running: the final stage/state only lands once the check's verdict — or a
 			// skipped check — is in, so the schedule tick can neither pick the card for a merge turn
 			// nor settle a parked review early.
 			const checkWillRun =
-				(reviewCard &&
-					next.stage === "merging" &&
-					result.recorded.length > 0) ||
-				(workCard && next.stage === "merging");
+				reviewFindings.length > 0 || (workCard && next.stage === "merging");
 			store.updateTask(id, {
 				...(checkWillRun
 					? {}
@@ -2374,18 +2385,14 @@ export function createTurnLoop(
 			// A review's recorded findings: Ottr caps them, checks the selection with a second model
 			// (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
 			// only), and files the kept ones as queued cards linked to the review, the flow
-			// create_task's per-finding calls did inline before. Only a cleanly approved review gets
-			// here: the park above set merging when findings were recorded — a stage the card does
-			// not store yet, so it stays in_progress/running until the deferred write below.
-			if (
-				reviewCard &&
-				next.stage === "merging" &&
-				result.recorded.length > 0
-			) {
+			// create_task's per-finding calls did inline before. An approved review holds at merging
+			// (FINDINGS_HOLD) and a needs_you review keeps its park: either way the card stays
+			// in_progress/running until the deferred write below stores the final state.
+			if (reviewFindings.length > 0) {
 				const checkOn = ops.reviewCheck?.() ?? true;
-				const selected = selectFindings(result.recorded);
+				const selected = selectFindings(reviewFindings);
 				const selectedSet = new Set(selected);
-				const belowCap = result.recorded.filter((f) => !selectedSet.has(f));
+				const belowCap = reviewFindings.filter((f) => !selectedSet.has(f));
 				// First line of a finding, for logs and the card report (the body can be long).
 				const head = (f: RecordedFinding): string =>
 					f.prompt.split("\n")[0]?.slice(0, 120) ?? "";
@@ -2526,7 +2533,7 @@ export function createTurnLoop(
 						filed.push(child.id);
 					}
 				log(
-					`- review findings: ${result.recorded.length} recorded, ${filed.length} filed, ${
+					`- review findings: ${reviewFindings.length} recorded, ${filed.length} filed, ${
 						belowCap.length + dropped.length
 					} not filed${checkOn ? `, check ${(checkMs / 1000).toFixed(0)}s` : ", check off"}`,
 				);
@@ -2541,7 +2548,7 @@ export function createTurnLoop(
 						),
 					];
 					store.updateTask(id, {
-						summary: `${cur.summary ?? "Review finished"}\nFindings: ${result.recorded.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${checkOn ? ` (check ${(checkMs / 1000).toFixed(0)}s)` : ""}.`,
+						summary: `${cur.summary ?? "Review finished"}\nFindings: ${reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${checkOn ? ` (check ${(checkMs / 1000).toFixed(0)}s)` : ""}.`,
 						details: `${cur.details ?? ""}\n\n## Findings\n${
 							filed.length > 0
 								? filed.map((cid) => `- filed as card #${cid}`).join("\n")

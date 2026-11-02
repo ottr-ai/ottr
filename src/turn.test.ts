@@ -12660,6 +12660,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = setupWith(record, {
 			maxTotalRuns: () => 0,
 			commitsAhead: async () => 0,
+			// Check off: the parked card's assertions stay about the park, not the check.
+			reviewCheck: () => false,
 			startRun: runWith(record, {
 				outcome: { status: "needs_you", summary: "s", question: "scope?" },
 				recorded: record.recorded,
@@ -13183,10 +13185,10 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		}
 	}
 
-	test("a review that parks needs_you with recorded findings runs no check and files nothing", async () => {
+	test("a review that reports needs_you with one recorded finding files one card and stays needs_you", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = reviewSetup(
+		const { store, loop, checkRuns } = reviewSetup(
 			record,
 			{
 				outcome: {
@@ -13199,11 +13201,41 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		);
 		const review = reviewCard(store);
 		await loop.runTurn(store.name, review.id);
-		expect(record.runs).toHaveLength(1);
-		expect(kidsOf(store, review.id)).toEqual([]);
+		expect(record.runs).toHaveLength(2); // review + the findings check
+		expect(checkRuns).toHaveLength(1);
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
 		const after = store.getTask(review.id)!;
 		expect(after.state).toBe("needs_you");
-		expect(after.summary).toBe("need input");
+		expect(after.needsReason).toBe("which branch?");
+		expect(after.summary).toContain("need input");
+	});
+
+	test("a second turn that records the same finding files no duplicate", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const park = {
+			outcome: {
+				status: "needs_you" as const,
+				summary: "need input",
+				question: "which branch?",
+			},
+		};
+		// The harness serves the review result only on the first run, so the second
+		// turn's review run arrives through the checks queue. Its own check must never
+		// run: the already-linked finding is skipped, so the queue ends there.
+		const { store, loop } = reviewSetup(record, park, [
+			verdicts([1, true, ""]),
+			runResult({ ...park, recorded: [finding("Bug A", 1)] }),
+		]);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+		store.updateTask(review.id, { state: "queued" });
+		await loop.runTurn(store.name, review.id);
+		expect(record.runs).toHaveLength(3); // review + check + second review, no second check
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
+		expect(store.getTask(review.id)!.state).toBe("needs_you");
 	});
 
 	test("a review that records no findings runs no check and settles done", async () => {
