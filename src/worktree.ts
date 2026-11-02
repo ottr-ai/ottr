@@ -1098,12 +1098,21 @@ export async function mergeHoldMismatch(
 		return { mismatch: false, pushDiff: null, auditedTip: null };
 	const branch = target.slice("origin/".length);
 	// --no-renames keeps the text deterministic across the two tree pairs (rename detection is
-	// pair-dependent); --full-index keeps blob ids content-exact.
+	// pair-dependent); --full-index keeps blob ids content-exact. --ignore-submodules=none
+	// overrides planted diff.ignoreSubmodules, which would otherwise drop a committed gitlink
+	// change from both texts and make a smuggled submodule bump match the approval.
 	// ponytail: full diff text in memory; upgrade to hashing only if a card ships a range big
 	// enough to block a settle.
 	const effect = async (from: string, to: string): Promise<string | null> => {
 		const r = await git(
-			["diff", "--no-renames", "--full-index", from, to],
+			[
+				"diff",
+				"--no-renames",
+				"--full-index",
+				"--ignore-submodules=none",
+				from,
+				to,
+			],
 			mainPath,
 		);
 		return r.code === 0 ? r.stdout : null;

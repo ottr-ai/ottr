@@ -582,6 +582,32 @@ describe("mergeHoldMismatch", () => {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
+
+	test("a gitlink bump hidden by planted diff.ignoreSubmodules mismatches", async () => {
+		const f = fixture();
+		try {
+			// The merge agent can rewrite the repo's config: with diff.ignoreSubmodules=all the
+			// porcelain effect diff drops committed gitlink changes, so a submodule bump beyond
+			// the approval would otherwise leave both texts equal. The gate's diff must pin
+			// --ignore-submodules=none, which overrides that config key.
+			run(f.wt, "config", "diff.ignoreSubmodules", "all");
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			const sub = join(f.dir, "sub");
+			run(f.dir, "init", "-q", sub);
+			writeFileSync(join(sub, "s.txt"), "1");
+			run(sub, ...id, "add", ".");
+			run(sub, ...id, "commit", "-qm", "s1");
+			const bump = run(sub, "rev-parse", "HEAD");
+			run(f.wt, "update-index", "--add", "--cacheinfo", `160000,${bump},sub`);
+			run(f.wt, ...id, "commit", "-qm", "bump sub");
+			run(f.main, "merge", "-q", "--ff-only", "ott/x");
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("sub");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("resetBranchTo", () => {
