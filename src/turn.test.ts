@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
@@ -1868,6 +1869,176 @@ describe("turn sessions, steering and images", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.shots).toEqual(first.shots);
 		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(1);
+	});
+
+	// A real decodable 16×24 8-bit gray PNG; `sub` picks Sub row filtering, so two
+	// encodings of the same pixels differ byte-wise but decode identically.
+	const grayPng = (
+		pixels: Uint8Array,
+		sub: boolean,
+	): Uint8Array<ArrayBuffer> => {
+		const w = 24;
+		const h = 16;
+		const crc32 = (buf: Buffer): number => {
+			let c = ~0;
+			for (const byte of buf) {
+				c ^= byte;
+				for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+			}
+			return ~c >>> 0;
+		};
+		const chunk = (type: string, data: Buffer): Buffer => {
+			const head = Buffer.alloc(4);
+			head.writeUInt32BE(data.length);
+			const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+			const crc = Buffer.alloc(4);
+			crc.writeUInt32BE(crc32(body));
+			return Buffer.concat([head, body, crc]);
+		};
+		const ihdr = Buffer.alloc(13);
+		ihdr.writeUInt32BE(w, 0);
+		ihdr.writeUInt32BE(h, 4);
+		ihdr[8] = 8; // bit depth
+		ihdr[9] = 0; // grayscale
+		const raw = Buffer.alloc(h * (w + 1));
+		for (let y = 0; y < h; y++) {
+			raw[y * (w + 1)] = sub ? 1 : 0;
+			for (let x = 0; x < w; x++) {
+				const px = pixels[y * w + x]!;
+				raw[y * (w + 1) + 1 + x] =
+					sub && x > 0 ? (px - pixels[y * w + x - 1]!) & 0xff : px;
+			}
+		}
+		return Uint8Array.from(
+			Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+				chunk("IHDR", ihdr),
+				chunk("IDAT", deflateSync(raw)),
+				chunk("IEND", Buffer.alloc(0)),
+			]),
+		);
+	};
+	const screenPixels = Uint8Array.from(
+		{ length: 24 * 16 },
+		(_, i) => (i * 7) & 0xff,
+	);
+	const otherPixels = Uint8Array.from(
+		{ length: 24 * 16 },
+		(_, i) => (200 - i * 7) & 0xff,
+	);
+
+	test("a re-captured screen with new bytes replaces the stored shot instead of doubling", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "ready",
+								summary: "did it",
+								shots: [record.runs.length === 1 ? "ui.png" : "ui2.png"],
+							},
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const wt = join(store.worktreesDir, task.id);
+		mkdirSync(wt, { recursive: true });
+		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
+		await loop.runTurn(store.name, task.id);
+		// Same screen captured again on a later turn: re-encoded bytes, identical pixels.
+		writeFileSync(join(wt, "ui2.png"), grayPng(screenPixels, true));
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.shots).toEqual(["1.png"]);
+		expect(readdirSync(store.imagesDir(task.id))).toEqual(["1.png"]);
+		// The stored shot now carries the newer capture's bytes.
+		expect(
+			readFileSync(join(store.imagesDir(task.id), "1.png")).equals(
+				Buffer.from(grayPng(screenPixels, true)),
+			),
+		).toBe(true);
+		expect(logText(store, task.id)).toContain(
+			"! shot ui2.png: visually identical to 1.png — replaced it",
+		);
+	});
+
+	test("a visually different new shot still appends", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "ready",
+								summary: "did it",
+								shots: [record.runs.length === 1 ? "ui.png" : "ui2.png"],
+							},
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const wt = join(store.worktreesDir, task.id);
+		mkdirSync(wt, { recursive: true });
+		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
+		await loop.runTurn(store.name, task.id);
+		writeFileSync(join(wt, "ui2.png"), grayPng(otherPixels, false));
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.shots).toHaveLength(2);
+		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(2);
+	});
+
+	test("one outcome reporting the same screen in two encodings saves one", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "ready",
+								summary: "did it",
+								shots: ["ui.png", "ui2.png"],
+							},
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		const wt = join(store.worktreesDir, task.id);
+		mkdirSync(wt, { recursive: true });
+		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
+		writeFileSync(join(wt, "ui2.png"), grayPng(screenPixels, true));
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.shots).toHaveLength(1);
+		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(1);
+		expect(logText(store, task.id)).toContain(
+			"! shot ui2.png: visually identical to a shot saved this turn",
+		);
 	});
 
 	test("work turn adopts a shots/ directory when the outcome's shots were stripped", async () => {

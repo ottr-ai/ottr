@@ -19,8 +19,10 @@ import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import {
 	type DecodedImage,
 	MAX_IMAGE_BYTES,
+	pngGray16,
 	saveImages,
 	sniffImage,
+	visuallyIdentical,
 } from "./images.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
 import { modelRoles } from "./models.ts";
@@ -1817,14 +1819,17 @@ export function createTurnLoop(
 				// Dedup by content: agents re-report the same screenshots (the same path
 				// twice in one outcome, or again on a later turn of the same card), and each
 				// copy used to land as a fresh numbered file. Seed with what the card has.
+				// Byte-exact copies dedup on the sha256; a re-capture of an unchanged screen
+				// (new bytes, same pixels) matches an existing shot visually and replaces it,
+				// so a check send-back round does not double every screenshot on the card.
 				const seen = new Set<string>();
+				const stored: { name: string; gray: Uint8Array }[] = [];
 				for (const name of task.shots) {
 					try {
-						seen.add(
-							createHash("sha256")
-								.update(readRegular(join(store.imagesDir(id), name)))
-								.digest("hex"),
-						);
+						const bytes = readRegular(join(store.imagesDir(id), name));
+						seen.add(createHash("sha256").update(bytes).digest("hex"));
+						const gray = pngGray16(bytes);
+						if (gray !== null) stored.push({ name, gray });
 					} catch {
 						// pruned or absent: nothing to dedup against
 					}
@@ -1847,6 +1852,9 @@ export function createTurnLoop(
 						.map((d) => [`shots/${d.name}`, join(wt, "shots", d.name)]);
 				}
 				const copied: DecodedImage[] = [];
+				// Grays of this run's new copies: a second capture of the same new screen
+				// in one outcome skips too, instead of landing as a fresh numbered file.
+				const batch: Uint8Array[] = [];
 				for (const [shot, p] of candidates) {
 					try {
 						if (!p.startsWith(resolve(wt) + sep))
@@ -1867,8 +1875,45 @@ export function createTurnLoop(
 								if (seen.has(hash))
 									log(`! shot ${shot}: duplicate of an existing screenshot`);
 								else {
-									seen.add(hash);
-									copied.push({ bytes, ext });
+									const gray = pngGray16(bytes);
+									if (gray === null) {
+										// Undecodable (jpg, webp, exotic png): byte-exact dedup only.
+										seen.add(hash);
+										copied.push({ bytes, ext });
+									} else {
+										const twin = stored.findIndex((s) =>
+											visuallyIdentical(s.gray, gray),
+										);
+										const batchTwin =
+											twin === -1
+												? batch.findIndex((g) => visuallyIdentical(g, gray))
+												: -1;
+										if (twin !== -1) {
+											// Same screen, new bytes: refresh the stored shot in place
+											// instead of appending a second copy of it.
+											const name = stored[twin]!.name;
+											writeBelow(
+												store.dataRoot,
+												join(store.imagesDir(id), name),
+												bytes,
+												"truncate",
+											);
+											stored[twin] = { name, gray };
+											seen.add(hash);
+											log(
+												`! shot ${shot}: visually identical to ${name} — replaced it`,
+											);
+										} else if (batchTwin !== -1) {
+											seen.add(hash);
+											log(
+												`! shot ${shot}: visually identical to a shot saved this turn`,
+											);
+										} else {
+											seen.add(hash);
+											copied.push({ bytes, ext });
+											batch.push(gray);
+										}
+									}
 								}
 							}
 						}

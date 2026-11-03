@@ -11,12 +11,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import type { DecodedImage } from "./images.ts";
+import type { DecodedImage, Rgba } from "./images.ts";
 import {
 	decodeImages,
+	decodePng,
+	gray16,
 	MAX_IMAGE_BYTES,
 	saveImages,
 	sniffImage,
+	visuallyIdentical,
 } from "./images.ts";
 import fc from "./test/properties.ts";
 
@@ -306,6 +309,333 @@ describe("decodeImages properties", () => {
 					[1, 64],
 				],
 			},
+		);
+	});
+});
+
+describe("decodePng, gray16 and visuallyIdentical", () => {
+	const crc32 = (buf: Buffer): number => {
+		let c = ~0;
+		for (const byte of buf) {
+			c ^= byte;
+			for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+		}
+		return ~c >>> 0;
+	};
+
+	const chunk = (type: string, data: Buffer): Buffer => {
+		const head = Buffer.alloc(4);
+		head.writeUInt32BE(data.length);
+		const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+		const crc = Buffer.alloc(4);
+		crc.writeUInt32BE(crc32(body));
+		return Buffer.concat([head, body, crc]);
+	};
+
+	const ihdrFor = (
+		w: number,
+		h: number,
+		channels: number,
+		overrides: { depth?: number; colorType?: number; interlace?: number } = {},
+	): Buffer => {
+		const ihdr = Buffer.alloc(13);
+		ihdr.writeUInt32BE(w, 0);
+		ihdr.writeUInt32BE(h, 4);
+		ihdr[8] = overrides.depth ?? 8;
+		ihdr[9] =
+			overrides.colorType ??
+			(channels === 1 ? 0 : channels === 2 ? 4 : channels === 3 ? 2 : 6);
+		ihdr[12] = overrides.interlace ?? 0;
+		return ihdr;
+	};
+
+	const paeth = (a: number, b: number, c: number): number => {
+		const p = a + b - c;
+		const pa = Math.abs(p - a);
+		const pb = Math.abs(p - b);
+		const pc = Math.abs(p - c);
+		return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+	};
+
+	/** Encodes `pixels` (w*h*channels bytes, row-major) as a PNG with the given per-row filter type. */
+	const buildPngPixels = (
+		w: number,
+		h: number,
+		channels: number,
+		pixels: Uint8Array,
+		filterFor: (y: number) => number = () => 0,
+	): Buffer => {
+		const stride = w * channels;
+		const raw = Buffer.alloc(h * (stride + 1));
+		const at = (y: number, x: number): number =>
+			x < 0 || y < 0 ? 0 : pixels[y * stride + x]!;
+		for (let y = 0; y < h; y++) {
+			const filter = filterFor(y);
+			raw[y * (stride + 1)] = filter;
+			for (let x = 0; x < stride; x++) {
+				const cur = pixels[y * stride + x]!;
+				const left = x >= channels ? at(y, x - channels) : 0;
+				const above = at(y - 1, x);
+				const aboveLeft = x >= channels ? at(y - 1, x - channels) : 0;
+				let v = cur;
+				if (filter === 1) v = cur - left;
+				else if (filter === 2) v = cur - above;
+				else if (filter === 3) v = cur - ((left + above) >> 1);
+				else if (filter === 4) v = cur - paeth(left, above, aboveLeft);
+				raw[y * (stride + 1) + 1 + x] = v & 0xff;
+			}
+		}
+		return Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdrFor(w, h, channels)),
+			chunk("IDAT", deflateSync(raw)),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+	};
+
+	/** The RGBA expansion decodePng must produce for `pixels`. */
+	const expectRgba = (
+		w: number,
+		h: number,
+		channels: number,
+		pixels: Uint8Array,
+		decoded: Rgba | null,
+	) => {
+		expect(decoded).not.toBe(null);
+		const d = decoded!;
+		expect(d.w).toBe(w);
+		expect(d.h).toBe(h);
+		expect(d.rgba).toHaveLength(w * h * 4);
+		for (let i = 0; i < w * h; i++) {
+			const o = i * 4;
+			if (channels === 1) {
+				expect([
+					d.rgba[o],
+					d.rgba[o + 1],
+					d.rgba[o + 2],
+					d.rgba[o + 3],
+				]).toEqual([pixels[i], pixels[i], pixels[i], 255]);
+			} else if (channels === 2) {
+				expect([
+					d.rgba[o],
+					d.rgba[o + 1],
+					d.rgba[o + 2],
+					d.rgba[o + 3],
+				]).toEqual([
+					pixels[i * 2],
+					pixels[i * 2],
+					pixels[i * 2],
+					pixels[i * 2 + 1],
+				]);
+			} else if (channels === 3) {
+				expect([
+					d.rgba[o],
+					d.rgba[o + 1],
+					d.rgba[o + 2],
+					d.rgba[o + 3],
+				]).toEqual([pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2], 255]);
+			} else {
+				expect([
+					d.rgba[o],
+					d.rgba[o + 1],
+					d.rgba[o + 2],
+					d.rgba[o + 3],
+				]).toEqual([
+					pixels[i * 4],
+					pixels[i * 4 + 1],
+					pixels[i * 4 + 2],
+					pixels[i * 4 + 3],
+				]);
+			}
+		}
+	};
+
+	test("decodes all five filter types exactly", () => {
+		const w = 7;
+		const h = 6;
+		const pixels = Uint8Array.from(
+			{ length: w * h * 4 },
+			(_, i) => (i * 37 + 11) & 0xff,
+		);
+		for (const filter of [0, 1, 2, 3, 4]) {
+			const png = buildPngPixels(w, h, 4, pixels, () => filter);
+			expectRgba(w, h, 4, pixels, decodePng(png));
+		}
+	});
+
+	test("decodes gray, gray+alpha and rgb color types", () => {
+		const w = 5;
+		const h = 3;
+		const gray = Uint8Array.from({ length: w * h }, (_, i) => (i * 23) & 0xff);
+		expectRgba(w, h, 1, gray, decodePng(buildPngPixels(w, h, 1, gray)));
+		const ga = Uint8Array.from(
+			{ length: w * h * 2 },
+			(_, i) => (i * 13) & 0xff,
+		);
+		expectRgba(w, h, 2, ga, decodePng(buildPngPixels(w, h, 2, ga)));
+		const rgb = Uint8Array.from(
+			{ length: w * h * 3 },
+			(_, i) => (i * 29) & 0xff,
+		);
+		expectRgba(w, h, 3, rgb, decodePng(buildPngPixels(w, h, 3, rgb)));
+	});
+
+	test("rejects palette, 16-bit, interlaced, zero-sized and truncated PNGs", () => {
+		const pixels = Uint8Array.from({ length: 4 * 4 }, () => 7);
+		const good = buildPngPixels(4, 4, 1, pixels);
+		expect(decodePng(good)).not.toBe(null);
+
+		const ihdrPalette = ihdrFor(4, 4, 1, { colorType: 3 });
+		const palette = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdrPalette),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(decodePng(palette)).toBe(null);
+
+		const ihdr16 = ihdrFor(4, 4, 1, { depth: 16 });
+		const deep = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdr16),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(decodePng(deep)).toBe(null);
+
+		const ihdrAdam7 = ihdrFor(4, 4, 1, { interlace: 1 });
+		const adam7 = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdrAdam7),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(decodePng(adam7)).toBe(null);
+
+		const ihdrZero = ihdrFor(0, 4, 1);
+		const zero = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdrZero),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(decodePng(zero)).toBe(null);
+
+		expect(decodePng(good.subarray(0, good.length - 6))).toBe(null); // truncated IEND
+		expect(decodePng(good.subarray(0, 20))).toBe(null); // truncated IDAT
+		expect(
+			decodePng(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+		).toBe(null);
+		expect(decodePng(Buffer.from("hello, not a png"))).toBe(null);
+	});
+
+	test("a broken zlib stream returns null instead of throwing", () => {
+		const ihdr = ihdrFor(4, 4, 1);
+		const badIdat = chunk("IDAT", Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+		const png = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdr),
+			badIdat,
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(decodePng(png)).toBe(null);
+	});
+
+	test("tolerates trailing bytes after IEND", () => {
+		const pixels = Uint8Array.from({ length: 4 * 4 }, (_, i) => i & 0xff);
+		const png = buildPngPixels(4, 4, 1, pixels);
+		expectRgba(
+			4,
+			4,
+			1,
+			pixels,
+			decodePng(Buffer.concat([png, Buffer.from([1])])),
+		);
+	});
+
+	test("gray16 downsamples uniform blocks to exact cell values", () => {
+		// 16×16 with one distinct value per cell.
+		const cells = Uint8Array.from(
+			{ length: 16 * 16 },
+			(_, i) => (i * 3) & 0xff,
+		);
+		const g = gray16({
+			w: 16,
+			h: 16,
+			rgba: Uint8Array.from([...cells].flatMap((v) => [v, v, v, 255])),
+		});
+		expect([...g]).toEqual([...cells]);
+
+		// 32×32 of uniform 2×2 blocks: cell k averages exactly its block.
+		const blockValue = (i: number): number =>
+			((Math.floor(i / 64) * 16 + Math.floor((i % 32) / 2)) * 5) & 0xff;
+		const blocks = Uint8Array.from({ length: 32 * 32 }, (_, i) =>
+			blockValue(i),
+		);
+		const g2 = gray16({
+			w: 32,
+			h: 32,
+			rgba: Uint8Array.from([...blocks].flatMap((v) => [v, v, v, 255])),
+		});
+		for (let c = 0; c < 256; c++) {
+			const y = Math.floor(c / 16);
+			const x = c % 16;
+			const v = blocks[y * 2 * 32 + x * 2]!;
+			expect(g2[c]).toBe(v);
+		}
+	});
+
+	test("visuallyIdentical allows noise, rejects real changes", () => {
+		const base = new Uint8Array(256).fill(100);
+		expect(visuallyIdentical(base, Uint8Array.from(base))).toBe(true);
+		// One cell within the noise band, and one beyond it: both stay inside the
+		// eight-cell budget, so a lone hot cell is still the same screen.
+		const near = Uint8Array.from(base);
+		near[10] = 108;
+		expect(visuallyIdentical(base, near)).toBe(true);
+		const hot = Uint8Array.from(base);
+		hot[10] = 109;
+		expect(visuallyIdentical(base, hot)).toBe(true);
+		// Eight cells beyond the band exhaust the budget exactly; a ninth fails.
+		const eight = Uint8Array.from(base);
+		for (let i = 0; i < 8; i++) eight[i] = 0;
+		expect(visuallyIdentical(base, eight)).toBe(true);
+		const nine = Uint8Array.from(eight);
+		nine[8] = 0;
+		expect(visuallyIdentical(base, nine)).toBe(false);
+	});
+
+	test("property: decodePng never throws on arbitrary bytes", () => {
+		fc.assert(
+			fc.property(fc.uint8Array({ maxLength: 512 }), (bytes) => {
+				const d = decodePng(bytes);
+				if (d !== null) {
+					expect(d.w).toBeGreaterThan(0);
+					expect(d.h).toBeGreaterThan(0);
+					expect(d.rgba).toHaveLength(d.w * d.h * 4);
+				}
+			}),
+		);
+	});
+
+	test("property: encode/decode round trips random images through every filter", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 24 }),
+				fc.integer({ min: 1, max: 24 }),
+				fc.integer({ min: 0, max: 4 }),
+				fc.uint8Array({ minLength: 16 * 16, maxLength: 16 * 16 }),
+				(w, h, filter, noise) => {
+					const pixels = Uint8Array.from(
+						{ length: w * h },
+						(_, i) => noise[i % noise.length]!,
+					);
+					expectRgba(
+						w,
+						h,
+						1,
+						pixels,
+						decodePng(buildPngPixels(w, h, 1, pixels, () => filter)),
+					);
+				},
+			),
+			{ examples: [[1, 1, 4, new Uint8Array(256).fill(9)]] },
 		);
 	});
 });
