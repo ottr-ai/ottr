@@ -182,12 +182,15 @@ describe("GitHostsSection GitHub App form", () => {
 				container.querySelector(".auth-error")?.textContent ?? null,
 			).toBeNull();
 
-			// Type a numeric ID and a PEM into the fields, then let React's
-			// production handlers pick the values up.
+			// Type a numeric ID and a fake key into the fields, then let React's
+			// production handlers pick the values up. The key fixture must stay
+			// PEM-free: the CI secret scan pairs a BEGIN header with a KEY-----
+			// tail 64+ characters later, so the two PEM strings here matched as
+			// one leak and failed the Scan job (run 41583302106).
 			await act(async () => {
 				typeInto(idInput, "123456");
 				onChangeOf(idInput)({ target: idInput, currentTarget: idInput });
-				typeInto(keyArea, "-----BEGIN RSA PRIVATE KEY-----");
+				typeInto(keyArea, "fake-key-0000");
 				onChangeOf(keyArea)({ target: keyArea, currentTarget: keyArea });
 			});
 
@@ -199,7 +202,7 @@ describe("GitHostsSection GitHub App form", () => {
 			expect(postCalls).toBe(1);
 			expect(postBody).toEqual({
 				id: "123456",
-				key: "-----BEGIN RSA PRIVATE KEY-----",
+				key: "fake-key-0000",
 			});
 			const saveButton = container.querySelector<HTMLButtonElement>(
 				"#github-app-block button[type='submit']",

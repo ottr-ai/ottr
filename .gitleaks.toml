@@ -25,3 +25,15 @@ regexes = ['''\bglpat-[a-z-]+-0{3,}\b''', '''dGhlIHNhbXBsZSBub25jZQ==''', '''9d1
 [[allowlists]]
 description = "impeccable live-reload dev marker injected into the UI entry html"
 paths = ['''(^|/)src/ui/index\.html$''']
+
+# Commit 9fc23a9 added two PEM header strings to the settings test; the
+# private-key rule pairs a BEGIN header with a KEY----- tail 64+ characters
+# later, so the two strings matched as one leak and failed the Scan job on
+# every push. The settings tip commit replaces both with the fake-key-0000
+# fixture, but the finding lives in that commit's patch, which history keeps
+# forever. Scoped to the one commit: a future PEM string anywhere else stays
+# flagged.
+
+[[allowlists]]
+description = "the settings test PEM fixture pairing in commit 9fc23a9, replaced by fake-key-0000 on the tip"
+commits = ["9fc23a988c46bc57a9a8b93cd15155bdbb672c87"]
