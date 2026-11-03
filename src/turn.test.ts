@@ -12415,7 +12415,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		await loop.runTurn(store.name, task.id);
 		expect(store.getTask(task.id)!.shots).toEqual([]);
 		expect(logText(store, task.id)).toContain(
-			"! shot ../escape.png: path escapes the worktree",
+			"! shot ../escape.png: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)",
 		);
 	});
 

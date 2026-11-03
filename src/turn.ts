@@ -1837,7 +1837,9 @@ export function createTurnLoop(
 				for (const [shot, p] of candidates) {
 					try {
 						if (!p.startsWith(resolve(wt) + sep))
-							log(`! shot ${shot}: path escapes the worktree`);
+							log(
+								`! shot ${shot}: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)`,
+							);
 						else {
 							const bytes = readBelow(
 								worktreeAnchor(e.path, wt),
