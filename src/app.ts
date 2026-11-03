@@ -2242,6 +2242,16 @@ export function createApp(deps: AppDeps) {
 			}
 			patch.displayName = name === "" ? null : name;
 		}
+		const ix = body.iconText;
+		if (ix !== undefined) {
+			if (ix !== null && typeof ix !== "string")
+				return json({ error: "iconText must be a string or null" }, 400);
+			const marker = typeof ix === "string" ? ix.trim() : "";
+			if (marker.length > 4 || /[\p{Cc}]/u.test(marker)) {
+				return json({ error: "iconText must be at most 4 characters" }, 400);
+			}
+			patch.iconText = marker === "" ? null : marker;
+		}
 		const rc = body.releaseCommand;
 		if (rc !== undefined) {
 			if (rc !== null && typeof rc !== "string")

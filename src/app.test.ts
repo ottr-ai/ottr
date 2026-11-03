@@ -1058,6 +1058,25 @@ describe("settings routes", () => {
 		expect(store.getSettings().maxParallel).toBeNull();
 	});
 
+	test("iconText: a string or null, at most 4 characters, empty becomes null", async () => {
+		const tooLong = await post("/api/projects/p1/settings", {
+			iconText: "TOOLONG",
+		});
+		expect(tooLong.status).toBe(400);
+		expect(await errorOf(tooLong)).toBe(
+			"iconText must be at most 4 characters",
+		);
+		const badType = await post("/api/projects/p1/settings", { iconText: 7 });
+		expect(badType.status).toBe(400);
+		expect(await errorOf(badType)).toBe("iconText must be a string or null");
+		const ok = await post("/api/projects/p1/settings", { iconText: " OT " });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().iconText).toBe("OT");
+		const empty = await post("/api/projects/p1/settings", { iconText: "  " });
+		expect(empty.status).toBe(200);
+		expect(store.getSettings().iconText).toBeNull();
+	});
+
 	test("auto-tend settings validate and round-trip through the project settings route", async () => {
 		const ok = await post("/api/projects/p1/settings", {
 			autoTend: true,

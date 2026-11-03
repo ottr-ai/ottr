@@ -270,6 +270,7 @@ describe("settings", () => {
 			maxParallel: 3,
 			copyExtra: [],
 			displayName: "Ottr",
+			iconText: null,
 			releaseCommand: "node scripts/release.mjs --ottr",
 			archReviewCap: 80,
 			maxImages: 4,
@@ -291,6 +292,7 @@ describe("settings", () => {
 			maxParallel: 3,
 			copyExtra: [],
 			displayName: null,
+			iconText: null,
 			releaseCommand: null,
 			archReviewCap: 80,
 			maxImages: 4,
@@ -307,6 +309,19 @@ describe("settings", () => {
 			targetBranch: null,
 			originUrl: null,
 		});
+		store.close();
+	});
+
+	test("iconText persists across a reopen and resets to null", () => {
+		const dir = join(root, "settings-icon-text");
+		let store = open(dir);
+		expect(store.getSettings().iconText).toBeNull();
+		store.setSettings({ iconText: "OT" });
+		store.close();
+		store = open(dir);
+		expect(store.getSettings().iconText).toBe("OT");
+		store.setSettings({ iconText: null });
+		expect(store.getSettings().iconText).toBeNull();
 		store.close();
 	});
 

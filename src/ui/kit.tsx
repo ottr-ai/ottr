@@ -813,9 +813,18 @@ export function sourceIconUrl(p: ProjectView): string | null {
 }
 
 export function ProjectTag({ project }: { project: ProjectView }) {
-	// Custom upload first, then the source's icon. A load failure falls back to the
-	// monogram; a re-upload gets a new ?v, so a new src retries the img.
+	// The text marker wins over every image: its purpose is to replace whatever icon
+	// would otherwise show (docs/specs/project-icon-text.md). Then the custom upload,
+	// then the source's icon. A load failure falls back to the monogram; a re-upload
+	// gets a new ?v, so a new src retries the img.
 	const [failedSrc, setFailedSrc] = useState<string | null>(null);
+	const marker = project.settings.iconText;
+	if (marker)
+		return (
+			<span className="ptag tag-text" aria-hidden="true">
+				{marker}
+			</span>
+		);
 	const src =
 		project.icon !== null
 			? `/api/projects/${encodeURIComponent(project.name)}/icon?v=${project.icon}`

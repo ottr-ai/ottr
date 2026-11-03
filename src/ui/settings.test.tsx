@@ -548,6 +548,131 @@ describe("ProjectSettingsForm target branch", () => {
 	});
 });
 
+describe("ProjectSettingsForm icon text marker", () => {
+	// A minimal ProjectView: the form reads the name and the full settings shape.
+	const project = {
+		name: "proj",
+		icon: null,
+		remote: "https://github.com/octo/repo",
+		github: "https://github.com/octo/repo",
+		hasRules: true,
+		gitless: false,
+		settings: {
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			iconText: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: true,
+			forkResearch: false,
+			prReviews: false,
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+		},
+	} as unknown as ProjectView;
+
+	/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
+	async function mountForm(fetchMock: typeof fetch): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("the Icon card shows the marker row and saving posts the trimmed text", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return ok(project);
+			}
+			// Sections beside the form that load on mount.
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountForm(fetchMock);
+		try {
+			const card = container.querySelector("#project-icon-section");
+			expect(card).not.toBeNull();
+			expect(card?.textContent).toContain("Text marker");
+			// No upload and no marker stored: the chip names the default chain.
+			expect(card?.textContent).toContain("Default");
+			const input = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Text marker"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("text marker input did not render");
+			expect(input.getAttribute("maxlength")).toBe("4");
+			await act(async () => {
+				typeInto(input, " OT ");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = card?.querySelector("form");
+			if (form === null || form === undefined)
+				throw new Error("text marker form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			// The server stores the trimmed text; an empty input would store null.
+			expect(postBody?.iconText).toBe("OT");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
 /** Mounts SessionSection against `fetchMock`, same cleanup as mountSection. */
 async function mountSessions(fetchMock: typeof fetch): Promise<{
 	container: HTMLDivElement;

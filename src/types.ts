@@ -122,6 +122,12 @@ export interface ProjectSettings {
 	/** Name the board shows instead of the folder name; null = folder name. The folder name stays the project's id. */
 	displayName: string | null;
 	/**
+	 * Short text (at most 4 characters) shown on the project tag's plate instead of any
+	 * icon — the upload, the owner avatar or the host favicon; null = icons show.
+	 * docs/specs/project-icon-text.md
+	 */
+	iconText: string | null;
+	/**
 	 * Runs after a release review approves, instead of Ottr's tag, push and GitHub release; null = those
 	 * built-in steps. Split on spaces (double quotes group), no shell; gets OTTR_RELEASE_VERSION,
 	 * OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW (commits since the last

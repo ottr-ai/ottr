@@ -44,9 +44,8 @@ const {
 	Drawer,
 	openCardInProject,
 } = await import("./app.tsx");
-const { monogram, sourceIconUrl, ProjectLogo, windowGone } = await import(
-	"./kit.tsx"
-);
+const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
+	await import("./kit.tsx");
 const {
 	alateChip,
 	alateHint,
@@ -161,6 +160,30 @@ describe("sourceIconUrl", () => {
 	});
 	test("a GitHub URL without an owner: nothing to adopt from", () => {
 		expect(sourceIconUrl(p("https://github.com/"))).toBe(null);
+	});
+});
+
+describe("ProjectTag", () => {
+	const p = (icon: number | null, iconText: string | null) =>
+		({
+			remote: "https://github.com/octo/repo",
+			icon,
+			name: "demo",
+			github: "https://github.com/octo/repo",
+			settings: { displayName: null, iconText },
+		}) as Parameters<typeof ProjectTag>[0]["project"];
+	const html = (x: Parameters<typeof ProjectTag>[0]["project"]) =>
+		renderToStaticMarkup(<ProjectTag project={x} />);
+	test("the text marker wins over the upload and the source avatar: text on the plate, no image", () => {
+		const out = html(p(123, "GD"));
+		expect(out).toContain("tag-text");
+		expect(out).toContain(">GD<");
+		expect(out).not.toContain("<img");
+	});
+	test("without a marker the uploaded icon still shows", () => {
+		const out = html(p(123, null));
+		expect(out).toContain("<img");
+		expect(out).not.toContain("tag-text");
 	});
 });
 

@@ -4382,8 +4382,12 @@ export function ProjectSettingsForm({
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
+	const [marker, setMarker] = useState(project.settings.iconText ?? "");
 	const st = project.settings;
 	const icon = useInstantSave(act);
+	const markerSave = useInstantSave(act);
+	const markerFormId = useId();
+	const markerDirty = marker.trim() !== (st.iconText ?? "");
 	// The setup wizard, opened by Open setup.
 	const [setupOpen, setSetupOpen] = useState(false);
 	const removable = !tasks.some(
@@ -4436,9 +4440,11 @@ export function ProjectSettingsForm({
 					id="project-icon-section"
 					title="Icon"
 					status={
-						project.icon !== null
-							? { label: "Uploaded", tone: "ok" }
-							: { label: "Default", tone: "off" }
+						st.iconText
+							? { label: "Text", tone: "ok" }
+							: project.icon !== null
+								? { label: "Uploaded", tone: "ok" }
+								: { label: "Default", tone: "off" }
 					}
 				>
 					<div className="alate-def-rows">
@@ -4507,6 +4513,40 @@ export function ProjectSettingsForm({
 									failed={icon.failed}
 								/>
 							</div>
+						</DefRow>
+						<DefRow
+							name="Text marker"
+							action={
+								<SaveButton
+									form={markerFormId}
+									s={markerSave}
+									dirty={markerDirty}
+								/>
+							}
+							help="Up to 4 characters shown on the plate instead of any icon: this upload, the owner's avatar or the host's favicon. Empty shows the images again."
+							shape="Up to 4 characters"
+						>
+							<form
+								id={markerFormId}
+								onSubmit={(e) => {
+									e.preventDefault();
+									if (markerDirty)
+										markerSave.run(() =>
+											send({ iconText: marker.trim() || null }),
+										);
+								}}
+							>
+								<label>
+									<input
+										type="text"
+										maxLength={4}
+										value={marker}
+										onChange={(e) => setMarker(e.target.value)}
+										placeholder="e.g. OT"
+										aria-label="Text marker"
+									/>
+								</label>
+							</form>
 						</DefRow>
 					</div>
 				</SettingsCard>
