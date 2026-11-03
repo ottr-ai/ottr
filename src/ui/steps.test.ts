@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import type { RetroView, TurnKind, TurnView, WorkCheckRun } from "../types.ts";
+import type {
+	FindingView,
+	RetroView,
+	TurnKind,
+	TurnView,
+	WorkCheckRun,
+} from "../types.ts";
 import { type Step, workSteps } from "./steps.ts";
 
 const turn = (id: number, kind: TurnKind, startedAt: number): TurnView => ({
@@ -42,10 +48,28 @@ const retro = (
 	turns,
 });
 
+const finding = (
+	id: string,
+	turns: TurnView[],
+	createdAt = 0,
+): FindingView => ({
+	id,
+	title: `the ${id} bug`,
+	state: "idle",
+	stage: "done",
+	cancelledAt: null,
+	createdAt,
+	turns,
+});
+
 /** What the rail reads, in order: the step kind plus the turn kind or run number. */
 const labels = (steps: Step[]): string[] =>
 	steps.map((s) =>
-		s.kind === "check" ? `check#${s.n}` : `${s.kind}:${s.turn.kind}`,
+		s.kind === "check"
+			? `check#${s.n}`
+			: s.kind === "filed"
+				? "filed"
+				: `${s.kind}:${s.turn.kind}`,
 	);
 
 test("workSteps lists turns, checks and the retro by start time, oldest first", () => {
@@ -108,6 +132,52 @@ test("workSteps keeps input order for equal times within one kind", () => {
 test("workSteps still lists the turns of a cancelled retro", () => {
 	const steps = workSteps([], [], retro([turn(9, "work", 100)], 200));
 	expect(labels(steps)).toEqual(["retro:work"]);
+});
+
+test("workSteps folds a review's finding turns in after the retro at the same start time", () => {
+	const steps = workSteps(
+		[turn(1, "work", 100)],
+		[check(120)],
+		retro([turn(9, "work", 100)]),
+		[finding("OTTR-3", [turn(5, "work", 100), turn(6, "merge", 150)], 90)],
+	);
+	expect(labels(steps)).toEqual([
+		"turn:work",
+		"retro:work",
+		"finding:work",
+		"check#1",
+		"finding:merge",
+	]);
+	const first = steps.find((s) => s.kind === "finding");
+	expect(first?.kind === "finding" && first.finding.id).toBe("OTTR-3");
+});
+
+test("workSteps marks a finding that has not started yet at its creation", () => {
+	const steps = workSteps([turn(1, "work", 100)], [], undefined, [
+		finding("OTTR-3", [], 90),
+	]);
+	expect(labels(steps)).toEqual(["filed", "turn:work"]);
+	const filed = steps.find((s) => s.kind === "filed");
+	expect(filed?.kind === "filed" && filed.finding.id).toBe("OTTR-3");
+	expect(filed?.kind === "filed" && filed.at).toBe(90);
+});
+
+test("workSteps still lists the turns of a cancelled finding", () => {
+	const steps = workSteps([], [], undefined, [
+		{
+			...finding("OTTR-3", [turn(5, "work", 100)]),
+			cancelledAt: 200,
+		},
+	]);
+	expect(labels(steps)).toEqual(["finding:work"]);
+});
+
+test("workSteps ranks one finding's filed marker before another finding's turn at the same time", () => {
+	const steps = workSteps([], [], undefined, [
+		finding("OTTR-3", [], 100),
+		finding("OTTR-4", [turn(5, "work", 100)], 100),
+	]);
+	expect(labels(steps)).toEqual(["filed", "finding:work"]);
 });
 
 test("workSteps gives an empty rail for empty inputs", () => {

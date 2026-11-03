@@ -777,6 +777,71 @@ describe("task routes", () => {
 		);
 	});
 
+	test("detail carries a review's findings with prompt-free turns", async () => {
+		const review = store.createTask("review prompt", null, "review");
+		const finding = store.createTask("the found bug");
+		store.updateTask(finding.id, { followUpOf: review.id });
+		const turn = store.startTurn(
+			finding.id,
+			"work",
+			"finding turn prompt",
+			null,
+		);
+		// The closure: a follow-up of the finding and a dependency join it; a retro never does.
+		const grand = store.createTask("follow-up of the finding");
+		store.updateTask(grand.id, { followUpOf: finding.id });
+		const dep = store.createTask("prerequisite of the finding");
+		store.updateTask(finding.id, { dependsOn: [dep.id] });
+		const retro = store.createTask("retro prompt", null, "retro");
+		store.updateTask(retro.id, { followUpOf: review.id });
+		const res = await get(`/api/projects/p1/tasks/${review.id}`);
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			findings?: Array<{
+				id: string;
+				title: string;
+				turns: Array<Record<string, unknown>>;
+			}>;
+		};
+		expect(b.findings?.map((f) => f.id)).toEqual([
+			finding.id,
+			grand.id,
+			dep.id,
+		]);
+		expect(b.findings?.[0]?.title).toBe("the found bug");
+		expect(b.findings?.[0]?.turns.map((x) => x.id)).toEqual([turn.id]);
+		expect(b.findings?.[0]?.turns[0]).not.toHaveProperty("prompt");
+		expect(b.findings?.map((f) => f.id)).not.toContain(retro.id);
+
+		// A card filed after the review finished is not part of this review any more.
+		store.updateTask(review.id, { stage: "done", state: "idle" });
+		const landed = store.getTask(review.id)?.doneAt ?? 0;
+		while (Date.now() <= landed) {} // the late card must be created strictly after the landing
+		const late = store.createTask("a later follow-up of the finding");
+		store.updateTask(late.id, { followUpOf: finding.id });
+		const doneRes = await get(`/api/projects/p1/tasks/${review.id}`);
+		const done = (await doneRes.json()) as { findings?: Array<{ id: string }> };
+		expect(done.findings?.map((f) => f.id)).not.toContain(late.id);
+
+		// A release card runs the same review flow: its findings ride on its detail too.
+		const release = store.createTask("cut the release");
+		store.updateTask(release.id, { releaseVersion: "v0.4.0" });
+		const releaseFinding = store.createTask("the release blocker");
+		store.updateTask(releaseFinding.id, { followUpOf: release.id });
+		const releaseRes = await get(`/api/projects/p1/tasks/${release.id}`);
+		const rb = (await releaseRes.json()) as {
+			findings?: Array<{ id: string }>;
+		};
+		expect(rb.findings?.map((f) => f.id)).toEqual([releaseFinding.id]);
+
+		// A plain work card has no findings.
+		const plain = store.createTask("no review here");
+		const plainRes = await get(`/api/projects/p1/tasks/${plain.id}`);
+		expect(((await plainRes.json()) as { findings?: unknown }).findings).toBe(
+			undefined,
+		);
+	});
+
 	test("state lists a cancelled card with its cancelledAt", async () => {
 		const t = store.createTask("cancelled card stays visible");
 		store.updateTask(t.id, { cancelledAt: 1760000000000, state: "idle" });

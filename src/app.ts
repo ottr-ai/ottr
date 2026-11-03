@@ -151,6 +151,7 @@ import {
 	archReviewDue,
 	findingsSettledAt,
 	isRetro,
+	isReview,
 	lastReviewBase,
 	liveCard,
 	mergeAnywayPatch,
@@ -2192,6 +2193,23 @@ export function createApp(deps: AppDeps) {
 								.listTurns(retro.id)
 								.map(({ prompt: _prompt, ...turn }) => turn),
 						},
+					}
+				: {}),
+			...(isReview(t)
+				? {
+						findings: reviewFindings(e.store.listTasks(), t)
+							.sort((a, b) => a.createdAt - b.createdAt)
+							.map((f) => ({
+								id: f.id,
+								title: f.title,
+								state: f.state,
+								stage: f.stage,
+								cancelledAt: f.cancelledAt,
+								createdAt: f.createdAt,
+								turns: e.store
+									.listTurns(f.id)
+									.map(({ prompt: _prompt, ...turn }) => turn),
+							})),
 					}
 				: {}),
 		};

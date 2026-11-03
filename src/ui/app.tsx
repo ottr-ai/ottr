@@ -6489,10 +6489,21 @@ export function Drawer({
 		report: null,
 		diffFiles: null,
 	};
-	// Work steps rail: this card's turns, its work check runs and its retro's turns by start time.
-	const steps = workSteps(task.turns, task.workCheckLog, task.retro);
+	// Work steps rail: this card's turns, its work check runs, its retro's turns and its
+	// review's finding turns by start time.
+	const steps = workSteps(
+		task.turns,
+		task.workCheckLog,
+		task.retro,
+		task.findings,
+	);
 	// The retro's link and waiting reason ride on its latest step only.
 	const lastRetro = steps.findLast((s) => s.kind === "retro");
+	// Each finding's "Open finding" link rides on its latest step only.
+	const lastFindingStep = new Map<string, number>();
+	steps.forEach((s, i) => {
+		if (s.kind === "finding") lastFindingStep.set(s.finding.id, i);
+	});
 	// Touched-file stats (captured at merge, or live from the branch while open): totals for the
 	// section's summary line.
 	const diffFiles = task.diffFiles ?? [];
@@ -7523,7 +7534,7 @@ export function Drawer({
 							steps.length === 0 && <p className="dim">No turns yet.</p>
 						)}
 						<ul className="turns">
-							{steps.map((s) => {
+							{steps.map((s, idx) => {
 								if (s.kind === "check") {
 									const { run } = s;
 									const nb = run.blockers.length;
@@ -7573,10 +7584,45 @@ export function Drawer({
 										</li>
 									);
 								}
+								if (s.kind === "filed") {
+									const f = s.finding;
+									return (
+										// Not expandable: the finding has no turns yet; its card holds the state.
+										<li key={`filed-${f.id}`} className="turn turn-check">
+											<span className="turn-node" aria-hidden="true">
+												<Mark kind="queued" />
+											</span>
+											<div className="turn-head">
+												<strong>finding</strong>
+												<span
+													className={
+														"outcome" +
+														(f.cancelledAt !== null || f.state === "needs_you"
+															? " o-needs_you"
+															: "")
+													}
+												>
+													{f.cancelledAt !== null ? "cancelled" : f.state}
+												</span>
+												<span className="turn-time">
+													{new Date(f.createdAt).toLocaleTimeString()}
+												</span>
+											</div>
+											<div className="dim turn-sum">{f.title}</div>
+										</li>
+									);
+								}
 								const t = s.turn;
-								const retroId = s.kind === "retro" ? s.retroId : null;
-								// A retro turn's id comes from another card: key its open state apart.
-								const stepKey = retroId === null ? t.id : `retro-${t.id}`;
+								// The card that ran the turn: null for this card's own turns.
+								const sub =
+									s.kind === "retro"
+										? s.retroId
+										: s.kind === "finding"
+											? s.finding.id
+											: null;
+								// A retro or finding turn's id comes from another card: key its open state apart.
+								const stepKey =
+									sub === null ? t.id : `${s.kind}-${sub}-${t.id}`;
 								const expanded = openTurn === stepKey;
 								// The retro's waiting reason, unless its latest turn already shows it.
 								const retroWait =
@@ -7587,10 +7633,10 @@ export function Drawer({
 										? task.retro
 										: null;
 								// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
-								// A retro runs on its own card's model, which this drawer does not carry.
+								// A retro or finding runs on its own card's model, which this drawer does not carry.
 								const model =
 									t.model ??
-									(t.endedAt === null && retroId === null
+									(t.endedAt === null && sub === null
 										? (task.model ?? catalog?.defaultModel ?? null)
 										: null);
 								return (
@@ -7660,7 +7706,13 @@ export function Drawer({
 												aria-expanded={expanded}
 											>
 												<Icon name="chevron-right" size={13} />
-												<strong>{retroId === null ? t.kind : "retro"}</strong>
+												<strong>
+													{sub === null
+														? t.kind
+														: s.kind === "finding"
+															? "finding"
+															: "retro"}
+												</strong>
 												{t.outcome !== null && (
 													<span
 														className={
@@ -7686,24 +7738,42 @@ export function Drawer({
 												</span>
 												<span className="turn-dur">{turnDuration(t)}</span>
 											</button>
+											{s.kind === "finding" && (
+												<div className="dim turn-sum">{s.finding.title}</div>
+											)}
 											{t.summary !== null && (
 												<div className="dim turn-sum">{t.summary}</div>
 											)}
 											{/* The retro card's own drawer keeps reply and cancel for a retro that waits. */}
-											{retroId !== null && s === lastRetro && (
+											{s.kind === "retro" && s === lastRetro && (
 												<a
 													className="turn-link"
-													href={taskPath(task.project, retroId)}
+													href={taskPath(task.project, s.retroId)}
 													// The link is its own target: the row's toggle must not fire.
 													onKeyDown={(e) => e.stopPropagation()}
 													onClick={(e) => {
 														e.stopPropagation();
-														navClick(e, () => onOpenTask(retroId));
+														navClick(e, () => onOpenTask(s.retroId));
 													}}
 												>
 													Open retro
 												</a>
 											)}
+											{s.kind === "finding" &&
+												lastFindingStep.get(s.finding.id) === idx && (
+													<a
+														className="turn-link"
+														href={taskPath(task.project, s.finding.id)}
+														// The link is its own target: the row's toggle must not fire.
+														onKeyDown={(e) => e.stopPropagation()}
+														onClick={(e) => {
+															e.stopPropagation();
+															navClick(e, () => onOpenTask(s.finding.id));
+														}}
+													>
+														Open finding
+													</a>
+												)}
 											{t.error !== null && (
 												<div
 													className={
@@ -7727,10 +7797,7 @@ export function Drawer({
 												</div>
 											)}
 											{expanded && (
-												<LogView
-													project={project}
-													taskId={retroId ?? task.id}
-												/>
+												<LogView project={project} taskId={sub ?? task.id} />
 											)}
 										</div>
 									</li>

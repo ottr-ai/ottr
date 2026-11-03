@@ -670,6 +670,10 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	/** The retro card filed after this card (kind "retro", followUpOf this card); this card's
 	 * Work steps show its turns, and the board shows no card for it. Absent without a retro. */
 	retro?: RetroView;
+	/** Review and release cards only: the cards the review filed (reviewFindings), oldest
+	 * first. This card's Work steps show their turns; each finding stays a card of its own.
+	 * Absent without findings. */
+	findings?: FindingView[];
 }
 
 /** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */
@@ -680,6 +684,19 @@ export interface RetroView {
 	cancelledAt: number | null;
 	needsReason: string | null;
 	asked: Task["asked"];
+	turns: TurnView[];
+}
+
+/** One finding of a review or release card, as that card's drawer shows it: the facts its
+ * Work steps entries read. The finding itself stays a normal card on the board. */
+export interface FindingView {
+	id: string;
+	title: string;
+	state: RunState;
+	stage: Stage;
+	cancelledAt: number | null;
+	/** Epoch ms the review filed the finding; a finding without turns marks this time. */
+	createdAt: number;
 	turns: TurnView[];
 }
 
