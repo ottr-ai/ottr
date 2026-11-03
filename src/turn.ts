@@ -32,8 +32,8 @@ import {
 	followUpPrompt,
 	grillPrompt,
 	handoffMarkdown,
+	isRetroProposalReason,
 	mergePrompt,
-	PROPOSED_REASON_PREFIX,
 	proposedReason,
 	RESEARCH_REPORT,
 	rebaseRetryPrompt,
@@ -2620,7 +2620,7 @@ export function createTurnLoop(
 						(x) =>
 							!x.cancelledAt &&
 							x.state === "needs_you" &&
-							(x.needsReason ?? "").startsWith(PROPOSED_REASON_PREFIX) &&
+							isRetroProposalReason(x.needsReason) &&
 							store.listTurns(x.id).length === 0,
 					).length;
 				if (openProposals >= 3) {
@@ -2658,7 +2658,13 @@ export function createTurnLoop(
 						// A null model means the proposal card runs on the default role.
 						model: result.proposed.model,
 						state: "needs_you",
-						needsReason: proposedReason(task.title),
+						// The reason names the retro's source card once; a missing link falls
+						// back to naming the retro itself, never its doubled title alone.
+						needsReason: proposedReason(
+							(task.followUpOf !== null
+								? store.getTask(task.followUpOf)
+								: null) ?? { id: task.id, title: task.title },
+						),
 					});
 					log(`- filed proposal ${child.id} (held for approval)`);
 				}

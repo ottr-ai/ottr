@@ -490,15 +490,50 @@ describe("turn loop", () => {
 		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
+	test("a retro proposal names its source card once by id and title", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const source = store.createTask(
+			"Rebase and retry when the server push after a merge fails",
+		);
+		const retro = store.createTask(
+			`${RETRO_MARKER}${source.title}`,
+			null,
+			"retro",
+		);
+		store.updateTask(retro.id, { followUpOf: source.id });
+		record.proposal = {
+			prompt: "Add a benchmark for the merge path",
+			model: null,
+		};
+
+		await loop.runTurn(store.name, retro.id);
+
+		const kid = store.listTasks().find((t) => t.followUpOf === retro.id);
+		expect(kid).toBeDefined();
+		const reason = kid!.needsReason ?? "";
+		expect(reason.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
+		expect(reason).toBe(
+			`Retro proposal from ${source.id} ("${source.title}"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+		// The source's title appears once; the retro's own "Retro of ..." title never doubles.
+		expect(reason.split(source.title).length - 1).toBe(1);
+		expect(/retro of retro of/i.test(reason)).toBe(false);
+		expect(reason).not.toContain(retro.id);
+	});
+
 	test("retro proposal filing is capped at 3 open proposals", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
-		// Three already-open, untouched proposals fill the cap.
+		// Three already-open, untouched proposals fill the cap. The first keeps the
+		// pre-2026-11 wording: stored cards still count against the cap.
 		for (let i = 0; i < 3; i++) {
 			const p = store.createTask(`proposal ${i}`);
 			store.updateTask(p.id, {
 				state: "needs_you",
-				needsReason: `${PROPOSED_REASON_PREFIX}an older retro. Accept to start it, edit the prompt first, or cancel to decline.`,
+				needsReason:
+					i === 0
+						? "Proposed by the retro of an older retro. Accept to start it, edit the prompt first, or cancel to decline."
+						: `${PROPOSED_REASON_PREFIX}an older retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 			});
 		}
 		record.proposal = { prompt: "one too many", model: null };

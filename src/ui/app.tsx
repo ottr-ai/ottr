@@ -19,10 +19,7 @@ import { createRoot } from "react-dom/client";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import { commitDeltas } from "../progress.ts";
-import {
-	FORK_PROPOSED_REASON_PREFIX,
-	PROPOSED_REASON_PREFIX,
-} from "../prompts.ts";
+import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
@@ -6437,9 +6434,7 @@ export function Drawer({
 	// The row (not the fetched detail) carries `progress`, and its changes refetch the detail.
 	const mut = row.state === "running" ? strykerProgress(row.progress) : null;
 	// Retro proposal card: Resume acts as Accept, and New session (409 on a never-run card) is hidden.
-	const proposal =
-		task.needsReason?.startsWith(PROPOSED_REASON_PREFIX) === true ||
-		task.needsReason?.startsWith(FORK_PROPOSED_REASON_PREFIX) === true;
+	const proposal = isProposalReason(task.needsReason);
 	// Non-null while the release-notes editor is open, for release cards with a mutable state.
 	const [notesEdit, setNotesEdit] = useState<string | null>(null);
 	const notesSave = useBusy();

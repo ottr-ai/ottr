@@ -16,10 +16,13 @@ import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ARCH_REVIEW_MARKER,
-	FORK_PROPOSED_REASON_PREFIX,
-	PROPOSED_REASON_PREFIX,
+	ARCH_REVIEW_MARKER,
+	forkProposedReason,
+	LEGACY_FORK_PROPOSED_REASON_PREFIX,
+	LEGACY_PROPOSED_REASON_PREFIX,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
+	shortTitle,
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
 import { queueOrder } from "./scheduler.ts";
@@ -768,13 +771,11 @@ function deriveTitle(prompt: string): string {
 /**
  * Short board-card name cut from the prompt line at a word boundary. The stopgap a card shows
  * before omp or the agent titles the session; never persisted, so the real title still wins.
+ *
+ * Defined in prompts.ts (the proposal reasons cut source titles with it too); re-exported here
+ * for the store's own callers.
  */
-export function shortTitle(title: string, max = 48): string {
-	if (title.length <= max) return title;
-	const cut = title.lastIndexOf(" ", max);
-	const base = (cut <= 0 ? title.slice(0, max) : title.slice(0, cut)).trimEnd();
-	return `${base}…`;
-}
+export { shortTitle };
 
 /** One append-only lifecycle record in the `events` table: task created, a stage or state transition, or an error. */
 export interface StatEvent {
@@ -1271,10 +1272,10 @@ export class ProjectStore {
 			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || ?, ?)
 			 WHERE needs_reason LIKE ? || ? || '%'`,
 			[
-				PROPOSED_REASON_PREFIX,
+				LEGACY_PROPOSED_REASON_PREFIX,
 				RETRO_MARKER,
-				PROPOSED_REASON_PREFIX,
-				PROPOSED_REASON_PREFIX,
+				LEGACY_PROPOSED_REASON_PREFIX,
+				LEGACY_PROPOSED_REASON_PREFIX,
 				RETRO_MARKER,
 			],
 		);
@@ -1282,9 +1283,9 @@ export class ProjectStore {
 			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || 'Fork research: ', ?)
 			 WHERE needs_reason LIKE ? || 'Fork research: %'`,
 			[
-				FORK_PROPOSED_REASON_PREFIX,
-				FORK_PROPOSED_REASON_PREFIX,
-				FORK_PROPOSED_REASON_PREFIX,
+				LEGACY_FORK_PROPOSED_REASON_PREFIX,
+				LEGACY_FORK_PROPOSED_REASON_PREFIX,
+				LEGACY_FORK_PROPOSED_REASON_PREFIX,
 			],
 		);
 		db.run(
@@ -1552,7 +1553,6 @@ export class ProjectStore {
 		topic: string;
 		proposals: Array<{
 			prompt: string;
-			needsReason: string;
 			model: string | null;
 		}>;
 		analyzed: Array<{
@@ -1579,7 +1579,7 @@ export class ProjectStore {
 				this.updateTask(child.id, {
 					followUpOf: card.id,
 					state: "needs_you",
-					needsReason: p.needsReason,
+					needsReason: forkProposedReason({ id: card.id, title: o.title }),
 					model: p.model,
 				});
 			}

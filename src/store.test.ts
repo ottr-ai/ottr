@@ -2520,15 +2520,14 @@ describe("fork research store methods", () => {
 			lastError: "earlier failure",
 			retries: 2,
 		});
-		const reason = "Proposed by the fork research feat-a. x";
 		const card = store.createForkResult({
 			prompt: "report prompt",
 			title: "Fork research: 2026-10-14",
 			report: "# findings",
 			topic: "fork research",
 			proposals: [
-				{ prompt: "do a", needsReason: reason, model: null },
-				{ prompt: "do b", needsReason: reason, model: "m" },
+				{ prompt: "do a", model: null },
+				{ prompt: "do b", model: "m" },
 			],
 			analyzed: [{ forkId: 7, branchHash: "h1", head: "abc", at: 42 }],
 		});
@@ -2546,7 +2545,9 @@ describe("fork research store methods", () => {
 		expect(kids).toHaveLength(2);
 		for (const kid of kids) {
 			expect(kid.state).toBe("needs_you");
-			expect(kid.needsReason).toBe(reason);
+			expect(kid.needsReason).toBe(
+				`Fork proposal from ${card.id} ("Fork research: 2026-10-14"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+			);
 		}
 		expect(kids[1]!.model).toBe("m");
 		const branch = store.listForkBranches(7)[0]!;

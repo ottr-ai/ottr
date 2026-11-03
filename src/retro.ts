@@ -1,4 +1,4 @@
-import { PROPOSED_REASON_PREFIX } from "./prompts.ts";
+import { isRetroProposalReason } from "./prompts.ts";
 import type { TranscriptTexts } from "./session.ts";
 import type { Task, Turn } from "./types.ts";
 
@@ -383,8 +383,6 @@ export function collectRetroFacts(o: {
 			.at(-1)
 			?.trim() ?? null;
 
-	const isProposal = (t: RetroTask) =>
-		t.needsReason !== null && t.needsReason.startsWith(PROPOSED_REASON_PREFIX);
 	const pick = (t: RetroTask) => ({ id: t.id, title: t.title });
 
 	return {
@@ -416,10 +414,14 @@ export function collectRetroFacts(o: {
 		},
 		cost,
 		openProposals: o.tasks
-			.filter((t) => isProposal(t) && t.cancelledAt === null)
+			.filter(
+				(t) => isRetroProposalReason(t.needsReason) && t.cancelledAt === null,
+			)
 			.map(pick),
 		declinedProposals: o.tasks
-			.filter((t) => isProposal(t) && t.cancelledAt !== null)
+			.filter(
+				(t) => isRetroProposalReason(t.needsReason) && t.cancelledAt !== null,
+			)
 			.map(pick),
 		lessons: o.tasks
 			.filter((t) => t.kind === "retro")

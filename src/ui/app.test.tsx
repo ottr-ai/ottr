@@ -1610,6 +1610,24 @@ describe("Drawer approve button", () => {
 		expect(html).not.toContain("Read the summary");
 	});
 
+	test("a proposal card keeps the Accept button under the old and the new reason prefix", () => {
+		for (const needsReason of [
+			"Proposed by the retro of Fix the widget. Accept to start it, edit the prompt first, or cancel to decline.",
+			'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		]) {
+			const task = cardFixture({
+				...drawerFields,
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason,
+			});
+			const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+			expect(html).toContain("Accept");
+			expect(html).toContain("Start the proposed task");
+			expect(html).not.toContain("New session");
+		}
+	});
+
 	const releaseFields = {
 		...drawerFields,
 		releaseVersion: "v1.2.3",

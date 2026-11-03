@@ -472,11 +472,10 @@ describe("watcher", () => {
 		const proposal = store.listTasks().find((t) => t.followUpOf === card!.id);
 		expect(proposal).toBeDefined();
 		expect(proposal!.state).toBe("needs_you");
-		expect(
-			(proposal!.needsReason ?? "").startsWith(
-				"Proposed by the fork research ",
-			),
-		).toBe(true);
+		// The reason names the fork research card once by id and title.
+		expect(proposal!.needsReason).toBe(
+			`Fork proposal from ${card!.id} ("${card!.title}"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
 		const row = store.listAllForkBranches()[0]!;
 		expect(row.analyzedHead).toBe(row.head);
 		expect(row.firstPendingAt).toBeNull();

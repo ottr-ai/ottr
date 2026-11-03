@@ -541,29 +541,66 @@ Continue the retro. Do not change files. Before you finish, call report_outcome 
 ${ONE_SHOT}`;
 }
 
-export const PROPOSED_REASON_PREFIX = "Proposed by the retro of ";
+/** The retro proposal reason string; names the retro's source card once by id and title. */
+export const PROPOSED_REASON_PREFIX = "Retro proposal from ";
 
 /** The action sentence names the drawer buttons verbatim, so the box reads as steps. */
 export const PROPOSED_ACTIONS =
 	"Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
 
-export function proposedReason(retroTitle: string): string {
-	// The retro card's title carries the RETRO_MARKER marker; the reason must not
-	// double it ("the retro of Retro of X" reads as gibberish in the box).
-	const name = retroTitle.startsWith(RETRO_MARKER)
-		? retroTitle.slice(RETRO_MARKER.length)
-		: retroTitle;
-	return `${PROPOSED_REASON_PREFIX}${name}. ${PROPOSED_ACTIONS}`;
+/** Proposal cards stored before 2026-11 keep this wording; detection must match it too. */
+export const LEGACY_PROPOSED_REASON_PREFIX = "Proposed by the retro of ";
+
+export const FORK_PROPOSED_REASON_PREFIX = "Fork proposal from ";
+
+export const LEGACY_FORK_PROPOSED_REASON_PREFIX =
+	"Proposed by the fork research ";
+
+export function proposedReason(source: { id: string; title: string }): string {
+	// The reason quotes the retro's source card, so the retro title's RETRO_MARKER
+	// can never double it ("the retro of Retro of X" cannot form).
+	return `${PROPOSED_REASON_PREFIX}${source.id} ("${shortTitle(source.title, 80)}"). ${PROPOSED_ACTIONS}`;
 }
 
-export const FORK_PROPOSED_REASON_PREFIX = "Proposed by the fork research ";
+export function forkProposedReason(source: {
+	id: string;
+	title: string;
+}): string {
+	return `${FORK_PROPOSED_REASON_PREFIX}${source.id} ("${shortTitle(source.title, 80)}"). ${PROPOSED_ACTIONS}`;
+}
 
-export function forkProposedReason(cardTitle: string): string {
-	return `${FORK_PROPOSED_REASON_PREFIX}${cardTitle}. ${PROPOSED_ACTIONS}`;
+/** True when a stored needsReason marks a retro proposal, new or legacy wording. */
+export function isRetroProposalReason(reason: string | null): boolean {
+	return (
+		reason !== null &&
+		(reason.startsWith(PROPOSED_REASON_PREFIX) ||
+			reason.startsWith(LEGACY_PROPOSED_REASON_PREFIX))
+	);
+}
+
+/** True when a stored needsReason marks any held proposal (retro or fork, new or legacy wording). */
+export function isProposalReason(reason: string | null): boolean {
+	return (
+		reason !== null &&
+		(isRetroProposalReason(reason) ||
+			reason.startsWith(FORK_PROPOSED_REASON_PREFIX) ||
+			reason.startsWith(LEGACY_FORK_PROPOSED_REASON_PREFIX))
+	);
 }
 
 export const PROPOSE_TOOL_DESCRIPTION =
-	"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text. model: optional model for the task.";
+	"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task.";
+
+/**
+ * Short board-card name cut from the prompt line at a word boundary. The stopgap a card shows
+ * before omp or the agent titles the session; never persisted, so the real title still wins.
+ */
+export function shortTitle(title: string, max = 48): string {
+	if (title.length <= max) return title;
+	const cut = title.lastIndexOf(" ", max);
+	const base = (cut <= 0 ? title.slice(0, max) : title.slice(0, cut)).trimEnd();
+	return `${base}…`;
+}
 
 export const REVIEW_PROPOSE_TOOL_DESCRIPTION =
 	'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out.';

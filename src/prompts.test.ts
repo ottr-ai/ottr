@@ -3,6 +3,8 @@ import {
 	ARCH_REVIEW_MARKER,
 	grillPrompt,
 	handoffMarkdown,
+	isProposalReason,
+	isRetroProposalReason,
 	mergePrompt,
 	PROPOSE_TOOL_DESCRIPTION,
 	PROPOSED_REASON_PREFIX,
@@ -548,20 +550,61 @@ describe("retro prompts", () => {
 	});
 
 	test("proposedReason, PROPOSED_REASON_PREFIX and RETRO_MARKER", () => {
-		expect(proposedReason("Fix the widget")).toBe(
-			"Proposed by the retro of Fix the widget. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		expect(proposedReason({ id: "t3", title: "Fix the widget" })).toBe(
+			'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
 		);
-		// The retro card's title carries the marker: the reason must not double it.
-		expect(proposedReason("Retro of Fix the widget")).toBe(
-			"Proposed by the retro of Fix the widget. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
-		);
-		expect(PROPOSED_REASON_PREFIX).toBe("Proposed by the retro of ");
+		expect(PROPOSED_REASON_PREFIX).toBe("Retro proposal from ");
 		expect(RETRO_MARKER).toBe("Retro of ");
+	});
+
+	test("PROPOSE_TOOL_DESCRIPTION pins the prompt shape", () => {
+		expect(PROPOSE_TOOL_DESCRIPTION).toContain("Line 1:");
+		expect(PROPOSE_TOOL_DESCRIPTION).toContain("becomes the card title");
+		expect(PROPOSE_TOOL_DESCRIPTION).toContain(
+			"No repo notes or meta text on line 1",
+		);
+		for (const part of ["Why:", "Change:", "Check:", "Gain:"]) {
+			expect(PROPOSE_TOOL_DESCRIPTION).toContain(part);
+		}
+	});
+
+	test("proposal detection matches the legacy wording stored on old cards", () => {
+		for (const reason of [
+			"Proposed by the retro of Fix the widget. Accept to start it, edit the prompt first, or cancel to decline.",
+			"Proposed by the fork research card. Accept to start it, edit the prompt first, or cancel to decline.",
+			'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+			'Fork proposal from t9 ("card"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		]) {
+			expect(isProposalReason(reason)).toBe(true);
+		}
+		expect(isRetroProposalReason("Proposed by the retro of x. Accept")).toBe(
+			true,
+		);
+		// A legacy fork reason is a proposal but not a retro proposal.
+		expect(
+			isRetroProposalReason("Proposed by the fork research x. Accept"),
+		).toBe(false);
+		// Blockers, holds and other needs-you reasons never match.
+		expect(isProposalReason("hit a blocker")).toBe(false);
+		expect(isProposalReason(null)).toBe(false);
+	});
+
+	test("a source title past 80 chars is cut at a word with an ellipsis", () => {
+		const long =
+			"Fix the login bug when the session cookie expires mid request and the retry loop never stops";
+		const reason = proposedReason({ id: "t1", title: long });
+		expect(reason).toBe(
+			'Retro proposal from t1 ("Fix the login bug when the session cookie expires mid request and the retry loop…"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		);
+		// A title within the cap passes through whole.
+		expect(proposedReason({ id: "t1", title: "Fix the widget" })).toBe(
+			'Retro proposal from t1 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		);
 	});
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(PROPOSE_TOOL_DESCRIPTION).toBe(
-			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text. model: optional model for the task.",
+			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task.",
 		);
 	});
 

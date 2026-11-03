@@ -8,11 +8,7 @@ import {
 	stripInvisible,
 } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
-import {
-	FORK_PROPOSED_REASON_PREFIX,
-	forkProposedReason,
-	PROPOSED_REASON_PREFIX,
-} from "./prompts.ts";
+import { isProposalReason } from "./prompts.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
@@ -519,8 +515,7 @@ function openProposals(store: ProjectStore): number {
 			(x) =>
 				!x.cancelledAt &&
 				x.state === "needs_you" &&
-				((x.needsReason ?? "").startsWith(PROPOSED_REASON_PREFIX) ||
-					(x.needsReason ?? "").startsWith(FORK_PROPOSED_REASON_PREFIX)) &&
+				isProposalReason(x.needsReason) &&
 				store.listTurns(x.id).length === 0,
 		).length;
 }
@@ -718,9 +713,7 @@ export function createForkWatcher(deps: {
 					const title = `Fork research: ${fork.owner}/${fork.name} (${range.commits.length} new commits)`;
 					const proposals = result.proposals.slice(0, 5).map((p) => ({
 						prompt: proposalPrompt(fork.owner, fork.name, p),
-						// owner/name only: the prefix already says "fork research", so the
-						// stored title's label would double it ("the fork research Fork research: …").
-						needsReason: forkProposedReason(`${fork.owner}/${fork.name}`),
+
 						model: null,
 					}));
 					const open = openProposals(store);
