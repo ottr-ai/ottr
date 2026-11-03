@@ -43,6 +43,28 @@ test("strykerStatus rate rounding and omitted segments", () => {
 	expect(strykerStatus("INFO Initial test run succeeded.\n")).toBeNull();
 });
 
+const waitLine = (pid: number): string =>
+	`[stryker] waiting for the mutation lock /tmp/ott-stryker.lock (pid ${pid})\n`;
+const acquiredLine = "[stryker] mutation lock /tmp/ott-stryker.lock acquired\n";
+
+test("strykerStatus shows the mutation lock wait and hands back to progress", () => {
+	// the wait line alone: another pid holds the mutation lock
+	expect(strykerStatus(waitLine(60900))).toBe(
+		"Stryker waiting for the mutation lock (pid 60900)",
+	);
+	// a later progress line wins over the wait
+	expect(strykerStatus(`${waitLine(60900)}${line(12, "~30m", 780)}`)).toBe(
+		"Stryker 12% · 780/6523 · 38 survived (4.9%) · ~2h 59m elapsed · ~30m left",
+	);
+	// the acquired line ends the wait; with no progress line yet, runProgress
+	// falls back to its plain "Stryker running"
+	expect(strykerStatus(`${waitLine(60900)}${acquiredLine}`)).toBeNull();
+	// a wait after the last progress line takes over again (the lock is contended anew)
+	expect(strykerStatus(`${line(12, "~30m", 780)}${waitLine(4242)}`)).toBe(
+		"Stryker waiting for the mutation lock (pid 4242)",
+	);
+});
+
 const mline = (
 	n: number,
 	total: number,

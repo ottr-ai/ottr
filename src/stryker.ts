@@ -19,14 +19,28 @@ export const PROGRESS_EVENT = "ottr_progress";
 const STRYKER_LINE =
 	/Mutation testing (\d+)% \(elapsed: (~?\d+h \d+m|~?\d+m|<1m), remaining: (~?\d+h \d+m|~?\d+m|<1m|n\/a)\) (\d+)\/(\d+) tested \((\d+) survived(?:, (\d+) timed out)?\)/g;
 
+// acquireMutationLock (scripts/stryker-load.mjs) polls a lock another process holds: it logs
+// this line on each poll, then one acquired line (the LOCK_ACQUIRED prefix) once it takes it.
+const LOCK_WAIT_LINE =
+	/\[stryker\] waiting for the mutation lock \S+ \(pid (\d+)\)/g;
+const LOCK_ACQUIRED = "[stryker] mutation lock";
+
 /**
  * The card text for the last Stryker progress line in `text`, else null:
  * `Stryker {pct}% · {tested}/{total} · {survived} survived ({rate}%){ · {timedOut} timed out}{ · {elapsed} elapsed}{ · {left} left}`
  * with the rate = survived/tested*100 to one decimal, omitted when tested === 0;
  * the timed-out segment only when timedOut > 0 and the left segment only when remaining !== n/a.
+ * A trailing lock-wait line gives `Stryker waiting for the mutation lock (pid N)` instead:
+ * a later progress line wins, and the acquired line ends the wait (null).
  */
 export function strykerStatus(text: string): string | null {
 	const m = [...text.matchAll(STRYKER_LINE)].at(-1);
+	const waited = [...text.matchAll(LOCK_WAIT_LINE)].at(-1);
+	if (waited && (waited.index ?? -1) > (m?.index ?? -1)) {
+		const acquired = text.lastIndexOf(LOCK_ACQUIRED);
+		if (acquired < (waited.index ?? -1))
+			return `Stryker waiting for the mutation lock (pid ${waited[1]})`;
+	}
 	if (!m) return null;
 	const [, pct, elapsed, left, tested, total, survived, timedOut] = m;
 	let status = `Stryker ${pct}% · ${tested}/${total}`;
