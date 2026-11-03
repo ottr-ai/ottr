@@ -1636,7 +1636,7 @@ describe("Drawer approve button", () => {
 	test("a proposal card keeps the Accept button under the old and the new reason prefix", () => {
 		for (const needsReason of [
 			"Proposed by the retro of Fix the widget. Accept to start it, edit the prompt first, or cancel to decline.",
-			'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+			"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		]) {
 			const task = cardFixture({
 				...drawerFields,
@@ -1649,6 +1649,56 @@ describe("Drawer approve button", () => {
 			expect(html).toContain("Start the proposed task");
 			expect(html).not.toContain("New session");
 		}
+	});
+
+	test("a proposal reason links its source id; legacy wording and a gone id stay plain", () => {
+		const source = cardFixture({
+			id: "t3",
+			title: "Fix the widget",
+			sessionTitle: "Fix the widget",
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		const taskWith = (needsReason: string) =>
+			renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={cardFixture({
+						...drawerFields,
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason,
+					})}
+					tasks={[source]}
+				/>,
+			);
+		// The current reason: the id is a link to the card, the rest stays text.
+		const html = taskWith(
+			"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		expect(html).toContain('href="/projects/proj/tasks/t3"');
+		expect(html).toContain('class="reason-card-link"');
+		expect(html).toContain('title="Fix the widget"');
+		expect(html).toContain("Retro proposal from <a");
+		// A stored quoted-title row links the same id.
+		expect(
+			taskWith(
+				'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+			),
+		).toContain('href="/projects/proj/tasks/t3"');
+		// Legacy wording names a title instead of an id: no link is promised.
+		const legacy = taskWith(
+			"Proposed by the retro of Fix the widget. Accept to start it, edit the prompt first, or cancel to decline.",
+		);
+		expect(legacy).toContain("Proposed by the retro of Fix the widget.");
+		expect(legacy).not.toContain("reason-card-link");
+		// An id the board no longer lists renders as plain text.
+		const gone = taskWith(
+			"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		expect(gone).toContain("Retro proposal from t9.");
+		expect(gone).not.toContain("reason-card-link");
 	});
 
 	const releaseFields = {

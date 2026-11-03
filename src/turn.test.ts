@@ -473,7 +473,9 @@ describe("turn loop", () => {
 		const kid = kids[0]!;
 		expect(kid.state).toBe("needs_you");
 		expect(kid.needsReason?.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
-		expect(kid.needsReason).toContain("the weekly retro");
+		// No parent: the reason names the retro card itself by id, not its title.
+		expect(kid.needsReason).toContain(task.id);
+		expect(kid.needsReason).not.toContain("the weekly retro");
 		expect(kid.model).toBe("zai/glm");
 		expect(kid.prompt).toContain("handoffs");
 		expect(kid.prompt).toContain("Add a benchmark for the merge path");
@@ -513,10 +515,11 @@ describe("turn loop", () => {
 		const reason = kid!.needsReason ?? "";
 		expect(reason.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
 		expect(reason).toBe(
-			`Retro proposal from ${source.id} ("${source.title}"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+			`Retro proposal from ${source.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		// The source's title appears once; the retro's own "Retro of ..." title never doubles.
-		expect(reason.split(source.title).length - 1).toBe(1);
+		// The reason carries the source's id, never the retro's own "Retro of ..." title.
+		expect(reason).toContain(source.id);
+		expect(reason).not.toContain(source.title);
 		expect(/retro of retro of/i.test(reason)).toBe(false);
 		expect(reason).not.toContain(retro.id);
 	});

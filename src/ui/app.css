@@ -5661,6 +5661,17 @@ button.diff-path {
 	background: var(--alarm);
 	clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
+/* The source card id inside a proposal reason: a real link, underlined so it reads
+   as one; the accent carries the hover and focus states. */
+.needs-reason a {
+	color: var(--accent);
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+.needs-reason a:hover,
+.needs-reason a:focus-visible {
+	color: var(--accent-hover);
+}
 /* An ask echo is a question, not a stall: the ask panel's hairline box and the steel
    question mark in markup replace the amber fill and triangle (::before). */
 .needs-reason.asked {

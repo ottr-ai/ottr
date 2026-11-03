@@ -21,6 +21,7 @@ import {
 	reviewCheckPrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
+	shortTitle,
 	workCheckPrompt,
 	workCheckSendBack,
 	workPrompt,
@@ -550,8 +551,8 @@ describe("retro prompts", () => {
 	});
 
 	test("proposedReason, PROPOSED_REASON_PREFIX and RETRO_MARKER", () => {
-		expect(proposedReason({ id: "t3", title: "Fix the widget" })).toBe(
-			'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		expect(proposedReason({ id: "t3" })).toBe(
+			"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
 		expect(PROPOSED_REASON_PREFIX).toBe("Retro proposal from ");
 		expect(RETRO_MARKER).toBe("Retro of ");
@@ -589,17 +590,14 @@ describe("retro prompts", () => {
 		expect(isProposalReason(null)).toBe(false);
 	});
 
-	test("a source title past 80 chars is cut at a word with an ellipsis", () => {
+	test("shortTitle cuts a long title at a word with an ellipsis", () => {
 		const long =
 			"Fix the login bug when the session cookie expires mid request and the retry loop never stops";
-		const reason = proposedReason({ id: "t1", title: long });
-		expect(reason).toBe(
-			'Retro proposal from t1 ("Fix the login bug when the session cookie expires mid request and the retry loop…"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		expect(shortTitle(long, 80)).toBe(
+			"Fix the login bug when the session cookie expires mid request and the retry loop…",
 		);
 		// A title within the cap passes through whole.
-		expect(proposedReason({ id: "t1", title: "Fix the widget" })).toBe(
-			'Retro proposal from t1 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
-		);
+		expect(shortTitle("Fix the widget", 80)).toBe("Fix the widget");
 	});
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {

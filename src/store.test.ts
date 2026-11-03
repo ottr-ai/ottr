@@ -1630,6 +1630,73 @@ describe("preparing migration", () => {
 		again.close();
 	});
 
+	test("open recovers the source id for legacy proposal reasons through the follow-up chain", () => {
+		const store = open(join(root, "proposal-reason-id"));
+		// A legacy retro proposal two hops down: proposal → retro → source.
+		const source = store.createTask("the pinned session name");
+		const retro = store.createTask("a retro");
+		store.updateTask(retro.id, { followUpOf: source.id, stage: "done" });
+		const held = store.createTask("a held proposal");
+		store.updateTask(held.id, {
+			followUpOf: retro.id,
+			state: "needs_you",
+			needsReason:
+				"Proposed by the retro of the pinned session name. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		});
+		// A legacy retro proposal whose retro has no parent names the retro itself.
+		const loneRetro = store.createTask("an orphan retro");
+		const loneHeld = store.createTask("another held proposal");
+		store.updateTask(loneHeld.id, {
+			followUpOf: loneRetro.id,
+			state: "needs_you",
+			needsReason:
+				"Proposed by the retro of an orphan retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		});
+		// A legacy fork proposal names the result card one hop up.
+		const forkCard = store.createTask("fork research");
+		const forkHeld = store.createTask("a fork proposal");
+		store.updateTask(forkHeld.id, {
+			followUpOf: forkCard.id,
+			state: "needs_you",
+			needsReason:
+				"Proposed by the fork research the repo. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		});
+		// The 2026-11 wording already carries the id: only the quoted title drops.
+		const quoted = store.createTask("a quoted proposal");
+		store.updateTask(quoted.id, {
+			followUpOf: loneRetro.id,
+			state: "needs_you",
+			needsReason:
+				'Retro proposal from t9 ("the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		});
+		store.close();
+
+		const reopened = open(join(root, "proposal-reason-id"));
+		expect(reopened.getTask(held.id)!.needsReason).toBe(
+			`Retro proposal from ${source.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+		expect(reopened.getTask(loneHeld.id)!.needsReason).toBe(
+			`Retro proposal from ${loneRetro.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+		expect(reopened.getTask(forkHeld.id)!.needsReason).toBe(
+			`Fork proposal from ${forkCard.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+		expect(reopened.getTask(quoted.id)!.needsReason).toBe(
+			"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		reopened.close();
+
+		// Idempotent: the id-only text survives another open unchanged.
+		const again = open(join(root, "proposal-reason-id"));
+		expect(again.getTask(held.id)!.needsReason).toBe(
+			`Retro proposal from ${source.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+		expect(again.getTask(quoted.id)!.needsReason).toBe(
+			"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		again.close();
+	});
+
 	test("fresh databases: new tasks carry a null topic and updateTask can set it", () => {
 		const store = open(join(root, "topic-fresh"));
 		const task = store.createTask("brand new");
@@ -2576,7 +2643,7 @@ describe("fork research store methods", () => {
 		for (const kid of kids) {
 			expect(kid.state).toBe("needs_you");
 			expect(kid.needsReason).toBe(
-				`Fork proposal from ${card.id} ("Fork research: 2026-10-14"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+				"Fork proposal from FORK-1. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 			);
 		}
 		expect(kids[1]!.model).toBe("m");

@@ -541,7 +541,8 @@ Continue the retro. Do not change files. Before you finish, call report_outcome 
 ${ONE_SHOT}`;
 }
 
-/** The retro proposal reason string; names the retro's source card once by id and title. */
+/** The retro proposal reason string; names the retro's source card once by id. The
+ * drawer turns that id into a link to the card (see ui ProposalReasonLink). */
 export const PROPOSED_REASON_PREFIX = "Retro proposal from ";
 
 /** The action sentence names the drawer buttons verbatim, so the box reads as steps. */
@@ -556,17 +557,12 @@ export const FORK_PROPOSED_REASON_PREFIX = "Fork proposal from ";
 export const LEGACY_FORK_PROPOSED_REASON_PREFIX =
 	"Proposed by the fork research ";
 
-export function proposedReason(source: { id: string; title: string }): string {
-	// The reason quotes the retro's source card, so the retro title's RETRO_MARKER
-	// can never double it ("the retro of Retro of X" cannot form).
-	return `${PROPOSED_REASON_PREFIX}${source.id} ("${shortTitle(source.title, 80)}"). ${PROPOSED_ACTIONS}`;
+export function proposedReason(source: { id: string }): string {
+	return `${PROPOSED_REASON_PREFIX}${source.id}. ${PROPOSED_ACTIONS}`;
 }
 
-export function forkProposedReason(source: {
-	id: string;
-	title: string;
-}): string {
-	return `${FORK_PROPOSED_REASON_PREFIX}${source.id} ("${shortTitle(source.title, 80)}"). ${PROPOSED_ACTIONS}`;
+export function forkProposedReason(source: { id: string }): string {
+	return `${FORK_PROPOSED_REASON_PREFIX}${source.id}. ${PROPOSED_ACTIONS}`;
 }
 
 /** True when a stored needsReason marks a retro proposal, new or legacy wording. */

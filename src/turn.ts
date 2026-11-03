@@ -2659,11 +2659,11 @@ export function createTurnLoop(
 						model: result.proposed.model,
 						state: "needs_you",
 						// The reason names the retro's source card once; a missing link falls
-						// back to naming the retro itself, never its doubled title alone.
+						// back to naming the retro itself.
 						needsReason: proposedReason(
 							(task.followUpOf !== null
 								? store.getTask(task.followUpOf)
-								: null) ?? { id: task.id, title: task.title },
+								: null) ?? { id: task.id },
 						),
 					});
 					log(`- filed proposal ${child.id} (held for approval)`);

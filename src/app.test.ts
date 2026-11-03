@@ -5917,8 +5917,8 @@ describe("drain route", () => {
 describe("fork research routes", () => {
 	test("fork proposal reason strings mirror the retro ones", async () => {
 		expect(FORK_PROPOSED_REASON_PREFIX).toBe("Fork proposal from ");
-		expect(forkProposedReason({ id: "t9", title: "card" })).toBe(
-			'Fork proposal from t9 ("card"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
+		expect(forkProposedReason({ id: "t9" })).toBe(
+			"Fork proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
 	});
 

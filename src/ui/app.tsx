@@ -6271,6 +6271,65 @@ function LineageCardLink({
 	);
 }
 
+/** A proposal reason names its source card by id; the drawer renders that id as a card
+ * link with the same click rules as LineageCardLink. Legacy wording names a title
+ * instead of an id, and an id the board no longer lists renders as plain text — the
+ * box never promises a link it cannot open. */
+function ProposalReasonLink({
+	reason,
+	selfProject,
+	tasks,
+	onOpenTask,
+	navigate,
+}: {
+	reason: string;
+	selfProject: string;
+	tasks: TaskCard[];
+	onOpenTask: (id: string) => void;
+	navigate: (path: string) => void;
+}) {
+	const m =
+		/^(Retro proposal from |Fork proposal from )(\S+?)(?: \("|\. |$)/.exec(
+			reason,
+		);
+	const lead = m?.[1];
+	const hit = m?.[2];
+	if (lead === undefined || hit === undefined) return <span>{reason}</span>;
+	const id: string = hit;
+	const linked =
+		tasks.find((t) => t.id === id && t.project === selfProject) ??
+		tasks.find((t) => t.id === id) ??
+		null;
+	const start = lead.length;
+	const end = start + id.length;
+	// One span, not a fragment: .needs-reason is a flex row and multiple children
+	// would lay out as separate columns instead of flowing as one paragraph.
+	return (
+		<span>
+			{reason.slice(0, start)}
+			{linked === null ? (
+				id
+			) : (
+				<a
+					className="reason-card-link"
+					href={taskPath(linked.project, linked.id)}
+					title={linked.sessionTitle ?? linked.title}
+					onClick={(e) =>
+						navClick(e, () =>
+							linked.project === selfProject
+								? onOpenTask(linked.id)
+								: openCardInProject(linked, navigate, onOpenTask),
+						)
+					}
+				>
+					{id}
+				</a>
+			)}
+			{reason.slice(end)}
+		</span>
+	);
+}
+
 export function Drawer({
 	open = true,
 	task: row,
@@ -6900,7 +6959,15 @@ export function Drawer({
 					{/* A live ask round hides its reason: the runner echoes the first question into
 					    it, and the ask panel below already carries the full questions. */}
 					{task.needsReason !== null && !askedNow && (
-						<div className="needs-reason">{task.needsReason}</div>
+						<div className="needs-reason">
+							<ProposalReasonLink
+								reason={task.needsReason}
+								selfProject={row.project}
+								tasks={tasks}
+								onOpenTask={onOpenTask}
+								navigate={navigate}
+							/>
+						</div>
 					)}
 					{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
 					    body pins the message's actions while the report scrolls. The server still

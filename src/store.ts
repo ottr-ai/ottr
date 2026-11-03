@@ -16,9 +16,12 @@ import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ARCH_REVIEW_MARKER,
+	FORK_PROPOSED_REASON_PREFIX,
 	forkProposedReason,
 	LEGACY_FORK_PROPOSED_REASON_PREFIX,
 	LEGACY_PROPOSED_REASON_PREFIX,
+	PROPOSED_REASON_PREFIX,
+	proposedReason,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 	shortTitle,
@@ -1303,6 +1306,63 @@ export class ProjectStore {
 		db.run(
 			`UPDATE tasks SET needs_reason = replace(needs_reason, '. Accept to start it, edit the prompt first, or cancel to decline.', '. Accept starts it. Edit task changes the prompt first. Cancel task declines it.') WHERE needs_reason LIKE '%Accept to start it, edit the prompt first, or cancel to decline.'`,
 		);
+		// Proposal reasons that quote the source title converge to the id-only text the
+		// drawer can link. Legacy prefixes recover the source id through the follow-up
+		// chain (a retro proposal names the parent retro's own follow-up, else that retro
+		// itself; a fork proposal names the result card); a row whose chain is gone keeps
+		// its legacy text — no id, no rewrite. Rows of the 2026-11 wording already carry
+		// the id and only drop the quoted title. Display text only: it never touches
+		// titles, prompts or turn rows. A converged row no longer matches, so the pass
+		// stays idempotent on every open.
+		for (const row of db
+			.query<
+				{ id: string; needs_reason: string; follow_up_of: string | null },
+				[string, string, string, string]
+			>(
+				`SELECT id, needs_reason, follow_up_of FROM tasks
+				 WHERE needs_reason LIKE ? || '%'
+				    OR needs_reason LIKE ? || '%'
+				    OR (needs_reason LIKE ? || '%' AND needs_reason LIKE '% ("%')
+				    OR (needs_reason LIKE ? || '%' AND needs_reason LIKE '% ("%')`,
+			)
+			.all(
+				LEGACY_PROPOSED_REASON_PREFIX,
+				LEGACY_FORK_PROPOSED_REASON_PREFIX,
+				PROPOSED_REASON_PREFIX,
+				FORK_PROPOSED_REASON_PREFIX,
+			)) {
+			const reason = row.needs_reason;
+			let next: string | null = null;
+			if (reason.startsWith(LEGACY_PROPOSED_REASON_PREFIX)) {
+				const parent = row.follow_up_of
+					? db
+							.query<{ follow_up_of: string | null }, [string]>(
+								"SELECT follow_up_of FROM tasks WHERE id = ?",
+							)
+							.get(row.follow_up_of)
+					: null;
+				const sourceId =
+					parent === null ? null : (parent.follow_up_of ?? row.follow_up_of);
+				if (sourceId !== null) next = proposedReason({ id: sourceId });
+			} else if (reason.startsWith(LEGACY_FORK_PROPOSED_REASON_PREFIX)) {
+				if (row.follow_up_of !== null)
+					next = forkProposedReason({ id: row.follow_up_of });
+			} else {
+				const id =
+					/^(?:Retro proposal from |Fork proposal from )(\S+) \("/.exec(
+						reason,
+					)?.[1];
+				if (id !== undefined)
+					next = reason.startsWith(PROPOSED_REASON_PREFIX)
+						? proposedReason({ id })
+						: forkProposedReason({ id });
+			}
+			if (next !== null)
+				db.run("UPDATE tasks SET needs_reason = ? WHERE id = ?", [
+					next,
+					row.id,
+				]);
+		}
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 		// updates a live table, so converge additively like the tasks columns above.
 		const prCols = db
@@ -1591,7 +1651,7 @@ export class ProjectStore {
 				this.updateTask(child.id, {
 					followUpOf: card.id,
 					state: "needs_you",
-					needsReason: forkProposedReason({ id: card.id, title: o.title }),
+					needsReason: forkProposedReason({ id: card.id }),
 					model: p.model,
 				});
 			}
