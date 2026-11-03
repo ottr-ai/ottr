@@ -274,7 +274,7 @@ describe("UpdateRowLine", () => {
 			/>,
 		);
 		expect(html).toContain("Removed upstream");
-		expect(html).toContain(">in progress</button>");
+		expect(html).toContain(">in progress</a>");
 		expect(html).not.toContain(">Remove</button>");
 		expect(html).not.toContain(">Skip</button>");
 	});
@@ -1194,6 +1194,7 @@ describe("Drawer parent chip", () => {
 		read: false,
 		onMarkUnread: () => {},
 		onOpenTask: () => {},
+		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1286,12 +1287,13 @@ describe("Drawer cross-project lineage", () => {
 		read: false,
 		onMarkUnread: () => {},
 		onOpenTask: () => {},
+		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
 	};
 
-	test("a foreign parent renders as a button naming its project", () => {
+	test("a foreign parent renders as a link naming its project", () => {
 		const parent = cardFixture({
 			id: "P-1",
 			project: "other",
@@ -1310,6 +1312,8 @@ describe("Drawer cross-project lineage", () => {
 			<Drawer {...base} task={child} tasks={[parent]} />,
 		);
 		expect(html).toContain('class="lineage-row"');
+		// The href uses the linked card's project, not the open card's.
+		expect(html).toContain('href="/projects/other/tasks/P-1"');
 		expect(html).toContain("Parent work");
 		expect(html).toContain("parent");
 		expect(html).toContain("other");
@@ -1329,6 +1333,8 @@ describe("Drawer cross-project lineage", () => {
 			<Drawer {...base} task={self} tasks={[kid]} />,
 		);
 		expect(html).toContain("K-1");
+		// The href uses the linked card's project, not the open card's.
+		expect(html).toContain('href="/projects/other/tasks/K-1"');
 		expect(html).toContain("other");
 		expect(html).toContain('class="lineage-branch"');
 	});
@@ -1372,21 +1378,40 @@ describe("Drawer cross-project lineage", () => {
 		expect(html).not.toContain("drawer-lineage");
 		expect(html).not.toContain("lineage-branch");
 	});
+
+	test("a cross-project dependency row links the dependency's project", () => {
+		const row = childCard({
+			id: "C-1",
+			stage: "todo",
+			state: "queued",
+			dependsOn: ["D-9"],
+		});
+		const dep = cardFixture({
+			id: "D-9",
+			project: "other",
+			stage: "in_progress",
+			state: "running",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={row} tasks={[dep]} />,
+		);
+		expect(html).toContain('href="/projects/other/tasks/D-9"');
+	});
 });
 
-test("openCardInProject switches the board by hash, then opens the card", () => {
-	const realLocation = globalThis.location;
-	const stub = { hash: "" };
+test("openCardInProject navigates the linked card's path, then opens the card", () => {
+	const navigated: string[] = [];
 	const opened: string[] = [];
-	globalThis.location = stub as unknown as Location;
-	try {
-		openCardInProject({ project: "agent-data", id: "AGEN-30" }, (id) => {
+	openCardInProject(
+		{ project: "agent-data", id: "AGEN-30" },
+		(path) => {
+			navigated.push(path);
+		},
+		(id) => {
 			opened.push(id);
-		});
-	} finally {
-		globalThis.location = realLocation;
-	}
-	expect(stub.hash).toBe("agent-data");
+		},
+	);
+	expect(navigated).toEqual(["/projects/agent-data/tasks/AGEN-30"]);
 	expect(opened).toEqual(["AGEN-30"]);
 });
 
@@ -1425,6 +1450,7 @@ describe("Drawer prompt markdown", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
+		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1504,6 +1530,7 @@ describe("Drawer approve button", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
+		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1756,6 +1783,7 @@ describe("cancelled cards on the board", () => {
 				compose={() => {}}
 				onAdd={() => {}}
 				openTask={() => {}}
+				navigate={() => {}}
 			/>,
 		);
 		// The project row's stage cells in column order: the cancelled card leaves
@@ -1803,6 +1831,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
+		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -2020,5 +2049,117 @@ describe("Overview Context, max tile and column", () => {
 		expect(html).toContain("Context (max)");
 		expect(html).toContain("130k");
 		expect(html).toContain(`title="Open ottr big-2"`);
+	});
+});
+
+describe("path URL card links", () => {
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+		updateIds: [],
+	} as unknown as Partial<TaskCard>;
+	const drawerBase = {
+		project: {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			sessionsDir: "/tmp/sessions",
+			settings: { maxParallel: 1 },
+		} as unknown as ProjectView,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: false,
+		onMarkUnread: () => {},
+		onOpenTask: () => {},
+		navigate: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("a board card opens through an anchor to the card's path", () => {
+		const html = renderToStaticMarkup(
+			<LaneCol
+				stage="todo"
+				tasks={[cardFixture({ id: "X" })]}
+				projectTasks={[]}
+				groups={null}
+				collapsed={{}}
+				onToggle={() => {}}
+				hasRules={true}
+				github={null}
+				deltas={new Map()}
+				open={() => {}}
+				unread={() => false}
+				onReorder={async () => {}}
+				filtering={false}
+				draining={false}
+			/>,
+		);
+		// The card shell renders as a real link: the browser can open it in a new tab.
+		expect(html).toContain(
+			'<a class="card-open" href="/projects/proj/tasks/X"',
+		);
+		// The card's title renders inside the anchor, so it is the accessible name.
+		expect(html).toContain("Task one");
+	});
+
+	test("a covered update row's in-progress chip links the card's path", () => {
+		const html = renderToStaticMarkup(
+			<UpdateRowLine
+				row={removedRow}
+				act={async () => true}
+				card={cardFixture({ id: "t9", updateIds: [removedRow.id] })}
+				selected={false}
+				onToggle={() => {}}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html).toContain('href="/projects/proj/tasks/t9"');
+		expect(html).toContain(">in progress</a>");
+	});
+
+	test("a drawer lineage parent and follow-up link the cards' paths", () => {
+		const parent = cardFixture({
+			...drawerFields,
+			id: "P-1",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Parent work",
+		});
+		const child = cardFixture({
+			...drawerFields,
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-1",
+		});
+		const kid = cardFixture({
+			...drawerFields,
+			id: "K-1",
+			stage: "todo",
+			state: "queued",
+			followUpOf: "C-1",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...drawerBase} task={child} tasks={[parent, kid]} />,
+		);
+		expect(html).toContain('href="/projects/proj/tasks/P-1"');
+		expect(html).toContain('href="/projects/proj/tasks/K-1"');
+		// Both rows name their card with its title text, not just a URL.
+		expect(html).toContain("Parent work");
 	});
 });

@@ -71,6 +71,7 @@ export function diffAlerts(
 
 /** Detailed payload for a single needs_you card; grouped frames use payloadsFor instead. */
 export function payloadFor(card: {
+	id: string;
 	title: string;
 	needsReason: string | null;
 	sessionTitle: string | null;
@@ -80,7 +81,7 @@ export function payloadFor(card: {
 		title: card.sessionTitle ?? card.title,
 		body: card.needsReason ?? "This task needs you.",
 		tag: "needs_you",
-		url: `/#${card.project}`,
+		url: `/projects/${encodeURIComponent(card.project)}/tasks/${encodeURIComponent(card.id)}`,
 	};
 }
 
@@ -90,6 +91,7 @@ export function payloadFor(card: {
  * currently in needs_you; doneTotal counts done transitions since the user last opened a board.
  */
 type AlertCard = {
+	id: string;
 	title: string;
 	state: string;
 	needsReason: string | null;
@@ -135,7 +137,7 @@ export function payloadsFor(
 						title: done.sessionTitle ?? done.title,
 						body: `${done.title} was done`,
 						tag: "done",
-						url: `/#${done.project}`,
+						url: `/projects/${encodeURIComponent(done.project)}`,
 					},
 		);
 	}

@@ -3077,6 +3077,11 @@ export function createApp(deps: AppDeps) {
 
 	const routes = defineRoutes({
 		"/": board,
+		// Fixed-path views serve the same board HTML; the client routes on location.pathname.
+		"/projects/:project": board,
+		"/projects/:project/tasks/:id": board,
+		"/settings": board,
+		"/settings/:project": board,
 		// --- Web Push (begin): service worker for notifications; the sibling PWA branch adds its static routes here too ---
 		"/sw.js": () =>
 			new Response(Bun.file(resolve(import.meta.dir, "ui", "sw.js")), {

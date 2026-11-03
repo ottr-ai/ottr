@@ -171,7 +171,7 @@ describe("providerLogin", () => {
 		await l.start("anthropic", BOARD);
 		const res = await l.callback(browserTo(CALLBACK));
 		expect(res?.status).toBe(303);
-		expect(res?.headers.get("location")).toBe(`${BOARD}/#settings`);
+		expect(res?.headers.get("location")).toBe(`${BOARD}/settings`);
 		expect(l.pending()?.ok).toBe(true);
 		expect(l.pending()?.output).toContain("Logged in to anthropic");
 	}, 30_000);

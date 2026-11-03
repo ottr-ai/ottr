@@ -7853,3 +7853,30 @@ describe("behindMain", () => {
 		).toEqual(none);
 	});
 });
+
+describe("fixed-path view routes (OTTR-405)", () => {
+	test("serve the same board HTML; /api keeps JSON; deeper unknown paths 404", async () => {
+		const root = await get("/");
+		expect(root.status).toBe(200);
+		expect(root.headers.get("content-type")).toContain("text/html");
+		const html = await root.text();
+		for (const path of [
+			"/projects/ottr",
+			"/projects/ottr/tasks/OTTR-1",
+			"/settings",
+			"/settings/ottr",
+		]) {
+			const res = await get(path);
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/html");
+			expect(await res.text()).toBe(html);
+		}
+		// Static /api routes still win over the :param view routes.
+		const api = await get("/api/boot");
+		expect(api.status).toBe(200);
+		expect(api.headers.get("content-type")).toContain("application/json");
+		expect((await get("/api/projects/nope/how-it-works")).status).toBe(404);
+		// One segment past a known view is still unknown.
+		expect((await get("/projects/ottr/tasks/OTTR-1/extra")).status).toBe(404);
+	});
+});

@@ -62,6 +62,7 @@ describe("diffAlerts", () => {
 	});
 	test("payloadFor keeps the needs reason on a needs_you done card", () => {
 		const p = payloadFor({
+			id: "OTTR-1",
 			title: "do a thing",
 			needsReason: "Release review waiting",
 			sessionTitle: null,
@@ -99,6 +100,7 @@ describe("diffAlerts", () => {
 
 describe("payloadsFor", () => {
 	const doneCard = () => ({
+		id: "OTTR-1",
 		title: "ship it",
 		state: "idle",
 		needsReason: null,
@@ -106,6 +108,7 @@ describe("payloadsFor", () => {
 		project: "ottr",
 	});
 	const needsCard = () => ({
+		id: "OTTR-2",
 		title: "ask",
 		state: "needs_you",
 		needsReason: "pick one",
@@ -119,7 +122,7 @@ describe("payloadsFor", () => {
 				title: "ship it",
 				body: "ship it was done",
 				tag: "done",
-				url: "/#ottr",
+				url: "/projects/ottr",
 			},
 		]);
 	});
@@ -134,7 +137,7 @@ describe("payloadsFor", () => {
 				title: "Fix the bug",
 				body: "pick one",
 				tag: "needs_you",
-				url: "/#ottr",
+				url: "/projects/ottr/tasks/OTTR-2",
 			},
 		]);
 	});
@@ -160,7 +163,7 @@ describe("payloadsFor", () => {
 				title: "ship it",
 				body: "ship it was done",
 				tag: "done",
-				url: "/#ottr",
+				url: "/projects/ottr",
 			},
 		]);
 	});
@@ -352,6 +355,7 @@ describe("payloadFor", () => {
 	test("shape", () => {
 		expect(
 			payloadFor({
+				id: "OTTR-1",
 				title: "do a thing",
 				needsReason: "Need a decision",
 				sessionTitle: "Fix the bug",
@@ -361,11 +365,22 @@ describe("payloadFor", () => {
 			title: "Fix the bug",
 			body: "Need a decision",
 			tag: "needs_you",
-			url: "/#ottr",
+			url: "/projects/ottr/tasks/OTTR-1",
 		});
+	});
+	test("percent-encodes the project and the card id once", () => {
+		const p = payloadFor({
+			id: "OTTR 2",
+			title: "do a thing",
+			needsReason: null,
+			sessionTitle: null,
+			project: "50%off",
+		});
+		expect(p.url).toBe("/projects/50%25off/tasks/OTTR%202");
 	});
 	test("fallback body without a reason", () => {
 		const p = payloadFor({
+			id: "OTTR-1",
 			title: "do a thing",
 			needsReason: null,
 			sessionTitle: null,

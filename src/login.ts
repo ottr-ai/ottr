@@ -341,7 +341,7 @@ export function providerLogin({
 		)
 			return null;
 		await answer(`${back.origin}${url.pathname}${url.search}`);
-		return Response.redirect(`${l.returnTo}/#settings`, 303);
+		return Response.redirect(`${l.returnTo}/settings`, 303);
 	}
 
 	/** The latest sign-in's running or last omp child: its exit and signal prove a kill. */

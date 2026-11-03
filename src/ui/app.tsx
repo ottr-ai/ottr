@@ -141,7 +141,17 @@ import {
 	seenable,
 	slotUse,
 } from "./queue.ts";
-import { readHash, SETTINGS_HASH, settingsSub } from "./route.ts";
+import {
+	migrateHash,
+	navClick,
+	projectPath,
+	readPath,
+	SETTINGS_HASH,
+	settingsPath,
+	settingsSub,
+	taskPath,
+	viewPath,
+} from "./route.ts";
 import {
 	alateHint,
 	asError,
@@ -594,8 +604,8 @@ function Card({
 			? `No log output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
 			: null;
 	return (
-		// A stretched button opens the card; the release link sits beside it, never nested in it.
-		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched button inside
+		// A stretched link opens the card; the release link sits beside it, never nested in it.
+		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
 		<div
 			className={`card${drag?.dragging ? " dragging" : ""}${drag?.dropBefore ? " drop-before" : ""}${locked ? " reorder-lock" : ""}`}
 			data-state={task.state}
@@ -611,15 +621,17 @@ function Card({
 			onDragStart={drag?.onDragStart}
 			onDragEnd={drag?.onDragEnd}
 		>
-			<button
-				type="button"
+			<a
 				className="card-open"
+				href={taskPath(task.project, task.id)}
+				// The card shell owns HTML5 drag-and-drop; the anchor must not start a link drag.
+				draggable={false}
 				title={
 					task.state === "needs_you"
 						? (task.needsReason ?? "Action required")
 						: undefined
 				}
-				onClick={onOpen}
+				onClick={(e) => navClick(e, onOpen)}
 			>
 				<span className="card-head">
 					{task.starred && task.cancelledAt === null ? (
@@ -748,26 +760,25 @@ function Card({
 						<span className="mutation-stats">{sp.rest}</span>
 					</span>
 				)}
-			</button>
+			</a>
 			{(release !== null ||
 				holdRelease != null ||
 				onRerelease !== undefined) && (
 				<span className="card-tags">
 					{holdRelease != null && onOpenTask !== undefined && (
-						<button
-							type="button"
+						<a
 							className="hold-link"
+							href={taskPath(task.project, holdRelease.id)}
 							title={`Task ${holdRelease.id}: the release holding this card${holdRelease.version !== null ? ` (${holdRelease.version})` : ""}`}
 							onClick={(e) => {
-								// The card body is a stretched open button: keep the click off it.
-								e.preventDefault();
+								// The card body is a stretched open link: keep the click off it.
 								e.stopPropagation();
-								onOpenTask(holdRelease.id);
+								navClick(e, () => onOpenTask(holdRelease.id));
 							}}
 						>
 							<Icon name="corner-up-left" size={12} />
 							{holdRelease.id}
-						</button>
+						</a>
 					)}
 					{onRerelease !== undefined && (
 						<button
@@ -3087,16 +3098,19 @@ function ProjectBoard({
 
 /** Triage block (Option A): every waiting card across projects, oldest
  * wait first, then each project's warnings. A row opens what it names: the card through the same
- * openTask the alarm bell popover uses, a warning through the project's board hash. */
+ * openTask the alarm bell popover uses, a warning through the project's path. */
 function Triage({
 	projects,
 	tasks,
 	openTask,
+	navigate,
 	setup,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	openTask: (id: string) => void;
+	/** Plain-click navigation to a view path (see navClick). */
+	navigate: (path: string) => void;
 	/** Board-wide setup problems (setupHints); each row opens Settings → Alate. */
 	setup: SetupHint[];
 }) {
@@ -3132,11 +3146,11 @@ function Triage({
 						{cards.map((t) => {
 							const owner = projects.find((p) => p.name === t.project);
 							return (
-								<button
+								<a
 									key={t.id}
-									type="button"
 									className="tri"
-									onClick={() => openTask(t.id)}
+									href={taskPath(t.project, t.id)}
+									onClick={(e) => navClick(e, () => openTask(t.id))}
 								>
 									<Mark kind={cardMark(t)} />
 									{owner !== undefined && <ProjectTag project={owner} />}
@@ -3146,7 +3160,7 @@ function Triage({
 									<span className="w">
 										{duration(Date.now() - t.updatedAt)}
 									</span>
-								</button>
+								</a>
 							);
 						})}
 						{cards.length > 0 && warns.length > 0 && (
@@ -3173,7 +3187,8 @@ function Triage({
 							<a
 								className="tri warn"
 								key={`${project.name}:${text}`}
-								href={`#${encodeURIComponent(project.name)}`}
+								href={projectPath(project.name)}
+								onClick={(e) => navClick(e, navigate)}
 							>
 								<Mark kind="warn" />
 								<ProjectTag project={project} />
@@ -3199,12 +3214,15 @@ export function Overview({
 	compose,
 	onAdd,
 	openTask,
+	navigate,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	compose: (name: string) => void;
 	onAdd: () => void;
 	openTask: (id: string) => void;
+	/** Plain-click navigation to a view path (see navClick). */
+	navigate: (path: string) => void;
 }) {
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
@@ -3313,10 +3331,29 @@ export function Overview({
 							return (
 								<tr
 									key={p.name}
-									onClick={() => (location.hash = encodeURIComponent(p.name))}
+									onClick={(e) => {
+										// Row click = plain-click link: modifier and middle clicks
+										// keep the browser's own behavior.
+										if (
+											e.button === 0 &&
+											!e.metaKey &&
+											!e.ctrlKey &&
+											!e.shiftKey &&
+											!e.altKey
+										)
+											navigate(projectPath(p.name));
+									}}
 								>
 									<th scope="row">
-										<a href={`#${encodeURIComponent(p.name)}`}>
+										<a
+											href={projectPath(p.name)}
+											onClick={(e) => {
+												// The anchor navigates; keep the row handler from
+												// pushing the same path a second time.
+												e.stopPropagation();
+												navClick(e, navigate);
+											}}
+										>
 											<ProjectTag project={p} />
 											{projectLabel(p)}
 										</a>
@@ -3399,6 +3436,7 @@ export function Overview({
 				projects={projects}
 				tasks={tasks}
 				openTask={openTask}
+				navigate={navigate}
 				setup={setupHints(prov.data, prov.err)}
 			/>
 			{projectsNow}
@@ -3745,6 +3783,7 @@ export function KpiStrip({
 						? undefined
 						: {
 								id: f.contextMaxTask.id,
+								project: f.contextMaxTask.project,
 								title: `Open ${f.contextMaxTask.project} ${f.contextMaxTask.id}`,
 							}
 				}
@@ -3775,8 +3814,8 @@ function Kpi({
 	dFmt: (abs: number) => string;
 	pFmt: (n: number) => string;
 	alarm?: boolean;
-	/** Task the value points at; the button wraps the value so the whole number opens the card. */
-	link?: { id: string; title: string } | null;
+	/** Task the value points at; the link wraps the value so the whole number opens the card. */
+	link?: { id: string; project: string; title: string } | null;
 	onOpen?: (id: string) => void;
 }) {
 	const { value, prev } = stat;
@@ -3795,14 +3834,14 @@ function Kpi({
 			</span>
 			<span className="v">
 				{link !== undefined && link !== null && onOpen !== undefined ? (
-					<button
-						type="button"
+					<a
 						className="v-link"
+						href={taskPath(link.project, link.id)}
 						title={link.title}
-						onClick={() => onOpen(link.id)}
+						onClick={(e) => navClick(e, () => onOpen(link.id))}
 					>
 						{vContent}
-					</button>
+					</a>
 				) : (
 					vContent
 				)}
@@ -3983,14 +4022,14 @@ export function PerfTable({
 										maxTask === null ? (
 											tokFmt(p.contextMaxTokens.value)
 										) : (
-											<button
-												type="button"
+											<a
 												className="v-link"
+												href={taskPath(maxTask.project, maxTask.id)}
 												title={`Open ${maxTask.project} ${maxTask.id}`}
-												onClick={() => openTask(maxTask.id)}
+												onClick={(e) => navClick(e, () => openTask(maxTask.id))}
 											>
 												{tokFmt(p.contextMaxTokens.value)}
-											</button>
+											</a>
 										)
 									}
 									ratio={
@@ -4963,28 +5002,28 @@ export function UpdateRowLine({
 							{skipButton}
 						</>
 					) : (
-						<button
-							type="button"
+						<a
 							className="updates-inprogress"
+							href={taskPath(card.project, card.id)}
 							title={card.sessionTitle}
-							onClick={() => openTask(card.id)}
+							onClick={(e) => navClick(e, () => openTask(card.id))}
 						>
 							in progress
-						</button>
+						</a>
 					)}
 				</span>
 			) : row.managedBy !== undefined ? (
 				<span className="dialog-sub">managed by {row.managedBy}</span>
 			) : card !== null ? (
 				// U6: an open card owns this row; clicking jumps to it instead of offering Skip.
-				<button
-					type="button"
+				<a
 					className="updates-inprogress"
+					href={taskPath(card.project, card.id)}
 					title={card.sessionTitle}
-					onClick={() => openTask(card.id)}
+					onClick={(e) => navClick(e, () => openTask(card.id))}
 				>
 					in progress
-				</button>
+				</a>
 			) : (
 				skipButton
 			)}
@@ -5966,18 +6005,21 @@ export const recommendsSteps = (report: string): boolean =>
 	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report);
 
 /** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
- * status words and alarm coding as the meta line; a click opens the card. */
+ * status words and alarm coding as the meta line; a click opens the card. The href uses each
+ * linked card's own project, so a cross-project row opens that project's URL. */
 function RelatedTasks({
 	items,
 	project,
 	tasks,
 	onOpenTask,
+	navigate,
 	draining,
 }: {
 	items: TaskCard[];
 	project: ProjectView;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
+	navigate: (path: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 }) {
@@ -5985,10 +6027,16 @@ function RelatedTasks({
 		<ul className="fu-list">
 			{items.map((k) => (
 				<li key={k.id}>
-					<button
-						type="button"
+					<a
+						href={taskPath(k.project, k.id)}
 						title={k.sessionTitle ?? k.title}
-						onClick={() => onOpenTask(k.id)}
+						onClick={(e) =>
+							navClick(e, () =>
+								k.project === project.name
+									? onOpenTask(k.id)
+									: openCardInProject(k, navigate, onOpenTask),
+							)
+						}
 					>
 						<span className="fu-key">{k.id}</span>
 						<span className="fu-title">{k.sessionTitle ?? k.title}</span>
@@ -6003,7 +6051,7 @@ function RelatedTasks({
 							{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
 							{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
 						</span>
-					</button>
+					</a>
 				</li>
 			))}
 		</ul>
@@ -6155,26 +6203,29 @@ export function reportHtml(title: string, body: string): string {
 }
 
 /** In-app navigation to a card on another project's board: switch the board with the
- * same hash navigation the project tabs use, then open the card. No card URL scheme
- * lives here — OTTR-405 gives the drawer's card links their path URLs in one place. */
+ * same path navigation the project tabs use, then open the card. The link's href
+ * already names the linked card's project, so the navigate lands on it (OTTR-405). */
 export function openCardInProject(
 	card: Pick<TaskCard, "project" | "id">,
+	navigate: (path: string) => void,
 	openTask: (id: string) => void,
 ): void {
-	location.hash = encodeURIComponent(card.project);
+	navigate(taskPath(card.project, card.id));
 	openTask(card.id);
 }
 
 /** One card link in the drawer's lineage rail: the one place a drawer renders a link
  * to another card (the parent above, the follow-ups below), so an href change lands
- * on every row at once. A link always carries the card's project and id; a link to
- * another project first switches the board to that project, then opens the card. */
+ * on every row at once. The href always uses the LINKED card's project and id, so a
+ * cross-project link opens that project's URL; a plain click switches the board to
+ * that project, then opens the card, and a middle or Ctrl/Cmd click opens a new tab. */
 function LineageCardLink({
 	card,
 	selfProject,
 	tag,
 	state,
 	onOpenTask,
+	navigate,
 }: {
 	card: TaskCard;
 	selfProject: string;
@@ -6183,16 +6234,19 @@ function LineageCardLink({
 	/** Live state of a follow-up row, rendered after the tags. */
 	state?: ReactNode;
 	onOpenTask: (id: string) => void;
+	navigate: (path: string) => void;
 }) {
 	return (
-		<button
-			type="button"
+		<a
 			className="lineage-row"
+			href={taskPath(card.project, card.id)}
 			title={card.sessionTitle ?? card.title}
-			onClick={() =>
-				card.project === selfProject
-					? onOpenTask(card.id)
-					: openCardInProject(card, onOpenTask)
+			onClick={(e) =>
+				navClick(e, () =>
+					card.project === selfProject
+						? onOpenTask(card.id)
+						: openCardInProject(card, navigate, onOpenTask),
+				)
 			}
 		>
 			<span className="lineage-key">{card.id}</span>
@@ -6204,7 +6258,7 @@ function LineageCardLink({
 				{tag !== "" && <span className="lineage-tag">{tag}</span>}
 				{state}
 			</span>
-		</button>
+		</a>
 	);
 }
 
@@ -6220,6 +6274,7 @@ export function Drawer({
 	delta,
 	tasks,
 	onOpenTask,
+	navigate,
 	draining,
 	usedTotal,
 	maxTotal,
@@ -6238,6 +6293,8 @@ export function Drawer({
 	delta?: number;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
+	/** Plain-click navigation to a view path (see navClick); cross-project card links use it. */
+	navigate: (path: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 	/** Agents running machine-wide right now, and the global cap they share. */
@@ -6725,6 +6782,7 @@ export function Drawer({
 												selfProject={row.project}
 												tag="parent"
 												onOpenTask={onOpenTask}
+												navigate={navigate}
 											/>
 										</li>
 									))}
@@ -6745,6 +6803,7 @@ export function Drawer({
 														selfProject={row.project}
 														tag=""
 														onOpenTask={onOpenTask}
+														navigate={navigate}
 														state={
 															<span
 																className={
@@ -6782,6 +6841,7 @@ export function Drawer({
 								project={project}
 								tasks={tasks}
 								onOpenTask={onOpenTask}
+								navigate={navigate}
 								draining={draining}
 							/>
 						</DrawerSec>
@@ -8312,12 +8372,15 @@ function AreasNav({
 	tasks,
 	project,
 	view,
+	navigate,
 	onAdd,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	project: ProjectView | null;
 	view: string;
+	/** Plain-click navigation to a view path (see navClick). */
+	navigate: (path: string) => void;
 	onAdd: () => void;
 }) {
 	// Closes the phone popout on selection; in the desktop rail the popover is already shut (no-op).
@@ -8326,27 +8389,32 @@ function AreasNav({
 	const [legendOpen, setLegendOpen] = useState(false);
 	return (
 		<>
-			{/* biome-ignore lint/a11y/useValidAnchor: the empty hash is the overview route; readHash() maps "" to no project */}
 			<a
 				className="area"
 				aria-current={
 					project === null && !settingsSub(view).onSettings ? "page" : undefined
 				}
-				href="#"
-				onClick={closePop}
+				href="/"
+				onClick={(e) => {
+					navClick(e, navigate);
+					closePop();
+				}}
 			>
 				<Icon name="grid" />
 				<span className="area-name">Overview</span>
 			</a>
 			<a
 				className="area"
-				href={`#${SETTINGS_HASH}`}
+				href={settingsPath(null)}
 				aria-current={
 					view === SETTINGS_HASH || view.startsWith(`${SETTINGS_HASH}/`)
 						? "page"
 						: undefined
 				}
-				onClick={closePop}
+				onClick={(e) => {
+					navClick(e, navigate);
+					closePop();
+				}}
 			>
 				<Icon name="gear" />
 				<span className="area-name">Settings</span>
@@ -8400,9 +8468,12 @@ function AreasNav({
 						<li key={p.name}>
 							<a
 								className="area"
-								href={`#${encodeURIComponent(p.name)}`}
+								href={projectPath(p.name)}
 								aria-current={project?.name === p.name ? "page" : undefined}
-								onClick={closePop}
+								onClick={(e) => {
+									navClick(e, navigate);
+									closePop();
+								}}
 							>
 								<ProjectTag project={p} />
 								<span className="area-name">{projectLabel(p)}</span>
@@ -8504,11 +8575,16 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 }
 
 function App() {
+	// One-time client migration: an old hash URL becomes its path URL before the first
+	// readPath(), so the initial view and card come from the pathname.
+	migrateHash();
 	const [state, setState] = useState<StateResponse | null>(null);
-	const [view, setView] = useState(readHash);
+	const [view, setView] = useState(readPath().view);
 	const [showAdd, setShowAdd] = useState(false);
 	const [showUpdates, setShowUpdates] = useState(false);
-	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [selectedId, setSelectedId] = useState<string | null>(
+		() => readPath().task,
+	);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
 	/** One-shot localStorage → server migration of seen answers, run after the first state load. */
@@ -8552,13 +8628,31 @@ function App() {
 	const openTask = useCallback(
 		(id: string) => {
 			// Every card open is one history entry, so Back returns to the previous card
-			// (e.g. child → parent → child) before it leaves the page.
-			history.pushState({ ompTask: id }, "");
+			// (e.g. child → parent → child) before it leaves the page. The URL names the
+			// card: /projects/<project>/tasks/<id>.
+			const card = tasks.find((t) => t.id === id);
+			history.pushState(
+				{ ompTask: id },
+				"",
+				card === undefined ? location.pathname : taskPath(card.project, id),
+			);
 			setSelectedId(id);
-			markSeen(tasks.find((t) => t.id === id));
+			markSeen(card);
 		},
 		[tasks, markSeen],
 	);
+	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
+	 * drawer selection stays untouched, like the hashchange listener did. */
+	const navigate = useCallback((path: string) => {
+		history.pushState(null, "", path);
+		setView(readPath().view);
+	}, []);
+	/** The explicit drawer close (X, Esc, backdrop): rewrites the current entry to the view's
+	 * URL without a card. replaceState never adds an entry, so Back keeps walking cards. */
+	const closeDrawer = useCallback(() => {
+		setSelectedId(null);
+		history.replaceState(null, "", viewPath(view));
+	}, [view]);
 	const [composeFor, setComposeFor] = useState<string | null>(null);
 	const [draftFor, setDraftFor] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -8687,19 +8781,14 @@ function App() {
 		}
 	}, [theme]);
 
-	useEffect(() => {
-		const onHash = (): void => setView(readHash());
-		window.addEventListener("hashchange", onHash);
-		return () => window.removeEventListener("hashchange", onHash);
-	}, []);
-
-	// Back/Forward walk the card entries pushState()d by openTask; a non-card entry closes
-	// the drawer. A vanished card id self-cleans: the drawer only renders a task the
-	// current state still lists. The explicit close (X, Esc, backdrop) only drops the
-	// selection: it must not traverse, or closing the parent of a child → parent walk
-	// would pop to the child's entry and reopen it instead of closing.
+	// Back/Forward walk the entries pushState()d by openTask and the view links; both the
+	// view and the drawer follow the entry. A vanished card id self-cleans: the drawer only
+	// renders a task the current state still lists. The explicit close (X, Esc, backdrop)
+	// only drops the selection: it must not traverse, or closing the parent of a child →
+	// parent walk would pop to the child's entry and reopen it instead of closing.
 	useEffect(() => {
 		const onPop = (e: PopStateEvent): void => {
+			setView(readPath().view);
 			setSelectedId((e.state as { ompTask?: string } | null)?.ompTask ?? null);
 		};
 		window.addEventListener("popstate", onPop);
@@ -9035,11 +9124,11 @@ function App() {
 									const key = taskEntryKey(t);
 									return (
 										<li key={t.id}>
-											<button
-												type="button"
+											<a
 												className="alarm-link"
-												onClick={() => {
-													openTask(t.id);
+												href={taskPath(t.project, t.id)}
+												onClick={(e) => {
+													navClick(e, () => openTask(t.id));
 													// Hides the inbox panel; hiding a closed one is a no-op.
 													document.getElementById("inbox")?.hidePopover();
 												}}
@@ -9056,7 +9145,7 @@ function App() {
 												{inboxFresh.has(key) && (
 													<span className="new-tag">New</span>
 												)}
-											</button>
+											</a>
 										</li>
 									);
 								})}
@@ -9375,6 +9464,7 @@ function App() {
 						tasks={tasks}
 						project={project}
 						view={view}
+						navigate={navigate}
 						onAdd={() => setShowAdd(true)}
 					/>
 				</div>
@@ -9598,8 +9688,8 @@ function App() {
 						aria-current={
 							project === null && !settingsRoute.onSettings ? "page" : undefined
 						}
-						// biome-ignore lint/a11y/useValidAnchor: the empty hash is the overview route; readHash() maps "" to no project
-						href="#"
+						href="/"
+						onClick={(e) => navClick(e, navigate)}
 						title={railCollapsed ? "Overview" : undefined}
 					>
 						<span className="rail-plate icon">
@@ -9627,8 +9717,9 @@ function App() {
 								<li key={p.name}>
 									<a
 										className="area"
-										href={`#${encodeURIComponent(p.name)}`}
+										href={projectPath(p.name)}
 										aria-current={project?.name === p.name ? "page" : undefined}
+										onClick={(e) => navClick(e, navigate)}
 										title={
 											railCollapsed
 												? `${projectLabel(p)}${r.summary === "" ? "" : `: ${r.summary}`}`
@@ -9705,8 +9796,11 @@ function App() {
 					</p>
 					<a
 						className="menu-row"
-						href={`#${SETTINGS_HASH}`}
-						onClick={() => document.getElementById("user-menu")?.hidePopover()}
+						href={settingsPath(null)}
+						onClick={(e) => {
+							navClick(e, navigate);
+							document.getElementById("user-menu")?.hidePopover();
+						}}
 					>
 						<Icon name="gear" size={14} />
 						Settings
@@ -9772,6 +9866,7 @@ function App() {
 							compose={setComposeFor}
 							onAdd={() => setShowAdd(true)}
 							openTask={openTask}
+							navigate={navigate}
 						/>
 					) : (
 						<ProjectBoard
@@ -9835,6 +9930,7 @@ function App() {
 								t.followUpOfProject === drawerTask.project),
 					)}
 					onOpenTask={openTask}
+					navigate={navigate}
 					draining={draining}
 					usedTotal={usedTotal}
 					maxTotal={state?.maxTotal ?? null}
@@ -9843,17 +9939,17 @@ function App() {
 					onMarkUnread={() => {
 						if (selected === null) return; // the deferred native close after an app-driven close
 						void markUnread(selected);
-						setSelectedId(null); // close so the board shows the card unread; onClose would re-mark it read
+						closeDrawer(); // close so the board shows the card unread; onClose would re-mark it read
 					}}
 					onClose={() => {
 						if (selected === null) return; // same deferred close; do not re-mark it read
 						// An answer that landed while the drawer was open counts as read.
 						markSeen(selected);
-						setSelectedId(null);
+						closeDrawer();
 					}}
 					onFollowed={(id, from) => {
 						origin.current = { id, from };
-						setSelectedId(null); // close the drawer so the board shows the follow-up fly in
+						closeDrawer(); // close the drawer so the board shows the follow-up fly in
 					}}
 				/>
 			)}

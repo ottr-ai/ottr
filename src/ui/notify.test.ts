@@ -142,32 +142,55 @@ test("alertNotices groups same-channel alerts, keeps lone detail", () => {
 	const done1 = card({ id: "c", stage: "done" });
 	const done2 = card({ id: "d", stage: "done", sessionTitle: "Ship" });
 	const answered = card({ id: "e", answered: true, summary: "yes" });
-	// Lone alerts keep their detail; done says "<task title> was done".
+	// Lone alerts keep their detail; done says "<task title> was done". A lone notice
+	// names one card, so it carries the card URL; grouped counted notices do not.
 	expect(alertNotices([needs1])).toEqual([
-		{ title: "proj: short title", body: "one", tag: "needs_you" },
+		{
+			title: "proj: short title",
+			body: "one",
+			tag: "needs_you",
+			url: "/projects/proj/tasks/a",
+		},
 	]);
 	expect(alertNotices([done1])).toEqual([
 		{
 			title: "proj: short title",
 			body: "short title was done",
 			tag: "done",
+			url: "/projects/proj/tasks/c",
 		},
 	]);
-	// Multiple same-channel alerts collapse into one counted notice.
+	// Multiple same-channel alerts collapse into one counted notice, no single card URL.
 	expect(alertNotices([needs1, needs2])).toEqual([
-		{ title: "Ottr", body: "2 tasks need your attention", tag: "needs_you" },
+		{
+			title: "Ottr",
+			body: "2 tasks need your attention",
+			tag: "needs_you",
+			url: undefined,
+		},
 	]);
 	expect(alertNotices([done1, done2])).toEqual([
-		{ title: "Ottr", body: "2 tasks finished", tag: "done" },
+		{ title: "Ottr", body: "2 tasks finished", tag: "done", url: undefined },
 	]);
 	// Different channels push separately; answered reports stay per-card.
 	expect(alertNotices([answered, needs1, done1])).toEqual([
-		{ title: "proj: short title", body: "yes", tag: "ottr:e" },
-		{ title: "proj: short title", body: "one", tag: "needs_you" },
+		{
+			title: "proj: short title",
+			body: "yes",
+			tag: "ottr:e",
+			url: "/projects/proj/tasks/e",
+		},
+		{
+			title: "proj: short title",
+			body: "one",
+			tag: "needs_you",
+			url: "/projects/proj/tasks/a",
+		},
 		{
 			title: "proj: short title",
 			body: "short title was done",
 			tag: "done",
+			url: "/projects/proj/tasks/c",
 		},
 	]);
 });
@@ -176,6 +199,7 @@ test("tab notices share the web push channel tags, so the device never doubles a
 	const needs = card({ id: "a", state: "needs_you", needsReason: "one" });
 	const done = card({ id: "c", stage: "done" });
 	const toAlert = (t: TaskCard) => ({
+		id: t.id,
 		title: t.title,
 		state: t.state,
 		needsReason: t.needsReason,
@@ -383,12 +407,24 @@ describe("arch-review changed-line coverage", () => {
 	class FakeNotification {
 		static permission = "granted";
 		title: string;
-		opts: { body: string; tag: string; renotify: boolean; icon: unknown };
+		opts: {
+			body: string;
+			tag: string;
+			renotify: boolean;
+			icon: unknown;
+			url?: string;
+		};
 		onclick: (() => void) | null = null;
 		closeCalls = 0;
 		constructor(
 			title: string,
-			opts: { body: string; tag: string; renotify: boolean; icon: unknown },
+			opts: {
+				body: string;
+				tag: string;
+				renotify: boolean;
+				icon: unknown;
+				url?: string;
+			},
 		) {
 			this.title = title;
 			this.opts = opts;
@@ -401,25 +437,34 @@ describe("arch-review changed-line coverage", () => {
 	const created: FakeNotification[] = [];
 	const g = globalThis as unknown as Record<string, unknown>;
 	let focusCalls = 0;
+	let assigned: string | null = null;
 	const originals = {
 		document: g.document,
 		window: g.window,
 		Notification: g.Notification,
+		location: g.location,
 	};
 
 	// Install fakes; restore() puts the originals back.
 	function install(hidden: boolean): void {
 		focusCalls = 0;
+		assigned = null;
 		created.length = 0;
 		g.document = { hidden };
 		g.window = { Notification: FakeNotification, focus: () => focusCalls++ };
 		g.Notification = FakeNotification;
+		g.location = {
+			assign: (url: string) => {
+				assigned = url;
+			},
+		};
 		localStorage.setItem(NOTIFY_KEY, "1");
 	}
 	function restore(): void {
 		g.document = originals.document;
 		g.window = originals.window;
 		g.Notification = originals.Notification;
+		g.location = originals.location;
 		localStorage.removeItem(NOTIFY_KEY);
 	}
 
@@ -436,10 +481,36 @@ describe("arch-review changed-line coverage", () => {
 				tag: "needs_you",
 				renotify: true,
 				icon,
+				url: "/projects/proj/tasks/a",
 			});
 			created[0]!.onclick!();
 			expect(focusCalls).toBe(1);
+			expect(assigned).toBe("/projects/proj/tasks/a");
 			expect(created[0]!.closeCalls).toBe(1);
+		} finally {
+			restore();
+		}
+	});
+
+	test("a grouped notice stays focus-only; a lone card carries its card URL", () => {
+		install(true);
+		try {
+			// Two needs_you cards collapse into one counted notice: no URL, click only focuses.
+			showAlerts([
+				card({ id: "a", state: "needs_you", needsReason: "x" }),
+				card({ id: "b", state: "needs_you", needsReason: "y" }),
+			]);
+			expect(created).toHaveLength(1);
+			expect(created[0]!.opts.url).toBeUndefined();
+			created[0]!.onclick!();
+			expect(focusCalls).toBe(1);
+			expect(assigned).toBeNull();
+			// One answered report names exactly one card: the click opens its path.
+			showAlerts([card({ id: "c", stage: "in_progress", answered: true })]);
+			expect(created).toHaveLength(2);
+			expect(created[1]!.opts.url).toBe("/projects/proj/tasks/c");
+			created[1]!.onclick!();
+			expect(assigned).toBe("/projects/proj/tasks/c");
 		} finally {
 			restore();
 		}

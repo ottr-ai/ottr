@@ -1,5 +1,6 @@
 import type { TaskCard } from "../types.ts";
 import icon from "./icon-192.png";
+import { taskPath } from "./route.ts";
 
 /** localStorage switch for desktop notifications; present = the user turned them on. */
 export const NOTIFY_KEY = "ottr.notify";
@@ -186,6 +187,9 @@ export interface AlertNotice {
 	title: string;
 	body: string;
 	tag: string;
+	/** The card's path when the notice names exactly one card; a grouped notice stays
+	 * focus-only. Assigned to location on click, so the drawer opens after the focus. */
+	url?: string;
 }
 
 /**
@@ -214,6 +218,7 @@ export function alertNotices(alerts: TaskCard[]): AlertNotice[] {
 				title: alertTitle(t),
 				body: alertBody(t),
 				tag: `ottr:${t.id}`,
+				url: taskPath(t.project, t.id),
 			});
 		}
 	}
@@ -228,6 +233,7 @@ export function alertNotices(alerts: TaskCard[]): AlertNotice[] {
 			title: alertTitle(needs),
 			body: alertBody(needs),
 			tag: "needs_you",
+			url: taskPath(needs.project, needs.id),
 		});
 	if (doneCount > 1)
 		out.push({
@@ -240,6 +246,7 @@ export function alertNotices(alerts: TaskCard[]): AlertNotice[] {
 			title: alertTitle(done),
 			body: `${done.title} was done`,
 			tag: "done",
+			url: taskPath(done.project, done.id),
 		});
 	return out;
 }
@@ -255,15 +262,18 @@ export function showAlerts(alerts: TaskCard[]): void {
 	if (!notificationsOn()) return;
 	for (const a of alertNotices(alerts)) {
 		// TS's DOM lib lacks renotify; Chrome and Edge read it.
-		const opts: NotificationOptions & { renotify: boolean } = {
+		const opts: NotificationOptions & { renotify: boolean; url?: string } = {
 			body: a.body,
 			tag: a.tag,
 			renotify: true,
 			icon,
+			url: a.url,
 		};
 		const n = new Notification(a.title, opts);
 		n.onclick = () => {
 			window.focus();
+			// A notice naming one card opens that card; a grouped notice stays focus-only.
+			if (a.url !== undefined) location.assign(a.url);
 			n.close();
 		};
 	}
