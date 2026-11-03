@@ -100,7 +100,7 @@ export function rebaseRetryPrompt(o: {
 	max: number;
 }): string {
 	return `The server push of origin/${o.branch} was rejected because origin moved while this card was merging (automatic rebase retry ${o.attempt} of ${o.max}); the server has fetched origin, so origin/${o.branch} here is current.
-In the main checkout, rebase the local target branch onto origin/${o.branch} (resolve conflicts keeping both intents), run the gates again, and report integrated. After your report, the normal server push runs again.
+In the main checkout, rebase the local target branch onto origin/${o.branch} (resolve conflicts keeping both intents), run the gates again, and report integrated (summary is one line). After your report, the normal server push runs again.
 Do not push: the server pushes with its stored credentials.`;
 }
 
@@ -139,7 +139,7 @@ export function replyPrompt(o: {
 	const outcomes = o.release
 		? RELEASE_OUTCOMES
 		: o.kind === "merge"
-			? "integrated (integration output verbatim in details) or needs_you (with the exact question — call ask with it and its options first, then end)"
+			? "integrated (summary is one line; integration output verbatim in details) or needs_you (with the exact question — call ask with it and its options first, then end)"
 			: WORK_OUTCOMES;
 	const rejected = o.rejected
 		? `The tracker rejected your last report_outcome: ${o.rejected}\n\n`
