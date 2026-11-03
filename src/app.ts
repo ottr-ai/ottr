@@ -4250,6 +4250,10 @@ export function createApp(deps: AppDeps) {
 							: null;
 					}
 					e.store.setSettings(patch);
+					// A new targetBranch must move e.target at once: the board, the supervisor,
+					// the diffs and the gates read it until the next turn. A save that does not
+					// touch the target leaves it alone.
+					if (patch.targetBranch !== undefined) await refreshRemote(e);
 					return json(projectView(e));
 				}),
 		},

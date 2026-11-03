@@ -3917,6 +3917,42 @@ describe("project settings validation", () => {
 		expect(clear.status).toBe(200);
 		expect(store.getSettings().targetBranch).toBeNull();
 	});
+
+	test("saving targetBranch moves the board target at once", async () => {
+		const dir = join(root, "target-save-proj");
+		const add = await post("/api/projects", { name: "target-save-proj" });
+		expect(add.status).toBe(200);
+		const e = projects.get("target-save-proj")!;
+		// A second branch on origin, different from the checked-out head: only a
+		// targetBranch-aware resolution can land on it.
+		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+			.toString()
+			.trim();
+		const other = execSync(
+			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
+				`${tree} -m feature`,
+			{ cwd: dir },
+		)
+			.toString()
+			.trim();
+		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			cwd: dir,
+		});
+		e.target = "origin/main";
+		const res = await post("/api/projects/target-save-proj/settings", {
+			targetBranch: "feature",
+		});
+		expect(res.status).toBe(200);
+		expect(e.target).toBe("origin/feature");
+		// A save that does not touch the target leaves it alone.
+		const other2 = await post("/api/projects/target-save-proj/settings", {
+			maxImages: 5,
+		});
+		expect(other2.status).toBe(200);
+		expect(e.target).toBe("origin/feature");
+		projects.delete("target-save-proj");
+		e.store.close();
+	});
 });
 
 describe("project icon", () => {

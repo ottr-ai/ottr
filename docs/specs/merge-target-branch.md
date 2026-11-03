@@ -22,7 +22,9 @@ merges into `develop`".
    routes, the arch-review route (which also passes the pinned origin URL, so
    a configured branch the clone never fetched still resolves), the task
    view's late-commits anchor, and both `turn.ts` call sites (release publish
-   and the per-turn worktree/target resolution).
+   and the per-turn worktree/target resolution). A settings save that changes
+   `targetBranch` refreshes `e.target` at once through `refreshRemote`; a save
+   that does not touch it leaves the target alone.
 3. Resolution ladder for `targetBranch === null` (the default):
    - `git symbolic-ref refs/remotes/origin/HEAD` names the repo's default
      branch: target = `origin/<default>`, canonical form;
