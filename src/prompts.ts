@@ -54,6 +54,7 @@ export function workPrompt(o: {
 
 ---
 orchestrate this task following AGENTS.md: plan, implement, verify, and commit on branch ${o.branch}.
+In a fresh worktree, run the project's dependency install in locked/frozen mode before the gates (bun: \`bun install --frozen-lockfile\`).
 When a commit replaces an earlier commit's change instead of fixing it, reference the earlier commit with a \`Supersedes: <sha>\` body line. The release notes drop the named commit's bullet.
 Do not merge, push, tag or release: the tracker runs integration as a separate turn when this project's merge slot is free.
 If this task only researches a topic or answers a question — no code changes needed — do not implement: write the complete report as a markdown file named ${RESEARCH_REPORT} at the repository root of your worktree, do not commit it, do not create or modify any other file except image files you pass in report_outcome's shots field, and report answered (never ready: there is nothing to integrate). The tracker archives the report with the card and removes the worktree.
@@ -77,6 +78,7 @@ export function mergePrompt(o: { branch: string; target: string }): string {
 		? o.target.slice("origin/".length)
 		: o.target;
 	return `Your turn to integrate ${o.branch}: rebase onto ${o.target} (resolve conflicts keeping both intents), re-run the project's verification, then integrate exactly as AGENTS.md prescribes.
+If the rebase pulled in commits that touch dependencies, install again in locked/frozen mode before re-running the gates.
 Then, in the main checkout, fast-forward ${targetBranch} to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so ${targetBranch} holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
 Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated. If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.
 ${RENAME}
