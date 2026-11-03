@@ -70,21 +70,107 @@ function statNames(file: string): string[] {
 	return names;
 }
 
-/** One file's section of a unified diff, from its `diff --git` line to the next; null when the
- *  file has no section (also the answer for a diff truncated before this file's section). */
-export function diffFileSlice(text: string, file: string): string | null {
+/** One file's section of a unified diff, split out for per-file cards. */
+export type DiffSection = {
+	/** Display path: the `+++ b/` side, or the `--- a/` side when the new side is absent or `/dev/null` (deleted file); falls back to names[0]. */
+	path: string;
+	/** Every path the section answers to: the `diff --git a/… b/…` pair plus the `--- a/` and `+++ b/` names. */
+	names: string[];
+	/** The section's lines, from the `diff --git` header through the section's last content line; never a trailing empty line. */
+	lines: string[];
+};
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/** Splits a unified diff into one section per file, in file order. Text without any `diff --git ` line yields []. */
+export function splitDiffSections(text: string): DiffSection[] {
 	const lines = text.split("\n");
-	const wanted = statNames(file);
 	const heads: number[] = [];
 	for (const [i, line] of lines.entries()) {
 		if (line.startsWith("diff --git ")) heads.push(i);
 	}
+	const sections: DiffSection[] = [];
 	for (const [n, start] of heads.entries()) {
-		const end = n + 1 < heads.length ? heads[n + 1] : lines.length;
-		const section = lines.slice(start, end).join("\n");
-		if (sectionNames(section).some((name) => wanted.includes(name))) {
-			return section;
+		let end =
+			n + 1 < heads.length ? (heads[n + 1] ?? lines.length) : lines.length;
+		while (end > start && lines[end - 1] === "") end--;
+		const sectionLines = lines.slice(start, end);
+		const names = sectionNames(sectionLines.join("\n"));
+		const neu = sectionLines.find((l) => l.startsWith("+++ "));
+		const old = sectionLines.find((l) => l.startsWith("--- "));
+		// Pure renames carry no ---/+++ headers: the `diff --git` pair's b-side (names[1]) is
+		// then the new path; names[0] is the last resort for sections with no names at all.
+		let path = names[1] ?? names[0] ?? "";
+		if (neu !== undefined) {
+			const p = neu.slice("+++ ".length).replace(/^b\//, "");
+			if (p !== "/dev/null") path = p;
+		} else if (old !== undefined) {
+			path = old.slice("--- ".length).replace(/^a\//, "");
+		}
+		sections.push({ path, names, lines: sectionLines });
+	}
+	return sections;
+}
+
+/** Picks the sections for the named drawer files, keeping the requested order; a file whose section is absent is skipped. Matches with the same rules the old diffFileSlice used (statNames: raw path, `old => new`, and `dir/{old => new}/rest` brace forms). */
+export function pickDiffSections(
+	all: DiffSection[],
+	files: string[],
+): DiffSection[] {
+	const picked: DiffSection[] = [];
+	const taken = new Set<DiffSection>();
+	for (const file of files) {
+		const wanted = statNames(file);
+		for (const section of all) {
+			if (taken.has(section)) continue;
+			if (section.names.some((name) => wanted.includes(name))) {
+				picked.push(section);
+				taken.add(section);
+				break;
+			}
 		}
 	}
-	return null;
+	return picked;
+}
+
+/** One renderable diff line: class for color, old/new line numbers from the `@@ -o[,oc] +n[,nc] @@` headers (null = no number). */
+export type DiffLine = {
+	cls: "add" | "del" | "hunk" | "meta" | "ctx";
+	old: number | null;
+	new: number | null;
+	text: string;
+};
+
+/** Adds old/new line numbers to one file section's lines by walking its `@@` hunk headers. */
+export function numberDiffLines(lines: string[]): DiffLine[] {
+	const out: DiffLine[] = [];
+	let hunkSeen = false;
+	let oldCounter = 0;
+	let newCounter = 0;
+	for (const line of lines) {
+		const cls = diffLineClass(line);
+		let o: number | null = null;
+		let n: number | null = null;
+		if (cls === "hunk") {
+			const m = line.match(HUNK_HEADER);
+			if (m !== null) {
+				hunkSeen = true;
+				oldCounter = Number(m[1]);
+				newCounter = Number(m[3]);
+			} else {
+				hunkSeen = false;
+			}
+		} else if (hunkSeen) {
+			if (cls === "add") {
+				n = newCounter++;
+			} else if (cls === "del") {
+				o = oldCounter++;
+			} else if (line !== "\\ No newline at end of file") {
+				o = oldCounter++;
+				n = newCounter++;
+			}
+		}
+		out.push({ cls, old: o, new: n, text: line });
+	}
+	return out;
 }

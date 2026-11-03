@@ -60,7 +60,12 @@ import {
 	type AttachedImages,
 	readPicks,
 } from "./attach.ts";
-import { diffFileSlice, diffLineClass, diffLinkParts } from "./diff.ts";
+import {
+	diffLinkParts,
+	numberDiffLines,
+	pickDiffSections,
+	splitDiffSections,
+} from "./diff.ts";
 import type { CardPos } from "./flight.ts";
 import { freshTaskIds, listSlides, stageFlights } from "./flight.ts";
 import logo from "./icon-192.png";
@@ -1375,7 +1380,7 @@ function HowItWorksModal({
 	);
 }
 
-/** The task diff in a lightbox: the whole diff for file=null, one file's section otherwise.
+/** The task diff in a lightbox: one card per file, each with a line-number gutter.
  *  Fetched live per open; done cards serve the text captured at merge. */
 function DiffModal({
 	task,
@@ -1414,15 +1419,12 @@ function DiffModal({
 			: files.length === 1
 				? (files[0] ?? "")
 				: `${files.length} files`;
-	const section =
+	const sections =
 		result !== null && "text" in result
 			? files === null
-				? result.text
-				: files
-						.map((f) => diffFileSlice(result.text, f))
-						.filter((s) => s !== null)
-						.join("\n")
-			: null;
+				? splitDiffSections(result.text)
+				: pickDiffSections(splitDiffSections(result.text), files)
+			: [];
 	return (
 		<Modal
 			open
@@ -1438,20 +1440,34 @@ function DiffModal({
 				<p className="hint diff-empty">Loading…</p>
 			) : "failed" in result ? (
 				<p className="hint diff-empty">Diff unavailable.</p>
-			) : section === null ? (
-				<p className="hint diff-empty">No diff for this file.</p>
+			) : sections.length === 0 ? (
+				<p className="hint diff-empty">
+					{files === null ? "No changes." : "No diff for this file."}
+				</p>
 			) : (
-				<pre className="diff-code">
-					{section
-						.replace(/\n$/, "")
-						.split("\n")
-						.map((line, i) => (
-							// biome-ignore lint/suspicious/noArrayIndexKey: static split of fetched text; lines are positional
-							<div key={i} className={`dl-${diffLineClass(line)}`}>
-								{line === "" ? " " : line}
+				<div className="diff-scroll">
+					{sections.map((section) => (
+						<section
+							// biome-ignore lint/suspicious/noArrayIndexKey: section paths are unique within one diff
+							key={section.names[0]}
+							className="diff-card"
+						>
+							<div className="diff-card-head">{section.path}</div>
+							<div className="diff-card-body">
+								{numberDiffLines(section.lines).map((line, i) => (
+									// biome-ignore lint/suspicious/noArrayIndexKey: static split of fetched text; lines are positional
+									<div key={i} className={`dl-${line.cls}`}>
+										<span className="dl-old">{line.old ?? ""}</span>
+										<span className="dl-new">{line.new ?? ""}</span>
+										<span className="dl-text">
+											{line.text === "" ? " " : line.text}
+										</span>
+									</div>
+								))}
 							</div>
-						))}
-				</pre>
+						</section>
+					))}
+				</div>
 			)}
 		</Modal>
 	);
