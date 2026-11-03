@@ -34,6 +34,7 @@ import {
 	PROPOSED_REASON_PREFIX,
 	proposedReason,
 	RESEARCH_REPORT,
+	rebaseRetryPrompt,
 	replyPrompt,
 	restartResumePrompt,
 	retroReplyPrompt,
@@ -104,6 +105,7 @@ import type {
 	createWorktree,
 	diffStat,
 	diffText,
+	fetchOriginBranch,
 	hasRules,
 	ignoreInMain,
 	isClean,
@@ -314,6 +316,8 @@ export interface TurnOps {
 	targetContains: typeof targetContains;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
+	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
+	fetchOriginBranch: typeof fetchOriginBranch;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
 	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
@@ -406,6 +410,9 @@ interface UsageHold {
 const KEPT_PREFIX = "Kept the worktree: ";
 const demoBoard = () => process.env.OTTR_DEMO === "1";
 const CANCEL_KEPT_PREFIX = "Cancel kept the worktree: ";
+// OTTR-394: automatic rebase retries a card may spend when a merge push is rejected
+// because origin moved. Beyond the budget the card parks at needs_you with git's reason.
+const MERGE_PUSH_RETRIES = 2;
 // ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -1905,6 +1912,8 @@ export function createTurnLoop(
 			// the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
 			// local branch, and only this push moves it to origin.
 			let pushError: string | null = null;
+			// OTTR-394: the push failed as a rejected non-fast-forward (origin moved).
+			let pushRejected = false;
 			// The head a settle parks for a hold: a work-settle hold parks the worktree HEAD, a
 			// merge-hold mismatch park the local target head. A reply approves exactly this head.
 			let holdHead: string | null = null;
@@ -2034,6 +2043,11 @@ export function createTurnLoop(
 							);
 						}
 					}
+					if (p.status === "rejected") {
+						pushRejected = true;
+						pushError = p.error;
+						log(`! server push of ${target} rejected: ${p.error}`);
+					}
 					if (p.status === "failed") {
 						pushError = p.error;
 						log(`! server push of ${target} failed: ${p.error}`);
@@ -2081,12 +2095,68 @@ export function createTurnLoop(
 					}),
 			});
 			// A failed server push keeps the card at merging with git's reason: the worktree stays.
-			if (pushError !== null)
-				next = {
-					stage: "merging",
-					state: "needs_you",
-					needsReason: `Server push to origin failed: ${pushError}`,
-				};
+			// OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
+			// server fetches origin with its own credentials, then queues its own next merge turn
+			// with the rebase prompt: only a merge turn rebases, because the gates must run on the
+			// rebased code, so the server never pushes code no gate checked. Budget: 2 automatic
+			// retries per card. Beyond the budget, any other push error, or a hold-approved push
+			// (its lease covers one exact head, OTTR-274): today's needs_you with git's reason.
+			if (pushError !== null) {
+				const branch = target.startsWith("origin/")
+					? target.slice("origin/".length)
+					: null;
+				const retries = store.getTask(id)?.pushRetries ?? 0;
+				if (
+					pushRejected &&
+					holdTip === null &&
+					branch !== null &&
+					retries < MERGE_PUSH_RETRIES
+				) {
+					const fetchError =
+						settings.originUrl === null
+							? "no pinned origin URL to fetch the moved tip from"
+							: await ops
+									.fetchOriginBranch(e.path, branch, settings.originUrl)
+									.then(() => null)
+									.catch((err: unknown) => errmsg(err));
+					if (fetchError !== null) {
+						next = {
+							stage: "merging",
+							state: "needs_you",
+							needsReason: `Server push to origin failed: ${pushError}`,
+						};
+					} else {
+						const prompt = rebaseRetryPrompt({
+							branch,
+							attempt: retries + 1,
+							max: MERGE_PUSH_RETRIES,
+						});
+						// Steering that landed mid-run rides the rebase turn, its authorship
+						// leading — the same rule a hold park follows under queued user text.
+						const steer = store.getTask(id)?.pendingPrompt ?? null;
+						store.updateTask(id, { pushRetries: retries + 1 });
+						appendLog(
+							store,
+							id,
+							`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+						);
+						next = {
+							stage: "merging",
+							state: "queued",
+							needsReason: null,
+							pendingPrompt: steer === null ? prompt : `${prompt}\n\n${steer}`,
+							pendingBy:
+								steer === null ? "supervisor" : (live.pendingBy ?? "user"),
+						};
+					}
+				} else {
+					next = {
+						stage: "merging",
+						state: "needs_you",
+						needsReason: `Server push to origin failed: ${pushError}`,
+					};
+				}
+			}
 			// OTTR-274: a held merge carries patches beyond the approval: park instead of landing
 			// it. holdHead holds the exact local target head the reply can approve.
 			if (holdMismatch !== null)

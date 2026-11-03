@@ -299,6 +299,8 @@ export interface Task {
 	followUpOf: string | null;
 	/** CI watch: sha of the merge push whose GitHub Actions verdict the supervisor awaits; null once checked, skipped, or given up on. */
 	pushSha: string | null;
+	/** OTTR-394: automatic rebase retries a rejected server push has spent (budget 2 per card). */
+	pushRetries: number;
 	/** Integration target head when the task finished (stamped with `commits`); the anchor that attributes a release's late commits to the card that merged them. null when unmeasured or not done. */
 	mergeHead: string | null;
 	/** Coarse board topic: the last turn report's `topic:` line (max 40 chars), else a keyword label backfilled for done cards; null = unclassified. */

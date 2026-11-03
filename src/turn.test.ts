@@ -206,6 +206,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		// Fails closed like the real git read: containment must be proven, never assumed.
 		targetContains: async () => false,
 		serverMergePush: async () => ({ status: "skipped" as const }),
+		fetchOriginBranch: async () => null,
 		mergeHoldMismatch: async () => ({
 			mismatch: false,
 			pushDiff: null,
@@ -4344,6 +4345,113 @@ describe("turn ci watch pinning", () => {
 			"Server push to origin failed: fatal: [REDACTED] rejected",
 		);
 		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a rejected server push fetches origin and queues a rebase merge turn, not needs_you", async () => {
+		const fetches: string[] = [];
+		let pushes = 0;
+		const { store, record, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return pushes === 1
+					? {
+							status: "rejected" as const,
+							error: "! [rejected] main -> main (non-fast-forward)",
+						}
+					: { status: "pushed" as const, output: "" };
+			},
+			fetchOriginBranch: async (
+				_mainPath: string,
+				branch: string,
+				originUrl: string,
+			) => {
+				fetches.push(`${branch}@${originUrl}`);
+				return null;
+			},
+		});
+		// maxParallel 0 keeps the scheduler's post-settle schedule() from auto-starting the
+		// queued rebase turn mid-assertion; phase 2 below starts it like the merge slot would.
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		// The card lands queued with the rebase prompt, not parked at needs_you.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushRetries).toBe(1);
+		expect(fetches).toEqual(["main@ssh://git.example.com/a/r.git"]);
+		expect(after.pendingPrompt).toContain(
+			"rebase the local target branch onto origin/main",
+		);
+		expect(after.pendingPrompt).toContain("automatic rebase retry 1 of 2");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(logText(store, task.id)).toContain(
+			"server push rejected: origin moved, merge turn queued to rebase (retry 1 of 2)",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+		// The queued turn runs with the rebase prompt, the push runs again, and the card lands.
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect(pushes).toBe(2);
+		expect(record.runs[1]!.prompt).toContain(
+			"rebase the local target branch onto origin/main",
+		);
+		expect(store.listTurns(task.id)[1]!.inputBy).toBe("supervisor");
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("the third rejected push parks the card at needs_you with git's reason", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "rejected" as const,
+				error: "! [rejected] main -> main (non-fast-forward)",
+			}),
+			fetchOriginBranch: async () => {
+				throw new Error("must not fetch beyond the retry budget");
+			},
+		});
+		store.updateTask(task.id, { pushRetries: 2 });
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(
+			"Server push to origin failed: ! [rejected] main -> main (non-fast-forward)",
+		);
+		expect(t.pushRetries).toBe(2);
+		expect(t.pendingPrompt).toBeNull();
+	});
+
+	test("a hold-approved merge origin rejects keeps needs_you: the lease covers one exact head", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "rejected" as const,
+				error: "! [rejected] main -> main (stale info)",
+			}),
+			mergeHoldMismatch: async () => ({
+				mismatch: false,
+				pushDiff: null,
+				auditedTip: "sha-audited",
+			}),
+			fetchOriginBranch: async () => {
+				throw new Error("must not fetch a held push");
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(
+			"Server push to origin failed: ! [rejected] main -> main (stale info)",
+		);
+		expect(t.pushRetries).toBe(0);
 	});
 });
 

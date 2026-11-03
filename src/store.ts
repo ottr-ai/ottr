@@ -203,6 +203,7 @@ interface TaskRow {
 	needs_reason: string | null;
 	pending_prompt: string | null;
 	pending_by: string | null;
+	push_retries: number;
 	branch: string | null;
 	base: string | null;
 	worktree: string | null;
@@ -336,6 +337,7 @@ function toTask(project: string, r: TaskRow): Task {
 		needsReason: r.needs_reason,
 		pendingPrompt: r.pending_prompt,
 		pendingBy: r.pending_by as "user" | "supervisor" | null,
+		pushRetries: r.push_retries,
 		branch: r.branch,
 		base: r.base,
 		worktree: r.worktree,
@@ -527,6 +529,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	needsReason: "needs_reason",
 	pendingPrompt: "pending_prompt",
 	pendingBy: "pending_by",
+	pushRetries: "push_retries",
 	branch: "branch",
 	base: "base",
 	worktree: "worktree",
@@ -1169,6 +1172,12 @@ export class ProjectStore {
 		// rebuilds, same reason as priority above; null behaves as "user" on old rows.
 		if (!cols.includes("pending_by"))
 			db.exec("ALTER TABLE tasks ADD COLUMN pending_by TEXT");
+		// OTTR-394: how many automatic rebase retries a rejected server push has spent
+		// (budget 2 per card). ALTER-only after the rebuilds, like pending_by above.
+		if (!cols.includes("push_retries"))
+			db.exec(
+				"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
+			);
 		const turnCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
 			.all()

@@ -2866,6 +2866,47 @@ describe("learnings", () => {
 	});
 });
 
+describe("push retries (OTTR-394)", () => {
+	test("a database created before push_retries converges on open and the field round-trips", () => {
+		const dir = join(root, "push-retries-legacy");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		// The tasks DDL of a fresh database minus the ALTER-only push_retries column: the
+		// shape every live database carried before this feature.
+		const ref = open(join(root, "push-retries-schema-ref"));
+		ref.close();
+		const refDb = new Database(
+			join(root, "push-retries-schema-ref", ".tasks", "tasks.db"),
+		);
+		const ddl =
+			refDb
+				.query<{ sql: string }, []>(
+					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+				)
+				.get()?.sql ?? "";
+		refDb.close();
+		const legacy = ddl.replace(
+			/,\s*push_retries INTEGER NOT NULL DEFAULT 0/,
+			"",
+		);
+		expect(legacy).not.toBe(ddl);
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(legacy);
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'old card', 'merging', 'queued', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		expect(store.getTask("seed1")?.pushRetries).toBe(0);
+		store.updateTask("seed1", { pushRetries: 2 });
+		expect(store.getTask("seed1")?.pushRetries).toBe(2);
+		store.close();
+		const reopened = open(dir);
+		expect(reopened.getTask("seed1")?.pushRetries).toBe(2);
+		reopened.close();
+	});
+});
+
 describe("starred flag", () => {
 	test("a fresh task defaults to unstarred and updateTask persists the flag across reopen", () => {
 		const store = open(join(root, "starred"));

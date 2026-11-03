@@ -142,6 +142,7 @@ function task(p: Partial<Task> = {}): Task {
 		keptFiles: [],
 		followUpOf: null,
 		pushSha: null,
+		pushRetries: 0,
 		mergeHead: null,
 		topic: null,
 		dependsOn: [],

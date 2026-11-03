@@ -90,6 +90,20 @@ Add a final line \`topic: <one or two words for the task's subject>\` to the rep
 ${ONE_SHOT}`;
 }
 
+/** The reply the server queues on a card whose merge push origin rejected (OTTR-394): the
+ * merge agent rebases the local target branch onto the fetched origin tip, runs the gates
+ * again, and reports integrated again; the server push then runs once more. attempt/max is
+ * the card's automatic retry budget. */
+export function rebaseRetryPrompt(o: {
+	branch: string;
+	attempt: number;
+	max: number;
+}): string {
+	return `The server push of origin/${o.branch} was rejected because origin moved while this card was merging (automatic rebase retry ${o.attempt} of ${o.max}); the server has fetched origin, so origin/${o.branch} here is current.
+In the main checkout, rebase the local target branch onto origin/${o.branch} (resolve conflicts keeping both intents), run the gates again, and report integrated. After your report, the normal server push runs again.
+Do not push: the server pushes with its stored credentials.`;
+}
+
 /** Resume hint for a turn the tracker restarted: an unchanged tree must not repeat long suites. */
 export function restartResumePrompt(o: {
 	sha: string | null;

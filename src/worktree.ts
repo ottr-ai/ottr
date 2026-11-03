@@ -1215,7 +1215,9 @@ export async function originRemoteUrl(
  * The push names `originUrl` — the server-pinned URL (project settings), never the remote
  * name: a work turn can re-point a name through the worker-writable .git/config, and the
  * named repo's pre-receive hook would run here. A null pin, or one checkPinnedRemote
- * refuses, fails closed.
+ * refuses, fails closed. A push git rejects because the remote moved (a non-fast-forward,
+ * "fetch first", or a --force-with-lease "stale info") returns `rejected` (OTTR-394), so the
+ * merge turn can queue its own rebase; any other failure stays `failed`.
  */
 export async function serverMergePush(
 	mainPath: string,
@@ -1228,6 +1230,7 @@ export async function serverMergePush(
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
 	| { status: "failed"; error: string }
+	| { status: "rejected"; error: string }
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
@@ -1294,7 +1297,48 @@ export async function serverMergePush(
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
 	}
 	const last = r.stderr.trim().split("\n").filter(Boolean).pop();
+	// OTTR-394: git's rejection of a remote that moved while the merge ran ("fetch first" is
+	// the same rejection worded for a still-fast-forwardable local side); "(stale info)" is a
+	// --force-with-lease rejection, which the caller refuses to retry on a held push. Any
+	// other failure keeps today's parking.
+	if (
+		/\[rejected\].*\((?:non-fast-forward|fetch first|stale info)\)/.test(
+			r.stderr,
+		)
+	)
+		return { status: "rejected", error: last ?? `git push exited ${r.code}` };
 	return { status: "failed", error: last ?? `git push exited ${r.code}` };
+}
+
+/**
+ * OTTR-394: the server-side fetch that backs an automatic rebase retry. A rejected merge
+ * push means origin moved while the merge ran; the queued rebase turn needs a current
+ * origin/<branch> to rebase onto, and the merge agent holds no git credentials (D6). The
+ * fetch names the pinned origin URL (never the remote name a work turn can re-point, R5-1)
+ * with an explicit force refspec into the remote-tracking ref, so planted fetch refspecs
+ * stay irrelevant, and --no-tags keeps a planted tag opt from dragging tags in. Returns the
+ * error text, else null.
+ */
+export async function fetchOriginBranch(
+	mainPath: string,
+	branch: string,
+	originUrl: string,
+): Promise<string | null> {
+	const guard = await checkPinnedRemote(mainPath, originUrl);
+	if (guard !== null) return guard;
+	const r = await git(
+		[
+			"fetch",
+			"--no-tags",
+			originUrl,
+			`+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+		],
+		mainPath,
+	);
+	return r.code === 0
+		? null
+		: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
+				`git fetch exited ${r.code}`);
 }
 
 /**

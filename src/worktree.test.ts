@@ -28,6 +28,7 @@ import {
 	createWorktree,
 	diffStat,
 	diffText,
+	fetchOriginBranch,
 	GIT_AUTH_ENV_NAME,
 	git,
 	gitEnv,
@@ -274,6 +275,66 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("a push origin moved during the merge is rejected, and fetchOriginBranch catches up", async () => {
+		const f = fixture();
+		try {
+			// Another writer lands a commit on origin while the merge turn runs: the local
+			// tracking ref still names the old tip, so the push is a rejected non-fast-forward.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(twin, ...id, "commit", "-q", "--allow-empty", "-m", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			const moved = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			if (r.status === "rejected")
+				// git's last stderr line is the fast-forward hint — the text OTTR-391 parked on.
+				expect(r.error).toContain("Note about fast-forwards");
+			else throw new Error(`expected a rejected push, got ${r.status}`);
+			// The board fetches origin with its own credentials; the tracking ref catches up,
+			// so the queued rebase turn rebases onto the moved tip.
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			expect(run(f.main, "rev-parse", "refs/remotes/origin/main")).toBe(moved);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a hold-approved push whose lease no longer matches classifies as rejected too", async () => {
+		const f = fixture();
+		try {
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(twin, ...id, "commit", "-q", "--allow-empty", "-m", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			// The audited tip the hold gate fetched: origin's tip at approval time (the
+			// tracking ref, which only the board's own fetches and pushes move).
+			const leaseTip = run(f.main, "rev-parse", "refs/remotes/origin/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				leaseTip,
+				f.bare,
+			);
+			// The remote rejected the lease; the turn refuses to retry a held push.
+			if (r.status === "rejected")
+				expect(r.error).toContain("failed to push some refs");
+			else throw new Error(`expected a rejected lease push, got ${r.status}`);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a removed worktree proves the merge by its branch, and a removed branch by main ahead of origin", async () => {
 		const f = fixture();
 		try {
@@ -379,7 +440,7 @@ describe("serverMergePush", () => {
 		}
 	});
 
-	test("a push whose lease does not match the remote fails", async () => {
+	test("a push whose lease does not match the remote is rejected", async () => {
 		const f = fixture();
 		try {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
@@ -398,7 +459,9 @@ describe("serverMergePush", () => {
 				stale,
 				f.bare,
 			);
-			expect(r.status).toBe("failed");
+			// OTTR-394: the lease rejection classifies as rejected, so the turn can tell it
+			// from other failures — and refuses to retry a held push by the hold tip.
+			expect(r.status).toBe("rejected");
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });

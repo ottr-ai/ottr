@@ -606,6 +606,7 @@ describe("handoffMarkdown research report", () => {
 		priority: null,
 		closeCandidate: null,
 		pendingBy: null,
+		pushRetries: 0,
 	};
 
 	test("carries the full report markdown", () => {
