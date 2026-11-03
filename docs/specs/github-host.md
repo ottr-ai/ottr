@@ -6,9 +6,22 @@ GitHub App. Plain git needs no setting: it already works on any host (src/gitHos
 
 ## Setting
 
-`OTTR_GITHUB_HOST` (env, default `github.com`). Settings → Git hosts shows it. One host per
-board. The module `src/githubHost.ts` owns every value derived from it. No other file builds
-a github.com URL or picks the gh env.
+One host per board, set in either place; a saved Settings value wins while it exists:
+
+- Settings → Git hosts → **GitHub host**: an input field that shows the host in effect
+  (`github.com` when nothing is set). Saving calls `POST /api/settings/github-host` with
+  `{host}`; an empty `host` clears the saved value. The answer is
+  `{host, expiresAt}`: the host now in effect (`null` only for an invalid env) and the
+  token expiry after a fresh probe, so the notice follows the new host at once.
+- `OTTR_GITHUB_HOST` (env, default `github.com`): the fallback a saved value overwrites.
+
+Applying a value writes it into `OTTR_GITHUB_HOST` in the server process — the same pattern
+as the GitHub token writing `GH_TOKEN`. The app remembers the env value it booted with; a
+clear restores that value, or removes the variable when the env had none. A saved value
+persists in the config store (`githubHost` field of the `config` row) and the load reapplies
+it over the env at every boot. The module `src/githubHost.ts` owns every value derived from
+the host and reads only the env, so no caller changes. No other file builds a github.com URL
+or picks the gh env.
 
 ## Host kinds and derived values
 
@@ -55,6 +68,10 @@ check at boot.
 - Invalid `OTTR_GITHUB_HOST`: the server refuses to start; `githubHost()` throws the same
   message at every other use. The Settings view reports the host as unknown (`null`) instead
   of a wrong host.
+- An invalid saved value cannot exist: the endpoint refuses it with a 400 carrying the
+  `parseGithubHost` message and stores nothing. The boot check in `src/server.ts` runs
+  before the config loads, so an invalid env refuses the start even when a saved value
+  would override it.
 - GitHub answers 401/404: unchanged behavior per caller. The probe keeps the stored value;
   the App mint returns null when no installation exists.
 
@@ -68,6 +85,13 @@ check at boot.
 - Without the setting, every call is unchanged (github.com URLs, `GH_TOKEN` only).
 - Property: for every host the module accepts, the derived URLs stay on that host; a host
   with a scheme, path, port or whitespace is refused.
+- Saving `bmw.ghe.com` in Settings: the `/api/git-hosts` view names it, the config row holds
+  it, a new app on the same store still names it after boot, and the probe calls
+  `https://api.bmw.ghe.com`.
+- A saved value wins over a different env value; clearing falls back to the env value, or to
+  `github.com` without one. An invalid save answers 400 and stores nothing.
+- The Settings field shows `github.com` by default; a save posts the endpoint and the view
+  updates; a 400 error lands on the section's error line.
 - `bun run check` and `bun test` exit 0.
 
 ## Non-goals
@@ -78,3 +102,5 @@ check at boot.
 - Git authentication to the host stays with the Settings → Git hosts tokens and SSH keys;
   `GH_ENTERPRISE_TOKEN` serves gh only. The board's own upstream checks (`ottr-ai/ottr`
   updates) stay on github.com.
+- No delete endpoint for the host: an empty save is the reset, as `github.com` in the field
+  is the explicit default.

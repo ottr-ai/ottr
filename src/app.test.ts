@@ -6392,6 +6392,129 @@ describe("git-hosts view github host", () => {
 	});
 });
 
+describe("POST /api/settings/github-host", () => {
+	const savedEnv = process.env.OTTR_GITHUB_HOST;
+	afterAll(() => {
+		if (savedEnv === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedEnv;
+	});
+
+	test("a save names the host in the view, the env and the config row", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const m = mount({ sshDir: join(root, "ssh-host-save") });
+		const res = await m.call("/api/settings/github-host", {
+			host: "bmw.ghe.com",
+		});
+		expect(await res.json()).toEqual({ host: "bmw.ghe.com", expiresAt: null });
+		expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+			"bmw.ghe.com",
+		);
+		expect(String(process.env.OTTR_GITHUB_HOST)).toBe("bmw.ghe.com");
+		expect(m.g.get<{ githubHost?: unknown }>("config")?.githubHost).toBe(
+			"bmw.ghe.com",
+		);
+	});
+
+	test("a saved host survives a second boot on the same store", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const g = GlobalStore.open(
+			join(root, "g-host-boot", Math.random().toString(36).slice(2)),
+		);
+		const m = mount({ gstore: g, sshDir: join(root, "ssh-host-boot") });
+		await m.call("/api/settings/github-host", { host: "bmw.ghe.com" });
+		const m2 = mount({ gstore: g, sshDir: join(root, "ssh-host-boot") });
+		expect((await (await m2.call("/api/git-hosts")).json()).githubHost).toBe(
+			"bmw.ghe.com",
+		);
+	});
+
+	test("a saved host wins over the env; clearing falls back to env, then github.com", async () => {
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		const m = mount({ sshDir: join(root, "ssh-host-clear") });
+		await m.call("/api/settings/github-host", { host: "bmw.ghe.com" });
+		expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+			"bmw.ghe.com",
+		);
+		const cleared = (await (
+			await m.call("/api/settings/github-host", { host: "  " })
+		).json()) as { host: string | null };
+		expect(cleared.host).toBe("acme.ghe.com");
+		expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+			"acme.ghe.com",
+		);
+		delete process.env.OTTR_GITHUB_HOST;
+		const m2 = mount({ sshDir: join(root, "ssh-host-clear2") });
+		const bare = (await (
+			await m2.call("/api/settings/github-host", { host: "" })
+		).json()) as { host: string | null };
+		expect(bare.host).toBe("github.com");
+		expect(process.env.OTTR_GITHUB_HOST).toBeUndefined();
+	});
+
+	test("an invalid host answers 400 with the parse message and stores nothing", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const m = mount({ sshDir: join(root, "ssh-host-bad") });
+		const res = await m.call("/api/settings/github-host", {
+			host: "https://x",
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { error: string };
+		expect(body.error).toBe(
+			"OTTR_GITHUB_HOST: must hold only letters, digits, dots and hyphens (use a bare hostname, for example github.com or acme.ghe.com)",
+		);
+		expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
+			"github.com",
+		);
+		expect(
+			m.g.get<{ githubHost?: unknown }>("config")?.githubHost,
+		).toBeUndefined();
+	});
+
+	test("the save's probe follows the new host; the default keeps the github.com URL", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const m = mount({ sshDir: join(root, "ssh-host-probe") });
+		const urls: string[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			urls.push(url);
+			if (url === "https://api.bmw.ghe.com/user")
+				return new Response(null, {
+					status: 200,
+					headers: { "github-authentication-token-expiration": "2027-01-01" },
+				});
+			if (url === "https://api.github.com/repos/ottr-ai/ottr")
+				return new Response(null, {
+					status: 200,
+					headers: { "github-authentication-token-expiration": "2026-12-01" },
+				});
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			await m.call("/api/settings/github-token", {
+				token: `ghp_${"e".repeat(36)}`,
+			});
+			const saved = (await (
+				await m.call("/api/settings/github-host", { host: "bmw.ghe.com" })
+			).json()) as { host: string; expiresAt: string | null };
+			expect(saved.host).toBe("bmw.ghe.com");
+			expect(saved.expiresAt).toBe("2027-01-01T00:00:00.000Z");
+			expect(urls).toContain("https://api.bmw.ghe.com/user");
+			const cleared = (await (
+				await m.call("/api/settings/github-host", { host: "" })
+			).json()) as { host: string; expiresAt: string | null };
+			expect(cleared.host).toBe("github.com");
+			expect(cleared.expiresAt).toBe("2026-12-01T00:00:00.000Z");
+			expect(urls).toContain("https://api.github.com/repos/ottr-ai/ottr");
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+});
+
 describe("git-host ssh keys", () => {
 	test("pending keys are generated server-side, 0600, and never echoed", async () => {
 		const f = sshFixture();

@@ -1430,6 +1430,10 @@ export function GitHostsSection() {
 	const [appId, setAppId] = useState("");
 	const [appKey, setAppKey] = useState("");
 	const appBusy = useBusy();
+	// GitHub host: a local draft so typing does not fight the reload; null = show
+	// the value from state (or empty while state is still loading).
+	const [ghHostDraft, setGhHostDraft] = useState<string | null>(null);
+	const ghBusy = useBusy();
 	// Global-key flow: a pending key, then the save call that also runs the test.
 	const [pending, setPending] = useState<PendingKeyInfo | null>(null);
 	const [gUrl, setGUrl] = useState("");
@@ -1535,6 +1539,22 @@ export function GitHostsSection() {
 			await load();
 			return true;
 		});
+	// Guarded save for the GitHub host; an empty field clears the saved value.
+	const saveHost = (): void => {
+		ghBusy.start(() =>
+			run(async () => {
+				const { status, data } = await gitReq(
+					"POST",
+					"/api/settings/github-host",
+					{ host: (ghHostDraft ?? state?.githubHost ?? "").trim() },
+				);
+				if (status !== 200) throw new Error(asError(data, status));
+				setGhHostDraft(null);
+				await load();
+				return true;
+			}),
+		);
+	};
 	return (
 		<SettingsCard
 			id="git-hosts-section"
@@ -1542,6 +1562,50 @@ export function GitHostsSection() {
 			status={gitHostsChip(state)}
 			hint="The GitHub token serves the board's own git and releases. Other HTTPS tokens and the server-side SSH key serve clones, fetches and pushes on any git host. Agents on workers never receive them."
 		>
+			<div className="sec-block" id="github-host-block" tabIndex={-1}>
+				<h4>GitHub host</h4>
+				<p className="hint">
+					Where GitHub lives for this board: github.com, a *.ghe.com Enterprise
+					Cloud host, or an Enterprise Server host. It steers the API calls, gh,
+					PR links, releases and fork research.
+				</p>
+				<form
+					className="settings-form"
+					onSubmit={(e) => {
+						e.preventDefault();
+						saveHost();
+					}}
+				>
+					<label className="settings-field">
+						GitHub host
+						<input
+							value={ghHostDraft ?? state?.githubHost ?? ""}
+							onChange={(e) => setGhHostDraft(e.target.value)}
+							placeholder="github.com"
+							spellCheck={false}
+							aria-label="GitHub host"
+						/>
+					</label>
+					<button
+						type="submit"
+						disabled={ghBusy.busy}
+						className={`primary${ghBusy.failed ? " failed" : ""}`}
+					>
+						{ghBusy.busy && <span className="spinner" aria-hidden="true" />}
+						Save
+					</button>
+				</form>
+				<p className="hint">
+					Saved here wins over the OTTR_GITHUB_HOST env until you clear it.
+					Empty resets to the env value or github.com.
+				</p>
+				{state !== null && state.githubHost === null && (
+					<p className="hint">
+						OTTR_GITHUB_HOST is invalid — use a bare hostname, for example
+						acme.ghe.com
+					</p>
+				)}
+			</div>
 			<div className="sec-block" id="github-token-block" tabIndex={-1}>
 				<h4>GitHub token</h4>
 				<p className="hint">
@@ -1558,15 +1622,6 @@ export function GitHostsSection() {
 					captionUnknown="Unknown: the check failed"
 					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
-				{state !== null && (
-					<p className="hint">
-						{state.githubHost === null
-							? "GitHub host: OTTR_GITHUB_HOST is invalid — use a bare hostname, for example acme.ghe.com"
-							: state.githubHost === "github.com"
-								? "GitHub host: github.com (default)"
-								: `GitHub host: ${state.githubHost} (GitHub Enterprise)`}
-					</p>
-				)}
 			</div>
 			<div className="sec-block" id="github-app-block" tabIndex={-1}>
 				<h4>
@@ -3601,6 +3656,7 @@ export const SETTINGS_TOC = [
 				id: "git-hosts-section",
 				label: "Git hosts",
 				blocks: [
+					{ id: "github-host-block", label: "GitHub host" },
 					{ id: "github-token-block", label: "GitHub token" },
 					{ id: "github-app-block", label: "GitHub App" },
 					{ id: "host-tokens-block", label: "Other host tokens" },

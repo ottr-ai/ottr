@@ -240,3 +240,163 @@ describe("GitHostsSection GitHub App form", () => {
 		}
 	});
 });
+
+describe("GitHostsSection GitHub host", () => {
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	const view = {
+		tokens: [],
+		globalKey: null,
+		githubApp: null,
+		githubHost: "github.com",
+	};
+
+	/** Mock for /api/git-hosts and the GitHub token check; `extra` handles the rest. */
+	const baseMock = (
+		loaded: { calls: number },
+		extra: (url: string, init?: RequestInit) => Response | undefined,
+	): typeof fetch =>
+		(async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
+				loaded.calls += 1;
+				return ok(view);
+			}
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			const hit = extra(url, init);
+			if (hit !== undefined) return hit;
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+
+	test("the input is prefilled with the host in effect", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(loaded, () => undefined),
+		);
+		try {
+			expect(loaded.calls).toBe(1);
+			const input = container.querySelector<HTMLInputElement>(
+				"#github-host-block input",
+			);
+			if (input === null) throw new Error("GitHub host input did not render");
+			expect(input.value).toBe("github.com");
+			expect(input.getAttribute("aria-label")).toBe("GitHub host");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("saving posts the new host and the section refetches", async () => {
+		const loaded = { calls: 0 };
+		let postCalls = 0;
+		let postBody: { host?: string } | undefined;
+		const fixture = { ...view };
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
+				loaded.calls += 1;
+				return ok(fixture);
+			}
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			if (
+				url.endsWith("/api/settings/github-host") &&
+				init?.method === "POST"
+			) {
+				postCalls += 1;
+				postBody = JSON.parse(String(init.body));
+				// The save lands; the refetch then reports the new host.
+				fixture.githubHost = "acme.ghe.com";
+				return ok({ host: "acme.ghe.com", expiresAt: null });
+			}
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				"#github-host-block input",
+			);
+			const form = container.querySelector("#github-host-block form");
+			if (input === null || form === null)
+				throw new Error("form did not render");
+			expect(loaded.calls).toBe(1);
+
+			await act(async () => {
+				typeInto(input, "acme.ghe.com");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postCalls).toBe(1);
+			expect(postBody).toEqual({ host: "acme.ghe.com" });
+			// The 200 refreshed the section: a second GET /api/git-hosts, and the
+			// input now shows the host the refreshed state holds.
+			expect(loaded.calls).toBe(2);
+			const refetched = container.querySelector<HTMLInputElement>(
+				"#github-host-block input",
+			);
+			if (refetched === null) throw new Error("input gone after refetch");
+			expect(refetched.value).toBe("acme.ghe.com");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a 400 lands on the section's error line and the view keeps the old host", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(loaded, (url, init) => {
+				if (
+					url.endsWith("/api/settings/github-host") &&
+					init?.method === "POST"
+				)
+					return new Response(
+						JSON.stringify({
+							error: "not a bare hostname: scheme not allowed",
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } },
+					);
+				return undefined;
+			}),
+		);
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				"#github-host-block input",
+			);
+			const form = container.querySelector("#github-host-block form");
+			if (input === null || form === null)
+				throw new Error("form did not render");
+
+			await act(async () => {
+				typeInto(input, "https://acme.ghe.com");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			const line = container.querySelector(".auth-error");
+			expect(line).not.toBeNull();
+			expect(line?.getAttribute("role")).toBe("alert");
+			expect(line?.textContent).toBe("not a bare hostname: scheme not allowed");
+			// No refetch on failure: the section keeps the old host in the input.
+			expect(loaded.calls).toBe(1);
+			const kept = container.querySelector<HTMLInputElement>(
+				"#github-host-block input",
+			);
+			expect(kept?.value).toBe("https://acme.ghe.com");
+		} finally {
+			await unmount();
+		}
+	});
+});

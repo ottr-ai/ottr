@@ -692,6 +692,13 @@ export function createApp(deps: AppDeps) {
 	/** GitHub token from onboarding or Settings; stored plaintext like apiKey (same trust level). */
 	let githubToken: string | null = null;
 	/**
+	 * GitHub host saved in Settings; null = nothing saved, so the env decides. The app
+	 * remembers the env value it booted with: a clear restores it, or removes the variable
+	 * when the env had none.
+	 */
+	let savedGithubHost: string | null = null;
+	const bootGithubHostEnv = process.env[GITHUB_HOST_ENV];
+	/**
 	 * Per-host HTTPS tokens for every git host; stored plaintext like
 	 * githubToken (same trust level). One entry per host; the token is handed to git through a
 	 * credential helper env, never through a URL or .git/config.
@@ -714,6 +721,17 @@ export function createApp(deps: AppDeps) {
 	 */
 	function applyGithubToken(): void {
 		if (githubToken !== null) process.env.GH_TOKEN = githubToken;
+	}
+	/**
+	 * Apply the saved GitHub host by writing the env var, the same pattern as
+	 * applyGithubToken writing GH_TOKEN: every caller reads it through githubHost().
+	 */
+	function applyGithubHost(): void {
+		if (savedGithubHost !== null)
+			process.env[GITHUB_HOST_ENV] = savedGithubHost;
+		else if (bootGithubHostEnv === undefined)
+			delete process.env[GITHUB_HOST_ENV];
+		else process.env[GITHUB_HOST_ENV] = bootGithubHostEnv;
 	}
 	/** Default probe: the board's own repo answers with the expiry header when the token expires. */
 	const githubTokenExpiry =
@@ -1293,6 +1311,7 @@ export function createApp(deps: AppDeps) {
 			vapid,
 			alate,
 			githubToken,
+			githubHost: savedGithubHost,
 			gitTokens,
 			githubApp:
 				githubApp === null ? null : { id: githubApp.id, key: githubApp.key },
@@ -1313,6 +1332,7 @@ export function createApp(deps: AppDeps) {
 		vapid?: unknown;
 		alate?: unknown;
 		githubToken?: unknown;
+		githubHost?: unknown;
 		gitTokens?: unknown;
 		githubApp?: unknown;
 		envValues?: unknown;
@@ -1372,6 +1392,8 @@ export function createApp(deps: AppDeps) {
 		}
 		if (typeof parsed.githubToken === "string")
 			githubToken = parsed.githubToken;
+		if (typeof parsed.githubHost === "string")
+			savedGithubHost = parsed.githubHost;
 		if (Array.isArray(parsed.gitTokens)) {
 			// Each stored row re-runs the request validation; a malformed row is dropped so a
 			// corrupt config can never reach git's credential helper.
@@ -1427,6 +1449,8 @@ export function createApp(deps: AppDeps) {
 		if (seedKey) alate.key = seedKey;
 	}
 	applyGithubToken();
+	// A saved host wins over the env at every boot; a clear restored the boot value already.
+	applyGithubHost();
 	// Every git/ssh/env output the board logs or shows passes redact() with these: the stored
 	// tokens, the ssh dir (which holds every key path, in both slash forms, since
 	// GIT_SSH_COMMAND names it with forward slashes) and the secret env values. Kept in sync
@@ -3008,6 +3032,31 @@ export function createApp(deps: AppDeps) {
 					// Immediate probe: a pasted token shows its real date at once.
 					const expiresAt = await refreshBoardExpiry();
 					return json({ tokenSet: true, expiresAt });
+				}),
+		},
+		// Settings → Git hosts → GitHub host. An empty host is the reset: the boot env value
+		// comes back, or github.com when the env had none. A save re-probes the token so the
+		// expiry notice follows the new host at once.
+		"/api/settings/github-host": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const raw = r.body.host;
+					if (typeof raw !== "string")
+						return json({ error: "host must be a string" }, 400);
+					const host = raw.trim();
+					if (host === "") {
+						savedGithubHost = null;
+					} else {
+						const parsed = parseGithubHost(host);
+						if ("error" in parsed) return json({ error: parsed.error }, 400);
+						savedGithubHost = parsed.host;
+					}
+					saveConfig();
+					applyGithubHost();
+					const expiresAt = await refreshBoardExpiry();
+					return json({ host: githubHostView(), expiresAt });
 				}),
 		},
 		// Secret env values, one per env.txt name. No answer ever holds a value; a re-save

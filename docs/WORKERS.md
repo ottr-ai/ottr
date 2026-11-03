@@ -240,7 +240,9 @@ config"). Until a seed runs, turns get no env values.
   that outlives a board restart holds a stale token: its card filing fails
   with 401.
 - Server: `OTTR_GITHUB_HOST` names the GitHub host of the board. The default
-  is `github.com`, and an empty value keeps the default. Compose reads the
+  is `github.com`, and an empty value keeps the default. You can also set it
+  in Settings → Git hosts → GitHub host; a saved value wins over the env
+  until cleared. Compose reads the
   value from the host shell or the compose env file and passes it to the
   server only; workers never use it. Refer to the README row "GitHub host".
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
