@@ -31,7 +31,9 @@ Usage: `bun run test:mutation:delta <base> [head]`.
 - No entries at all: print `no ranges: no changed file is mutated by a Stryker config` and
   exit 0 without starting Stryker.
 - Run the owning configs one at a time, sequentially (the mutation lock in
-  `scripts/stryker-load.mjs` is held until process exit, so one Stryker process at a time):
+  `scripts/stryker-load.mjs` serializes real Stryker runs; `stryker.config.mjs` takes it only
+  under a Stryker-shaped argv (`isStrykerRun`), so this script's plain config import holds no
+  lock and each Stryker child takes it itself — OTTR-366's deadlock fix):
 
   ```
   <repo>/node_modules/.bin/stryker run <wrapperConfig>

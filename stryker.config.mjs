@@ -1,12 +1,18 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireMutationLock, mutationConcurrency } from "./scripts/stryker-load.mjs";
+import {
+	acquireMutationLock,
+	isStrykerRun,
+	mutationConcurrency,
+} from "./scripts/stryker-load.mjs";
 
-// One mutation run at a time on a worker: every config imports this base module, so the lock
-// next to the temp dir serializes all five Stryker runs here. A second run waits and logs; a
-// lock from a killed run is taken over.
+// One mutation run at a time on a worker: every Stryker run imports this base module, so the
+// lock next to the temp dir serializes all five Stryker runs here. A second run waits and
+// logs; a lock from a killed run is taken over. Only a run takes the lock, never a plain
+// import: a tool that reads the configs to learn their mutate arrays (scripts/mutation-delta.ts)
+// must not hold the lock its own Stryker children then wait for (OTTR-366).
 const tempDirName = join(tmpdir(), "ott-stryker");
-acquireMutationLock(tempDirName);
+if (isStrykerRun()) acquireMutationLock(tempDirName);
 
 // Mutation testing: `bun run test:mutation` runs this config, then stryker.release.config.mjs,
 // stryker.turn.config.mjs, stryker.worktree.config.mjs and stryker.update-image.config.mjs.

@@ -22,6 +22,18 @@ export function mutationConcurrency(
 	return Math.max(1, Math.floor(parallelism / 2));
 }
 
+/**
+ * True when this process is a Stryker run itself: its entry script is Stryker's own bin
+ * (`node_modules/.bin/stryker`, or the `stryker.js` file it points at). A plain import of a
+ * config — a tool reading the `mutate` arrays — must take no mutation lock, or the Stryker
+ * children it starts would wait for the lock their own parent holds (OTTR-366).
+ */
+export function isStrykerRun(argv = process.argv) {
+	const entry = String(argv[1] ?? "").replaceAll("\\", "/");
+	const base = entry.slice(entry.lastIndexOf("/") + 1);
+	return /^stryker(\.(cjs|mjs|js))?$/.test(base);
+}
+
 // Atomics.wait is a synchronous sleep, so the Stryker config modules need no top-level await.
 const sleepSync = (ms) =>
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
