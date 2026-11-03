@@ -173,6 +173,18 @@ export interface DiffFileStat {
 
 export type TaskKind = "work" | "retro" | "review" | "interview" | "pr_review";
 
+/** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
+export const UPDATE_HOLD_REASON =
+	"Update card: read the summary, then reply to approve the merge.";
+
+/** A fork-born task parked for merge approval; the reply recognizes it by this reason. */
+export const FORK_HOLD_REASON =
+	"Fork-research-born task: the merge is held. Reply to approve the merge, or cancel the card.";
+
+/** OTTR-274: a merge turn added changes beyond an approved hold head; the reply approves the exact parked push head. */
+export const MERGE_HOLD_MISMATCH_REASON =
+	"The merge added changes beyond the approved head. Read the diff, then reply to approve the merge, or cancel the card.";
+
 export type PrState = "open" | "closed" | "merged";
 
 /** The registered GitHub App as the Settings git-hosts view shows it — never the key. */

@@ -5668,6 +5668,23 @@ button.diff-path {
 	height: 13px;
 	margin-top: 1px;
 }
+/* Fixed action bar for a parked merge hold (update, fork, mismatch): the hold message's
+   actions pin to the drawer's bottom edge while the report scrolls; fully scrolled, the
+   bar rests above the reply form. The band-bleed margins match .drawer-top's pattern, and
+   the opaque panel background keeps content from bleeding through. */
+.hold-actions {
+	position: sticky;
+	bottom: 0;
+	z-index: 2;
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+	margin: 18px -22px 0;
+	padding: 10px 22px calc(10px + env(safe-area-inset-bottom, 0px));
+	background: var(--panel);
+	border-top: 1px solid var(--line-soft);
+}
 .summary {
 	margin: 0 0 8px;
 	white-space: pre-wrap;

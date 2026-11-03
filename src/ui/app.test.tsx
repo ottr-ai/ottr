@@ -7,6 +7,11 @@ import type {
 	TaskCard,
 	UpdateRow,
 } from "../types.ts";
+import {
+	FORK_HOLD_REASON,
+	MERGE_HOLD_MISMATCH_REASON,
+	UPDATE_HOLD_REASON,
+} from "../types.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -1559,6 +1564,50 @@ describe("Drawer approve button", () => {
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).not.toContain("Approve merge");
+	});
+
+	test("an update hold pins summary and merge actions, no cancel", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: UPDATE_HOLD_REASON,
+			holdHead: "sha-parked",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Read the summary");
+		expect(html).toContain("Approve merge");
+		expect(html).not.toContain("Cancel card");
+	});
+
+	test("a fork hold pins approve and cancel actions", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: FORK_HOLD_REASON,
+			holdHead: "sha-parked",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Approve merge");
+		expect(html).toContain("Cancel card");
+		expect(html).not.toContain("Read the summary");
+	});
+
+	test("a mismatch hold pins approve and cancel actions", () => {
+		// The diff button keys on the fetched diffFiles, which never ride this static render;
+		// the server-side park captures the push-side stat the section then shows.
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: MERGE_HOLD_MISMATCH_REASON,
+			holdHead: "sha-parked",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Approve merge");
+		expect(html).toContain("Cancel card");
+		expect(html).not.toContain("Read the summary");
 	});
 
 	const releaseFields = {

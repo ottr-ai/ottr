@@ -49,9 +49,12 @@ import type {
 	UpdatesView,
 } from "../types.ts";
 import {
+	FORK_HOLD_REASON,
+	MERGE_HOLD_MISMATCH_REASON,
 	PERF_RANGES,
 	PRIORITIES,
 	REVIEW_BODY_MAX,
+	UPDATE_HOLD_REASON,
 	VERSION_RE,
 } from "../types.ts";
 import { mapRepo } from "../updates.ts";
@@ -6560,6 +6563,43 @@ export function Drawer({
 		});
 	};
 
+	/** The confirm + cancel flow of the drawer-actions row, shared with the hold bar's
+	 * Cancel card: a fork or mismatch hold message names cancelling the card as an action. */
+	const runCancel = async (): Promise<boolean> =>
+		(
+			task.stage === "done"
+				? // A done task has no run, worktree or branch left; this only removes the card from the board.
+					await confirmDialog("Delete this done task from the board?", {
+						ok: "Delete task",
+						danger: true,
+					})
+				: await confirmDialog(
+						"Cancel this task? It stops the run and deletes its worktree and branch.",
+						{
+							ok: "Cancel task",
+							cancel: "Keep task",
+							danger: true,
+						},
+					)
+		)
+			? act(async () => {
+					const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
+					const r = await post<{ kept?: string }>(url, {});
+					// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
+					if (r.kept !== undefined) {
+						if (
+							!(await confirmDialog(
+								`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+								{ ok: "Delete", danger: true },
+							))
+						)
+							return;
+						await post(url, { force: true });
+					}
+					onClose();
+				})
+			: Promise.resolve(true);
+
 	/** Posts the Merge-anyway reason past an unresolved work-check block; act shows a thrown
 	 * error through setMergeError inside the modal, and the ok path closes it. */
 	const mergeAnyway = (): Promise<boolean> =>
@@ -6852,20 +6892,9 @@ export function Drawer({
 					{task.needsReason !== null && !askedNow && (
 						<div className="needs-reason">{task.needsReason}</div>
 					)}
-					{/* A parked merge hold (update, fork, mismatch) approves by reply; the button
-					    sends that approving reply itself. The server still gates the approval. */}
-					{task.state === "needs_you" &&
-						task.holdHead !== null &&
-						!askedNow && (
-							<BusyButton
-								className="approve-hold"
-								title="Sends the approving reply, so the parked merge can land"
-								run={() => sendReply("approved")}
-							>
-								<Icon name="check" />
-								Approve merge
-							</BusyButton>
-						)}
+					{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
+					    body pins the message's actions while the report scrolls. The server still
+					    gates the approval. */}
 					{/* A stopped card only interacts through the composer at the very bottom;
 					    the jump link skips the report so no manual scrolling is needed. */}
 					{task.state === "needs_you" && !askedNow && !followUp && (
@@ -7671,6 +7700,66 @@ export function Drawer({
 							)}
 						</DrawerSec>
 					)}
+					{/* A parked merge hold (update, fork, mismatch) approves by reply; the fixed bar
+					    carries the hold message's actions and pins to the drawer's bottom edge while
+					    the report scrolls. The server still gates the approval. */}
+					{task.state === "needs_you" &&
+						task.holdHead !== null &&
+						!askedNow && (
+							<div className="hold-actions">
+								{/* The summary is the ready report an update card parks on; it always
+								    exists, so the button rides the bar's first paint. Before the fetch
+								    lands it scrolls to the drawer top, where the report sits. */}
+								{task.needsReason === UPDATE_HOLD_REASON && (
+									<button
+										type="button"
+										title="Scrolls up to the report summary"
+										onClick={() => {
+											const target = document.getElementById("drawer-result");
+											if (target !== null)
+												target.scrollIntoView({ block: "start" });
+											else
+												document
+													.querySelector("dialog.drawer")
+													?.scrollTo({ top: 0 });
+										}}
+									>
+										Read the summary
+									</button>
+								)}
+								{/* The mismatch park serves its stat only through the drawer fetch, so
+								    the button and the Changed files section appear together. */}
+								{task.needsReason === MERGE_HOLD_MISMATCH_REASON &&
+									diffFiles.length > 0 && (
+										<button
+											type="button"
+											title="Scrolls to the changed files the merge added beyond the approval"
+											onClick={() =>
+												document
+													.getElementById("drawer-diff")
+													?.scrollIntoView({ block: "start" })
+											}
+										>
+											Read the diff
+										</button>
+									)}
+								<BusyButton
+									className="primary"
+									title="Sends the approving reply, so the parked merge can land"
+									run={() => sendReply("approved")}
+								>
+									<Icon name="check" />
+									Approve merge
+								</BusyButton>
+								{(task.needsReason === FORK_HOLD_REASON ||
+									task.needsReason === MERGE_HOLD_MISMATCH_REASON) && (
+									<BusyButton className="danger" run={runCancel}>
+										<Icon name="x" />
+										Cancel card
+									</BusyButton>
+								)}
+							</div>
+						)}
 					{followUp ? (
 						<div className="followup-cta">
 							<button
@@ -7955,44 +8044,7 @@ export function Drawer({
 						{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
 						{!cancelled && (
-							<BusyButton
-								className="danger"
-								run={async () =>
-									(
-										task.stage === "done"
-											? // A done task has no run, worktree or branch left; this only removes the card from the board.
-												await confirmDialog(
-													"Delete this done task from the board?",
-													{ ok: "Delete task", danger: true },
-												)
-											: await confirmDialog(
-													"Cancel this task? It stops the run and deletes its worktree and branch.",
-													{
-														ok: "Cancel task",
-														cancel: "Keep task",
-														danger: true,
-													},
-												)
-									)
-										? act(async () => {
-												const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
-												const r = await post<{ kept?: string }>(url, {});
-												// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
-												if (r.kept !== undefined) {
-													if (
-														!(await confirmDialog(
-															`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
-															{ ok: "Delete", danger: true },
-														))
-													)
-														return;
-													await post(url, { force: true });
-												}
-												onClose();
-											})
-										: Promise.resolve(true)
-								}
-							>
+							<BusyButton className="danger" run={runCancel}>
 								<Icon name={task.stage === "done" ? "trash" : "x"} />
 								{task.stage === "done" ? "Delete task" : "Cancel task"}
 							</BusyButton>
