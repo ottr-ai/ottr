@@ -173,9 +173,10 @@ test("workSteps still lists the turns of a cancelled finding", () => {
 });
 
 test("workSteps ranks one finding's filed marker before another finding's turn at the same time", () => {
+	// Input order is the reverse of the rank order: the sort, not the input, must decide.
 	const steps = workSteps([], [], undefined, [
-		finding("OTTR-3", [], 100),
 		finding("OTTR-4", [turn(5, "work", 100)], 100),
+		finding("OTTR-3", [], 100),
 	]);
 	expect(labels(steps)).toEqual(["filed", "finding:work"]);
 });
