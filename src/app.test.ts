@@ -838,6 +838,38 @@ describe("task routes", () => {
 		expect(smuggled.status).toBe(400);
 	});
 
+	test("a retro of a legacy 8-hex card passes the route checks too", async () => {
+		// A legacy card keeps its 8-hex id, and the retro child id follows it:
+		// `deadbeef-retro`, not the counter's next number.
+		const source = store.createTask("legacy source", null, "work", "deadbeef");
+		const retro = store.createTask(
+			"retro prompt",
+			null,
+			"retro",
+			"deadbeef-retro",
+		);
+		store.updateTask(retro.id, { followUpOf: source.id });
+		// The Work steps link's target opens: GET detail on the retro id.
+		const got = await get("/api/projects/p1/tasks/deadbeef-retro");
+		expect(got.status).toBe(200);
+		const detail = (await (
+			await get("/api/projects/p1/tasks/deadbeef")
+		).json()) as { retro?: { id: string } };
+		expect(detail.retro?.id).toBe(retro.id);
+		// A second retro of the same legacy card gets -retro-2, and /api/seen takes the batch.
+		const second = store.createTask(
+			"retro prompt",
+			null,
+			"retro",
+			"deadbeef-retro",
+		);
+		expect(second.id).toBe("deadbeef-retro-2");
+		const seen = await post("/api/seen", {
+			ids: ["deadbeef-retro", second.id],
+		});
+		expect(seen.status).toBe(200);
+	});
+
 	test("reply queues a needs-you task and refuses queued ones", async () => {
 		const t = store.createTask("needs answer");
 		store.updateTask(t.id, { state: "needs_you", needsReason: "?" });

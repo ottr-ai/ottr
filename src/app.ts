@@ -271,10 +271,11 @@ function removeIcons(root: string, tasksDir: string): void {
 
 const IMAGE_BODY_BYTES = 32 * 1024 * 1024;
 const LOG_CHUNK_BYTES = 256 * 1024;
-/** A route param that names a task: legacy 8-hex, the project's `PREFIX-n` handle, or a retro
- * child `PREFIX-n-retro[-k]`. One constant, so resolveTask and /api/seen cannot drift apart. */
+/** A route param that names a task: legacy 8-hex or the project's `PREFIX-n` handle, either
+ * with a retro child suffix `-retro[-k]`. One constant, so resolveTask and /api/seen cannot
+ * drift apart. */
 const TASK_ID_RE =
-	/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+(?:-retro(?:-[0-9]+)?)?)$/;
+	/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)(?:-retro(?:-[0-9]+)?)?$/;
 /** How long one POST /api/drain holds new turns. scripts/update-image.ts renews it every 30 s
  * while it waits, so a hold that the script stops renewing lapses on its own. DELETE ends it
  * at once: the script does that when its 1 h limit ends the wait. */
