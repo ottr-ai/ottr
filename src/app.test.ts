@@ -8264,28 +8264,6 @@ describe("project order route", () => {
 			storedProjectPaths(gstore).projectOrder.filter((n) => four.includes(n)),
 		).toEqual(["ord-b", "ord-c", "p1", "ord-a"]);
 	});
-
-	test("property: any permutation posts ok and sorts /api/state", async () => {
-		// fc.assert resolves asynchronously: without the await the property detaches
-		// from the test and races the rest of the file (its writes landed under later tests).
-		await fc.assert(
-			fc.asyncProperty(
-				fc.shuffledSubarray(["ord-a", "ord-b", "ord-c"], {
-					minLength: 3,
-					maxLength: 3,
-				}),
-				async (order) => {
-					const res = await post("/api/projects/order", { order });
-					expect(res.status).toBe(200);
-					expect(await picked(...four)).toEqual([...order, "p1"]);
-					const bad = await post("/api/projects/order", {
-						order: [...order, "nope"],
-					});
-					expect(bad.status).toBe(400);
-					expect(await errorOf(bad)).toBe("unknown project: nope");
-				},
-			),
-			{ seed: 20261103, numRuns: 100 },
-		);
-	});
+	// Permutations and the append rule are property-tested at the unit level
+	// (src/projectOrder.test.ts); these HTTP examples pin the route wiring.
 });

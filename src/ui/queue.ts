@@ -203,22 +203,6 @@ export function spliceColumn(
 	);
 }
 
-/** Stable reorder of `names` by index in `order`; names missing from `order` keep their input
- *  relative order after all known ones (the server appends unknown names the same way). */
-export function orderBy(
-	names: readonly string[],
-	order: readonly string[],
-): string[] {
-	const rank = new Map<string, number>();
-	for (const [i, name] of order.entries()) rank.set(name, i);
-	const known: string[] = [];
-	const unknown: string[] = [];
-	for (const name of names) (rank.has(name) ? known : unknown).push(name);
-	const last = order.length;
-	known.sort((a, b) => (rank.get(a) ?? last) - (rank.get(b) ?? last));
-	return [...known, ...unknown];
-}
-
 /** The gap under the pointer, or no new slot when it borders the dragged card's old place. */
 export function dropBeforeId(
 	cards: readonly { id: string; middle: number }[],

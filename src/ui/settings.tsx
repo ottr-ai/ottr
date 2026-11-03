@@ -8,6 +8,7 @@ import {
 	useState,
 } from "react";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
+import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
 import type {
 	AppCheck,
@@ -51,7 +52,7 @@ import {
 	seedStep,
 	useModels,
 } from "./models.ts";
-import { dropBeforeId, orderBy } from "./queue.ts";
+import { dropBeforeId } from "./queue.ts";
 import { SETTINGS_HASH, settingsSub } from "./route.ts";
 import { refreshState } from "./socket.ts";
 import { age, stamp } from "./time.ts";

@@ -118,6 +118,7 @@ import { type ModelOption, modelList, modelRoles } from "./models.ts";
 import { orphanCache } from "./orphans.ts";
 import { perfMetrics } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
+import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
 import {
 	BOARD_CHECK_PROMPT,
 	followUpPrompt,
@@ -2113,10 +2114,6 @@ export function createApp(deps: AppDeps) {
 		}
 		const roles = modelRoles();
 		const dead = deadSignIns(list, roles);
-		const rank = (name: string): number => {
-			const i = deps.shared.projectOrder.indexOf(name);
-			return i === -1 ? Number.MAX_SAFE_INTEGER : i;
-		};
 		const projects = [...deps.projects.values()]
 			.flatMap((e) => {
 				try {
@@ -2126,7 +2123,11 @@ export function createApp(deps: AppDeps) {
 					return [];
 				}
 			})
-			.sort((a, b) => rank(a.name) - rank(b.name));
+			.sort(
+				(a, b) =>
+					rankInOrder(a.name, deps.shared.projectOrder) -
+					rankInOrder(b.name, deps.shared.projectOrder),
+			);
 		return {
 			projects,
 			tasks,
@@ -4010,10 +4011,9 @@ export function createApp(deps: AppDeps) {
 							return json({ error: `unknown project: ${name}` }, 400);
 						}
 					}
-					const missing = [...deps.projects.keys()].filter(
-						(n) => !order.includes(n),
-					);
-					deps.shared.projectOrder = [...order, ...missing];
+					deps.shared.projectOrder = mergeProjectOrder(order, [
+						...deps.projects.keys(),
+					]);
 					saveConfig();
 					deps.schedule();
 					return json({ ok: true });

@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import fc from "../test/properties.ts";
 import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
 	donePage,
@@ -8,7 +7,6 @@ import {
 	laneCounts,
 	laneOrder,
 	laneStage,
-	orderBy,
 	reorderIds,
 	seenable,
 	slotUse,
@@ -291,6 +289,19 @@ test("drag slot follows card midpoints and skips the old position", () => {
 	expect(dropBeforeId(cards, "d", 230)).toBeUndefined(); // source is last
 });
 
+test("drag slot edges: an unknown card, the first card, and the exact midpoint", () => {
+	const cards = [
+		{ id: "a", middle: 30 },
+		{ id: "b", middle: 90 },
+	];
+	// A drag id that is not in the list has no slot at all (undefined, not the end slot).
+	expect(dropBeforeId(cards, "z", 10)).toBeUndefined();
+	// Dragging the first card below every other one lands on the end slot (null, not "no slot").
+	expect(dropBeforeId(cards, "a", 100)).toBeNull();
+	// A y equal to a card's midpoint sits below it: the boundary is strict.
+	expect(dropBeforeId(cards, "b", 30)).toBeUndefined();
+});
+
 test("laneCounts filters by query across id, titles, prompt and summary", () => {
 	const tasks = [
 		card("t1", "todo", "queued", { title: "Extract logic", prompt: "move it" }),
@@ -444,38 +455,5 @@ describe("donePage", () => {
 		const page = donePage(tasks, (t) => t === "t5" || t === "t30", 20);
 		expect(page.shown).toEqual(n(31));
 		expect(page.hidden).toBe(14);
-	});
-});
-
-describe("orderBy", () => {
-	test("a known order applies", () => {
-		expect(orderBy(["a", "b", "c"], ["c", "a", "b"])).toEqual(["c", "a", "b"]);
-	});
-
-	test("names missing from the order follow the known ones in input order", () => {
-		expect(orderBy(["x", "a", "y", "b"], ["b", "a"])).toEqual([
-			"b",
-			"a",
-			"x",
-			"y",
-		]);
-	});
-
-	test("an empty order returns the input unchanged", () => {
-		expect(orderBy(["b", "a"], [])).toEqual(["b", "a"]);
-	});
-
-	test("always a permutation of the input, and idempotent under its own order", () => {
-		fc.assert(
-			fc.property(
-				fc.array(fc.string()),
-				fc.array(fc.string()),
-				(names, order) => {
-					const out = orderBy(names, order);
-					expect([...out].sort()).toEqual([...names].sort());
-					expect(orderBy(out, order)).toEqual(out);
-				},
-			),
-		);
 	});
 });
