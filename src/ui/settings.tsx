@@ -521,12 +521,14 @@ function TotalRunnersForm({
 	maxTotal,
 	reviewCheck,
 	workCheck,
+	idleReviews,
 	allocated,
 	act,
 }: {
 	maxTotal: number | null;
 	reviewCheck: boolean;
 	workCheck: boolean;
+	idleReviews: boolean;
 	allocated: number;
 	act: Act;
 }) {
@@ -601,6 +603,13 @@ function TotalRunnersForm({
 					desc="Check a work card with a second model before it enters the merge queue"
 					checked={workCheck}
 					save={(v) => send({ workCheck: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Run due reviews while idle"
+					desc="After two hours without input, and while no turn runs, the board files the architecture review card of the first project whose review is due, by itself"
+					checked={idleReviews}
+					save={(v) => send({ idleReviews: v })}
 					act={act}
 				/>
 			</form>
@@ -4078,6 +4087,7 @@ export function SettingsPage({
 	maxTotal,
 	reviewCheck,
 	workCheck,
+	idleReviews,
 	act,
 	view,
 }: {
@@ -4086,6 +4096,7 @@ export function SettingsPage({
 	maxTotal: number | null;
 	reviewCheck: boolean;
 	workCheck: boolean;
+	idleReviews: boolean;
 	act: Act;
 	view: string;
 }) {
@@ -4217,6 +4228,7 @@ export function SettingsPage({
 								maxTotal={maxTotal}
 								reviewCheck={reviewCheck}
 								workCheck={workCheck}
+								idleReviews={idleReviews}
 								allocated={allocated}
 								act={act}
 							/>

@@ -228,6 +228,7 @@ import {
 } from "./webpush.ts";
 import {
 	archReviewDelta,
+	archReviewDue,
 	diffStat,
 	diffText,
 	git,
@@ -304,6 +305,9 @@ interface AppDeps {
 	/** Live progress of the task's running turn (TaskCard.progress); absent in tests. */
 	progressOf?(project: string, id: string): string | null;
 	schedule: () => void;
+	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
+	 * Defaults to Date.now. */
+	now?: () => number;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -312,6 +316,8 @@ interface AppDeps {
 		maxTotalRuns: number | null;
 		reviewCheck: boolean;
 		workCheck: boolean;
+		/** Default on; POST /api/settings writes it, the idle review tick reads it. */
+		idleReviews: boolean;
 		removedPaths: string[];
 		projectPaths: string[];
 		/** Secret env values from Settings, one per env.txt name; the only copy. Stored plaintext
@@ -595,6 +601,11 @@ export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
 	// GitHub App mint and review post; the seam keeps both off the real network in tests.
 	const githubAppFetch = deps.githubAppFetch ?? noRedirectFetch;
+	// Idle clock (docs/specs/mutation-delta.md §7): only the idle-review logic reads it,
+	// and tests inject a fixed clock. It initializes at createApp, so a board restart
+	// counts as input and never starts a review right after boot.
+	const now = deps.now ?? Date.now;
+	let lastInputAt = now();
 	const prod = deps.prod === true;
 	// Server-only ssh material: a data dir outside every checkout.
 	const sshDir = deps.sshDir ?? defaultSshDir();
@@ -1340,11 +1351,121 @@ export function createApp(deps: AppDeps) {
 		alateProvisionError = r.ok ? null : r.error;
 		if (!r.ok) alateBackoffUntil = Date.now() + 60 * 60_000;
 	}
+
+	/** Files one architecture-review card; shared by the manual route and the idle auto-start
+	 * tick (docs/specs/mutation-delta.md §7). Keeps the R1-8 ordering: resolveTarget and
+	 * archReviewDelta run BEFORE the reviewBlocked guard, so the guard and createTask sit in
+	 * one synchronous block and two overlapping calls cannot both pass it. With
+	 * opts.requireDue (the tick only) the review must also be due right now:
+	 * archReviewDue(delta, cap, reviewed). Returns the filed card or the route's json error. */
+	async function fileArchReview(
+		e: Entry,
+		model: string | null,
+		opts: { requireDue: boolean },
+	): Promise<
+		{ ok: true; task: Task } | { ok: false; status: number; error: string }
+	> {
+		if (e.gitless)
+			return { ok: false, status: 409, error: "init a git repository first" };
+		if (e.target === null)
+			return {
+				ok: false,
+				status: 409,
+				error: "project has no integration target",
+			};
+		// The review freezes the target's current head, like a release card.
+		let resolved: { target: string; sha: string };
+		try {
+			resolved = await resolveTarget(
+				e.path,
+				true,
+				e.store.getSettings().originUrl,
+				e.store.getSettings().targetBranch,
+			);
+		} catch (err) {
+			return { ok: false, status: 409, error: errmsg(err) };
+		}
+		const delta = await archReviewDelta(
+			e.path,
+			resolved.target,
+			lastReviewBase(e.store.listTasks()),
+		).catch(() => null);
+		// The git spawns run BEFORE the guard, so the guard and createTask below sit in one
+		// synchronous block: two overlapping requests cannot both pass it (R1-8).
+		const blocked = reviewBlocked(e.store.listTasks());
+		if (blocked !== null) return { ok: false, status: 409, error: blocked };
+		if (delta === null)
+			return {
+				ok: false,
+				status: 409,
+				error: "could not read the git history",
+			};
+		if (
+			opts.requireDue &&
+			!archReviewDue(
+				delta.delta,
+				e.store.getSettings().archReviewCap,
+				delta.reviewed,
+			)
+		)
+			return { ok: false, status: 409, error: "review is not due" };
+		const t = e.store.createTask(
+			reviewPrompt({
+				target: resolved.target,
+				sha: resolved.sha,
+				from: delta.reviewed ? delta.anchor : null,
+				commits: delta.delta,
+			}),
+			model,
+			"review",
+		);
+		// Synchronous with createTask: the scheduler must never see a review card without its base.
+		const updated = e.store.updateTask(t.id, { base: resolved.sha });
+		deps.schedule();
+		return { ok: true, task: updated };
+	}
+
+	/** Card id the idle auto-start filed last (in-memory only): while that card exists and is
+	 * neither done nor cancelled, the tick files nothing new. A restart forgets it. */
+	let idleReviewCardId: string | null = null;
+
+	/** Idle auto-start of the full review, run every 5 minutes (src/server.ts): with the
+	 * setting on, after two hours without input and with no turn preparing or running
+	 * anywhere, file the first due project's architecture-review card, in project map
+	 * order. Silent when nothing qualifies (docs/specs/mutation-delta.md §7). */
+	async function idleReviewTick(): Promise<void> {
+		if (!deps.shared.idleReviews) return;
+		if (now() - lastInputAt < 2 * 60 * 60_000) return;
+		if (anyTurnActive()) return;
+		if (idleReviewCardId !== null) {
+			const id = idleReviewCardId;
+			const live = [...deps.projects.values()].some((pe) => {
+				const t = pe.store.getTask(id);
+				return t !== null && t.cancelledAt === null && t.stage !== "done";
+			});
+			// The remembered card finished or its project left the board: filing may start again.
+			if (live) return;
+			idleReviewCardId = null;
+		}
+		for (const e of deps.projects.values()) {
+			// Cheap pre-filter from the refreshed entry; reviewBlocked and the due recompute
+			// live inside the helper.
+			if (e.archReview === null || !e.archReview.due || e.archReview.running)
+				continue;
+			const filed = await fileArchReview(e, null, { requireDue: true });
+			if (filed.ok) {
+				idleReviewCardId = filed.task.id;
+				return;
+			}
+			// Not due any more, blocked, or git failed: the tick stays silent.
+		}
+	}
 	function saveConfig(): void {
 		deps.gstore.set("config", {
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
+			idleReviews: deps.shared.idleReviews,
 			removed: deps.shared.removedPaths,
 			projects: deps.shared.projectPaths,
 			admin,
@@ -1367,6 +1488,7 @@ export function createApp(deps: AppDeps) {
 		maxTotal?: unknown;
 		reviewCheck?: unknown;
 		workCheck?: unknown;
+		idleReviews?: unknown;
 		removed?: unknown;
 		projects?: unknown;
 		admin?: unknown;
@@ -1398,6 +1520,9 @@ export function createApp(deps: AppDeps) {
 		}
 		if (typeof parsed.workCheck === "boolean") {
 			deps.shared.workCheck = parsed.workCheck;
+		}
+		if (typeof parsed.idleReviews === "boolean") {
+			deps.shared.idleReviews = parsed.idleReviews;
 		}
 		if (
 			typeof parsed.admin === "object" &&
@@ -1678,6 +1803,9 @@ export function createApp(deps: AppDeps) {
 					return Promise.resolve(json({ error: "unauthorized" }, 401));
 			}
 		}
+		// Every mutation that reaches a handler counts as input for the idle clock
+		// (docs/specs/mutation-delta.md §7): the walls above passed, so the request is real.
+		if (req.method !== "GET") lastInputAt = now();
 		return (
 			fn()
 				.catch((err) => {
@@ -1980,6 +2108,7 @@ export function createApp(deps: AppDeps) {
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
+			idleReviews: deps.shared.idleReviews,
 			serverVersion: deps.serverVersion,
 			quota,
 			onboarding: admin === null,
@@ -3819,6 +3948,7 @@ export function createApp(deps: AppDeps) {
 						maxTotal?: unknown;
 						reviewCheck?: unknown;
 						workCheck?: unknown;
+						idleReviews?: unknown;
 					};
 					const maxTotal = body.maxTotal;
 					if (maxTotal !== undefined) {
@@ -3849,12 +3979,20 @@ export function createApp(deps: AppDeps) {
 						}
 						deps.shared.workCheck = workCheck;
 					}
+					const idleReviews = body.idleReviews;
+					if (idleReviews !== undefined) {
+						if (typeof idleReviews !== "boolean") {
+							return json({ error: "idleReviews must be a boolean" }, 400);
+						}
+						deps.shared.idleReviews = idleReviews;
+					}
 					saveConfig();
 					deps.schedule();
 					return json({
 						maxTotal: deps.shared.maxTotalRuns,
 						reviewCheck: deps.shared.reviewCheck,
 						workCheck: deps.shared.workCheck,
+						idleReviews: deps.shared.idleReviews,
 					});
 				}),
 		},
@@ -4529,49 +4667,14 @@ export function createApp(deps: AppDeps) {
 					if ("error" in r) return r.error;
 					const e = deps.projects.get(req.params.project);
 					if (!e) return json({ error: "unknown project" }, 404);
-					if (e.gitless)
-						return json({ error: "init a git repository first" }, 409);
-					if (e.target === null)
-						return json({ error: "project has no integration target" }, 409);
-					// The review freezes the target's current head, like a release card.
-					let resolved: { target: string; sha: string };
-					try {
-						resolved = await resolveTarget(
-							e.path,
-							true,
-							e.store.getSettings().originUrl,
-							e.store.getSettings().targetBranch,
-						);
-					} catch (err) {
-						return json({ error: errmsg(err) }, 409);
-					}
-					const delta = await archReviewDelta(
-						e.path,
-						resolved.target,
-						lastReviewBase(e.store.listTasks()),
-					).catch(() => null);
-					// The git spawns run BEFORE the guard, so the guard and createTask below sit in one
-					// synchronous block: two overlapping requests cannot both pass it (R1-8).
-					const blocked = reviewBlocked(e.store.listTasks());
-					if (blocked !== null) return json({ error: blocked }, 409);
-					if (delta === null)
-						return json({ error: "could not read the git history" }, 409);
 					const model = modelParam(r.body);
 					if (model instanceof Response) return model;
-					const t = e.store.createTask(
-						reviewPrompt({
-							target: resolved.target,
-							sha: resolved.sha,
-							from: delta.reviewed ? delta.anchor : null,
-							commits: delta.delta,
-						}),
-						model,
-						"review",
-					);
-					// Synchronous with createTask: the scheduler must never see a review card without its base.
-					const updated = e.store.updateTask(t.id, { base: resolved.sha });
-					deps.schedule();
-					return json({ ...updated, turns: [] });
+					// The helper keeps the R1-8 ordering (git spawns before the guard; guard
+					// and createTask in one synchronous block); the manual route files
+					// without a due check, as today.
+					const filed = await fileArchReview(e, model, { requireDue: false });
+					if (!filed.ok) return json({ error: filed.error }, filed.status);
+					return json({ ...filed.task, turns: [] });
 				}),
 		},
 		// The dev-only Check the board button: files the card that runs the check-ottr-board
@@ -5886,6 +5989,7 @@ export function createApp(deps: AppDeps) {
 		socketCount: () => sockets,
 		sampleStats,
 		alateProvisionTick,
+		idleReviewTick,
 		refreshUpdates,
 		tokenReminderTick,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),

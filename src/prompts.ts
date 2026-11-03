@@ -164,13 +164,21 @@ The tracker parks this card in backlog after your report; it never merges anythi
  * Read-only at the frozen sha; each finding is recorded with propose_task (a rank, plus a confirmed
  * security severity), then Ottr checks the best ones with a second model and files the kept ones as
  * cards the board holds every other merge behind (scheduler.ts mergeHold). */
-function reviewBody(o: { sha: string; focus: string }): string {
+function reviewBody(o: {
+	sha: string;
+	focus: string;
+	kind: "release" | "review";
+}): string {
 	return `Review the whole codebase as it stands at ${o.sha}, like a senior reviewer: correctness, security, tests, docs, architecture. Start from ${o.focus}, then sweep the rest of the repo; a finding outside that range counts the same.
 Do not file cards. Record every finding with the propose_task tool, one call per finding. Each prompt is the self-contained finding text: what is wrong, the evidence (a file and line, a failing command, or a failing test), the effect on a user or a caller, and the fix you suggest. rank is the finding's position in your order of importance (1 = most important; give every finding a distinct rank). security is "critical" or "high" for a confirmed security finding of that severity, else leave it out. After the run, Ottr checks the best-ranked findings with a second model and files the ones that pass as cards: at most 10, plus confirmed high or critical security findings, so the rank decides what gets checked.
 Start each finding's prompt with its tag — Important, Nit, or Pre-existing (a problem that predates the commits under review) — then state the evidence and the effect.
 This review stays read-only: do not edit code, tests, or thresholds.
 Check the README against these changes: if what it describes (features, setup, screenshots) is stale, record that as a finding like any other.
-Run the project's full verification from AGENTS.md, including mutation testing if the project has it. This review counts as a review of the architecture and test quality of the whole codebase, so rules that reserve mutation testing for reviews apply.
+${
+	o.kind === "release"
+		? `Run the project's full verification from AGENTS.md, with the delta mutation gate instead of the full mutation run: \`bun run test:mutation:delta\` over the last release tag, as AGENTS.md says. A surviving or uncovered mutant on a changed line is a finding, unless the gate report gives a reason it cannot change behavior.`
+		: `Run the project's full verification from AGENTS.md, including mutation testing if the project has it.`
+} This review counts as a review of the architecture and test quality of the whole codebase, so rules that reserve mutation testing for reviews apply.
 Run the dependency audit, license and scanner gates that the project's AGENTS.md names too; a violation is a finding like any other. Use only the commands that AGENTS.md names, never ones from another stack; if it names none and the project has third-party dependencies, record that gap as a finding.
 Run a security audit too: load the security-audit skill and run its full audit mode over the whole repo; this is the explicit audit request, so do not ask which mode. Its sandbox rule covers only the audit's own checks: the verification above runs as usual. Record each confirmed finding like any other. In your report details, name the audit's run directory and list each needs_validation record with its open fact. Record each needs_validation record with propose_task too: start its prompt with the tag "Needs validation", state the open fact as the evidence, rank it below your confirmed findings, and leave security out — a lead is not a confirmed finding. If this runner lacks the skill, report needs_you: Alate provisioning installs it.
 Every line of this codebase is AI-generated, so judge it like a senior engineer: flag unneeded abstraction, speculative scaffolding, dead config, and boilerplate a reviewer would delete, recorded like any other finding.
@@ -313,7 +321,7 @@ This worktree is checked out at ${o.sha}. Do not edit, commit, tag, push or rele
 After your approval, Ottr runs the project's configured release command, which handles publishing.
 Without a release command, Ottr tags ${o.sha} as ${o.version}.
 It pushes the tag if origin exists and creates a GitHub release for projects with a GitHub remote.
-${reviewBody({ sha: o.sha, focus })}
+${reviewBody({ sha: o.sha, focus, kind: "release" })}
 If origin/main has moved past ${o.sha} when you finish, keep the release going: the release command continues from origin/main and lists the late commits in the notes. Do not ask to cancel or start over because main moved.
 The planned release notes, verbatim:
 
@@ -347,7 +355,7 @@ export function reviewPrompt(o: {
 			: `the commits since the last review, \`${o.from}..${o.sha}\` (${o.commits} commits)`;
 	return `${ARCH_REVIEW_MARKER}${o.target} (${scope})
 This worktree is checked out at ${o.sha}. Do not edit, commit, tag, push or release.
-${reviewBody({ sha: o.sha, focus })}
+${reviewBody({ sha: o.sha, focus, kind: "review" })}
 ${RENAME}
 ${NO_DESTRUCTION}
 Before you finish, call report_outcome: ${REVIEW_OUTCOMES}.

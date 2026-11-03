@@ -286,14 +286,31 @@ describe("reviewPrompt", () => {
 			commits: 3,
 			notes: "- fix",
 		});
-		// Everything after the focus sentence: findings, gates, security audit, architecture lenses.
-		const steps = review.slice(
+		// Everything before the mutation sentence: findings flow and read-only rules.
+		const findings = review.slice(
 			review.indexOf("Record every finding"),
+			review.indexOf("Run the project's full verification"),
+		);
+		// Everything after it: dependency gates, security audit, architecture lenses.
+		const after = review.slice(
+			review.indexOf("Run the dependency audit"),
 			review.indexOf("findings, cards.") + "findings, cards.".length,
 		);
-		expect(steps).toContain("security-audit skill");
-		expect(steps).toContain("ponytail-audit");
-		expect(release).toContain(steps);
+		expect(findings).toContain("This review stays read-only");
+		expect(after).toContain("security-audit skill");
+		expect(after).toContain("ponytail-audit");
+		expect(release).toContain(findings);
+		expect(release).toContain(after);
+		// Only the mutation sentence differs: the release names the delta gate, the review the
+		// full run.
+		const fullRun =
+			"Run the project's full verification from AGENTS.md, including mutation testing if the project has it.";
+		const deltaGate =
+			"Run the project's full verification from AGENTS.md, with the delta mutation gate instead of the full mutation run: `bun run test:mutation:delta` over the last release tag, as AGENTS.md says.";
+		expect(review).toContain(fullRun);
+		expect(review).not.toContain("test:mutation:delta");
+		expect(release).toContain(deltaGate);
+		expect(release).not.toContain(fullRun);
 	});
 
 	test("the review records ranked findings instead of filing cards", () => {

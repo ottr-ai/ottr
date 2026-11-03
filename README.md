@@ -261,6 +261,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | PR reviews | off | **Settings**, per project: hourly watch of the project's open GitHub pull requests. For each new head, the server asks the model for a draft review in one tool-free call and files it on a review card, which wears the unread `new` badge until you open it; a new review of the same PR re-badges the card. No agent runs over the PR code. You edit the draft in the card and click **Post** to send one GitHub review with the `COMMENT` event; with the GitHub App configured the post goes out as `ottr[bot]`, without it under your own identity; after a post the card links the posted review. Spec: [docs/specs/pr-reviews.md](docs/specs/pr-reviews.md) |
 | Hindsight server | env on compose | **Settings → Hindsight**: URL and API key for omp's memory backend |
 | Review due | 150 commits | **Settings**, per project; see [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
+| Run due reviews while idle | on | **Settings**; when the board is idle for 2 hours with no turn running, Ottr files a due architecture review card by itself. See [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
 | Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
 | Kept-worktree quarantine | 7 days | **Settings** |
 

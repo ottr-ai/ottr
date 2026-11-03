@@ -9627,6 +9627,7 @@ function App() {
 							maxTotal={state.maxTotal}
 							reviewCheck={state.reviewCheck}
 							workCheck={state.workCheck}
+							idleReviews={state.idleReviews}
 							act={act}
 							view={view}
 						/>

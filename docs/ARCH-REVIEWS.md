@@ -7,10 +7,19 @@ page shows **Review due (n commits)**.
 ## When a review starts
 
 - **Cap**: the project has `archReviewCap` or more commits since the last
-  finished review. A newly added project counts as un-reviewed, so a review is
-  due at once.
+  finished full review. A newly added project counts as un-reviewed, so a
+  review is due at once. A release does not reset this counter; only a full
+  review (the Review button's card) does.
 - **Release**: **Create release** always runs the full review before it tags
-  and publishes.
+  and publishes. Its review runs the delta mutation gate (see below) instead
+  of the full mutation suite.
+- **While idle**: with **Run due reviews while idle** on (Settings; default
+  on), Ottr files the full review card itself when all of these hold: the
+  project shows Review due, no review or release is open in the project, no
+  turn runs or prepares on any project, no auto-started review runs on the
+  board, and the board has seen no input for 2 hours. Any change through the
+  UI or the API resets that clock. A board restart counts as input, so a
+  restart never starts a review at once.
 - Only one review runs at a time, and a new review or release waits while the
   open review's findings are not done.
 
@@ -28,13 +37,28 @@ The review runs read-only at a frozen commit and changes no code:
    hand. The check run can be skipped with the global **Review check** switch
    (settings page).
 3. Gates: the project's full verification from `AGENTS.md`, then the dependency
-   audit gates that `AGENTS.md` names.
+   audit gates that `AGENTS.md` names. A release review runs the delta
+   mutation gate instead of the full mutation suite; a full review runs the
+   full suite with its break thresholds.
 4. Quality reports: duplicate and dead code, cognitive complexity, and the
    project host's open dependency, code scanning and secret scanning alerts.
 5. A full security audit with the `security-audit` skill, then an architecture
    pass over module seams, coupling and over-engineering.
 
 Each kept finding becomes a tracker card, triaged like any task.
+
+## Delta gate
+
+`bun run test:mutation:delta <base>` runs Stryker only on the lines a change
+touched. It reads the diff from `<base>` to the current head, gives each
+changed line range to the Stryker config that owns the file, and runs those
+configs with those ranges. A changed-line mutant that survives or has no
+coverage fails the gate; a timed-out mutant counts as detected, as in the full
+run. No changed file is mutated by a config: the gate exits 0 without a
+Stryker run. Work turns run it over the card's base. Release reviews run it
+over the last release tag; a survivor without a reason is a finding. The
+Review button and an auto-started review keep the full suite
+(`bun run test:mutation`) with its break thresholds.
 
 ## Merge hold
 

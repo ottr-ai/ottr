@@ -18,6 +18,7 @@ import {
 	findingsSettledAt,
 	isRetro,
 	isReview,
+	lastFullReviewBase,
 	lastReviewBase,
 	liveCard,
 	mergeAnywayPatch,
@@ -907,6 +908,59 @@ describe("lastReviewBase", () => {
 		});
 		expect(lastReviewBase([old, review, open, cancelled, work])).toBe("bbb");
 		expect(lastReviewBase([work])).toBeNull();
+	});
+});
+
+describe("lastFullReviewBase", () => {
+	test("a done release does not move the base, a done full review does", () => {
+		const review = task({
+			kind: "review",
+			base: "aaa",
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		const release = task({
+			releaseVersion: "v1.0.0",
+			base: "bbb",
+			stage: "done",
+			state: "idle",
+			doneAt: 300,
+		});
+		// The release ran after the full review, but only a full review resets the counter.
+		expect(lastFullReviewBase([review, release])).toBe("aaa");
+		const laterReview = task({
+			kind: "review",
+			base: "ccc",
+			stage: "done",
+			state: "idle",
+			doneAt: 500,
+		});
+		expect(lastFullReviewBase([review, release, laterReview])).toBe("ccc");
+		const open = task({
+			releaseVersion: "v1.1.0",
+			base: "ddd",
+			stage: "merging",
+			state: "idle",
+		});
+		const cancelled = task({
+			kind: "review",
+			base: "eee",
+			stage: "done",
+			doneAt: 600,
+			cancelledAt: 600,
+		});
+		const work = task({
+			base: "fff",
+			stage: "done",
+			state: "idle",
+			doneAt: 700,
+		});
+		// Open, cancelled and work cards do not move it either.
+		expect(lastFullReviewBase([review, release, open, cancelled, work])).toBe(
+			"aaa",
+		);
+		expect(lastFullReviewBase([work])).toBeNull();
 	});
 });
 

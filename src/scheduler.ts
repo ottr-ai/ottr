@@ -235,6 +235,27 @@ export function lastReviewBase(
 	return best?.base ?? null;
 }
 
+/** The base the Review-due counter counts from: like lastReviewBase, but only a full review (the
+ * Review button's card) counts — a release keeps the counter going, so releases are gated by the
+ * delta mutation run, not a new full one. lastReviewBase stays for the review-context and
+ * OTTR_ARCH_REVIEW call sites. */
+export function lastFullReviewBase(
+	tasks: readonly Pick<
+		Task,
+		"kind" | "releaseVersion" | "cancelledAt" | "stage" | "doneAt" | "base"
+	>[],
+): string | null {
+	let best: { at: number; base: string } | null = null;
+	for (const t of tasks) {
+		if (t.cancelledAt !== null || t.stage !== "done" || t.base === null)
+			continue;
+		if (!isReview(t) || t.releaseVersion !== null) continue;
+		const at = t.doneAt ?? 0;
+		if (best === null || at > best.at) best = { at, base: t.base };
+	}
+	return best?.base ?? null;
+}
+
 /** The unfinished dependency cards `t` waits for, in its dependsOn order. A cancelled dependency
  * counts as satisfied: cancelling M1 must not strand M2 in the queue forever. `tasks` must be the
  * whole project: a dependency missing from it counts as done. */

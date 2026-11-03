@@ -194,6 +194,7 @@ const shared = {
 	maxTotalRuns: 3,
 	reviewCheck: true,
 	workCheck: true,
+	idleReviews: true,
 	removedPaths: [] as string[],
 	projectPaths: [] as string[],
 	envValues: {} as Record<string, string>,
@@ -307,6 +308,9 @@ function mount(
 		sshDir?: string;
 		keyscan?: Keyscan;
 		models?: Parameters<typeof createApp>[0]["models"];
+		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
+		now?: () => number;
+		schedule?: () => void;
 	} = {},
 ) {
 	const g =
@@ -333,7 +337,8 @@ function mount(
 		stopTurn: async () => ({ ok: true }),
 		finishKept: async () => ({ ok: true }),
 		claimedPids: () => new Set<number>(),
-		schedule: () => {},
+		schedule: input.schedule ?? (() => {}),
+		now: input.now,
 		serverVersion: "test",
 		port: 0,
 		publicHosts: [],
@@ -341,6 +346,7 @@ function mount(
 			maxTotalRuns: 3,
 			reviewCheck: true,
 			workCheck: true,
+			idleReviews: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -864,6 +870,7 @@ describe("settings routes", () => {
 			maxTotal: shared.maxTotalRuns,
 			reviewCheck: false,
 			workCheck: shared.workCheck,
+			idleReviews: shared.idleReviews,
 		});
 		expect(shared.reviewCheck).toBe(false);
 	});
@@ -873,6 +880,7 @@ describe("settings routes", () => {
 			maxTotal: shared.maxTotalRuns,
 			reviewCheck: shared.reviewCheck,
 			workCheck: shared.workCheck,
+			idleReviews: shared.idleReviews,
 		};
 		const ok = await post("/api/settings", {});
 		expect(ok.status).toBe(200);
@@ -892,8 +900,40 @@ describe("settings routes", () => {
 			maxTotal: shared.maxTotalRuns,
 			reviewCheck: false,
 			workCheck: false,
+			idleReviews: shared.idleReviews,
 		});
 		expect(shared.workCheck).toBe(false);
+	});
+
+	test("idleReviews must be a boolean, lands in shared, and persists", async () => {
+		const m = mount({ projects: new Map() });
+		const bad = await m.call("/api/settings", { idleReviews: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("idleReviews must be a boolean");
+		const off = await m.call("/api/settings", { idleReviews: false });
+		expect(off.status).toBe(200);
+		expect(await off.json()).toEqual({
+			maxTotal: 3,
+			reviewCheck: true,
+			workCheck: true,
+			idleReviews: false,
+		});
+		// The state payload exposes it for the Settings switch.
+		const state = (await (await m.call("/api/state")).json()) as {
+			idleReviews: boolean;
+		};
+		expect(state.idleReviews).toBe(false);
+		// saveConfig persists it in the gstore config blob.
+		const cfg = m.g.get<{ idleReviews?: unknown }>("config");
+		expect(cfg?.idleReviews).toBe(false);
+	});
+
+	test("idleReviews defaults to true on a fresh app", async () => {
+		const m = mount({ projects: new Map() });
+		const state = (await (await m.call("/api/state")).json()) as {
+			idleReviews: boolean;
+		};
+		expect(state.idleReviews).toBe(true);
 	});
 
 	test("maxParallel: a positive integer or null persists", async () => {
@@ -2426,6 +2466,122 @@ describe("alate provision trigger (U9)", () => {
 	});
 });
 
+describe("idle auto review tick", () => {
+	// Fixed idle clock: createApp stamps lastInputAt at mount, tests move t forward.
+	let t = 1_750_000_000_000;
+	let scheduled = 0;
+	const opened: Entry[] = [];
+	afterAll(() => {
+		for (const e of opened) e.store.close();
+	});
+
+	/** A fresh app (own shared state, own remembered card) with one due project: target
+	 * main and archReview.due, like a refresh left it. */
+	async function idleMount() {
+		const name = `idle-${opened.length}-${Math.random()
+			.toString(36)
+			.slice(2, 6)}`;
+		const projects = new Map<string, Entry>();
+		const m = mount({
+			projects,
+			now: () => t,
+			schedule: () => {
+				scheduled++;
+			},
+		});
+		const add = await m.call("/api/projects", { name });
+		expect(add.status).toBe(200);
+		const e = projects.get(name)!;
+		e.target = "main";
+		e.archReview = {
+			delta: 150,
+			reviewed: true,
+			cap: 150,
+			due: true,
+			running: false,
+		};
+		opened.push(e);
+		return { m, e, dir: join(root, name), projects };
+	}
+
+	const reviewCards = (e: Entry): Task[] =>
+		e.store.listTasks().filter((task) => task.kind === "review");
+
+	test("files the due project's review card at exactly two hours of silence", async () => {
+		const { m, e, dir } = await idleMount();
+		t += 2 * 60 * 60_000; // the boundary itself: now() - lastInputAt == 2h files
+		await m.app.idleReviewTick();
+		const cards = reviewCards(e);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.kind).toBe("review");
+		// The review freezes the target head, like a release card.
+		const head = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		expect(cards[0]?.base).toBe(head);
+		expect(scheduled).toBeGreaterThan(0);
+	});
+
+	test("stays silent at one hour fifty-nine minutes", async () => {
+		const { m, e } = await idleMount();
+		t += 2 * 60 * 60_000 - 60_000;
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(0);
+	});
+
+	test("a preparing turn on any project blocks the tick", async () => {
+		const { m, e, projects } = await idleMount();
+		// The busy turn lives on a second project: anyTurnActive scans them all.
+		const busyName = `idle-busy-${opened.length}-${Math.random()
+			.toString(36)
+			.slice(2, 6)}`;
+		const add = await m.call("/api/projects", { name: busyName });
+		expect(add.status).toBe(200);
+		const busy = projects.get(busyName)!;
+		opened.push(busy);
+		const turn = busy.store.createTask("busy");
+		busy.store.updateTask(turn.id, { state: "preparing" });
+		t += 3 * 60 * 60_000;
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(0);
+	});
+
+	test("a blocked review keeps the tick silent", async () => {
+		const { m, e } = await idleMount();
+		// A live review card the refreshed entry does not know about yet: the entry still
+		// shows running false, and reviewBlocked inside the helper catches it.
+		e.store.createTask("earlier review", null, "review");
+		t += 3 * 60 * 60_000;
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(1);
+	});
+
+	test("an auto review already live files nothing new", async () => {
+		const { m, e } = await idleMount();
+		t += 2 * 60 * 60_000;
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(1);
+		// The tick remembers its card: a later tick with every other gate open files nothing.
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(1);
+	});
+
+	test("a fresh app counts as input and files nothing", async () => {
+		const { m, e } = await idleMount();
+		// No request since mount: lastInputAt is the createApp stamp, so a restart never
+		// files at once, even with the due badge showing.
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(0);
+	});
+
+	test("the setting off keeps the tick silent", async () => {
+		const { m, e } = await idleMount();
+		const off = await m.call("/api/settings", { idleReviews: false });
+		expect(off.status).toBe(200);
+		t += 3 * 60 * 60_000;
+		await m.app.idleReviewTick();
+		expect(reviewCards(e)).toHaveLength(0);
+	});
+});
+
 describe("model roles routes", () => {
 	const ORIGINAL = `theme: dark
 modelRoles:
@@ -3175,6 +3331,7 @@ describe("github token", () => {
 				maxTotalRuns: 3,
 				reviewCheck: true,
 				workCheck: true,
+				idleReviews: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -3360,6 +3517,7 @@ describe("hindsight settings", () => {
 				maxTotalRuns: 3,
 				reviewCheck: true,
 				workCheck: true,
+				idleReviews: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -3631,6 +3789,7 @@ describe("loopback Host from another machine or container", () => {
 			maxTotalRuns: 3,
 			reviewCheck: true,
 			workCheck: true,
+			idleReviews: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -5133,6 +5292,7 @@ describe("sign out everywhere", () => {
 			maxTotalRuns: 3,
 			reviewCheck: true,
 			workCheck: true,
+			idleReviews: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -5252,6 +5412,7 @@ describe("session registry (OTTR-387)", () => {
 				maxTotalRuns: 3,
 				reviewCheck: true,
 				workCheck: true,
+				idleReviews: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -7244,6 +7405,7 @@ describe("token expiry reminders", () => {
 				maxTotalRuns: 3,
 				reviewCheck: true,
 				workCheck: true,
+				idleReviews: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

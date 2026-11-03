@@ -27,7 +27,7 @@ import {
 } from "./release.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, workerFromEnv } from "./runner.ts";
-import { lastReviewBase, reviewBlocked } from "./scheduler.ts";
+import { lastFullReviewBase, reviewBlocked } from "./scheduler.ts";
 import {
 	type AdoptResult,
 	adoptSharedProjectData,
@@ -113,6 +113,8 @@ const shared: {
 	reviewCheck: boolean;
 	/** True when a finished work card is checked by a second model before it enters the merge queue. */
 	workCheck: boolean;
+	/** Default on; POST /api/settings writes it, the idle review tick reads it. */
+	idleReviews: boolean;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 	/** /api/settings/env writes saved values here; the loop reads them per turn. */
@@ -125,6 +127,7 @@ const shared: {
 			: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 3),
 	reviewCheck: true,
 	workCheck: true,
+	idleReviews: true,
 	envValues: {},
 	...storedProjectPaths(gstore),
 };
@@ -206,7 +209,9 @@ async function refreshArchReview(e: Entry): Promise<void> {
 	const a = await archReviewDelta(
 		e.path,
 		e.target,
-		lastReviewBase(e.store.listTasks()),
+		// The due badge counts from the newest full review: a release card must not reset it,
+		// releases gate on the delta mutation run instead (docs/specs/mutation-delta.md §6).
+		lastFullReviewBase(e.store.listTasks()),
 	).catch(() => null);
 	const cap = getSettingsLogged(e).archReviewCap;
 	// Running: a review is queued or running, or its findings are still landing.
@@ -521,6 +526,10 @@ setInterval(() => void supervisor.tick(), 60_000);
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
 // provision path as Settings → Alate → Provision now; a failed attempt waits an hour.
 setInterval(() => void app.alateProvisionTick(), 5 * 60_000);
+
+// Idle auto-start (docs/specs/mutation-delta.md §7): with the setting on, a board quiet for
+// two hours files the first due project's architecture-review card by itself.
+setInterval(() => void app.idleReviewTick(), 5 * 60_000);
 
 // 1 s diff tick: catches file-driven changes no code path writes (omp session titles, AGENTS.md
 // appearing, main-checkout dirtiness). ponytail: replace with fs watchers if the state build ever

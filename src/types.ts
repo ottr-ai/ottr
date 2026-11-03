@@ -755,6 +755,8 @@ export interface StateResponse {
 	reviewCheck: boolean;
 	/** True when a finished work card is checked by a second model before it enters the merge queue. */
 	workCheck: boolean;
+	/** True when the board files a due architecture review card by itself after two hours without input. */
+	idleReviews: boolean;
 	/** Version stamp of the running server (HEAD sha, else boot time); stale tabs reload once when it changes. */
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */

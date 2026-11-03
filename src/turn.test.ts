@@ -3093,6 +3093,7 @@ describe("turn release cards", () => {
 				maxTotalRuns: 3,
 				reviewCheck: true,
 				workCheck: true,
+				idleReviews: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

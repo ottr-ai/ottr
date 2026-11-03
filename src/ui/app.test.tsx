@@ -1074,6 +1074,7 @@ describe("settings TOC", () => {
 				maxTotal={null}
 				reviewCheck={false}
 				workCheck={false}
+				idleReviews={true}
 				act={async () => true}
 				view="settings"
 			/>,
@@ -1087,6 +1088,8 @@ describe("settings TOC", () => {
 		for (const id of ids) expect(html.split(`id="${id}"`).length - 1).toBe(1);
 		for (const id of ["signin-section", "model-roles-section", "alate-section"])
 			expect(html).toContain(`id="${id}"`);
+		// The idle-reviews switch row: labelled checkbox inside the Runners card.
+		expect(html).toContain("Run due reviews while idle");
 		expect(html.split("<h1").length - 1).toBe(1);
 		const nav =
 			html.match(/<nav[^>]*class="[^"]*settings-nav[\s\S]*?<\/nav>/)?.[0] ?? "";
