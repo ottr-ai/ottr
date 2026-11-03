@@ -1077,6 +1077,42 @@ describe("settings routes", () => {
 		expect(store.getSettings().iconText).toBeNull();
 	});
 
+	test("taskIdPrefix validates, persists, and overrides the derived task id handle", async () => {
+		const ok = await post("/api/projects/p1/settings", { taskIdPrefix: "chs" });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().taskIdPrefix).toBe("CHS");
+		const body = (await ok.json()) as { taskPrefix?: string };
+		expect(body.taskPrefix).toBe("CHS");
+		expect(store.createTask("with override").id).toMatch(/^CHS-[0-9]+$/);
+		const clear = await post("/api/projects/p1/settings", { taskIdPrefix: "" });
+		expect(clear.status).toBe(200);
+		expect(store.getSettings().taskIdPrefix).toBeNull();
+		const cleared = (await clear.json()) as { taskPrefix?: string };
+		expect(cleared.taskPrefix).toBe("P1");
+		expect(store.createTask("derived again").id).toMatch(/^P1-[0-9]+$/);
+		const bad1 = await post("/api/projects/p1/settings", {
+			taskIdPrefix: "ch st",
+		});
+		expect(bad1.status).toBe(400);
+		expect(await errorOf(bad1)).toBe(
+			"taskIdPrefix must be 1 to 8 letters and digits",
+		);
+		const bad2 = await post("/api/projects/p1/settings", {
+			taskIdPrefix: "ABCDEFGHIJKLMNOP",
+		});
+		expect(bad2.status).toBe(400);
+		expect(await errorOf(bad2)).toBe(
+			"taskIdPrefix must be 1 to 8 letters and digits",
+		);
+		const wrongType = await post("/api/projects/p1/settings", {
+			taskIdPrefix: 5,
+		});
+		expect(wrongType.status).toBe(400);
+		expect(await errorOf(wrongType)).toBe(
+			"taskIdPrefix must be a string or null",
+		);
+	});
+
 	test("auto-tend settings validate and round-trip through the project settings route", async () => {
 		const ok = await post("/api/projects/p1/settings", {
 			autoTend: true,

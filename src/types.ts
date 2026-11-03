@@ -171,6 +171,8 @@ export interface ProjectSettings {
 	 * closed at the next push until the server pins again.
 	 */
 	originUrl: string | null;
+	/** Task id handle like OTTR; null = derived from the folder name. Uppercase letters and digits, at most 8. */
+	taskIdPrefix: string | null;
 }
 
 /** One task's touched file with its +/- line counts; null counts mark a binary file. */
@@ -650,6 +652,8 @@ export interface ProjectView {
 	/** Since the last arch review on the target; null with no target, before the first scan, or when git fails. */
 	archReview: ArchReview | null;
 	settings: ProjectSettings;
+	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
+	taskPrefix: string;
 }
 
 export interface TaskView extends Omit<Task, "diffText"> {

@@ -71,7 +71,17 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
+	taskIdPrefix: null,
 };
+
+/** Uppercase alphanumeric fallback handle, max 4 chars, from the folder name; TASK when nothing survives. */
+export function derivedTaskPrefix(folderName: string): string {
+	const p = folderName
+		.replaceAll(/[^A-Za-z0-9]/g, "")
+		.toUpperCase()
+		.slice(0, 4);
+	return p === "" ? "TASK" : p;
+}
 
 /** The tasks table DDL, kept separate so the CHECK migration below reuses the exact shape. */
 const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
@@ -809,6 +819,7 @@ const SETTINGS_SHAPES = {
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
+	taskIdPrefix: "string|null",
 } as const satisfies Record<keyof ProjectSettings, string>;
 
 /** Validates one stored settings value; undefined when corrupt or of the wrong shape (keep default). */
@@ -1780,13 +1791,18 @@ export class ProjectStore {
 		return card;
 	}
 
-	/** Uppercase alphanumeric project prefix, max 4 chars, from the store folder name. */
+	/**
+	 * The project's task id handle: the taskIdPrefix setting or the folder-derived default.
+	 * Defensive normalization covers values stored by direct setSettings callers that bypass
+	 * the API's validation.
+	 */
 	private taskPrefix(): string {
-		const p = this.name
-			.replaceAll(/[^A-Za-z0-9]/g, "")
-			.toUpperCase()
-			.slice(0, 4);
-		return p === "" ? "TASK" : p;
+		const p = this.getSettings().taskIdPrefix;
+		if (p !== null) {
+			const s = p.replaceAll(/[^A-Za-z0-9]/g, "").toUpperCase();
+			if (s !== "") return s;
+		}
+		return derivedTaskPrefix(this.name);
 	}
 
 	/** Next `PREFIX-n` id; the per-store counter only ever increments (no reuse). */

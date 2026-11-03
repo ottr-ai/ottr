@@ -449,7 +449,9 @@ describe("ProjectSettingsForm target branch", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
+			taskIdPrefix: null,
 		},
+		taskPrefix: "PROJ",
 	} as unknown as ProjectView;
 
 	/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
@@ -542,6 +544,59 @@ describe("ProjectSettingsForm target branch", () => {
 			});
 			expect(postBody).not.toBeUndefined();
 			expect(postBody?.targetBranch).toBe("develop");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the Identity card shows the task id prefix row and saving posts it", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return ok(project);
+			}
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountForm(fetchMock);
+		try {
+			const card = container.querySelector("#project-identity-section");
+			expect(card).not.toBeNull();
+			const row = card?.querySelector(".alate-def-row");
+			expect(row?.textContent).toContain("Display name");
+			const input = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Task ID prefix"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("task id prefix input did not render");
+			expect(input.value).toBe("");
+			expect(input.getAttribute("placeholder")).toBe("PROJ");
+			expect(input.getAttribute("maxlength")).toBe("8");
+			await act(async () => {
+				typeInto(input, "chs");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = container.querySelector("#project-identity-section form");
+			if (form === null) throw new Error("form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.taskIdPrefix).toBe("chs");
 		} finally {
 			await unmount();
 		}

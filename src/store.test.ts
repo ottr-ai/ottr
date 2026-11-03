@@ -286,6 +286,7 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
+			taskIdPrefix: null,
 		});
 		store.setSettings({ displayName: null, releaseCommand: null });
 		expect(store.getSettings()).toEqual({
@@ -308,6 +309,7 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
+			taskIdPrefix: null,
 		});
 		store.close();
 	});
@@ -2471,6 +2473,19 @@ describe("arch-review changed-line coverage", () => {
 			expect(a.id).toMatch(/^[A-Z0-9]{1,4}-[0-9]+$/);
 			expect(a.id).toBe("MYRE-1");
 			expect(b.id).toBe("MYRE-2");
+		});
+
+		test("taskIdPrefix overrides the derived handle; null returns to it; the counter never resets", () => {
+			const dir = join(root, "chs-override");
+			const store = open(dir);
+			expect(store.createTask("a").id).toBe("CHSO-1");
+			store.setSettings({ taskIdPrefix: "chs" });
+			expect(store.createTask("b").id).toBe("CHS-2");
+			// Defensive normalization: a stored lowercase value still yields uppercase ids.
+			store.setSettings({ taskIdPrefix: "zz" });
+			expect(store.createTask("c").id).toBe("ZZ-3");
+			store.setSettings({ taskIdPrefix: null });
+			expect(store.createTask("d").id).toBe("CHSO-4");
 		});
 
 		test("getTask still resolves a legacy 8-hex id", () => {

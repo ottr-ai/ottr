@@ -165,7 +165,7 @@ import {
 	WORK_CHECK_THIRD_BLOCK,
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
-import { ProjectStore } from "./store.ts";
+import { derivedTaskPrefix, ProjectStore } from "./store.ts";
 import {
 	ENV_NAME,
 	envListPath,
@@ -1981,6 +1981,7 @@ export function createApp(deps: AppDeps) {
 		const icon = file
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
+		const settings = e.store.getSettings();
 		return {
 			name: e.store.name,
 			icon: icon ?? null,
@@ -1995,7 +1996,8 @@ export function createApp(deps: AppDeps) {
 			latestRelease: e.latestRelease,
 			latestImage: e.latestImage,
 			archReview: e.archReview,
-			settings: e.store.getSettings(),
+			settings,
+			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
 		};
 	}
 
@@ -2183,7 +2185,7 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		if (!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,4}-[0-9]+)$/.test(id))
+		if (!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)$/.test(id))
 			return json({ error: "bad task id" }, 400);
 		const task = e.store.getTask(id);
 		if (!task) return json({ error: "unknown task" }, 404);
@@ -2251,6 +2253,19 @@ export function createApp(deps: AppDeps) {
 				return json({ error: "iconText must be at most 4 characters" }, 400);
 			}
 			patch.iconText = marker === "" ? null : marker;
+		}
+		const tp = body.taskIdPrefix;
+		if (tp !== undefined) {
+			if (tp !== null && typeof tp !== "string")
+				return json({ error: "taskIdPrefix must be a string or null" }, 400);
+			const prefix = typeof tp === "string" ? tp.trim().toUpperCase() : "";
+			if (prefix !== "" && !/^[A-Z0-9]{1,8}$/.test(prefix)) {
+				return json(
+					{ error: "taskIdPrefix must be 1 to 8 letters and digits" },
+					400,
+				);
+			}
+			patch.taskIdPrefix = prefix === "" ? null : prefix;
 		}
 		const rc = body.releaseCommand;
 		if (rc !== undefined) {
@@ -3798,7 +3813,7 @@ export function createApp(deps: AppDeps) {
 						ids.some(
 							(id) =>
 								typeof id !== "string" ||
-								!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,4}-[0-9]+)$/.test(id),
+								!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)$/.test(id),
 						)
 					)
 						return json({ error: "invalid ids" }, 400);

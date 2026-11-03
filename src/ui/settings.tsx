@@ -4384,6 +4384,7 @@ export function ProjectSettingsForm({
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const [marker, setMarker] = useState(project.settings.iconText ?? "");
 	const st = project.settings;
+	const [prefix, setPrefix] = useState(st.taskIdPrefix ?? "");
 	const icon = useInstantSave(act);
 	const markerSave = useInstantSave(act);
 	const markerFormId = useId();
@@ -4553,9 +4554,15 @@ export function ProjectSettingsForm({
 				<SaveCard
 					id="project-identity-section"
 					act={act}
-					dirty={label.trim() !== (st.displayName ?? "")}
+					dirty={
+						label.trim() !== (st.displayName ?? "") ||
+						prefix.trim().toUpperCase() !== (st.taskIdPrefix ?? "")
+					}
 					save={async () => {
-						const r = await send({ displayName: label.trim() || null });
+						const r = await send({
+							displayName: label.trim() || null,
+							taskIdPrefix: prefix.trim() || null,
+						});
 						if (r.name !== project.name)
 							location.hash = `#${SETTINGS_HASH}/${encodeURIComponent(r.name)}`;
 					}}
@@ -4583,6 +4590,23 @@ export function ProjectSettingsForm({
 										onChange={(e) => setLabel(e.target.value)}
 										placeholder={project.name}
 										aria-label="Display name"
+									/>
+								</label>
+							</DefRow>
+							<DefRow
+								name="Task ID prefix"
+								action={save}
+								help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
+								shape="empty = from folder name"
+							>
+								<label>
+									<input
+										type="text"
+										maxLength={8}
+										value={prefix}
+										onChange={(e) => setPrefix(e.target.value)}
+										placeholder={project.taskPrefix}
+										aria-label="Task ID prefix"
 									/>
 								</label>
 							</DefRow>
