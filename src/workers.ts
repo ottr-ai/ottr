@@ -55,6 +55,10 @@ export function serveWorker(opts: {
 	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
 	sweepGraceMs?: number;
 }): Bun.Server<never> {
+	// Pids of the live /run children. The sweep must never stop a turn that still runs:
+	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
+	// ends in " (deleted)" while the turn still has to push and report. Removed on close.
+	const runChildren = new Set<number>();
 	return Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
@@ -71,6 +75,7 @@ export function serveWorker(opts: {
 					const stopped = await sweepLeftovers({
 						roots: opts.sweepRoots,
 						graceMs: opts.sweepGraceMs,
+						keepPids: runChildren,
 					});
 					return Response.json(stopped);
 				} catch (err) {
@@ -156,6 +161,13 @@ export function serveWorker(opts: {
 			} catch (err) {
 				return new Response(`spawn failed: ${String(err)}`, { status: 500 });
 			}
+			const forgetChild = (): void => {
+				if (child.pid !== undefined) runChildren.delete(child.pid);
+			};
+			child.on("close", forgetChild);
+			// A spawn error never fires "close", so forget here too.
+			child.on("error", forgetChild);
+			if (child.pid !== undefined) runChildren.add(child.pid);
 			const killTree = (): void => {
 				if (child.pid !== undefined) platform.killTree(child.pid);
 			};
@@ -427,17 +439,51 @@ export function matchSweepTarget(
  * Kills processes whose cwd is a deleted worktree under the roots (leftover dev
  * servers from a finished card). SIGTERM first, then SIGKILL after the grace
  * period for anything still alive. Throws when /proc itself is unreadable.
+ *
+ * `keepPids` names processes that must survive: the daemon's live /run children.
+ * Their whole descendant trees are excluded too, so a turn's shells and dev
+ * servers stay safe while the turn runs. A merge turn can remove its own
+ * worktree mid-run, which turns its cwd link into a " (deleted)" one — still a
+ * live run, never a leftover.
  */
 export async function sweepLeftovers(opts?: {
 	roots?: readonly string[];
 	graceMs?: number;
+	keepPids?: Iterable<number>;
 }): Promise<SweptProcess[]> {
 	const roots = opts?.roots ?? ["/workspace"];
 	const graceMs = opts?.graceMs ?? 1000;
+	// One /proc snapshot of the parent links; the kept set is the keep roots plus
+	// every descendant (BFS over ppid). A process that forks after the snapshot is
+	// swept at the next tick, same known gap killTree has.
+	const ppid = new Map<number, number>();
+	for (const name of readdirSync("/proc")) {
+		const pid = Number(name);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		try {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			// comm can hold spaces and parens: fields start after the last ")".
+			const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			const parent = Number(after[1]);
+			if (Number.isInteger(parent)) ppid.set(pid, parent);
+		} catch {
+			// exited between readdir and stat
+		}
+	}
+	const keep = new Set<number>();
+	const queue = [...(opts?.keepPids ?? [])];
+	while (queue.length > 0) {
+		const pid = queue.pop()!;
+		if (keep.has(pid)) continue;
+		keep.add(pid);
+		for (const [child, parent] of ppid)
+			if (parent === pid && !keep.has(child)) queue.push(child);
+	}
 	const targets: SweptProcess[] = [];
 	for (const name of readdirSync("/proc")) {
 		const pid = Number(name);
 		if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+		if (keep.has(pid)) continue; // a live /run child (or its tree) is not a leftover
 		let cwdLink: string;
 		try {
 			cwdLink = readlinkSync(`/proc/${pid}/cwd`);

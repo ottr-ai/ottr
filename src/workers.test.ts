@@ -55,6 +55,16 @@ const burst = '{"type":"tick"}\\n'.repeat(4096);
 setInterval(() => process.stdout.write(burst), 1);`,
 );
 
+// Pid-writing sleeper omp: drops its pid, then stays alive until killed. The sweep test
+// uses it as the live run child whose worktree disappears mid-run.
+const sweepSleepPath = join(dir, "sweep-sleep-omp.js");
+writeFileSync(
+	sweepSleepPath,
+	`require("node:fs").writeFileSync(process.argv[2], String(process.pid));
+setInterval(() => {}, 1000);
+setTimeout(() => process.exit(0), 60000);`,
+);
+
 // Every test below that runs one of these fakes through serveWorker or runWorker spawns a real
 // bun child, and child boot is unbounded under concurrent machine load (past 4 s observed).
 // Such tests carry a 30 s budget: the 5 s default bounds the machine, not the assertions.
@@ -903,6 +913,70 @@ describe("sweepLeftovers", () => {
 				child.kill();
 			rmSync(root, { recursive: true, force: true });
 		}
+	}, 30_000);
+
+	// Real child and real /proc state: fake timers cannot drive a separate process or
+	// the kernel's "(deleted)" cwd marker, so the polls use the platform clock.
+	test("a live /run child with a deleted worktree survives the sweep", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-run-"));
+		const wt = join(root, "proj", ".worktrees", "T3");
+		mkdirSync(wt, { recursive: true });
+		const pidFile = join(root, "pid");
+		const url = start({
+			token: "t",
+			ompPath: process.execPath,
+			sweepRoots: [root],
+			sweepGraceMs: 100,
+		});
+		const handle = runWorker(
+			{
+				id: "sweep-live",
+				argv: [sweepSleepPath, pidFile],
+				cwd: wt,
+				stdin: "",
+				env: {},
+			},
+			{ urls: [url], token: "t" },
+			fakeSink(),
+		);
+		let ompPid: number | undefined;
+		try {
+			// The run child must be up and have dropped its pid before the worktree goes.
+			const deadline = Date.now() + 20_000;
+			for (;;) {
+				try {
+					ompPid = Number(readFileSync(pidFile, "utf8"));
+					break;
+				} catch {
+					if (Date.now() > deadline)
+						throw new Error("run child never wrote its pid");
+					await Bun.sleep(100);
+				}
+			}
+			rmSync(root, { recursive: true, force: true });
+			// The merge-turn shape: the agent removed its own worktree mid-run, so the
+			// live omp cwd link ends in " (deleted)" while the turn still runs.
+			const gone = Date.now() + 20_000;
+			for (;;) {
+				const link = readlinkSync(`/proc/${ompPid}/cwd`);
+				if (link.endsWith(" (deleted)")) break;
+				if (Date.now() > gone)
+					throw new Error(`cwd never turned deleted: ${link}`);
+				await Bun.sleep(100);
+			}
+			const res = await fetch(`${url}/sweep`, {
+				method: "POST",
+				headers: { "x-otwr-token": "t" },
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual([]);
+			// Still alive: a live run (or its tree) is never a leftover.
+			process.kill(ompPid!, 0);
+		} finally {
+			handle.kill();
+			rmSync(root, { recursive: true, force: true });
+		}
+		await handle.done;
 	}, 30_000);
 
 	test("rejects a request without the token", async () => {
