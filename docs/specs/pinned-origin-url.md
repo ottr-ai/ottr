@@ -55,8 +55,9 @@ from `origin` by name.
      falling back to the planted default remote) is refused;
    - a local pin must resolve outside every worker-writable root. Local forms:
      a plain absolute path, a Windows drive/UNC path, any `file://` URL (current
-     git ignores its authority and serves the path after the first `/`
-     locally), and any no-scheme value that git reads as a path (no colon, or
+     git ignores its authority and serves the path after the first raw `/`
+     locally; with no raw `/` it url-decodes the whole remainder as the path),
+     and any no-scheme value that git reads as a path (no colon, or
      the first slash before the first colon — `./x:y.git` is a path, `host:path`
      is scp-ssh). The roots are the project
      roots (`OMP_TRACKER_ROOTS`), `OTTR_DATA_DIR`, and the server's own home
@@ -108,8 +109,9 @@ from `origin` by name.
 - A relative pin git reads as a local path (`./x:y.git`: first slash before the
   first colon) gets the worker-root check and fails closed under a configured
   root; the same reading without roots pushes a relative bare.
-- Every `file://` authority form (`file://host/path`, `file://localhost:9/path`)
-  resolves to the path after the first slash and gets the worker-root check.
+- Every `file://` authority form (`file://host/path`, `file://localhost:9/path`,
+  `file://%2Fpath` with all slashes encoded) resolves to the local path git
+  reads and gets the worker-root check.
 - An upstream the pin does not cover (a fork remote, a merge ref outside
   `refs/heads`) skips the refresh fetch with a warning; no fetch by remote name
   runs.

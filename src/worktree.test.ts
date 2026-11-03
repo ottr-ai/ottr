@@ -939,6 +939,8 @@ describe("pinned origin URL (OTTR-348)", () => {
 					`file://${f.evil}`,
 					`file://nowhere${f.evil}`,
 					`file://localhost:9${f.evil}`,
+					// No raw slash: git url-decodes the whole remainder as the path.
+					`file://${encodeURIComponent(f.evil)}`,
 				]) {
 					const r = await serverMergePush(
 						f.main,
