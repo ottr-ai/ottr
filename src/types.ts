@@ -667,6 +667,20 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	prReview?: PrReviewView;
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
 	lateCommits?: LateCommit[];
+	/** The retro card filed after this card (kind "retro", followUpOf this card); this card's
+	 * Work steps show its turns, and the board shows no card for it. Absent without a retro. */
+	retro?: RetroView;
+}
+
+/** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */
+export interface RetroView {
+	id: string;
+	state: RunState;
+	stage: Stage;
+	cancelledAt: number | null;
+	needsReason: string | null;
+	asked: Task["asked"];
+	turns: TurnView[];
 }
 
 /** One commit in a waiting release card's late range, as shown on the drawer. */
@@ -680,7 +694,7 @@ export interface LateCommit {
 }
 
 /** A turn as shipped over the API: everything but the prompt text. */
-type TurnView = Omit<Turn, "prompt">;
+export type TurnView = Omit<Turn, "prompt">;
 
 /** A task as shipped in /api/state: card facts without the full report text (the drawer fetches it per task). */
 export type TaskCard = Omit<

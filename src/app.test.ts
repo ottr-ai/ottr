@@ -755,6 +755,28 @@ describe("task routes", () => {
 		expect(card.lastModel).toBe("zai/glm-5.3-flash");
 	});
 
+	test("detail carries the card's retro with prompt-free turns", async () => {
+		const parent = store.createTask("retro source");
+		store.updateTask(parent.id, { stage: "done", state: "idle" });
+		const retro = store.createTask("retro prompt", null, "retro");
+		store.updateTask(retro.id, { followUpOf: parent.id });
+		const turn = store.startTurn(retro.id, "work", "retro turn prompt", null);
+		const res = await get(`/api/projects/p1/tasks/${parent.id}`);
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			retro?: { id: string; turns: Array<Record<string, unknown>> };
+		};
+		expect(b.retro?.id).toBe(retro.id);
+		expect(b.retro?.turns.map((x) => x.id)).toEqual([turn.id]);
+		expect(b.retro?.turns[0]).not.toHaveProperty("prompt");
+
+		const plain = store.createTask("no retro");
+		const plainRes = await get(`/api/projects/p1/tasks/${plain.id}`);
+		expect(((await plainRes.json()) as { retro?: unknown }).retro).toBe(
+			undefined,
+		);
+	});
+
 	test("state lists a cancelled card with its cancelledAt", async () => {
 		const t = store.createTask("cancelled card stays visible");
 		store.updateTask(t.id, { cancelledAt: 1760000000000, state: "idle" });

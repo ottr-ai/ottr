@@ -66,18 +66,26 @@ export function laneStage(
 	return t.stage === "backlog" && t.state !== "idle" ? "todo" : t.stage;
 }
 
-/** The board's search filter plus per-stage counts: the shown list for the lanes, counts for tab strip and lane heads. */
+/** A card the board lanes list. A retro card shows only inside its source card's Work steps,
+ * except while it needs the user: a hidden question would hide waiting work. */
+export function onBoard(t: Pick<TaskCard, "kind" | "state">): boolean {
+	return t.kind !== "retro" || t.state === "needs_you";
+}
+
+/** The board's search filter plus per-stage counts: the shown list for the lanes, counts for tab strip and lane heads.
+ * Cards off the board (see onBoard) are in neither the shown list nor any count. */
 export function laneCounts<T extends LaneTask>(
 	tasks: readonly T[],
 	query: string,
 	seen: ReadonlySet<string>,
 ): { shown: T[]; counts: Record<Stage, LaneCount> } {
+	const board = tasks.filter(onBoard);
 	const q = query.trim().toLowerCase();
 	// Contains match on the id, what the card shows, plus the full prompt and latest summary.
 	const shown =
 		q === ""
-			? [...tasks]
-			: tasks.filter((t) =>
+			? board
+			: board.filter((t) =>
 					`${t.id}\n${t.sessionTitle || t.title}\n${t.prompt}\n${t.summary ?? ""}`
 						.toLowerCase()
 						.includes(q),
@@ -85,12 +93,12 @@ export function laneCounts<T extends LaneTask>(
 	const counts = {} as Record<Stage, LaneCount>;
 	for (const stage of STAGES) {
 		const visible = shown.filter((t) => laneStage(t) === stage);
-		const waiting = tasks.filter(
+		const waiting = board.filter(
 			(t) => laneStage(t) === stage && t.state === "needs_you",
 		);
 		counts[stage] = {
 			shown: visible.length,
-			total: tasks.filter((t) => laneStage(t) === stage).length,
+			total: board.filter((t) => laneStage(t) === stage).length,
 			fresh:
 				stage === "done" ? visible.filter((t) => isUnread(t, seen)).length : 0,
 			waiting: waiting.length,

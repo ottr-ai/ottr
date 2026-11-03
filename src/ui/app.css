@@ -5994,6 +5994,17 @@ button.diff-path {
 	-webkit-box-orient: vertical;
 	overflow: hidden;
 }
+/* A work check step: a turn's head row with nothing to open (the Work check section holds
+   the findings), so the pointer stays an arrow. */
+.turn-check .turn-head {
+	cursor: auto;
+}
+/* The retro step's way to the retro card's own drawer (reply, cancel). */
+.turn-link {
+	display: inline-block;
+	margin-top: 4px;
+	font-size: 12px;
+}
 /* User input (reply, steering, resume) speaks from the right: right-aligned bubble,
    worker turns keep the left rail. Grey surfaces only — user input is not an alarm,
    and steel is reserved for interaction (One-Edge Rule). */

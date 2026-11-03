@@ -136,6 +136,7 @@ import {
 	laneCounts,
 	laneOrder,
 	laneStage,
+	onBoard,
 	reorderIds,
 	SLOT_STAGES,
 	type SlotCounts,
@@ -187,6 +188,7 @@ import {
 	strykerProgress,
 	strykerStats,
 } from "./status.ts";
+import { workSteps } from "./steps.ts";
 import { age, duration, landed, stamp, turnDuration, until } from "./time.ts";
 import { decideReload, RELOAD_GUARD_KEY, SEEN_VERSION_KEY } from "./version.ts";
 import {
@@ -2604,6 +2606,8 @@ function ProjectBoard({
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
 	const { shown, counts } = laneCounts(tasks, query, seenAnswers);
 	const perStage = COLUMNS.map((c) => ({ ...c, ...counts[c.key] }));
+	// The search count matches the lanes: a retro off the board is no task to count.
+	const boardTotal = tasks.filter(onBoard).length;
 	return (
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
@@ -2691,7 +2695,7 @@ function ProjectBoard({
 								q === "" ? "Tasks in this project" : "Matching of total tasks"
 							}
 						>
-							{q === "" ? tasks.length : `${shown.length}/${tasks.length}`}
+							{q === "" ? boardTotal : `${shown.length}/${boardTotal}`}
 						</span>
 					</span>
 					<div className="seg">
@@ -3324,7 +3328,10 @@ export function Overview({
 					</thead>
 					<tbody>
 						{projects.map((p) => {
-							const own = tasks.filter((t) => t.project === p.name);
+							// The cards the project's board lists: a retro off the board counts nowhere.
+							const own = tasks.filter(
+								(t) => t.project === p.name && onBoard(t),
+							);
 							const split = splitAlarms(own);
 							// Last activity reads every card, cancelled ones included: the cancel
 							// stamp is the project's latest event (updateTask bumps updated_at)
@@ -6312,10 +6319,12 @@ export function Drawer({
 						t.project === (row.followUpOfProject ?? row.project),
 				) ?? null);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
+	// A retro is no follow-up row: the Work steps already list its turns.
 	const kids = tasks
 		.filter(
 			(t) =>
 				t.followUpOf === row.id &&
+				t.kind !== "retro" &&
 				(t.followUpOfProject ?? t.project) === row.project,
 		)
 		.sort((a, b) => a.createdAt - b.createdAt);
@@ -6328,8 +6337,9 @@ export function Drawer({
 	const [copiedId, flashCopiedId] = useFlash(1500);
 	const [idCopyError, setIdCopyError] = useState<string | null>(null);
 	const [cmdCopyError, setCmdCopyError] = useState<string | null>(null);
-	/** The one turn whose log is expanded; the log is per task, so only one copy shows at a time. */
-	const [openTurn, setOpenTurn] = useState<number | null>(null);
+	/** The one Work steps turn whose log is expanded: a turn id, or `retro-<id>` for a retro turn (its
+	 * id comes from another card and may equal one of this card's). Only one log shows at a time. */
+	const [openTurn, setOpenTurn] = useState<number | string | null>(null);
 	/** Open lightbox: the full-size list, the page shown and, for screenshots, the file names to caption; null while closed. Task inputs, reply and steer drafts each page their own list. */
 	const [viewing, setViewing] = useState<{
 		list: string[];
@@ -6420,6 +6430,10 @@ export function Drawer({
 		report: null,
 		diffFiles: null,
 	};
+	// Work steps rail: this card's turns, its work check runs and its retro's turns by start time.
+	const steps = workSteps(task.turns, task.workCheckLog, task.retro);
+	// The retro's link and waiting reason ride on its latest step only.
+	const lastRetro = steps.findLast((s) => s.kind === "retro");
 	// Touched-file stats (captured at merge, or live from the branch while open): totals for the
 	// section's summary line.
 	const diffFiles = task.diffFiles ?? [];
@@ -7439,19 +7453,82 @@ export function Drawer({
 								Loading…
 							</p>
 						) : (
-							task.turns.length === 0 && <p className="dim">No turns yet.</p>
+							steps.length === 0 && <p className="dim">No turns yet.</p>
 						)}
 						<ul className="turns">
-							{task.turns.map((t) => {
+							{steps.map((s) => {
+								if (s.kind === "check") {
+									const { run } = s;
+									const nb = run.blockers.length;
+									const nn = run.notes.length;
+									return (
+										// Not expandable: the Work check section above holds the findings.
+										<li key={`check-${s.n}`} className="turn turn-check">
+											{run.outcome === "pass" ? (
+												<span className="turn-node">
+													<Icon name="check" size={11} />
+												</span>
+											) : (
+												<span className="turn-node ask" aria-hidden="true" />
+											)}
+											<div className="turn-head">
+												<strong>work check</strong>
+												<span
+													className={
+														"outcome" +
+														(run.outcome === "pass" ? "" : " o-needs_you")
+													}
+												>
+													{run.outcome === "pass"
+														? "passed"
+														: run.outcome === "blockers"
+															? "blocked"
+															: "error"}
+												</span>
+												<span className="turn-model" title="model">
+													{run.model === null
+														? "default model"
+														: run.model.slice(run.model.indexOf("/") + 1)}
+												</span>
+												<span className="turn-time">
+													{new Date(run.at).toLocaleTimeString()}
+												</span>
+												<span className="turn-dur">
+													{duration(run.durationMs)}
+												</span>
+											</div>
+											{(run.error !== undefined || nb + nn > 0) && (
+												<div className="dim turn-sum">
+													{run.error ??
+														`${nb} ${nb === 1 ? "blocker" : "blockers"} · ${nn} ${nn === 1 ? "note" : "notes"}`}
+												</div>
+											)}
+										</li>
+									);
+								}
+								const t = s.turn;
+								const retroId = s.kind === "retro" ? s.retroId : null;
+								// A retro turn's id comes from another card: key its open state apart.
+								const stepKey = retroId === null ? t.id : `retro-${t.id}`;
+								const expanded = openTurn === stepKey;
+								// The retro's waiting reason, unless its latest turn already shows it.
+								const retroWait =
+									s === lastRetro &&
+									task.retro?.state === "needs_you" &&
+									task.retro.needsReason !== null &&
+									task.retro.needsReason !== t.error
+										? task.retro
+										: null;
 								// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
+								// A retro runs on its own card's model, which this drawer does not carry.
 								const model =
 									t.model ??
-									(t.endedAt === null
+									(t.endedAt === null && retroId === null
 										? (task.model ?? catalog?.defaultModel ?? null)
 										: null);
 								return (
 									<li
-										key={t.id}
+										key={stepKey}
 										className="turn"
 										// Keyboard support without a second tab stop: the turn-head button
 										// is the only stop, and its Enter/Space keydown bubbles to the
@@ -7459,7 +7536,7 @@ export function Drawer({
 										onKeyDown={(e) => {
 											if (e.key !== "Enter" && e.key !== " ") return;
 											e.preventDefault();
-											setOpenTurn(openTurn === t.id ? null : t.id);
+											setOpenTurn(expanded ? null : stepKey);
 										}}
 										onClick={(e) => {
 											// The log stays open while scrolling/selecting in it; selecting summary text must not toggle either.
@@ -7469,7 +7546,7 @@ export function Drawer({
 												!window.getSelection()?.isCollapsed
 											)
 												return;
-											setOpenTurn(openTurn === t.id ? null : t.id);
+											setOpenTurn(expanded ? null : stepKey);
 										}}
 									>
 										{/* Shape carries state on the rail: check = ended, filled dot = live, triangle = needs you (steel when the turn asked a question). */}
@@ -7513,10 +7590,10 @@ export function Drawer({
 											<button
 												type="button"
 												className="turn-head"
-												aria-expanded={openTurn === t.id}
+												aria-expanded={expanded}
 											>
 												<Icon name="chevron-right" size={13} />
-												<strong>{t.kind}</strong>
+												<strong>{retroId === null ? t.kind : "retro"}</strong>
 												{t.outcome !== null && (
 													<span
 														className={
@@ -7545,6 +7622,21 @@ export function Drawer({
 											{t.summary !== null && (
 												<div className="dim turn-sum">{t.summary}</div>
 											)}
+											{/* The retro card's own drawer keeps reply and cancel for a retro that waits. */}
+											{retroId !== null && s === lastRetro && (
+												<a
+													className="turn-link"
+													href={taskPath(task.project, retroId)}
+													// The link is its own target: the row's toggle must not fire.
+													onKeyDown={(e) => e.stopPropagation()}
+													onClick={(e) => {
+														e.stopPropagation();
+														navClick(e, () => onOpenTask(retroId));
+													}}
+												>
+													Open retro
+												</a>
+											)}
 											{t.error !== null && (
 												<div
 													className={
@@ -7556,8 +7648,22 @@ export function Drawer({
 													{t.error}
 												</div>
 											)}
-											{openTurn === t.id && (
-												<LogView project={project} taskId={task.id} />
+											{retroWait !== null && (
+												<div
+													className={
+														"needs-reason" +
+														(retroWait.asked !== null ? " asked" : "")
+													}
+												>
+													{retroWait.asked !== null && <Mark kind="asked" />}
+													{retroWait.needsReason}
+												</div>
+											)}
+											{expanded && (
+												<LogView
+													project={project}
+													taskId={retroId ?? task.id}
+												/>
 											)}
 										</div>
 									</li>

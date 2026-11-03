@@ -2139,6 +2139,18 @@ export function createApp(deps: AppDeps) {
 	function taskView(e: Entry, t: Task): TaskView {
 		const { diffText: _diffText, ...task } = t;
 		const pr = t.kind === "pr_review" ? e.store.getPrReviewByTask(t.id) : null;
+		// listTasks orders newest first, so find takes the newest retro of this card.
+		const retro =
+			t.kind === "retro"
+				? undefined
+				: e.store
+						.listTasks()
+						.find(
+							(c) =>
+								c.kind === "retro" &&
+								c.followUpOf === t.id &&
+								c.followUpOfProject === null,
+						);
 		return {
 			...task,
 			turns: e.store
@@ -2159,6 +2171,21 @@ export function createApp(deps: AppDeps) {
 							postedUrl: pr.postedUrl,
 							postedLogin: pr.postedLogin,
 							postError: pr.postError,
+						},
+					}
+				: {}),
+			...(retro
+				? {
+						retro: {
+							id: retro.id,
+							state: retro.state,
+							stage: retro.stage,
+							cancelledAt: retro.cancelledAt,
+							needsReason: retro.needsReason,
+							asked: retro.asked,
+							turns: e.store
+								.listTurns(retro.id)
+								.map(({ prompt: _prompt, ...turn }) => turn),
 						},
 					}
 				: {}),
