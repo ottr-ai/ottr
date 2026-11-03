@@ -252,15 +252,22 @@ export default function (pi: Pi) {
 	// extension load — and a synchronous throw escapes the .catch below, aborting the whole
 	// extension (no report_outcome/ask for the run). Defer the call past load; a macrotask
 	// runs after omp finishes initializing the runtime.
+	// The first macrotask is still too early: omp hands extensions a stub runtime whose
+	// action methods throw until its session initialize() patches them, seconds later in
+	// real runs (OTTR-413: ~23 s), so the one-shot attempt always died in the catch below.
+	// Retry until the methods answer or the cap; a lapsed run gets its pin at report_outcome.
 	if (pinned !== "") {
 		setTimeout(() => {
 			void (async () => {
-				try {
-					const current = await pi.getSessionName();
-					if (typeof current !== "string" || current.trim() === "")
-						await pi.setSessionName(pinned);
-				} catch {
-					// ponytail: cosmetic; the prompt's rename call stays as fallback
+				for (let attempt = 0; attempt < 60; attempt++) {
+					try {
+						const current = await pi.getSessionName();
+						if (typeof current !== "string" || current.trim() === "")
+							await pi.setSessionName(pinned);
+						return;
+					} catch {
+						await new Promise((r) => setTimeout(r, 500));
+					}
 				}
 			})();
 		}, 0);
@@ -309,11 +316,12 @@ export default function (pi: Pi) {
 		loadMode: "essential",
 		approval: "read",
 		async execute(_toolCallId: string, params: ReportParams) {
-			// A card without a session title shows the prompt's first line, so refuse once and
-			// send the agent to rename. The next call records even when the name is still
-			// missing, so an agent that ignores the hint keeps its outcome. Retro runs have no
-			// rename tool, so they never refuse; a getSessionName failure records rather than
-			// blocks the outcome.
+			// A card without a session title shows the prompt's first line. A run with a pinned
+			// name (OTTR_SESSION_NAME) applies that name here instead of refusing, so the
+			// outcome records at once. Without a pin, refuse once and send the agent to
+			// rename; the next call records even when the name is still missing, so an agent
+			// that ignores the hint keeps its outcome. Retro runs have no rename tool, so they
+			// never refuse; a getSessionName failure records rather than blocks the outcome.
 			if (!refusedOnce && process.env.OTTR_RETRO !== "1") {
 				let unnamed = true;
 				try {
@@ -322,7 +330,13 @@ export default function (pi: Pi) {
 				} catch {
 					unnamed = false;
 				}
-				if (unnamed) {
+				if (unnamed && pinned !== "") {
+					try {
+						await pi.setSessionName(pinned);
+					} catch {
+						// A failed name must not lose the outcome; record anyway.
+					}
+				} else if (unnamed) {
 					refusedOnce = true;
 					throw new Error(
 						"This session has no title yet, so the board card would show the prompt's first line. " +

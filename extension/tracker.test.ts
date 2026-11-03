@@ -24,6 +24,9 @@ interface ToolResult {
 const setSessionNameCalls: string[] = [];
 let currentSessionName: string | undefined;
 let sessionNameFails = false;
+// omp hands extensions a stub whose action methods throw until its session
+// initialize() patches them (OTTR-418); tests flip this to model that window.
+let runtimeReady = true;
 // session_stop handlers, for tests that pin what `reported` gates.
 const stopHandlers: Array<(...args: unknown[]) => unknown> = [];
 // tool_result handlers: the session-file redaction of git host secrets.
@@ -62,11 +65,20 @@ function fakePi(
 			if (event === "tool_result") resultHandlers.push(handler);
 		},
 		getSessionName: async () => {
+			if (!runtimeReady)
+				throw new Error(
+					"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+				);
 			if (sessionNameFails) throw new Error("name lookup failed");
 			return currentSessionName;
 		},
-		setSessionName: (name: string) => {
+		setSessionName: async (name: string) => {
+			if (!runtimeReady)
+				throw new Error(
+					"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+				);
 			setSessionNameCalls.push(name);
+			currentSessionName = name;
 		},
 	};
 	tracker(pi as never);
@@ -93,6 +105,7 @@ afterEach(() => {
 	setSessionNameCalls.length = 0;
 	currentSessionName = undefined;
 	sessionNameFails = false;
+	runtimeReady = true;
 	stopHandlers.length = 0;
 	resultHandlers.length = 0;
 });
@@ -193,6 +206,60 @@ describe("report_outcome refuses once while the session has no name", () => {
 		setEnv({ OTTR_RETRO: "1" });
 		const tools = await freshTools();
 		expect(text(await call(tools))).toBe("Outcome recorded: ready");
+	});
+});
+
+describe("report_outcome applies the pinned session name", () => {
+	const call = (tools: Record<string, RegisteredTool>) =>
+		tools.report_outcome!.execute("t1", { status: "ready", summary: "done" });
+	// The retry loop paces itself with real setTimeout calls, and bun:test 1.4.4's fake
+	// timers lack advanceTimersByTimeAsync, so tests wait out one real 500 ms attempt gap.
+	const settle = async () => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, 600);
+		await promise;
+	};
+
+	test("an unnamed pinned session records at once and applies the pin", async () => {
+		process.env.OTTR_SESSION_NAME = "Board check";
+		runtimeReady = false; // the load-time attempt dies on omp's stub, as in OTTR-413
+		const tools = await freshTools();
+		await settle();
+		runtimeReady = true;
+		expect(text(await call(tools))).toBe("Outcome recorded: ready");
+		expect(setSessionNameCalls).toEqual(["Board check"]);
+		expect(currentSessionName).toBe("Board check");
+		await settle(); // let the deferred retry loop finish so no timer leaks
+	});
+
+	test("the deferred retry names the session once omp's runtime is ready", async () => {
+		process.env.OTTR_SESSION_NAME = "Review";
+		runtimeReady = false;
+		const tools = await freshTools();
+		await settle(); // the load-time attempt fires here and dies on the stub
+		expect(setSessionNameCalls).toEqual([]);
+		runtimeReady = true;
+		await settle();
+		expect(setSessionNameCalls).toEqual(["Review"]);
+		expect(currentSessionName).toBe("Review");
+		expect(text(await call(tools))).toBe("Outcome recorded: ready");
+	});
+
+	test("a named pinned session is not renamed", async () => {
+		process.env.OTTR_SESSION_NAME = "Review";
+		runtimeReady = false;
+		await freshTools();
+		await settle(); // the load-time attempt fires here and dies on the stub
+		currentSessionName = "Agent named it first";
+		runtimeReady = true;
+		await settle(); // the retry sees the agent's name and leaves it alone
+		expect(setSessionNameCalls).toEqual([]);
+	});
+
+	test("an unnamed session without a pinned name still refuses once", async () => {
+		const tools = await freshTools();
+		await expect(call(tools)).rejects.toThrow(/rename/);
+		expect(setSessionNameCalls).toEqual([]);
 	});
 });
 
