@@ -437,8 +437,7 @@ textarea {
 .card .mark-needs,
 .area-ind .mark-needs,
 .needs-count .mark-needs,
-.needs-count .mark-asked,
-.inbox.lit .mark {
+.needs-count .mark-asked {
 	animation: mark-in 0.22s var(--ease) backwards;
 }
 @keyframes mark-in {
@@ -647,7 +646,8 @@ textarea {
 	color: var(--crit);
 }
 /* Phone-only bar chrome: the areas popout trigger; at wide viewports the rail takes its
-   place. The notification bell is the same on every viewport. */
+   place, and the bar's first icon folds the rail instead (.rail-toggle, hidden on phones).
+   The notification bell is the same on every viewport. */
 .areas-toggle {
 	display: none;
 }
@@ -1248,11 +1248,23 @@ textarea {
 .inbox.lit .inbox-n {
 	color: inherit;
 }
-.inbox.lit .mark {
-	fill: currentColor;
+/* No mark on the bell: the bell itself carries the level. While something needs you it fills in
+   the level colour (the count too); new notices fill the whole button and the bell turns ink. */
+.inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
+		.lit
+	)
+	> .icon-svg {
+	color: var(--lit);
+	fill: var(--lit);
 }
-.inbox.lit .mark-ink {
-	stroke: var(--lit); /* inverted mark, so it reads on the solid fill */
+.inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
+		.lit
+	)
+	.inbox-n {
+	color: var(--lit);
+}
+.inbox.lit > .icon-svg {
+	fill: currentColor;
 }
 .new-tag {
 	flex: none;
@@ -1564,33 +1576,16 @@ button.notif-link {
 		transition: none;
 	}
 }
+/* The rail's empty space folds it on click, so it shows the button pointer; its children reset to
+   their own cursors, so the label, the version text and the footer gaps never claim a click. */
 .rail {
 	padding: 8px 8px 6px;
 	gap: 4px;
 	background: var(--well);
+	cursor: pointer;
 }
-/* Last item of the footer, so the arrow stays at the bottom in both widths. */
-.rail-fold {
-	flex: none;
-	display: grid;
-	place-items: center;
-	width: 32px;
-	height: 32px;
-	min-height: 0;
-	padding: 0;
-	color: var(--dim);
-	background: transparent;
-	border: 1px solid transparent;
-	border-radius: 4px;
-}
-/* Bare at rest; hover lifts it to a light fill and border, like the board's buttons. */
-.rail-fold:hover {
-	color: var(--text-strong);
-	background: var(--card-hover);
-	border-color: var(--line-hover);
-}
-.rail-fold .icon-svg {
-	transform: rotate(180deg);
+.rail > :not(a, button) {
+	cursor: auto;
 }
 /* Rows stay bare until hover; the open page is a raised button: fill plus border. */
 .rail .area {
@@ -1598,8 +1593,15 @@ button.notif-link {
 	min-height: 40px;
 	padding: 0 6px;
 }
+/* Add project sits right under Overview, as a second top row. */
+.rail .area-add {
+	margin-top: 0;
+}
+/* Rail rows (projects, Overview, Add project, the account) hover with a fill and an outline;
+   the open page keeps the outline at rest. */
 .rail .area:hover {
 	background: var(--card-hover);
+	border-color: var(--line-hover);
 }
 .rail .area[aria-current="page"] {
 	background: var(--card);
@@ -1638,11 +1640,14 @@ button.notif-link {
 	width: 9px;
 	height: 9px;
 }
+/* "Projects" in sentence case at the rows' dim colour, no rule: the 10px gap above divides. */
 .rail .areas-label {
-	margin: 12px 6px 2px;
+	margin: 10px 6px 2px;
+	font-size: 12px;
 }
-/* Two rows: the centered "Ottr <version>" line, then Settings left and the fold right.
-   Collapsed, the same order stacks in one centered column. */
+/* Two rows: the centered "Ottr <version>" line, then the account chip (with its name).
+   Collapsed, the version and chip stack in one centered column. Settings lives in the
+   account menu. */
 .rail-foot {
 	display: flex;
 	flex-wrap: wrap;
@@ -1662,27 +1667,115 @@ button.notif-link {
 	gap: 8px;
 	margin: 0;
 }
-.rail-gear {
+/* Account: a round chip plus the name, one button that opens the account menu. */
+.rail-user {
+	flex: 1;
+	justify-content: flex-start;
+	gap: 10px;
+	min-width: 0;
+	min-height: 40px;
+	padding: 0 6px 0 2px;
 	color: var(--text);
-	text-decoration: none;
+	background: transparent;
+	border-color: transparent;
+	/* Same 4px box as the rail's other buttons; only the chip itself is round. */
 	border-radius: 4px;
 }
-/* Same 32px box and hover as .rail-fold. On Settings it stays raised to mark the page. */
-.rail-gear .rail-plate {
-	width: 32px;
-	height: 32px;
-	color: var(--dim);
-	border-radius: 4px;
-}
-.rail-gear:hover .rail-plate {
+.rail-user:hover {
 	color: var(--text-strong);
 	background: var(--card-hover);
 	border-color: var(--line-hover);
 }
-.rail-gear[aria-current="page"] .rail-plate {
-	color: var(--text-strong);
+.rail-user .rail-label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 13px;
+}
+/* A down caret says the chip opens a menu; it turns up while the menu is open. */
+.rail-user-caret {
+	display: grid;
+	color: var(--dim);
+}
+.rail-user-caret .icon-svg {
+	transform: rotate(90deg);
+	transition: transform 160ms var(--ease);
+}
+.rail:has(#user-menu:popover-open) .rail-user-caret .icon-svg {
+	transform: rotate(-90deg);
+}
+.user-chip {
+	display: grid;
+	flex: none;
+	place-items: center;
+	width: 32px;
+	height: 32px;
+	color: var(--dim);
 	background: var(--card);
-	border-color: var(--line-hover);
+	border: 1px solid var(--line);
+	border-radius: 50%;
+}
+/* Account menu: rows like the theme menu, opening upward from the chip. */
+.user-menu {
+	inset: auto;
+	min-width: 200px;
+	margin: 0;
+	padding: 6px;
+	color: var(--text);
+	background: var(--field);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	box-shadow: var(--shadow-overlay);
+}
+@supports (position-anchor: auto) {
+	.user-menu {
+		position-anchor: auto;
+		position-area: top span-right;
+		position-try-fallbacks: flip-inline;
+		margin-bottom: 6px;
+	}
+}
+.user-menu hr {
+	margin: 6px 4px;
+	border: 0;
+	border-top: 1px solid var(--line-soft);
+}
+/* Who the menu belongs to: one dim line above the rows, as a label, not a control. */
+.menu-who {
+	margin: 0;
+	padding: 4px 10px 6px;
+	overflow: hidden;
+	font-size: 12px;
+	color: var(--dim);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.menu-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	width: 100%;
+	min-height: 32px;
+	padding: 0 10px;
+	font: inherit;
+	font-size: 13px;
+	color: var(--text-strong);
+	text-decoration: none;
+	background: transparent;
+	border: 0;
+	border-radius: 4px;
+	justify-content: flex-start;
+	cursor: pointer;
+}
+.menu-row:hover {
+	background: var(--card);
+}
+.menu-row:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
+}
+.menu-row .icon-svg {
+	color: var(--dim);
 }
 .rail-ver {
 	color: var(--dim);
@@ -1691,9 +1784,6 @@ button.notif-link {
 }
 .rail[data-collapsed] {
 	padding: 8px 4px 6px;
-}
-.rail[data-collapsed] .rail-fold .icon-svg {
-	transform: none;
 }
 .rail[data-collapsed] .area {
 	justify-content: center;
@@ -1726,6 +1816,19 @@ button.notif-link {
 }
 .rail[data-collapsed] .rail-ver {
 	font-size: 11px;
+}
+.rail[data-collapsed] .rail-user {
+	flex: none;
+	padding: 2px;
+}
+.rail[data-collapsed] .rail-user-caret {
+	display: none;
+}
+/* The account menu owns Log out on desktop; phones keep the bar button (no rail there). */
+@media (min-width: 721px) {
+	.bar-logout {
+		display: none;
+	}
 }
 
 .main {
@@ -2532,33 +2635,40 @@ a.release:hover {
 	letter-spacing: 0.08em;
 	color: var(--dim);
 }
-/* Todo lane's backlog row: the count sits beside the label, the Add draft button takes the line's end. */
+/* Todo lane's backlog row: label left, the boxed count right (as in the stage heads),
+   and Add draft as a full-width dashed slot underneath, where the new draft lands. */
 .backlog-head {
 	display: flex;
+	flex-wrap: wrap;
 	align-items: center;
-	gap: 6px;
+	gap: 8px 6px;
 }
-.backlog-head .topic-count {
-	margin-left: 0;
-}
-.backlog-head .lane-add {
+.backlog-head .count {
 	margin-left: auto;
 }
 .lane-add {
-	display: inline-flex;
+	display: flex;
+	flex-basis: 100%;
 	align-items: center;
-	gap: 3px;
-	padding: 1px 5px;
-	font-size: 11px;
+	justify-content: center;
+	gap: 4px;
+	min-height: 32px;
+	padding: 0;
+	font-size: 12px;
+	font-weight: 500;
+	letter-spacing: 0;
+	text-transform: none;
 	color: var(--dim);
 	background: transparent;
-	border: 1px dashed var(--line-soft);
+	border: 1px dashed var(--line);
 	border-radius: 4px;
 	cursor: pointer;
 }
 .lane-add:hover {
+	color: var(--text-strong);
+	background: var(--card-hover);
 	border-style: solid;
-	color: var(--text);
+	border-color: var(--line-hover);
 }
 /* Done lane "Show more": a quiet full-width button under the last page of cards. */
 .lane-more {
@@ -3792,9 +3902,12 @@ dialog.diff-view {
 	border: 1px solid var(--line-soft);
 	border-radius: 6px;
 }
+/* 5px left room: the map's top-level nodes centre on the page link's steel bar, and the scroll
+   box would clip their left half. */
 .settings-nav {
 	max-height: 100vh;
 	overflow-y: auto;
+	padding-left: 5px;
 }
 /* Card anatomy: head (title row + hint), body, optional foot. */
 .settings-sec {
@@ -3942,84 +4055,92 @@ dialog.diff-view {
 	text-transform: uppercase;
 	color: var(--dim);
 }
-/* Settings map under the current page link: a path line naming the current card, then one
-   line of stops. Groups are rings, cards dots, sub-blocks small dots; the line is darker up
-   to the current stop, and the current stop is the page's one steel mark (One-Edge Rule). */
-.smap-path {
-	margin: 8px 0 4px 12px;
-	font-size: 12px;
-	line-height: 1.4;
-	color: var(--dim);
+/* Settings map under the current page link: the page as a lineage-style tree (as in the drawer's
+   lineage rail). Each row centres a hollow node on a 1px thread between siblings; children sit
+   one indent in, hang from a stem under the parent's node, and each gets one elbow. The current
+   entry is the page's one steel node (One-Edge Rule). */
+.smap-tree {
+	--indent: 18px;
+	--row: 26px;
+	margin: 8px 0 10px;
+	/* The top-level thread sits on the left edge, under the current page link's steel bar. */
+	padding: 0;
 }
-.smap-path b {
-	font-weight: 600;
-	color: var(--text-strong);
-}
-.smap-line {
-	margin: 0 0 10px;
-	padding: 0 0 0 12px;
+.smap-tree,
+.smap-tree ol {
 	list-style: none;
 }
-.smap-stop {
-	position: relative;
-	padding-left: 20px;
+.smap-tree ol {
+	margin: 0;
+	padding: 0;
 }
-.smap-stop::before {
+.smap-tree li {
+	position: relative;
+	padding-left: var(--indent);
+}
+.smap-tree li::before {
 	content: "";
 	position: absolute;
-	left: 5px;
+	left: 0;
 	top: 0;
 	bottom: 0;
 	width: 1px;
-	background: var(--line-soft);
+	background: var(--line);
 }
-.smap-stop:first-child::before {
-	top: 50%;
+.smap-tree > li:first-child::before {
+	top: calc(var(--row) / 2);
 }
-.smap-stop:last-child::before {
-	bottom: 50%;
+.smap-tree > li:last-child::before,
+.smap-tree ol > li:last-child::before {
+	bottom: auto;
+	height: calc(var(--row) / 2);
 }
-.smap-stop[data-state="past"]::before {
-	background: var(--dim);
+/* A child thread starts at its parent's node, not at the parent's row bottom, so every first
+   child joins its parent without a gap (the last top-level group has no sibling thread below). */
+.smap-tree ol > li:first-child::before {
+	top: calc(var(--row) / -2);
 }
-.smap-dot {
+.smap-tree ol > li:only-child::before {
+	height: var(--row);
+}
+.smap-tree ol > li::before {
+	left: calc(0px - var(--indent));
+}
+.smap-tree ol > li > .smap-row::before {
+	content: "";
 	position: absolute;
-	left: 5px;
-	top: 50%;
+	left: calc(0px - var(--indent));
+	top: calc(var(--row) / 2);
+	width: calc(var(--indent) - 4px);
+	height: 1px;
+	background: var(--line);
+}
+.smap-tree li::after {
+	content: "";
+	position: absolute;
+	left: -4px;
+	top: calc(var(--row) / 2 - 4.5px);
+	width: 9px;
+	height: 9px;
+	box-sizing: border-box;
+	border: 1px solid var(--line-hover);
+	border-radius: 50%;
+	background: var(--well);
+}
+.smap-tree li[data-depth="2"]::after {
+	left: -3px;
+	top: calc(var(--row) / 2 - 3.5px);
 	width: 7px;
 	height: 7px;
-	border-radius: 50%;
-	background: var(--line);
-	transform: translate(-50%, -50%);
 }
-.smap-stop[data-depth="0"] .smap-dot {
-	width: 11px;
-	height: 11px;
-	background: var(--field);
-	border: 1px solid var(--line);
-}
-.smap-stop[data-depth="2"] .smap-dot {
-	width: 5px;
-	height: 5px;
-}
-.smap-stop[data-state="past"] .smap-dot {
-	background: var(--dim);
-	border-color: var(--dim);
-}
-.smap-stop[data-depth="0"][data-state="past"] .smap-dot {
-	background: var(--field);
-}
-.smap-stop[data-state="here"] .smap-dot {
-	width: 11px;
-	height: 11px;
+.smap-tree li[data-state="here"]::after {
+	border-color: var(--accent);
 	background: var(--accent);
-	border: 2px solid var(--field);
-	box-shadow: 0 0 0 1px var(--accent);
 }
-.smap-stop button {
+.smap-row {
 	display: block;
 	width: 100%;
-	min-height: 26px;
+	min-height: var(--row);
 	padding: 3px 6px;
 	font: inherit;
 	font-size: 12.5px;
@@ -4030,23 +4151,19 @@ dialog.diff-view {
 	border-radius: 3px;
 	cursor: pointer;
 }
-.smap-stop[data-depth="0"] button {
-	margin-top: 6px;
+.smap-tree li[data-depth="0"] > .smap-row {
 	font-weight: 500;
 	color: var(--text);
 }
-.smap-stop[data-depth="2"] button {
-	padding-left: 16px;
-}
-.smap-stop button:hover {
+.smap-row:hover {
 	color: var(--text-strong);
 	background: var(--panel);
 }
-.smap-stop[data-state="here"] > button {
+.smap-tree li[data-state="here"] > .smap-row {
 	font-weight: 600;
 	color: var(--text-strong);
 }
-.smap-stop button:focus-visible,
+.smap-row:focus-visible,
 .settings-toc-mobile > summary:focus-visible {
 	outline: 2px solid var(--accent);
 	outline-offset: -2px;
@@ -4110,6 +4227,7 @@ dialog.diff-view {
 		align-items: center;
 		gap: 0 12px;
 		max-height: none;
+		padding-left: 0;
 		border-bottom: 1px solid var(--line-soft);
 	}
 	.settings-nav .smap {
@@ -4140,8 +4258,9 @@ dialog.diff-view {
 	.settings-toc-mobile > .smap {
 		padding-bottom: 8px;
 	}
-	.settings-toc-mobile .smap-stop button {
-		min-height: 44px;
+	/* 44px touch rows; the nodes and elbows follow --row. */
+	.settings-toc-mobile .smap-tree {
+		--row: 44px;
 	}
 	.snb {
 		min-height: 44px;
@@ -5810,6 +5929,9 @@ button.diff-path {
 	}
 	.areas-toggle {
 		display: inline-flex;
+	}
+	.rail-toggle {
+		display: none;
 	}
 	/* The fill already says new and the bar keeps its room for the meters;
 	   the accessible name keeps the word. */

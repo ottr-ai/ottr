@@ -23,6 +23,7 @@ import {
 	CloseButton,
 	clamp,
 	copyText,
+	Help,
 	Icon,
 	interviewMsg,
 	logOut,
@@ -3468,27 +3469,6 @@ function LearningsSection({
 
 type ChipTone = "ok" | "warn" | "off";
 
-/** "?" badge: one short explanation in a native popover. Click, Enter or Space opens it; Esc or a click outside closes it. */
-function Help({ label, text }: { label: string; text: string }) {
-	const id = useId();
-	return (
-		<>
-			<button
-				type="button"
-				className="help-badge"
-				popoverTarget={id}
-				aria-label={`About ${label}`}
-				title={`About ${label}`}
-			>
-				<Icon name="help" size={13} />
-			</button>
-			<span id={id} popover="auto" className="help-pop">
-				{text}
-			</span>
-		</>
-	);
-}
-
 /** One definition row: name (with an optional "?" explanation), purpose and value shape on the left, the value on the right. */
 function DefRow({
 	name,
@@ -3664,9 +3644,9 @@ type TocGroup = {
 	readonly sections: readonly TocSection[];
 };
 
-/** The settings map: a path line names the current card, then one line of stops (groups as
- *  rings, cards as dots, sub-blocks as small dots). The line is darker up to the current stop,
- *  which is the one steel dot. One group (a project page) drops the group stops. */
+/** The settings map: the page as a lineage-style tree (groups, their cards one indent in,
+ *  sub-blocks one more): hollow nodes on a 1px thread, an elbow into each level, and the
+ *  current entry as the one steel node. One group (a project page) drops the group level. */
 function SettingsMap({
 	groups,
 	hash,
@@ -3690,57 +3670,70 @@ function SettingsMap({
 		0,
 		flat.findIndex((x) => x.id === active),
 	);
-	const here = flat[hi];
-	if (here === undefined) return null;
+	if (flat.length === 0) return null;
 	const state = (i: number) => (i < hi ? "past" : i === hi ? "here" : "ahead");
-	const stops = groups.flatMap((g) => {
-		const first = flat.findIndex((x) => x.g === g);
-		const head = named
-			? [
-					{
-						id: g.sections[0]?.id ?? "",
-						key: g.id,
-						label: g.label,
-						depth: 0,
-						state: first <= hi ? "past" : "ahead",
-					},
-				]
-			: [];
-		return [
-			...head,
-			...flat.flatMap((x, i) =>
-				x.g === g ? [{ ...x, key: x.id, state: state(i) }] : [],
-			),
-		];
+	type MapNode = {
+		id: string;
+		label: string;
+		depth: number;
+		state: string;
+		kids: MapNode[];
+	};
+	const node = (
+		id: string,
+		label: string,
+		depth: number,
+		kids: MapNode[] = [],
+	): MapNode => ({
+		id,
+		label,
+		depth,
+		state: state(flat.findIndex((x) => x.id === id)),
+		kids,
 	});
+	const cards = (g: TocGroup): MapNode[] =>
+		g.sections.map((s) =>
+			node(
+				s.id,
+				s.label,
+				1,
+				(s.blocks ?? []).map((b) => node(b.id, b.label, 2)),
+			),
+		);
+	const tree: MapNode[] = named
+		? groups.map((g) => ({
+				id: g.sections[0]?.id ?? "",
+				label: g.label,
+				depth: 0,
+				state: "group",
+				kids: cards(g),
+			}))
+		: groups.flatMap(cards);
+	const branch = (nodes: MapNode[]) =>
+		nodes.map((n) => (
+			<li
+				key={`${n.depth}-${n.label}`}
+				data-depth={n.depth}
+				data-state={n.state}
+			>
+				<button
+					type="button"
+					className="smap-row"
+					aria-current={n.state === "here" ? "location" : undefined}
+					onClick={() => {
+						onPick(n.id);
+						openSettingsSection(n.id, hash);
+					}}
+				>
+					{n.label}
+				</button>
+				{n.kids.length > 0 && <ol>{branch(n.kids)}</ol>}
+			</li>
+		));
 	return (
 		<div className="smap">
-			<p className="smap-path">
-				{named ? `${here.g.label} / ` : ""}
-				{here.depth === 2 ? `${here.s.label} / ` : ""}
-				<b>{here.label}</b>
-			</p>
-			<ol className="smap-line" aria-label="On this page">
-				{stops.map((st) => (
-					<li
-						key={st.key}
-						className="smap-stop"
-						data-depth={st.depth}
-						data-state={st.state}
-					>
-						<span className="smap-dot" aria-hidden="true" />
-						<button
-							type="button"
-							aria-current={st.state === "here" ? "location" : undefined}
-							onClick={() => {
-								onPick(st.id);
-								openSettingsSection(st.id, hash);
-							}}
-						>
-							{st.label}
-						</button>
-					</li>
-				))}
+			<ol className="smap-tree" aria-label="On this page">
+				{branch(tree)}
 			</ol>
 		</div>
 	);

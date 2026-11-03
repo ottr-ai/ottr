@@ -4276,7 +4276,7 @@ export function LaneCol({
 					<p className="lane-label backlog-head">
 						Backlog
 						{parkedTotal !== undefined && (
-							<span className="topic-count">{parkedTotal}</span>
+							<span className="count">{parkedTotal}</span>
 						)}
 						{onAddDraft && (
 							<button
@@ -7961,6 +7961,7 @@ function railRow(p: ProjectView, tasks: TaskCard[]) {
 	const needs = split.needs.length;
 	const asks = split.asks.length;
 	const waiting = own.filter((t) => t.state === "queued").length;
+	// The one mark a row shows, by rank: needs action > asked > running. Waiting has no mark.
 	const top =
 		needs > 0
 			? ("needs" as const)
@@ -7968,9 +7969,7 @@ function railRow(p: ProjectView, tasks: TaskCard[]) {
 				? ("asked" as const)
 				: running > 0
 					? ("running" as const)
-					: waiting > 0
-						? ("queued" as const)
-						: null;
+					: null;
 	const summary = [
 		needs > 0 ? `${needs} need action` : "",
 		asks > 0 ? `${asks} asked` : "",
@@ -8244,11 +8243,25 @@ function App() {
 	const [railCollapsed, setRailCollapsed] = useState(
 		() => localStorage.getItem("ottr.rail.collapsed") === "1",
 	);
-	const toggleRail = (): void =>
-		setRailCollapsed((c) => {
-			localStorage.setItem("ottr.rail.collapsed", c ? "0" : "1");
-			return !c;
-		});
+	const toggleRail = useCallback(
+		(): void =>
+			setRailCollapsed((c) => {
+				localStorage.setItem("ottr.rail.collapsed", c ? "0" : "1");
+				return !c;
+			}),
+		[],
+	);
+	// "[" folds the rail (Linear's key), except while typing or with a modifier held.
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent): void => {
+			if (e.key !== "[" || e.ctrlKey || e.metaKey || e.altKey) return;
+			const t = e.target as HTMLElement | null;
+			if (t?.closest("input, textarea, select, [contenteditable]")) return;
+			toggleRail();
+		};
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
+	}, [toggleRail]);
 	// A dev build reports a full commit sha; the rail shows its 7-character short form.
 	const railVersion =
 		bootVersion !== null && /^[0-9a-f]{12,}$/.test(bootVersion)
@@ -9018,6 +9031,19 @@ function App() {
 						onAdd={() => setShowAdd(true)}
 					/>
 				</div>
+				<button
+					type="button"
+					className="icon rail-toggle"
+					aria-expanded={!railCollapsed}
+					aria-keyshortcuts="["
+					aria-label={
+						railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
+					}
+					title={`${railCollapsed ? "Expand" : "Collapse"} the sidebar ([)`}
+					onClick={toggleRail}
+				>
+					<Icon name="panel-left" />
+				</button>
 				<a className="brand" href="/">
 					<img src={logo} alt="" />
 					<span>Ottr</span>
@@ -9060,9 +9086,6 @@ function App() {
 					aria-label={inboxName}
 				>
 					<Icon name="bell" />
-					{inbox.level !== null && inbox.level !== "info" && (
-						<Mark key={inbox.level} kind={inbox.level} />
-					)}
 					{inbox.total > 0 && (
 						<span className="inbox-n">
 							{inbox.lit ? inbox.fresh.length : inbox.total}
@@ -9198,7 +9221,7 @@ function App() {
 				{state?.user != null && (
 					<button
 						type="button"
-						className="icon"
+						className="icon bar-logout"
 						title={`Log out ${state.user}`}
 						aria-label={`Log out ${state.user}`}
 						// act surfaces a failed POST as an error and leaves the button usable;
@@ -9214,10 +9237,15 @@ function App() {
 				className="shell"
 				data-rail={railCollapsed ? "collapsed" : undefined}
 			>
+				{/* biome-ignore lint/a11y/useKeyWithClickEvents: a mouse shortcut only; the fold button in the footer is the keyboard path */}
 				<nav
 					className="areas rail"
 					aria-label="Projects"
 					data-collapsed={railCollapsed || undefined}
+					// A click on the rail's empty space (not on a row or the footer) folds it, like the fold button.
+					onClick={(e) => {
+						if (e.target === e.currentTarget) toggleRail();
+					}}
 				>
 					<a
 						className="area"
@@ -9233,10 +9261,19 @@ function App() {
 						</span>
 						<span className="area-name rail-label">Overview</span>
 					</a>
-					<p className="areas-label">
-						PROJECTS
-						<span className="areas-rule" aria-hidden="true" />
-					</p>
+					<button
+						type="button"
+						className="area area-add"
+						aria-label="Add project"
+						title={railCollapsed ? "Add project" : undefined}
+						onClick={() => setShowAdd(true)}
+					>
+						<span className="rail-plate icon">
+							<Icon name="plus" size={13} />
+						</span>
+						<span className="rail-label">Add project</span>
+					</button>
+					<p className="areas-label">Projects</p>
 					<ul>
 						{projects.map((p) => {
 							const r = railRow(p, tasks);
@@ -9263,35 +9300,14 @@ function App() {
 										<span className="area-name rail-label">
 											{projectLabel(p)}
 										</span>
-										{r.needs > 0 && (
-											<span className="area-ind needs">
-												<Mark kind="needs" />
-												{r.needs}
-												<span className="sr"> need action</span>
+										{/* One mark, the highest ranked; the full counts sit in the title and
+										    for screen readers. */}
+										{r.top !== null && (
+											<span className={`area-ind ${r.top}`} title={r.summary}>
+												<Mark kind={r.top} />
 											</span>
 										)}
-										{r.asks > 0 && (
-											<span className="area-ind asked">
-												<Mark kind="asked" />
-												{r.asks}
-												<span className="sr"> asked</span>
-											</span>
-										)}
-										{r.running > 0 && (
-											<span className="area-ind">
-												<Mark kind="running" />
-												{r.running}
-												<span className="sr"> running</span>
-											</span>
-										)}
-										{r.waiting > 0 && (
-											<span className="area-ind waiting">
-												<Mark kind="queued" />
-												{r.waiting}
-												<span className="sr"> waiting</span>
-											</span>
-										)}
-										{railCollapsed && r.summary !== "" && (
+										{r.summary !== "" && (
 											<span className="sr">: {r.summary}</span>
 										)}
 									</a>
@@ -9299,18 +9315,6 @@ function App() {
 							);
 						})}
 					</ul>
-					<button
-						type="button"
-						className="area area-add"
-						aria-label="Add project"
-						title={railCollapsed ? "Add project" : undefined}
-						onClick={() => setShowAdd(true)}
-					>
-						<span className="rail-plate icon">
-							<Icon name="plus" size={13} />
-						</span>
-						<span className="rail-label">Add project</span>
-					</button>
 					<footer className="rail-foot">
 						<p className="rail-ident">
 							<a
@@ -9328,32 +9332,55 @@ function App() {
 								</span>
 							)}
 						</p>
-						<a
-							className="rail-gear"
-							href={`#${SETTINGS_HASH}`}
-							aria-label="Settings"
-							title="Settings"
-							aria-current={settingsRoute.onSettings ? "page" : undefined}
-						>
-							<span className="rail-plate icon">
-								<Icon name="gear" size={13} />
-							</span>
-						</a>
+						{/* ponytail: placeholder account chip; swap in the user's avatar and name when
+				    		    Ottr gets user accounts. */}
 						<button
 							type="button"
-							className="rail-fold"
-							aria-expanded={!railCollapsed}
-							aria-label={
-								railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
-							}
-							title={
-								railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
-							}
-							onClick={toggleRail}
+							className="rail-user"
+							popoverTarget="user-menu"
+							title={railCollapsed ? "Account" : undefined}
+							aria-label={`Account menu, ${state?.user ?? "operator"}`}
 						>
-							<Icon name="chevron-right" size={14} />
+							<span className="user-chip" aria-hidden="true">
+								<Icon name="user" size={15} />
+							</span>
+							<span className="rail-label">{state?.user ?? "Operator"}</span>
+							<span className="rail-user-caret" aria-hidden="true">
+								<Icon name="chevron-right" size={12} />
+							</span>
 						</button>
 					</footer>
+					<div id="user-menu" popover="auto" className="user-menu">
+						<p className="menu-who">
+							{state?.user == null
+								? "Local access, no login"
+								: `Signed in as ${state.user}`}
+						</p>
+						<a
+							className="menu-row"
+							href={`#${SETTINGS_HASH}`}
+							onClick={() =>
+								document.getElementById("user-menu")?.hidePopover()
+							}
+						>
+							<Icon name="gear" size={14} />
+							Settings
+						</a>
+						{state?.user != null && (
+							<>
+								<hr />
+								<button
+									type="button"
+									className="menu-row"
+									// act surfaces a failed POST as an error; only a confirmed logout reloads.
+									onClick={() => void act(logOut)}
+								>
+									<Icon name="log-out" size={14} />
+									Log out
+								</button>
+							</>
+						)}
+					</div>
 				</nav>
 
 				<main className="main">

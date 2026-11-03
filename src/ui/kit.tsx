@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import {
 	useCallback,
 	useEffect,
+	useId,
 	useLayoutEffect,
 	useRef,
 	useState,
@@ -12,6 +13,27 @@ import { stamp, until } from "./time.ts";
 
 export function clamp(n: number, lo: number, hi: number): number {
 	return Math.min(hi, Math.max(lo, n));
+}
+
+/** "?" badge: one short explanation in a native popover. Click, Enter or Space opens it; Esc or a click outside closes it. */
+export function Help({ label, text }: { label: string; text: ReactNode }) {
+	const id = useId();
+	return (
+		<>
+			<button
+				type="button"
+				className="help-badge"
+				popoverTarget={id}
+				aria-label={`About ${label}`}
+				title={`About ${label}`}
+			>
+				<Icon name="help" size={13} />
+			</button>
+			<span id={id} popover="auto" className="help-pop">
+				{text}
+			</span>
+		</>
+	);
 }
 
 // ponytail: inline Feather (MIT) paths instead of @phosphor-icons/react; swap to the library if this set grows
@@ -100,6 +122,13 @@ const ICON_PATHS = {
 			<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
 		</>
 	),
+	// lucide user (ISC): placeholder avatar until Ottr has user accounts
+	user: (
+		<>
+			<circle cx="12" cy="8" r="4" />
+			<path d="M4 21a8 8 0 0 1 16 0" />
+		</>
+	),
 	moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />,
 	tag: (
 		<>
@@ -171,6 +200,13 @@ const ICON_PATHS = {
 			<path d="m10 14 11.9-6.9" />
 			<path d="M14 19.8v-8.1" />
 			<path d="M18 17.5V9.4" />
+		</>
+	),
+	// lucide panel-left (ISC): the app bar's sidebar toggle
+	"panel-left": (
+		<>
+			<rect x="3" y="3" width="18" height="18" rx="2" />
+			<path d="M9 3v18" />
 		</>
 	),
 	// lucide chevrons-up / chevrons-down (ISC): collapse-all / expand-all lane tools

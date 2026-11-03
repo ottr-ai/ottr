@@ -1076,9 +1076,7 @@ describe("settings TOC", () => {
 		const nav =
 			html.match(/<nav[^>]*class="[^"]*settings-nav[\s\S]*?<\/nav>/)?.[0] ?? "";
 		const tocLabels = [
-			...nav.matchAll(
-				/class="smap-stop"[^>]*><span[^>]*><\/span><button[^>]*>([^<]*)<\/button>/g,
-			),
+			...nav.matchAll(/class="smap-row"[^>]*>([^<]*)<\/button>/g),
 		].map((m) => m[1]);
 		expect(tocLabels).toEqual(
 			SETTINGS_TOC.flatMap((g) => [
