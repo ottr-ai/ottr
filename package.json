@@ -26,6 +26,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "fast-check": "^4.10.2",
+    "happy-dom": "^21.0.4",
     "jscpd": "5.4.2",
     "knip": "6.43.0",
     "typescript": "^7.0.2"

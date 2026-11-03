@@ -4,6 +4,7 @@ const ALLOWED: Record<string, true> = {
 	"0BSD": true,
 	"Apache-2.0": true,
 	"BlueOak-1.0.0": true,
+	"BSD-2-Clause": true,
 	"BSD-3-Clause": true,
 	"CC-BY-4.0": true,
 	ISC: true,
