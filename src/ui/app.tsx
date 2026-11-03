@@ -142,6 +142,7 @@ import {
 	slotUse,
 } from "./queue.ts";
 import {
+	historyTask,
 	migrateHash,
 	navClick,
 	projectPath,
@@ -8788,8 +8789,9 @@ function App() {
 	// parent walk would pop to the child's entry and reopen it instead of closing.
 	useEffect(() => {
 		const onPop = (e: PopStateEvent): void => {
-			setView(readPath().view);
-			setSelectedId((e.state as { ompTask?: string } | null)?.ompTask ?? null);
+			const path = readPath();
+			setView(path.view);
+			setSelectedId(historyTask(e.state, path.task));
 		};
 		window.addEventListener("popstate", onPop);
 		return () => window.removeEventListener("popstate", onPop);

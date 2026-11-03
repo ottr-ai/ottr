@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+	historyTask,
 	migrateHash,
 	navClick,
 	projectPath,
@@ -156,4 +157,18 @@ test("navClick preventDefaults a plain click and navigates to the anchor's path"
 	// The closure assigns navigated, but TS keeps the initializer's null narrowing here;
 	// widen X or the string argument cannot match.
 	expect(navigated).toBe<string | null>("/projects/p1/tasks/X");
+});
+
+test("historyTask takes the entry's card id first, then the path's card", () => {
+	// A deep link's first entry carries no state: the path names the open card.
+	expect(historyTask(null, "X")).toBe("X");
+	// An entry pushed by openTask carries the card in state.
+	expect(historyTask({ ompTask: "Y" }, "X")).toBe("Y");
+	// Entries pushed before the path scheme carry the card in state alone.
+	expect(historyTask({ ompTask: "Y" }, null)).toBe("Y");
+	// Junk state falls through to the path.
+	expect(historyTask({ ompTask: 5 }, "X")).toBe("X");
+	expect(historyTask("card", "X")).toBe("X");
+	// Neither source names a card: the drawer closes.
+	expect(historyTask(null, null)).toBeNull();
 });

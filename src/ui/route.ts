@@ -18,6 +18,21 @@ export interface PathView {
 	task: string | null;
 }
 
+/** The card a Back/Forward traversal opens: the entry's stored card id first (entries
+ * pushed before the path scheme carry the card in history state alone), else the card
+ * the pathname names — the first entry of a deep link has null state, and its URL is
+ * the only record of the open card. */
+export function historyTask(
+	state: unknown,
+	task: string | null,
+): string | null {
+	if (typeof state === "object" && state !== null && "ompTask" in state) {
+		const id: unknown = state.ompTask;
+		if (typeof id === "string") return id;
+	}
+	return task;
+}
+
 /** The view string and open card id from location.pathname: "/" is the overview,
  * "/projects/<project>" a project, "/projects/<project>/tasks/<id>" that project with the
  * card's drawer open, "/settings" and "/settings/<project>" Settings. Each segment is
