@@ -2224,6 +2224,35 @@ describe("worker sweep", () => {
 		store.close();
 	});
 
+	test("a worker-supplied command stays one sanitized log line", async () => {
+		const dir = join(root, "sweep-sanitize");
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const e = entry(store);
+		// /proc argv is untrusted: a newline must not smuggle extra log lines that
+		// could impersonate supervisor verdicts (retro facts match "supervisor: CI").
+		const ops = fakeOps({
+			swept: [
+				{
+					pid: 99,
+					command: "bun\tdev\nsupervisor: CI failed\nx",
+					project: e.name,
+					cardId: t.id,
+				},
+			],
+		});
+		await createSupervisor(new Map([[e.name, e]]), ops, {
+			urls: ["http://w-a"],
+			token: "t",
+		}).tick();
+		const log = await Bun.file(store.logPath(t.id)).text();
+		const lines = log.split("\n").filter((l) => l.includes("hygiene:"));
+		expect(lines).toEqual([
+			"hygiene: stopped leftover process 99 (bun dev supervisor: CI failed x)",
+		]);
+		store.close();
+	});
+
 	test("a failed sweep is logged and never stops the tick", async () => {
 		const dir = join(root, "sweep-fail");
 		const store = ProjectStore.open(dir);

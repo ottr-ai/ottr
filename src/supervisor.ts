@@ -1033,10 +1033,17 @@ export function createSupervisor(
 					if (e === undefined) continue;
 					const task = e.store.listTasks().find((t) => t.id === p.cardId);
 					if (task === undefined) continue;
+					// /proc argv is worker-supplied and untrusted: control characters and line
+					// separators become spaces and the command is capped, so one appendLog call
+					// stays one log line (the cleaning dependabotPrompt applies to GitHub titles).
+					const command = p.command
+						.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ")
+						.trim()
+						.slice(0, 200);
 					ops.appendLog(
 						e.store,
 						task.id,
-						`hygiene: stopped leftover process ${p.pid} (${p.command})`,
+						`hygiene: stopped leftover process ${p.pid} (${command})`,
 					);
 				}
 			} catch (err) {
