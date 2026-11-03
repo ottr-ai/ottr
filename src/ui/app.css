@@ -3057,6 +3057,19 @@ a.release:hover {
 
 /* ---- Performance section on the overview ---- */
 
+/* A task-linked tile or cell value: an inline button that reads as the value text. */
+.v-link {
+	background: none;
+	border: 0;
+	padding: 0;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+.v-link:hover {
+	color: var(--accent);
+}
+
 /* Range pills ride the section head's right edge; the spinner slots in before them. */
 .perf-range {
 	display: flex;
@@ -6189,6 +6202,10 @@ button.diff-path {
 	}
 	button {
 		min-height: 40px;
+	}
+	/* Inline value links stay text-sized inside KPI tiles and table cells. */
+	.v-link {
+		min-height: 0;
 	}
 	button.icon {
 		min-width: 40px;

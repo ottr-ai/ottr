@@ -917,6 +917,12 @@ export interface PerfMetrics {
 	/** Average final context-window size (prompt tokens) over the window's done tasks
 	 *  with a captured reading; null when none has one. */
 	contextAvgTokens: PerfStat;
+	/** Largest final context-window size (prompt tokens) over the window's done tasks
+	 *  with a captured reading; null when none has one. Same shape rules as contextAvgTokens. */
+	contextMaxTokens: PerfStat;
+	/** The done task holding contextMaxTokens.value, named so the board can link to it;
+	 *  null whenever the value is null. */
+	contextMaxTask: { project: string; id: string } | null;
 	/** Counts of the current window. */
 	done: number;
 	firstPassDone: number;

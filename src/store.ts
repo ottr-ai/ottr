@@ -2093,6 +2093,8 @@ export class ProjectStore {
 			.all();
 		return {
 			tasks: tasks.map((t) => ({
+				id: t.id,
+				project: this.name,
 				createdAt: t.created_at,
 				doneAt: doneAt.get(t.id) ?? null,
 				cancelled: t.cancelled_at !== null,

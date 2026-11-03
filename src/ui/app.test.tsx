@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { ProjectView, TaskCard, UpdateRow } from "../types.ts";
+import type {
+	PerfMetrics,
+	PerfStat,
+	ProjectView,
+	TaskCard,
+	UpdateRow,
+} from "../types.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -22,6 +28,8 @@ const {
 	doneTopicPages,
 	cancelledTopic,
 	Overview,
+	KpiStrip,
+	PerfTable,
 	coveredUpdateIds,
 	recommendsSteps,
 	serverLine,
@@ -1789,5 +1797,93 @@ describe("LaneCol release hold", () => {
 		);
 		expect(html).toContain("hold-link");
 		expect(html).toContain("r1");
+	});
+});
+
+describe("Overview Context, max tile and column", () => {
+	// A stat with one reading or a silent one; the fixtures stay as small as the strip reads.
+	const st = (v: number | null): PerfStat => ({
+		value: v,
+		prev: null,
+		series: v === null ? [null] : [v],
+	});
+	const fleet = (
+		contextMaxTokens: PerfStat,
+		contextMaxTask: {
+			project: string;
+			id: string;
+		} | null,
+	): PerfMetrics => ({
+		throughput: st(3),
+		leadMedianMs: st(60000),
+		leadP90Ms: st(120000),
+		firstPass: st(0.8),
+		failure: st(0.05),
+		spend: st(1.5),
+		contextAvgTokens: st(90_000),
+		contextMaxTokens,
+		contextMaxTask,
+		done: 4,
+		firstPassDone: 3,
+		turns: 10,
+		failedTurns: 1,
+		costMissing: 0,
+		contextMissing: 0,
+	});
+	// PerfTable's project lookup reads only the name and display name.
+	const project = {
+		name: "ottr",
+		settings: {},
+	} as unknown as ProjectView;
+
+	test("the max tile renders and links its task", () => {
+		let opened = "";
+		const html = renderToStaticMarkup(
+			<KpiStrip
+				fleet={fleet(st(130_000), { project: "ottr", id: "big-2" })}
+				openTask={(id) => {
+					opened = id;
+				}}
+			/>,
+		);
+		expect(html).toContain("Context, max");
+		expect(html).toContain("130k");
+		expect(html).toContain("big-2");
+		expect(html).toContain(`title="Open ottr big-2"`);
+		// Static markup cannot fire events; the onClick wiring is the openTask id above.
+		expect(opened).toBe("");
+	});
+
+	test("the max tile shows a dash without any reading", () => {
+		const html = renderToStaticMarkup(
+			<KpiStrip fleet={fleet(st(null), null)} openTask={() => {}} />,
+		);
+		expect(html).toContain("Context, max");
+		expect(html).toContain("–");
+		expect(html).not.toContain("v-link");
+	});
+
+	test("the per-project table column links its task", () => {
+		const html = renderToStaticMarkup(
+			<PerfTable
+				perf={{
+					range: "all",
+					bucketMs: 3_600_000,
+					seriesStart: 0,
+					fleet: fleet(st(130_000), { project: "ottr", id: "big-2" }),
+					projects: [
+						{
+							...fleet(st(130_000), { project: "ottr", id: "big-2" }),
+							name: "ottr",
+						},
+					],
+				}}
+				projects={[project]}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html).toContain("Context (max)");
+		expect(html).toContain("130k");
+		expect(html).toContain(`title="Open ottr big-2"`);
 	});
 });

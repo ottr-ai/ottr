@@ -3267,11 +3267,12 @@ export function Overview({
 			{perfStatus}
 			{perf !== null && (
 				<div className="ov-wrap">
-					<KpiStrip fleet={perf.fleet} />
+					<KpiStrip fleet={perf.fleet} openTask={openTask} />
 					<PerfTable
 						perf={perf}
 						projects={projects}
 						firstCol={`By project · ${PERF_RANGE_LABELS[perf.range]}`}
+						openTask={openTask}
 					/>
 				</div>
 			)}
@@ -3663,9 +3664,15 @@ const tokFmt = (v: number | null) =>
 				? `${Math.round(v / 1000)}k`
 				: String(v);
 
-/** The six fleet tiles: grey everywhere, an amber edge only on a
+/** The seven fleet tiles: grey everywhere, an amber edge only on a
  * failure rate past the 0.10 alarm line. */
-function KpiStrip({ fleet: f }: { fleet: PerfMetrics }) {
+export function KpiStrip({
+	fleet: f,
+	openTask,
+}: {
+	fleet: PerfMetrics;
+	openTask: (id: string) => void;
+}) {
 	const ptsFmt = (v: number) => `${Math.round(v * 100)} pts`;
 	return (
 		<div className="kpis">
@@ -3724,6 +3731,23 @@ function KpiStrip({ fleet: f }: { fleet: PerfMetrics }) {
 				dFmt={tokFmt}
 				pFmt={tokFmt}
 			/>
+			<Kpi
+				label="Context, max"
+				stat={f.contextMaxTokens}
+				text={tokFmt(f.contextMaxTokens.value)}
+				sub={f.contextMaxTask === null ? null : f.contextMaxTask.id}
+				dFmt={tokFmt}
+				pFmt={tokFmt}
+				link={
+					f.contextMaxTask === null
+						? undefined
+						: {
+								id: f.contextMaxTask.id,
+								title: `Open ${f.contextMaxTask.project} ${f.contextMaxTask.id}`,
+							}
+				}
+				onOpen={openTask}
+			/>
 		</div>
 	);
 }
@@ -3739,6 +3763,8 @@ function Kpi({
 	dFmt,
 	pFmt,
 	alarm = false,
+	link,
+	onOpen,
 }: {
 	label: string;
 	stat: PerfStat;
@@ -3747,9 +3773,18 @@ function Kpi({
 	dFmt: (abs: number) => string;
 	pFmt: (n: number) => string;
 	alarm?: boolean;
+	/** Task the value points at; the button wraps the value so the whole number opens the card. */
+	link?: { id: string; title: string } | null;
+	onOpen?: (id: string) => void;
 }) {
 	const { value, prev } = stat;
 	const d = value !== null && prev !== null ? value - prev : null;
+	const vContent = (
+		<>
+			{text}
+			{sub !== null && <small>{sub}</small>}
+		</>
+	);
 	return (
 		<div className={alarm ? "kpi alarm" : "kpi"}>
 			<span className="l">
@@ -3757,8 +3792,18 @@ function Kpi({
 				{label}
 			</span>
 			<span className="v">
-				{text}
-				{sub !== null && <small>{sub}</small>}
+				{link !== undefined && link !== null && onOpen !== undefined ? (
+					<button
+						type="button"
+						className="v-link"
+						title={link.title}
+						onClick={() => onOpen(link.id)}
+					>
+						{vContent}
+					</button>
+				) : (
+					vContent
+				)}
 			</span>
 			{d !== null && prev !== null && (
 				<span className="d">
@@ -3830,15 +3875,17 @@ function Spark({ series }: { series: (number | null)[] }) {
 
 /** Per-project performance for the selected range: one row per project, each cell a value plus a
  * grey inline bar scaled to the column max; a failure rate past 0.10 turns that bar amber. */
-function PerfTable({
+export function PerfTable({
 	perf,
 	projects,
 	firstCol = "Project",
+	openTask,
 }: {
 	perf: PerfResponse;
 	projects: ProjectView[];
 	/** Header of the project column; the Performance card puts the range label here. */
 	firstCol?: string;
+	openTask: (id: string) => void;
 }) {
 	const viewOf = (name: string) => projects.find((p) => p.name === name);
 	const labelOf = (name: string) => viewOf(name)?.settings.displayName ?? name;
@@ -3858,12 +3905,15 @@ function PerfTable({
 					<th scope="col">Failure rate</th>
 					<th scope="col">Spend</th>
 					<th scope="col">Context (avg)</th>
+					<th scope="col">Context (max)</th>
 				</tr>
 			</thead>
 			<tbody>
 				{rows.map((p) => {
 					const alarm = (p.failure.value ?? 0) > 0.1;
 					const view = viewOf(p.name);
+					// Narrow once so the link id stays non-null inside the JSX.
+					const maxTask = p.contextMaxTask;
 					return (
 						<tr key={p.name}>
 							<th scope="row">
@@ -3922,6 +3972,28 @@ function PerfTable({
 									ratio={
 										(p.contextAvgTokens.value ?? 0) /
 										maxOf((m) => m.contextAvgTokens.value)
+									}
+								/>
+							</td>
+							<td>
+								<CellBar
+									text={
+										maxTask === null ? (
+											tokFmt(p.contextMaxTokens.value)
+										) : (
+											<button
+												type="button"
+												className="v-link"
+												title={`Open ${maxTask.project} ${maxTask.id}`}
+												onClick={() => openTask(maxTask.id)}
+											>
+												{tokFmt(p.contextMaxTokens.value)}
+											</button>
+										)
+									}
+									ratio={
+										(p.contextMaxTokens.value ?? 0) /
+										maxOf((m) => m.contextMaxTokens.value)
 									}
 								/>
 							</td>

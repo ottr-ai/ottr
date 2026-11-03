@@ -11,6 +11,8 @@ function task(
 	p: Partial<PerfFacts["tasks"][number]> = {},
 ): PerfFacts["tasks"][number] {
 	return {
+		id: "t1",
+		project: "ottr",
 		createdAt: NOW - DAY,
 		doneAt: null,
 		cancelled: false,
@@ -191,6 +193,49 @@ describe("context", () => {
 		const m = perfMetrics(facts, "24h", NOW).metrics;
 		expect(m.contextAvgTokens.value).toBe(80_000);
 		expect(m.contextAvgTokens.prev).toBe(500_000);
+	});
+
+	test("max picks the largest reading and names its task", () => {
+		const facts: PerfFacts = {
+			tasks: [
+				task({ id: "small-1", doneAt: NOW - 30 * MIN, contextTokens: 40_000 }),
+				task({ id: "big-2", doneAt: NOW - 20 * MIN, contextTokens: 130_000 }),
+				task({ id: "quiet-3", doneAt: NOW - 10 * MIN }), // no reading
+			],
+			turns: [],
+		};
+		const m = perfMetrics(facts, "24h", NOW).metrics;
+		expect(m.contextMaxTokens.value).toBe(130_000);
+		expect(m.contextMaxTask).toEqual({ project: "ottr", id: "big-2" });
+		expect(m.contextAvgTokens.value).toBe(85_000);
+	});
+
+	test("no reading anywhere gives null and no task", () => {
+		const m = perfMetrics(
+			{ tasks: [task({ doneAt: NOW - 30 * MIN })], turns: [] },
+			"24h",
+			NOW,
+		).metrics;
+		expect(m.contextMaxTokens.value).toBeNull();
+		expect(m.contextMaxTask).toBeNull();
+	});
+
+	test("a reading outside the window does not enter the max", () => {
+		const facts: PerfFacts = {
+			tasks: [
+				task({ id: "old-big", doneAt: NOW - 2 * DAY, contextTokens: 500_000 }),
+				task({
+					id: "new-small",
+					doneAt: NOW - 30 * MIN,
+					contextTokens: 80_000,
+				}),
+			],
+			turns: [],
+		};
+		const m = perfMetrics(facts, "24h", NOW).metrics;
+		expect(m.contextMaxTokens.value).toBe(80_000);
+		expect(m.contextMaxTokens.prev).toBe(500_000);
+		expect(m.contextMaxTask).toEqual({ project: "ottr", id: "new-small" });
 	});
 });
 

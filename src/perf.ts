@@ -8,6 +8,10 @@ import type { PerfMetrics, PerfRange, PerfStat } from "./types.ts";
  * any state→needs_you event (the first-pass penalty). */
 export interface PerfFacts {
 	tasks: {
+		/** The task's board id; names the task that holds the largest context reading. */
+		id: string;
+		/** The owning project; lets the fleet's facts union name the right project. */
+		project: string;
 		createdAt: number;
 		doneAt: number | null;
 		cancelled: boolean;
@@ -40,7 +44,13 @@ const RANGE_SHAPE: Record<
 /** One window's raw inputs: the done cards (for lead time and first pass) and the
  * finished turns (for failure rate and spend) whose timestamps fall in [w0, w1). */
 interface Slice {
-	done: { leadMs: number; firstPass: boolean; ctx: number | null }[];
+	done: {
+		id: string;
+		project: string;
+		leadMs: number;
+		firstPass: boolean;
+		ctx: number | null;
+	}[];
 	turns: { failed: boolean; cost: number | null }[];
 }
 
@@ -51,6 +61,8 @@ function slice(facts: PerfFacts, w0: number, w1: number): Slice {
 				? []
 				: [
 						{
+							id: t.id,
+							project: t.project,
 							leadMs: t.doneAt - t.createdAt,
 							firstPass: t.workTurns === 1 && !t.hadNeedsYou,
 							ctx: t.contextTokens,
@@ -124,6 +136,24 @@ export function perfMetrics(
 		),
 	});
 	const firstPassCount = cur.done.filter((d) => d.firstPass).length;
+	// Largest context reading in one pass, value and task together so a non-null task
+	// always matches the value. Strict > keeps the first-seen reading on ties.
+	const ctxMax = (
+		s: Slice,
+	): {
+		v: number | null;
+		task: { project: string; id: string } | null;
+	} => {
+		let v: number | null = null;
+		let task: { project: string; id: string } | null = null;
+		for (const d of s.done)
+			if (d.ctx !== null && (v === null || d.ctx > v)) {
+				v = d.ctx;
+				task = { project: d.project, id: d.id };
+			}
+		return { v, task };
+	};
+	const curMax = ctxMax(cur);
 	return {
 		bucketMs,
 		seriesStart,
@@ -155,6 +185,26 @@ export function perfMetrics(
 					? null
 					: known.reduce((sum, v) => sum + v, 0) / known.length;
 			}),
+			// Built explicitly rather than through stat: stat derives only numbers, and
+			// ctxMax must run on the current window once so value and task come from one
+			// pass. The series mirrors stat's bucket bounds.
+			contextMaxTokens: {
+				value: curMax.v,
+				prev: prevWindow === null ? null : ctxMax(prevWindow).v,
+				series: Array.from(
+					{ length: buckets },
+					(_, i) =>
+						ctxMax(
+							slice(
+								facts,
+								seriesStart + i * bucketMs,
+								Math.min(seriesStart + (i + 1) * bucketMs, now),
+							),
+						).v,
+				),
+			},
+			// Identity only for the current window; prev and series carry no task name.
+			contextMaxTask: curMax.task,
 			done: cur.done.length,
 			firstPassDone: firstPassCount,
 			turns: cur.turns.length,
