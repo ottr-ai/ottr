@@ -13,7 +13,7 @@ const ONE_SHOT =
 
 /** The card shows `details`, not the chat, so an answer has to go there. */
 const WORK_OUTCOMES =
-	"ready (committed, needs integration; details are the release notes: only bug fixes, changes and new features — no verification output), answered (question only, nothing to merge; put your complete answer in details) or needs_you (with the exact question — call ask with it and its options first, then end; the tracker then surfaces the question with clickable choices). If the task exists to get your input — questions, grilling, decisions — end with the ask tool's questions outstanding or needs_you, never answered";
+	"ready (committed, needs integration; summary is one line; details are the release notes: only bug fixes, changes and new features — no verification output), answered (question only, nothing to merge; put your complete answer in details) or needs_you (with the exact question — call ask with it and its options first, then end; the tracker then surfaces the question with clickable choices). If the task exists to get your input — questions, grilling, decisions — end with the ask tool's questions outstanding or needs_you, never answered";
 
 const RELEASE_OUTCOMES =
 	"answered (summary is one line, details hold your findings and verification results; a blocker is a finding: name each blocker in the details and record it with propose_task like every finding — the board files the findings as cards and the release waits for those cards and your approval) or needs_you (only for a blocker no fix card can solve, for example a decision about the release scope or version; report the blocker and what should happen)";
@@ -85,7 +85,7 @@ Do not push: the server pushes ${o.branch}'s head with its stored credentials af
 ${RENAME}
 Call rename with a 3-8 word title before your first report_outcome.
 ${NO_DESTRUCTION}
-Call report_outcome: integrated (put the integration output, e.g. release stdout, verbatim in details) or needs_you with the exact question — call ask with it and its options first, then end.
+Call report_outcome: integrated (summary is one line; put the integration output, e.g. release stdout, verbatim in details) or needs_you with the exact question — call ask with it and its options first, then end.
 Add a final line \`topic: <one or two words for the task's subject>\` to the report details — the board groups done tasks by it.
 ${ONE_SHOT}`;
 }

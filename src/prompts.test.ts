@@ -50,6 +50,20 @@ describe("no-destruction rule", () => {
 	});
 });
 
+describe("summary requirement", () => {
+	test("work prompt's ready outcome names the one-line summary", () => {
+		expect(workPrompt({ text: "t", branch: "b", siblings: [] })).toContain(
+			"ready (committed, needs integration; summary is one line;",
+		);
+	});
+
+	test("merge prompt's integrated outcome names the one-line summary", () => {
+		expect(mergePrompt({ branch: "b", target: "main" })).toContain(
+			"integrated (summary is one line; put the integration output, e.g. release stdout, verbatim in details)",
+		);
+	});
+});
+
 describe("mergePrompt fast-forward step", () => {
 	test("names the ff-merge of the branch in the main checkout", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
