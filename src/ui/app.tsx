@@ -3632,8 +3632,17 @@ const pctFmt = (v: number | null) =>
 	v === null ? "–" : `${Math.round(v * 100)}%`;
 const usdFmt = (v: number | null) => (v === null ? "–" : `$${v.toFixed(2)}`);
 const durFmt = (v: number | null) => (v === null ? "–" : duration(v));
+/** Context-window sizes read at a glance: k below a million, M above. */
+const tokFmt = (v: number | null) =>
+	v === null
+		? "–"
+		: v >= 1_000_000
+			? `${(v / 1_000_000).toFixed(1)}M`
+			: v >= 10_000
+				? `${Math.round(v / 1000)}k`
+				: String(v);
 
-/** The five fleet tiles: grey everywhere, an amber edge only on a
+/** The six fleet tiles: grey everywhere, an amber edge only on a
  * failure rate past the 0.10 alarm line. */
 function KpiStrip({ fleet: f }: { fleet: PerfMetrics }) {
 	const ptsFmt = (v: number) => `${Math.round(v * 100)} pts`;
@@ -3679,6 +3688,20 @@ function KpiStrip({ fleet: f }: { fleet: PerfMetrics }) {
 				sub={f.costMissing > 0 ? `${f.costMissing} turns no data` : null}
 				dFmt={usdFmt}
 				pFmt={usdFmt}
+			/>
+			<Kpi
+				label="Context, avg"
+				stat={f.contextAvgTokens}
+				text={tokFmt(f.contextAvgTokens.value)}
+				sub={
+					f.done === 0
+						? null
+						: f.contextMissing > 0
+							? `${f.contextMissing} of ${f.done} no data`
+							: `${f.done} done`
+				}
+				dFmt={tokFmt}
+				pFmt={tokFmt}
 			/>
 		</div>
 	);
@@ -3813,6 +3836,7 @@ function PerfTable({
 					<th scope="col">First-pass</th>
 					<th scope="col">Failure rate</th>
 					<th scope="col">Spend</th>
+					<th scope="col">Context (avg)</th>
 				</tr>
 			</thead>
 			<tbody>
@@ -3869,6 +3893,15 @@ function PerfTable({
 								<CellBar
 									text={usdFmt(p.spend.value)}
 									ratio={(p.spend.value ?? 0) / maxOf((m) => m.spend.value)}
+								/>
+							</td>
+							<td>
+								<CellBar
+									text={tokFmt(p.contextAvgTokens.value)}
+									ratio={
+										(p.contextAvgTokens.value ?? 0) /
+										maxOf((m) => m.contextAvgTokens.value)
+									}
 								/>
 							</td>
 						</tr>

@@ -914,6 +914,9 @@ export interface PerfMetrics {
 	firstPass: PerfStat;
 	failure: PerfStat;
 	spend: PerfStat;
+	/** Average final context-window size (prompt tokens) over the window's done tasks
+	 *  with a captured reading; null when none has one. */
+	contextAvgTokens: PerfStat;
 	/** Counts of the current window. */
 	done: number;
 	firstPassDone: number;
@@ -921,6 +924,8 @@ export interface PerfMetrics {
 	failedTurns: number;
 	/** Finished turns in the window without captured cost. */
 	costMissing: number;
+	/** Done tasks in the window without a captured context reading. */
+	contextMissing: number;
 }
 
 /** `GET /api/performance?range=`: bucket i covers [seriesStart + i*bucketMs, +bucketMs). */

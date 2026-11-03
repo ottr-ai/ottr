@@ -1208,6 +1208,124 @@ describe("turn cost capture", () => {
 	});
 });
 
+describe("done task context capture", () => {
+	const sid = "eeee0000-0000-0000-0000-000000000401";
+
+	/** One assistant contextSnapshot record at `at` (the omp transcript message shape). */
+	function contextLine(at: number, promptTokens: number): string {
+		return JSON.stringify({
+			type: "message",
+			timestamp: new Date(at).toISOString(),
+			message: {
+				role: "assistant",
+				provider: "zai",
+				model: "glm-5.3-flash",
+				usage: {},
+				contextSnapshot: { promptTokens, compactionEpoch: 0 },
+			},
+		});
+	}
+
+	function writeTranscript(
+		sessionsDir: string,
+		sessionId: string,
+		lines: string[],
+	): void {
+		mkdirSync(sessionsDir, { recursive: true });
+		writeFileSync(
+			join(sessionsDir, `2026-09-27T10-00-00-000Z_${sessionId}.jsonl`),
+			`${lines.join("\n")}\n`,
+		);
+	}
+
+	function storedContext(dir: string): number | null {
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const row = raw
+			.query<{ context_tokens: number | null }, []>(
+				"SELECT context_tokens FROM tasks",
+			)
+			.get();
+		raw.close();
+		return row?.context_tokens ?? null;
+	}
+
+	test("finishTurn stores the session's final context tokens", () => {
+		const dir = join(root, "context-finish");
+		const store = open(dir);
+		const t = store.updateTask(store.createTask("contextful").id, {
+			sessionId: sid,
+		});
+		const turn = store.startTurn(t.id, "work", "p", null);
+		// The last snapshot wins: an earlier smaller reading, then the final one.
+		writeTranscript(store.sessionsDir, sid, [
+			contextLine(turn.startedAt + 100, 10_000),
+			contextLine(turn.startedAt + 2000, 250_000),
+		]);
+		store.finishTurn(turn.id, { endedAt: turn.startedAt + 3000 });
+		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(250_000);
+		store.close();
+		expect(storedContext(dir)).toBe(250_000);
+	});
+
+	test("a turn without a transcript keeps the column NULL, a later turn refreshes it", () => {
+		const dir = join(root, "context-refresh");
+		const store = open(dir);
+		const t = store.updateTask(store.createTask("late file").id, {
+			sessionId: sid,
+		});
+		const a = store.startTurn(t.id, "work", "p", null);
+		store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
+		expect(store.perfFacts().tasks[0]?.contextTokens).toBeNull();
+		writeTranscript(store.sessionsDir, sid, [
+			contextLine(a.startedAt + 2000, 300_000),
+		]);
+		const b = store.startTurn(t.id, "work", "p2", null);
+		store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
+		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(300_000);
+		store.close();
+	});
+
+	test("reopen backfills a done task's reading once its transcript exists", () => {
+		const dir = join(root, "context-backfill");
+		const store = open(dir);
+		const t = store.updateTask(store.createTask("done later").id, {
+			sessionId: sid,
+		});
+		const turn = store.startTurn(t.id, "work", "p", null);
+		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file yet
+		store.updateTask(t.id, { stage: "done" });
+		store.close();
+		expect(storedContext(dir)).toBeNull();
+		writeTranscript(store.sessionsDir, sid, [
+			contextLine(turn.startedAt + 900, 128_000),
+		]);
+		const reopened = open(dir);
+		expect(reopened.perfFacts().tasks[0]?.contextTokens).toBe(128_000);
+		reopened.close();
+		// A second open is idempotent: filled tasks are not re-read.
+		expect(open(dir).perfFacts().tasks[0]?.contextTokens).toBe(128_000);
+	});
+
+	test("only done tasks backfill; a missing transcript keeps NULL", () => {
+		const dir = join(root, "context-skip");
+		const missingSid = "eeee0000-0000-0000-0000-000000000402";
+		const store = open(dir);
+		// The running card's transcript exists on disk, the done card's does not.
+		store.updateTask(store.createTask("still open").id, { sessionId: sid });
+		const done = store.updateTask(store.createTask("no transcript").id, {
+			sessionId: missingSid,
+		});
+		store.updateTask(done.id, { stage: "done" });
+		store.close();
+		writeTranscript(store.sessionsDir, sid, [contextLine(1, 64_000)]);
+		const facts = open(dir).perfFacts().tasks;
+		// The running card never backfills, even with a readable transcript.
+		expect(facts.find((f) => f.doneAt === null)?.contextTokens).toBeNull();
+		// The done card has no transcript to read.
+		expect(facts.find((f) => f.doneAt !== null)?.contextTokens).toBeNull();
+	});
+});
+
 describe("row literals and patch types", () => {
 	// Regression for R4-9: createTask/startTurn used to hand-build their return values,
 	// which could drift from the stored row and the toTask/toTurn normalizers.

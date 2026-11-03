@@ -16,6 +16,7 @@ function task(
 		cancelled: false,
 		workTurns: 1,
 		hadNeedsYou: false,
+		contextTokens: null,
 		...p,
 	};
 }
@@ -145,6 +146,51 @@ describe("spend", () => {
 		expect(m.throughput.series).toHaveLength(24);
 		expect(m.throughput.series.every((v) => v === 0)).toBe(true);
 		expect(m.spend.series.every((v) => v === 0)).toBe(true);
+	});
+});
+
+describe("context", () => {
+	test("averages the final context of done tasks; missing readings count as missing", () => {
+		const facts: PerfFacts = {
+			tasks: [
+				task({ doneAt: NOW - 30 * MIN, contextTokens: 100_000 }),
+				task({ doneAt: NOW - 20 * MIN, contextTokens: 200_000 }),
+				task({ doneAt: NOW - 10 * MIN }), // no reading
+				task({
+					doneAt: NOW - 5 * MIN,
+					cancelled: true,
+					contextTokens: 900_000,
+				}),
+			],
+			turns: [],
+		};
+		const m = perfMetrics(facts, "24h", NOW).metrics;
+		expect(m.contextAvgTokens.value).toBe(150_000);
+		expect(m.contextMissing).toBe(1);
+		expect(m.done).toBe(3);
+	});
+
+	test("no done task with a reading gives null, not 0", () => {
+		const m = perfMetrics(
+			{ tasks: [task({ doneAt: NOW - 30 * MIN })], turns: [] },
+			"24h",
+			NOW,
+		).metrics;
+		expect(m.contextAvgTokens.value).toBeNull();
+		expect(m.contextMissing).toBe(1);
+	});
+
+	test("a reading outside the window does not enter the average", () => {
+		const facts: PerfFacts = {
+			tasks: [
+				task({ doneAt: NOW - 2 * DAY, contextTokens: 500_000 }),
+				task({ doneAt: NOW - 30 * MIN, contextTokens: 80_000 }),
+			],
+			turns: [],
+		};
+		const m = perfMetrics(facts, "24h", NOW).metrics;
+		expect(m.contextAvgTokens.value).toBe(80_000);
+		expect(m.contextAvgTokens.prev).toBe(500_000);
 	});
 });
 

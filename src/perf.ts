@@ -13,6 +13,9 @@ export interface PerfFacts {
 		cancelled: boolean;
 		workTurns: number;
 		hadNeedsYou: boolean;
+		/** Final context-window size in prompt tokens (tasks.context_tokens); null when
+		 *  the task has no captured reading. */
+		contextTokens: number | null;
 	}[];
 	/** Finished turns only (ended_at not null), each with its SQL-semantics failure flag. */
 	turns: { endedAt: number; failed: boolean; cost: number | null }[];
@@ -37,7 +40,7 @@ const RANGE_SHAPE: Record<
 /** One window's raw inputs: the done cards (for lead time and first pass) and the
  * finished turns (for failure rate and spend) whose timestamps fall in [w0, w1). */
 interface Slice {
-	done: { leadMs: number; firstPass: boolean }[];
+	done: { leadMs: number; firstPass: boolean; ctx: number | null }[];
 	turns: { failed: boolean; cost: number | null }[];
 }
 
@@ -50,6 +53,7 @@ function slice(facts: PerfFacts, w0: number, w1: number): Slice {
 						{
 							leadMs: t.doneAt - t.createdAt,
 							firstPass: t.workTurns === 1 && !t.hadNeedsYou,
+							ctx: t.contextTokens,
 						},
 					],
 		),
@@ -143,11 +147,20 @@ export function perfMetrics(
 					: s.turns.filter((t) => t.failed).length / s.turns.length,
 			),
 			spend: stat((s) => s.turns.reduce((sum, t) => sum + (t.cost ?? 0), 0)),
+			contextAvgTokens: stat((s) => {
+				const known = s.done
+					.map((d) => d.ctx)
+					.filter((v): v is number => v !== null);
+				return known.length === 0
+					? null
+					: known.reduce((sum, v) => sum + v, 0) / known.length;
+			}),
 			done: cur.done.length,
 			firstPassDone: firstPassCount,
 			turns: cur.turns.length,
 			failedTurns: cur.turns.filter((t) => t.failed).length,
 			costMissing: cur.turns.filter((t) => t.cost === null).length,
+			contextMissing: cur.done.filter((d) => d.ctx === null).length,
 		},
 	};
 }

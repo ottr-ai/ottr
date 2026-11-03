@@ -21,7 +21,12 @@ import {
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
 import { queueOrder } from "./scheduler.ts";
-import { cleanTitle, firstSessionTitle, readTranscript } from "./session.ts";
+import {
+	cleanTitle,
+	firstSessionTitle,
+	readTranscript,
+	sessionContext,
+} from "./session.ts";
 import { assignTopics } from "./topics.ts";
 import type {
 	AskQuestion,
@@ -891,6 +896,28 @@ function backfillTurnCosts(db: Database, sessionsDir: string): void {
 	}
 }
 
+/**
+ * Backfills done tasks' final context tokens (runs once per open): reads each task's
+ * session transcript tail once and stores its last contextSnapshot's promptTokens.
+ * Best-effort like the cost backfill: no transcript or an unreadable one leaves the
+ * column NULL and the next open tries again.
+ */
+function backfillDoneContext(db: Database, sessionsDir: string): void {
+	const tasks = db
+		.query<{ id: string; session_id: string | null }, []>(
+			"SELECT id, session_id FROM tasks WHERE stage = 'done' AND context_tokens IS NULL",
+		)
+		.all();
+	for (const task of tasks) {
+		const ctx = sessionContext(sessionsDir, task.session_id);
+		if (ctx !== null)
+			db.run("UPDATE tasks SET context_tokens = ? WHERE id = ?", [
+				ctx.promptTokens,
+				task.id,
+			]);
+	}
+}
+
 export class ProjectStore {
 	readonly path: string;
 	readonly name: string;
@@ -1224,6 +1251,16 @@ export class ProjectStore {
 			);
 		if (!cols.includes("merge_head"))
 			db.exec("ALTER TABLE tasks ADD COLUMN merge_head TEXT");
+		// context_tokens: the task's final context-window size in prompt tokens, captured
+		// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
+		// after every rebuild, like the columns above.
+		if (!cols.includes("context_tokens"))
+			db.exec("ALTER TABLE tasks ADD COLUMN context_tokens INTEGER");
+		try {
+			backfillDoneContext(db, join(tasksDir, "sessions"));
+		} catch {
+			/* backfill is best-effort; the next open retries */
+		}
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 		// updates a live table, so converge additively like the tasks columns above.
 		const prCols = db
@@ -1924,8 +1961,12 @@ export class ProjectStore {
 		if (!row) throw new Error(`unknown turn: ${turnId}`);
 		// Cost capture: a finished turn owns its transcript window's usage; a
 		// missing or unreadable transcript leaves the columns NULL and never fails the turn.
-		if (patch.endedAt !== undefined && row.ended_at !== null)
+		if (patch.endedAt !== undefined && row.ended_at !== null) {
 			this.captureTurnCost(row.task_id, turnId, row.started_at, row.ended_at);
+			// Context capture: the transcript tail holds the run's latest context-window
+			// snapshot, so the column tracks the session's context as turns finish.
+			this.captureTaskContext(row.task_id);
+		}
 		// A failed turn is an error event; a deliberate Cancel is not. `task_id` is NOT NULL in turns.
 		if (
 			patch.error !== undefined &&
@@ -1966,6 +2007,26 @@ export class ProjectStore {
 		}
 		// Null: no transcript, a malformed record, or not this session's turn. Stays NULL.
 		if (sum !== null) writeTurnCost(this.db, turnId, sum);
+	}
+
+	/**
+	 * Refreshes the task's final context-window reading (tasks.context_tokens) from the
+	 * current session transcript's last contextSnapshot. Best-effort: no session, an
+	 * unreadable transcript, or no usable snapshot leaves the column as-is.
+	 */
+	private captureTaskContext(taskId: string): void {
+		const sessionId =
+			this.db
+				.query<{ session_id: string | null }, [string]>(
+					"SELECT session_id FROM tasks WHERE id = ?",
+				)
+				.get(taskId)?.session_id ?? null;
+		const ctx = sessionContext(this.sessionsDir, sessionId);
+		if (ctx !== null)
+			this.db.run("UPDATE tasks SET context_tokens = ? WHERE id = ?", [
+				ctx.promptTokens,
+				taskId,
+			]);
 	}
 
 	listTurns(taskId: string): Turn[] {
@@ -2039,9 +2100,14 @@ export class ProjectStore {
 	perfFacts(): PerfFacts {
 		const tasks = this.db
 			.query<
-				{ id: string; created_at: number; cancelled_at: number | null },
+				{
+					id: string;
+					created_at: number;
+					cancelled_at: number | null;
+					context_tokens: number | null;
+				},
 				[]
-			>("SELECT id, created_at, cancelled_at FROM tasks")
+			>("SELECT id, created_at, cancelled_at, context_tokens FROM tasks")
 			.all();
 		const doneAt = new Map(
 			this.db
@@ -2087,6 +2153,7 @@ export class ProjectStore {
 				cancelled: t.cancelled_at !== null,
 				workTurns: workTurns.get(t.id) ?? 0,
 				hadNeedsYou: needsYou.has(t.id),
+				contextTokens: t.context_tokens,
 			})),
 			turns: turns.map((t) => ({
 				endedAt: t.ended_at,
