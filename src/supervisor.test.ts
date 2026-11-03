@@ -1746,6 +1746,23 @@ describe("retroPass", () => {
 		store.close();
 	});
 
+	test("the retro id is the source id plus -retro and no counter number goes missing", async () => {
+		const dir = join(root, "retro-id-wiring");
+		const store = ProjectStore.open(dir);
+		const { t, doneAt } = doneCard(store);
+		const ops = fakeOps();
+		await retroTick(store, ops, doneAt);
+		const kids = kidsOf(store, t);
+		expect(kids).toHaveLength(1);
+		expect(kids[0]!.id).toBe(`${t.id}-retro`);
+		// The retro consumed no counter value: the next work card takes the next number.
+		const next = store.createTask("next work card");
+		expect(Number(next.id.match(/[0-9]+$/)?.[0])).toBe(
+			Number(t.id.match(/[0-9]+$/)?.[0]) + 1,
+		);
+		store.close();
+	});
+
 	test("each exclusion files nothing", async () => {
 		// One store per case: a shared store lets an earlier case's tick file retros for later
 		// cases' Done cards, and the assertions would measure cross-case contamination.

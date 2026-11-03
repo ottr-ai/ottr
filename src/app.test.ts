@@ -810,6 +810,34 @@ describe("task routes", () => {
 		expect(unknownId.status).toBe(404);
 	});
 
+	test("a retro id passes the route checks; a traversal shape still fails", async () => {
+		const source = store.createTask("retro source");
+		const retro = store.createTask(
+			"retro prompt",
+			null,
+			"retro",
+			`${source.id}-retro`,
+		);
+		store.updateTask(retro.id, { followUpOf: source.id });
+		// The retro drawer's link target opens: GET detail on the retro id.
+		const got = await get(`/api/projects/p1/tasks/${retro.id}`);
+		expect(got.status).toBe(200);
+		// POST on the retro id (edit) passes the id check too.
+		const edited = await post(`/api/projects/p1/tasks/${retro.id}/edit`, {
+			prompt: "edited retro",
+		});
+		expect(edited.status).toBe(200);
+		expect(store.getTask(retro.id)?.prompt).toBe("edited retro");
+		// The source card's detail still names the retro (Work steps and its drawer link).
+		const detail = (await (
+			await get(`/api/projects/p1/tasks/${source.id}`)
+		).json()) as { retro?: { id: string } };
+		expect(detail.retro?.id).toBe(retro.id);
+		// A retro-shaped id may not smuggle path parts: one segment, decoded or not.
+		const smuggled = await get(`/api/projects/p1/tasks/${retro.id}%2F..%2Fx`);
+		expect(smuggled.status).toBe(400);
+	});
+
 	test("reply queues a needs-you task and refuses queued ones", async () => {
 		const t = store.createTask("needs answer");
 		store.updateTask(t.id, { state: "needs_you", needsReason: "?" });

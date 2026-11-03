@@ -1885,24 +1885,35 @@ export class ProjectStore {
 		prompt: string,
 		model: string | null = null,
 		kind: TaskKind = "work",
+		id?: string,
 	): Task {
 		const now = Date.now();
 		const title = deriveTitle(prompt);
-		let id = this.nextTaskId();
-		while (this.getTask(id) !== null) {
-			// Each retry consumes the next counter value: no reuse, guaranteed termination.
-			id = this.nextTaskId();
+		// An explicit id (a retro child `<source id>-retro`) skips the counter: no number is
+		// consumed, so visible cards keep gap-free ids. A taken id gets -2, -3, ...: no id
+		// is ever reused and the loop ends because the store holds finitely many ids.
+		let usedId: string;
+		if (id === undefined) {
+			usedId = this.nextTaskId();
+			while (this.getTask(usedId) !== null) {
+				// Each retry consumes the next counter value: no reuse, guaranteed termination.
+				usedId = this.nextTaskId();
+			}
+		} else {
+			if (id === "") throw new Error("createTask: an explicit id is empty");
+			usedId = id;
+			for (let n = 2; this.getTask(usedId) !== null; n++) usedId = `${id}-${n}`;
 		}
 		this.db.run(
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)",
-			[id, title, prompt, now, now, now, model, kind],
+			[usedId, title, prompt, now, now, now, model, kind],
 		);
-		this.recordEvent("create", id, null, "todo", null);
-		this.recordEvent("state", id, null, "queued", null);
+		this.recordEvent("create", usedId, null, "todo", null);
+		this.recordEvent("state", usedId, null, "queued", null);
 		// Read the row back instead of hand-building the literal (R4-9): defaults and the
 		// toTask normalizer stay in one place, so the returned Task can't drift from the DB.
-		const task = this.getTask(id);
-		if (!task) throw new Error(`unknown task: ${id}`);
+		const task = this.getTask(usedId);
+		if (!task) throw new Error(`unknown task: ${usedId}`);
 		return task;
 	}
 

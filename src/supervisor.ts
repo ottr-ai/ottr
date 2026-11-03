@@ -819,6 +819,9 @@ export function createSupervisor(
 			retroPrompt({ title: t.title, model: t.model, handoff }),
 			null,
 			"retro",
+			// The retro takes the source card's id, not the counter's next number (no gaps
+			// in the visible cards' ids); a second retro for the card gets -retro-2, -3, ...
+			`${t.id}-retro`,
 		);
 		e.store.updateTask(child.id, { followUpOf: t.id });
 		ops.schedule();

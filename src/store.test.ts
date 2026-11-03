@@ -2542,6 +2542,34 @@ describe("arch-review changed-line coverage", () => {
 			expect(b.id).toBe("MYRE-2");
 		});
 
+		test("an explicit id skips the counter; a taken one gets -2, -3, ...", () => {
+			const dir = join(root, "explicit-id");
+			const store = open(dir);
+			store.setSettings({ taskIdPrefix: "RTR" });
+			const source = store.createTask("source card");
+			expect(source.id).toBe("RTR-1");
+			const retro = store.createTask(
+				"retro prompt",
+				null,
+				"retro",
+				`${source.id}-retro`,
+			);
+			expect(retro.id).toBe("RTR-1-retro");
+			// A second retro for the same card: the id is taken, so -retro-2. No reuse.
+			const retro2 = store.createTask(
+				"retro prompt",
+				null,
+				"retro",
+				`${source.id}-retro`,
+			);
+			expect(retro2.id).toBe("RTR-1-retro-2");
+			// The retro ids consumed no counter value: the next card takes the next number.
+			expect(store.createTask("next card").id).toBe("RTR-2");
+			// An empty explicit id is a caller bug, not an idless card.
+			expect(() => store.createTask("x", null, "work", "")).toThrow();
+			store.close();
+		});
+
 		test("taskIdPrefix overrides the derived handle; null returns to it; the counter never resets", () => {
 			const dir = join(root, "chs-override");
 			const store = open(dir);

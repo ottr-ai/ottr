@@ -271,6 +271,10 @@ function removeIcons(root: string, tasksDir: string): void {
 
 const IMAGE_BODY_BYTES = 32 * 1024 * 1024;
 const LOG_CHUNK_BYTES = 256 * 1024;
+/** A route param that names a task: legacy 8-hex, the project's `PREFIX-n` handle, or a retro
+ * child `PREFIX-n-retro[-k]`. One constant, so resolveTask and /api/seen cannot drift apart. */
+const TASK_ID_RE =
+	/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+(?:-retro(?:-[0-9]+)?)?)$/;
 /** How long one POST /api/drain holds new turns. scripts/update-image.ts renews it every 30 s
  * while it waits, so a hold that the script stops renewing lapses on its own. DELETE ends it
  * at once: the script does that when its 1 h limit ends the wait. */
@@ -2212,8 +2216,7 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		if (!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)$/.test(id))
-			return json({ error: "bad task id" }, 400);
+		if (!TASK_ID_RE.test(id)) return json({ error: "bad task id" }, 400);
 		const task = e.store.getTask(id);
 		if (!task) return json({ error: "unknown task" }, 404);
 		return { e, task };
@@ -3837,11 +3840,7 @@ export function createApp(deps: AppDeps) {
 					if (
 						!Array.isArray(ids) ||
 						ids.length > 10000 ||
-						ids.some(
-							(id) =>
-								typeof id !== "string" ||
-								!/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)$/.test(id),
-						)
+						ids.some((id) => typeof id !== "string" || !TASK_ID_RE.test(id))
 					)
 						return json({ error: "invalid ids" }, 400);
 					// unread: true makes a read result unread again; unmentioned ids leave the
