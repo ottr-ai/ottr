@@ -141,36 +141,59 @@ export type DiffLine = {
 	text: string;
 };
 
-/** Adds old/new line numbers to one file section's lines by walking its `@@` hunk headers. */
+/** Adds old/new line numbers to one file section's lines by walking its `@@` hunk headers.
+ *  Inside a hunk the class comes from the prefix character alone: body text may itself read
+ *  as a header (`--- ` from a removed SQL or Lua comment, `+++ ` from an added one), which
+ *  the whole-diff classifier would misfile as meta. The header's counts end the hunk, so
+ *  nothing after it shifts the numbering; a combined-diff `@@@` header ends it with the
+ *  numbers cleared. */
 export function numberDiffLines(lines: string[]): DiffLine[] {
 	const out: DiffLine[] = [];
-	let hunkSeen = false;
-	let oldCounter = 0;
-	let newCounter = 0;
+	let oldNo = 0;
+	let newNo = 0;
+	let oldLeft = 0;
+	let newLeft = 0;
 	for (const line of lines) {
-		const cls = diffLineClass(line);
-		let o: number | null = null;
-		let n: number | null = null;
-		if (cls === "hunk") {
-			const m = line.match(HUNK_HEADER);
-			if (m !== null) {
-				hunkSeen = true;
-				oldCounter = Number(m[1]);
-				newCounter = Number(m[3]);
-			} else {
-				hunkSeen = false;
-			}
-		} else if (hunkSeen) {
-			if (cls === "add") {
-				n = newCounter++;
-			} else if (cls === "del") {
-				o = oldCounter++;
-			} else if (line !== "\\ No newline at end of file") {
-				o = oldCounter++;
-				n = newCounter++;
-			}
+		const header =
+			oldLeft === 0 && newLeft === 0 ? line.match(HUNK_HEADER) : null;
+		if (header !== null) {
+			oldNo = Number(header[1]);
+			newNo = Number(header[3]);
+			// Omitted count means one line: git writes `@@ -5 +5,2 @@`, not `@@ -5,1 +5,2 @@`.
+			oldLeft = header[2] === undefined ? 1 : Number(header[2]);
+			newLeft = header[4] === undefined ? 1 : Number(header[4]);
+			out.push({ cls: "hunk", old: null, new: null, text: line });
+			continue;
 		}
-		out.push({ cls, old: o, new: n, text: line });
+		if (oldLeft > 0 || newLeft > 0) {
+			if (line.startsWith("@@")) {
+				oldLeft = 0;
+				newLeft = 0;
+				out.push({ cls: "hunk", old: null, new: null, text: line });
+				continue;
+			}
+			const first = line.charAt(0);
+			if (first === "+") {
+				newLeft--;
+				out.push({ cls: "add", old: null, new: newNo++, text: line });
+				continue;
+			}
+			if (first === "-") {
+				oldLeft--;
+				out.push({ cls: "del", old: oldNo++, new: null, text: line });
+				continue;
+			}
+			if (first === "\\") {
+				// The no-newline marker belongs to the previous line: no numbers, no advance.
+				out.push({ cls: "ctx", old: null, new: null, text: line });
+				continue;
+			}
+			oldLeft--;
+			newLeft--;
+			out.push({ cls: "ctx", old: oldNo++, new: newNo++, text: line });
+			continue;
+		}
+		out.push({ cls: diffLineClass(line), old: null, new: null, text: line });
 	}
 	return out;
 }

@@ -213,6 +213,59 @@ describe("numberDiffLines", () => {
 		expect(out[3]?.new).toBeNull();
 		expect(out[4]?.new).toBeNull();
 	});
+
+	test("comment lines that read as headers keep their class inside a hunk", () => {
+		// A removed SQL comment (`-- old`) renders as "--- old", an added one as "+++ new";
+		// both are hunk body lines, not file headers.
+		const out = numberDiffLines([
+			"@@ -10,3 +10,3 @@",
+			" SELECT 1;",
+			"--- old comment",
+			"+++ new comment",
+			" SELECT 2;",
+		]);
+		expect(out[1]).toEqual({
+			cls: "ctx",
+			old: 10,
+			new: 10,
+			text: " SELECT 1;",
+		});
+		expect(out[2]).toEqual({
+			cls: "del",
+			old: 11,
+			new: null,
+			text: "--- old comment",
+		});
+		expect(out[3]).toEqual({
+			cls: "add",
+			old: null,
+			new: 11,
+			text: "+++ new comment",
+		});
+		expect(out[4]).toEqual({
+			cls: "ctx",
+			old: 12,
+			new: 12,
+			text: " SELECT 2;",
+		});
+	});
+
+	test("a hunk ends at its header counts, so later header-like lines take no numbers", () => {
+		const out = numberDiffLines([
+			"@@ -1,1 +1,1 @@",
+			"-one",
+			"+two",
+			"--- a/stray.ts",
+		]);
+		expect(out[1]).toEqual({ cls: "del", old: 1, new: null, text: "-one" });
+		expect(out[2]).toEqual({ cls: "add", old: null, new: 1, text: "+two" });
+		expect(out[3]).toEqual({
+			cls: "meta",
+			old: null,
+			new: null,
+			text: "--- a/stray.ts",
+		});
+	});
 });
 
 describe("diffLinkParts", () => {
