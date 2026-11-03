@@ -1903,8 +1903,43 @@ button.notif-link {
 	justify-content: space-between;
 	gap: 16px;
 }
-.project-head .search {
-	width: 220px;
+/* Search and its count are one control: the field and a count box share one border.
+   The box is always there (the total while idle, matched/total while filtering), so
+   the bar never moves when a search starts. */
+.project-head .search-group {
+	display: flex;
+	width: 260px;
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.search-group:focus-within,
+.search-group.filtered {
+	border-color: var(--accent);
+}
+.search-group .search {
+	flex: 1;
+	min-width: 0;
+	background: transparent;
+	border: 0;
+	border-radius: 4px 0 0 4px;
+}
+/* The group's edge shows the focus. */
+.search-group .search:focus-visible {
+	outline: none;
+}
+.search-count {
+	display: grid;
+	place-items: center;
+	min-width: 48px;
+	padding: 0 8px;
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	color: var(--dim);
+	border-left: 1px solid var(--line-soft);
+}
+.search-group.filtered .search-count {
+	color: var(--accent);
 }
 /* Filtered-view indication: matched/total beside the search. A value in grey, not an alarm. */
 .filter-note {
@@ -2109,19 +2144,30 @@ button.notif-link {
 	align-items: stretch; /* search, segment group and New task share one height and top */
 	gap: 8px;
 }
-/* Narrow board: the actions take their own line, the search fills what the icon-only
-   segments and New task leave. The icon plus its aria-label/tooltip carry each action. */
+/* Narrow board: the search and New task share the first line, and the four actions take
+   a 2x2 grid under them. Every action keeps its label (the Verb-Label Rule): each icon is
+   unique, but it only supports the words. */
 @container (max-width: 960px) {
 	.project-actions {
 		flex: 1 1 100%;
+		flex-wrap: wrap;
 	}
-	.project-head .search {
+	.project-head .search-group {
 		flex: 1 1 auto;
 		width: auto;
 		min-width: 0;
 	}
-	.project-actions .seg .seg-label {
-		display: none;
+	.project-actions .seg {
+		order: 1;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		flex: 1 1 100%;
+	}
+	.project-actions .seg button:nth-child(3) {
+		border-left: 0;
+	}
+	.project-actions .seg button:nth-child(n + 3) {
+		border-top: 1px solid var(--line-soft);
 	}
 	.project-actions .primary {
 		flex: none;
@@ -2243,10 +2289,16 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	/* Horizontal pans belong to the swipe handler, not the browser's history-nav gesture;
 	   vertical panning (column scroll, pull-to-refresh) stays native. */
 	touch-action: pan-y;
+	/* The board is one card: a 1px grid gap over the line colour draws exactly one rule
+	   between columns (and between rows in the 2x2 tier); the columns carry no box. */
 	display: grid;
 	grid-template-columns: repeat(4, minmax(0, 1fr));
 	grid-template-rows: minmax(0, 1fr);
-	gap: 10px;
+	gap: 1px;
+	background: var(--line-soft);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	overflow: hidden;
 }
 @container (max-width: 760px) {
 	.flow {
@@ -2287,24 +2339,35 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	flex-direction: column;
 	min-width: 0;
 	background: var(--panel);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
 }
 /* Landed work recedes: the Done column sits back toward the field. */
 .stage[data-stage="done"] {
 	background: color-mix(in srgb, var(--field) 60%, var(--panel));
 }
-/* Values read first: the column name is a dim label, its count the bright value. */
+/* The column title reads first, in bright text; its count is a quiet number at the
+   right. No rule under the head: the four heads read as the card's header row, and
+   the columns' only lines are the dividers between them. */
 .stage-head {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
-	padding: 9px 12px;
-	font-size: 12.5px;
+	padding: 14px 16px 6px;
+	font-size: 14px;
 	font-weight: 600;
+	color: var(--text-strong);
+}
+/* The total is a plain number; the "new" and alarm chips keep their boxes. */
+.stage-head > .count:not(.fresh) {
+	min-width: 0;
+	padding: 0;
+	font-weight: 500;
 	color: var(--dim);
-	border-bottom: 1px solid var(--line-soft);
+	background: none;
+	border: 0;
+}
+.stage-head > .count.filtered {
+	color: var(--accent);
 }
 .count {
 	min-width: 24px;
@@ -2325,8 +2388,9 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	overflow-y: auto;
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
-	padding: 8px;
+	gap: 10px;
+	/* 16px from every column line, so cards sit clear of the dividers. */
+	padding: 8px 16px 16px;
 }
 .stage-empty {
 	margin: 0;
@@ -2722,16 +2786,26 @@ a.release:hover {
 	letter-spacing: 0.08em;
 	color: var(--dim);
 }
-/* Todo lane's backlog row: label left, the boxed count right (as in the stage heads),
-   and Add draft as a full-width dashed slot underneath, where the new draft lands. */
+/* Todo lane's backlog row: the column head's grammar one step down (bright 13px title,
+   quiet count at the right), and Add draft as a full-width dashed slot underneath,
+   where the new draft lands. */
 .backlog-head {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
 	gap: 8px 6px;
+	margin: 4px 0 0;
+	font-size: 13px;
+	letter-spacing: 0;
+	text-transform: none;
+	color: var(--text-strong);
 }
-.backlog-head .count {
+.backlog-count {
 	margin-left: auto;
+	font-size: 12.5px;
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+	color: var(--dim);
 }
 .lane-add {
 	display: flex;
@@ -2777,13 +2851,13 @@ a.release:hover {
 	border-style: solid;
 	color: var(--text);
 }
-/* Boundary between pinned unread answers and the landing order below:
-   generous margins against the 6px card gap give the two groups separation. */
+/* Boundary between pinned groups (unread, starred, backlog) and the rest: space, not a
+   rule. The group labels already name each block, so the extra gap against the 6px
+   card gap is enough separation. */
 .lane-divider {
 	width: 100%;
-	margin: 8px 0;
+	margin: 6px 0;
 	border: 0;
-	border-top: 1px solid var(--line-soft);
 }
 /* The unread chip rides with the total count, right-aligned. */
 .count.fresh {
@@ -2853,8 +2927,8 @@ a.release:hover {
 	padding: 5px 2px 5px 0;
 	/* Reuse the done column's recessed background so cards scroll under the head. */
 	background: color-mix(in srgb, var(--field) 60%, var(--panel));
+	/* No rule: the head's own fill already separates it from the cards below. */
 	border: 0;
-	border-bottom: 1px solid var(--line-soft);
 	cursor: pointer;
 	text-align: left;
 	font: inherit;
@@ -3988,7 +4062,7 @@ dialog.confirm-dialog {
 	gap: 8px;
 	margin: 0;
 }
-/* The name takes the free space, so the chip, Run setup again and Save group at the right. */
+/* The name takes the free space, so the chip, Open setup and Save group at the right. */
 .settings-head h2 {
 	margin: 0 auto 0 0;
 }
@@ -4537,7 +4611,7 @@ dialog.confirm-dialog {
 	}
 }
 
-/* ---- Project setup wizard (Add project steps 2-4, Run setup again) ---- */
+/* ---- Project setup wizard (Add project steps 2-4, Open setup) ---- */
 .setup-steps {
 	display: flex;
 	gap: 2px;
@@ -4840,14 +4914,37 @@ dialog.drawer[open]::backdrop {
 .drawer-body {
 	padding: 18px 22px 26px;
 }
+/* The drawer's header band: title, actions and the meta line stay at the top of the
+   drawer while a long report scrolls under them. The band bleeds past the body's
+   side padding, so its bottom edge is one line across the whole drawer. */
+.drawer-top {
+	position: sticky;
+	top: 0;
+	z-index: 3;
+	margin: -18px -22px 0;
+	padding: 18px 22px 10px;
+	background: var(--panel);
+	border-bottom: 1px solid var(--line-soft);
+}
+/* The band's edge is the first section's top rule: no second rule and no margin above
+   it, so edge-to-label is the same 14px as every rule-to-label below. */
+.drawer-body > .drawer-top + .dsec {
+	margin-top: 0;
+	border-top: 0;
+}
 .drawer-head {
 	display: flex;
 	align-items: flex-start;
 	justify-content: space-between;
 	gap: 10px;
 }
+/* Two lines at most, so the band stays short; the full title is the dialog's name. */
 .drawer-head h2 {
-	font-size: 20px;
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	font-size: 17px;
 	font-weight: 600;
 	line-height: 1.25;
 	color: var(--text-strong);
@@ -6156,15 +6253,20 @@ button.diff-path {
 	.project-actions {
 		flex-wrap: wrap;
 	}
-	/* Icon-only segments share one row as separate buttons: equal thirds, halves, or a
-	   lone full-width icon; min-height 40px comes from the tier's button rule. */
+	/* Labelled segments as separate buttons in a 2x2 grid (a lone one spans the row);
+	   min-height 40px comes from the tier's button rule. */
 	.project-actions .seg {
-		display: flex;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 8px;
 		border: 0; /* separate bordered buttons on touch, no group edge around them */
 		width: 100%;
 	}
-	.project-actions .seg button {
+	.project-actions .seg button:only-child {
+		grid-column: 1 / -1;
+	}
+	/* :nth-child(n) outranks the joined group's inner-edge rules from the narrow tier. */
+	.project-actions .seg button:nth-child(n) {
 		flex: 1;
 		border: 1px solid var(--line);
 		border-radius: 4px;
@@ -6293,7 +6395,7 @@ button.diff-path {
 	border-color: var(--crit);
 }
 /* Session card: one row per login, secondary "when" line, per-row logout
-   button; "Log out all sessions" sits in the card footer. */
+   button; "Sign out everywhere" sits in the card footer. */
 .session-rows {
 	display: flex;
 	flex-direction: column;

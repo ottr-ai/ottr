@@ -161,11 +161,34 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
   - **Actions:** every card button sits at the right, in the card footer or in a right-aligned action row. Steel primary marks only the card's main action. Red (danger) marks only a destructive action, and that action always asks in the board's confirm dialog (`confirmDialog`), never in `window.confirm`.
   - **Danger zone:** a red card border and a red button. The title keeps the normal heading colour, and the card has no state chip.
 
+- **Button labels** — a label names the action and its result. Sources: [NN/g, UI Copy](https://www.nngroup.com/articles/ui-copy/), [GOV.UK Button](https://design-system.service.gov.uk/components/button/), [Red Hat Button](https://ux.redhat.com/elements/button/guidelines/), [Apple HIG Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons).
+  - **Shape:** a verb first, then an object when the verb alone could mean several things ("Copy key", "Replace token", "Add project"). Two to four words, at most 30 characters. No articles, no end punctuation.
+  - **Case:** sentence case ("Open settings", not "Open Settings"). A capital noun reads as a product name.
+  - **One word per action:** the same action has the same label everywhere, and one label never means two actions. The board's fixed words:
+    - Sign in / Sign out / Sign out everywhere (never "Log in" or "Log out").
+    - Delete: the item leaves the board for good. Remove: the item leaves a list, but its data stays (a project, a key, a token). Discard: unsaved work goes. Cancel task: a queued or running task stops.
+    - Cancel only closes a dialog. When the dialog's action itself contains "Cancel", the safe button names what it keeps (`confirmDialog(..., { cancel: "Keep task" })`).
+    - Open setup (the setup wizard), Start review, Create release / Start release / Release again, Plan with agent (the backlog interview), Discuss rules (the rules interview).
+  - **Toggles name the next state:** "Turn on" / "Turn off", "By topic" / "By time".
+  - **No jargon or tool names:** "Send code", not "Send to omp". "Plan with agent", not "Grill".
+  - **No "now":** an action button runs on click, so "Provision" and "Propose" are enough.
+  - **Ellipsis:** only when the button asks for more input before it acts ("Add image…"). A progress label also ends in one ("Provisioning…").
+  - **Destructive confirm:** the confirm button repeats the action's label ("Cancel task", "Remove project"), never "OK" or "Confirm".
+- **Icons on buttons** — sources: [NN/g, Icon Usability](https://www.nngroup.com/articles/icon-usability/), [Apple HIG Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons), [Red Hat Button](https://ux.redhat.com/elements/button/guidelines/).
+  - **A visible text label by default.** Few icons are universal: close (x), search, plus for add, and the help "?". Every other icon-only button needs `aria-label` and a `title` tooltip. A tooltip does not replace a label on touch screens, because they have no hover.
+  - **One icon, one meaning.** An icon that already means one action never stands for a second action. Pick a different glyph, or show the text label.
+  - **Familiar actions, familiar glyphs:** x closes, plus adds, a pencil edits, a trash can deletes, a down arrow downloads, a send arrow sends.
+  - **Icon-only only where space forces it**, for example the bar's sidebar toggle or the narrow-board segment buttons. The `aria-label` and the tooltip then carry the same words as the full label.
+  - **No typed symbols as icons** ("+", "×", "→" as text); use the `Icon` set in `kit.tsx`.
+  - **Five-second test:** if a new glyph needs more than five seconds of thought to match its action, use text.
+
 **The Native-Platform Rule.** Modality uses the platform: `<dialog>` for focus, Esc, backdrop, and inertness; the Popover API for light-dismiss detail. No JS re-implements what the browser ships.
 
 **The Lit-Is-New Rule.** A fill on the bell means unacknowledged and nothing else. The inverted mark and the word "new" carry the state without colour.
 
 **The Settings-Row Rule.** A typed field explains itself in its "?" badge. A checkbox or a read-only fact explains itself in visible text. No setting does both. Buttons sit at the right, and only typed fields wait for a Save.
+
+**The Verb-Label Rule.** Every button label is a verb in sentence case, with an object when the verb alone is unclear. One label means one action across the whole board, and an icon never stands in for a label it cannot carry on its own.
 
 **Motion.** Everything uses one easing, `cubic-bezier(0.2, 0.7, 0.3, 1)`. Durations: 120ms control feedback, 160ms dialogs, 200ms drawer, 220ms alarm-mark arrival and in-column card slides (FLIP), 340ms card flights between stages (FLIP via WAAPI), 400ms indicator ramps, 420ms mark traces when a card lands. Under `prefers-reduced-motion`, all animation collapses to 0.01ms except the spinner, which keeps turning at its normal 0.7s so progress feedback stays legible; the mark trace and the card slides do not run at all.
 
@@ -193,6 +216,7 @@ The board targets **WCAG 2.1 AA**, enforced through the design system itself, th
 - Do keep all motion on the shared easing, and respect the reduced-motion tiers.
 - Do keep WCAG 2.1 AA: contrast, visible focus, names on icon-only controls, announced status — the detector and `impeccable audit` check it.
 - Do build every new setting with the Settings rows (definition row, checkbox row, `SaveCard`) and the Settings-Row Rule.
+- Do name every new button with the Button-labels list and the Verb-Label Rule, and reuse the board's fixed words before you choose a new one.
 
 ### Don'ts
 

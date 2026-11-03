@@ -782,7 +782,7 @@ function Card({
 							}}
 						>
 							<Icon name="corner-up-left" size={12} />
-							Re-release
+							Release again
 						</button>
 					)}
 					{release !== null &&
@@ -2025,13 +2025,13 @@ function BacklogModelDialog({
 		<Modal
 			open={open}
 			onClose={onClose}
-			label={mode === "grill" ? "Grill with the agent" : "Move to todo"}
+			label={mode === "grill" ? "Plan with agent" : "Move to todo"}
 			className="dialog"
 		>
 			<div className="dialog-body">
 				<div className="dialog-head">
 					<h2>
-						{mode === "grill" ? "Grill with the agent" : "Move to todo"}
+						{mode === "grill" ? "Plan with agent" : "Move to todo"}
 						<span className="dialog-sub">{taskTitle}</span>
 					</h2>
 					<CloseButton />
@@ -2085,7 +2085,7 @@ function BacklogModelDialog({
 					>
 						{send.busy && <span className="spinner" aria-hidden="true" />}
 						<Icon name={mode === "grill" ? "send" : "plus"} />
-						{mode === "grill" ? "Grill" : "Move to todo"}
+						{mode === "grill" ? "Plan with agent" : "Move to todo"}
 					</button>
 				</div>
 			</div>
@@ -2662,23 +2662,25 @@ function ProjectBoard({
 					</div>
 				</div>
 				<div className="project-actions">
-					<input
-						type="search"
-						className={q === "" ? "search" : "search filtered"}
-						placeholder="Search tasks"
-						aria-label="Search tasks"
-						value={query}
-						onChange={(e) => setQuery(e.target.value)}
-					/>
-					{q !== "" && (
+					<span className={q === "" ? "search-group" : "search-group filtered"}>
+						<input
+							type="search"
+							className={q === "" ? "search" : "search filtered"}
+							placeholder="Search tasks"
+							aria-label="Search tasks"
+							value={query}
+							onChange={(e) => setQuery(e.target.value)}
+						/>
 						<span
-							className="filter-note"
+							className="search-count"
 							role="status"
-							title="Matching of total tasks"
+							title={
+								q === "" ? "Tasks in this project" : "Matching of total tasks"
+							}
 						>
-							{shown.length}/{tasks.length}
+							{q === "" ? tasks.length : `${shown.length}/${tasks.length}`}
 						</span>
-					)}
+					</span>
 					<div className="seg">
 						{project.hasRules && (
 							<button
@@ -2693,7 +2695,7 @@ function ProjectBoard({
 								}
 								title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
 							>
-								<Icon name="refresh-cw" />
+								<Icon name="scale" />
 								<span className="seg-label">Align rules</span>
 							</button>
 						)}
@@ -2701,7 +2703,7 @@ function ProjectBoard({
 							<button
 								type="button"
 								className="arch-start"
-								aria-label="Review"
+								aria-label="Start review"
 								disabled={project.archReview.running}
 								title={
 									project.archReview.running
@@ -2710,8 +2712,8 @@ function ProjectBoard({
 								}
 								onClick={() => setShowReview(true)}
 							>
-								<Icon name="eye" size={13} />
-								<span className="seg-label">Review</span>
+								<Icon name="shield-check" size={13} />
+								<span className="seg-label">Start review</span>
 							</button>
 						) : (
 							project.archReview !== null &&
@@ -2719,12 +2721,12 @@ function ProjectBoard({
 								<button
 									type="button"
 									className="arch-start quiet"
-									aria-label="Review"
+									aria-label="Start review"
 									title={`${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`}
 									onClick={() => setShowReview(true)}
 								>
-									<Icon name="eye" size={13} />
-									<span className="seg-label">Review</span>
+									<Icon name="shield-check" size={13} />
+									<span className="seg-label">Start review</span>
 								</button>
 							)
 						)}
@@ -2739,10 +2741,10 @@ function ProjectBoard({
 								title={
 									project.archReview?.running
 										? "A release or review is still open: one at a time"
-										: "Release everything new on the target"
+										: "Release all new commits"
 								}
 							>
-								<Icon name="tag" />
+								<Icon name="package" />
 								<span className="seg-label">Create release</span>
 							</button>
 						)}
@@ -2750,12 +2752,12 @@ function ProjectBoard({
 							<button
 								type="button"
 								className="ghost"
-								aria-label="Diagrams"
+								aria-label="Show diagrams"
 								onClick={() => setShowDiagrams(true)}
 								title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
 							>
-								<Icon name="image" />
-								<span className="seg-label">Diagrams</span>
+								<Icon name="workflow" />
+								<span className="seg-label">Show diagrams</span>
 							</button>
 						)}
 					</div>
@@ -2805,7 +2807,7 @@ function ProjectBoard({
 					<Icon name="info" size={14} />
 					No AGENTS.md yet, so tasks wait in Todo.
 					<BusyButton run={() => interview("/interview", {})}>
-						Start rules interview
+						Discuss rules
 					</BusyButton>
 				</p>
 			)}
@@ -2814,7 +2816,7 @@ function ProjectBoard({
 					<Icon name="info" size={14} />
 					Not a git repository yet, so every action waits.
 					<BusyButton run={() => interview("/init", {})}>
-						Init git repository
+						Create git repo
 					</BusyButton>
 				</p>
 			)}
@@ -3214,7 +3216,7 @@ export function Overview({
 				<p>
 					Point at any directory. Ottr gives every task its own worktree and
 					agent, then merges the finished work; a directory without a git repo
-					gets an Init git repository action first.
+					gets a Create git repo action first.
 				</p>
 				<button type="button" className="primary" onClick={onAdd}>
 					<Icon name="plus" />
@@ -3516,7 +3518,7 @@ function Provisioning({
 									type="button"
 									onClick={() => openSettingsSection("alate-section")}
 								>
-									Set it up
+									Open setup
 								</button>
 							</>
 						) : (
@@ -4473,7 +4475,7 @@ export function LaneCol({
 					<p className="lane-label backlog-head">
 						Backlog
 						{parkedTotal !== undefined && (
-							<span className="count">{parkedTotal}</span>
+							<span className="backlog-count">{parkedTotal}</span>
 						)}
 						{onAddDraft && (
 							<button
@@ -4790,13 +4792,13 @@ function UpdatesPanel({
 							);
 						}}
 					>
-						Propose now
+						Propose
 					</button>
 				</div>
 				{all.length > 0 && (
 					<label
 						className="updates-all"
-						title="Also show releases younger than 7 days (Propose now until they qualify)"
+						title="Also show releases younger than 7 days (Propose until they qualify)"
 					>
 						<input
 							type="checkbox"
@@ -5414,7 +5416,7 @@ function AddProjectModal({
 												openSettingsSection("github-token-block");
 											}}
 										>
-											Open Settings
+											Open settings
 										</button>
 									</p>
 								))}
@@ -5432,7 +5434,7 @@ function AddProjectModal({
 						)}
 						{addTrust !== null && (
 							<SshTestRow
-								label="Add"
+								label="Add project"
 								success="Project added"
 								send={(trust) =>
 									gitReq("POST", "/api/projects", {
@@ -5473,7 +5475,7 @@ function AddProjectModal({
 							>
 								{add.busy && <span className="spinner" aria-hidden="true" />}
 								<Icon name="plus" />
-								Add
+								Add project
 							</button>
 						</div>
 					</form>
@@ -5711,7 +5713,7 @@ export function AskBlock({
 					disabled={busy || (multi ? multiTotal === 0 : custom.trim() === "")}
 				>
 					{busy && <span className="spinner" aria-hidden="true" />}
-					{(selected === null ? "Answer" : "Replace") +
+					{(selected === null ? "Answer" : "Replace answer") +
 						(multi && multiTotal > 0 ? ` (${multiTotal})` : "")}
 				</button>
 			</form>
@@ -5952,7 +5954,7 @@ function turnPage<T extends { list: string[]; index: number }>(
 	return { ...v, index: (v.index + delta + v.list.length) % v.list.length };
 }
 
-/** Follow-up text behind a research report's "Implement recommendations" button. */
+/** Follow-up text behind a research report's "Implement steps" button. */
 const IMPLEMENT_RECOMMENDATIONS =
 	"Implement the recommended steps (also called next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
@@ -6098,7 +6100,7 @@ function PrReviewSection({
 						}
 					>
 						<Icon name="send" />
-						Post
+						Post review
 					</BusyButton>
 				</div>
 			</div>
@@ -6494,116 +6496,118 @@ export function Drawer({
 				className="drawer"
 			>
 				<div className="drawer-body">
-					<div className="drawer-head">
-						<h2>{task.sessionTitle ?? task.title}</h2>
-						<div className="drawer-head-actions">
-							{task.stage === "done" && task.research && !cancelled && (
+					<header className="drawer-top">
+						<div className="drawer-head">
+							<h2>{task.sessionTitle ?? task.title}</h2>
+							<div className="drawer-head-actions">
+								{task.stage === "done" && task.research && !cancelled && (
+									<button
+										type="button"
+										className="icon"
+										aria-pressed={task.starred}
+										aria-label={task.starred ? "Starred" : "Star"}
+										title={
+											task.starred
+												? "Removes this report from the Starred section"
+												: "Pins this report in the Starred section of the done lane"
+										}
+										onClick={() =>
+											void act(async () => {
+												await post(
+													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
+													{ starred: !task.starred },
+												);
+											})
+										}
+									>
+										<Icon name="star" />
+									</button>
+								)}
 								<button
 									type="button"
 									className="icon"
-									aria-pressed={task.starred}
-									aria-label={task.starred ? "Starred" : "Star"}
-									title={
-										task.starred
-											? "Removes this report from the Starred section"
-											: "Pins this report in the Starred section of the done lane"
-									}
-									onClick={() =>
-										void act(async () => {
-											await post(
-												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
-												{ starred: !task.starred },
-											);
-										})
-									}
+									aria-label="Workflow overview"
+									title="Workflow overview"
+									onClick={() => setWfOpen(true)}
 								>
-									<Icon name="star" />
+									<Icon name="route" />
 								</button>
-							)}
-							<button
-								type="button"
-								className="icon"
-								aria-label="Workflow overview"
-								title="Workflow overview"
-								onClick={() => setWfOpen(true)}
-							>
-								<Icon name="branch" />
-							</button>
-							<CloseButton />
+								<CloseButton />
+							</div>
 						</div>
-					</div>
-					<p className="drawer-sub">
-						<span>{projectLabel(project)}</span>
-						<span className="sub-dim">
-							{/* Click copies the id for pasting into another task or an agent session. */}
-							<button
-								type="button"
-								className="task-id"
-								title="Copy task ID"
-								onClick={() => {
-									setIdCopyError(null);
-									copyText(task.id).then(flashCopiedId, (err) =>
-										setIdCopyError(
-											err instanceof Error ? err.message : String(err),
-										),
-									);
-								}}
-							>
-								{copiedId ? "Copied" : task.id}
-							</button>
-							{idCopyError !== null && (
-								<span role="alert" className="auth-error">
-									{idCopyError}
-								</span>
-							)}
-						</span>
-						<span>
-							{COLUMNS.find((c) => c.key === task.stage)?.label ?? task.stage}
-						</span>
-						<span
-							className="sub-dim"
-							title={new Date(task.createdAt).toLocaleString()}
-						>
-							created {stamp(task.createdAt)}
-						</span>
-						{task.cancelledAt !== null && (
-							<span
-								className="sub-dim"
-								title={new Date(task.cancelledAt).toLocaleString()}
-							>
-								cancelled {stamp(task.cancelledAt)}
-							</span>
-						)}
-						{task.stage === "done" && task.doneAt !== null && (
-							<span
-								className="sub-dim"
-								title={new Date(task.doneAt).toLocaleString()}
-							>
-								landed {stamp(task.doneAt)}
-							</span>
-						)}
-						{/* The stage label already says done; the status word only earns its place when it adds state. */}
-						{task.state !== "idle" && (
-							<span
-								className={
-									"st st-" + task.state + (askedNow ? " st-asked" : "")
-								}
-							>
-								{/* Alarm coding rides in markup, not ::before: the drawer-sub
-								    separator owns that pseudo-element. */}
-								{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
-								{statusLine(
-									task,
-									project.hasRules,
-									// The list below names the cards; the meta line only counts them.
-									waiting.length > 0
-										? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
-										: holdFor(task, tasks),
-									draining,
+						<p className="drawer-sub">
+							<span>{projectLabel(project)}</span>
+							<span className="sub-dim">
+								{/* Click copies the id for pasting into another task or an agent session. */}
+								<button
+									type="button"
+									className="task-id"
+									title="Copy task ID"
+									onClick={() => {
+										setIdCopyError(null);
+										copyText(task.id).then(flashCopiedId, (err) =>
+											setIdCopyError(
+												err instanceof Error ? err.message : String(err),
+											),
+										);
+									}}
+								>
+									{copiedId ? "Copied" : task.id}
+								</button>
+								{idCopyError !== null && (
+									<span role="alert" className="auth-error">
+										{idCopyError}
+									</span>
 								)}
 							</span>
-						)}
-					</p>
+							<span>
+								{COLUMNS.find((c) => c.key === task.stage)?.label ?? task.stage}
+							</span>
+							<span
+								className="sub-dim"
+								title={new Date(task.createdAt).toLocaleString()}
+							>
+								created {stamp(task.createdAt)}
+							</span>
+							{task.cancelledAt !== null && (
+								<span
+									className="sub-dim"
+									title={new Date(task.cancelledAt).toLocaleString()}
+								>
+									cancelled {stamp(task.cancelledAt)}
+								</span>
+							)}
+							{task.stage === "done" && task.doneAt !== null && (
+								<span
+									className="sub-dim"
+									title={new Date(task.doneAt).toLocaleString()}
+								>
+									landed {stamp(task.doneAt)}
+								</span>
+							)}
+							{/* The stage label already says done; the status word only earns its place when it adds state. */}
+							{task.state !== "idle" && (
+								<span
+									className={
+										"st st-" + task.state + (askedNow ? " st-asked" : "")
+									}
+								>
+									{/* Alarm coding rides in markup, not ::before: the drawer-sub
+					    				    separator owns that pseudo-element. */}
+									{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
+									{statusLine(
+										task,
+										project.hasRules,
+										// The list below names the cards; the meta line only counts them.
+										waiting.length > 0
+											? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
+											: holdFor(task, tasks),
+										draining,
+									)}
+								</span>
+							)}
+						</p>
+					</header>
 					{mut !== null && (
 						<DrawerSec
 							id="drawer-mut"
@@ -6932,7 +6936,7 @@ export function Drawer({
 											{notesSave.busy && (
 												<span className="spinner" aria-hidden="true" />
 											)}
-											Append
+											Add to notes
 										</button>
 										<button
 											type="submit"
@@ -7524,7 +7528,7 @@ export function Drawer({
 											{triageSave.busy && (
 												<span className="spinner" aria-hidden="true" />
 											)}
-											Nominate
+											Suggest closing
 										</button>
 									</form>
 								) : (
@@ -7541,7 +7545,7 @@ export function Drawer({
 											aria-busy={triageSave.busy || undefined}
 											onClick={clearCandidate}
 										>
-											Clear
+											Clear reason
 										</button>
 									</span>
 								)}
@@ -7579,7 +7583,7 @@ export function Drawer({
 										}
 									>
 										<Icon name="play" />
-										Implement recommendations
+										Implement steps
 									</BusyButton>
 								)}
 							<p className="hint">
@@ -7792,7 +7796,7 @@ export function Drawer({
 										onClick={() => setPick("grill")}
 									>
 										<Icon name="send" />
-										Grill with the agent
+										Plan with agent
 									</button>
 									<button
 										type="button"
@@ -7849,7 +7853,11 @@ export function Drawer({
 												)
 											: await confirmDialog(
 													"Cancel this task? It stops the run and deletes its worktree and branch.",
-													{ ok: "Cancel task", danger: true },
+													{
+														ok: "Cancel task",
+														cancel: "Keep task",
+														danger: true,
+													},
 												)
 									)
 										? act(async () => {
@@ -7957,7 +7965,7 @@ export function Drawer({
 										);
 									}}
 								>
-									{copied ? "Copied" : "Copy"}
+									{copied ? "Copied" : "Copy command"}
 								</button>
 							</div>
 						)}
@@ -8182,7 +8190,7 @@ function AuthPage({
 					)}
 					<button type="submit" className="primary" disabled={busy}>
 						{busy && <span className="spinner" aria-hidden="true" />}
-						{setup ? "Create admin" : "Log in"}
+						{setup ? "Create admin" : "Sign in"}
 					</button>
 				</form>
 				{version !== null && <p className="auth-version">{version}</p>}
@@ -9148,7 +9156,7 @@ function App() {
 								className="notif-link"
 								onClick={() => openSettingsSection("alate-section")}
 							>
-								Open Settings
+								Open settings
 							</button>
 						</span>
 						{inboxFresh.has(alatePendingKey) && (
@@ -9167,7 +9175,7 @@ function App() {
 								className="notif-link"
 								onClick={() => openSettingsSection("signin-section")}
 							>
-								Open Settings
+								Open settings
 							</button>
 						</span>
 						{inboxFresh.has(`signin:${d.provider}`) && (
@@ -9680,7 +9688,7 @@ function App() {
 								onClick={() => void act(logOut)}
 							>
 								<Icon name="log-out" size={14} />
-								Log out
+								Sign out
 							</button>
 						</>
 					)}

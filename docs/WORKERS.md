@@ -27,7 +27,7 @@ docker compose up -d
 The board also provisions on its own: every 5 minutes it reads the alate server's
 `GET /health`, and when the server reports an unprovisioned import (`pending`) and no
 turn is preparing or running, it calls the same provisioning API as
-**Settings → Alate → Provision now**. A failed attempt waits an hour before it tries
+**Settings → Alate → Provision**. A failed attempt waits an hour before it tries
 again; the error shows in the Alate settings section.
 
 At run time git authenticates with the board's GitHub token (asked for at

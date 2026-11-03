@@ -588,22 +588,22 @@ describe("SessionSection", () => {
 			const card = container.querySelector("#session-section");
 			expect(card).not.toBeNull();
 			const rows = card?.querySelectorAll(".session-row");
-			expect(rows?.length).toBe(2); // one row per session; Log out all sits in the footer
+			expect(rows?.length).toBe(2); // one row per session; Sign out everywhere sits in the footer
 			expect(container.textContent).toContain("Firefox on Windows");
 			expect(container.textContent).toContain("Chrome on Linux");
 			expect(container.textContent).toContain("This browser");
 			expect(card?.querySelectorAll(".session-current").length).toBe(1);
 			expect(
 				card?.querySelectorAll(
-					'button[aria-label="Log out Firefox on Windows"]',
+					'button[aria-label="Sign out Firefox on Windows"]',
 				),
 			).toHaveLength(1);
 			expect(
-				card?.querySelectorAll('button[aria-label="Log out Chrome on Linux"]'),
+				card?.querySelectorAll('button[aria-label="Sign out Chrome on Linux"]'),
 			).toHaveLength(1);
 			expect(
 				card?.querySelector(".sec-foot button.danger")?.textContent,
-			).toContain("Log out all sessions");
+			).toContain("Sign out everywhere");
 			// Ids are never rendered.
 			expect(container.textContent).not.toContain("a".repeat(24));
 		} finally {
@@ -611,7 +611,7 @@ describe("SessionSection", () => {
 		}
 	});
 
-	test("a failed list fetch shows the failure line and keeps Log out all sessions", async () => {
+	test("a failed list fetch shows the failure line and keeps Sign out everywhere", async () => {
 		const fetchMock = (async (): Promise<Response> =>
 			new Response(JSON.stringify({ error: "boom" }), {
 				status: 500,
@@ -623,10 +623,10 @@ describe("SessionSection", () => {
 			expect(container.textContent).toContain("Sessions could not be loaded.");
 			expect(
 				card?.querySelector(".sec-foot button.danger")?.textContent,
-			).toContain("Log out all sessions");
+			).toContain("Sign out everywhere");
 			// No per-session rows, so no per-session logout buttons.
 			expect(
-				card?.querySelectorAll('button[aria-label^="Log out "]'),
+				card?.querySelectorAll('button[aria-label^="Sign out "]'),
 			).toHaveLength(0);
 		} finally {
 			await unmount();
@@ -684,7 +684,7 @@ describe("GitHostsSection global SSH key", () => {
 				return b as HTMLButtonElement;
 			};
 			// Before a key and a URL exist, neither button can act.
-			expect(button("Test").disabled).toBe(true);
+			expect(button("Test key").disabled).toBe(true);
 			expect(button("Save key").disabled).toBe(true);
 			await act(async () => {
 				button("Generate").click();
@@ -698,7 +698,7 @@ describe("GitHostsSection global SSH key", () => {
 				onChangeOf(url)({ target: url, currentTarget: url });
 			});
 			await act(async () => {
-				button("Test").click();
+				button("Test key").click();
 			});
 			await act(async () => {
 				button("Save key").click();

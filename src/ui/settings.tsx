@@ -238,7 +238,7 @@ export function ProjectSetupSteps({
 										}, setErr)
 									}
 								>
-									Init git repository
+									Create git repo
 								</BusyButton>
 							</div>
 						</>
@@ -250,7 +250,7 @@ export function ProjectSetupSteps({
 							</p>
 							<div>
 								<BusyButton run={() => runInterview({ fix: true })}>
-									Align rules now
+									Align rules
 								</BusyButton>
 							</div>
 						</>
@@ -269,7 +269,7 @@ export function ProjectSetupSteps({
 								<BusyButton
 									run={() => runInterview({}, () => setRulesQueued(true))}
 								>
-									Start rules interview
+									Discuss rules
 								</BusyButton>
 							</div>
 						</>
@@ -462,7 +462,7 @@ export function ProjectSetupSteps({
 	);
 }
 
-/** The wizard as its own dialog: Run setup again (settings page) and Open setup (checklist). */
+/** The wizard as its own dialog: Open setup, from the settings page or the checklist. */
 export function SetupWizardModal({
 	project,
 	act,
@@ -631,7 +631,7 @@ function TotalRunnersForm({
 /** Settings "Push notifications" section: Web Push opt-in for closed-phone alerts, plus a test. */
 function PushSection() {
 	const [enabled, setEnabled] = useState(false);
-	// "Test sent" is a short confirmation; the button reads "Test" again after it.
+	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
@@ -732,7 +732,7 @@ function PushSection() {
 						title={enabled ? undefined : "Turn on push notifications first"}
 					>
 						{spin("test", sent ? "check" : "send")}
-						{sent ? "Test sent" : "Test"}
+						{sent ? "Test sent" : "Send test"}
 					</button>
 					{enabled ? (
 						<button
@@ -909,7 +909,7 @@ type SessionEntry = {
 };
 
 /** Settings "Session" section: the list of logins, per-row logout, and the footer's
- *  "Log out all sessions", which rotates the session secret and revokes all. */
+ *  "Sign out everywhere", which rotates the session secret and revokes all. */
 export function SessionSection() {
 	const busy = useBusy();
 	const revokeBusy = useBusy();
@@ -929,8 +929,8 @@ export function SessionSection() {
 	}, [load]);
 	const revoke = async (entry: SessionEntry): Promise<void> => {
 		if (
-			!(await confirmDialog(`Log out ${entry.label}?`, {
-				ok: "Log out",
+			!(await confirmDialog(`Sign out ${entry.label}?`, {
+				ok: "Sign out",
 				danger: true,
 			}))
 		)
@@ -958,8 +958,8 @@ export function SessionSection() {
 	const logOutAll = async (): Promise<void> => {
 		if (
 			!(await confirmDialog(
-				"Log out all sessions? Every browser, including this one, must log in again.",
-				{ ok: "Log out all", danger: true },
+				"Sign out everywhere? Every browser, including this one, must sign in again.",
+				{ ok: "Sign out everywhere", danger: true },
 			))
 		)
 			return;
@@ -978,7 +978,7 @@ export function SessionSection() {
 		<SettingsCard
 			id="session-section"
 			title="Session"
-			hint="Log out in the account menu signs out only this browser. If a device is lost or a cookie escaped, log out all sessions: every login session is revoked."
+			hint="Sign out in the account menu signs out only this browser. If a device is lost or a cookie escaped, sign out everywhere: every login session is revoked."
 			footer={
 				<button
 					type="button"
@@ -992,7 +992,7 @@ export function SessionSection() {
 					) : (
 						<Icon name="log-out" />
 					)}
-					Log out all sessions
+					Sign out everywhere
 				</button>
 			}
 		>
@@ -1016,8 +1016,8 @@ export function SessionSection() {
 							<button
 								type="button"
 								className="icon danger"
-								aria-label={`Log out ${entry.label}`}
-								title={`Log out ${entry.label}`}
+								aria-label={`Sign out ${entry.label}`}
+								title={`Sign out ${entry.label}`}
 								onClick={() => void revoke(entry)}
 								disabled={revokeBusy.busy}
 							>
@@ -1318,7 +1318,7 @@ type SshTestOptions = {
  *  separate so a button can sit on a field's line while the result spans the card below. */
 function useSshTest({
 	send,
-	label = "Test",
+	label = "Test key",
 	success = "Test passed",
 	onOk,
 	disabledReason,
@@ -1347,7 +1347,7 @@ function useSshTest({
 			})
 			.finally(() => setBusy(false));
 	};
-	// "Test" retries as "Trust and test", "Save key" as "Trust and save key", "Add" as "Trust and add".
+	// "Test key" retries as "Trust and test key", "Save key" as "Trust and save key", "Add project" as "Trust and add project".
 	const retryLabel = `Trust and ${label.toLowerCase()}`;
 	const button = (
 		<button
@@ -1501,7 +1501,7 @@ export function PendingKeyRow({
 							type="button"
 							onClick={() => void copyText(pending.publicKey)}
 						>
-							Copy
+							Copy key
 						</button>
 					</div>
 					<p className="hint">
@@ -1563,7 +1563,7 @@ export function GitHostsSection() {
 	// Test only checks access and saves nothing: the new key when one is pending, else the
 	// global key. Save key stores the pending key; the server tests it first and refuses a failure.
 	const gTest = useSshTest({
-		label: "Test",
+		label: "Test key",
 		disabledReason:
 			gUrl.trim() === ""
 				? "Enter a test URL first"
@@ -1800,7 +1800,7 @@ export function GitHostsSection() {
 							Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
 						</p>
 						<button type="button" onClick={() => setAppFormOpen(true)}>
-							Replace
+							Replace key
 						</button>{" "}
 						<BusyButton className="danger" run={removeApp}>
 							Remove
@@ -1894,7 +1894,7 @@ export function GitHostsSection() {
 												setTUser(t.username);
 											}}
 										>
-											Replace
+											Replace token
 										</button>{" "}
 										<BusyButton
 											className="danger"
@@ -2025,7 +2025,7 @@ export function GitHostsSection() {
 										void copyText(state.globalKey?.publicKey ?? "")
 									}
 								>
-									Copy
+									Copy key
 								</button>
 								<BusyButton className="danger" run={removeGlobal}>
 									Remove
@@ -2097,7 +2097,7 @@ function SshKeySection({ project }: { project: ProjectView }) {
 				? `project:${project.name}`
 				: "global";
 	const pTest = useSshTest({
-		label: "Test",
+		label: "Test key",
 		disabledReason: pUrl.trim() === "" ? "Enter a test URL first" : undefined,
 		send: (trust) =>
 			gitReq("POST", "/api/git-hosts/ssh/test", {
@@ -2591,7 +2591,7 @@ function ProviderLoginSection() {
 								className={act.failed ? "failed" : undefined}
 							>
 								{act.busy && <span className="spinner" aria-hidden="true" />}
-								Send to omp
+								Send code
 							</button>
 						</div>
 					</div>
@@ -2988,7 +2988,7 @@ function ModelRolesSection() {
 							/>
 						</label>
 						<button type="submit" disabled={save.busy}>
-							Add
+							Add role
 						</button>
 					</form>
 					{addErr !== null && (
@@ -3047,7 +3047,7 @@ function ModelRolesSection() {
 										: failed.length > 0
 											? `: ${failed.length} of ${prov.results.length} scripts failed`
 											: ""}
-									. The commit stays in the data repo. Use Provision now in the
+									. The commit stays in the data repo. Use Provision in the
 									Alate section to try again.
 								</>
 							)}
@@ -3592,7 +3592,7 @@ function AlateSection() {
 						{(prov.busy || awaiting) && (
 							<span className="spinner" aria-hidden="true" />
 						)}
-						{awaiting ? "Provisioning…" : "Provision now"}
+						{awaiting ? "Provisioning…" : "Provision"}
 					</button>
 				</div>
 			</form>
@@ -4319,7 +4319,7 @@ export function ProjectSettingsForm({
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const st = project.settings;
 	const icon = useInstantSave(act);
-	// The setup wizard, opened by Run setup again.
+	// The setup wizard, opened by Open setup.
 	const [setupOpen, setSetupOpen] = useState(false);
 	const removable = !tasks.some(
 		(t) =>
@@ -4354,8 +4354,8 @@ export function ProjectSettingsForm({
 					onClick={() => setSetupOpen(true)}
 					title="Open the setup wizard at the Rules step for this project"
 				>
-					<Icon name="refresh-cw" size={13} />
-					Run setup again
+					<Icon name="list-checks" size={13} />
+					Open setup
 				</button>
 			</div>
 			<section

@@ -995,7 +995,7 @@ describe("AskBlock", () => {
 		// Both picked presets render checked; the custom row's checkbox stays unchecked.
 		expect(html.split('checked=""').length - 1).toBe(2);
 		expect(html).toContain("(2)");
-		expect(html).toContain("Replace");
+		expect(html).toContain("Replace answer");
 	});
 
 	test("a single question stays a radio group that answers in one click", () => {
@@ -1689,7 +1689,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(html).toContain('class="turns"');
 		// No action button survives: follow-up, cancel/delete, unread flip.
 		expect(html).not.toContain("Follow up");
-		expect(html).not.toContain("Implement recommendations");
+		expect(html).not.toContain("Implement steps");
 		expect(html).not.toContain("Cancel task");
 		expect(html).not.toContain("Delete task");
 		expect(html).not.toContain("Mark unread");
@@ -1768,7 +1768,7 @@ describe("LaneCol release hold", () => {
 		expect(html).toContain("merges wait for this release");
 		expect(html).toContain("All 2 findings are done.");
 		expect(html).toContain("m1, m2");
-		expect(html).toContain("Re-release");
+		expect(html).toContain("Release again");
 	});
 
 	test("a release card with an open finding shows no re-release line", () => {
@@ -1782,7 +1782,7 @@ describe("LaneCol release hold", () => {
 			/>,
 		);
 		expect(html).not.toContain("merges wait for this release");
-		expect(html).not.toContain("Re-release");
+		expect(html).not.toContain("Release again");
 	});
 
 	test("a held queued merging card links to the release card holding it", () => {

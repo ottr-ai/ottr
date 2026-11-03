@@ -24,7 +24,7 @@ import { ProjectStore } from "../src/store.ts";
 
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
-const POOL_VERSION = 3;
+const POOL_VERSION = 4;
 
 type Stage = "todo" | "in_progress" | "merging" | "done";
 type RunState = "queued" | "preparing" | "running" | "needs_you" | "idle";
@@ -169,6 +169,15 @@ const POOL: ProjectSpec[] = [
 				work: 7,
 				merge: 2,
 				followUpOf: 0,
+			},
+			{
+				title: "Compare Zigbee and Thread for the next sensor batch",
+				stage: "done",
+				state: "idle",
+				age: 3,
+				work: 24,
+				merge: 3,
+				research: true,
 			},
 		],
 	},

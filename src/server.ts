@@ -526,7 +526,7 @@ const supervisor = createSupervisor(
 setInterval(() => void supervisor.tick(), 60_000);
 
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
-// provision path as Settings → Alate → Provision now; a failed attempt waits an hour.
+// provision path as Settings → Alate → Provision; a failed attempt waits an hour.
 setInterval(() => void app.alateProvisionTick(), 5 * 60_000);
 
 // Idle auto-start (docs/specs/mutation-delta.md §7): with the setting on, a board quiet for

@@ -76,10 +76,10 @@ Origin wall on non-GET, host wall, auth wall (session cookie or
 
 - The Session card lists the sessions as rows: client label, a "This
   browser" mark on the current one, when it was last seen, when it signed
-  in. Each row carries a "Log out" button on its right.
-- "Log out" asks through a confirmation first (the card's established
+  in. Each row carries a "Sign out" button on its right.
+- "Sign out" asks through a confirmation first (the card's established
   `window.confirm` pattern). Confirming revokes the entry; revoking the
-  current session then behaves like the account menu's Log out (cookie gone,
+  current session then behaves like the account menu's Sign out (cookie gone,
   reload into the login gate). Revoking another session refreshes the list.
 - Rows follow the settings row conventions (36 px rhythm, quiet secondary
   text, steel only as the interaction edge; the destructive button keeps the

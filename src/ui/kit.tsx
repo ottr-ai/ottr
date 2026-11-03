@@ -212,6 +212,58 @@ const ICON_PATHS = {
 			<path d="M9 3v18" />
 		</>
 	),
+	// lucide scale (ISC): Align rules weighs AGENTS.md against the pipeline
+	scale: (
+		<>
+			<path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+			<path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+			<path d="M7 21h10" />
+			<path d="M12 3v18" />
+			<path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
+		</>
+	),
+	// lucide shield-check (ISC): Start review
+	"shield-check": (
+		<>
+			<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+			<path d="m9 12 2 2 4-4" />
+		</>
+	),
+	// lucide package (ISC): Create release
+	package: (
+		<>
+			<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z" />
+			<path d="M12 22V12" />
+			<path d="m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7" />
+			<path d="m7.5 4.27 9 5.15" />
+		</>
+	),
+	// lucide workflow (ISC): Show diagrams
+	workflow: (
+		<>
+			<rect x="3" y="3" width="8" height="8" rx="2" />
+			<path d="M7 11v4a2 2 0 0 0 2 2h4" />
+			<rect x="13" y="13" width="8" height="8" rx="2" />
+		</>
+	),
+	// lucide list-checks (ISC): Open setup, a wizard of steps
+	"list-checks": (
+		<>
+			<path d="m3 17 2 2 4-4" />
+			<path d="m3 7 2 2 4-4" />
+			<path d="M13 6h8" />
+			<path d="M13 12h8" />
+			<path d="M13 18h8" />
+		</>
+	),
+	// lucide route (ISC): the drawer's workflow overview, one card's path through the stages
+	route: (
+		<>
+			<circle cx="6" cy="19" r="3" />
+			<path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" />
+			<circle cx="18" cy="5" r="3" />
+		</>
+	),
 	// lucide chevrons-up / chevrons-down (ISC): collapse-all / expand-all lane tools
 	"chevrons-up": (
 		<>
@@ -648,10 +700,16 @@ export function CloseButton() {
  * Board-styled stand-in for window.confirm. The text up to the first "?" is the title, the
  * rest the detail (line breaks kept). Resolves true only on the confirm button; Cancel, Esc,
  * the close button and the backdrop all resolve false. A danger confirm starts on Cancel.
+ * `cancel` renames the safe button when "Cancel" would collide with the action itself
+ * (for example "Cancel task" pairs with "Keep task").
  */
 export function confirmDialog(
 	message: string,
-	{ ok = "Confirm", danger = false }: { ok?: string; danger?: boolean } = {},
+	{
+		ok = "Confirm",
+		cancel = "Cancel",
+		danger = false,
+	}: { ok?: string; cancel?: string; danger?: boolean } = {},
 ): Promise<boolean> {
 	const cut = message.search(/\?(\s|$)/);
 	const title = cut < 0 ? message : message.slice(0, cut + 1);
@@ -684,7 +742,7 @@ export function confirmDialog(
 						data-autofocus={danger || undefined}
 						onClick={close}
 					>
-						Cancel
+						{cancel}
 					</button>
 					<button
 						type="button"
