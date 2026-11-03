@@ -37,9 +37,11 @@ from `origin` by name.
    target-refresh paths. It names the pinned URL instead:
    - `serverMergePush` pushes `<originUrl> refs/heads/<branch>:refs/heads/<branch>`;
    - `mergeHoldMismatch` fetches `<originUrl> +refs/heads/<branch>:refs/ottr/gate/<branch>`;
-   - `resolveTarget(…, fetch=true)` fetches `<originUrl> +<remoteRef>:refs/remotes/origin/<short>`
-     when the upstream remote is `origin`, so the configured (plantable)
-     refspecs stay irrelevant;
+   - `resolveTarget(…, fetch=true)` fetches `<originUrl>
+     +<remoteRef>:refs/remotes/origin/<short>` for every origin upstream, so the
+     configured (plantable) refspecs stay irrelevant; an upstream the pin does
+     not cover (a fork remote, a merge ref outside `refs/heads`) skips the
+     fetch with a warning — the board never fetches by remote name;
    - `planRelease` fetches `--tags <originUrl>`;
    - `publishRelease` pushes the tag to `<originUrl>`;
    - `runReleaseCommand` ls-remotes and fetches tags from `<originUrl>`.
@@ -52,10 +54,11 @@ from `origin` by name.
      (it would parse as a git option and could drop the repository argument,
      falling back to the planted default remote) is refused;
    - a local pin must resolve outside every worker-writable root. Local forms:
-     a plain absolute path, a Windows drive/UNC path, a `file://` URL whose
-     authority is empty or `localhost`, and any no-scheme value that git reads
-     as a path (no colon, or the first slash before the first colon —
-     `./x:y.git` is a path, `host:path` is scp-ssh). The roots are the project
+     a plain absolute path, a Windows drive/UNC path, any `file://` URL (current
+     git ignores its authority and serves the path after the first `/`
+     locally), and any no-scheme value that git reads as a path (no colon, or
+     the first slash before the first colon — `./x:y.git` is a path, `host:path`
+     is scp-ssh). The roots are the project
      roots (`OMP_TRACKER_ROOTS`), `OTTR_DATA_DIR`, and the server's own home
      (the compose shared `home` volume at `/root`), set at boot when
      `OTTR_DATA_DIR` is configured — that is, when a worker boundary exists at
@@ -105,6 +108,11 @@ from `origin` by name.
 - A relative pin git reads as a local path (`./x:y.git`: first slash before the
   first colon) gets the worker-root check and fails closed under a configured
   root; the same reading without roots pushes a relative bare.
+- Every `file://` authority form (`file://host/path`, `file://localhost:9/path`)
+  resolves to the path after the first slash and gets the worker-root check.
+- An upstream the pin does not cover (a fork remote, a merge ref outside
+  `refs/heads`) skips the refresh fetch with a warning; no fetch by remote name
+  runs.
 - A pin under a configured worker root fails closed; with no roots configured
   the same pin works (native behavior unchanged).
 - A planted `remote.origin.fetch` refspec is ignored by the pinned

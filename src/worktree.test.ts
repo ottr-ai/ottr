@@ -928,6 +928,66 @@ describe("pinned origin URL (OTTR-348)", () => {
 		}
 	}, 60_000);
 
+	test("every file:// authority form gets the worker-root check", async () => {
+		const f = fixture();
+		try {
+			// Current git ignores a file:// URL's authority and serves the path after the
+			// first slash locally, so each of these names f.evil once resolved.
+			setWorkerRoots([f.dir]);
+			try {
+				for (const pin of [
+					`file://${f.evil}`,
+					`file://nowhere${f.evil}`,
+					`file://localhost:9${f.evil}`,
+				]) {
+					const r = await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						pin,
+					);
+					expect(r.status).toBe("failed");
+					expect(
+						r.status === "failed" && r.error.includes("worker-writable"),
+					).toBe(true);
+				}
+				expect(existsSync(f.marker)).toBe(false);
+			} finally {
+				setWorkerRoots([]);
+			}
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("an upstream the pin does not cover skips the fetch instead of a name fetch", async () => {
+		const f = fixture();
+		try {
+			// A planted fork remote whose url names the evil bare: a name fetch would run
+			// its upload-pack in the server's git, so the board skips with a warning.
+			const evil = join(f.dir, "fork-evil.git");
+			run(f.main, "remote", "add", "fork", `file://${evil}`);
+			run(f.main, "config", "branch.main.remote", "fork");
+			run(f.main, "config", "branch.main.merge", "refs/heads/main");
+			// A stale tracking ref resolves, so the call returns the skip warning instead of
+			// the missing-upstream error.
+			run(
+				f.main,
+				"update-ref",
+				"refs/remotes/fork/main",
+				run(f.main, "rev-parse", "main"),
+			);
+			const r = await resolveTarget(f.main, true, f.bare);
+			expect(r.target).toBe("fork/main");
+			expect(r.warning).toContain("the board fetches only the pinned origin");
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	test("the pinned target fetch ignores a planted origin URL and rigged refspecs", async () => {
 		const f = fixture();
 		try {

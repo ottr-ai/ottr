@@ -389,8 +389,9 @@ the child git of a submodule, so board git also never recurses into submodules
 specific URL match over the env value. No turn's shell sees
 them.
 
-The merge push, the merge-hold gate fetch and the release fetch/push never take
-a remote name. They name the origin URL the server pinned once in the project
+The merge push, the merge-hold gate fetch, the target-refresh fetch and the
+release fetch/push never take a remote name. They name the origin URL the
+server pinned once in the project
 settings (`originUrl`, docs/specs/pinned-origin-url.md): the server reads it
 from the origin remote at boot or add time, before any turn runs, because a
 work turn can re-point a remote name through the worker-writable `.git/config`

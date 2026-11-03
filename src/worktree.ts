@@ -733,11 +733,12 @@ export function archReviewDue(
  * Upstream of the main checkout's branch, else the branch itself; sha of target.
  * fetch (before a new worktree): refresh the upstream first. A failed fetch only warns, but an upstream
  * that still doesn't resolve stops, instead of silently basing the work on the local branch.
- * An origin upstream is fetched from the server-pinned originUrl with an explicit refspec
- * (R5-1, docs/specs/pinned-origin-url.md): a work turn can re-point the remote name and the
- * configured refspecs through the worker-writable .git/config. No pin yet skips the fetch
- * with a warning (never a name fetch); a non-origin upstream (a fork remote) keeps the
- * legacy name fetch.
+ * The fetch names the server-pinned originUrl with an explicit refspec (R5-1,
+ * docs/specs/pinned-origin-url.md): a work turn can re-point remote names and the configured
+ * refspecs through the worker-writable .git/config, and a fetch by name would run the named
+ * repo's upload-pack in the server's git next to the tokens. No pin yet — or an upstream the
+ * pin does not cover (a fork remote, a merge ref outside refs/heads) — skips the fetch with
+ * a warning, the same degraded state as a failed fetch.
  */
 export async function resolveTarget(
 	mainPath: string,
@@ -802,9 +803,12 @@ export async function resolveTarget(
 				}
 			}
 		} else {
-			const f = await git(["fetch", "--quiet", remote, remoteRef], mainPath);
-			if (f.code !== 0)
-				fetchError = `git fetch ${remote} ${remoteRef} failed: ${f.stderr.trim()}`;
+			// R5-1: a fetch by remote name runs the named repo's upload-pack in the server's
+			// git next to the tokens (a plantable uploadpack.packObjectsHook executes there).
+			// The board targets origin/<branch> only; any other upstream (a fork remote, a
+			// merge ref outside refs/heads) skips the refresh with the same warning a failed
+			// fetch gets, instead of trusting a plantable name.
+			fetchError = `not fetching ${upstream || remote}: the board fetches only the pinned origin`;
 		}
 	}
 	const sha = await git(
@@ -1050,14 +1054,18 @@ export function setWorkerRoots(roots: readonly string[]): void {
 }
 
 /** The local path a pinned URL names, resolved; null when the URL is not local
- * (https/ssh and other schemes, scp-style ssh). A `file://` URL is local when its
- * authority is empty or `localhost`. Without a scheme, git reads scp-style ssh only when
- * the first colon precedes the first slash (connect.c url_is_local_not_ssh) — `./x:y.git`
- * and `../bare.git` are local paths and get the worker-root check. */
+ * (https/ssh and other schemes, scp-style ssh). A `file://` URL is always local: current
+ * git ignores its authority and serves the path after the first `/` locally, so every
+ * authority form gets the worker-root check. Without a scheme, git reads scp-style ssh only
+ * when the first colon precedes the first slash (connect.c url_is_local_not_ssh) —
+ * `./x:y.git` and `../bare.git` are local paths and get the worker-root check. */
 function localPinPath(mainPath: string, pinned: string): string | null {
-	const file = /^file:\/\/(?:localhost)?(\/.*)$/i.exec(pinned);
-	if (file !== null)
-		return path.resolve(mainPath, decodeURIComponent(file[1]!));
+	if (/^file:\/\//i.test(pinned)) {
+		const slash = pinned.indexOf("/", 7);
+		return slash === -1
+			? null
+			: path.resolve(mainPath, decodeURIComponent(pinned.slice(slash)));
+	}
 	if (/^[A-Za-z]:[\\/]/.test(pinned) || pinned.startsWith("\\\\"))
 		return path.resolve(pinned);
 	if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(pinned)) return null; // https:, ssh:, ext::, …
