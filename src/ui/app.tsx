@@ -8925,11 +8925,6 @@ function App() {
 		document.addEventListener("keydown", onKey);
 		return () => document.removeEventListener("keydown", onKey);
 	}, [toggleRail]);
-	// A dev build reports a full commit sha; the rail shows its 7-character short form.
-	const railVersion =
-		bootVersion !== null && /^[0-9a-f]{12,}$/.test(bootVersion)
-			? bootVersion.slice(0, 7)
-			: bootVersion;
 	const [live, setLive] = useState<boolean | null>(null);
 	useEffect(() => {
 		void fetch("/api/boot")
@@ -9986,9 +9981,9 @@ function App() {
 							>
 								Ottr
 							</a>
-							{railVersion !== null && (
-								<span className="rail-ver" title={bootVersion ?? undefined}>
-									{railVersion}
+							{bootVersion !== null && (
+								<span className="rail-ver" title={bootVersion}>
+									{bootVersion}
 								</span>
 							)}
 						</p>

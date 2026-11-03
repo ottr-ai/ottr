@@ -26,6 +26,7 @@ import {
 	branchMergedOrGone,
 	changedFiles,
 	createWorktree,
+	describeVersion,
 	diffStat,
 	diffText,
 	fetchOriginBranch,
@@ -1828,6 +1829,29 @@ describe("headVersion", () => {
 			expect(await headVersion(dir)).toBe(v2); // stable across polls
 			expect(v2).not.toBe(v1); // changes only when HEAD changes
 			expect(v1).toBe(await must(dir, "rev-parse", "HEAD~"));
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+});
+
+describe("describeVersion", () => {
+	test("release tag at HEAD, tag-plus-commits form past it, short sha on dev, timestamp without commits", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
+		try {
+			await must(dir, "init", "-q", "-b", "main");
+			expect(await describeVersion(dir)).toMatch(/^\d+$/); // no commits yet: boot-time fallback
+			await must(dir, "commit", "-q", "--allow-empty", "-m", "a");
+			const dev = await describeVersion(dir);
+			expect(dev).toMatch(/^[0-9a-f]{7}$/); // no release: short HEAD sha
+			expect(dev).toBe(await must(dir, "rev-parse", "--short", "HEAD"));
+			await must(dir, "tag", "-a", "v1.2.3", "-m", "v1.2.3");
+			expect(await describeVersion(dir)).toBe("v1.2.3"); // exactly at the release
+			await must(dir, "commit", "-q", "--allow-empty", "-m", "b");
+			const past = await describeVersion(dir);
+			expect(past).toMatch(/^v1\.2\.3-1-g[0-9a-f]{7}$/); // past the release: tag plus count plus sha
+			await must(dir, "tag", "notarelease");
+			expect(await describeVersion(dir)).toBe(past); // non-release tags are ignored
 		} finally {
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}

@@ -663,6 +663,24 @@ export async function headVersion(dir: string): Promise<string> {
 	return String(Date.now());
 }
 
+/** Version the board shows: the newest release tag reachable from HEAD (`vX.Y.Z`, or
+ * `vX.Y.Z-N-g<short>` when HEAD sits past it), the short HEAD sha on a dev checkout with no
+ * release, and headVersion's boot-time fallback when git is unusable. */
+export async function describeVersion(dir: string): Promise<string> {
+	try {
+		const r = await git(
+			["describe", "--tags", "--match", "v[0-9]*", "HEAD"],
+			dir,
+		);
+		if (r.code === 0 && r.stdout.trim() !== "") return r.stdout.trim();
+		const sha = await git(["rev-parse", "--short", "HEAD"], dir);
+		if (sha.code === 0 && sha.stdout.trim() !== "") return sha.stdout.trim();
+	} catch {
+		// git missing or unusable
+	}
+	return headVersion(dir);
+}
+
 /** What `archReviewDelta` reports: the commit delta, whether a watermark anchors it (false = never
  * reviewed), and the anchor commit ("" when there is none). */
 export interface ArchReviewDelta {

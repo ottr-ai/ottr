@@ -804,7 +804,7 @@ export interface StateResponse {
 	workCheck: boolean;
 	/** True when the board files a due architecture review card by itself after two hours without input. */
 	idleReviews: boolean;
-	/** Version stamp of the running server (HEAD sha, else boot time); stale tabs reload once when it changes. */
+	/** Version stamp of the running server (release tag `vX.Y.Z`, short sha on dev, else boot time); stale tabs reload once when it changes. */
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */
 	quota: QuotaState | null;

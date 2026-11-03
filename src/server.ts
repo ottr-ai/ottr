@@ -53,13 +53,13 @@ import {
 	changedFiles,
 	commitsAhead,
 	createWorktree,
+	describeVersion,
 	diffStat,
 	diffText,
 	fetchOriginBranch,
 	git,
 	githubUrl,
 	hasRules,
-	headVersion,
 	ignoreInMain,
 	isClean,
 	isGitRepoWithCommit,
@@ -236,8 +236,9 @@ async function targetSha(
 // The server's own checkout; in the stable deployment this is the live clone.
 const SELF_ROOT = resolve(import.meta.dir, "..");
 
-/** Shipped on every /api/state; stale tabs compare it against the first version they saw and reload once. */
-const serverVersion = await headVersion(SELF_ROOT);
+/** Shipped on every /api/state; stale tabs compare it against the first version they saw and reload once.
+ * The release tag HEAD carries (`vX.Y.Z`), else the short sha on a dev checkout, else boot time. */
+const serverVersion = await describeVersion(SELF_ROOT);
 
 if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 	let adopted: AdoptResult[] = [];
