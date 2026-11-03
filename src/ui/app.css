@@ -1630,9 +1630,12 @@ button.notif-link {
 	border: 1px solid transparent;
 	border-radius: 3px;
 }
-.rail .area[aria-current="page"] .rail-plate {
-	outline: 1px solid var(--accent);
-	outline-offset: 2px;
+/* The row highlight is the only marker an area needs: its icon shows bare, so a
+   transparent project icon sits straight on the row and the monogram loses its
+   plate here (the header and the New task dialog keep it). */
+.rail .area .ptag {
+	background: none;
+	border-color: transparent;
 }
 .rail-badge {
 	display: none;
@@ -1896,8 +1899,9 @@ button.notif-link {
 	min-width: 0;
 }
 /* Project tag: a two-letter plate that tells projects apart by letter shape. Grey stock,
-   never a hue (Grey-Is-Normal): the same plate marks the area row, the header and the
-   New task dialog, so the eye can match them before it reads the name. */
+   never a hue (Grey-Is-Normal): the same plate marks the header and the New task
+   dialog, so the eye can match them before it reads the name. Rail rows show the
+   icon bare — only the row itself carries a highlight. */
 .ptag {
 	display: inline-grid;
 	flex-shrink: 0;
