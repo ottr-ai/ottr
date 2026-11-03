@@ -48,6 +48,7 @@ import {
 } from "./prompts.ts";
 import { createRunSink } from "./runner.ts";
 import {
+	type ReviewTask,
 	SILENT_LOG_MS,
 	WORK_CHECK_THIRD_BLOCK,
 	workCheckAsk,
@@ -6731,6 +6732,134 @@ describe("board warnings", () => {
 			expect(warnings(dir, {})).toEqual([
 				"No active sign-in for zai (role smol): sign in under Settings - Provider sign-in, or set its API key in the environment.",
 			]);
+		}));
+
+	test("state names the merges an open release holds", async () => {
+		// TaskPatch cannot write createdAt/doneAt, so the finding is marked done for real
+		// (its doneAt lands after its createdAt) and the release stays open in merging.
+		const finding = store.createTask("release finding");
+		store.updateTask(finding.id, {
+			followUpOf: null,
+			stage: "done",
+			state: "idle",
+		});
+		const release = store.createTask("release v0.3.0");
+		store.updateTask(finding.id, { followUpOf: release.id });
+		store.updateTask(release.id, {
+			releaseVersion: "v0.3.0",
+			stage: "merging",
+			state: "needs_you",
+		});
+		const held = store.createTask("held merge");
+		store.updateTask(held.id, { stage: "merging", state: "queued" });
+		const state = (await (await get("/api/state")).json()) as {
+			tasks: Array<{ id: string; heldMerges?: string[] }>;
+		};
+		const card = state.tasks.find((t) => t.id === release.id);
+		// The module store holds queued cards from earlier tests too; this release holds them all.
+		expect(card?.heldMerges).toContain(held.id);
+		// A held merge is no release: it never carries the link itself.
+		expect(
+			state.tasks.find((t) => t.id === held.id)?.heldMerges,
+		).toBeUndefined();
+	});
+
+	test("a release holding merges with every finding done warns past an hour only", async () =>
+		withAgentDir(async (dir) => {
+			writeFileSync(join(dir, "config.yml"), "modelRoles: {}\n");
+			const now = 1_762_000_000_000;
+			const card = (
+				over: Partial<ReviewTask & Pick<Task, "state">>,
+			): ReviewTask & Pick<Task, "state"> => ({
+				id: "x",
+				kind: "work",
+				releaseVersion: null,
+				cancelledAt: null,
+				stage: "todo",
+				state: "queued",
+				createdAt: now - 10_000,
+				doneAt: null,
+				dependsOn: [],
+				followUpOf: null,
+				...over,
+			});
+			// A shared shape: the release, its settled finding, and one queued merge.
+			const make = (
+				findingDoneAt: number | null,
+				findingStage: Task["stage"],
+			) => {
+				const release = card({
+					id: "release",
+					releaseVersion: "v0.3.0",
+					stage: "merging",
+					state: "needs_you",
+					doneAt: now - 3 * 3_600_000,
+				});
+				const finding = card({
+					id: "finding",
+					followUpOf: "release",
+					// Filed while the review ran: reviewFindings only counts findings
+					// created no later than the review's own doneAt.
+					createdAt: now - 4 * 3_600_000,
+					stage: findingStage,
+					state: "idle",
+					doneAt: findingDoneAt,
+				});
+				const merge = card({ id: "merge", stage: "merging" });
+				return [release, finding, merge];
+			};
+			// Settled two hours ago: past the one-hour window, so the stall warns.
+			const settled = boardWarnings(
+				[],
+				modelRoles(),
+				{},
+				undefined,
+				make(now - 2 * 3_600_000, "done"),
+				now,
+			);
+			expect(
+				settled.filter(
+					(w) =>
+						w.includes("Release v0.3.0") &&
+						w.includes("cancel the release card"),
+				),
+			).toHaveLength(1);
+			// Settled half an hour ago: inside the window, no warning yet.
+			expect(
+				boardWarnings(
+					[],
+					modelRoles(),
+					{},
+					undefined,
+					make(now - 30 * 60_000, "done"),
+					now,
+				),
+			).toEqual([]);
+			// A finding still open may file more work: no warning while it runs.
+			const open = card({
+				id: "release",
+				releaseVersion: "v0.3.0",
+				stage: "merging",
+				state: "needs_you",
+				doneAt: now - 3 * 3_600_000,
+			});
+			const openFinding = card({
+				id: "finding",
+				followUpOf: "release",
+				createdAt: now - 4 * 3_600_000,
+				stage: "todo",
+				state: "queued",
+			});
+			expect(
+				boardWarnings(
+					[],
+					modelRoles(),
+					{},
+					undefined,
+					[open, openFinding, card({ id: "merge", stage: "merging" })],
+					now,
+				),
+			).toEqual([]);
 		}));
 });
 

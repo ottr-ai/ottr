@@ -2440,6 +2440,18 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .card-error {
 	color: var(--alarm);
 }
+/* Stalled release: the "findings done, merges wait" line under the card meta; error-toned like
+   the needs-attention line, but dimmer — it reports, it does not alarm. */
+.card-hold {
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+	font-size: 12px;
+	line-height: 1.35;
+	color: var(--alarm);
+	opacity: 0.85;
+}
 /* Follow-up marker: the send icon from the Follow up button, at the right end of the card's head. */
 .card-fu {
 	display: flex;
@@ -2585,6 +2597,26 @@ a.release:hover {
 	color: var(--accent);
 	border-color: var(--accent);
 	fill: currentColor;
+}
+/* Hold chip inside .card-tags: the held queued merge names the release card that parks it, and
+   a stalled release card carries the re-release action; same voice as the star toggle. */
+.card-tags .hold-link {
+	pointer-events: auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim);
+	background: none;
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	cursor: pointer;
+}
+.card-tags .hold-link:hover {
+	color: var(--accent);
+	border-color: var(--accent);
 }
 /* Unread answer badge: a done question card whose drawer never opened; opening clears it. */
 .card .unread {

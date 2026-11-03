@@ -1,4 +1,9 @@
-import { depHold, mergeHold, type ReviewTask } from "../scheduler.ts";
+import {
+	depHold,
+	mergeHold,
+	type ReviewTask,
+	reviewFindings,
+} from "../scheduler.ts";
 import type { Task, TaskCard } from "../types.ts";
 
 /** Split a live Stryker or Python mutate.py progress line into its parts; format produced by src/stryker.ts.
@@ -127,6 +132,39 @@ export function holdFor(
 	return (
 		(t.stage === "merging" ? mergeHold(tasks, t) : null) ?? depHold(tasks, t)
 	);
+}
+
+/** The release card's re-release view, else null: parked for the user (needs_you or idle, not
+ * cancelled, not done), every finding done or cancelled, and at least one queued merge held
+ * (the state names the ids on the release card). */
+export function reReleaseOf(
+	t: TaskCard,
+	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
+): { ids: string[]; findings: number } | null {
+	if (t.cancelledAt !== null || t.releaseVersion === null || t.stage === "done")
+		return null;
+	if (t.state !== "needs_you" && t.state !== "idle") return null;
+	const ids = t.heldMerges ?? [];
+	if (ids.length === 0) return null;
+	if (
+		reviewFindings(tasks, t).some(
+			(f) => f.cancelledAt === null && f.stage !== "done",
+		)
+	)
+		return null;
+	return { ids, findings: reviewFindings(tasks, t).length };
+}
+
+/** The open release that mergeHold holds `t` behind — the inverse of the state's heldMerges
+ * lists; null when no release card names `t`. */
+export function releaseHolding(
+	t: Pick<Task, "id">,
+	tasks: readonly TaskCard[],
+): { id: string; version: string | null } | null {
+	for (const r of tasks)
+		if ((r.heldMerges ?? []).includes(t.id))
+			return { id: r.id, version: r.releaseVersion };
+	return null;
 }
 
 /** The alarm split the overview, the areas nav and the notifications share: plain needs_you

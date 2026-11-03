@@ -66,6 +66,8 @@ The project's **Review** button starts a read-only review card: full verificatio
 
 While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else. Also, the **Create release** and **Review** buttons stay disabled until the open review or release and its findings are done.
 
+A release card that waits for you with every finding done shows the held merges on the card and offers **Re-release**: it cancels the release and opens Create release, so a new review covers the fixes. A card that waits for such a release shows the hold and links to the release card. The board warnings name a release that holds merges for more than an hour after its last finding landed.
+
 **Diagrams** shows `docs/how-it-works.md` as committed on the target branch, with each Mermaid block drawn as a diagram. **Create/update diagrams** at the top of that window asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project; if the file already exists, the task updates it to match the code. The skill comes from agent-data, so the host and the workers must have it.
 
 ## Requirements

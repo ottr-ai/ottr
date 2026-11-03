@@ -5,6 +5,8 @@ import {
 	alarmLabel,
 	cardMark,
 	holdFor,
+	releaseHolding,
+	reReleaseOf,
 	splitAlarms,
 	statusLine,
 	strykerProgress,
@@ -339,4 +341,70 @@ test("statusLine queued with a future holdUntil shows its hold reason", () => {
 			true,
 		),
 	).toBe("resuming");
+});
+
+const release = (over: Partial<TaskCard> = {}): TaskCard =>
+	card({
+		id: "r1",
+		releaseVersion: "v0.3.0",
+		stage: "merging",
+		state: "needs_you",
+		doneAt: 10,
+		...over,
+	});
+const finding = (over: Partial<TaskCard> = {}): TaskCard =>
+	card({ id: "f1", title: "finding", followUpOf: "r1", ...over });
+
+test("reReleaseOf describes the stalled release: findings done, merges held", () => {
+	const r = release({ heldMerges: ["m1", "m2"] });
+	const done = finding({ stage: "done", state: "idle", doneAt: 5 });
+	expect(reReleaseOf(r, [r, done])).toEqual({
+		ids: ["m1", "m2"],
+		findings: 1,
+	});
+	// idle works like needs_you: the release parked while its findings landed.
+	const parked = release({ state: "idle", heldMerges: ["m1"] });
+	expect(reReleaseOf(parked, [parked, done])).toEqual({
+		ids: ["m1"],
+		findings: 1,
+	});
+	// A cancelled finding is not open: it does not block the re-release view.
+	const gone = finding({ cancelledAt: 5 });
+	expect(reReleaseOf(r, [r, gone])).toEqual({
+		ids: ["m1", "m2"],
+		findings: 1,
+	});
+});
+
+test("reReleaseOf null cases", () => {
+	const r = release({ heldMerges: ["m1"] });
+	const done = finding({ stage: "done", state: "idle", doneAt: 5 });
+	// A finding still open blocks the view.
+	expect(reReleaseOf(r, [r, finding()])).toBeNull();
+	// Running or queued states are not parked for the user.
+	expect(
+		reReleaseOf(release({ state: "running", heldMerges: ["m1"] }), [r, done]),
+	).toBeNull();
+	expect(
+		reReleaseOf(release({ state: "queued", heldMerges: ["m1"] }), [r, done]),
+	).toBeNull();
+	// No held merges, no view.
+	expect(reReleaseOf(release(), [r, done])).toBeNull();
+	// Cancelled release, or a done one, never re-releases.
+	expect(
+		reReleaseOf(release({ cancelledAt: 5, heldMerges: ["m1"] }), [r, done]),
+	).toBeNull();
+	expect(
+		reReleaseOf(release({ stage: "done", heldMerges: ["m1"] }), [r, done]),
+	).toBeNull();
+});
+
+test("releaseHolding finds the release naming a card, via heldMerges", () => {
+	const r = release({ heldMerges: ["m1"] });
+	const m1 = card({ id: "m1", stage: "merging", state: "queued" });
+	expect(releaseHolding(m1, [r, m1])).toEqual({
+		id: "r1",
+		version: "v0.3.0",
+	});
+	expect(releaseHolding(card({ id: "m2" }), [r, m1])).toBeNull();
 });

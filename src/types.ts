@@ -671,6 +671,9 @@ export type TaskCard = Omit<
 	/** Epoch ms of the last log write, present only while a preparing or running card's log has been
 	 * silent past the board's limit (SILENT_LOG_MS in src/scheduler.ts): the agent may wait on a hung command. */
 	silentSince?: number;
+	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
+	 * <version>"); present on release cards only, and only when the list is non-empty. */
+	heldMerges?: string[];
 };
 
 /** A done card is question-only when the last work turn reported `answered` (a later follow-up replaces it). */

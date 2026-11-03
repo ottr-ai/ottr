@@ -1683,3 +1683,90 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(html).not.toContain('label="Steer"');
 	});
 });
+
+describe("LaneCol release hold", () => {
+	const base = {
+		groups: null,
+		collapsed: {},
+		onToggle: () => {},
+		hasRules: true,
+		github: null,
+		deltas: new Map<string, number>(),
+		open: () => {},
+		unread: () => false,
+		onReorder: async () => {},
+		filtering: false,
+		draining: false,
+		onRerelease: () => {},
+	} as const;
+
+	// The release card parked with its findings done: the board names the held merges.
+	const releaseCard = (heldMerges?: string[]): TaskCard =>
+		cardFixture({
+			id: "r1",
+			releaseVersion: "v0.3.0",
+			stage: "merging",
+			state: "needs_you",
+			doneAt: 10,
+			heldMerges,
+		});
+	const finding = (stage: "done" | "todo", id: string): TaskCard =>
+		cardFixture({
+			id,
+			followUpOf: "r1",
+			stage,
+			state: stage === "done" ? "idle" : "queued",
+		});
+	const heldMerge = (id: string): TaskCard =>
+		cardFixture({ id, stage: "merging", state: "queued" });
+
+	test("a stalled release card names its done findings and the waiting merges", () => {
+		const r1 = releaseCard(["m1", "m2"]);
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="merging"
+				tasks={[r1]}
+				projectTasks={[
+					r1,
+					finding("done", "f1"),
+					finding("done", "f2"),
+					heldMerge("m1"),
+					heldMerge("m2"),
+				]}
+			/>,
+		);
+		expect(html).toContain("merges wait for this release");
+		expect(html).toContain("All 2 findings are done.");
+		expect(html).toContain("m1, m2");
+		expect(html).toContain("Re-release");
+	});
+
+	test("a release card with an open finding shows no re-release line", () => {
+		const r1 = releaseCard(["m1"]);
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="merging"
+				tasks={[r1]}
+				projectTasks={[r1, finding("todo", "f1"), heldMerge("m1")]}
+			/>,
+		);
+		expect(html).not.toContain("merges wait for this release");
+		expect(html).not.toContain("Re-release");
+	});
+
+	test("a held queued merging card links to the release card holding it", () => {
+		const r1 = releaseCard(["m1"]);
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="todo"
+				tasks={[heldMerge("m1")]}
+				projectTasks={[r1, finding("done", "f3"), heldMerge("m1")]}
+			/>,
+		);
+		expect(html).toContain("hold-link");
+		expect(html).toContain("r1");
+	});
+});

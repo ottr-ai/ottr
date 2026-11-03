@@ -15,6 +15,7 @@ import {
 	demoteUnquoted,
 	depHold,
 	findingsHold,
+	findingsSettledAt,
 	isRetro,
 	isReview,
 	lastReviewBase,
@@ -27,6 +28,7 @@ import {
 	parseWorkCheck,
 	pickRunnable,
 	queueOrder,
+	releaseHeldMerges,
 	reviewBlocked,
 	reviewFindings,
 	SILENT_LOG_MS,
@@ -402,6 +404,99 @@ describe("pickRunnable", () => {
 			"waiting for the review to finish",
 		);
 		expect(pickRunnable([review, other, finding], opts)).toEqual([finding]);
+	});
+
+	test("releaseHeldMerges names the queued merges an open release holds", () => {
+		const release = task({
+			stage: "merging",
+			state: "needs_you",
+			releaseVersion: "v0.3.0",
+			base: "abc",
+			doneAt: 900,
+		});
+		const held = task({ stage: "merging", queuedAt: 100 });
+		const finding = task({
+			followUpOf: release.id,
+			createdAt: 800,
+			stage: "merging",
+			queuedAt: 200,
+		});
+		const cancelled = task({
+			stage: "merging",
+			queuedAt: 300,
+			cancelledAt: 400,
+		});
+		expect(
+			releaseHeldMerges([release, held, finding, cancelled], release),
+		).toEqual([held]);
+	});
+
+	test("releaseHeldMerges holds nothing for a done or cancelled release or a plain review", () => {
+		const held = task({ stage: "merging", queuedAt: 100 });
+		const done = task({
+			stage: "done",
+			state: "idle",
+			releaseVersion: "v0.3.0",
+			doneAt: 500,
+		});
+		const cancelled = task({
+			stage: "merging",
+			releaseVersion: "v0.3.0",
+			cancelledAt: 10,
+		});
+		const button = task({ kind: "review", stage: "in_progress" });
+		expect(releaseHeldMerges([done, held], done)).toEqual([]);
+		expect(releaseHeldMerges([cancelled, held], cancelled)).toEqual([]);
+		expect(releaseHeldMerges([button, held], button)).toEqual([]);
+	});
+
+	test("findingsSettledAt is the latest finding end, else the review's doneAt", () => {
+		const release = task({
+			stage: "done",
+			state: "idle",
+			doneAt: 500,
+		});
+		const first = task({
+			followUpOf: release.id,
+			createdAt: 100,
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		const second = task({
+			followUpOf: release.id,
+			createdAt: 150,
+			stage: "done",
+			state: "idle",
+			doneAt: 200,
+		});
+		expect(findingsSettledAt([release, first, second], release)).toBe(200);
+		// A cancelled finding settles at its cancelledAt, past every doneAt here.
+		const lateCancelled = task({
+			followUpOf: release.id,
+			createdAt: 150,
+			stage: "merging",
+			doneAt: 250,
+			cancelledAt: 300,
+		});
+		expect(
+			findingsSettledAt([release, first, second, lateCancelled], release),
+		).toBe(300);
+	});
+
+	test("findingsSettledAt waits for an open finding and falls back to doneAt", () => {
+		const release = task({ stage: "merging", doneAt: 400 });
+		const open = task({
+			followUpOf: release.id,
+			createdAt: 100,
+			stage: "todo",
+			doneAt: 100,
+		});
+		expect(findingsSettledAt([release, open], release)).toBeNull();
+		expect(findingsSettledAt([release], release)).toBe(400);
+		expect(
+			findingsSettledAt([release], { ...release, doneAt: null }),
+		).toBeNull();
 	});
 
 	test("a card added by hand during a review is no finding: it waits for the findings", () => {

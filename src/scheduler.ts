@@ -158,6 +158,48 @@ export function findingsHold(
 	return findingsOpen(tasks, review) ? FINDINGS_HOLD : null;
 }
 
+/** The queued merges mergeHold parks behind the open release `review` ("waiting for release
+ * <version>"): the cards its hold names, its own findings excluded (they merge while it runs).
+ * A done or cancelled review, and the Review button's card (no releaseVersion), holds nothing. */
+export function releaseHeldMerges<T extends ReviewTask & Pick<Task, "state">>(
+	tasks: readonly T[],
+	review: ReviewTask & Pick<Task, "state">,
+): T[] {
+	if (
+		review.cancelledAt !== null ||
+		review.releaseVersion === null ||
+		review.stage === "done"
+	)
+		return [];
+	const hold = `waiting for release ${review.releaseVersion}`;
+	return tasks.filter(
+		(t) =>
+			t.id !== review.id &&
+			t.cancelledAt === null &&
+			t.state === "queued" &&
+			mergeHold(tasks, t) === hold,
+	);
+}
+
+/** When the release's findings last reached done or cancelled, else null while one is still open
+ * or the review has not finished (it may still file findings): the anchor for "the release holds
+ * merges with nothing left to do". */
+export function findingsSettledAt(
+	tasks: readonly ReviewTask[],
+	review: Pick<Task, "id" | "doneAt">,
+): number | null {
+	const findings = reviewFindings(tasks, review);
+	if (findingsOpen(tasks, review)) return null;
+	// The review's own doneAt is only the fallback: a review that filed findings settles
+	// when its last finding did, not when the review itself finished.
+	let at: number | null = null;
+	for (const f of findings) {
+		const end = f.cancelledAt ?? f.doneAt;
+		if (end !== null && (at === null || end > at)) at = end;
+	}
+	return at ?? review.doneAt;
+}
+
 /** Why a new review (Review button or Create release) cannot start, else null. One review at a
  * time, and a review stays open until its findings are done: two open reviews would hold each
  * other's findings and deadlock. */

@@ -163,6 +163,7 @@ import {
 	alarmLabel,
 	cardMark,
 	holdFor,
+	reReleaseOf,
 	splitAlarms,
 	statusLine,
 	strykerProgress,
@@ -551,6 +552,10 @@ function Card({
 	drain,
 	locked,
 	onStar,
+	holdRelease,
+	onOpenTask,
+	reRelease,
+	onRerelease,
 }: {
 	task: TaskCard;
 	hasRules: boolean;
@@ -569,6 +574,14 @@ function Card({
 	locked?: boolean;
 	/** Done research cards only: renders the star toggle; the handler posts and never opens the drawer. */
 	onStar?: () => void;
+	/** The release card whose heldMerges list names this card; null or undefined otherwise. */
+	holdRelease?: { id: string; version: string | null } | null;
+	/** Opens another card's drawer; the hold link chip uses it to name the release. */
+	onOpenTask?: (id: string) => void;
+	/** A stalled release card's re-release view: findings done, merges waiting. Null otherwise. */
+	reRelease?: { ids: string[]; findings: number } | null;
+	/** Cancels the release card and opens Create release; set only while reRelease is non-null. */
+	onRerelease?: () => void;
 }) {
 	const release = releaseOf(task);
 	const commits = task.stage === "done" ? task.commits : null;
@@ -706,6 +719,15 @@ function Card({
 						</span>
 					)}
 				</span>
+				{reRelease !== null && reRelease !== undefined && (
+					<span
+						className="card-hold"
+						title={`Held merges: ${reRelease.ids.join(", ")}`}
+					>
+						All {reRelease.findings} findings are done. {reRelease.ids.length}{" "}
+						merges wait for this release: {reRelease.ids.join(", ")}.
+					</span>
+				)}
 				{sp !== null && (
 					<span className="card-mutation" title={task.progress ?? undefined}>
 						<Meter
@@ -719,8 +741,42 @@ function Card({
 				)}
 			</button>
 			{(release !== null ||
+				holdRelease != null ||
+				onRerelease !== undefined ||
 				(task.stage === "done" && task.research && onStar)) && (
 				<span className="card-tags">
+					{holdRelease != null && onOpenTask !== undefined && (
+						<button
+							type="button"
+							className="hold-link"
+							title={`Task ${holdRelease.id}: the release holding this card${holdRelease.version !== null ? ` (${holdRelease.version})` : ""}`}
+							onClick={(e) => {
+								// The card body is a stretched open button: keep the click off it.
+								e.preventDefault();
+								e.stopPropagation();
+								onOpenTask(holdRelease.id);
+							}}
+						>
+							<Icon name="corner-up-left" size={12} />
+							{holdRelease.id}
+						</button>
+					)}
+					{onRerelease !== undefined && (
+						<button
+							type="button"
+							className="hold-link"
+							title={`Cancel release ${task.releaseVersion ?? ""} and open Create release`}
+							onClick={(e) => {
+								// The card body is a stretched open button: keep the click off it.
+								e.preventDefault();
+								e.stopPropagation();
+								onRerelease();
+							}}
+						>
+							<Icon name="corner-up-left" size={12} />
+							Re-release
+						</button>
+					)}
 					{release !== null &&
 						(github !== null ? (
 							<a
@@ -2456,6 +2512,31 @@ function ProjectBoard({
 }) {
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
+	// A stalled release card's action: cancel the release, then open Create release so the user
+	// re-releases with the same version; the held merges then wait for the new release's review.
+	const rerelease = (t: TaskCard): void => {
+		if (
+			!window.confirm(
+				`Cancel release ${t.releaseVersion ?? ""} and open Create release? The held merges then wait for the new release's review.`,
+			)
+		)
+			return;
+		void act(async () => {
+			const url = `/api/projects/${encodeURIComponent(t.project)}/tasks/${t.id}/cancel`;
+			const r = await post<{ kept?: string }>(url, {});
+			// The server kept unmerged work and wants a second yes; a release card normally keeps nothing.
+			if (r.kept !== undefined) {
+				if (
+					!window.confirm(
+						`The worktree was kept: ${r.kept}.\n\nDelete the worktree and its branch anyway?`,
+					)
+				)
+					return;
+				await post(url, { force: true });
+			}
+			setShowRelease(true);
+		});
+	};
 	const [showDiagrams, setShowDiagrams] = useState(false);
 	const [query, setQuery] = useState("");
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
@@ -2976,6 +3057,7 @@ function ProjectBoard({
 											}
 										: undefined
 								}
+								onRerelease={rerelease}
 								hasRules={project.hasRules}
 								github={project.github}
 								deltas={deltas}
@@ -3873,6 +3955,7 @@ export function LaneCol({
 	onMore,
 	onTopicMore,
 	onStar,
+	onRerelease,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
@@ -3895,6 +3978,8 @@ export function LaneCol({
 	onTopicMore?: (key: string) => void;
 	/** Done lane only: toggles a done research card's star; the socket frame refreshes the card. */
 	onStar?: (t: TaskCard) => void;
+	/** Cancels a stalled release card and opens Create release; set only for the release flow. */
+	onRerelease?: (t: TaskCard) => void;
 	collapsed: Record<string, boolean>;
 	onToggle: (key: string) => void;
 	hasRules: boolean;
@@ -4031,6 +4116,14 @@ export function LaneCol({
 		moreFocus.current = { scope, index };
 		go();
 	};
+	// The inverse of the release cards' heldMerges lists: which open release holds each queued
+	// merge, so the held card can link to the release card that parks it.
+	const heldBy = new Map<string, { id: string; version: string | null }>();
+	for (const r of projectTasks) {
+		if (r.heldMerges === undefined) continue;
+		for (const id of r.heldMerges)
+			heldBy.set(id, { id: r.id, version: r.releaseVersion });
+	}
 	const card = (t: TaskCard): ReactNode => (
 		<Card
 			key={t.id}
@@ -4045,6 +4138,14 @@ export function LaneCol({
 			unread={unread(t)}
 			onStar={onStar ? () => onStar(t) : undefined}
 			locked={pending?.id === t.id}
+			holdRelease={heldBy.get(t.id)}
+			onOpenTask={open}
+			reRelease={reReleaseOf(t, projectTasks)}
+			onRerelease={
+				onRerelease !== undefined && reReleaseOf(t, projectTasks) !== null
+					? () => onRerelease(t)
+					: undefined
+			}
 			drag={
 				dnd && !busy && t.state === "queued"
 					? {
