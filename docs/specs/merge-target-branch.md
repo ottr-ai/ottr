@@ -16,9 +16,13 @@ merges into `develop`".
    setting lives in the per-project settings JSON in `tasks.db` (server-only
    state), validated per key by `SETTINGS_SHAPES` like `originUrl`. No schema
    migration: `parseSetting` reads a JSON object per key.
-2. `resolveTarget` gains a fourth parameter `targetBranch: string | null`
-   (default `null`); `turn.ts` passes `settings.targetBranch` at both call
-   sites (release publish and the per-turn worktree/target resolution).
+2. Every server-side resolution of a project's integration target passes
+   `settings.targetBranch` as the fourth `resolveTarget` argument: boot
+   discovery and `refreshRemote` (both set `e.target`), the release GET/POST
+   routes, the arch-review route (which also passes the pinned origin URL, so
+   a configured branch the clone never fetched still resolves), the task
+   view's late-commits anchor, and both `turn.ts` call sites (release publish
+   and the per-turn worktree/target resolution).
 3. Resolution ladder for `targetBranch === null` (the default):
    - `git symbolic-ref refs/remotes/origin/HEAD` names the repo's default
      branch: target = `origin/<default>`, canonical form;

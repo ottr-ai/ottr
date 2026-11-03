@@ -4235,6 +4235,45 @@ describe("arch-review duplicate guard (R1-8)", () => {
 		projects.delete("arch-proj");
 		e.store.close();
 	});
+
+	test("arch-review freezes the configured target branch, not the checkout", async () => {
+		const dir = join(root, "target-branch-proj");
+		const add = await post("/api/projects", { name: "target-branch-proj" });
+		expect(add.status).toBe(200);
+		const e = projects.get("target-branch-proj")!;
+		// A second branch on origin, different from the checked-out head: only the
+		// configured target resolves to it.
+		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+			.toString()
+			.trim();
+		const other = execSync(
+			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
+				`${tree} -m feature`,
+			{ cwd: dir },
+		)
+			.toString()
+			.trim();
+		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			cwd: dir,
+		});
+		e.store.setSettings({ targetBranch: "feature" });
+		e.target = "origin/feature";
+		const res = await post("/api/projects/target-branch-proj/arch-review", {});
+		expect(res.status).toBe(200);
+		const live = e.store
+			.listTasks()
+			.filter(
+				(t) =>
+					t.prompt.startsWith(ARCH_REVIEW_MARKER) &&
+					t.cancelledAt === null &&
+					t.stage !== "done",
+			);
+		expect(live).toHaveLength(1);
+		expect(live[0]?.prompt).toContain("origin/feature");
+		expect(live[0]?.base).toBe(other);
+		projects.delete("target-branch-proj");
+		e.store.close();
+	});
 });
 
 describe("learnings routes", () => {

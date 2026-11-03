@@ -2672,7 +2672,14 @@ export function createApp(deps: AppDeps) {
 	/** Re-reads the integration target and the origin remotes after the folder's git state changed. */
 	async function refreshRemote(e: Entry): Promise<void> {
 		try {
-			e.target = (await resolveTarget(e.path)).target;
+			e.target = (
+				await resolveTarget(
+					e.path,
+					false,
+					null,
+					e.store.getSettings().targetBranch,
+				)
+			).target;
 		} catch {
 			// unresolved target stays null
 		}
@@ -4325,6 +4332,7 @@ export function createApp(deps: AppDeps) {
 							e.path,
 							true,
 							e.store.getSettings().originUrl,
+							e.store.getSettings().targetBranch,
 						);
 					} catch (err) {
 						return json({ error: errmsg(err) }, 409);
@@ -4376,6 +4384,7 @@ export function createApp(deps: AppDeps) {
 							e.path,
 							true,
 							e.store.getSettings().originUrl,
+							e.store.getSettings().targetBranch,
 						);
 					} catch (err) {
 						return json({ error: errmsg(err) }, 409);
@@ -4458,7 +4467,12 @@ export function createApp(deps: AppDeps) {
 					// The review freezes the target's current head, like a release card.
 					let resolved: { target: string; sha: string };
 					try {
-						resolved = await resolveTarget(e.path, true);
+						resolved = await resolveTarget(
+							e.path,
+							true,
+							e.store.getSettings().originUrl,
+							e.store.getSettings().targetBranch,
+						);
 					} catch (err) {
 						return json({ error: errmsg(err) }, 409);
 					}
@@ -4668,7 +4682,12 @@ export function createApp(deps: AppDeps) {
 							.filter((f) => f.cancelledAt === null && f.mergeHead !== null)
 							.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
 							.map((f) => f.mergeHead!);
-						const head = await resolveTarget(e.path, false)
+						const head = await resolveTarget(
+							e.path,
+							false,
+							null,
+							e.store.getSettings().targetBranch,
+						)
 							.then((r) => r.sha)
 							.catch(() => null);
 						if (head !== null) {

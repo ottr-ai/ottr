@@ -322,7 +322,7 @@ for (const p of discoverProjects(
 			store.setSettings({ originUrl: pin });
 	}
 
-	resolveTarget(p)
+	resolveTarget(p, false, null, store.getSettings().targetBranch)
 		.then((r) => {
 			e.target = r.target;
 		})
