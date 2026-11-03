@@ -333,20 +333,6 @@ export interface Task {
 export const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 export type Priority = (typeof PRIORITIES)[number];
 
-/** One review learning: a standing convention injected into every review prompt. */
-export interface Learning {
-	id: number;
-	/** The convention, one rule per row, phrased as a review instruction. */
-	text: string;
-	/** Advisory path glob; null = the whole repo. The reviewer, not the store, matches it. */
-	glob: string | null;
-	usageCount: number;
-	lastUsedAt: number | null;
-	/** Card that produced the learning (a finding card the user declined), or null when typed by hand. */
-	fromTaskId: string | null;
-	createdAt: number;
-}
-
 /** One blocker the second-model work check raised; an empty quote demotes it to a note. */
 export interface WorkCheckBlocker {
 	/** What is wrong, one to three sentences. */

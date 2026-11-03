@@ -36,14 +36,12 @@ describe("no-destruction rule", () => {
 				sha: "abc",
 				commits: 1,
 				notes: "- n",
-				learnings: [],
 			}),
 			reviewPrompt({
 				target: "main",
 				sha: "abc",
 				from: "def",
 				commits: 5,
-				learnings: [],
 			}),
 		]) {
 			expect(p).toContain("never kill or force-stop a process");
@@ -169,7 +167,6 @@ describe("releasePrompt", () => {
 			sha: "abc1234",
 			commits: 1,
 			notes: "- fix",
-			learnings: [],
 		});
 		expect(prompt).toContain(
 			"If the session has no name yet, call the rename tool once",
@@ -183,7 +180,6 @@ describe("releasePrompt", () => {
 			sha: "abc1234",
 			commits: 3,
 			notes: "- fix",
-			learnings: [],
 		});
 		expect(prompt).toContain("a blocker is a finding");
 		expect(prompt).toContain("the release waits for those cards");
@@ -250,7 +246,6 @@ describe("reviewPrompt", () => {
 			sha: "abc1234",
 			from: "def5678",
 			commits: 269,
-			learnings: [],
 		});
 		// scheduler.ts isReview and the one-review guard match this prefix.
 		expect(prompt.startsWith(ARCH_REVIEW_MARKER)).toBe(true);
@@ -262,7 +257,6 @@ describe("reviewPrompt", () => {
 			sha: "abc1234",
 			from: null,
 			commits: 30,
-			learnings: [],
 		});
 		expect(fresh.split("\n")[0]).toContain("un-reviewed");
 	});
@@ -273,7 +267,6 @@ describe("reviewPrompt", () => {
 			sha: "abc1234",
 			from: "def5678",
 			commits: 3,
-			learnings: [],
 		});
 		const release = releasePrompt({
 			version: "v1.2.3",
@@ -281,7 +274,6 @@ describe("reviewPrompt", () => {
 			sha: "abc1234",
 			commits: 3,
 			notes: "- fix",
-			learnings: [],
 		});
 		// Everything after the focus sentence: findings, gates, security audit, architecture lenses.
 		const steps = review.slice(
@@ -299,7 +291,6 @@ describe("reviewPrompt", () => {
 			sha: "abc1234",
 			from: "def5678",
 			commits: 3,
-			learnings: [],
 		});
 		expect(prompt).toContain("Do not file cards.");
 		expect(prompt).toContain("Record every finding with the propose_task tool");

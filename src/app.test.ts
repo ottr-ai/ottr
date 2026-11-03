@@ -4312,64 +4312,6 @@ describe("arch-review duplicate guard (R1-8)", () => {
 	});
 });
 
-describe("learnings routes", () => {
-	const del = async (path: string) =>
-		fetch(new URL(path, server.url), {
-			method: "DELETE",
-			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
-		});
-
-	test("POST validates text and glob", async () => {
-		const missing = await post("/api/projects/p1/learnings", {});
-		expect(missing.status).toBe(400);
-		const empty = await post("/api/projects/p1/learnings", { text: "   " });
-		expect(empty.status).toBe(400);
-		const long = await post("/api/projects/p1/learnings", {
-			text: "x".repeat(501),
-		});
-		expect(long.status).toBe(400);
-		const badGlob = await post("/api/projects/p1/learnings", {
-			text: "ok",
-			glob: "",
-		});
-		expect(badGlob.status).toBe(400);
-		const longGlob = await post("/api/projects/p1/learnings", {
-			text: "ok",
-			glob: "x".repeat(201),
-		});
-		expect(longGlob.status).toBe(400);
-	});
-
-	test("POST trims, stores, and GET lists the learning", async () => {
-		const res = await post("/api/projects/p1/learnings", {
-			text: "  never edit generated files  ",
-			glob: " src/**/*.ts ",
-		});
-		expect(res.status).toBe(200);
-		const b: unknown = await res.json();
-		const learning =
-			typeof b === "object" && b !== null && "learning" in b
-				? (b.learning as { id: number; text: string; glob: string | null })
-				: null;
-		expect(learning?.text).toBe("never edit generated files");
-		expect(learning?.glob).toBe("src/**/*.ts");
-		const list = await get("/api/projects/p1/learnings");
-		expect(list.status).toBe(200);
-		const lb: unknown = await list.json();
-		const learnings =
-			typeof lb === "object" && lb !== null && "learnings" in lb
-				? (lb.learnings as { id: number }[])
-				: [];
-		expect(learnings.some((l) => l.id === learning?.id)).toBe(true);
-		expect(
-			(await del(`/api/projects/p1/learnings/${learning?.id}`)).status,
-		).toBe(200);
-		// Unknown ids still answer ok: deleteLearning is void.
-		expect((await del("/api/projects/p1/learnings/99999")).status).toBe(200);
-		expect((await del("/api/projects/p1/learnings/nope")).status).toBe(400);
-	});
-});
-
 describe("triage route", () => {
 	test("rejects an empty patch and a bad priority", async () => {
 		const task = store.createTask("triage me");
@@ -4411,29 +4353,6 @@ describe("triage route", () => {
 				: null;
 		expect(cview?.priority).toBeNull();
 		expect(cview?.closeCandidate).toBe("dup of OTTR-7");
-	});
-});
-
-describe("review prompt carries the project's learnings", () => {
-	test("a Review card's prompt contains the learning text and bumps its usage count", async () => {
-		const add = await post("/api/projects", { name: "learn-proj" });
-		expect(add.status).toBe(200);
-		const e = projects.get("learn-proj")!;
-		e.target = "main";
-		const learning = e.store.addLearning({ text: "flag dead config" });
-		const res = await post("/api/projects/learn-proj/arch-review", {});
-		expect(res.status).toBe(200);
-		const b: unknown = await res.json();
-		const id =
-			typeof b === "object" && b !== null && "id" in b ? String(b.id) : "";
-		const prompt = e.store.getTask(id)?.prompt ?? "";
-		expect(prompt).toContain("flag dead config");
-		const used = e.store
-			.listLearnings()
-			.find((l) => l.id === learning.id)?.usageCount;
-		expect(used).toBe(1);
-		projects.delete("learn-proj");
-		e.store.close();
 	});
 });
 

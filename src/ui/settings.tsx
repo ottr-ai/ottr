@@ -13,7 +13,6 @@ import type {
 	AppCheck,
 	GitHubAppView,
 	GithubFacts,
-	Learning,
 	ProjectView,
 	TaskCard,
 } from "../types.ts";
@@ -3393,151 +3392,6 @@ function AlateSection() {
 }
 
 /** The settings page: General for machine-wide knobs, one page per project, at #settings. */
-/** Review learnings: one row per standing review convention (text, glob, usage count),
- * a delete per row, and an add form. Loads on mount; errors surface like the other settings errors. */
-function LearningsSection({
-	project,
-	act,
-}: {
-	project: ProjectView;
-	act: Act;
-}) {
-	const [items, setItems] = useState<Learning[] | null>(null);
-	const [text, setText] = useState("");
-	const [glob, setGlob] = useState("");
-	const [error, setError] = useState<string | null>(null);
-	const save = useBusy();
-	const url = `/api/projects/${encodeURIComponent(project.name)}/learnings`;
-	const load = useCallback(async (): Promise<boolean> => {
-		try {
-			const v = (await unwrap(await fetch(url))) as {
-				learnings: Learning[];
-			};
-			setItems(v.learnings);
-			return true;
-		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err));
-			return false;
-		}
-	}, [url]);
-	useEffect(() => {
-		setItems(null);
-		setError(null);
-		void load();
-	}, [load]);
-	const add = (): void => {
-		save.start(() =>
-			act(async () => {
-				const v = await post<{ learning: Learning }>(url, {
-					text: text.trim(),
-					glob: glob.trim() === "" ? null : glob.trim(),
-				});
-				setItems([...(items ?? []), v.learning]);
-				setText("");
-				setGlob("");
-			}, setError),
-		);
-	};
-	const remove = (id: number): void => {
-		save.start(() =>
-			act(async () => {
-				await unwrap(await fetch(`${url}/${id}`, { method: "DELETE" }));
-				setItems((cur) => (cur ?? []).filter((l) => l.id !== id));
-			}, setError),
-		);
-	};
-	return (
-		<SettingsCard
-			id="project-learnings-section"
-			className="learnings-sec"
-			title="Review learnings"
-			help="Standing review rules. The prompt of each review card includes them, so a finding that only repeats a rule counts as noise."
-			status={
-				items === null
-					? undefined
-					: {
-							label: `${items.length} learning${items.length === 1 ? "" : "s"}`,
-							tone: items.length > 0 ? "ok" : "off",
-						}
-			}
-			hint="Standing review conventions, stated once. Every Review card's prompt carries them, so a finding that only restates one is treated as noise."
-		>
-			{items !== null && items.length === 0 && (
-				<p className="hint">No learnings yet.</p>
-			)}
-			{items !== null && items.length > 0 && (
-				<ul className="learnings-list">
-					{items.map((l) => (
-						<li key={l.id}>
-							<span className="learning-text">{l.text}</span>
-							{l.glob !== null && (
-								<code className="learning-glob">{l.glob}</code>
-							)}
-							<span className="learning-uses">
-								used {l.usageCount === 1 ? "once" : `${l.usageCount} times`}
-							</span>
-							<button
-								type="button"
-								className="icon"
-								aria-label={`Delete learning: ${l.text}`}
-								title="Delete learning"
-								disabled={save.busy}
-								onClick={() => remove(l.id)}
-							>
-								<Icon name="x" />
-							</button>
-						</li>
-					))}
-				</ul>
-			)}
-			<form
-				className="learnings-add"
-				onSubmit={(e) => {
-					e.preventDefault();
-					add();
-				}}
-			>
-				<label>
-					<span>Convention</span>
-					<textarea
-						rows={2}
-						maxLength={500}
-						required
-						value={text}
-						placeholder="e.g. Never suggest adding JSDoc to internal helpers"
-						onChange={(e) => setText(e.target.value)}
-					/>
-				</label>
-				<label>
-					<span>Path glob (optional)</span>
-					<input
-						maxLength={200}
-						value={glob}
-						placeholder="src/ui/**"
-						autoComplete="off"
-						spellCheck={false}
-						onChange={(e) => setGlob(e.target.value)}
-					/>
-				</label>
-				<button
-					type="submit"
-					disabled={save.busy}
-					className={save.failed ? "failed" : undefined}
-					aria-busy={save.busy || undefined}
-				>
-					{save.busy && <span className="spinner" aria-hidden="true" />}
-					Add learning
-				</button>
-			</form>
-			{error !== null && (
-				<p className="auth-error" role="alert">
-					{error}
-				</p>
-			)}
-		</SettingsCard>
-	);
-}
-
 type ChipTone = "ok" | "warn" | "off";
 
 /** One definition row: name (with an optional "?" explanation), purpose and value shape on the left, the value on the right. */
@@ -3688,7 +3542,6 @@ const PROJECT_TOC = [
 	{ id: "project-reviews-section", label: "Reviews" },
 	{ id: "project-messages-section", label: "Messages" },
 	{ id: "project-updates-section", label: "Updates" },
-	{ id: "project-learnings-section", label: "Review learnings" },
 	{ id: "project-ssh-section", label: "SSH key" },
 	{ id: "project-remove-section", label: "Remove project" },
 ] as const;
@@ -4553,7 +4406,6 @@ export function ProjectSettingsForm({
 					</div>
 				</SettingsCard>
 			</form>
-			<LearningsSection project={project} act={act} />
 			{setupOpen && (
 				<SetupWizardModal
 					project={project}

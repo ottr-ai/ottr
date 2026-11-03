@@ -2815,35 +2815,6 @@ describe("triage columns", () => {
 });
 
 describe("learnings", () => {
-	test("add/list/delete round trip; touchLearnings bumps counts and is a no-op on []", () => {
-		const store = open(join(root, "learnings"));
-		expect(store.listLearnings()).toEqual([]);
-		const a = store.addLearning({ text: "no default exports" });
-		const b = store.addLearning({
-			text: "tabs in src/",
-			glob: "src/**",
-			fromTaskId: "T-1",
-		});
-		expect(a.usageCount).toBe(0);
-		expect(a.lastUsedAt).toBeNull();
-		expect(a.fromTaskId).toBeNull();
-		expect(b.glob).toBe("src/**");
-		expect(b.fromTaskId).toBe("T-1");
-		// Oldest first.
-		expect(store.listLearnings().map((l) => l.id)).toEqual([a.id, b.id]);
-
-		store.touchLearnings([]);
-		expect(store.listLearnings().every((l) => l.usageCount === 0)).toBe(true);
-		store.touchLearnings([a.id]);
-		const touched = store.listLearnings().find((l) => l.id === a.id)!;
-		expect(touched.usageCount).toBe(1);
-		expect(touched.lastUsedAt).toBeGreaterThan(0);
-
-		store.deleteLearning(a.id);
-		expect(store.listLearnings().map((l) => l.id)).toEqual([b.id]);
-		store.close();
-	});
-
 	test("an old-shape database gains the triage columns and the learnings table on open", () => {
 		const dir = join(root, "learnings-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
@@ -2859,6 +2830,14 @@ describe("learnings", () => {
 					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
 				)
 				.get()?.sql ?? "";
+		// A fresh database has the retired table too: CREATE TABLE IF NOT EXISTS in the schema.
+		expect(
+			refDb
+				.query<{ name: string }, []>(
+					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learnings'",
+				)
+				.get(),
+		).toBeTruthy();
 		refDb.close();
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
 		db.exec(ddl);
@@ -2873,10 +2852,17 @@ describe("learnings", () => {
 		expect(seed?.title).toBe("old card");
 		expect(seed?.priority).toBeNull();
 		expect(seed?.closeCandidate).toBeNull();
-		// The table exists and works.
-		store.addLearning({ text: "converged" });
-		expect(store.listLearnings().map((l) => l.text)).toEqual(["converged"]);
+		// The retired learnings table still exists here; nothing reads or writes it.
 		store.close();
+		const reopened = new Database(join(dir, ".tasks", "tasks.db"));
+		expect(
+			reopened
+				.query<{ name: string }, []>(
+					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learnings'",
+				)
+				.get(),
+		).toBeTruthy();
+		reopened.close();
 	});
 });
 

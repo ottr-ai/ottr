@@ -491,14 +491,15 @@ describe("ProjectSettingsForm target branch", () => {
 			// Sections beside the form that load on mount.
 			if (url.endsWith("/api/projects/proj/ssh-key"))
 				return ok({ own: null, expiresAt: null });
-			if (url.endsWith("/api/projects/proj/learnings"))
-				return ok({ learnings: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountForm(fetchMock);
 		try {
 			const card = container.querySelector("#project-worktrees-section");
 			expect(card).not.toBeNull();
+			// The Review learnings feature is removed: no card, no map entry, no fetch.
+			expect(container.querySelector("#project-learnings-section")).toBeNull();
+			expect(container.textContent).not.toContain("Review learnings");
 			const row = card?.querySelector(".alate-def-row");
 			expect(row?.textContent).toContain("Target branch");
 			const input = card?.querySelector<HTMLInputElement>(

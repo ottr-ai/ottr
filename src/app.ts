@@ -4257,49 +4257,6 @@ export function createApp(deps: AppDeps) {
 					return json(projectView(e));
 				}),
 		},
-		"/api/projects/:project/learnings": {
-			GET: (req) =>
-				api(req, async () => {
-					const e = deps.projects.get(req.params.project);
-					if (!e) return json({ error: "unknown project" }, 404);
-					return json({ learnings: e.store.listLearnings() });
-				}),
-			POST: (req) =>
-				api(req, async () => {
-					const r = await readJson(req);
-					if ("error" in r) return r.error;
-					const e = deps.projects.get(req.params.project);
-					if (!e) return json({ error: "unknown project" }, 404);
-					const { text, glob } = r.body;
-					if (typeof text !== "string")
-						return json({ error: "text must be a string" }, 400);
-					const trimmed = text.trim();
-					if (!trimmed || trimmed.length > 500)
-						return json({ error: "text must be 1-500 characters" }, 400);
-					let g: string | null = null;
-					if (glob !== undefined) {
-						if (typeof glob !== "string")
-							return json({ error: "glob must be a string" }, 400);
-						g = glob.trim();
-						if (!g || g.length > 200)
-							return json({ error: "glob must be 1-200 characters" }, 400);
-					}
-					return json({
-						learning: e.store.addLearning({ text: trimmed, glob: g }),
-					});
-				}),
-		},
-		"/api/projects/:project/learnings/:id": {
-			DELETE: (req) =>
-				api(req, async () => {
-					const e = deps.projects.get(req.params.project);
-					if (!e) return json({ error: "unknown project" }, 404);
-					if (!/^-?\d+$/.test(req.params.id))
-						return json({ error: "bad learning id" }, 400);
-					e.store.deleteLearning(Number(req.params.id));
-					return json({ ok: true });
-				}),
-		},
 		// The board's Diagrams button: docs/how-it-works.md as committed on the target branch.
 		"/api/projects/:project/how-it-works": {
 			GET: (req) =>
@@ -4433,7 +4390,6 @@ export function createApp(deps: AppDeps) {
 					if (blocked !== null) return json({ error: blocked }, 409);
 					const model = modelParam(r.body);
 					if (model instanceof Response) return model;
-					const learnings = e.store.listLearnings();
 					const t = e.store.createTask(
 						releasePrompt({
 							version,
@@ -4441,12 +4397,9 @@ export function createApp(deps: AppDeps) {
 							sha: plan.sha,
 							commits: plan.commits,
 							notes: plan.notes,
-							learnings,
 						}),
 						model,
 					);
-					// ponytail: usage counted at card creation, not at turn start; a review card that never runs overcounts by one.
-					e.store.touchLearnings(learnings.map((l) => l.id));
 					// Synchronous with createTask: the scheduler must never see a half-made release card.
 					const updated = e.store.updateTask(t.id, {
 						base: plan.sha,
@@ -4493,20 +4446,16 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "could not read the git history" }, 409);
 					const model = modelParam(r.body);
 					if (model instanceof Response) return model;
-					const learnings = e.store.listLearnings();
 					const t = e.store.createTask(
 						reviewPrompt({
 							target: resolved.target,
 							sha: resolved.sha,
 							from: delta.reviewed ? delta.anchor : null,
 							commits: delta.delta,
-							learnings,
 						}),
 						model,
 						"review",
 					);
-					// ponytail: usage counted at card creation, not at turn start; a review card that never runs overcounts by one.
-					e.store.touchLearnings(learnings.map((l) => l.id));
 					// Synchronous with createTask: the scheduler must never see a review card without its base.
 					const updated = e.store.updateTask(t.id, { base: resolved.sha });
 					deps.schedule();

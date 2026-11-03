@@ -32,7 +32,6 @@ import type {
 	AskQuestion,
 	DiffFileStat,
 	ForkBranchState,
-	Learning,
 	OutcomeStatus,
 	ProjectSettings,
 	PrReviewRow,
@@ -183,6 +182,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
 );
 ${PR_REVIEW_RUNS_DDL};
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
+-- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   text TEXT NOT NULL,
@@ -323,29 +323,6 @@ interface TurnRow {
 	question: string | null;
 	error: string | null;
 	model: string | null;
-}
-
-/** One learnings row. */
-interface LearningRow {
-	id: number;
-	text: string;
-	glob: string | null;
-	usage_count: number;
-	last_used_at: number | null;
-	from_task_id: string | null;
-	created_at: number;
-}
-
-function toLearning(r: LearningRow): Learning {
-	return {
-		id: r.id,
-		text: r.text,
-		glob: r.glob,
-		usageCount: r.usage_count,
-		lastUsedAt: r.last_used_at,
-		fromTaskId: r.from_task_id,
-		createdAt: r.created_at,
-	};
 }
 
 function toTask(project: string, r: TaskRow): Task {
@@ -1863,49 +1840,6 @@ export class ProjectStore {
 
 	queueIds(): string[] {
 		return queueOrder(this.listTasks()).map((t) => t.id);
-	}
-
-	/** Learnings oldest first, so a prompt section lists them in the order the user stated them. */
-	listLearnings(): Learning[] {
-		return this.db
-			.query<LearningRow, []>("SELECT * FROM learnings ORDER BY created_at ASC")
-			.all()
-			.map(toLearning);
-	}
-
-	addLearning(o: {
-		text: string;
-		glob?: string | null;
-		fromTaskId?: string | null;
-	}): Learning {
-		const now = Date.now();
-		const res = this.db.run(
-			"INSERT INTO learnings (text, glob, usage_count, from_task_id, created_at) VALUES (?, ?, 0, ?, ?)",
-			[o.text, o.glob ?? null, o.fromTaskId ?? null, now],
-		);
-		return {
-			id: Number(res.lastInsertRowid),
-			text: o.text,
-			glob: o.glob ?? null,
-			usageCount: 0,
-			lastUsedAt: null,
-			fromTaskId: o.fromTaskId ?? null,
-			createdAt: now,
-		};
-	}
-
-	deleteLearning(id: number): void {
-		this.db.run("DELETE FROM learnings WHERE id = ?", [id]);
-	}
-
-	/** Marks learnings as applied by a review card: bumps the count and stamps the time; a no-op on []. */
-	touchLearnings(ids: number[]): void {
-		if (ids.length === 0) return;
-		const marks = ids.map(() => "?").join(", ");
-		this.db.run(
-			`UPDATE learnings SET usage_count = usage_count + 1, last_used_at = ? WHERE id IN (${marks})`,
-			[Date.now(), ...ids],
-		);
 	}
 
 	/** True iff `order` is an exact permutation of the current queue; then moves each task by writing future queuedAt. */
