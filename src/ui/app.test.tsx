@@ -594,10 +594,9 @@ describe("done lane star section", () => {
 		onReorder: async () => {},
 		filtering: false,
 		draining: false,
-		onStar: () => {},
 	} as const;
 
-	test("a starred done research card renders the star pressed, a plain done card none", () => {
+	test("a starred done research card renders the star in place of the check, a plain card the check", () => {
 		const research = cardFixture({
 			id: "r1",
 			stage: "done",
@@ -608,14 +607,17 @@ describe("done lane star section", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="done" tasks={[research]} />,
 		);
-		expect(html).toContain("card-star");
-		expect(html).toContain('aria-pressed="true"');
-		expect(html).toContain('title="Starred"');
+		expect(html).toContain("mark-star");
+		expect(html).not.toContain("mark-done");
+		// The star is state only: no button on the card.
+		expect(html).not.toContain("card-star");
+		expect(html).not.toContain('aria-pressed="true"');
 		const plain = cardFixture({ id: "w1", stage: "done", state: "idle" });
 		const bare = renderToStaticMarkup(
 			<LaneCol {...base} stage="done" tasks={[plain]} />,
 		);
-		expect(bare).not.toContain("card-star");
+		expect(bare).toContain("mark-done");
+		expect(bare).not.toContain("mark-star");
 	});
 
 	test("the Starred section sits below Unread and above normal done cards", () => {
@@ -1483,6 +1485,9 @@ describe("cancelled cards on the board", () => {
 		expect(html).not.toContain("Unread");
 		expect(html).not.toContain("Starred");
 		expect(html).toContain('data-task-id="s1"');
+		// The star never replaces the cancelled x, not even on a starred card.
+		expect(html).toContain("mark-cancelled");
+		expect(html).not.toContain("mark-star");
 	});
 
 	test("the topic view lists cancelled cards in a Cancelled section, outside every topic", () => {

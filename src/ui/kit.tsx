@@ -403,7 +403,8 @@ type MarkKind =
 	| "preparing"
 	| "queued"
 	| "done"
-	| "cancelled";
+	| "cancelled"
+	| "star";
 
 // Redundant state coding (ISA-101): shape carries the state; colour is spent only on alarms (amber, red).
 // Ask rounds are the exception: the question mark rides the steel accent — input requested, not a stall.
@@ -443,6 +444,13 @@ const MARK_SHAPES: Record<MarkKind, ReactNode> = {
 	done: <path d="M3.2 8.4l3.1 3.1 6.5-7" />,
 	// A cancelled card: the x closes the story; the "Cancelled" chip beside it carries the word.
 	cancelled: <path d="M4.6 4.6l6.8 6.8M11.4 4.6l-6.8 6.8" />,
+	// A starred report: the feather star scaled into the 16 box; the card-head sizing applies.
+	star: (
+		<polygon
+			transform="scale(0.6667)"
+			points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"
+		/>
+	),
 };
 
 export function Mark({ kind }: { kind: MarkKind }) {

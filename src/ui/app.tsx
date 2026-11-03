@@ -551,7 +551,6 @@ function Card({
 	hold,
 	drain,
 	locked,
-	onStar,
 	holdRelease,
 	onOpenTask,
 	reRelease,
@@ -572,8 +571,6 @@ function Card({
 	drain?: boolean;
 	/** A reorder request for this card is in flight; the card dims and cannot start another drag. */
 	locked?: boolean;
-	/** Done research cards only: renders the star toggle; the handler posts and never opens the drawer. */
-	onStar?: () => void;
 	/** The release card whose heldMerges list names this card; null or undefined otherwise. */
 	holdRelease?: { id: string; version: string | null } | null;
 	/** Opens another card's drawer; the hold link chip uses it to name the release. */
@@ -619,7 +616,13 @@ function Card({
 				onClick={onOpen}
 			>
 				<span className="card-head">
-					<Mark kind={cardMark(task)} />
+					{task.starred && task.cancelledAt === null ? (
+						// A starred report: the star stands in for the done check; the drawer's
+						// icon button toggles it, the card carries only the state.
+						<Mark kind="star" />
+					) : (
+						<Mark kind={cardMark(task)} />
+					)}
 					<span className="card-key" title={`Task ${task.id}`}>
 						{task.id}
 					</span>
@@ -742,8 +745,7 @@ function Card({
 			</button>
 			{(release !== null ||
 				holdRelease != null ||
-				onRerelease !== undefined ||
-				(task.stage === "done" && task.research && onStar)) && (
+				onRerelease !== undefined) && (
 				<span className="card-tags">
 					{holdRelease != null && onOpenTask !== undefined && (
 						<button
@@ -793,22 +795,6 @@ function Card({
 								{release}
 							</span>
 						))}
-					{task.stage === "done" && task.research && onStar && (
-						<button
-							type="button"
-							className="card-star"
-							aria-pressed={task.starred}
-							title={task.starred ? "Starred" : "Star this report"}
-							onClick={(e) => {
-								// The card body is a stretched open button: keep the click off it.
-								e.preventDefault();
-								e.stopPropagation();
-								onStar();
-							}}
-						>
-							<Icon name="star" size={12} />
-						</button>
-					)}
 				</span>
 			)}
 		</div>
@@ -3045,18 +3031,6 @@ function ProjectBoard({
 										),
 									)
 								}
-								onStar={
-									c.key === "done"
-										? (t) => {
-												void act(async () => {
-													await post(
-														`/api/projects/${encodeURIComponent(project.name)}/tasks/${t.id}/star`,
-														{ starred: !t.starred },
-													);
-												});
-											}
-										: undefined
-								}
 								onRerelease={rerelease}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -3954,7 +3928,6 @@ export function LaneCol({
 	more = 0,
 	onMore,
 	onTopicMore,
-	onStar,
 	onRerelease,
 }: {
 	stage: Stage;
@@ -3976,8 +3949,6 @@ export function LaneCol({
 		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
 		| null;
 	onTopicMore?: (key: string) => void;
-	/** Done lane only: toggles a done research card's star; the socket frame refreshes the card. */
-	onStar?: (t: TaskCard) => void;
 	/** Cancels a stalled release card and opens Create release; set only for the release flow. */
 	onRerelease?: (t: TaskCard) => void;
 	collapsed: Record<string, boolean>;
@@ -4136,7 +4107,6 @@ export function LaneCol({
 			fuOf={t.followUpOf}
 			onOpen={() => open(t.id)}
 			unread={unread(t)}
-			onStar={onStar ? () => onStar(t) : undefined}
 			locked={pending?.id === t.id}
 			holdRelease={heldBy.get(t.id)}
 			onOpenTask={open}
@@ -6381,6 +6351,29 @@ export function Drawer({
 					<div className="drawer-head">
 						<h2>{task.sessionTitle ?? task.title}</h2>
 						<div className="drawer-head-actions">
+							{task.stage === "done" && task.research && !cancelled && (
+								<button
+									type="button"
+									className="icon"
+									aria-pressed={task.starred}
+									aria-label={task.starred ? "Starred" : "Star"}
+									title={
+										task.starred
+											? "Removes this report from the Starred section"
+											: "Pins this report in the Starred section of the done lane"
+									}
+									onClick={() =>
+										void act(async () => {
+											await post(
+												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
+												{ starred: !task.starred },
+											);
+										})
+									}
+								>
+									<Icon name="star" />
+								</button>
+							)}
 							<button
 								type="button"
 								className="icon"
@@ -7684,26 +7677,6 @@ export function Drawer({
 							>
 								<Icon name="eye-off" />
 								Mark unread
-							</BusyButton>
-						)}
-						{task.stage === "done" && task.research && !cancelled && (
-							<BusyButton
-								title={
-									task.starred
-										? "Removes this report from the Starred section"
-										: "Pins this report in the Starred section of the done lane"
-								}
-								run={() =>
-									act(async () => {
-										await post(
-											`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
-											{ starred: !task.starred },
-										);
-									})
-								}
-							>
-								<Icon name="star" />
-								{task.starred ? "Starred" : "Star"}
 							</BusyButton>
 						)}
 						{/* A cancelled card is final: its drawer is read-only, so the delete

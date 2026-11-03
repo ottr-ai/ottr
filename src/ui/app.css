@@ -268,6 +268,10 @@ button.icon:hover {
 button.icon[aria-pressed="true"] {
 	color: var(--accent);
 }
+/* The drawer's star toggle reads as filled when pressed, like the old card button did. */
+.drawer-head-actions button.icon[aria-pressed="true"] .icon-svg {
+	fill: currentColor;
+}
 button.failed {
 	color: var(--crit-text);
 	border-color: var(--crit);
@@ -432,6 +436,10 @@ textarea {
 	stroke: var(--dim);
 	stroke-width: 1.8;
 	stroke-linecap: round;
+}
+/* A starred report: the filled accent star stands in for the done check. */
+.mark-star {
+	fill: var(--accent);
 }
 /* A new alarm arrives once, like an unacknowledged HMI alarm; it never blinks. */
 .card .mark-needs,
@@ -2575,28 +2583,6 @@ a.release {
 }
 a.release:hover {
 	border-color: var(--accent);
-}
-/* Star toggle on done research cards; the section head carries the count, the card only the state. */
-.card-tags .card-star {
-	pointer-events: auto;
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	padding: 0 4px;
-	color: var(--text);
-	background: none;
-	border: 1px solid var(--line);
-	border-radius: 3px;
-	cursor: pointer;
-}
-.card-tags .card-star:hover {
-	border-color: var(--accent);
-	color: var(--accent);
-}
-.card-tags .card-star[aria-pressed="true"] {
-	color: var(--accent);
-	border-color: var(--accent);
-	fill: currentColor;
 }
 /* Hold chip inside .card-tags: the held queued merge names the release card that parks it, and
    a stalled release card carries the re-release action; same voice as the star toggle. */
