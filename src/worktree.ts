@@ -663,10 +663,13 @@ export async function headVersion(dir: string): Promise<string> {
 	return String(Date.now());
 }
 
-/** Version the board shows: the newest release tag reachable from HEAD (`vX.Y.Z`, or
- * `vX.Y.Z-N-g<short>` when HEAD sits past it), the short HEAD sha on a dev checkout with no
- * release, and headVersion's boot-time fallback when git is unusable. */
+/** Version the board shows: the release stamp baked into the image first (OTTR_VERSION; the
+ * image ships no .git to describe), then the newest release tag reachable from HEAD
+ * (`vX.Y.Z`, or `vX.Y.Z-N-g<short>` when HEAD sits past it), the short HEAD sha on a dev
+ * checkout with no release, and headVersion's boot-time fallback when git is unusable. */
 export async function describeVersion(dir: string): Promise<string> {
+	const stamp = process.env.OTTR_VERSION?.trim();
+	if (stamp !== undefined && stamp !== "") return stamp;
 	try {
 		const r = await git(
 			["describe", "--tags", "--match", "v[0-9]*", "HEAD"],

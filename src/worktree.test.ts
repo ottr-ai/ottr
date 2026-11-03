@@ -1856,6 +1856,33 @@ describe("describeVersion", () => {
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
+
+	test("the image stamp OTTR_VERSION wins over git; an empty stamp behaves as unset", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-stamp-"));
+		const old = process.env.OTTR_VERSION;
+		process.env.OTTR_VERSION = " v9.9.9 ";
+		try {
+			await must(dir, "init", "-q", "-b", "main");
+			await must(dir, "commit", "-q", "--allow-empty", "-m", "a");
+			await must(dir, "tag", "-a", "v1.0.0", "-m", "v1.0.0");
+			expect(await describeVersion(dir)).toBe("v9.9.9"); // trims, and beats the repo's tag
+			process.env.OTTR_VERSION = ""; // the image build leaves the arg empty
+			expect(await describeVersion(dir)).toBe("v1.0.0"); // falls through to git
+		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+
+	test("a directory without .git falls back to the boot-time stamp (the image shape)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-nogit-"));
+		try {
+			expect(await describeVersion(dir)).toMatch(/^\d+$/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
 });
 
 describe("archReviewDelta", () => {

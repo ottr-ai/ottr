@@ -70,6 +70,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+      args:
+        OTTR_VERSION: ${OTTR_VERSION:-}
     image: ${OTTR_IMAGE:-ottr-worker:local}
     command: bun /app/src/server.ts
     init: true # reaps orphans as on the workers (148 zombies here after 7 hours, 2026-10-12)

@@ -237,7 +237,7 @@ async function targetSha(
 const SELF_ROOT = resolve(import.meta.dir, "..");
 
 /** Shipped on every /api/state; stale tabs compare it against the first version they saw and reload once.
- * The release tag HEAD carries (`vX.Y.Z`), else the short sha on a dev checkout, else boot time. */
+ * The image's OTTR_VERSION stamp, else the release tag HEAD carries, else short sha on dev, else boot time. */
 const serverVersion = await describeVersion(SELF_ROOT);
 
 if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {

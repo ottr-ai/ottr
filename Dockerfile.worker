@@ -167,6 +167,11 @@ COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
 COPY extension ./extension
 RUN bun install --frozen-lockfile --production
+# The image ships no .git, so the board takes its version from this stamp instead of git
+# describe (src/worktree.ts describeVersion). release.yml passes the release tag; a local
+# build leaves it empty and a git checkout describes itself at runtime.
+ARG OTTR_VERSION=
+ENV OTTR_VERSION=${OTTR_VERSION}
 # Every Node process preloads the Stryker tap (src/stryker-tap.cjs): a `stryker run` copies
 # its stdout to /tmp/ottr-stryker-<pid>.log, so the running card shows the progress even when
 # the agent's command pipes the output (rtk). Every other process returns at once; bun
