@@ -65,6 +65,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	forkResearch: false,
 	prReviews: false,
 	setupChecklist: false,
+	targetBranch: null,
 	originUrl: null,
 };
 
@@ -819,6 +820,7 @@ const SETTINGS_SHAPES = {
 	forkResearch: "boolean",
 	prReviews: "boolean",
 	setupChecklist: "boolean",
+	targetBranch: "string|null",
 	originUrl: "string|null",
 } as const satisfies Record<keyof ProjectSettings, string>;
 

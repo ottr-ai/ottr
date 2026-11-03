@@ -4033,7 +4033,7 @@ export function SettingsPage({
 }
 
 /** One project's settings page: identity, slots, worktrees, releases, reviews, messages, removal. */
-function ProjectSettingsForm({
+export function ProjectSettingsForm({
 	project,
 	tasks,
 	act,
@@ -4052,6 +4052,7 @@ function ProjectSettingsForm({
 	const [kwd, setKwd] = useState(String(project.settings.keptWorktreeDays));
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
+	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const [hold, setHold] = useState(project.settings.holdUpdateMerges);
 	const [retro, setRetro] = useState(project.settings.retroSince !== null);
@@ -4084,6 +4085,7 @@ function ProjectSettingsForm({
 		parallel !== project.settings.maxParallel ||
 		paths.join("\n") !== project.settings.copyExtra.join("\n") ||
 		relcmd.trim() !== (project.settings.releaseCommand ?? "") ||
+		tb.trim() !== (project.settings.targetBranch ?? "") ||
 		reviewCap !== project.settings.archReviewCap ||
 		imagesMax !== project.settings.maxImages ||
 		keepDays !== project.settings.keptWorktreeDays ||
@@ -4135,6 +4137,7 @@ function ProjectSettingsForm({
 									maxParallel: parallel,
 									copyExtra: paths,
 									releaseCommand: relcmd.trim() || null,
+									targetBranch: tb.trim() || null,
 									archReviewCap: reviewCap,
 									maxImages: imagesMax,
 									keptWorktreeDays: keepDays,
@@ -4329,6 +4332,23 @@ function ProjectSettingsForm({
 					}
 				>
 					<div className="alate-def-rows">
+						<DefRow
+							name="Target branch"
+							help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
+							desc="Where merges land"
+							shape="branch name · empty = default"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={200}
+									placeholder="main"
+									aria-label="Target branch for merges"
+									value={tb}
+									onChange={(e) => setTb(e.target.value)}
+								/>
+							</label>
+						</DefRow>
 						<DefRow
 							name="Extra paths"
 							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."

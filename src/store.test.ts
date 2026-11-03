@@ -278,6 +278,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			setupChecklist: false,
+			targetBranch: null,
 			originUrl: null,
 		});
 		store.setSettings({ displayName: null, releaseCommand: null });
@@ -298,6 +299,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			setupChecklist: false,
+			targetBranch: null,
 			originUrl: null,
 		});
 		store.close();
@@ -337,6 +339,19 @@ describe("settings", () => {
 		expect(store.getSettings().originUrl).toBeNull();
 		store.setSettings({ originUrl: null });
 		expect(store.getSettings().originUrl).toBeNull();
+		store.close();
+	});
+
+	test("targetBranch persists across a reopen and resets to null", () => {
+		const dir = join(root, "settings-target-branch");
+		let store = open(dir);
+		expect(store.getSettings().targetBranch).toBeNull();
+		store.setSettings({ targetBranch: "develop" });
+		store.close();
+		store = open(dir);
+		expect(store.getSettings().targetBranch).toBe("develop");
+		store.setSettings({ targetBranch: null });
+		expect(store.getSettings().targetBranch).toBeNull();
 		store.close();
 	});
 

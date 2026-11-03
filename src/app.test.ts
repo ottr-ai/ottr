@@ -3884,6 +3884,39 @@ describe("project settings validation", () => {
 		expect(ok.status).toBe(200);
 		expect(store.getSettings().maxImages).toBe(25);
 	});
+
+	test("targetBranch accepts a bare branch name, trims it, empty clears to null, and rejects bad names", async () => {
+		const error =
+			"targetBranch must be a bare git branch name of at most 200 characters";
+		for (const v of ["-x", "a b", "origin/x"]) {
+			const res = await post("/api/projects/p1/settings", {
+				targetBranch: v,
+			});
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toBe(error);
+		}
+		// A non-string gets the shape error, like the other string settings.
+		const wrongType = await post("/api/projects/p1/settings", {
+			targetBranch: 5,
+		});
+		expect(wrongType.status).toBe(400);
+		expect(await errorOf(wrongType)).toBe(
+			"targetBranch must be a string or null",
+		);
+		const ok = await post("/api/projects/p1/settings", {
+			targetBranch: "  develop  ",
+		});
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().targetBranch).toBe("develop");
+		// A patch without targetBranch leaves the stored value untouched.
+		await post("/api/projects/p1/settings", { maxImages: 3 });
+		expect(store.getSettings().targetBranch).toBe("develop");
+		const clear = await post("/api/projects/p1/settings", {
+			targetBranch: "",
+		});
+		expect(clear.status).toBe(200);
+		expect(store.getSettings().targetBranch).toBeNull();
+	});
 });
 
 describe("project icon", () => {

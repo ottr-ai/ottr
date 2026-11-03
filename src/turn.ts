@@ -981,7 +981,12 @@ export function createTurnLoop(
 			if (settings.releaseCommand === null) {
 				// Tag the target's head: the review's fixes landed there after the reviewed commit, and
 				// settleReviews waited for them. publishRelease refuses a head without that commit.
-				const head = await ops.resolveTarget(e.path, true, settings.originUrl);
+				const head = await ops.resolveTarget(
+					e.path,
+					true,
+					settings.originUrl,
+					settings.targetBranch,
+				);
 				if (head.warning !== null) log(head.warning);
 				if (!claimPublish()) return null;
 				line = await ops.publishRelease({
@@ -1177,6 +1182,7 @@ export function createTurnLoop(
 				e.path,
 				!task.worktree || !task.branch,
 				settings.originUrl,
+				settings.targetBranch,
 			);
 			if (warning) log(`! ${warning}`);
 			e.target = target;

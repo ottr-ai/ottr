@@ -58,6 +58,23 @@ describe("mergePrompt fast-forward step", () => {
 		expect(p).toContain("git merge --ff-only ott/x");
 		expect(p).toContain("main checkout");
 	});
+
+	test("derives the checkout branch from a non-main target", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/develop" });
+		expect(p).toContain("fast-forward develop to origin/develop");
+		expect(p).toContain("so develop holds the head of ott/x");
+	});
+
+	test("keeps the origin/main text byte-identical to the literal-main wording", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p).toContain("fast-forward main to origin/main");
+		expect(p).toContain("so main holds the head of ott/x");
+	});
+
+	test("passes an unprefixed target through as the checkout branch", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "main" });
+		expect(p).toContain("fast-forward main to main");
+	});
 });
 
 describe("workPrompt research hatch", () => {

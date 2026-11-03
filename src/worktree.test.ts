@@ -970,6 +970,15 @@ describe("pinned origin URL (OTTR-348)", () => {
 			// A planted fork remote whose url names the evil bare: a name fetch would run
 			// its upload-pack in the server's git, so the board skips with a warning.
 			const evil = join(f.dir, "fork-evil.git");
+			// A clone may carry origin/HEAD → main (git ≥ 2.48 sets it even for an unborn
+			// remote HEAD), which would win the default-branch ladder and mask the fork
+			// upstream; drop it when present so the fork path stays reachable. Older git
+			// leaves none for a clone of an empty bare.
+			try {
+				run(f.main, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
+			} catch {
+				// no origin/HEAD to drop
+			}
 			run(f.main, "remote", "add", "fork", `file://${evil}`);
 			run(f.main, "config", "branch.main.remote", "fork");
 			run(f.main, "config", "branch.main.merge", "refs/heads/main");
@@ -1499,9 +1508,22 @@ describe("against real repos", () => {
 		}
 	}, 60_000);
 
-	test("resolveTarget uses a branch without upstream as is and refuses a detached HEAD", async () => {
+	test("resolveTarget prefers origin/HEAD over a parked branch without upstream, and refuses a detached HEAD", async () => {
+		// The fixture clone has no origin/HEAD (built with init + push, not clone);
+		// set-head plants one naming the default branch.
+		await must(main, "remote", "set-head", "origin", "main");
 		await must(main, "checkout", "-q", "-b", "solo");
 		try {
+			// origin/HEAD wins: even a checked-out branch without upstream parks below it.
+			const headSha = await must(main, "rev-parse", "origin/main");
+			expect(await resolveTarget(main, true, origin)).toEqual({
+				target: "origin/main",
+				sha: headSha,
+				warning: null,
+			});
+			// Without origin/HEAD (a solo repo, a stripped clone) the old derivation holds:
+			// the upstreamless checked-out branch is the target.
+			await must(main, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
 			expect(await resolveTarget(main, true)).toEqual({
 				target: "solo",
 				sha: a,
@@ -1509,6 +1531,61 @@ describe("against real repos", () => {
 			});
 			await must(main, "checkout", "-q", "--detach");
 			await expect(resolveTarget(main)).rejects.toThrow("detached HEAD");
+		} finally {
+			await must(main, "checkout", "-q", "main");
+		}
+	}, 60_000);
+
+	test("resolveTarget resolves a configured target branch through the pinned origin", async () => {
+		// origin gains refs/heads/feature; the clone knows nothing of it yet, and there is
+		// no origin/HEAD in this fixture to fall back to.
+		const f1 = await must(
+			origin,
+			"commit-tree",
+			"-p",
+			"main",
+			"-m",
+			"f1",
+			"main^{tree}",
+		);
+		await must(origin, "update-ref", "refs/heads/feature", f1);
+		// An absent origin/<branch> fails loudly; it never falls back to the checkout.
+		await expect(resolveTarget(main, false, origin, "feature")).rejects.toThrow(
+			"cannot resolve origin/feature",
+		);
+		// The fetch refreshes origin/feature through the pinned origin URL.
+		expect(await resolveTarget(main, true, origin, "feature")).toEqual({
+			target: "origin/feature",
+			sha: f1,
+			warning: null,
+		});
+		// origin moves on; the next pinned fetch follows.
+		const f2 = await must(
+			origin,
+			"commit-tree",
+			"-p",
+			f1,
+			"-m",
+			"f2",
+			`${f1}^{tree}`,
+		);
+		await must(origin, "update-ref", "refs/heads/feature", f2);
+		expect(await resolveTarget(main, true, origin, "feature")).toEqual({
+			target: "origin/feature",
+			sha: f2,
+			warning: null,
+		});
+	}, 60_000);
+
+	test("a configured target ignores the main checkout's branch and its upstream", async () => {
+		const mainSha = await must(main, "rev-parse", "origin/main");
+		await must(main, "checkout", "-q", "-b", "parked");
+		try {
+			expect(await resolveTarget(main, false, origin, "main")).toEqual({
+				target: "origin/main",
+				sha: mainSha,
+				warning: null,
+			});
 		} finally {
 			await must(main, "checkout", "-q", "main");
 		}

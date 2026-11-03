@@ -730,7 +730,14 @@ export function archReviewDue(
 }
 
 /**
- * Upstream of the main checkout's branch, else the branch itself; sha of target.
+ * Resolution ladder for the target, in order:
+ * 1. `targetBranch` set (project setting): target = `origin/<targetBranch>`; the main
+ *    checkout's checked-out branch and its upstream stay irrelevant. A target that does
+ *    not resolve fails loudly, never falls back to the checked-out branch.
+ * 2. `targetBranch` null: `origin/HEAD` names the repo's default branch — target =
+ *    `origin/<default>`. No `origin/HEAD` (solo repo, clone without it): today's
+ *    derivation — the canonical `origin/<short>` for an origin upstream of the
+ *    checked-out branch, else the upstream as registered, else the checked-out branch.
  * fetch (before a new worktree): refresh the upstream first. A failed fetch only warns, but an upstream
  * that still doesn't resolve stops, instead of silently basing the work on the local branch.
  * The fetch names the server-pinned originUrl with an explicit refspec (R5-1,
@@ -744,6 +751,7 @@ export async function resolveTarget(
 	mainPath: string,
 	fetch = false,
 	originUrl: string | null = null,
+	targetBranch: string | null = null,
 ): Promise<{ target: string; sha: string; warning: string | null }> {
 	const head = await git(
 		["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -755,6 +763,38 @@ export async function resolveTarget(
 			`cannot read branch of main checkout: ${head.stderr.trim()}`,
 		);
 	const branch = head.stdout.trim();
+	if (targetBranch !== null) {
+		// Project setting wins: the checked-out branch and its upstream are irrelevant.
+		return resolveLadderTarget(mainPath, fetch, originUrl, {
+			target: `origin/${targetBranch}`,
+			remote: "origin",
+			remoteRef: `refs/heads/${targetBranch}`,
+			short: targetBranch,
+			branch: targetBranch,
+			upstream: "",
+			fetchErrorNote: `cannot resolve origin/${targetBranch}`,
+		});
+	}
+	// The repo's default branch, when origin/HEAD names one; else the checked-out
+	// branch's upstream derivation below (byte-for-byte today's behavior).
+	const def = await git(
+		["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+		mainPath,
+	);
+	if (def.code === 0) {
+		const defaultBranch = def.stdout
+			.trim()
+			.replace(/^refs\/remotes\/origin\//, "");
+		return resolveLadderTarget(mainPath, fetch, originUrl, {
+			target: `origin/${defaultBranch}`,
+			remote: "origin",
+			remoteRef: `refs/heads/${defaultBranch}`,
+			short: defaultBranch,
+			branch: defaultBranch,
+			upstream: "",
+			fetchErrorNote: `cannot resolve origin/${defaultBranch}`,
+		});
+	}
 	// The configured upstream, even when its remote-tracking ref is missing (@{u} fails then).
 	const fmt =
 		"--format=%(upstream:short) %(upstream:remotename) %(upstream:remoteref)";
@@ -771,14 +811,41 @@ export async function resolveTarget(
 	const short = remoteRef.startsWith("refs/heads/")
 		? remoteRef.slice("refs/heads/".length)
 		: null;
-	const target =
-		remote === "origin" && short !== null
-			? `origin/${short}`
-			: upstream || branch;
+	return resolveLadderTarget(mainPath, fetch, originUrl, {
+		target:
+			remote === "origin" && short !== null
+				? `origin/${short}`
+				: upstream || branch,
+		remote,
+		remoteRef,
+		short,
+		branch,
+		upstream,
+		fetchErrorNote: null,
+	});
+}
+
+/** Shared tail of the ladder: the pinned-URL fetch for an origin target, then resolve the target's sha. */
+async function resolveLadderTarget(
+	mainPath: string,
+	fetch: boolean,
+	originUrl: string | null,
+	o: {
+		target: string;
+		remote: string;
+		remoteRef: string;
+		short: string | null;
+		branch: string;
+		upstream: string;
+		/** Loud error when the target does not resolve and no upstream message applies. */
+		fetchErrorNote: string | null;
+	},
+): Promise<{ target: string; sha: string; warning: string | null }> {
+	const target = o.target;
 	let fetchError: string | null = null;
-	if (fetch && remote !== "") {
+	if (fetch && o.remote !== "") {
 		// ponytail: a remote branch deleted since the last fetch only warns (its stale ref still resolves); add `git ls-remote --exit-code` if that bites
-		if (remote === "origin" && short !== null) {
+		if (o.remote === "origin" && o.short !== null) {
 			// R5-1: fetch the pinned origin URL with an explicit refspec into the canonical
 			// tracking ref — a planted remote.origin.url and the configured refspecs stay
 			// irrelevant. No pin yet: skip (same degraded state as a failed fetch), never a
@@ -794,12 +861,12 @@ export async function resolveTarget(
 							"fetch",
 							"--quiet",
 							originUrl,
-							`+${remoteRef}:refs/remotes/origin/${short}`,
+							`+${o.remoteRef}:refs/remotes/origin/${o.short}`,
 						],
 						mainPath,
 					);
 					if (f.code !== 0)
-						fetchError = `git fetch ${originUrl} ${remoteRef} failed: ${f.stderr.trim()}`;
+						fetchError = `git fetch ${originUrl} ${o.remoteRef} failed: ${f.stderr.trim()}`;
 				}
 			}
 		} else {
@@ -808,7 +875,7 @@ export async function resolveTarget(
 			// The board targets origin/<branch> only; any other upstream (a fork remote, a
 			// merge ref outside refs/heads) skips the refresh with the same warning a failed
 			// fetch gets, instead of trusting a plantable name.
-			fetchError = `not fetching ${upstream || remote}: the board fetches only the pinned origin`;
+			fetchError = `not fetching ${o.upstream || o.remote}: the board fetches only the pinned origin`;
 		}
 	}
 	const sha = await git(
@@ -816,9 +883,10 @@ export async function resolveTarget(
 		mainPath,
 	);
 	if (sha.code !== 0) {
-		if (!upstream) throw new Error(`cannot resolve ${target}`);
+		if (o.fetchErrorNote !== null) throw new Error(o.fetchErrorNote);
+		if (!o.upstream) throw new Error(`cannot resolve ${target}`);
 		throw new Error(
-			`upstream ${target} of ${branch} not found${fetchError ? ` (${fetchError})` : ""}; push ${branch} or set its upstream with git branch -u`,
+			`upstream ${target} of ${o.branch} not found${fetchError ? ` (${fetchError})` : ""}; push ${o.branch} or set its upstream with git branch -u`,
 		);
 	}
 	return {

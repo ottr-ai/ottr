@@ -2091,6 +2091,28 @@ export function createApp(deps: AppDeps) {
 			}
 			patch.releaseCommand = command === "" ? null : command;
 		}
+		const tb = body.targetBranch;
+		if (tb !== undefined) {
+			if (tb !== null && typeof tb !== "string")
+				return json({ error: "targetBranch must be a string or null" }, 400);
+			const branch = typeof tb === "string" ? tb.trim() : "";
+			if (
+				branch.length > 200 ||
+				/[\p{Cc}\s]/u.test(branch) ||
+				branch.startsWith("-") ||
+				branch.includes("..") ||
+				branch.startsWith("origin/")
+			) {
+				return json(
+					{
+						error:
+							"targetBranch must be a bare git branch name of at most 200 characters",
+					},
+					400,
+				);
+			}
+			patch.targetBranch = branch === "" ? null : branch;
+		}
 		const cap = body.archReviewCap;
 		if (cap !== undefined) {
 			if (

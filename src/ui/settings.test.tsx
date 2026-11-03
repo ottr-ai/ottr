@@ -3,7 +3,8 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { GitHostsSection } from "./settings.tsx";
+import type { ProjectView } from "../types.ts";
+import { GitHostsSection, ProjectSettingsForm } from "./settings.tsx";
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -395,6 +396,130 @@ describe("GitHostsSection GitHub host", () => {
 				"#github-host-block input",
 			);
 			expect(kept?.value).toBe("https://acme.ghe.com");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("ProjectSettingsForm target branch", () => {
+	// A minimal ProjectView: the form reads the name and the full settings shape.
+	const project = {
+		name: "proj",
+		icon: null,
+		remote: null,
+		github: null,
+		hasRules: true,
+		gitless: false,
+		settings: {
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: true,
+			forkResearch: false,
+			prReviews: false,
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+		},
+	} as unknown as ProjectView;
+
+	/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
+	async function mountForm(fetchMock: typeof fetch): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("the Worktrees card shows the target branch row and saving posts it", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return ok(project);
+			}
+			// Sections beside the form that load on mount.
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			if (url.endsWith("/api/projects/proj/learnings"))
+				return ok({ learnings: [] });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountForm(fetchMock);
+		try {
+			const card = container.querySelector("#project-worktrees-section");
+			expect(card).not.toBeNull();
+			const row = card?.querySelector(".alate-def-row");
+			expect(row?.textContent).toContain("Target branch");
+			const input = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Target branch for merges"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("target branch input did not render");
+			expect(input.value).toBe("");
+			expect(input.getAttribute("placeholder")).toBe("main");
+			expect(input.getAttribute("maxlength")).toBe("200");
+			await act(async () => {
+				typeInto(input, "develop");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = container.querySelector("#project-settings");
+			if (form === null) throw new Error("form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.targetBranch).toBe("develop");
 		} finally {
 			await unmount();
 		}
