@@ -16,7 +16,6 @@ import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ARCH_REVIEW_MARKER,
-	ARCH_REVIEW_MARKER,
 	forkProposedReason,
 	LEGACY_FORK_PROPOSED_REASON_PREFIX,
 	LEGACY_PROPOSED_REASON_PREFIX,
