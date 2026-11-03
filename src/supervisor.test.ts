@@ -22,6 +22,7 @@ import {
 	tendFamily,
 } from "./supervisor.ts";
 import type { ProjectSettings, Task } from "./types.ts";
+import type { SweptProcess } from "./workers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "supervisor-"));
 afterAll(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
@@ -50,6 +51,9 @@ interface FakeOps extends SupervisorOps {
 	husk: boolean;
 	linkedNow: boolean;
 	quarantineErr: Error | null;
+	swept: SweptProcess[];
+	sweepErr: Error | null;
+	sweepUrls: string[];
 }
 
 function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
@@ -70,6 +74,9 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		husk: false,
 		linkedNow: true,
 		quarantineErr: null,
+		swept: [],
+		sweepErr: null,
+		sweepUrls: [],
 		appendLog: (store, id, line) => {
 			// ponytail: mirrors src/turn.ts appendLog minus the hook notify; test seam only
 			mkdirSync(dirname(store.logPath(id)), { recursive: true });
@@ -112,6 +119,11 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			return [];
 		},
 		targetCommits: async () => 3,
+		sweepWorker: async (url) => {
+			ops.sweepUrls.push(url);
+			if (ops.sweepErr) throw ops.sweepErr;
+			return ops.swept;
+		},
 		...p,
 	};
 	return ops;
@@ -2183,5 +2195,84 @@ describe("dependabotPrompt", () => {
 		expect(dependabotPrompt(2, "o/r", "x".repeat(250)).split("\n", 1)[0]).toBe(
 			`Dependabot PR #2 (https://github.com/o/r/pull/2): ${"x".repeat(200)}`,
 		);
+	});
+});
+
+// ---- worker sweep ----------------------------------------------------------
+
+describe("worker sweep", () => {
+	test("logs stopped leftover processes on their cards once per tick", async () => {
+		const dir = join(root, "sweep-log");
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const e = entry(store);
+		const ops = fakeOps({
+			swept: [
+				{ pid: 4242, command: "bun src/dev.ts", project: e.name, cardId: t.id },
+			],
+		});
+		const sv = createSupervisor(new Map([[e.name, e]]), ops, {
+			urls: ["http://w-a", "http://w-b"],
+			token: "t",
+		});
+		await sv.tick();
+		expect(ops.sweepUrls).toEqual(["http://w-a", "http://w-b"]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain(
+			"hygiene: stopped leftover process 4242 (bun src/dev.ts)",
+		);
+		store.close();
+	});
+
+	test("a failed sweep is logged and never stops the tick", async () => {
+		const dir = join(root, "sweep-fail");
+		const store = ProjectStore.open(dir);
+		const e = entry(store);
+		const ops = fakeOps({ sweepErr: new Error("connection refused") });
+		const errs: unknown[][] = [];
+		const orig = console.error;
+		console.error = (...a: unknown[]) => {
+			errs.push(a);
+		};
+		try {
+			await createSupervisor(new Map([[e.name, e]]), ops, {
+				urls: ["http://w-b"],
+				token: undefined,
+			}).tick(); // must not throw
+		} finally {
+			console.error = orig;
+		}
+		expect(errs).toHaveLength(1);
+		expect(String(errs[0]![0])).toContain("http://w-b");
+		store.close();
+	});
+
+	test("unknown project or unknown card logs nothing", async () => {
+		const dir = join(root, "sweep-unknown");
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const e = entry(store);
+		const ops = fakeOps({
+			swept: [
+				{ pid: 1, command: "x", project: "nope", cardId: t.id },
+				{ pid: 2, command: "y", project: e.name, cardId: "zzz" },
+			],
+		});
+		await createSupervisor(new Map([[e.name, e]]), ops, {
+			urls: ["http://w-a"],
+			token: undefined,
+		}).tick();
+		expect(existsSync(store.logPath(t.id))).toBe(false);
+		store.close();
+	});
+
+	test("host mode (no workers argument) never sweeps", async () => {
+		const dir = join(root, "sweep-host");
+		const store = ProjectStore.open(dir);
+		const e = entry(store);
+		const ops = fakeOps();
+		await tick(new Map([[e.name, e]]), ops);
+		expect(ops.sweepUrls).toEqual([]);
+		store.close();
 	});
 });

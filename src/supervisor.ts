@@ -17,6 +17,7 @@ import type {
 	RunResult,
 	Task,
 } from "./types.ts";
+import type { SweptProcess, WorkerTarget } from "./workers.ts";
 import type {
 	branchMergedOrGone,
 	commitsAhead,
@@ -37,6 +38,7 @@ export interface SupervisorEntry {
 }
 export interface SupervisorOps {
 	appendLog(store: ProjectStore, id: string, line: string): void;
+	sweepWorker(url: string, token: string | undefined): Promise<SweptProcess[]>;
 	schedule(): void;
 	now(): number;
 	removeWorktree(o: {
@@ -271,6 +273,7 @@ export function churnTend(
 export function createSupervisor(
 	projects: Map<string, SupervisorEntry>,
 	ops: SupervisorOps,
+	workers: WorkerTarget | null = null,
 ): { tick(): Promise<void> } {
 	let running = false;
 	const cleanup = new Map<string, CleanupState>();
@@ -1018,6 +1021,32 @@ export function createSupervisor(
 		}
 	}
 
+	// The worker pool is shared across projects, so the sweep runs once per tick, not per
+	// project; workers only answer for their own container's /proc.
+	async function workerSweepPass(): Promise<void> {
+		if (workers === null) return;
+		for (const url of workers.urls) {
+			try {
+				const swept = await ops.sweepWorker(url, workers.token);
+				for (const p of swept) {
+					const e = projects.get(p.project);
+					if (e === undefined) continue;
+					const task = e.store.listTasks().find((t) => t.id === p.cardId);
+					if (task === undefined) continue;
+					ops.appendLog(
+						e.store,
+						task.id,
+						`hygiene: stopped leftover process ${p.pid} (${p.command})`,
+					);
+				}
+			} catch (err) {
+				console.error(
+					`supervisor: worker sweep failed (${url}): ${errmsg(err)}`,
+				);
+			}
+		}
+	}
+
 	return {
 		async tick(): Promise<void> {
 			if (running) return;
@@ -1040,6 +1069,7 @@ export function createSupervisor(
 						console.error(`supervisor: project ${e.name}:`, err);
 					}
 				}
+				await workerSweepPass();
 			} finally {
 				running = false;
 			}

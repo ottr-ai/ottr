@@ -1,8 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { type ChildProcess, spawn } from "node:child_process";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -10,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRunSink, type RunSink } from "./runner.ts";
 import {
+	matchSweepTarget,
 	runWorker,
 	serveWorker,
 	WORKER_DONE,
@@ -784,4 +788,168 @@ runWorker({ id: "idle", argv: [], cwd: ${JSON.stringify(dir)}, stdin: "", env: {
 			silent.stop(true);
 		}
 	}, 30_000);
+});
+
+describe("sweepLeftovers", () => {
+	// Detached child with its cwd in a (later deleted) fake worktree: the leftover dev
+	// server shape the sweep exists to kill. Boot is a real spawn, so the same 30 s
+	// budget as the other real-child tests applies.
+	async function startSweepChild(
+		root: string,
+		project: string,
+		cardId: string,
+	) {
+		const cwd = join(root, project, ".worktrees", cardId);
+		mkdirSync(cwd, { recursive: true });
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				"setInterval(() => {}, 1000); setTimeout(() => process.exit(0), 60000);",
+			],
+			{ cwd, detached: true, stdio: "ignore" },
+		);
+		child.unref();
+		// The child's /proc/<pid>/cwd entry appears only once it has execed; under
+		// machine load that can take seconds.
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			try {
+				readlinkSync(`/proc/${child.pid}/cwd`);
+				return child;
+			} catch {
+				if (Date.now() > deadline)
+					throw new Error(`child ${child.pid} never showed a cwd`);
+				await Bun.sleep(100);
+			}
+		}
+	}
+
+	async function awaitExit(child: ChildProcess): Promise<void> {
+		await Promise.race([
+			new Promise<void>((resolve) => child.once("exit", () => resolve())),
+			Bun.sleep(10_000),
+		]);
+	}
+
+	test("sweeps a process whose worktree was deleted", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-"));
+		let child: ChildProcess | undefined;
+		try {
+			child = await startSweepChild(root, "proj", "T1");
+			rmSync(root, { recursive: true, force: true });
+			// The kernel only marks the link "(deleted)" once the dir is gone; the unlink
+			// is async, so poll instead of asserting immediately.
+			const deadline = Date.now() + 20_000;
+			for (;;) {
+				const link = readlinkSync(`/proc/${child.pid}/cwd`);
+				if (link.endsWith(" (deleted)")) break;
+				if (Date.now() > deadline)
+					throw new Error(`cwd never turned deleted: ${link}`);
+				await Bun.sleep(100);
+			}
+			const server = start({
+				token: "t",
+				sweepRoots: [root],
+				sweepGraceMs: 100,
+			});
+			const res = await fetch(`${server}/sweep`, {
+				method: "POST",
+				headers: { "x-otwr-token": "t" },
+			});
+			expect(res.status).toBe(200);
+			const stopped = (await res.json()) as {
+				pid: number;
+				project: string;
+				cardId: string;
+				command: string;
+			}[];
+			expect(stopped).toEqual([
+				{
+					pid: child.pid!,
+					project: "proj",
+					cardId: "T1",
+					command: expect.stringContaining("bun"),
+				},
+			]);
+			await awaitExit(child);
+		} finally {
+			if (child && child.exitCode === null && child.signalCode === null)
+				child.kill();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("leaves a process with a live worktree alone", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-live-"));
+		let child: ChildProcess | undefined;
+		try {
+			child = await startSweepChild(root, "proj", "T2");
+			const server = start({
+				token: "t",
+				sweepRoots: [root],
+				sweepGraceMs: 100,
+			});
+			const res = await fetch(`${server}/sweep`, {
+				method: "POST",
+				headers: { "x-otwr-token": "t" },
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual([]);
+			// Still alive: a live worktree must never be swept.
+			process.kill(child.pid!, 0);
+		} finally {
+			if (child && child.exitCode === null && child.signalCode === null)
+				child.kill();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("rejects a request without the token", async () => {
+		const server = start({ token: "t" });
+		const res = await fetch(`${server}/sweep`, { method: "POST" });
+		expect(res.status).toBe(401);
+		expect(await res.text()).toBe("unauthorized");
+	});
+});
+
+describe("matchSweepTarget", () => {
+	const roots = ["/workspace/ottr", "/workspace/other"];
+
+	test("a live link without the deleted suffix does not match", () => {
+		expect(matchSweepTarget("/workspace/ottr/.worktrees/T1", roots)).toBeNull();
+	});
+
+	test("a path outside every root does not match", () => {
+		expect(
+			matchSweepTarget("/tmp/x/.worktrees/T1 (deleted)", roots),
+		).toBeNull();
+	});
+
+	test("a link ending at .worktrees with no card segment does not match", () => {
+		expect(
+			matchSweepTarget("/workspace/ottr/.worktrees (deleted)", roots),
+		).toBeNull();
+	});
+
+	test("a deeper path keeps the .worktrees child segment as the card id", () => {
+		expect(
+			matchSweepTarget(
+				"/workspace/ottr/proj/.worktrees/T3/sub (deleted)",
+				roots,
+			),
+		).toEqual({ project: "proj", cardId: "T3" });
+	});
+
+	test("the root boundary is exact per segment", () => {
+		expect(
+			matchSweepTarget("/workspace/ottr2/proj/.worktrees/T4 (deleted)", roots),
+		).toBeNull();
+	});
+
+	test("the second root matches too", () => {
+		expect(
+			matchSweepTarget("/workspace/other/proj/.worktrees/T5 (deleted)", roots),
+		).toEqual({ project: "proj", cardId: "T5" });
+	});
 });

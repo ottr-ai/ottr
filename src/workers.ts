@@ -1,5 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import {
+	existsSync,
+	readdirSync,
+	readFileSync,
+	readlinkSync,
+	statSync,
+} from "node:fs";
 import { isAbsolute } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
 import { platform } from "./platform/index.ts";
@@ -44,6 +50,10 @@ export function serveWorker(opts: {
 	ensureTools?: typeof ensureProjectTools;
 	/** Only for tests: replaces the link dir prepended to the child's PATH. */
 	buildPath?: typeof buildToolsPath;
+	/** Only for tests: roots the /sweep scan instead of /workspace. */
+	sweepRoots?: readonly string[];
+	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
+	sweepGraceMs?: number;
 }): Bun.Server<never> {
 	return Bun.serve({
 		port: opts.port ?? 8787,
@@ -54,6 +64,24 @@ export function serveWorker(opts: {
 			const url = new URL(request.url);
 			if (request.method === "GET" && url.pathname === "/healthz")
 				return new Response("ok");
+			if (request.method === "POST" && url.pathname === "/sweep") {
+				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
+					return new Response("unauthorized", { status: 401 });
+				try {
+					const stopped = await sweepLeftovers({
+						roots: opts.sweepRoots,
+						graceMs: opts.sweepGraceMs,
+					});
+					return Response.json(stopped);
+				} catch (err) {
+					return new Response(
+						err instanceof Error ? err.message : String(err),
+						{
+							status: 500,
+						},
+					);
+				}
+			}
 			if (request.method !== "POST" || url.pathname !== "/run")
 				return new Response("not found", { status: 404 });
 			if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
@@ -358,4 +386,124 @@ export function runWorker(
 			);
 		},
 	};
+}
+
+export interface SweptProcess {
+	pid: number;
+	/** Full argv joined with single spaces, "" when unreadable. */
+	command: string;
+	/** Path segment between the root and .worktrees. */
+	project: string;
+	/** Path segment right after .worktrees. */
+	cardId: string;
+}
+
+/**
+ * Classifies a /proc/<pid>/cwd readlink result against the sweep roots. A deleted
+ * worktree leaves the link pointing at "<root>/<project>/.worktrees/<cardId>... (deleted)";
+ * only that exact suffix counts, so a still-present worktree never matches.
+ */
+export function matchSweepTarget(
+	cwdLink: string,
+	roots: readonly string[],
+): { project: string; cardId: string } | null {
+	const suffix = " (deleted)";
+	if (!cwdLink.endsWith(suffix)) return null;
+	const p = cwdLink.slice(0, -suffix.length);
+	for (const root of roots) {
+		if (p !== root && !p.startsWith(`${root}/`)) continue;
+		const segments = p.slice(root.length + 1).split("/");
+		const wt = segments.indexOf(".worktrees");
+		if (wt <= 0 || wt + 1 >= segments.length) continue;
+		const project = segments.slice(0, wt).join("/");
+		const cardId = segments[wt + 1]!;
+		if (project === "" || cardId === "") continue;
+		return { project, cardId };
+	}
+	return null;
+}
+
+/**
+ * Kills processes whose cwd is a deleted worktree under the roots (leftover dev
+ * servers from a finished card). SIGTERM first, then SIGKILL after the grace
+ * period for anything still alive. Throws when /proc itself is unreadable.
+ */
+export async function sweepLeftovers(opts?: {
+	roots?: readonly string[];
+	graceMs?: number;
+}): Promise<SweptProcess[]> {
+	const roots = opts?.roots ?? ["/workspace"];
+	const graceMs = opts?.graceMs ?? 1000;
+	const targets: SweptProcess[] = [];
+	for (const name of readdirSync("/proc")) {
+		const pid = Number(name);
+		if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+		let cwdLink: string;
+		try {
+			cwdLink = readlinkSync(`/proc/${pid}/cwd`);
+		} catch {
+			continue; // exited, zombie, or permission denied
+		}
+		const match = matchSweepTarget(cwdLink, roots);
+		if (!match) continue;
+		let command = "";
+		try {
+			command = readFileSync(`/proc/${pid}/cmdline`, "utf8")
+				.split("\0")
+				.filter((seg) => seg !== "")
+				.join(" ");
+		} catch {}
+		targets.push({ pid, command, ...match });
+	}
+	const stopped: SweptProcess[] = [];
+	for (const target of targets) {
+		try {
+			process.kill(target.pid, "SIGTERM");
+		} catch {
+			continue; // ESRCH: already gone
+		}
+		stopped.push(target);
+	}
+	if (stopped.length > 0) await Bun.sleep(graceMs);
+	for (const target of stopped) {
+		try {
+			// Signal 0: existence probe. ESRCH here means the process took the TERM.
+			process.kill(target.pid, 0);
+			process.kill(target.pid, "SIGKILL");
+		} catch {
+			// already exited between the check and the kill
+		}
+	}
+	return stopped;
+}
+
+/** POST /sweep to a worker: kills the processes whose worktree is gone on that host. */
+export async function sweepWorker(
+	target: WorkerTarget,
+	url: string,
+): Promise<SweptProcess[]> {
+	let res: Response;
+	try {
+		res = await fetch(`${url}/sweep`, {
+			method: "POST",
+			headers: {
+				...(target.token ? { "x-otwr-token": target.token } : {}),
+			},
+			// redirect: "manual": the worker token must never follow a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(10_000),
+		});
+	} catch (err) {
+		throw new WorkerConnectError(String(err));
+	}
+	if (res.status !== 200) {
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url}/sweep responded ${res.status}${body ? `: ${body}` : ""}`,
+		);
+	}
+	const stopped = (await res.json()) as unknown;
+	if (!Array.isArray(stopped))
+		throw new WorkerConnectError(`worker ${url}/sweep sent a non-array body`);
+	return stopped as SweptProcess[];
 }

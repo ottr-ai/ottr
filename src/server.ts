@@ -46,6 +46,7 @@ import {
 	type TurnLoop,
 } from "./turn.ts";
 import type { LatestImage } from "./types.ts";
+import { sweepWorker as sweepWorkerRequest } from "./workers.ts";
 import {
 	archReviewDelta,
 	archReviewDue,
@@ -385,6 +386,7 @@ const board = {
 // tools.json, R5-1; homedir() for apt.txt); the dev board pins a fixture so demo names stay
 // off the real home.
 const workersHome = process.env.OTTR_WORKERS_HOME;
+const workerTarget = workerFromEnv();
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
 const loop = createTurnLoop(projects, {
@@ -426,7 +428,7 @@ const loop = createTurnLoop(projects, {
 	pidAlive,
 	// OTTR_WORKER_URLS selects worker dispatch for work turns; unset (the default) and any
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).
-	workerTarget: workerFromEnv(),
+	workerTarget,
 	startRun,
 	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
@@ -491,23 +493,29 @@ loop.schedule();
 setInterval(loop.schedule, 5000);
 
 // Supervisor: retries locked-worktree removal after done/cancel and watches CI for merge pushes.
-const supervisor = createSupervisor(projects, {
-	appendLog,
-	schedule: loop.schedule,
-	now: Date.now,
-	removeWorktree,
-	unsavedWork,
-	statusRows,
-	gh: runGh,
-	commitsAhead,
-	isClean,
-	isIntegrated,
-	worktreeHusk,
-	worktreeLinked,
-	branchMergedOrGone,
-	quarantineUntracked,
-	targetCommits,
-});
+const supervisor = createSupervisor(
+	projects,
+	{
+		appendLog,
+		schedule: loop.schedule,
+		now: Date.now,
+		sweepWorker: (url, token) =>
+			sweepWorkerRequest({ urls: [url], token }, url),
+		removeWorktree,
+		unsavedWork,
+		statusRows,
+		gh: runGh,
+		commitsAhead,
+		isClean,
+		isIntegrated,
+		worktreeHusk,
+		worktreeLinked,
+		branchMergedOrGone,
+		quarantineUntracked,
+		targetCommits,
+	},
+	workerTarget,
+);
 setInterval(() => void supervisor.tick(), 60_000);
 
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
