@@ -37,6 +37,7 @@ const {
 	setupHints,
 	reportHtml,
 	Drawer,
+	openCardInProject,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, windowGone } = await import(
 	"./kit.tsx"
@@ -1371,6 +1372,22 @@ describe("Drawer cross-project lineage", () => {
 		expect(html).not.toContain("drawer-lineage");
 		expect(html).not.toContain("lineage-branch");
 	});
+});
+
+test("openCardInProject switches the board by hash, then opens the card", () => {
+	const realLocation = globalThis.location;
+	const stub = { hash: "" };
+	const opened: string[] = [];
+	globalThis.location = stub as unknown as Location;
+	try {
+		openCardInProject({ project: "agent-data", id: "AGEN-30" }, (id) => {
+			opened.push(id);
+		});
+	} finally {
+		globalThis.location = realLocation;
+	}
+	expect(stub.hash).toBe("agent-data");
+	expect(opened).toEqual(["AGEN-30"]);
 });
 
 describe("Drawer prompt markdown", () => {

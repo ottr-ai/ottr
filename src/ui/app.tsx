@@ -6154,6 +6154,60 @@ export function reportHtml(title: string, body: string): string {
 	].join("\n");
 }
 
+/** In-app navigation to a card on another project's board: switch the board with the
+ * same hash navigation the project tabs use, then open the card. No card URL scheme
+ * lives here — OTTR-405 gives the drawer's card links their path URLs in one place. */
+export function openCardInProject(
+	card: Pick<TaskCard, "project" | "id">,
+	openTask: (id: string) => void,
+): void {
+	location.hash = encodeURIComponent(card.project);
+	openTask(card.id);
+}
+
+/** One card link in the drawer's lineage rail: the one place a drawer renders a link
+ * to another card (the parent above, the follow-ups below), so an href change lands
+ * on every row at once. A link always carries the card's project and id; a link to
+ * another project first switches the board to that project, then opens the card. */
+function LineageCardLink({
+	card,
+	selfProject,
+	tag,
+	state,
+	onOpenTask,
+}: {
+	card: TaskCard;
+	selfProject: string;
+	/** Row label after the title: "parent", or empty on a follow-up row. */
+	tag: string;
+	/** Live state of a follow-up row, rendered after the tags. */
+	state?: ReactNode;
+	onOpenTask: (id: string) => void;
+}) {
+	return (
+		<button
+			type="button"
+			className="lineage-row"
+			title={card.sessionTitle ?? card.title}
+			onClick={() =>
+				card.project === selfProject
+					? onOpenTask(card.id)
+					: openCardInProject(card, onOpenTask)
+			}
+		>
+			<span className="lineage-key">{card.id}</span>
+			<span className="lineage-title">{card.sessionTitle ?? card.title}</span>
+			<span className="lineage-end">
+				{card.project !== selfProject && (
+					<span className="lineage-tag">{card.project}</span>
+				)}
+				{tag !== "" && <span className="lineage-tag">{tag}</span>}
+				{state}
+			</span>
+		</button>
+	);
+}
+
 export function Drawer({
 	open = true,
 	task: row,
@@ -6666,25 +6720,12 @@ export function Drawer({
 										</li>
 									) : (
 										<li>
-											<button
-												type="button"
-												className="lineage-row"
-												title={parent.sessionTitle ?? parent.title}
-												onClick={() => onOpenTask(parent.id)}
-											>
-												<span className="lineage-key">{parent.id}</span>
-												<span className="lineage-title">
-													{parent.sessionTitle ?? parent.title}
-												</span>
-												<span className="lineage-end">
-													{parent.project !== row.project && (
-														<span className="lineage-tag">
-															{parent.project}
-														</span>
-													)}
-													<span className="lineage-tag">parent</span>
-												</span>
-											</button>
+											<LineageCardLink
+												card={parent}
+												selfProject={row.project}
+												tag="parent"
+												onOpenTask={onOpenTask}
+											/>
 										</li>
 									))}
 								<li className="lineage-self" aria-current="true">
@@ -6699,20 +6740,12 @@ export function Drawer({
 										<ol className="lineage-branch" aria-label="Follow-ups">
 											{kids.map((k) => (
 												<li key={k.id}>
-													<button
-														type="button"
-														className="lineage-row"
-														title={k.sessionTitle ?? k.title}
-														onClick={() => onOpenTask(k.id)}
-													>
-														<span className="lineage-key">{k.id}</span>
-														<span className="lineage-title">
-															{k.sessionTitle ?? k.title}
-														</span>
-														<span className="lineage-end">
-															{k.project !== row.project && (
-																<span className="lineage-tag">{k.project}</span>
-															)}
+													<LineageCardLink
+														card={k}
+														selfProject={row.project}
+														tag=""
+														onOpenTask={onOpenTask}
+														state={
 															<span
 																className={
 																	k.state === "needs_you"
@@ -6732,8 +6765,8 @@ export function Drawer({
 																	draining,
 																)}
 															</span>
-														</span>
-													</button>
+														}
+													/>
 												</li>
 											))}
 										</ol>
