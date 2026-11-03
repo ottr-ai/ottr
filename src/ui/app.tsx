@@ -70,6 +70,7 @@ import {
 	BusyButton,
 	CloseButton,
 	clamp,
+	confirmDialog,
 	copyText,
 	Icon,
 	interviewMsg,
@@ -888,7 +889,7 @@ function SystemBar({
 					<span className="sb-lbl sb-hide-phone">Quota</span>
 					{quotaPct !== null && (
 						<span
-							className="sb-twin sb-hide-phone"
+							className="sb-twin"
 							data-level={quotaLevel}
 							aria-hidden="true"
 						>
@@ -1329,10 +1330,11 @@ function HowItWorksModal({
 					<button
 						type="button"
 						className="ghost"
-						onClick={() =>
-							window.confirm(
+						onClick={async () =>
+							(await confirmDialog(
 								"Create/update diagrams? This creates a task that writes docs/how-it-works.md with Mermaid diagrams.",
-							) &&
+								{ ok: "Create task" },
+							)) &&
 							act(async () => {
 								const t = await post<TaskView>(
 									`/api/projects/${encodeURIComponent(project)}/tasks`,
@@ -2500,11 +2502,12 @@ function ProjectBoard({
 	const [showReview, setShowReview] = useState(false);
 	// A stalled release card's action: cancel the release, then open Create release so the user
 	// re-releases with the same version; the held merges then wait for the new release's review.
-	const rerelease = (t: TaskCard): void => {
+	const rerelease = async (t: TaskCard): Promise<void> => {
 		if (
-			!window.confirm(
+			!(await confirmDialog(
 				`Cancel release ${t.releaseVersion ?? ""} and open Create release? The held merges then wait for the new release's review.`,
-			)
+				{ ok: "Cancel release", danger: true },
+			))
 		)
 			return;
 		void act(async () => {
@@ -2513,9 +2516,10 @@ function ProjectBoard({
 			// The server kept unmerged work and wants a second yes; a release card normally keeps nothing.
 			if (r.kept !== undefined) {
 				if (
-					!window.confirm(
-						`The worktree was kept: ${r.kept}.\n\nDelete the worktree and its branch anyway?`,
-					)
+					!(await confirmDialog(
+						`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+						{ ok: "Delete", danger: true },
+					))
 				)
 					return;
 				await post(url, { force: true });
@@ -2665,10 +2669,11 @@ function ProjectBoard({
 								type="button"
 								className="ghost"
 								aria-label="Align rules"
-								onClick={() =>
-									window.confirm(
+								onClick={async () =>
+									(await confirmDialog(
 										"Align rules? This creates a task that fixes AGENTS.md rules that contradict the tracker's pipeline.",
-									) && interview("/interview", { fix: true })
+										{ ok: "Create task" },
+									)) && interview("/interview", { fix: true })
 								}
 								title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
 							>
@@ -4971,6 +4976,9 @@ function AddProjectModal({
 	// gh facts for the New tab's hints: auth state, login, projects root, name check.
 	const [gh, setGh] = useState<GhStatus | null>(null);
 	const [free, setFree] = useState<boolean | null>(null);
+	// A checked repo box needs a signed-in Git host; Add waits until one is (or the box clears).
+	// A failed probe (gh null) blocks nothing: the server still answers at submit.
+	const noGitHost = mode === "new" && ghRepo && gh?.authed === false;
 	// One probe per dialog open; a failed probe leaves the hints out, the form still works.
 	useEffect(() => {
 		let alive = true;
@@ -5160,7 +5168,7 @@ function AddProjectModal({
 								onClick={() => setMode("new")}
 								onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
 							>
-								<Icon name="branch" />
+								<Icon name="plus" />
 								New
 							</button>
 						</div>
@@ -5292,22 +5300,34 @@ function AddProjectModal({
 									checked={ghRepo}
 									onChange={(e) => setGhRepo(e.target.checked)}
 								/>
-								Create a private GitHub repo and push (needs gh auth)
+								Create a private repo on {gh?.host ?? "the configured Git host"}{" "}
+								and push
 							</label>
 							{ghRepo &&
 								(gh === null ? null : gh.authed ? (
 									<p className="hint">
 										Repo will be created under {gh.user}.
 										{free === false
-											? " That name is already taken on GitHub."
+											? ` That name is already taken on ${gh.host}.`
 											: free === true
-												? " The name is free on GitHub."
+												? ` The name is free on ${gh.host}.`
 												: ""}
 									</p>
 								) : (
-									<p className="auth-error" role="status">
-										gh is not authenticated on the server: run gh auth login
-										there, or uncheck the box for a local repo only.
+									<p className="hint trust-warn" role="status">
+										No Git host is signed in, so Ottr cannot create the repo.
+										Add a token in Settings → Git hosts, or uncheck the box for
+										a local repo only.{" "}
+										<button
+											type="button"
+											className="notif-link"
+											onClick={() => {
+												onClose();
+												openSettingsSection("github-token-block");
+											}}
+										>
+											Open Settings
+										</button>
 									</p>
 								))}
 							{!ghRepo && gh !== null && (
@@ -5350,13 +5370,17 @@ function AddProjectModal({
 						<div className="dialog-actions">
 							<button
 								type="submit"
-								disabled={add.busy || (mode === "url" && ssh && !sshTested)}
+								disabled={
+									add.busy || (mode === "url" && ssh && !sshTested) || noGitHost
+								}
 								className={`primary${add.failed ? " failed" : ""}`}
 								aria-busy={add.busy || undefined}
 								title={
 									mode === "url" && ssh && !sshTested
 										? "Run the SSH test first"
-										: undefined
+										: noGitHost
+											? "Sign in to a Git host in Settings, or uncheck the repo box"
+											: undefined
 								}
 							>
 								{add.busy && <span className="spinner" aria-hidden="true" />}
@@ -5660,10 +5684,11 @@ function KeptFilesPanel({
 			<div className="kept-actions">
 				<BusyButton
 					className="primary"
-					run={() =>
-						window.confirm(
+					run={async () =>
+						(await confirmDialog(
 							`Finish and discard the worktree?\n\nApplies the choices above, then deletes:\n${task.worktree ?? "the worktree"}${task.branch !== null ? `\nbranch ${task.branch}` : ""}\n\nMoved files are copied to the main checkout first; ignored files are added to .git/info/exclude; deleted files are lost.`,
-						)
+							{ ok: "Finish and discard", danger: true },
+						))
 							? act(async () => {
 									await post(
 										`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/finish-kept`,
@@ -7323,8 +7348,11 @@ export function Drawer({
 													<BusyButton
 														className="ghost"
 														ariaLabel="Cancel the queued steering"
-														run={() =>
-															window.confirm("Discard the queued steering?")
+														run={async () =>
+															(await confirmDialog(
+																"Discard the queued steering?",
+																{ ok: "Discard", danger: true },
+															))
 																? cancelSteer()
 																: Promise.resolve(true)
 														}
@@ -7504,10 +7532,11 @@ export function Drawer({
 											{!proposal && (
 												<BusyButton
 													title="Start a fresh omp session in the same worktree; the broken one is abandoned (its files stay in .tasks/sessions)"
-													run={() =>
-														window.confirm(
+													run={async () =>
+														(await confirmDialog(
 															"Start a fresh omp session for this task? The broken session is abandoned (its transcript stays in .tasks/sessions).",
-														)
+															{ ok: "Start fresh session" },
+														))
 															? act(async () => {
 																	await post(
 																		`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/restart-session`,
@@ -7617,10 +7646,15 @@ export function Drawer({
 										{task.state === "running" && (
 											<BusyButton
 												title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
-												run={() =>
-													window.confirm(
+												run={async () =>
+													(await confirmDialog(
 														"Stop this turn? The card waits for your reply.",
-													) && window.confirm("Really stop the running turn?")
+														{ ok: "Stop turn" },
+													)) &&
+													(await confirmDialog(
+														"Really stop the running turn?",
+														{ ok: "Stop turn", danger: true },
+													))
 														? act(async () => {
 																await post(
 																	`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/stop`,
@@ -7717,13 +7751,17 @@ export function Drawer({
 						{!cancelled && (
 							<BusyButton
 								className="danger"
-								run={() =>
+								run={async () =>
 									(
 										task.stage === "done"
 											? // A done task has no run, worktree or branch left; this only removes the card from the board.
-												window.confirm("Delete this done task from the board?")
-											: window.confirm(
+												await confirmDialog(
+													"Delete this done task from the board?",
+													{ ok: "Delete task", danger: true },
+												)
+											: await confirmDialog(
 													"Cancel this task? It stops the run and deletes its worktree and branch.",
+													{ ok: "Cancel task", danger: true },
 												)
 									)
 										? act(async () => {
@@ -7732,9 +7770,10 @@ export function Drawer({
 												// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
 												if (r.kept !== undefined) {
 													if (
-														!window.confirm(
-															`The worktree was kept: ${r.kept}.\n\nDelete the worktree and its branch anyway?`,
-														)
+														!(await confirmDialog(
+															`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+															{ ok: "Delete", danger: true },
+														))
 													)
 														return;
 													await post(url, { force: true });
@@ -9198,10 +9237,11 @@ function App() {
 						className="icon"
 						title="Check the board with the check-ottr-board skill (dev tool)"
 						aria-label="Check the board"
-						onClick={() =>
-							window.confirm(
+						onClick={async () =>
+							(await confirmDialog(
 								"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
-							) &&
+								{ ok: "Create task" },
+							)) &&
 							void act(async () => {
 								const card = await post<{ id: string }>(
 									`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
@@ -9319,9 +9359,10 @@ function App() {
 						</div>
 					)}
 				</div>
+				{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
 				<button
 					type="button"
-					className="icon"
+					className="icon bar-theme"
 					popoverTarget="theme-pop"
 					title="Theme"
 					aria-label="Theme"
@@ -9355,19 +9396,16 @@ function App() {
 						</button>
 					))}
 				</div>
-				{state?.user != null && (
-					<button
-						type="button"
-						className="icon bar-logout"
-						title={`Log out ${state.user}`}
-						aria-label={`Log out ${state.user}`}
-						// act surfaces a failed POST as an error and leaves the button usable;
-						// only a confirmed logout sets the gate flag and reloads.
-						onClick={() => void act(logOut)}
-					>
-						<Icon name="log-out" />
-					</button>
-				)}
+				{/* Phones have no rail: the bar's account chip opens the same account menu. */}
+				<button
+					type="button"
+					className="icon bar-user"
+					popoverTarget="user-menu"
+					title="Account"
+					aria-label={`Account menu, ${state?.user ?? "operator"}`}
+				>
+					<Icon name="user" />
+				</button>
 			</header>
 
 			<div
@@ -9487,38 +9525,56 @@ function App() {
 							</span>
 						</button>
 					</footer>
-					<div id="user-menu" popover="auto" className="user-menu">
-						<p className="menu-who">
-							{state?.user == null
-								? "Local access, no login"
-								: `Signed in as ${state.user}`}
-						</p>
-						<a
-							className="menu-row"
-							href={`#${SETTINGS_HASH}`}
-							onClick={() =>
-								document.getElementById("user-menu")?.hidePopover()
-							}
-						>
-							<Icon name="gear" size={14} />
-							Settings
-						</a>
-						{state?.user != null && (
-							<>
-								<hr />
-								<button
-									type="button"
-									className="menu-row"
-									// act surfaces a failed POST as an error; only a confirmed logout reloads.
-									onClick={() => void act(logOut)}
-								>
-									<Icon name="log-out" size={14} />
-									Log out
-								</button>
-							</>
-						)}
-					</div>
 				</nav>
+				<div id="user-menu" popover="auto" className="user-menu">
+					<p className="menu-who">
+						{state?.user == null
+							? "Local access, no login"
+							: `Signed in as ${state.user}`}
+					</p>
+					<a
+						className="menu-row"
+						href={`#${SETTINGS_HASH}`}
+						onClick={() => document.getElementById("user-menu")?.hidePopover()}
+					>
+						<Icon name="gear" size={14} />
+						Settings
+					</a>
+					{/* Phones only: the bar has no room for the theme button there. */}
+					<fieldset className="menu-theme">
+						<legend className="sr">Theme</legend>
+						<hr />
+						{THEME_ORDER.map((t) => (
+							<button
+								key={t}
+								type="button"
+								className="menu-row"
+								aria-pressed={theme === t}
+								onClick={() => setTheme(t)}
+							>
+								<Icon name={THEME_META[t].icon} size={14} />
+								{t === "system"
+									? `${THEME_META[t].label} (${THEME_META[sysLight ? "light" : "dark"].label})`
+									: THEME_META[t].label}
+								{theme === t && <Icon name="check" size={14} />}
+							</button>
+						))}
+					</fieldset>
+					{state?.user != null && (
+						<>
+							<hr />
+							<button
+								type="button"
+								className="menu-row"
+								// act surfaces a failed POST as an error; only a confirmed logout reloads.
+								onClick={() => void act(logOut)}
+							>
+								<Icon name="log-out" size={14} />
+								Log out
+							</button>
+						</>
+					)}
+				</div>
 
 				<main className="main">
 					{state === null ? (

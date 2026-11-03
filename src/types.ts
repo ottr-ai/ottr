@@ -837,6 +837,8 @@ export interface GhStatus {
 	free: boolean | null;
 	/** Server-side projects root; an unchecked box creates the local repo in here. */
 	dir: string;
+	/** The configured GitHub host (github.com or an Enterprise host) gh creates the repo on; null when the setting is invalid. */
+	host: string | null;
 }
 
 /** `vX.Y.Z`: the release tag format, shared by the server (validation) and the dialog (input check). */

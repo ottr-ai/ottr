@@ -3743,13 +3743,14 @@ export function createApp(deps: AppDeps) {
 						() => ({ code: -1, stdout: "", stderr: "" }),
 					);
 					const dir = resolve(deps.defaultDir);
+					const host = githubHostView();
 					if (u.code !== 0)
-						return json({ authed: false, user: null, free: null, dir });
+						return json({ authed: false, user: null, free: null, dir, host });
 					const user = u.stdout.trim();
 					// GitHub repo-name charset; anything else stays unchecked and waits for
 					// the submit-time validation instead of a misleading answer.
 					if (name === "" || /[^A-Za-z0-9_.-]/.test(name))
-						return json({ authed: true, user, free: null, dir });
+						return json({ authed: true, user, free: null, dir, host });
 					// Exit 0 = the repo exists (taken); gh's not-found line = free; anything
 					// else (network down, rate limit) stays unknown rather than guessed.
 					const v = await gh(["repo", "view", `${user}/${name}`], 15_000).catch(
@@ -3761,7 +3762,7 @@ export function createApp(deps: AppDeps) {
 							: /Could not resolve to a Repository/.test(v.stderr)
 								? true
 								: null;
-					return json({ authed: true, user, free, dir });
+					return json({ authed: true, user, free, dir, host });
 				}),
 		},
 		"/api/projects": {

@@ -150,10 +150,22 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
 - **Card** — 4px radius, `--card` stock, soft line; hover lifts to card-hover and the strong line; the whole card is the hit area for opening. A head line holds the state mark, the task key in quiet mono, and the chips. Below it, the name uses the full width of the card, flush with the excerpt and the meta line. needs-you cards take the amber border; landed (idle) cards recede to panel stock and weight-500 title.
 - **Dialogs and drawer** — native `<dialog>` in the top layer: field-grey surface, 1px line, 6px radius, overlay shadow, 60%-black backdrop, 160ms rise. The drawer slides from the right in 200ms.
 - **System popover** — Popover API panel anchored under the bar meters (CSS anchor positioning where supported), showing a key-value readout of the 15-minute CPU and RAM averages in tabular figures, and provider quota: one grid of meters (label, track, value, reset countdown) grouped by provider, so every track lines up. The bar carries only the tightest quota window — the one that stops agents first. The panel scrolls inside the viewport and spans the screen on phones.
+- **Settings** — the General page and each project page use one grammar.
+  - **Page:** topic groups (a small dim heading) hold the cards, 12px apart. The settings map in the sidebar shows the groups, their cards and the cards' sub-blocks as an indented tree.
+  - **Card:** a title, an optional state chip and one hint line. The chip is grey when off and steel when on. It is amber or red only for a state that needs action, and an icon can lead its label (a crossed-out bell for off). The card's content uses the full card width.
+  - **Rows:** each setting is a definition row: a 260px name column, and the value in the rest of the width. A 1px rule separates two rows. The last row has no rule, because the card edge closes the list.
+  - **Typed fields** (text, number, URL, password, textarea, select, file upload): the name carries a "?" help badge, and the explanation lives only in the badge popover. Under the name, show only a short mono format line, for example `empty = no cap` or `secret · stored, never shown`. That line can also carry live state, for example `· saved`. The row shows no other description.
+  - **On/off settings:** a checkbox row in the GitHub style. The box leads, the bold name is its label, and a one-line description shows below the name. This row has no "?" badge. An option that depends on the row above indents 24px under it, with no rule between the two rows.
+  - **Read-only facts** (a folder path, a linked repository): the name and a visible description. These rows have no badge.
+  - **Saving:** a card or block with typed fields has one Save button. With one typed field, Save sits on that field's line at the right, as on the Env rows. With two or more, Save sits below the rows at the right, in the card footer or in the form's action row. Save is a native submit of the card's form, so required and min/max checks run first. It is live only while that card has changes, and it sends only that card's fields. Checkboxes, uploads and other buttons save at once and show the save tick: a spinner after 250ms, then a grey check that draws itself and fades. A failed save shows "Not saved", and the checkbox returns to its old value. A settings page has no page-level Save.
+  - **Actions:** every card button sits at the right, in the card footer or in a right-aligned action row. Steel primary marks only the card's main action. Red (danger) marks only a destructive action, and that action always asks in the board's confirm dialog (`confirmDialog`), never in `window.confirm`.
+  - **Danger zone:** a red card border and a red button. The title keeps the normal heading colour, and the card has no state chip.
 
 **The Native-Platform Rule.** Modality uses the platform: `<dialog>` for focus, Esc, backdrop, and inertness; the Popover API for light-dismiss detail. No JS re-implements what the browser ships.
 
 **The Lit-Is-New Rule.** A fill on the bell means unacknowledged and nothing else. The inverted mark and the word "new" carry the state without colour.
+
+**The Settings-Row Rule.** A typed field explains itself in its "?" badge. A checkbox or a read-only fact explains itself in visible text. No setting does both. Buttons sit at the right, and only typed fields wait for a Save.
 
 **Motion.** Everything uses one easing, `cubic-bezier(0.2, 0.7, 0.3, 1)`. Durations: 120ms control feedback, 160ms dialogs, 200ms drawer, 220ms alarm-mark arrival and in-column card slides (FLIP), 340ms card flights between stages (FLIP via WAAPI), 400ms indicator ramps, 420ms mark traces when a card lands. Under `prefers-reduced-motion`, all animation collapses to 0.01ms except the spinner, which keeps turning at its normal 0.7s so progress feedback stays legible; the mark trace and the card slides do not run at all.
 
@@ -180,6 +192,7 @@ The board targets **WCAG 2.1 AA**, enforced through the design system itself, th
 - Do let landed work recede: recessed stock, lighter title weight, no celebration.
 - Do keep all motion on the shared easing, and respect the reduced-motion tiers.
 - Do keep WCAG 2.1 AA: contrast, visible focus, names on icon-only controls, announced status — the detector and `impeccable audit` check it.
+- Do build every new setting with the Settings rows (definition row, checkbox row, `SaveCard`) and the Settings-Row Rule.
 
 ### Don'ts
 

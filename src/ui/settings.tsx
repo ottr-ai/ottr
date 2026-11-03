@@ -21,9 +21,11 @@ import {
 	BusyButton,
 	CloseButton,
 	clamp,
+	confirmDialog,
 	copyText,
 	Help,
 	Icon,
+	type IconName,
 	interviewMsg,
 	logOut,
 	Mark,
@@ -490,47 +492,29 @@ export function SetupWizardModal({
 	);
 }
 
-/** The save-state contract next to a settings Save button: what happened, or what will. */
-function SaveStateChip({
+/** A card's one Save: a native submit of the card's form (so required and min/max checks run
+ *  first), live only while that form has unsaved changes; it shows "Saved" for a moment after. */
+function SaveButton({
+	form,
+	s,
 	dirty,
-	saving,
-	failed,
-	saved,
-	dirtyNote,
 }: {
+	form: string;
+	s: InstantSave;
 	dirty: boolean;
-	saving: boolean;
-	failed: boolean;
-	saved: boolean;
-	dirtyNote?: string;
 }) {
-	if (failed)
-		return (
-			<span className="save-chip failed" role="status">
-				Save failed — press Save
-			</span>
-		);
-	if (saving)
-		return (
-			<span className="save-chip saving" role="status">
-				<span className="spinner" aria-hidden="true" />
-				Saving…
-			</span>
-		);
-	if (saved)
-		return (
-			<span className="save-chip saved" role="status">
-				<Mark kind="done" />
-				Saved
-			</span>
-		);
-	if (dirty)
-		return (
-			<span className="save-chip dirty" role="status">
-				{dirtyNote ?? "Unsaved changes"}
-			</span>
-		);
-	return null;
+	return (
+		<button
+			type="submit"
+			form={form}
+			className={`settings-save${s.failed ? " failed" : ""}`}
+			disabled={s.busy || !dirty}
+			aria-busy={s.busy || undefined}
+		>
+			{s.busy && <span className="spinner" aria-hidden="true" />}
+			<SaveLabel saved={s.saved} />
+		</button>
+	);
 }
 
 function TotalRunnersForm({
@@ -547,43 +531,17 @@ function TotalRunnersForm({
 	act: Act;
 }) {
 	const [n, setN] = useState(maxTotal === null ? "" : String(maxTotal));
-	const [chk, setChk] = useState(reviewCheck);
-	const [wchk, setWchk] = useState(workCheck);
-	const [saved, flashSaved] = useFlash(1500);
-	const save = useBusy();
+	const s = useInstantSave(act);
+	const formId = useId();
 	const next =
 		n.trim() === "" ? null : clamp(Math.trunc(Number(n)), 1, Infinity);
 	// The cap counts as edited only when the input moved off the server value: an
 	// untouched input must not save its clamped form (a server cap below 1, e.g.
-	// OMP_TRACKER_MAX_TOTAL=0, would otherwise jump to 1 on a checkbox toggle).
-	// An empty input means "no cap"; it saves only when it moved off the server's.
+	// OMP_TRACKER_MAX_TOTAL=0, would otherwise jump to 1). An empty input means "no cap".
 	const capEdited = n !== (maxTotal === null ? "" : String(maxTotal));
-	const dirty =
-		(capEdited && next !== maxTotal) ||
-		chk !== reviewCheck ||
-		wchk !== workCheck;
-	const doSave = (): void =>
-		save.start(() =>
-			act(async () => {
-				// Send only what changed: an untouched cap must not overwrite the server's.
-				await post(
-					"/api/settings",
-					capEdited
-						? { maxTotal: next, reviewCheck: chk, workCheck: wchk }
-						: { reviewCheck: chk, workCheck: wchk },
-				);
-				flashSaved();
-			}),
-		);
-	// Scalars are safe to auto-save: the debounce only fires after the last
-	// keystroke, and the value is clamped before it goes out. Paths and secrets
-	// never auto-save (a half-typed value must not reach the server).
-	// biome-ignore lint/correctness/useExhaustiveDependencies: doSave closes over the current n and chk; these are the debounce key
-	useEffect(() => {
-		if (!dirty) return;
-		const t = setTimeout(doSave, 900);
-		return () => clearTimeout(t);
-	}, [n, maxTotal, chk, reviewCheck, wchk, workCheck]);
+	const dirty = capEdited && next !== maxTotal;
+	const send = (body: Record<string, unknown>): Promise<unknown> =>
+		post("/api/settings", body);
 	return (
 		<SettingsCard
 			id="runners-section"
@@ -598,49 +556,27 @@ function TotalRunnersForm({
 					? "No cap: agents start whenever projects need them."
 					: `At most ${maxTotal} agents run at once across all projects; configured slots beyond the cap wait.`
 			}
-			footer={
-				<>
-					<SaveStateChip
-						dirty={dirty}
-						saving={save.busy}
-						failed={save.failed}
-						saved={saved}
-						dirtyNote="Autosaves in a moment"
-					/>
-					<button
-						type="button"
-						className={`settings-save${save.failed ? " failed" : ""}`}
-						disabled={save.busy || !dirty}
-						onClick={() => {
-							void doSave();
-						}}
-					>
-						{save.busy && <span className="spinner" aria-hidden="true" />}
-						<SaveLabel saved={saved} />
-					</button>
-				</>
-			}
 		>
 			<form
-				className="settings-form"
+				id={formId}
+				className="alate-def-rows"
 				onSubmit={(e) => {
 					e.preventDefault();
-					void doSave();
+					if (dirty) s.run(() => send({ maxTotal: next }));
 				}}
 			>
-				<div className="alate-def-rows">
-					<div className="alate-def-row">
-						<div className="alate-def-name">
-							<b>
-								Runner cap
-								<Help
-									label="Runner cap"
-									text="The most agent turns that run at the same time on this board. Other tasks wait in Todo until a slot is free. Each project can also set its own cap."
-								/>
-							</b>
-							<span>How many agents may run at once, across all projects</span>
-							<code>empty = no cap · autosaves</code>
-						</div>
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>
+							Runner cap
+							<Help
+								label="Runner cap"
+								text="The most agent turns that run at the same time on this board. Other tasks wait in Todo until a slot is free. Each project can also set its own cap."
+							/>
+						</b>
+						<code>empty = no cap</code>
+					</div>
+					<div className="alate-def-actions">
 						<label>
 							<input
 								type="number"
@@ -650,54 +586,23 @@ function TotalRunnersForm({
 								aria-label="Runner cap across all projects (empty = no cap)"
 							/>
 						</label>
-					</div>
-					<div className="alate-def-row">
-						<div className="alate-def-name">
-							<b>
-								Review check
-								<Help
-									label="Review check"
-									text="A second model reads each finding of a review before Ottr files it as a card, so weak findings do not reach the board."
-								/>
-							</b>
-							<span>
-								Check a review's findings with a second model before they become
-								cards
-							</span>
-						</div>
-						<label>
-							<input
-								type="checkbox"
-								checked={chk}
-								onChange={(e) => setChk(e.target.checked)}
-								aria-label="Check a review's findings with a second model"
-							/>
-						</label>
-					</div>
-					<div className="alate-def-row">
-						<div className="alate-def-name">
-							<b>
-								Work check
-								<Help
-									label="Work check"
-									text="When a work turn reports ready, a second model without the turn's memory checks the result before the card enters the merge queue."
-								/>
-							</b>
-							<span>
-								Check a work card with a second model before it enters the merge
-								queue
-							</span>
-						</div>
-						<label>
-							<input
-								type="checkbox"
-								checked={wchk}
-								onChange={(e) => setWchk(e.target.checked)}
-								aria-label="Check a work card with a second model before it enters the merge queue"
-							/>
-						</label>
+						<SaveButton form={formId} s={s} dirty={dirty} />
 					</div>
 				</div>
+				<CheckRow
+					name="Review check"
+					desc="Check a review's findings with a second model before they become cards"
+					checked={reviewCheck}
+					save={(v) => send({ reviewCheck: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Work check"
+					desc="Check a work card with a second model before it enters the merge queue"
+					checked={workCheck}
+					save={(v) => send({ workCheck: v })}
+					act={act}
+				/>
 			</form>
 			{/* ponytail: configured slots is informational, so the meter stays grey even when over cap — the cap binds, it is not an alarm */}
 			<Meter
@@ -714,10 +619,11 @@ function TotalRunnersForm({
 	);
 }
 
-/** Settings "Push" section: one-button Web Push opt-in for closed-phone alerts. */
+/** Settings "Push notifications" section: Web Push opt-in for closed-phone alerts, plus a test. */
 function PushSection() {
 	const [enabled, setEnabled] = useState(false);
-	const [sent, setSent] = useState(false);
+	// "Test sent" is a short confirmation; the button reads "Test" again after it.
+	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
@@ -754,37 +660,94 @@ function PushSection() {
 				return false;
 			}
 		});
-	const test = (): void =>
+	// Turn off: the server drops this device first, so a failed call leaves push fully on;
+	// then the browser's own subscription goes.
+	const disable = (): void =>
 		busy.start(async () => {
 			setError(null);
-			setSent(false);
 			try {
-				await post("/api/push/test", {});
-				setSent(true);
+				const reg = await navigator.serviceWorker?.getRegistration();
+				const sub = await reg?.pushManager.getSubscription();
+				if (sub != null) {
+					await post("/api/push/unsubscribe", { endpoint: sub.endpoint });
+					await sub.unsubscribe();
+				}
+				setEnabled(false);
 				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
 				return false;
 			}
 		});
+	const test = (): void =>
+		busy.start(async () => {
+			setError(null);
+			try {
+				await post("/api/push/test", {});
+				flashSent();
+				return true;
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	// The spinner goes on the button that was pressed; off, only Turn on acts.
+	const [doing, setDoing] = useState<"on" | "off" | "test" | null>(null);
+	const run = (k: "on" | "off" | "test", fn: () => void) => (): void => {
+		setDoing(k);
+		fn();
+	};
+	const spin = (k: "on" | "off" | "test", icon: IconName) =>
+		busy.busy && doing === k ? (
+			<span className="spinner" aria-hidden="true" />
+		) : (
+			<Icon name={icon} />
+		);
 	return (
 		<SettingsCard
 			id="push-section"
-			title="Push"
-			help="Sends a phone notification when a card needs you, also when the board is closed. Turn it on in each browser or phone. It needs HTTPS."
+			title="Push notifications"
 			status={
-				enabled ? { label: "On", tone: "ok" } : { label: "Off", tone: "off" }
+				enabled
+					? { label: "On", tone: "ok", icon: "bell" }
+					: { label: "Off", tone: "off", icon: "bell-off" }
 			}
-			hint="Get a phone notification when a task needs you, even when the app is closed. Works over HTTPS (e.g. tailscale serve)."
+			hint="A phone notification when a task needs you, also while the app is closed. Needs HTTPS, for example tailscale serve."
+			footer={
+				<>
+					<button
+						type="button"
+						className="ghost"
+						onClick={run("test", test)}
+						disabled={busy.busy || !enabled}
+						title={enabled ? undefined : "Turn on push notifications first"}
+					>
+						{spin("test", sent ? "check" : "send")}
+						{sent ? "Test sent" : "Test"}
+					</button>
+					{enabled ? (
+						<button
+							type="button"
+							onClick={run("off", disable)}
+							disabled={busy.busy}
+						>
+							{spin("off", "bell-off")}
+							Turn off
+						</button>
+					) : (
+						<button
+							type="button"
+							className="primary"
+							onClick={run("on", enable)}
+							disabled={busy.busy}
+						>
+							{spin("on", "bell")}
+							Turn on
+						</button>
+					)}
+				</>
+			}
 		>
-			<button type="button" onClick={enable} disabled={busy.busy || enabled}>
-				{busy.busy && <span className="spinner" aria-hidden="true" />}
-				{enabled ? "Push enabled" : "Enable push notifications"}
-			</button>{" "}
-			<button type="button" onClick={test} disabled={busy.busy}>
-				{busy.busy && <span className="spinner" aria-hidden="true" />}
-				{sent ? "Test push sent" : "Send test push"}
-			</button>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -847,11 +810,12 @@ function ApiKeySection() {
 			}
 		});
 	};
-	const regenerate = (): void => {
+	const regenerate = async (): Promise<void> => {
 		if (
-			!window.confirm(
+			!(await confirmDialog(
 				"Regenerate the API key? Integrations using the old key stop working.",
-			)
+				{ ok: "Regenerate", danger: true },
+			))
 		)
 			return;
 		setError(null);
@@ -872,7 +836,6 @@ function ApiKeySection() {
 		<SettingsCard
 			id="api-key-section"
 			title="API key"
-			help="Lets scripts and integrations call the board's API without a login. If the key leaks, regenerate it. Integrations with the old key then stop working."
 			hint="A public host or a board in Docker needs this API key or your login session. Direct local access needs neither."
 		>
 			<div className="access-row">
@@ -936,8 +899,8 @@ type SessionEntry = {
 	current: boolean;
 };
 
-/** Settings "Session" section: the list of logins, per-row logout, and
- *  "Sign out everywhere", which rotates the session secret and revokes all. */
+/** Settings "Session" section: the list of logins, per-row logout, and the footer's
+ *  "Log out all sessions", which rotates the session secret and revokes all. */
 export function SessionSection() {
 	const busy = useBusy();
 	const revokeBusy = useBusy();
@@ -955,8 +918,14 @@ export function SessionSection() {
 	useEffect(() => {
 		load().catch(() => setLoadFailed(true));
 	}, [load]);
-	const revoke = (entry: SessionEntry): void => {
-		if (!window.confirm(`Log out ${entry.label}?`)) return;
+	const revoke = async (entry: SessionEntry): Promise<void> => {
+		if (
+			!(await confirmDialog(`Log out ${entry.label}?`, {
+				ok: "Log out",
+				danger: true,
+			}))
+		)
+			return;
 		setRevokingId(entry.id);
 		revokeBusy.start(async () => {
 			try {
@@ -977,11 +946,12 @@ export function SessionSection() {
 			}
 		});
 	};
-	const signOutEverywhere = (): void => {
+	const logOutAll = async (): Promise<void> => {
 		if (
-			!window.confirm(
-				"Sign out everywhere? Every browser, including this one, must log in again.",
-			)
+			!(await confirmDialog(
+				"Log out all sessions? Every browser, including this one, must log in again.",
+				{ ok: "Log out all", danger: true },
+			))
 		)
 			return;
 		busy.start(async () => {
@@ -999,8 +969,23 @@ export function SessionSection() {
 		<SettingsCard
 			id="session-section"
 			title="Session"
-			help="Sign out everywhere ends every login session on every device. Use it when you lose a device or a session cookie leaks."
-			hint="Logout in the top bar signs out only this browser. If a device is lost or a cookie escaped, sign out everywhere: every login session is revoked."
+			hint="Log out in the account menu signs out only this browser. If a device is lost or a cookie escaped, log out all sessions: every login session is revoked."
+			footer={
+				<button
+					type="button"
+					className="danger"
+					onClick={logOutAll}
+					disabled={busy.busy}
+					aria-busy={busy.busy || undefined}
+				>
+					{busy.busy ? (
+						<span className="spinner" aria-hidden="true" />
+					) : (
+						<Icon name="log-out" />
+					)}
+					Log out all sessions
+				</button>
+			}
 		>
 			{loadFailed ? (
 				<p className="session-failed">Sessions could not be loaded.</p>
@@ -1024,7 +1009,7 @@ export function SessionSection() {
 								className="icon danger"
 								aria-label={`Log out ${entry.label}`}
 								title={`Log out ${entry.label}`}
-								onClick={() => revoke(entry)}
+								onClick={() => void revoke(entry)}
 								disabled={revokeBusy.busy}
 							>
 								{revokingId === entry.id ? (
@@ -1037,22 +1022,6 @@ export function SessionSection() {
 					))}
 				</div>
 			)}
-			<div className="access-row session-row session-signout">
-				<button
-					type="button"
-					className="icon danger"
-					aria-label="Sign out everywhere"
-					title="Sign out everywhere"
-					onClick={signOutEverywhere}
-					disabled={busy.busy}
-				>
-					{busy.busy ? (
-						<span className="spinner" aria-hidden="true" />
-					) : (
-						<Icon name="log-out" />
-					)}
-				</button>
-			</div>
 		</SettingsCard>
 	);
 }
@@ -1156,39 +1125,40 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 								{title}
 								{help !== undefined && <Help label={title} text={help} />}
 							</b>
-							<span>
-								{tokenSet === true
-									? captionSet
-									: tokenSet === false
-										? captionUnset
-										: captionUnknown}
-							</span>
-							{expiryText !== null && <span>{expiryText}</span>}
-							<code>secret · stored, never shown</code>
+							<code>
+								secret · stored, never shown
+								{expiryText !== null && ` · ${expiryText}`}
+							</code>
 						</div>
-						<label>
-							<input
-								type="password"
-								value={token}
-								onChange={(e) => setToken(e.target.value)}
-								placeholder={tokenSet ? "••••••••••••" : undefined}
-								autoComplete="off"
-								spellCheck={false}
-								aria-label={label}
-								required
-							/>
-						</label>
+						<div className="alate-def-actions">
+							<label>
+								<input
+									type="password"
+									value={token}
+									onChange={(e) => setToken(e.target.value)}
+									placeholder={
+										tokenSet === true
+											? captionSet
+											: tokenSet === false
+												? captionUnset
+												: captionUnknown
+									}
+									autoComplete="off"
+									spellCheck={false}
+									aria-label={label}
+									required
+								/>
+							</label>
+							<button
+								type="submit"
+								disabled={save.busy}
+								className={save.failed ? "failed" : undefined}
+							>
+								{save.busy && <span className="spinner" aria-hidden="true" />}
+								<SaveLabel saved={saved} />
+							</button>
+						</div>
 					</div>
-				</div>
-				<div className="alate-def-actions">
-					<button
-						type="submit"
-						disabled={save.busy}
-						className={save.failed ? "failed" : undefined}
-					>
-						{save.busy && <span className="spinner" aria-hidden="true" />}
-						<SaveLabel saved={saved} />
-					</button>
 				</div>
 			</form>
 			{error !== null && (
@@ -1252,6 +1222,17 @@ export const asTrust = (d: Record<string, unknown>): TrustNeeded | null =>
 	d.needsTrust === true ? (d as unknown as TrustNeeded) : null;
 export const asError = (d: Record<string, unknown>, status: number): string =>
 	typeof d.error === "string" ? d.error : `HTTP ${status}`;
+/** One SSH test or key save as a TestAnswer: 200 passed, 409 asks to trust the host key. */
+const toTestAnswer = ({
+	status,
+	data,
+}: {
+	status: number;
+	data: Record<string, unknown>;
+}): TestAnswer =>
+	status === 200
+		? { ok: true }
+		: (asTrust(data) ?? { error: asError(data, status) });
 
 /** The app's GitHub name and its installs on the board repos, from the server's last check. */
 export function AppCheckLines({ check }: { check: AppCheck | null }) {
@@ -1310,21 +1291,27 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 	);
 }
 
-/** The one trust+test prompt, shared by the add form, the global key and a project key.
- *  `send` performs the call (with the confirmed fingerprints as `trust` on a retry); this
- *  component renders the action, an aria-live result, and on a 409 the host's fingerprints
- *  with a Trust-and-retry button. A changed host key takes the warning style. */
-export function SshTestRow({
-	send,
-	label = "Test",
-	success = "Test passed",
-	onOk,
-}: {
+type SshTestOptions = {
 	send: (trust?: string[]) => Promise<TestAnswer>;
 	label?: string;
 	success?: string;
 	onOk?: () => void;
-}) {
+	/** When set, the button shows but stays disabled, with this reason as its tooltip. */
+	disabledReason?: string;
+};
+
+/** The one trust+test prompt, shared by the add form, the global key and a project key.
+ *  `send` performs the call (with the confirmed fingerprints as `trust` on a retry). It gives
+ *  the action button and, apart from it, an aria-live result: on a 409 the host's fingerprints
+ *  with a Trust-and-retry button. A changed host key takes the warning style. The parts are
+ *  separate so a button can sit on a field's line while the result spans the card below. */
+function useSshTest({
+	send,
+	label = "Test",
+	success = "Test passed",
+	onOk,
+	disabledReason,
+}: SshTestOptions): { button: ReactNode; result: ReactNode } {
 	const [busy, setBusy] = useState(false);
 	const [ok, setOk] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -1349,51 +1336,68 @@ export function SshTestRow({
 			})
 			.finally(() => setBusy(false));
 	};
-	// "Save and test" retries as "Trust and test"; "Add" as "Trust and add".
-	const retryLabel = `Trust and ${label.toLowerCase().replace(/^save and /, "")}`;
+	// "Test" retries as "Trust and test", "Save key" as "Trust and save key", "Add" as "Trust and add".
+	const retryLabel = `Trust and ${label.toLowerCase()}`;
+	const button = (
+		<button
+			type="button"
+			disabled={busy || disabledReason !== undefined}
+			title={disabledReason}
+			onClick={() => run()}
+		>
+			{busy && <span className="spinner" aria-hidden="true" />}
+			{label}
+		</button>
+	);
+	const result = (
+		<div className="ssh-test-result" aria-live="polite">
+			{ok && (
+				<p className="hint" role="status">
+					{success}
+				</p>
+			)}
+			{error !== null && (
+				<p className="auth-error" role="alert">
+					{error}
+				</p>
+			)}
+			{trust !== null && (
+				<div className={trust.changed ? "trust-warn" : undefined}>
+					<p>
+						{trust.changed
+							? "Warning: the host key changed since the last test. "
+							: ""}
+						Check these fingerprints with your host admin for{" "}
+						<code>{trust.host}</code>:
+					</p>
+					<ul>
+						{trust.fingerprints.map((f) => (
+							<li key={f}>
+								<code>{f}</code>
+							</li>
+						))}
+					</ul>
+					<button
+						type="button"
+						disabled={busy}
+						onClick={() => run(trust.fingerprints)}
+					>
+						{retryLabel}
+					</button>
+				</div>
+			)}
+		</div>
+	);
+	return { button, result };
+}
+
+/** The trust+test prompt as one block: the button, then its result under it. */
+export function SshTestRow(props: SshTestOptions) {
+	const { button, result } = useSshTest(props);
 	return (
-		<div>
-			<button type="button" disabled={busy} onClick={() => run()}>
-				{busy && <span className="spinner" aria-hidden="true" />}
-				{label}
-			</button>
-			<div aria-live="polite">
-				{ok && (
-					<p className="hint" role="status">
-						{success}
-					</p>
-				)}
-				{error !== null && (
-					<p className="auth-error" role="alert">
-						{error}
-					</p>
-				)}
-				{trust !== null && (
-					<div className={trust.changed ? "trust-warn" : undefined}>
-						<p>
-							{trust.changed
-								? "Warning: the host key changed since the last test. "
-								: ""}
-							Check these fingerprints with your host admin for{" "}
-							<code>{trust.host}</code>:
-						</p>
-						<ul>
-							{trust.fingerprints.map((f) => (
-								<li key={f}>
-									<code>{f}</code>
-								</li>
-							))}
-						</ul>
-						<button
-							type="button"
-							disabled={busy}
-							onClick={() => run(trust.fingerprints)}
-						>
-							{retryLabel}
-						</button>
-					</div>
-				)}
-			</div>
+		<div className="ssh-test">
+			{button}
+			{result}
 		</div>
 	);
 }
@@ -1430,27 +1434,35 @@ export function PendingKeyRow({
 	};
 	return (
 		<div className="pending-key">
-			<button type="button" disabled={busy} onClick={() => make({})}>
-				{busy && <span className="spinner" aria-hidden="true" />}
-				Generate
-			</button>
-			<label>
-				Paste private key
-				<textarea
-					rows={3}
-					value={pasted}
-					onChange={(e) => setPasted(e.target.value)}
-					spellCheck={false}
-					autoComplete="off"
-				/>
-			</label>
-			<button
-				type="button"
-				disabled={busy || pasted.trim() === ""}
-				onClick={() => make({ privateKey: pasted })}
+			<DefRow
+				name="Private key"
+				help="Paste a private key without a passphrase and press Import, or press Generate for a new key made on the server. Ottr never shows the private key again."
+				shape="OpenSSH · no passphrase"
 			>
-				Import
-			</button>
+				<label>
+					<textarea
+						rows={3}
+						value={pasted}
+						onChange={(e) => setPasted(e.target.value)}
+						spellCheck={false}
+						autoComplete="off"
+						aria-label="Paste private key"
+					/>
+				</label>
+			</DefRow>
+			<div className="key-actions">
+				<button type="button" disabled={busy} onClick={() => make({})}>
+					{busy && <span className="spinner" aria-hidden="true" />}
+					Generate
+				</button>
+				<button
+					type="button"
+					disabled={busy || pasted.trim() === ""}
+					onClick={() => make({ privateKey: pasted })}
+				>
+					Import
+				</button>
+			</div>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -1458,22 +1470,29 @@ export function PendingKeyRow({
 			)}
 			{pending !== null && (
 				<div className="pending-key">
-					<label>
-						Public key — add it as a deploy key with write access on your host
-						<textarea
-							readOnly
-							rows={3}
-							value={pending.publicKey}
-							spellCheck={false}
-							onFocus={(e) => e.currentTarget.select()}
-						/>
-					</label>
-					<button
-						type="button"
-						onClick={() => void copyText(pending.publicKey)}
+					<DefRow
+						name="Public key"
+						help="Add this key as a deploy key with write access on your git host, then save it with the test below."
 					>
-						Copy
-					</button>
+						<label>
+							<textarea
+								readOnly
+								rows={3}
+								value={pending.publicKey}
+								spellCheck={false}
+								onFocus={(e) => e.currentTarget.select()}
+								aria-label="Public key"
+							/>
+						</label>
+					</DefRow>
+					<div className="key-actions">
+						<button
+							type="button"
+							onClick={() => void copyText(pending.publicKey)}
+						>
+							Copy
+						</button>
+					</div>
 					<p className="hint">
 						Fingerprint <code>{pending.fingerprint}</code>
 					</p>
@@ -1530,6 +1549,47 @@ export function GitHostsSection() {
 			setError(err instanceof Error ? err.message : String(err)),
 		);
 	}, [load]);
+	// Test only checks access and saves nothing: the new key when one is pending, else the
+	// global key. Save key stores the pending key; the server tests it first and refuses a failure.
+	const gTest = useSshTest({
+		label: "Test",
+		disabledReason:
+			gUrl.trim() === ""
+				? "Enter a test URL first"
+				: pending === null && state?.globalKey == null
+					? "Generate or import a key first"
+					: undefined,
+		send: (trust) =>
+			gitReq("POST", "/api/git-hosts/ssh/test", {
+				url: gUrl.trim(),
+				key: pending === null ? "global" : `pending:${pending.id}`,
+				trust,
+			}).then(toTestAnswer),
+	});
+	const gSave = useSshTest({
+		label: "Save key",
+		success: "Global key saved",
+		disabledReason:
+			pending === null
+				? "Generate or import a key first"
+				: gUrl.trim() === ""
+					? "Enter a test URL first: the key saves only after it passes"
+					: undefined,
+		send: (trust) =>
+			pending === null
+				? Promise.resolve({ error: "Generate or import a key first" })
+				: gitReq("PUT", "/api/git-hosts/ssh/global", {
+						pending: `pending:${pending.id}`,
+						testUrl: gUrl.trim(),
+						trust,
+					}).then((r) => {
+						if (r.status === 200) {
+							setPending(null);
+							void load();
+						}
+						return toTestAnswer(r);
+					}),
+	});
 	// One guarded call: the error lands on the section's error line, the answer tells the caller.
 	const run = (fn: () => Promise<boolean>): Promise<boolean> =>
 		(async () => {
@@ -1560,7 +1620,13 @@ export function GitHostsSection() {
 	};
 	const removeToken = (host: string): Promise<boolean> =>
 		run(async () => {
-			if (!window.confirm(`Remove the stored token for ${host}?`)) return true;
+			if (
+				!(await confirmDialog(`Remove the stored token for ${host}?`, {
+					ok: "Remove",
+					danger: true,
+				}))
+			)
+				return true;
 			const { status, data } = await gitReq(
 				"DELETE",
 				`/api/git-hosts/tokens/${encodeURIComponent(host)}`,
@@ -1572,9 +1638,10 @@ export function GitHostsSection() {
 	const removeGlobal = (): Promise<boolean> =>
 		run(async () => {
 			if (
-				!window.confirm(
+				!(await confirmDialog(
 					"Remove the global SSH key? Projects then clone over https or fail.",
-				)
+					{ ok: "Remove", danger: true },
+				))
 			)
 				return true;
 			const { status, data } = await gitReq(
@@ -1610,9 +1677,10 @@ export function GitHostsSection() {
 	const removeApp = (): Promise<boolean> =>
 		run(async () => {
 			if (
-				!window.confirm(
+				!(await confirmDialog(
 					"Remove the GitHub App? Reviews then post under your own identity.",
-				)
+					{ ok: "Remove", danger: true },
+				))
 			)
 				return true;
 			const { status, data } = await gitReq(
@@ -1648,11 +1716,6 @@ export function GitHostsSection() {
 		>
 			<div className="sec-block" id="github-host-block" tabIndex={-1}>
 				<h4>GitHub host</h4>
-				<p className="hint">
-					Where GitHub lives for this board: github.com, a *.ghe.com Enterprise
-					Cloud host, or an Enterprise Server host. It steers the API calls, gh,
-					PR links, releases and fork research.
-				</p>
 				<form
 					className="settings-form"
 					onSubmit={(e) => {
@@ -1660,29 +1723,36 @@ export function GitHostsSection() {
 						saveHost();
 					}}
 				>
-					<label className="settings-field">
-						GitHub host
-						<input
-							value={ghHostDraft ?? state?.githubHost ?? ""}
-							onChange={(e) => setGhHostDraft(e.target.value)}
-							placeholder="github.com"
-							spellCheck={false}
-							aria-label="GitHub host"
-						/>
-					</label>
-					<button
-						type="submit"
-						disabled={ghBusy.busy}
-						className={`primary${ghBusy.failed ? " failed" : ""}`}
-					>
-						{ghBusy.busy && <span className="spinner" aria-hidden="true" />}
-						Save
-					</button>
+					<div className="alate-def-rows">
+						<DefRow
+							name="GitHub host"
+							help="Where GitHub lives for this board: github.com, a *.ghe.com Enterprise Cloud host, or an Enterprise Server host. It steers the API calls, gh, PR links, releases and fork research. A saved value wins over the OTTR_GITHUB_HOST env. Empty resets to the env value or github.com."
+							shape="bare hostname"
+							action={
+								<button
+									type="submit"
+									disabled={ghBusy.busy}
+									className={`primary${ghBusy.failed ? " failed" : ""}`}
+								>
+									{ghBusy.busy && (
+										<span className="spinner" aria-hidden="true" />
+									)}
+									Save
+								</button>
+							}
+						>
+							<label>
+								<input
+									value={ghHostDraft ?? state?.githubHost ?? ""}
+									onChange={(e) => setGhHostDraft(e.target.value)}
+									placeholder="github.com"
+									spellCheck={false}
+									aria-label="GitHub host"
+								/>
+							</label>
+						</DefRow>
+					</div>
 				</form>
-				<p className="hint">
-					Saved here wins over the OTTR_GITHUB_HOST env until you clear it.
-					Empty resets to the env value or github.com.
-				</p>
 				{state !== null && state.githubHost === null && (
 					<p className="hint">
 						OTTR_GITHUB_HOST is invalid — use a bare hostname, for example
@@ -1692,35 +1762,25 @@ export function GitHostsSection() {
 			</div>
 			<div className="sec-block" id="github-token-block" tabIndex={-1}>
 				<h4>GitHub token</h4>
-				<p className="hint">
-					The board's git fetches, pushes and publishes releases with this
-					token. Agents on workers never receive it.
-				</p>
 				<SecretTokenForm<{ tokenSet: boolean; expiresAt: string | null }>
 					endpoint="/api/settings/github-token"
 					title="GitHub token"
 					help="The board uses this token for its own git fetches, pushes and GitHub releases. Agents on workers never get it."
 					label="GitHub token"
-					captionSet="Set. Paste a new token to replace it"
+					captionSet="Set · paste a new token to replace it"
 					captionUnset="Not set: fetch and push fail"
 					captionUnknown="Unknown: the check failed"
 					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
 			</div>
 			<div className="sec-block" id="github-app-block" tabIndex={-1}>
-				<h4>
-					GitHub App
-					<Help
-						label="GitHub App"
-						text="Optional. When it is set, posted PR reviews show as the app (a bot account) instead of your own GitHub account."
-					/>
-				</h4>
+				<h4>GitHub App</h4>
+				<p className="hint">
+					Optional. When it is set, posted PR reviews show as the app (a bot
+					account) instead of your own GitHub account.
+				</p>
 				{state !== null && state.githubApp !== null && !appFormOpen ? (
 					<div>
-						<p className="hint">
-							The app posts PR reviews as ottr[bot]; without it reviews post
-							under your own identity.
-						</p>
 						<div className="settings-field">
 							App ID <code>{state.githubApp.id}</code>
 						</div>
@@ -1743,56 +1803,69 @@ export function GitHostsSection() {
 							saveApp();
 						}}
 					>
-						<label className="settings-field">
-							App ID
-							<input
-								value={appId}
-								onChange={(e) => setAppId(e.target.value)}
-								placeholder="123456"
-								required
-								pattern="\d+"
-							/>
-						</label>
-						<label className="settings-field">
-							Private key
-							<textarea
-								rows={8}
-								value={appKey}
-								onChange={(e) => setAppKey(e.target.value)}
-								spellCheck={false}
-								autoComplete="off"
-								placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
-								required
-							/>
-						</label>
-						<button
-							type="submit"
-							disabled={appBusy.busy}
-							aria-busy={appBusy.busy || undefined}
-							className={appBusy.failed ? "failed" : ""}
-						>
-							{appBusy.busy && <span className="spinner" aria-hidden="true" />}
-							Save
-						</button>
-						{state !== null && state.githubApp !== null && (
-							<>
-								{" "}
+						<div className="alate-def-rows">
+							<DefRow
+								name="App ID"
+								help="The numeric ID on the GitHub App's settings page."
+								shape="digits"
+							>
+								<label>
+									<input
+										value={appId}
+										onChange={(e) => setAppId(e.target.value)}
+										placeholder="123456"
+										required
+										pattern="\d+"
+										aria-label="App ID"
+									/>
+								</label>
+							</DefRow>
+							<DefRow
+								name="Private key"
+								help="The app's private key, in PEM form, from the app's settings page. Ottr stores it and never shows it again."
+								shape="PEM · stored, never shown"
+							>
+								<label>
+									<textarea
+										rows={8}
+										value={appKey}
+										onChange={(e) => setAppKey(e.target.value)}
+										spellCheck={false}
+										autoComplete="off"
+										placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+										required
+										aria-label="GitHub App private key"
+									/>
+								</label>
+							</DefRow>
+						</div>
+						<div className="alate-def-actions">
+							{state !== null && state.githubApp !== null && (
 								<button type="button" onClick={() => setAppFormOpen(false)}>
 									Cancel
 								</button>
-							</>
-						)}
+							)}
+							<button
+								type="submit"
+								disabled={appBusy.busy}
+								aria-busy={appBusy.busy || undefined}
+								className={appBusy.failed ? "failed" : ""}
+							>
+								{appBusy.busy && (
+									<span className="spinner" aria-hidden="true" />
+								)}
+								Save
+							</button>
+						</div>
 					</form>
 				)}
 			</div>
 			<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
-				<h4>
-					Other host tokens
-					<Help
-						label="Other host tokens"
-						text="HTTPS tokens for git hosts other than GitHub, one for each host. Ottr tests each token with git ls-remote before it saves the token."
-					/>
-				</h4>
+				<h4>Other host tokens</h4>
+				<p className="hint">
+					HTTPS tokens for git hosts other than GitHub, one for each host. Ottr
+					tests each token with git ls-remote before it saves the token.
+				</p>
 				{state !== null && state.tokens.length > 0 && (
 					<table>
 						<tbody>
@@ -1831,61 +1904,86 @@ export function GitHostsSection() {
 						saveToken();
 					}}
 				>
-					<label className="settings-field">
-						Host
-						<input
-							value={tHost}
-							onChange={(e) => setTHost(e.target.value)}
-							placeholder="gitlab.com"
-							required
-						/>
-					</label>
-					<label className="settings-field">
-						Username
-						<input
-							value={tUser}
-							onChange={(e) => setTUser(e.target.value)}
-							placeholder="oauth2"
-						/>
-					</label>
-					<label className="settings-field">
-						Token
-						<input
-							type="password"
-							value={tToken}
-							onChange={(e) => setTToken(e.target.value)}
-							autoComplete="off"
-							spellCheck={false}
-							required
-						/>
-					</label>
-					<label className="settings-field">
-						Test URL (a repository the token can read)
-						<input
-							value={tUrl}
-							onChange={(e) => setTUrl(e.target.value)}
-							placeholder="https://gitlab.com/group/repo.git"
-							required
-						/>
-					</label>
-					<button
-						type="submit"
-						disabled={tBusy.busy}
-						className={`primary${tBusy.failed ? " failed" : ""}`}
-					>
-						{tBusy.busy && <span className="spinner" aria-hidden="true" />}
-						Save token
-					</button>
+					<div className="alate-def-rows">
+						<DefRow
+							name="Host"
+							help="The git host this token is for. Ottr keeps one token for each host."
+							shape="hostname"
+						>
+							<label>
+								<input
+									value={tHost}
+									onChange={(e) => setTHost(e.target.value)}
+									placeholder="gitlab.com"
+									required
+									aria-label="Host"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Username"
+							help="The username that git sends with the token. Most hosts accept oauth2."
+						>
+							<label>
+								<input
+									value={tUser}
+									onChange={(e) => setTUser(e.target.value)}
+									placeholder="oauth2"
+									aria-label="Username"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Token"
+							help="An HTTPS access token for the host. Ottr stores it and never shows it again."
+							shape="secret · stored, never shown"
+						>
+							<label>
+								<input
+									type="password"
+									value={tToken}
+									onChange={(e) => setTToken(e.target.value)}
+									autoComplete="off"
+									spellCheck={false}
+									required
+									aria-label="Token"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Test URL"
+							help="A repository that the token can read. Ottr runs git ls-remote against it before it saves the token."
+							shape="https URL"
+						>
+							<label>
+								<input
+									value={tUrl}
+									onChange={(e) => setTUrl(e.target.value)}
+									placeholder="https://gitlab.com/group/repo.git"
+									required
+									aria-label="Test URL (a repository the token can read)"
+								/>
+							</label>
+						</DefRow>
+					</div>
+					<div className="alate-def-actions">
+						<button
+							type="submit"
+							disabled={tBusy.busy}
+							className={`primary${tBusy.failed ? " failed" : ""}`}
+						>
+							{tBusy.busy && <span className="spinner" aria-hidden="true" />}
+							Save token
+						</button>
+					</div>
 				</form>
 			</div>
 			<div className="sec-block" id="ssh-key-block" tabIndex={-1}>
-				<h4>
-					Global SSH key
-					<Help
-						label="Global SSH key"
-						text="The server-side SSH key for clones, fetches and pushes over SSH. Each project without its own key uses this key."
-					/>
-				</h4>
+				<h4>Global SSH key</h4>
+				<p className="hint">
+					The server-side SSH key for clones, fetches and pushes over SSH. Each
+					project without its own key uses this key.
+				</p>
 				{state !== null &&
 					(state.globalKey === null ? (
 						<p className="hint">No global key.</p>
@@ -1894,25 +1992,34 @@ export function GitHostsSection() {
 							<p className="hint">
 								Fingerprint <code>{state.globalKey.fingerprint}</code>
 							</p>
-							<label>
-								Public key
-								<textarea
-									readOnly
-									rows={3}
-									value={state.globalKey.publicKey}
-									spellCheck={false}
-									onFocus={(e) => e.currentTarget.select()}
-								/>
-							</label>{" "}
-							<button
-								type="button"
-								onClick={() => void copyText(state.globalKey?.publicKey ?? "")}
+							<DefRow
+								name="Public key"
+								help="The public half of the global key. Add it as a deploy key with write access on each git host that the projects use."
 							>
-								Copy
-							</button>{" "}
-							<BusyButton className="danger" run={removeGlobal}>
-								Remove
-							</BusyButton>
+								<label>
+									<textarea
+										readOnly
+										rows={3}
+										value={state.globalKey.publicKey}
+										spellCheck={false}
+										onFocus={(e) => e.currentTarget.select()}
+										aria-label="Global public key"
+									/>
+								</label>
+							</DefRow>
+							<div className="key-actions">
+								<button
+									type="button"
+									onClick={() =>
+										void copyText(state.globalKey?.publicKey ?? "")
+									}
+								>
+									Copy
+								</button>
+								<BusyButton className="danger" run={removeGlobal}>
+									Remove
+								</BusyButton>
+							</div>
 						</div>
 					))}
 				<p className="hint">
@@ -1920,35 +2027,28 @@ export function GitHostsSection() {
 					the new one.
 				</p>
 				<PendingKeyRow pending={pending} onPending={setPending} />
-				<label className="settings-field">
-					Test URL (a repository the key can read)
-					<input
-						value={gUrl}
-						onChange={(e) => setGUrl(e.target.value)}
-						placeholder="git@gitlab.com:group/repo.git"
-					/>
-				</label>
-				{pending !== null && (
-					<SshTestRow
-						label="Save and test"
-						success="Global key saved"
-						send={(trust) =>
-							gitReq("PUT", "/api/git-hosts/ssh/global", {
-								pending: pending.id,
-								testUrl: gUrl.trim(),
-								trust,
-							}).then(({ status, data }) => {
-								if (status === 200) {
-									setPending(null);
-									void load();
-									return { ok: true } as const;
-								}
-								const t = asTrust(data);
-								return t !== null ? t : { error: asError(data, status) };
-							})
-						}
-					/>
-				)}
+				<div className="alate-def-rows">
+					<DefRow
+						name="Test URL"
+						help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
+						shape="SSH git URL"
+						action={gTest.button}
+					>
+						<label>
+							<input
+								value={gUrl}
+								onChange={(e) => setGUrl(e.target.value)}
+								placeholder="git@gitlab.com:group/repo.git"
+								aria-label="Test URL (a repository the key can read)"
+							/>
+						</label>
+					</DefRow>
+				</div>
+				{gTest.result}
+				<div className="ssh-test">
+					{gSave.button}
+					{gSave.result}
+				</div>
 			</div>
 			{error !== null && (
 				<p className="auth-error" role="alert">
@@ -1979,13 +2079,54 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			setError(err instanceof Error ? err.message : String(err)),
 		);
 	}, [load]);
+	const keySel =
+		pending !== null
+			? `pending:${pending.id}`
+			: own != null
+				? `project:${project.name}`
+				: "global";
+	const pTest = useSshTest({
+		label: "Test",
+		disabledReason: pUrl.trim() === "" ? "Enter a test URL first" : undefined,
+		send: (trust) =>
+			gitReq("POST", "/api/git-hosts/ssh/test", {
+				url: pUrl.trim(),
+				key: keySel,
+				trust,
+			}).then(toTestAnswer),
+	});
+	const pSave = useSshTest({
+		label: "Save key",
+		success: "Key saved for this project",
+		disabledReason:
+			pending === null
+				? "Generate or import a key first"
+				: pUrl.trim() === ""
+					? "Enter a test URL first: the key saves only after it passes"
+					: undefined,
+		send: (trust) =>
+			pending === null
+				? Promise.resolve({ error: "Generate or import a key first" })
+				: gitReq(
+						"PUT",
+						`/api/projects/${encodeURIComponent(project.name)}/ssh-key`,
+						{ pending: `pending:${pending.id}`, testUrl: pUrl.trim(), trust },
+					).then((r) => {
+						if (r.status === 200) {
+							setPending(null);
+							void load();
+						}
+						return toTestAnswer(r);
+					}),
+	});
 	const useGlobal = (): Promise<boolean> =>
 		(async () => {
 			setError(null);
 			if (
-				!window.confirm(
+				!(await confirmDialog(
 					"Remove this project's key? The project then uses the global key.",
-				)
+					{ ok: "Use global key", danger: true },
+				))
 			)
 				return true;
 			try {
@@ -2005,7 +2146,6 @@ function SshKeySection({ project }: { project: ProjectView }) {
 		<SettingsCard
 			id="project-ssh-section"
 			title="SSH key"
-			help="This project's own SSH key for git over SSH. Without one, the project uses the global key from the General settings."
 			status={
 				own === undefined
 					? undefined
@@ -2026,7 +2166,7 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			}
 		>
 			{own !== null && own !== undefined && (
-				<div>
+				<div className="key-actions">
 					<BusyButton className="danger" run={useGlobal}>
 						Use global key
 					</BusyButton>
@@ -2034,35 +2174,29 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			)}
 			<p className="hint">Save an own key to replace the global key:</p>
 			<PendingKeyRow pending={pending} onPending={setPending} />
-			<label className="settings-field">
-				Test URL (a repository this key can read)
-				<input
-					value={pUrl}
-					onChange={(e) => setPUrl(e.target.value)}
-					placeholder="git@host:group/repo.git"
-				/>
-			</label>
-			{pending !== null && (
-				<SshTestRow
-					label="Save and test"
-					success="Key saved for this project"
-					send={(trust) =>
-						gitReq(
-							"PUT",
-							`/api/projects/${encodeURIComponent(project.name)}/ssh-key`,
-							{ pending: pending.id, testUrl: pUrl.trim(), trust },
-						).then(({ status, data }) => {
-							if (status === 200) {
-								setPending(null);
-								void load();
-								return { ok: true } as const;
-							}
-							const t = asTrust(data);
-							return t !== null ? t : { error: asError(data, status) };
-						})
-					}
-				/>
-			)}
+			<div className="alate-def-rows">
+				<DefRow
+					name="Test URL"
+					help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
+					shape="SSH git URL"
+					action={pTest.button}
+				>
+					<label>
+						<input
+							value={pUrl}
+							onChange={(e) => setPUrl(e.target.value)}
+							placeholder="git@host:group/repo.git"
+							aria-label="Test URL (a repository this key can read)"
+						/>
+					</label>
+				</DefRow>
+			</div>
+			{pTest.result}
+			<div className="ssh-test">
+				{pSave.button}
+				{pSave.result}
+			</div>
+
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -2109,7 +2243,6 @@ function EnvSection() {
 		<SettingsCard
 			id="env-section"
 			title="Env"
-			help="Secret values for the names in the data repo's env.txt files. Workers get each value as an environment variable. Ottr never shows a value again after you save it."
 			status={
 				rows === null || rows.length === 0
 					? undefined
@@ -2143,9 +2276,12 @@ function EnvSection() {
 								<div className="alate-def-name">
 									<b>
 										<code>{row.name}</code>
+										<Help
+											label={row.name}
+											text={`A secret value that workers get as the environment variable ${row.name}. Used by ${row.projects.map((p) => (p === "_all" ? "every project" : p)).join(", ")}.`}
+										/>
 									</b>
-									<span className="caption">{row.set ? "Set" : "Missing"}</span>
-									<span>{row.projects.join(", ")}</span>
+									<code>secret · {row.set ? "set" : "missing"}</code>
 								</div>
 								<div className="alate-def-actions">
 									<input
@@ -2292,11 +2428,12 @@ function ProviderLoginSection() {
 			await load();
 			return true;
 		});
-	const signOutOf = (id: string): void => {
+	const signOutOf = async (id: string): Promise<void> => {
 		if (
-			!window.confirm(
+			!(await confirmDialog(
 				`Sign omp out of ${providerName(id)}? Turns that use it fail until you sign in again.`,
-			)
+				{ ok: "Sign out", danger: true },
+			))
 		)
 			return;
 		run(async () => {
@@ -2313,7 +2450,6 @@ function ProviderLoginSection() {
 			id="signin-section"
 			className="providers"
 			title="Provider sign-in"
-			help="The omp sign-ins on the board's machine, one for each provider. Each bar shows how much of a quota window is used. The thin line above it shows how much of the window's time has passed."
 			status={
 				state === null
 					? undefined
@@ -2418,14 +2554,9 @@ function ProviderLoginSection() {
 									Code or address
 									<Help
 										label="Code or address"
-										text="After you finish the provider's sign-in page, paste the address that the page ends on or the code that it shows."
+										text="After you finish the provider's sign-in page, paste the address that the page ends on (it starts with http://localhost) or the code that it shows. This works the same from another machine or a phone."
 									/>
 								</b>
-								<span>
-									Finish the provider's page. Copy the address it ends on (it
-									starts with http://localhost), or the code it shows, and paste
-									it here. Works the same from another machine or a phone.
-								</span>
 								<code>sent to omp once, never stored</code>
 							</div>
 							<label>
@@ -2472,7 +2603,6 @@ function ProviderLoginSection() {
 									text="The omp provider to sign in to. Pick one from the list, or type any id that omp login shows."
 								/>
 							</b>
-							<span>Pick one, or type any id that omp login lists</span>
 							<code>omp provider id</code>
 						</div>
 						<label>
@@ -2710,7 +2840,6 @@ function ModelRolesSection() {
 			id="model-roles-section"
 			className="model-roles"
 			title="Model roles"
-			help="The model and the thinking level that omp uses for each role. Save commits the change to Alate's data repo, and then Alate provisions the workers."
 			status={
 				loadErr !== null
 					? { label: "Unavailable", tone: "warn" }
@@ -3034,36 +3163,38 @@ function HindsightSection() {
 									text="The Hindsight memory server that the omp of each turn uses. Empty: turns use the HINDSIGHT_API_URL environment variable."
 								/>
 							</b>
-							<span>
+							<code>
+								http(s) URL ·{" "}
 								{view?.url == null
-									? "Not set: turns use HINDSIGHT_API_URL"
-									: "Saved. Paste a new address to move the memory server"}
-							</span>
-							<code>http(s) address of the Hindsight server</code>
+									? "not set, turns use HINDSIGHT_API_URL"
+									: "saved"}
+							</code>
 						</div>
-						<label>
-							<input
-								type="url"
-								value={url}
-								onChange={(e) => setUrl(e.target.value)}
-								placeholder={view?.url ?? "http://hindsight.local:8888"}
-								autoComplete="off"
-								spellCheck={false}
-								aria-label="Hindsight server URL"
-								required
-							/>
-						</label>
+						<div className="alate-def-actions">
+							<label>
+								<input
+									type="url"
+									value={url}
+									onChange={(e) => setUrl(e.target.value)}
+									placeholder={view?.url ?? "http://hindsight.local:8888"}
+									autoComplete="off"
+									spellCheck={false}
+									aria-label="Hindsight server URL"
+									required
+								/>
+							</label>
+							<button
+								type="submit"
+								disabled={urlSave.busy}
+								className={urlSave.failed ? "failed" : undefined}
+							>
+								{urlSave.busy && (
+									<span className="spinner" aria-hidden="true" />
+								)}
+								<SaveLabel saved={urlSaved} />
+							</button>
+						</div>
 					</div>
-				</div>
-				<div className="alate-def-actions">
-					<button
-						type="submit"
-						disabled={urlSave.busy}
-						className={urlSave.failed ? "failed" : undefined}
-					>
-						{urlSave.busy && <span className="spinner" aria-hidden="true" />}
-						<SaveLabel saved={urlSaved} />
-					</button>
 				</div>
 			</form>
 			{urlError !== null && (
@@ -3396,7 +3527,6 @@ function AlateSection() {
 									text="Where the alate server runs. The board asks this server to provision rules, settings, skills and plugins to the workers."
 								/>
 							</b>
-							<span>Where the alate server runs</span>
 							<code>http(s) URL</code>
 						</div>
 						<label>
@@ -3419,7 +3549,6 @@ function AlateSection() {
 									text="The key that the alate server prints at its first start. The board sends it with each provisioning request."
 								/>
 							</b>
-							<span>Printed by the alate server at first start</span>
 							<code>secret · stored, never shown</code>
 						</div>
 						<label>
@@ -3477,20 +3606,26 @@ function AlateSection() {
 }
 
 /** The settings page: General for machine-wide knobs, one page per project, at #settings. */
+
 type ChipTone = "ok" | "warn" | "off";
 
-/** One definition row: name (with an optional "?" explanation), purpose and value shape on the left, the value on the right. */
+/** One definition row: name and value shape on the left, the value on the right. An input row
+ *  explains itself only in its "?" popover (`help`); a read-only fact shows `desc` instead.
+ *  `action` sits on the value's line at the right (the Save of a card's one typed field).
+ *  DefRow, CheckRow and SaveCard implement DESIGN.md's Settings-Row Rule: follow it for new settings. */
 function DefRow({
 	name,
 	desc,
 	shape,
 	help,
+	action,
 	children,
 }: {
 	name: string;
 	desc?: string;
 	shape?: string;
 	help?: string;
+	action?: ReactNode;
 	children: ReactNode;
 }) {
 	return (
@@ -3503,8 +3638,164 @@ function DefRow({
 				{desc !== undefined && <span>{desc}</span>}
 				{shape !== undefined && <code>{shape}</code>}
 			</div>
-			{children}
+			{action === undefined ? (
+				children
+			) : (
+				<div className="alate-def-actions">
+					{children}
+					{action}
+				</div>
+			)}
 		</div>
+	);
+}
+
+/** Save status beside a control that saves on its own. The live region stays mounted so each
+ *  change is announced: a spinner while a slow save runs (CSS delays it, so a quick save shows
+ *  none), then a check that draws itself and fades; a failed save says so. */
+function SaveTick({
+	busy,
+	saved,
+	failed,
+}: {
+	busy: boolean;
+	saved: boolean;
+	failed: boolean;
+}) {
+	return (
+		<span className="save-tick" role="status">
+			{busy ? (
+				<>
+					<span className="spinner" aria-hidden="true" />
+					<span className="sr">Saving</span>
+				</>
+			) : failed ? (
+				<span className="save-tick-failed">Not saved</span>
+			) : saved ? (
+				<svg viewBox="0 0 16 16" role="img" aria-label="Saved">
+					<path d="M3 8.5l3.2 3.1L13 4.6" />
+				</svg>
+			) : null}
+		</span>
+	);
+}
+
+/** State of one save that runs on its own; `run` sends, `onFail` rolls an optimistic value back. */
+type InstantSave = {
+	run: (send: () => Promise<unknown>, onFail?: () => void) => void;
+	busy: boolean;
+	failed: boolean;
+	saved: boolean;
+};
+
+/** One save that runs on its own (a toggle, an upload, a card's Save): busy while it runs,
+ *  then a short "saved" flash. */
+function useInstantSave(act: Act): InstantSave {
+	const busy = useBusy();
+	const [saved, flash] = useFlash(1600);
+	const run = (send: () => Promise<unknown>, onFail?: () => void): void =>
+		busy.start(async () => {
+			const ok = await act(async () => {
+				await send();
+			});
+			if (ok) flash();
+			else onFail?.();
+			return ok;
+		});
+	return { run, busy: busy.busy, failed: busy.failed, saved };
+}
+
+/** One on/off setting, GitHub style: the checkbox leads, the bold name and the description
+ *  sit to its right. A change saves at once; the box shows the new value until the board
+ *  state catches up, and rolls back if the save fails. `sub` indents a dependent option. */
+function CheckRow({
+	name,
+	desc,
+	checked,
+	disabled,
+	sub,
+	save,
+	act,
+}: {
+	name: string;
+	desc: string;
+	/** The saved value. */
+	checked: boolean;
+	disabled?: boolean;
+	sub?: boolean;
+	save: (checked: boolean) => Promise<unknown>;
+	act: Act;
+}) {
+	const id = useId();
+	const s = useInstantSave(act);
+	const [local, setLocal] = useState<boolean | null>(null);
+	useEffect(() => {
+		if (local === checked) setLocal(null);
+	}, [local, checked]);
+	return (
+		<div
+			className={`alate-def-row check-row${sub === true ? " check-sub" : ""}`}
+		>
+			<input
+				id={id}
+				type="checkbox"
+				checked={local ?? checked}
+				disabled={disabled || s.busy}
+				onChange={(e) => {
+					const v = e.target.checked;
+					setLocal(v);
+					s.run(
+						() => save(v),
+						() => setLocal(null),
+					);
+				}}
+				aria-describedby={`${id}-desc`}
+			/>
+			<div className="alate-def-name">
+				<b>
+					<label htmlFor={id}>{name}</label>
+					<SaveTick busy={s.busy} saved={s.saved} failed={s.failed} />
+				</b>
+				<span id={`${id}-desc`}>{desc}</span>
+			</div>
+		</div>
+	);
+}
+
+/** A settings card whose typed fields save together: the rows sit in one form with one Save
+ *  button. The button submits natively, so required and min/max checks run before anything is
+ *  sent; Enter in a field saves the same way. With several typed fields the Save sits in the
+ *  footer; a card with one typed field passes a function as children and puts the Save it gets
+ *  on that field's line (DefRow `action`). */
+function SaveCard({
+	dirty,
+	save,
+	act,
+	children,
+	...card
+}: Omit<SettingsCardProps, "footer" | "children"> & {
+	dirty: boolean;
+	save: () => Promise<unknown>;
+	act: Act;
+	children: ReactNode | ((saveButton: ReactNode) => ReactNode);
+}) {
+	const s = useInstantSave(act);
+	const formId = useId();
+	const button = <SaveButton form={formId} s={s} dirty={dirty} />;
+	const inline = typeof children === "function";
+	return (
+		<SettingsCard {...card} footer={inline ? undefined : button}>
+			<form
+				id={formId}
+				className="alate-def-rows"
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (dirty) s.run(save);
+				}}
+			>
+				{inline ? children(button) : children}
+			</form>
+		</SettingsCard>
 	);
 }
 
@@ -3522,27 +3813,27 @@ function updatesChip(s: ProjectView["settings"]): {
 	return { label: `${on} of 4 on`, tone: on > 0 ? "ok" : "off" };
 }
 
+type SettingsCardProps = {
+	id?: string;
+	title: string;
+	hint?: ReactNode;
+	/** The card's state chip; `icon` leads the label (e.g. a crossed-out bell for off). */
+	status?: { label: string; tone: ChipTone; icon?: IconName };
+	footer?: ReactNode;
+	className?: string;
+	children: ReactNode;
+};
+
 /** One settings card: title, optional state chip and hint, body, optional Save footer. */
 function SettingsCard({
 	id,
 	title,
 	hint,
-	help,
 	status,
 	footer,
 	className,
 	children,
-}: {
-	id?: string;
-	title: string;
-	hint?: ReactNode;
-	/** Short "?" explanation beside the title, for cards without their own setting rows. */
-	help?: string;
-	status?: { label: string; tone: ChipTone };
-	footer?: ReactNode;
-	className?: string;
-	children: ReactNode;
-}) {
+}: SettingsCardProps) {
 	const titleId = id === undefined ? undefined : `${id}-title`;
 	return (
 		<section
@@ -3556,9 +3847,13 @@ function SettingsCard({
 			<div className="sec-head">
 				<div className="sec-title">
 					<h3 id={titleId}>{title}</h3>
-					{help !== undefined && <Help label={title} text={help} />}
 					{status !== undefined && (
-						<span className={`state-chip ${status.tone}`}>{status.label}</span>
+						<span className={`state-chip ${status.tone}`}>
+							{status.icon !== undefined && (
+								<Icon name={status.icon} size={12} />
+							)}
+							{status.label}
+						</span>
 					)}
 				</div>
 				{hint != null && <p className="hint">{hint}</p>}
@@ -3576,7 +3871,7 @@ export const SETTINGS_TOC = [
 		label: "Board",
 		sections: [
 			{ id: "runners-section", label: "Runners" },
-			{ id: "push-section", label: "Push" },
+			{ id: "push-section", label: "Push notifications" },
 		],
 	},
 	{
@@ -3617,18 +3912,44 @@ export const SETTINGS_TOC = [
 	},
 ] as const;
 
-/** One-project page: its cards in page order. */
+/** One-project page: topic groups and their cards, in page order; the TOC and scroll-spy read it. */
 const PROJECT_TOC = [
-	{ id: "project-icon-section", label: "Icon" },
-	{ id: "project-identity-section", label: "Identity" },
-	{ id: "project-runners-section", label: "Runners" },
-	{ id: "project-worktrees-section", label: "Worktrees" },
-	{ id: "project-releases-section", label: "Releases" },
-	{ id: "project-reviews-section", label: "Reviews" },
-	{ id: "project-messages-section", label: "Messages" },
-	{ id: "project-updates-section", label: "Updates" },
-	{ id: "project-ssh-section", label: "SSH key" },
-	{ id: "project-remove-section", label: "Remove project" },
+	{
+		id: "project-group",
+		label: "Project",
+		sections: [
+			{ id: "project-icon-section", label: "Icon" },
+			{ id: "project-identity-section", label: "Identity" },
+		],
+	},
+	{
+		id: "project-work-group",
+		label: "Work",
+		sections: [
+			{ id: "project-runners-section", label: "Runners" },
+			{ id: "project-worktrees-section", label: "Worktrees" },
+			{ id: "project-messages-section", label: "Messages" },
+		],
+	},
+	{
+		id: "project-reviews-group",
+		label: "Releases and reviews",
+		sections: [
+			{ id: "project-releases-section", label: "Releases" },
+			{ id: "project-reviews-section", label: "Reviews" },
+			{ id: "project-updates-section", label: "Updates" },
+		],
+	},
+	{
+		id: "project-git-group",
+		label: "Git",
+		sections: [{ id: "project-ssh-section", label: "SSH key" }],
+	},
+	{
+		id: "project-danger-group",
+		label: "Danger zone",
+		sections: [{ id: "project-remove-section", label: "Remove project" }],
+	},
 ] as const;
 
 type TocSection = {
@@ -3788,9 +4109,9 @@ export function SettingsPage({
 	useEffect(() => {
 		pinned.current = null;
 		const ids = tocIds(
-			general
-				? SETTINGS_TOC.flatMap((g): readonly TocSection[] => g.sections)
-				: PROJECT_TOC,
+			(general ? SETTINGS_TOC : PROJECT_TOC).flatMap(
+				(g): readonly TocSection[] => g.sections,
+			),
 		);
 		const pick = () => {
 			if (pinned.current !== null) return;
@@ -3838,17 +4159,7 @@ export function SettingsPage({
 	}, [general, view]);
 	const map = (
 		<SettingsMap
-			groups={
-				project === null
-					? SETTINGS_TOC
-					: [
-							{
-								id: "project-head",
-								label: projectLabel(project),
-								sections: PROJECT_TOC,
-							},
-						]
-			}
+			groups={project === null ? SETTINGS_TOC : PROJECT_TOC}
 			hash={general ? SETTINGS_HASH : view}
 			active={active}
 			onPick={onPick}
@@ -3992,13 +4303,8 @@ export function ProjectSettingsForm({
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
-	const [hold, setHold] = useState(project.settings.holdUpdateMerges);
-	const [retro, setRetro] = useState(project.settings.retroSince !== null);
-	const [retroFilter, setRetroFilter] = useState(project.settings.retroFilter);
-	const [forkRes, setForkRes] = useState(project.settings.forkResearch);
-	const [prRev, setPrRev] = useState(project.settings.prReviews);
-	const [saved, flashSaved] = useFlash(1500);
-	const save = useBusy();
+	const st = project.settings;
+	const icon = useInstantSave(act);
 	// The setup wizard, opened by Run setup again.
 	const [setupOpen, setSetupOpen] = useState(false);
 	const removable = !tasks.some(
@@ -4018,30 +4324,16 @@ export function ProjectSettingsForm({
 	const imagesMax = Math.max(1, Math.trunc(Number(mi)) || 1);
 	// A blank field is caught by the input's required on submit, never clamped to min.
 	const keepDays = clamp(Math.trunc(Number(kwd)), 0, 365);
-	const dirty =
-		label.trim() !== (project.settings.displayName ?? "") ||
-		parallel !== project.settings.maxParallel ||
-		paths.join("\n") !== project.settings.copyExtra.join("\n") ||
-		relcmd.trim() !== (project.settings.releaseCommand ?? "") ||
-		tb.trim() !== (project.settings.targetBranch ?? "") ||
-		reviewCap !== project.settings.archReviewCap ||
-		imagesMax !== project.settings.maxImages ||
-		keepDays !== project.settings.keptWorktreeDays ||
-		hold !== project.settings.holdUpdateMerges ||
-		retro !== (project.settings.retroSince !== null) ||
-		retroFilter !== project.settings.retroFilter ||
-		forkRes !== project.settings.forkResearch ||
-		prRev !== project.settings.prReviews;
+	/** One settings patch; the server takes any subset of the fields. */
+	const send = (patch: Record<string, unknown>): Promise<ProjectView> =>
+		post<ProjectView>(
+			`/api/projects/${encodeURIComponent(project.name)}/settings`,
+			patch,
+		);
 	return (
 		<>
 			<div className="settings-head" id="project-head" tabIndex={-1}>
 				<h2>{projectLabel(project)}</h2>
-				<SaveStateChip
-					dirty={dirty}
-					saving={save.busy}
-					failed={save.failed}
-					saved={saved}
-				/>
 				<button
 					type="button"
 					className="ghost"
@@ -4051,48 +4343,16 @@ export function ProjectSettingsForm({
 					<Icon name="refresh-cw" size={13} />
 					Run setup again
 				</button>
-				<button
-					type="submit"
-					form="project-settings"
-					className={`settings-save${save.failed ? " failed" : ""}`}
-					disabled={save.busy || !dirty}
-				>
-					{save.busy && <span className="spinner" aria-hidden="true" />}
-					<SaveLabel saved={saved} />
-				</button>
 			</div>
-			<form
-				id="project-settings"
-				onSubmit={(e) => {
-					e.preventDefault();
-					if (!dirty) return;
-					save.start(() =>
-						act(async () => {
-							const response = await post<ProjectView>(
-								`/api/projects/${encodeURIComponent(project.name)}/settings`,
-								{
-									displayName: label.trim() || null,
-									maxParallel: parallel,
-									copyExtra: paths,
-									releaseCommand: relcmd.trim() || null,
-									targetBranch: tb.trim() || null,
-									archReviewCap: reviewCap,
-									maxImages: imagesMax,
-									keptWorktreeDays: keepDays,
-									holdUpdateMerges: hold,
-									retro,
-									retroFilter,
-									forkResearch: forkRes,
-									prReviews: prRev,
-								},
-							);
-							if (response.name !== project.name)
-								location.hash = `#${SETTINGS_HASH}/${encodeURIComponent(response.name)}`;
-							flashSaved();
-						}),
-					);
-				}}
+			<section
+				className="settings-group"
+				id="project-group"
+				aria-labelledby="project-group-title"
+				tabIndex={-1}
 			>
+				<h2 className="settings-group-title" id="project-group-title">
+					Project
+				</h2>
 				<SettingsCard
 					id="project-icon-section"
 					title="Icon"
@@ -4106,7 +4366,6 @@ export function ProjectSettingsForm({
 						<DefRow
 							name="Project icon"
 							help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
-							desc="Replaces the letters on the board"
 							shape="PNG, JPEG, WebP or GIF"
 						>
 							<div className="icon-row">
@@ -4123,28 +4382,25 @@ export function ProjectSettingsForm({
 											const file = e.target.files?.[0];
 											e.target.value = "";
 											if (!file) return;
-											save.start(() =>
-												act(async () => {
-													const res = await fetch(
-														`/api/projects/${encodeURIComponent(project.name)}/icon`,
-														{ method: "POST", body: file },
-													);
-													if (!res.ok) {
-														let error = `HTTP ${res.status}`;
-														try {
-															const data = (await res.json()) as {
-																error?: string;
-															};
-															if (typeof data.error === "string")
-																error = data.error;
-														} catch {
-															// non-JSON error body; keep the HTTP status text
-														}
-														throw new Error(error);
+											icon.run(async () => {
+												const res = await fetch(
+													`/api/projects/${encodeURIComponent(project.name)}/icon`,
+													{ method: "POST", body: file },
+												);
+												if (!res.ok) {
+													let error = `HTTP ${res.status}`;
+													try {
+														const data = (await res.json()) as {
+															error?: string;
+														};
+														if (typeof data.error === "string")
+															error = data.error;
+													} catch {
+														// non-JSON error body; keep the HTTP status text
 													}
-													flashSaved();
-												}),
-											);
+													throw new Error(error);
+												}
+											});
 										}}
 									/>
 								</label>
@@ -4152,29 +4408,38 @@ export function ProjectSettingsForm({
 									<button
 										type="button"
 										className="ghost"
-										disabled={save.busy}
+										disabled={icon.busy}
 										onClick={() =>
-											save.start(() =>
-												act(async () => {
-													const res = await fetch(
-														`/api/projects/${encodeURIComponent(project.name)}/icon`,
-														{ method: "DELETE" },
-													);
-													if (!res.ok) throw new Error(`HTTP ${res.status}`);
-													flashSaved();
-												}),
-											)
+											icon.run(async () => {
+												const res = await fetch(
+													`/api/projects/${encodeURIComponent(project.name)}/icon`,
+													{ method: "DELETE" },
+												);
+												if (!res.ok) throw new Error(`HTTP ${res.status}`);
+											})
 										}
 									>
 										Remove
 									</button>
 								)}
+								<SaveTick
+									busy={icon.busy}
+									saved={icon.saved}
+									failed={icon.failed}
+								/>
 							</div>
 						</DefRow>
 					</div>
 				</SettingsCard>
-				<SettingsCard
+				<SaveCard
 					id="project-identity-section"
+					act={act}
+					dirty={label.trim() !== (st.displayName ?? "")}
+					save={async () => {
+						const r = await send({ displayName: label.trim() || null });
+						if (r.name !== project.name)
+							location.hash = `#${SETTINGS_HASH}/${encodeURIComponent(r.name)}`;
+					}}
 					title="Identity"
 					status={
 						project.github !== null
@@ -4184,50 +4449,63 @@ export function ProjectSettingsForm({
 								: { label: "Local git", tone: "off" }
 					}
 				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Display name"
-							help="A friendly name for the board. The folder and the repo keep their real names."
-							desc="Shown on the board instead of the folder name"
-						>
-							<label>
-								<input
-									type="text"
-									maxLength={60}
-									value={label}
-									onChange={(e) => setLabel(e.target.value)}
-									placeholder={project.name}
-									aria-label="Display name"
-								/>
-							</label>
-						</DefRow>
-						{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-						<DefRow
-							name="Folder path"
-							desc="Fixed when the project was added"
-							help="Where the project lives on the board's machine. Ottr sets it when you add the project."
-						>
-							<code>{project.path}</code>
-						</DefRow>
-						{project.github !== null && (
+					{(save) => (
+						<>
 							<DefRow
-								name="GitHub"
-								desc="Fixed when the project was added"
-								help="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+								name="Display name"
+								action={save}
+								help="A friendly name for the board. The folder and the repo keep their real names."
 							>
-								<a
-									href={project.github}
-									target="_blank"
-									rel="noopener noreferrer"
-								>
-									{project.github}
-								</a>
+								<label>
+									<input
+										type="text"
+										maxLength={60}
+										value={label}
+										onChange={(e) => setLabel(e.target.value)}
+										placeholder={project.name}
+										aria-label="Display name"
+									/>
+								</label>
 							</DefRow>
-						)}
-					</div>
-				</SettingsCard>
-				<SettingsCard
+							{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+							<DefRow
+								name="Folder path"
+								desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
+							>
+								<code>{project.path}</code>
+							</DefRow>
+							{project.github !== null && (
+								<DefRow
+									name="GitHub"
+									desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+								>
+									<a
+										href={project.github}
+										target="_blank"
+										rel="noopener noreferrer"
+									>
+										{project.github}
+									</a>
+								</DefRow>
+							)}
+						</>
+					)}
+				</SaveCard>
+			</section>
+			<section
+				className="settings-group"
+				id="project-work-group"
+				aria-labelledby="project-work-group-title"
+				tabIndex={-1}
+			>
+				<h2 className="settings-group-title" id="project-work-group-title">
+					Work
+				</h2>
+				<SaveCard
 					id="project-runners-section"
+					act={act}
+					dirty={parallel !== st.maxParallel}
+					save={() => send({ maxParallel: parallel })}
 					title="Runners"
 					status={
 						project.settings.maxParallel === null
@@ -4235,27 +4513,42 @@ export function ProjectSettingsForm({
 							: { label: `Cap ${project.settings.maxParallel}`, tone: "ok" }
 					}
 				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Runner cap"
-							help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
-							desc="Tasks of this project that may run at once"
-							shape="empty = no cap"
-						>
-							<label>
-								<input
-									type="number"
-									min={1}
-									value={mp}
-									onChange={(e) => setMp(e.target.value)}
-									aria-label="Max tasks of this project running at once (empty = no cap)"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</SettingsCard>
-				<SettingsCard
+					{(save) => (
+						<>
+							<DefRow
+								name="Runner cap"
+								action={save}
+								help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
+								shape="empty = no cap"
+							>
+								<label>
+									<input
+										type="number"
+										min={1}
+										value={mp}
+										onChange={(e) => setMp(e.target.value)}
+										aria-label="Max tasks of this project running at once (empty = no cap)"
+									/>
+								</label>
+							</DefRow>
+						</>
+					)}
+				</SaveCard>
+				<SaveCard
 					id="project-worktrees-section"
+					act={act}
+					dirty={
+						tb.trim() !== (st.targetBranch ?? "") ||
+						paths.join("\n") !== st.copyExtra.join("\n") ||
+						keepDays !== st.keptWorktreeDays
+					}
+					save={() =>
+						send({
+							targetBranch: tb.trim() || null,
+							copyExtra: paths,
+							keptWorktreeDays: keepDays,
+						})
+					}
 					title="Worktrees"
 					status={
 						project.settings.copyExtra.length > 0
@@ -4269,62 +4562,102 @@ export function ProjectSettingsForm({
 						'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
 					}
 				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Target branch"
-							help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
-							desc="Where merges land"
-							shape="branch name · empty = default"
-						>
-							<label>
-								<input
-									type="text"
-									maxLength={200}
-									placeholder="main"
-									aria-label="Target branch for merges"
-									value={tb}
-									onChange={(e) => setTb(e.target.value)}
-								/>
-							</label>
-						</DefRow>
-						<DefRow
-							name="Extra paths"
-							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
-							desc="Copied into each new worktree"
-							shape="one path per line"
-						>
-							<label>
-								<textarea
-									rows={3}
-									value={extra}
-									onChange={(e) => setExtra(e.target.value)}
-									placeholder="scripts/release.mjs"
-									aria-label="Extra paths copied into new worktrees (one per line)"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
-							name="Quarantine after"
-							help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
-							desc="Idle days before a kept worktree is quarantined"
-							shape="days · 0 = immediately"
-						>
-							<label>
-								<input
-									type="number"
-									min={0}
-									max={365}
-									required
-									value={kwd}
-									onChange={(e) => setKwd(e.target.value)}
-									aria-label="Quarantine kept worktrees after this many idle days"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</SettingsCard>
-				<SettingsCard
+					<DefRow
+						name="Target branch"
+						help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
+						shape="branch name · empty = default"
+					>
+						<label>
+							<input
+								type="text"
+								maxLength={200}
+								placeholder="main"
+								aria-label="Target branch for merges"
+								value={tb}
+								onChange={(e) => setTb(e.target.value)}
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Extra paths"
+						help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
+						shape="one path per line"
+					>
+						<label>
+							<textarea
+								rows={3}
+								value={extra}
+								onChange={(e) => setExtra(e.target.value)}
+								placeholder="scripts/release.mjs"
+								aria-label="Extra paths copied into new worktrees (one per line)"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Quarantine after"
+						help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
+						shape="days · 0 = immediately"
+					>
+						<label>
+							<input
+								type="number"
+								min={0}
+								max={365}
+								required
+								value={kwd}
+								onChange={(e) => setKwd(e.target.value)}
+								aria-label="Quarantine kept worktrees after this many idle days"
+							/>
+						</label>
+					</DefRow>
+				</SaveCard>
+				<SaveCard
+					id="project-messages-section"
+					act={act}
+					dirty={imagesMax !== st.maxImages}
+					save={() => send({ maxImages: imagesMax })}
+					title="Messages"
+					status={{
+						label: `${project.settings.maxImages} image${project.settings.maxImages === 1 ? "" : "s"}`,
+						tone: "off",
+					}}
+				>
+					{(save) => (
+						<>
+							<DefRow
+								name="Max images"
+								action={save}
+								help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
+							>
+								<label>
+									<input
+										type="number"
+										min={1}
+										required
+										value={mi}
+										onChange={(e) => setMi(e.target.value)}
+										aria-label="Max images per message"
+									/>
+								</label>
+							</DefRow>
+						</>
+					)}
+				</SaveCard>
+			</section>
+			<section
+				className="settings-group"
+				id="project-reviews-group"
+				aria-labelledby="project-reviews-group-title"
+				tabIndex={-1}
+			>
+				<h2 className="settings-group-title" id="project-reviews-group-title">
+					Releases and reviews
+				</h2>
+				<SaveCard
 					id="project-releases-section"
+					act={act}
+					dirty={relcmd.trim() !== (st.releaseCommand ?? "")}
+					save={() => send({ releaseCommand: relcmd.trim() || null })}
 					title="Releases"
 					status={
 						project.settings.releaseCommand !== null
@@ -4333,82 +4666,62 @@ export function ProjectSettingsForm({
 					}
 					hint="Runs in the release worktree after the review approves, instead of Ottr's tag and GitHub release. It gets OTTR_RELEASE_VERSION, OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW (commits since the last review). Must push the tag. Empty: Ottr tags and publishes itself."
 				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Release command"
-							help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
-							desc="Runs after the review approves"
-							shape="empty = Ottr tags and publishes"
-						>
-							<label>
-								<input
-									type="text"
-									maxLength={300}
-									value={relcmd}
-									onChange={(e) => setRelcmd(e.target.value)}
-									placeholder="node scripts/release.mjs --ottr"
-									aria-label="Release command"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</SettingsCard>
-				<SettingsCard
+					{(save) => (
+						<>
+							<DefRow
+								name="Release command"
+								action={save}
+								help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
+								shape="empty = Ottr tags and publishes"
+							>
+								<label>
+									<input
+										type="text"
+										maxLength={300}
+										value={relcmd}
+										onChange={(e) => setRelcmd(e.target.value)}
+										placeholder="node scripts/release.mjs --ottr"
+										aria-label="Release command"
+									/>
+								</label>
+							</DefRow>
+						</>
+					)}
+				</SaveCard>
+				<SaveCard
 					id="project-reviews-section"
+					act={act}
+					dirty={reviewCap !== st.archReviewCap}
+					save={() => send({ archReviewCap: reviewCap })}
 					title="Reviews"
 					status={{
 						label: `Every ${project.settings.archReviewCap} commits`,
 						tone: "off",
 					}}
 				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Review interval"
-							help="Ottr marks a review as due after this many new commits on the target branch."
-							desc="Commits on the target before a review is due"
-							shape="1 to 10000"
-						>
-							<label>
-								<input
-									type="number"
-									min={1}
-									max={10000}
-									required
-									value={cap}
-									onChange={(e) => setCap(e.target.value)}
-									aria-label="Review due after this many commits on the target"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</SettingsCard>
-				<SettingsCard
-					id="project-messages-section"
-					title="Messages"
-					status={{
-						label: `${project.settings.maxImages} image${project.settings.maxImages === 1 ? "" : "s"}`,
-						tone: "off",
-					}}
-				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Max images"
-							help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
-							desc="Per message: new tasks, replies, follow-ups and steers"
-						>
-							<label>
-								<input
-									type="number"
-									min={1}
-									required
-									value={mi}
-									onChange={(e) => setMi(e.target.value)}
-									aria-label="Max images per message"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</SettingsCard>
+					{(save) => (
+						<>
+							<DefRow
+								name="Review interval"
+								action={save}
+								help="Ottr marks a review as due after this many new commits on the target branch."
+								shape="1 to 10000"
+							>
+								<label>
+									<input
+										type="number"
+										min={1}
+										max={10000}
+										required
+										value={cap}
+										onChange={(e) => setCap(e.target.value)}
+										aria-label="Review due after this many commits on the target"
+									/>
+								</label>
+							</DefRow>
+						</>
+					)}
+				</SaveCard>
 				<SettingsCard
 					id="project-updates-section"
 					title="Updates"
@@ -4416,81 +4729,47 @@ export function ProjectSettingsForm({
 				>
 					<div className="alate-def-rows">
 						{/* U7: hold update-card merges at needs_you until a reply approves them. */}
-						<DefRow
+						<CheckRow
 							name="Hold update merges"
-							help="Update cards stop at needs-you after a ready turn. They merge only after your reply approves it."
 							desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
-						>
-							<label>
-								<input
-									type="checkbox"
-									checked={hold}
-									onChange={(e) => setHold(e.target.checked)}
-									aria-label="Hold merges of update cards until you approve"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
+							checked={st.holdUpdateMerges}
+							save={(v) => send({ holdUpdateMerges: v })}
+							act={act}
+						/>
+						<CheckRow
 							name="Retro"
-							help="After each card lands in Done, Ottr files one retro card that proposes follow-up work."
 							desc="After each done task the supervisor proposes follow-up cards from its retro"
-						>
-							<label>
-								<input
-									type="checkbox"
-									checked={retro}
-									onChange={(e) => setRetro(e.target.checked)}
-									aria-label="Retro"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
+							checked={st.retroSince !== null}
+							save={(v) => send({ retro: v })}
+							act={act}
+						/>
+						<CheckRow
+							sub
 							name="Friction filter"
-							help="Keeps only the retro proposals that fix a friction the task hit. It works only when Retro is on."
 							desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
-						>
-							<label>
-								<input
-									type="checkbox"
-									checked={retroFilter}
-									disabled={!retro}
-									onChange={(e) => setRetroFilter(e.target.checked)}
-									aria-label="Friction filter"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
+							checked={st.retroFilter}
+							disabled={st.retroSince === null}
+							save={(v) => send({ retroFilter: v })}
+							act={act}
+						/>
+						<CheckRow
 							name="Fork research"
-							help="Every hour, Ottr checks the project's GitHub forks. Findings arrive as proposals that you accept or decline."
 							desc="Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval"
-						>
-							<label>
-								<input
-									type="checkbox"
-									checked={forkRes}
-									onChange={(e) => setForkRes(e.target.checked)}
-									aria-label="Fork research"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
+							checked={st.forkResearch}
+							save={(v) => send({ forkResearch: v })}
+							act={act}
+						/>
+						<CheckRow
 							name="PR reviews"
-							help="Every hour, Ottr drafts a read-only review for each new head of an open pull request. You edit the draft and post it as a comment."
 							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
-						>
-							<label>
-								<input
-									type="checkbox"
-									checked={prRev}
-									disabled={project.github === null && !prRev}
-									onChange={(e) => setPrRev(e.target.checked)}
-									aria-label="PR reviews"
-								/>
-							</label>
-						</DefRow>
+							checked={st.prReviews}
+							disabled={project.github === null && !st.prReviews}
+							save={(v) => send({ prReviews: v })}
+							act={act}
+						/>
 					</div>
 				</SettingsCard>
-			</form>
+			</section>
 			{setupOpen && (
 				<SetupWizardModal
 					project={project}
@@ -4498,46 +4777,68 @@ export function ProjectSettingsForm({
 					onClose={() => setSetupOpen(false)}
 				/>
 			)}
-			<SshKeySection project={project} />
-			<SettingsCard
-				id="project-remove-section"
-				className="settings-danger"
-				title="Remove project"
-				help="Takes the project off this board. The folder, the repo and the task history stay on disk. Add the folder again to bring the project back."
-				status={
-					removable ? undefined : { label: "Tasks running", tone: "warn" }
-				}
-				hint={
-					<>
-						Removes the project {projectLabel(project)} from this Ottr board.
-						Nothing is deleted: its folder, repo, and task history stay on disk.
-						Adding the folder again brings the project back here.
-					</>
-				}
+			<section
+				className="settings-group"
+				id="project-git-group"
+				aria-labelledby="project-git-group-title"
+				tabIndex={-1}
 			>
-				<div>
-					<BusyButton
-						className="danger"
-						disabled={!removable}
-						title={
-							removable
-								? undefined
-								: "Cancel the queued and running tasks first."
-						}
-						run={() =>
-							act(async () => {
-								await post(
-									`/api/projects/${encodeURIComponent(project.name)}/remove`,
-									{},
-								);
-								location.hash = `#${SETTINGS_HASH}`;
-							})
-						}
-					>
-						Remove project
-					</BusyButton>
-				</div>
-			</SettingsCard>
+				<h2 className="settings-group-title" id="project-git-group-title">
+					Git
+				</h2>
+				<SshKeySection project={project} />
+			</section>
+			<section
+				className="settings-group"
+				id="project-danger-group"
+				aria-labelledby="project-danger-group-title"
+				tabIndex={-1}
+			>
+				<h2 className="settings-group-title" id="project-danger-group-title">
+					Danger zone
+				</h2>
+				<SettingsCard
+					id="project-remove-section"
+					className="settings-danger"
+					title="Remove project"
+					hint={
+						<>
+							Removes the project {projectLabel(project)} from this Ottr board.
+							Nothing is deleted: its folder, repo, and task history stay on
+							disk. Adding the folder again brings the project back here.
+						</>
+					}
+					footer={
+						<BusyButton
+							className="danger"
+							disabled={!removable}
+							title={
+								removable
+									? undefined
+									: "Cancel the queued and running tasks first."
+							}
+							run={async () =>
+								(await confirmDialog(
+									`Remove ${projectLabel(project)} from this board? The folder, the repo and the task history stay on disk.`,
+									{ ok: "Remove project", danger: true },
+								))
+									? act(async () => {
+											await post(
+												`/api/projects/${encodeURIComponent(project.name)}/remove`,
+												{},
+											);
+											location.hash = `#${SETTINGS_HASH}`;
+										})
+									: Promise.resolve(true)
+							}
+						>
+							Remove project
+						</BusyButton>
+					}
+				>
+					{null}
+				</SettingsCard>
+			</section>
 		</>
 	);
 }

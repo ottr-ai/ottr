@@ -280,7 +280,7 @@ Spec: [docs/specs/github-app.md](docs/specs/github-app.md).
 
 ### Remote access
 
-Public hostnames need a login (first visit creates the admin user) or the API key from **Settings**. Loopback access needs no login. Serve HTTPS with `tailscale serve --bg --https=443 http://127.0.0.1:4747`, set `OMP_TRACKER_PUBLIC_HOSTS`, and the board installs to a phone's home screen; Web Push (**Settings → Push**) then delivers "needs you" and "done" alerts. **Sign out everywhere** rotates the session secret and revokes all login sessions. **Settings → Session** lists the login sessions, marks the current browser, and can log out a single session. Non-GET API requests must send an `Origin` header matching the board URL.
+Public hostnames need a login (first visit creates the admin user) or the API key from **Settings**. Loopback access needs no login. Serve HTTPS with `tailscale serve --bg --https=443 http://127.0.0.1:4747`, set `OMP_TRACKER_PUBLIC_HOSTS`, and the board installs to a phone's home screen; Web Push (**Settings → Push notifications**) then delivers "needs you" and "done" alerts. **Settings → Session → Log out all sessions** rotates the session secret and revokes all login sessions. **Settings → Session** lists the login sessions, marks the current browser, and can log out a single session. Non-GET API requests must send an `Origin` header matching the board URL.
 
 ## Development
 

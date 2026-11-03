@@ -4177,6 +4177,7 @@ describe("GET /api/gh-status", () => {
 			user: "octocat",
 			free: true,
 			dir: resolve(root),
+			host: "github.com",
 		});
 	});
 
@@ -4236,6 +4237,7 @@ describe("GET /api/gh-status", () => {
 			user: null,
 			free: null,
 			dir: resolve(root),
+			host: "github.com",
 		});
 	});
 });

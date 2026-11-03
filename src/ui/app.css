@@ -474,7 +474,9 @@ textarea {
 	display: inline-flex;
 	align-items: center;
 	gap: 8px;
-	width: 212px;
+	/* The meters start on the 240px rail edge: 14px bar padding + this box + the 16px gap.
+	   The rail toggle in front takes 30px + one more gap, so the box is 212px less 46px. */
+	width: 166px;
 	flex: none;
 	color: var(--text-strong);
 	font-weight: 600;
@@ -601,6 +603,16 @@ textarea {
 	display: inline-grid;
 	gap: 2px;
 	width: 56px;
+}
+/* The smallest phones keep the twin bars, just shorter, and tighter gaps inside the group, so
+   the bar's items never clip. `.bar .meters` outranks the later phone-tier gap rule. */
+@media (max-width: 380px) {
+	.sb-twin {
+		width: 36px;
+	}
+	.bar .meters {
+		gap: 6px;
+	}
 }
 .sb-twin .t {
 	position: relative;
@@ -1712,7 +1724,7 @@ button.notif-link {
 	transform: rotate(90deg);
 	transition: transform 160ms var(--ease);
 }
-.rail:has(#user-menu:popover-open) .rail-user-caret .icon-svg {
+.shell:has(#user-menu:popover-open) .rail-user-caret .icon-svg {
 	transform: rotate(-90deg);
 }
 .user-chip {
@@ -1835,10 +1847,32 @@ button.notif-link {
 .rail[data-collapsed] .rail-user-caret {
 	display: none;
 }
-/* The account menu owns Log out on desktop; phones keep the bar button (no rail there). */
+/* The theme rows group as a fieldset for screen readers; the box itself adds nothing. */
+.menu-theme {
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+/* One account menu for every width. Desktop opens it from the rail chip and keeps theme in
+   the bar; phones have no rail, so a bar chip opens it and the menu carries the theme rows. */
 @media (min-width: 721px) {
-	.bar-logout {
+	.bar-user,
+	.menu-theme {
 		display: none;
+	}
+}
+@media (max-width: 720px) {
+	.bar-theme {
+		display: none;
+	}
+}
+@supports (position-anchor: auto) {
+	@media (max-width: 720px) {
+		.user-menu {
+			position-area: bottom span-left;
+			margin: 6px 0 0;
+		}
 	}
 }
 
@@ -3373,6 +3407,7 @@ a.release:hover {
 	white-space: nowrap;
 	text-overflow: ellipsis;
 }
+
 .tri-sep {
 	height: 1px;
 	margin: 4px 14px;
@@ -3699,6 +3734,19 @@ dialog.diff-view {
 	font-weight: 400;
 	color: var(--dim);
 }
+/* Board confirm (confirmDialog): a short question, its detail in body text with the message's
+   own line breaks, then Cancel and the action. Narrow, so the question reads as one glance. */
+dialog.confirm-dialog {
+	width: min(460px, calc(100vw - 24px));
+}
+.confirm-detail {
+	margin: 0;
+	color: var(--text);
+	font-size: 13px;
+	line-height: 1.5;
+	white-space: pre-line;
+	overflow-wrap: anywhere;
+}
 .dialog-body h3 {
 	margin-top: 4px;
 	font-size: 13.5px;
@@ -3769,21 +3817,32 @@ dialog.diff-view {
 	align-items: flex-start;
 	gap: 8px;
 }
-/* Add project: large container in a dialog; one column. */
+/* A form's action row spans the card so its Save sits at the right, like a card footer. */
+.settings-sec .settings-form > .alate-def-actions {
+	align-self: stretch;
+}
+/* Add project: large container in a dialog; one column. A grid, so both tab panels can
+   share one row: the form keeps the taller panel's height and never jumps on a tab switch. */
 .add-form {
-	display: flex;
-	flex-direction: column;
+	display: grid;
 	gap: 10px;
 	padding: 12px;
 	background: var(--panel);
 	border: 1px solid var(--line-soft);
 	border-radius: 6px;
 }
-/* The panel holds the fields: same column rhythm as the form. [hidden] must keep display: none. */
-.add-form > [role="tabpanel"]:not([hidden]) {
+/* The panel holds the fields: same column rhythm as the form. The inactive panel stays in
+   layout but visibility: hidden keeps it unseen, unfocusable and out of the a11y tree. */
+.add-form > [role="tabpanel"] {
+	grid-row: 2;
+	grid-column: 1;
 	display: flex;
 	flex-direction: column;
+	align-self: start;
 	gap: 10px;
+}
+.add-form > [role="tabpanel"][hidden] {
+	visibility: hidden;
 }
 .add-form label {
 	display: flex;
@@ -3999,6 +4058,9 @@ dialog.diff-view {
 	}
 }
 .state-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
 	padding: 1px 8px;
 	font-size: 11.5px;
 	line-height: 1.5;
@@ -4191,9 +4253,32 @@ dialog.diff-view {
 	font-size: 12.5px;
 	color: var(--dim);
 }
-/* Git hosts blocks span the card like the definition rows. */
-.sec-block .settings-field {
+/* In a settings card, fields and key boxes span the card like the definition rows, and the
+   key and test buttons sit at the right like the other card actions. Dialogs keep the cap. */
+.settings-sec .settings-field,
+.settings-sec .pending-key label {
 	max-width: none;
+}
+.settings-sec .pending-key {
+	justify-items: stretch;
+}
+.key-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+.settings-sec .key-actions {
+	justify-content: flex-end;
+}
+.settings-sec .ssh-test {
+	display: flex;
+	flex-direction: column;
+	align-self: stretch;
+	align-items: flex-end;
+	gap: 6px;
+}
+.settings-sec .ssh-test > [aria-live] {
+	align-self: stretch;
 }
 .settings-field input,
 .settings-field textarea {
@@ -4209,13 +4294,10 @@ dialog.diff-view {
 	max-width: 100%;
 	overflow-wrap: anywhere;
 }
-/* Danger zone: the one red-lined section, last on a project page. */
+/* Danger zone: the one red-lined section, last on a project page. The red border and the
+   red button carry the warning; the title keeps the normal heading colour. */
 .settings-danger {
 	border-color: var(--crit-line);
-}
-.settings-danger > h3,
-.settings-danger .sec-title h3 {
-	color: var(--crit);
 }
 @media (max-width: 900px) {
 	.settings-page {
@@ -4290,21 +4372,67 @@ dialog.diff-view {
 	justify-content: center;
 	min-width: 72px;
 }
-/* The save-state contract: dim when settled, accent while waiting on you, crit on failure. */
-.save-chip {
-	display: inline-flex;
-	align-items: center;
-	gap: 6px;
-	margin-left: auto;
+/* Save tick beside a control that saves at once. The spinner waits 250ms before it shows,
+   so a quick save goes straight to the check; the check draws its stroke, then fades. */
+.save-tick {
+	display: inline-grid;
+	place-items: center;
+	min-width: 16px;
+	height: 16px;
+	margin-left: 6px;
+	vertical-align: -3px;
+	color: var(--text);
+}
+.save-tick .spinner {
+	opacity: 0;
+	animation:
+		spin 0.7s linear infinite,
+		save-tick-wait 0s 0.25s forwards;
+}
+.save-tick svg {
+	width: 16px;
+	height: 16px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 2;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+	animation: save-tick-fade 1.6s var(--ease) forwards;
+}
+.save-tick path {
+	stroke-dasharray: 16;
+	stroke-dashoffset: 16;
+	animation: save-tick-draw 0.3s var(--ease) forwards;
+}
+.save-tick-failed {
 	font-size: 12px;
-	color: var(--dim);
-	white-space: nowrap;
-}
-.save-chip.dirty {
-	color: var(--accent);
-}
-.save-chip.failed {
+	font-weight: 400;
 	color: var(--crit);
+}
+@keyframes save-tick-wait {
+	to {
+		opacity: 1;
+	}
+}
+@keyframes save-tick-draw {
+	to {
+		stroke-dashoffset: 0;
+	}
+}
+@keyframes save-tick-fade {
+	0%,
+	70% {
+		opacity: 1;
+	}
+	100% {
+		opacity: 0;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.save-tick path {
+		animation: none;
+		stroke-dashoffset: 0;
+	}
 }
 /* Numeric knobs: one wrapping row of caption-over-input labels. */
 .settings-numbers {
@@ -6075,10 +6203,12 @@ button.diff-path {
 	}
 }
 
-/* Access section in settings: masked key field with an embedded reveal toggle,
-   plus copy and regenerate icon buttons. */
+/* Access section in settings: masked key field with an embedded reveal toggle, plus copy
+   and regenerate icon buttons. The row spans the card like the definition rows; the key
+   well takes the room, the icons keep theirs. */
 .access-row {
 	display: flex;
+	align-self: stretch;
 	align-items: center;
 	gap: 8px;
 }
@@ -6119,7 +6249,7 @@ button.diff-path {
 	border-color: var(--crit);
 }
 /* Session card: one row per login, secondary "when" line, per-row logout
-   button, and "Sign out everywhere" as the last row. */
+   button; "Log out all sessions" sits in the card footer. */
 .session-rows {
 	display: flex;
 	flex-direction: column;
@@ -6265,10 +6395,12 @@ button.diff-path {
 /* ---- Touch targets ---- */
 
 /* Coarse pointers (phones) get the 44px hit-area floor; desktop keeps its
-   dense 28px chrome. Selectors restate the compact overrides above so specificity holds. */
+   dense 28px chrome. Selectors restate the compact overrides above so specificity holds.
+   Single-line inputs share the floor, so a field and the Save on its line match in height. */
 @media (pointer: coarse) {
 	button,
-	select {
+	select,
+	input:not([type="checkbox"], [type="radio"], [type="file"], [type="range"]) {
 		min-height: 44px;
 	}
 	button.icon,
@@ -6339,6 +6471,36 @@ button.diff-path {
 .settings-sec .alate-def-row:first-child {
 	border-top: 1px solid var(--line-soft);
 }
+/* Rules sit between rows only: the last one would double the card's edge (or the foot's rule),
+   and the card's own padding closes the list. */
+.settings-sec .alate-def-row:last-child {
+	border-bottom: none;
+	padding-bottom: 0;
+}
+/* On/off rows, GitHub style: the checkbox leads, its name and description follow. The box
+   sits on the name's line; the name is the label, so a click on it toggles too. */
+.settings-sec .alate-def-row.check-row {
+	grid-template-columns: auto minmax(0, 1fr);
+	gap: 10px;
+	align-items: start;
+}
+.settings-sec .alate-def-row.check-row > input[type="checkbox"] {
+	margin: 4px 0 0;
+}
+.check-row label {
+	cursor: pointer;
+}
+.check-row > input:disabled + .alate-def-name label {
+	cursor: default;
+}
+/* A dependent option hangs under its parent: one indent in, no rule between them. */
+.settings-sec .alate-def-row.check-row:has(+ .check-sub) {
+	border-bottom: none;
+	padding-bottom: 0;
+}
+.settings-sec .alate-def-row.check-sub {
+	padding-left: 24px;
+}
 .settings-sec .alate-def-row > label > input:not([type="checkbox"]),
 .settings-sec .alate-def-row > label > textarea {
 	width: 100%;
@@ -6366,11 +6528,26 @@ button.diff-path {
 	gap: 10px;
 	margin-top: 12px;
 }
-/* Inside a row (Env value + Save, a provider's Sign out) the actions sit on the row's center line. */
+/* Inside a row (Env value + Save, a single field + its Save, a provider's Sign out) the
+   actions sit on the row's center line; the field takes the free width, the button keeps its own.
+   The group stretches its items, and the label passes that height to its input, so a field and
+   the button beside it are always one height (the touch floor makes both 44px on phones). */
 .settings-sec .alate-def-row > .alate-def-actions {
 	margin-top: 0;
 }
-.settings-sec .alate-def-row > .alate-def-actions > input {
+.settings-sec .alate-def-row > .alate-def-actions > input,
+.settings-sec .alate-def-row > .alate-def-actions > label {
+	flex: 1;
+	min-width: 0;
+}
+.settings-sec .alate-def-row > .alate-def-actions > label {
+	display: flex;
+}
+.settings-sec
+	.alate-def-row
+	> .alate-def-actions
+	> label
+	> :is(input, textarea) {
 	flex: 1;
 	min-width: 0;
 }

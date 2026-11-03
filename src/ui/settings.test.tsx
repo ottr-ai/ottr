@@ -518,7 +518,8 @@ describe("ProjectSettingsForm target branch", () => {
 				typeInto(input, "develop");
 				onChangeOf(input)({ target: input, currentTarget: input });
 			});
-			const form = container.querySelector("#project-settings");
+			// The Worktrees card saves its own fields through its own form.
+			const form = container.querySelector("#project-worktrees-section form");
 			if (form === null) throw new Error("form did not render");
 			await act(async () => {
 				form.dispatchEvent(submitEvent());
@@ -586,7 +587,7 @@ describe("SessionSection", () => {
 			const card = container.querySelector("#session-section");
 			expect(card).not.toBeNull();
 			const rows = card?.querySelectorAll(".session-row");
-			expect(rows?.length).toBe(3); // two sessions + the sign-out-everywhere row
+			expect(rows?.length).toBe(2); // one row per session; Log out all sits in the footer
 			expect(container.textContent).toContain("Firefox on Windows");
 			expect(container.textContent).toContain("Chrome on Linux");
 			expect(container.textContent).toContain("This browser");
@@ -599,7 +600,9 @@ describe("SessionSection", () => {
 			expect(
 				card?.querySelectorAll('button[aria-label="Log out Chrome on Linux"]'),
 			).toHaveLength(1);
-			expect(container.textContent).toContain("Sign out everywhere");
+			expect(
+				card?.querySelector(".sec-foot button.danger")?.textContent,
+			).toContain("Log out all sessions");
 			// Ids are never rendered.
 			expect(container.textContent).not.toContain("a".repeat(24));
 		} finally {
@@ -607,7 +610,7 @@ describe("SessionSection", () => {
 		}
 	});
 
-	test("a failed list fetch shows the failure line and keeps Sign out everywhere", async () => {
+	test("a failed list fetch shows the failure line and keeps Log out all sessions", async () => {
 		const fetchMock = (async (): Promise<Response> =>
 			new Response(JSON.stringify({ error: "boom" }), {
 				status: 500,
@@ -618,9 +621,105 @@ describe("SessionSection", () => {
 			expect(card).not.toBeNull();
 			expect(container.textContent).toContain("Sessions could not be loaded.");
 			expect(
-				card?.querySelectorAll('button[aria-label="Sign out everywhere"]'),
-			).toHaveLength(1);
-			expect(container.textContent).not.toContain("Log out ");
+				card?.querySelector(".sec-foot button.danger")?.textContent,
+			).toContain("Log out all sessions");
+			// No per-session rows, so no per-session logout buttons.
+			expect(
+				card?.querySelectorAll('button[aria-label^="Log out "]'),
+			).toHaveLength(0);
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("GitHostsSection global SSH key", () => {
+	test("Test and Save key send the server's pending:<id> reference, not the bare id", async () => {
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const sent: { method: string; url: string; body: unknown }[] = [];
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			if (url.endsWith("/api/git-hosts") && method === "GET")
+				return ok({
+					tokens: [],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "github.com",
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/git-hosts/ssh/pending"))
+				return ok({
+					id: "abc123",
+					publicKey: "ssh-ed25519 AAAA",
+					fingerprint: "SHA256:f",
+				});
+			if (
+				url.endsWith("/api/git-hosts/ssh/test") ||
+				url.endsWith("/api/git-hosts/ssh/global")
+			) {
+				sent.push({ method, url, body: JSON.parse(String(init?.body)) });
+				return ok({ ok: true });
+			}
+			throw new Error(`unexpected fetch ${method} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			const block = container.querySelector("#ssh-key-block");
+			if (block === null) throw new Error("global key block missing");
+			const button = (text: string): HTMLButtonElement => {
+				const b = [...block.querySelectorAll("button")].find(
+					(x) => x.textContent?.trim() === text,
+				);
+				if (b === undefined) throw new Error(`no ${text} button`);
+				return b as HTMLButtonElement;
+			};
+			// Before a key and a URL exist, neither button can act.
+			expect(button("Test").disabled).toBe(true);
+			expect(button("Save key").disabled).toBe(true);
+			await act(async () => {
+				button("Generate").click();
+			});
+			const url = block.querySelector<HTMLInputElement>(
+				'input[aria-label^="Test URL"]',
+			);
+			if (url === null) throw new Error("test URL input missing");
+			await act(async () => {
+				typeInto(url, "git@git.example.com:a/repo.git");
+				onChangeOf(url)({ target: url, currentTarget: url });
+			});
+			await act(async () => {
+				button("Test").click();
+			});
+			await act(async () => {
+				button("Save key").click();
+			});
+			expect(sent).toEqual([
+				{
+					method: "POST",
+					url: "/api/git-hosts/ssh/test",
+					body: {
+						url: "git@git.example.com:a/repo.git",
+						key: "pending:abc123",
+					},
+				},
+				{
+					method: "PUT",
+					url: "/api/git-hosts/ssh/global",
+					body: {
+						pending: "pending:abc123",
+						testUrl: "git@git.example.com:a/repo.git",
+					},
+				},
+			]);
 		} finally {
 			await unmount();
 		}

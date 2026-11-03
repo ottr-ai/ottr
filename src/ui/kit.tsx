@@ -7,6 +7,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { createRoot } from "react-dom/client";
 import type { ProjectView, QuotaLimit, QuotaState } from "../types.ts";
 import { latestQuota, liveEvents } from "./socket.ts";
 import { stamp, until } from "./time.ts";
@@ -236,13 +237,10 @@ const ICON_PATHS = {
 	activity: <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />,
 } satisfies Record<string, ReactNode>;
 
-export function Icon({
-	name,
-	size = 15,
-}: {
-	name: keyof typeof ICON_PATHS;
-	size?: number;
-}) {
+/** Every glyph name the board's Icon set knows. */
+export type IconName = keyof typeof ICON_PATHS;
+
+export function Icon({ name, size = 15 }: { name: IconName; size?: number }) {
 	return (
 		<svg
 			className="icon-svg"
@@ -644,6 +642,66 @@ export function CloseButton() {
 			<Icon name="x" />
 		</button>
 	);
+}
+
+/**
+ * Board-styled stand-in for window.confirm. The text up to the first "?" is the title, the
+ * rest the detail (line breaks kept). Resolves true only on the confirm button; Cancel, Esc,
+ * the close button and the backdrop all resolve false. A danger confirm starts on Cancel.
+ */
+export function confirmDialog(
+	message: string,
+	{ ok = "Confirm", danger = false }: { ok?: string; danger?: boolean } = {},
+): Promise<boolean> {
+	const cut = message.search(/\?(\s|$)/);
+	const title = cut < 0 ? message : message.slice(0, cut + 1);
+	const detail = cut < 0 ? "" : message.slice(cut + 1).trim();
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const host = document.body.appendChild(document.createElement("div"));
+	const root = createRoot(host);
+	let yes = false;
+	const close = (e: { currentTarget: Element }): void =>
+		e.currentTarget.closest("dialog")?.close();
+	const done = (): void => {
+		resolve(yes);
+		// Unmount after the close event's dispatch, never inside it.
+		setTimeout(() => {
+			root.unmount();
+			host.remove();
+		});
+	};
+	root.render(
+		<Modal label={title} className="dialog confirm-dialog" onClose={done}>
+			<div className="dialog-body">
+				<div className="dialog-head">
+					<h2>{title}</h2>
+					<CloseButton />
+				</div>
+				{detail !== "" && <p className="confirm-detail">{detail}</p>}
+				<div className="dialog-actions">
+					<button
+						type="button"
+						data-autofocus={danger || undefined}
+						onClick={close}
+					>
+						Cancel
+					</button>
+					<button
+						type="button"
+						className={danger ? "danger" : "primary"}
+						data-autofocus={!danger || undefined}
+						onClick={(e) => {
+							yes = true;
+							close(e);
+						}}
+					>
+						{ok}
+					</button>
+				</div>
+			</div>
+		</Modal>,
+	);
+	return promise;
 }
 
 export const interviewMsg = (interview: string): string =>
