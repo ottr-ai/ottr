@@ -39,6 +39,7 @@ interface CreateTaskParams {
 	prompt?: unknown;
 	model?: unknown;
 	dependsOn?: unknown;
+	project?: unknown;
 	rank?: unknown;
 	security?: unknown;
 }
@@ -475,7 +476,8 @@ export default function (pi: Pi) {
 			"starts filed cards automatically, in parallel up to the project's max-parallel setting. Pass dependsOn with the ids of cards that must be done first to run cards in sequence (e.g. milestones); a dependent card stays queued until they are done. Every card " +
 			"runs in a FRESH session with its own worktree: its prompt must be fully self-contained (goal, " +
 			"target paths, constraints, acceptance criteria) — the new agent sees nothing of this session. " +
-			"A turn that must wait for its new card (e.g. a merge turn blocked on a fix) reports that id in report_outcome's dependsOn instead of stopping at needs_you.",
+			"A turn that must wait for its new card (e.g. a merge turn blocked on a fix) reports that id in report_outcome's dependsOn instead of stopping at needs_you. " +
+			"project: file the card in another project on the board; omit to file in this one.",
 		parameters: z.object({
 			prompt: z
 				.string()
@@ -486,6 +488,12 @@ export default function (pi: Pi) {
 				.string()
 				.optional()
 				.describe("Model override for the new card (provider/model)"),
+			project: z
+				.string()
+				.optional()
+				.describe(
+					"Project name on the board to file the card in; omit to file in this task's own project",
+				),
 			dependsOn: z
 				.array(z.string())
 				.optional()
@@ -504,9 +512,15 @@ export default function (pi: Pi) {
 				return textResult("Error: prompt must be 1-20000 characters.");
 			}
 			const dependsOn = parseDependsOn(params);
+			const target = trimmed(params.project);
+			if (params.project !== undefined && target === "") {
+				return textResult(
+					"Error: project must be a non-empty string when given.",
+				);
+			}
 			const filed = await fileCard({
 				base,
-				project,
+				project: target === "" ? project : target,
 				parent,
 				token,
 				prompt,
@@ -514,6 +528,10 @@ export default function (pi: Pi) {
 				dependsOn,
 			});
 			if (!filed.ok) return textResult(filed.text);
+			if (target !== "" && target !== project)
+				return textResult(
+					`Card ${filed.id} filed in project ${target} and linked to this task. It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.`,
+				);
 			return textResult(
 				`Card ${filed.id} filed and linked to this task. It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.`,
 			);

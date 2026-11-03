@@ -6193,10 +6193,18 @@ export function Drawer({
 	const parent =
 		row.followUpOf === null
 			? null
-			: (tasks.find((t) => t.id === row.followUpOf) ?? null);
+			: (tasks.find(
+					(t) =>
+						t.id === row.followUpOf &&
+						t.project === (row.followUpOfProject ?? row.project),
+				) ?? null);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	const kids = tasks
-		.filter((t) => t.followUpOf === row.id)
+		.filter(
+			(t) =>
+				t.followUpOf === row.id &&
+				(t.followUpOfProject ?? t.project) === row.project,
+		)
 		.sort((a, b) => a.createdAt - b.createdAt);
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
@@ -6668,7 +6676,14 @@ export function Drawer({
 												<span className="lineage-title">
 													{parent.sessionTitle ?? parent.title}
 												</span>
-												<span className="lineage-tag">parent</span>
+												<span className="lineage-end">
+													{parent.project !== row.project && (
+														<span className="lineage-tag">
+															{parent.project}
+														</span>
+													)}
+													<span className="lineage-tag">parent</span>
+												</span>
 											</button>
 										</li>
 									))}
@@ -6694,24 +6709,29 @@ export function Drawer({
 														<span className="lineage-title">
 															{k.sessionTitle ?? k.title}
 														</span>
-														<span
-															className={
-																k.state === "needs_you"
-																	? "st st-needs_you" +
-																		(k.asked !== null ? " st-asked" : "")
-																	: "st"
-															}
-														>
-															{/* Same alarm marks as the meta line: markup, not ::before. */}
-															{k.state === "needs_you" && (
-																<Mark kind={cardMark(k)} />
+														<span className="lineage-end">
+															{k.project !== row.project && (
+																<span className="lineage-tag">{k.project}</span>
 															)}
-															{statusLine(
-																k,
-																project.hasRules,
-																holdFor(k, tasks),
-																draining,
-															)}
+															<span
+																className={
+																	k.state === "needs_you"
+																		? "st st-needs_you" +
+																			(k.asked !== null ? " st-asked" : "")
+																		: "st"
+																}
+															>
+																{/* Same alarm marks as the meta line: markup, not ::before. */}
+																{k.state === "needs_you" && (
+																	<Mark kind={cardMark(k)} />
+																)}
+																{statusLine(
+																	k,
+																	project.hasRules,
+																	holdFor(k, tasks),
+																	draining,
+																)}
+															</span>
 														</span>
 													</button>
 												</li>
@@ -9771,7 +9791,16 @@ function App() {
 					task={drawerTask}
 					project={drawerProject}
 					delta={deltas.get(drawerTask.id)}
-					tasks={tasks.filter((t) => t.project === drawerProject.name)}
+					tasks={tasks.filter(
+						(t) =>
+							t.project === drawerProject.name ||
+							(drawerTask.followUpOf !== null &&
+								drawerTask.followUpOfProject !== null &&
+								t.id === drawerTask.followUpOf &&
+								t.project === drawerTask.followUpOfProject) ||
+							(t.followUpOf === drawerTask.id &&
+								t.followUpOfProject === drawerTask.project),
+					)}
 					onOpenTask={openTask}
 					draining={draining}
 					usedTotal={usedTotal}

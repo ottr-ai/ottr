@@ -250,6 +250,67 @@ describe("create_task tool", () => {
 		expect(body).toEqual({ prompt: "p", followUpOf: "t" });
 	});
 
+	test("project param files into the named project's route and still links back", async () => {
+		setEnv({
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify({ id: "abc12345" }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: "p",
+			project: " agent-data ",
+		});
+		expect(seen!.url).toBe(
+			"http://127.0.0.1:4747/api/projects/agent-data/tasks",
+		);
+		expect(JSON.parse(String(seen!.init.body))).toEqual({
+			prompt: "p",
+			followUpOf: "t",
+		});
+		expect(text(out)).toContain("abc12345");
+		expect(text(out)).toContain("agent-data");
+	});
+
+	test("without project the card files in its own project", async () => {
+		setEnv({
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify({ id: "abc12345" }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		expect(seen!.url).toBe("http://127.0.0.1:4747/api/projects/p/tasks");
+		expect(text(out)).toContain("abc12345");
+	});
+
+	test("a blank project refuses before any HTTP call", async () => {
+		setEnv({
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: "p",
+			project: "   ",
+		});
+		expect(text(out)).toContain("non-empty");
+		expect(called).toBe(false);
+	});
+
 	test("without injected coordinates it refuses honestly and fetches nothing", async () => {
 		let called = false;
 		globalThis.fetch = (async () => {
@@ -497,10 +558,11 @@ describe("arch-review changed-line coverage", () => {
 		expect(setSessionNameCalls).toEqual([]);
 	});
 
-	test("create_task declares exactly prompt, model and dependsOn", () => {
+	test("create_task declares exactly prompt, model, project and dependsOn", () => {
 		expect(Object.keys(fakePi().create_task?.parameters ?? {})).toEqual([
 			"prompt",
 			"model",
+			"project",
 			"dependsOn",
 		]);
 	});

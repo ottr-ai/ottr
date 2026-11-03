@@ -622,6 +622,112 @@ describe("task routes", () => {
 		expect(wrongType.status).toBe(415);
 	});
 
+	describe("create_task cross-project followUpOf", () => {
+		// Foreign stores with the SAME folder basename: taskPrefix() derives from the
+		// folder name, so each store's first createTask() yields the same id.
+		const p2Dir = join(root, "a", "dup");
+		const p3Dir = join(root, "b", "dup");
+		let p2: Entry;
+		let p3: Entry;
+		beforeAll(() => {
+			p2 = {
+				path: p2Dir,
+				name: "p2",
+				store: ProjectStore.open(p2Dir),
+				target: null,
+				gitless: false,
+				github: null,
+				remote: null,
+				dirty: false,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			};
+			p3 = {
+				path: p3Dir,
+				name: "p3",
+				store: ProjectStore.open(p3Dir),
+				target: null,
+				gitless: false,
+				github: null,
+				remote: null,
+				dirty: false,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			};
+			projects.set("p2", p2);
+			projects.set("p3", p3);
+		});
+		afterAll(() => {
+			projects.delete("p2");
+			projects.delete("p3");
+			p2.store.close();
+			p3.store.close();
+		});
+
+		test("create links a card into another project and stores the parent's project", async () => {
+			const parent = store.createTask("p1 parent");
+			store.updateTask(parent.id, { updateIds: ["x@1"] });
+			const res = await post("/api/projects/p2/tasks", {
+				prompt: "child in p2",
+				followUpOf: parent.id,
+			});
+			expect(res.status).toBe(200);
+			const child = p2.store
+				.listTasks()
+				.find((t) => t.followUpOf === parent.id)!;
+			expect(child.followUpOfProject).toBe("p1");
+			// The merge hold never crosses a project border.
+			expect(child.updateIds).toEqual([]);
+		});
+
+		test("create with a parent on this board keeps the link local", async () => {
+			const parent = store.createTask("p1 parent again");
+			store.updateTask(parent.id, { updateIds: ["x@1"] });
+			const res = await post("/api/projects/p1/tasks", {
+				prompt: "local child",
+				followUpOf: parent.id,
+			});
+			expect(res.status).toBe(200);
+			const kid = store.listTasks().find((t) => t.followUpOf === parent.id)!;
+			expect(kid.followUpOfProject).toBeNull();
+			expect(kid.updateIds).toEqual(["x@1"]);
+		});
+
+		test("an unknown parent still 404s with the same error", async () => {
+			const res = await post("/api/projects/p1/tasks", {
+				prompt: "lost child",
+				// A well-formed id that exists on no board; a malformed shape still 400s
+				// from resolveTask before the fleet scan.
+				followUpOf: "abcd1234",
+			});
+			expect(res.status).toBe(404);
+			expect(await errorOf(res)).toBe("unknown followUpOf task");
+			const badShape = await post("/api/projects/p1/tasks", {
+				prompt: "lost child",
+				followUpOf: "nope1234",
+			});
+			expect(badShape.status).toBe(400);
+			expect(await errorOf(badShape)).toBe("bad task id");
+		});
+
+		test("a parent id on several foreign boards is ambiguous", async () => {
+			// p2 already holds DUP-1 (the test above filed its child there); p3's
+			// first createTask() yields the same id.
+			const dupId = p2.store.listTasks()[0]!.id;
+			p3.store.createTask("dup twin");
+			const res = await post("/api/projects/p1/tasks", {
+				prompt: "ambiguous child",
+				followUpOf: dupId,
+			});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"followUpOf names cards in several projects: p2, p3",
+			);
+		});
+	});
+
 	test("state cards omit details and report", async () => {
 		const t = store.createTask("card shape");
 		store.updateTask(t.id, { details: "secret", report: "finding" });

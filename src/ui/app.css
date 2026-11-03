@@ -5209,6 +5209,12 @@ button.lineage-row:hover .lineage-title {
 .lineage-row .st-needs_you.st-asked {
 	color: var(--accent);
 }
+/* Lineage end column: the parent tag or state, plus the project tag of a cross-project link. */
+.lineage-end {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 6px;
+}
 .lineage-self > .lineage-row .lineage-key,
 .lineage-self > .lineage-row .lineage-title {
 	color: var(--text-strong);

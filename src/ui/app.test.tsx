@@ -309,6 +309,7 @@ const cardFixture = (over: Partial<TaskCard>): TaskCard =>
 		dependsOn: [],
 		releaseVersion: null,
 		followUpOf: null,
+		followUpOfProject: null,
 		asked: null,
 		answered: false,
 		answeredAt: null,
@@ -1174,6 +1175,7 @@ describe("Drawer parent chip", () => {
 			shots: [],
 			keptFiles: [],
 			updateIds: [],
+			followUpOfProject: null,
 			...over,
 		});
 	const project = {
@@ -1253,6 +1255,121 @@ describe("Drawer parent chip", () => {
 		const branch = html.slice(html.indexOf('class="lineage-branch"'));
 		expect(html.indexOf('class="lineage-branch"')).toBeGreaterThan(at("S-1"));
 		for (const id of ["K-1", "K-2", "K-3"]) expect(branch).toContain(`>${id}<`);
+	});
+});
+
+describe("Drawer cross-project lineage", () => {
+	const childCard = (over: Partial<TaskCard>): TaskCard =>
+		cardFixture({
+			workCheckLog: [],
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			updateIds: [],
+			followUpOfProject: null,
+			...over,
+		});
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: false,
+		onMarkUnread: () => {},
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("a foreign parent renders as a button naming its project", () => {
+		const parent = cardFixture({
+			id: "P-1",
+			project: "other",
+			sessionTitle: "Parent work",
+			stage: "done",
+			state: "idle",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-1",
+			followUpOfProject: "other",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={child} tasks={[parent]} />,
+		);
+		expect(html).toContain('class="lineage-row"');
+		expect(html).toContain("Parent work");
+		expect(html).toContain("parent");
+		expect(html).toContain("other");
+	});
+
+	test("a foreign follow-up lists with id, project and state", () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const kid = childCard({
+			id: "K-1",
+			project: "other",
+			followUpOf: "S-1",
+			followUpOfProject: "proj",
+			state: "needs_you",
+			stage: "todo",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={self} tasks={[kid]} />,
+		);
+		expect(html).toContain("K-1");
+		expect(html).toContain("other");
+		expect(html).toContain('class="lineage-branch"');
+	});
+
+	test("a same-id card on another board does not pose as the parent", () => {
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-1",
+		});
+		const impostor = cardFixture({
+			id: "P-1",
+			project: "other",
+			sessionTitle: "Impostor work",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={child} tasks={[impostor]} />,
+		);
+		expect(html).toContain("lineage-gone");
+		expect(html).toContain("Not on the board");
+		expect(html).not.toContain("Impostor work");
+	});
+
+	test("a foreign card sharing this card's id does not list as a kid", () => {
+		const self = childCard({
+			id: "S-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: null,
+		});
+		const stranger = cardFixture({
+			id: "S-1",
+			project: "other",
+			followUpOf: "S-1",
+			followUpOfProject: "other",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={self} tasks={[stranger]} />,
+		);
+		expect(html).not.toContain("drawer-lineage");
+		expect(html).not.toContain("lineage-branch");
 	});
 });
 

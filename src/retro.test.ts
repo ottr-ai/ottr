@@ -72,6 +72,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		model: null,
 		keptFiles: [],
 		followUpOf: null,
+		followUpOfProject: null,
 		pushSha: null,
 		pushRetries: 0,
 		mergeHead: null,

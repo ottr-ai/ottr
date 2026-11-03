@@ -685,10 +685,18 @@ describe("keptFiles", () => {
 		const child = store.createTask("follow up");
 		const updated = store.updateTask(child.id, { followUpOf: parent.id });
 		expect(updated.followUpOf).toBe(parent.id);
+		// A same-project parent stores no project; a foreign one names it.
+		expect(updated.followUpOfProject).toBe(null);
 		expect(store.getTask(child.id)?.followUpOf).toBe(parent.id);
+		const foreign = store.updateTask(child.id, {
+			followUpOf: "AGEN-30",
+			followUpOfProject: "agent-data",
+		});
+		expect(foreign.followUpOfProject).toBe("agent-data");
 		store.close();
 		const reopened = open(join(root, "follow-up-link"));
-		expect(reopened.getTask(child.id)?.followUpOf).toBe(parent.id);
+		expect(reopened.getTask(child.id)?.followUpOf).toBe("AGEN-30");
+		expect(reopened.getTask(child.id)?.followUpOfProject).toBe("agent-data");
 		reopened.close();
 	});
 

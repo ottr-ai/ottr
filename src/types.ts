@@ -297,6 +297,8 @@ export interface Task {
 	keptFiles: string[];
 	/** Task id this card continues (set by the Follow up flow); null for a from-scratch task. Children are tasks whose followUpOf is this id. */
 	followUpOf: string | null;
+	/** The parent's project when followUpOf names a card on another project's board (create_task's project parameter); null for a parent on this project's board. */
+	followUpOfProject: string | null;
 	/** CI watch: sha of the merge push whose GitHub Actions verdict the supervisor awaits; null once checked, skipped, or given up on. */
 	pushSha: string | null;
 	/** OTTR-394: automatic rebase retries a rejected server push has spent (budget 2 per card). */

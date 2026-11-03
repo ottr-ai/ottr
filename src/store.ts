@@ -229,6 +229,7 @@ interface TaskRow {
 	model: string | null;
 	kept_files: string;
 	follow_up_of: string | null;
+	follow_up_of_project: string | null;
 	push_sha: string | null;
 	topic: string | null;
 	depends_on: string;
@@ -363,6 +364,7 @@ function toTask(project: string, r: TaskRow): Task {
 		model: r.model,
 		keptFiles: parseStringList(r.kept_files),
 		followUpOf: r.follow_up_of,
+		followUpOfProject: r.follow_up_of_project,
 		pushSha: r.push_sha,
 		topic: r.topic,
 		dependsOn: parseStringList(r.depends_on),
@@ -552,6 +554,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	model: "model",
 	keptFiles: "kept_files",
 	followUpOf: "follow_up_of",
+	followUpOfProject: "follow_up_of_project",
 	pushSha: "push_sha",
 	topic: "topic",
 	dependsOn: "depends_on",
@@ -1239,6 +1242,13 @@ export class ProjectStore {
 			);
 		if (!cols.includes("merge_head"))
 			db.exec("ALTER TABLE tasks ADD COLUMN merge_head TEXT");
+		// The parent's project when follow_up_of names a card on another project's board
+		// (create_task's project parameter); null keeps the link on this board. ALTER-only
+		// after every rebuild, like the columns above: a rebuild's explicit column list
+		// would drop it, and a column living in TASKS_DDL too would dupe here on the
+		// stale cols list.
+		if (!cols.includes("follow_up_of_project"))
+			db.exec("ALTER TABLE tasks ADD COLUMN follow_up_of_project TEXT");
 		// context_tokens: the task's final context-window size in prompt tokens, captured
 		// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
 		// after every rebuild, like the columns above.

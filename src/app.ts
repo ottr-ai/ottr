@@ -4740,16 +4740,44 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "prompt must be 1-20000 characters" }, 400);
 					// Agents filing cards from another task's run pass that task here; the link renders in both drawers.
 					let followUpOf: string | null = null;
+					let followUpOfProject: string | null = null;
 					let updateIds: string[] = [];
 					if (r.body.followUpOf !== undefined && r.body.followUpOf !== null) {
 						if (typeof r.body.followUpOf !== "string")
 							return json({ error: "followUpOf must be a task id" }, 400);
-						const parent = resolveTask(req.params.project, r.body.followUpOf);
-						if (parent instanceof Response)
-							return json({ error: "unknown followUpOf task" }, 404);
-						followUpOf = parent.task.id;
-						// A child of an update card inherits its merge hold: split-off update work needs the same approval.
-						updateIds = parent.task.updateIds;
+						const parentId: string = r.body.followUpOf;
+						const parent = resolveTask(req.params.project, parentId);
+						if (!(parent instanceof Response)) {
+							followUpOf = parent.task.id;
+							// A child of an update card inherits its merge hold: split-off update work needs the same approval.
+							updateIds = parent.task.updateIds;
+						} else if (parent.status === 404) {
+							// Not on this project's board: create_task can file the work into
+							// another project, so scan the fleet for the parent. A 404 here means
+							// the id shape is valid (resolveTask answers 400 for a bad shape
+							// first). Ids are unique per project, not across projects: exactly
+							// one foreign match links and stores the parent's project, several
+							// are ambiguous, and the merge hold never crosses a project border.
+							const hits = [...deps.projects.values()]
+								.filter((p) => p.name !== req.params.project)
+								.flatMap((p) => {
+									const task = p.store.getTask(parentId);
+									return task === null ? [] : [{ project: p.name, task }];
+								});
+							if (hits.length === 0)
+								return json({ error: "unknown followUpOf task" }, 404);
+							if (hits.length > 1)
+								return json(
+									{
+										error: `followUpOf names cards in several projects: ${hits.map((h) => h.project).join(", ")}`,
+									},
+									409,
+								);
+							followUpOf = hits[0]!.task.id;
+							followUpOfProject = hits[0]!.project;
+						} else {
+							return parent;
+						}
 					}
 					let dependsOn: string[] = [];
 					if (r.body.dependsOn !== undefined && r.body.dependsOn !== null) {
@@ -4799,7 +4827,11 @@ export function createApp(deps: AppDeps) {
 						);
 					}
 					if (followUpOf !== null)
-						e.store.updateTask(t.id, { followUpOf, updateIds });
+						e.store.updateTask(t.id, {
+							followUpOf,
+							followUpOfProject,
+							updateIds,
+						});
 					if (dependsOn.length > 0) e.store.updateTask(t.id, { dependsOn });
 					if (r.body.backlog === true)
 						e.store.updateTask(t.id, {
