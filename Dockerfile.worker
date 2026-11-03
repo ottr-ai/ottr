@@ -23,10 +23,10 @@ ARG RIPWIRE_VERSION=0.6.8
 # sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
 ARG RIPWIRE_SHA256=aa09e8c43acd2104db91a80f2824a36c314ea4a72fd565cd2e579e043e09b03b
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
-# GitHub token (D6). Host runs 2.103.0. A wrong pin 404s the download (fails the build loudly).
-ARG GH_VERSION=2.103.2
+# GitHub token (D6). Host runs 2.103.2. A wrong pin 404s the download (fails the build loudly).
+ARG GH_VERSION=2.103.3
 # sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
-ARG GH_SHA256=62ccf747115ddc61237efffdde66a3c8f70ba249433dc64f70801089b59c59c8
+ARG GH_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
