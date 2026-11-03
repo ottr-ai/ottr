@@ -84,6 +84,7 @@ test("push shows a notification built from the payload", async () => {
 			options: {
 				body: "task done",
 				tag: "t1",
+				renotify: true,
 				icon: "/icon-192.png",
 				data: { url: "/tasks/1" },
 			},
@@ -99,6 +100,7 @@ test("push falls back to defaults for missing payload fields", async () => {
 			options: {
 				body: undefined,
 				tag: undefined,
+				renotify: false,
 				icon: "/icon-192.png",
 				data: { url: "/" },
 			},

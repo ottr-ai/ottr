@@ -246,18 +246,22 @@ export function alertNotices(alerts: TaskCard[]): AlertNotice[] {
 
 /**
  * Chrome notifications per channel, only while the tab is hidden — a visible board already
- * shows the bell and the alarm popover. Same tag replaces, so repeat asks never stack.
+ * shows the bell and the alarm popover. Same tag replaces, so repeat asks never stack, and
+ * renotify makes each replacement alert again instead of a silent swap.
  * ponytail: fires only with this tab open; sw.js already delivers the server's pushes to closed tabs.
  */
 export function showAlerts(alerts: TaskCard[]): void {
 	if (alerts.length === 0 || !document.hidden) return;
 	if (!notificationsOn()) return;
 	for (const a of alertNotices(alerts)) {
-		const n = new Notification(a.title, {
+		// TS's DOM lib lacks renotify; Chrome and Edge read it.
+		const opts: NotificationOptions & { renotify: boolean } = {
 			body: a.body,
 			tag: a.tag,
+			renotify: true,
 			icon,
-		});
+		};
+		const n = new Notification(a.title, opts);
 		n.onclick = () => {
 			window.focus();
 			n.close();

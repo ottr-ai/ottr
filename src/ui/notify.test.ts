@@ -383,12 +383,12 @@ describe("arch-review changed-line coverage", () => {
 	class FakeNotification {
 		static permission = "granted";
 		title: string;
-		opts: { body: string; tag: string; icon: unknown };
+		opts: { body: string; tag: string; renotify: boolean; icon: unknown };
 		onclick: (() => void) | null = null;
 		closeCalls = 0;
 		constructor(
 			title: string,
-			opts: { body: string; tag: string; icon: unknown },
+			opts: { body: string; tag: string; renotify: boolean; icon: unknown },
 		) {
 			this.title = title;
 			this.opts = opts;
@@ -434,6 +434,7 @@ describe("arch-review changed-line coverage", () => {
 			expect(created[0]!.opts).toEqual({
 				body: "turn ended",
 				tag: "needs_you",
+				renotify: true,
 				icon,
 			});
 			created[0]!.onclick!();

@@ -5,6 +5,8 @@ self.addEventListener("push", (event) => {
 		self.registration.showNotification(data.title ?? "Ottr", {
 			body: data.body,
 			tag: data.tag,
+			// Same tag replaces the tray entry; renotify makes the replacement alert again.
+			renotify: data.tag !== undefined,
 			icon: "/icon-192.png",
 			data: { url: data.url ?? "/" },
 		}),
