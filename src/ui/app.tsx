@@ -6642,7 +6642,7 @@ export function Drawer({
 											aria-label="Edit release notes"
 											onClick={() => setNotesEdit("")}
 										>
-											<Icon name="plus" />
+											<Icon name="edit" />
 											Edit
 										</button>
 									)
@@ -6724,7 +6724,7 @@ export function Drawer({
 							<div className="task-prompt">
 								<Markdown text={task.prompt} />
 								<button type="button" onClick={() => setEdit(task.prompt)}>
-									<Icon name="plus" />
+									<Icon name="edit" />
 									Edit task
 								</button>
 							</div>
