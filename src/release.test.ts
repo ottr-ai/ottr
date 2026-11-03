@@ -856,6 +856,7 @@ describe("against real repos", () => {
 				notes: "Planned.\n\n## Changes\n\n- Planned thing",
 				findings: [finding],
 				github: sh ? "https://github.com/o/r" : null,
+				originUrl: origin,
 			});
 			expect(log).toStartWith(
 				`tagged v9.9.9 at ${outside.slice(0, 7)} (late fixes: 2), pushed`,
@@ -881,6 +882,7 @@ describe("against real repos", () => {
 			version: "v9.9.8",
 			notes: "Planned.\n\n## Changes\n\n- Planned thing",
 			github: null,
+			originUrl: origin,
 		});
 		expect(log).toBe(`tagged v9.9.8 at ${head.slice(0, 7)}, pushed`);
 		const marked = await lateCommits(main, head, head, []);
