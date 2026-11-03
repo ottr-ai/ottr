@@ -510,7 +510,7 @@ export function boardWarnings(
 	roles: Readonly<Record<string, string>>,
 	env: Record<string, string | undefined> = process.env,
 	expiry: TokenExpiryView = tokenExpiryView(env),
-	tasks: readonly (ReviewTask & Pick<Task, "state">)[] = [],
+	tasks: readonly (ReviewTask & Pick<Task, "state" | "project">)[] = [],
 	now: number = Date.now(),
 ): string[] {
 	if (!existsSync(join(agentDir(), "config.yml")))
@@ -540,21 +540,34 @@ export function boardWarnings(
 		);
 	}
 	// A release parked on finished findings still holds every other merge (mergeHold): warn
-	// once the stall passes an hour, so the next step stays visible on the board.
-	for (const r of tasks) {
-		if (
-			r.cancelledAt !== null ||
-			r.releaseVersion === null ||
-			r.stage === "done"
-		)
-			continue;
-		const held = releaseHeldMerges(tasks, r);
-		if (held.length === 0) continue;
-		const settled = findingsSettledAt(tasks, r);
-		if (settled === null || now - settled <= 3_600_000) continue;
-		out.push(
-			`Release ${r.releaseVersion} holds ${held.length} merge${held.length === 1 ? "" : "s"} with every finding done (over an hour now): cancel the release card and create the release again so the fixes get reviewed.`,
-		);
+	// once the stall passes an hour, so the next step stays visible on the board. mergeHold
+	// compares versions within one project, so the loop runs per project, never on the
+	// flat cross-project list.
+	const byProject = new Map<
+		string,
+		(ReviewTask & Pick<Task, "state" | "project">)[]
+	>();
+	for (const t of tasks) {
+		const group = byProject.get(t.project);
+		if (group === undefined) byProject.set(t.project, [t]);
+		else group.push(t);
+	}
+	for (const group of byProject.values()) {
+		for (const r of group) {
+			if (
+				r.cancelledAt !== null ||
+				r.releaseVersion === null ||
+				r.stage === "done"
+			)
+				continue;
+			const held = releaseHeldMerges(group, r);
+			if (held.length === 0) continue;
+			const settled = findingsSettledAt(group, r);
+			if (settled === null || now - settled <= 3_600_000) continue;
+			out.push(
+				`Release ${r.releaseVersion} holds ${held.length} merge${held.length === 1 ? "" : "s"} with every finding done (over an hour now): cancel the release card and create the release again so the fixes get reviewed.`,
+			);
+		}
 	}
 	// Token warnings come last; a token that is not in effect (not set / board unseeded) never warns.
 	const tokenNow = new Date(now);
@@ -1942,7 +1955,7 @@ export function createApp(deps: AppDeps) {
 			drainUntil: drainUntil > now ? drainUntil : null,
 			drainCommits: drainUntil > now ? drainCommits : null,
 			warnings: [
-				...boardWarnings(list, roles),
+				...boardWarnings(list, roles, undefined, undefined, tasks, now),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),

@@ -6769,14 +6769,15 @@ describe("board warnings", () => {
 			writeFileSync(join(dir, "config.yml"), "modelRoles: {}\n");
 			const now = 1_762_000_000_000;
 			const card = (
-				over: Partial<ReviewTask & Pick<Task, "state">>,
-			): ReviewTask & Pick<Task, "state"> => ({
+				over: Partial<ReviewTask & Pick<Task, "state" | "project">>,
+			): ReviewTask & Pick<Task, "state" | "project"> => ({
 				id: "x",
 				kind: "work",
 				releaseVersion: null,
 				cancelledAt: null,
 				stage: "todo",
 				state: "queued",
+				project: "p",
 				createdAt: now - 10_000,
 				doneAt: null,
 				dependsOn: [],
@@ -6860,6 +6861,40 @@ describe("board warnings", () => {
 					now,
 				),
 			).toEqual([]);
+			// Two projects may run the same release version: each warning counts
+			// only its own project's held merges, never the other project's.
+			const twin = (
+				project: string,
+			): (ReviewTask & Pick<Task, "state" | "project">)[] => [
+				card({
+					id: `${project}-release`,
+					project,
+					releaseVersion: "v0.3.0",
+					stage: "merging",
+					state: "needs_you",
+					doneAt: now - 3 * 3_600_000,
+				}),
+				card({
+					id: `${project}-finding`,
+					project,
+					followUpOf: `${project}-release`,
+					createdAt: now - 4 * 3_600_000,
+					stage: "done",
+					state: "idle",
+					doneAt: now - 2 * 3_600_000,
+				}),
+				card({ id: `${project}-merge`, project, stage: "merging" }),
+			];
+			const twins = boardWarnings(
+				[],
+				modelRoles(),
+				{},
+				undefined,
+				[...twin("a"), ...twin("b")],
+				now,
+			).filter((w) => w.includes("Release v0.3.0"));
+			expect(twins).toHaveLength(2);
+			for (const w of twins) expect(w).toContain("holds 1 merge");
 		}));
 });
 
