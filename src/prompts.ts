@@ -543,14 +543,23 @@ ${ONE_SHOT}`;
 
 export const PROPOSED_REASON_PREFIX = "Proposed by the retro of ";
 
+/** The action sentence names the drawer buttons verbatim, so the box reads as steps. */
+export const PROPOSED_ACTIONS =
+	"Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
+
 export function proposedReason(retroTitle: string): string {
-	return `${PROPOSED_REASON_PREFIX}${retroTitle}. Accept to start it, edit the prompt first, or cancel to decline.`;
+	// The retro card's title carries the RETRO_MARKER marker; the reason must not
+	// double it ("the retro of Retro of X" reads as gibberish in the box).
+	const name = retroTitle.startsWith(RETRO_MARKER)
+		? retroTitle.slice(RETRO_MARKER.length)
+		: retroTitle;
+	return `${PROPOSED_REASON_PREFIX}${name}. ${PROPOSED_ACTIONS}`;
 }
 
 export const FORK_PROPOSED_REASON_PREFIX = "Proposed by the fork research ";
 
 export function forkProposedReason(cardTitle: string): string {
-	return `${FORK_PROPOSED_REASON_PREFIX}${cardTitle}. Accept to start it, edit the prompt first, or cancel to decline.`;
+	return `${FORK_PROPOSED_REASON_PREFIX}${cardTitle}. ${PROPOSED_ACTIONS}`;
 }
 
 export const PROPOSE_TOOL_DESCRIPTION =

@@ -142,6 +142,11 @@ describe("deriveTitle", () => {
 			["# Set up agent rules for demo\nbody", "Set up agent rules for demo"],
 			["first line\nsecond line", "first line"],
 			["# Goal", "Goal"],
+			// Overlong first line cuts at a word boundary, never mid-word.
+			[
+				"Rebase and retry when the server push after a merge fails because origin/main moved",
+				"Rebase and retry when the server push after a merge fails because origin/main…",
+			],
 		];
 		for (const [prompt, title] of cases)
 			expect(store.createTask(prompt).title).toBe(title);
@@ -1564,6 +1569,48 @@ describe("preparing migration", () => {
 			expect(store.createTask(prompt).kind).toBe("work");
 		}
 		store.close();
+	});
+
+	test("open converges pre-fix proposal reasons and keeps them on a reopen", () => {
+		const store = open(join(root, "proposal-reason-converge"));
+		const retro = store.createTask("a proposal");
+		store.updateTask(retro.id, {
+			state: "needs_you",
+			needsReason:
+				"Proposed by the retro of Retro of the card. Accept to start it, edit the prompt first, or cancel to decline.",
+		});
+		const fork = store.createTask("a fork proposal");
+		store.updateTask(fork.id, {
+			state: "needs_you",
+			needsReason:
+				"Proposed by the fork research Fork research: ottr-ai/ottr. Accept to start it, edit the prompt first, or cancel to decline.",
+		});
+		// A non-proposal reason must survive the pass untouched.
+		const plain = store.createTask("a crashed card");
+		store.updateTask(plain.id, {
+			state: "needs_you",
+			needsReason: "omp exited with code 1 before finishing",
+		});
+		store.close();
+
+		const reopened = open(join(root, "proposal-reason-converge"));
+		expect(reopened.getTask(retro.id)!.needsReason).toBe(
+			"Proposed by the retro of the card. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		expect(reopened.getTask(fork.id)!.needsReason).toBe(
+			"Proposed by the fork research ottr-ai/ottr. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		expect(reopened.getTask(plain.id)!.needsReason).toBe(
+			"omp exited with code 1 before finishing",
+		);
+		reopened.close();
+
+		// Idempotent: the converged text survives another open unchanged.
+		const again = open(join(root, "proposal-reason-converge"));
+		expect(again.getTask(retro.id)!.needsReason).toBe(
+			"Proposed by the retro of the card. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		again.close();
 	});
 
 	test("fresh databases: new tasks carry a null topic and updateTask can set it", () => {

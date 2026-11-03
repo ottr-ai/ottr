@@ -5814,8 +5814,8 @@ describe("drain route", () => {
 describe("fork research routes", () => {
 	test("fork proposal reason strings mirror the retro ones", async () => {
 		expect(FORK_PROPOSED_REASON_PREFIX).toBe("Proposed by the fork research ");
-		expect(forkProposedReason("card")).toBe(
-			"Proposed by the fork research card. Accept to start it, edit the prompt first, or cancel to decline.",
+		expect(forkProposedReason("ottr-ai/ottr")).toBe(
+			"Proposed by the fork research ottr-ai/ottr. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
 	});
 

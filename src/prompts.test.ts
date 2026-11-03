@@ -535,7 +535,11 @@ describe("retro prompts", () => {
 
 	test("proposedReason, PROPOSED_REASON_PREFIX and RETRO_MARKER", () => {
 		expect(proposedReason("Fix the widget")).toBe(
-			"Proposed by the retro of Fix the widget. Accept to start it, edit the prompt first, or cancel to decline.",
+			"Proposed by the retro of Fix the widget. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		);
+		// The retro card's title carries the marker: the reason must not double it.
+		expect(proposedReason("Retro of Fix the widget")).toBe(
+			"Proposed by the retro of Fix the widget. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
 		expect(PROPOSED_REASON_PREFIX).toBe("Proposed by the retro of ");
 		expect(RETRO_MARKER).toBe("Retro of ");

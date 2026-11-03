@@ -16,6 +16,8 @@ import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ARCH_REVIEW_MARKER,
+	FORK_PROPOSED_REASON_PREFIX,
+	PROPOSED_REASON_PREFIX,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
@@ -749,9 +751,9 @@ export function discoverProjects(
 /**
  * First non-empty trimmed line of the prompt, max 80 chars — the task's title. Skips section
  * labels (Markdown headings with a single word, e.g. "# Goal") and strips leading `#` marks,
- * so a heading like "# Set up agent rules" becomes the bare text. No code matches on the
- * title text (card kind is a trusted, server-set field, never derived from prompt text),
- * so this is safe to change.
+ * so a heading like "# Set up agent rules" becomes the bare text. Overlong lines cut at a
+ * word boundary (shortTitle), never mid-word. No code matches on the title text (card kind
+ * is a trusted, server-set field, never derived from prompt text), so this is safe to change.
  */
 function deriveTitle(prompt: string): string {
 	const lines = prompt.split("\n").map((line) => line.trim());
@@ -760,7 +762,7 @@ function deriveTitle(prompt: string): string {
 		lines.find((line) => line.length > 0 && !isSectionLabel(line)) ??
 		lines.find((line) => line.length > 0) ??
 		"";
-	return line.replace(/^#+\s*/, "").slice(0, 80);
+	return shortTitle(line.replace(/^#+\s*/, ""), 80);
 }
 
 /**
@@ -1259,6 +1261,35 @@ export class ProjectStore {
 		} catch {
 			/* backfill is best-effort; the next open retries */
 		}
+		// Proposal reasons written before the 2026-11 wording fix double the kind label
+		// ("the retro of Retro of …", "the fork research Fork research: …") and describe
+		// the actions without naming the drawer buttons. replace() with the exact
+		// generated substrings converges held proposals; a converged row no longer
+		// matches, so the pass stays idempotent on every open. Display text only: it
+		// never touches titles, prompts or turn rows.
+		db.run(
+			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || ?, ?)
+			 WHERE needs_reason LIKE ? || ? || '%'`,
+			[
+				PROPOSED_REASON_PREFIX,
+				RETRO_MARKER,
+				PROPOSED_REASON_PREFIX,
+				PROPOSED_REASON_PREFIX,
+				RETRO_MARKER,
+			],
+		);
+		db.run(
+			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || 'Fork research: ', ?)
+			 WHERE needs_reason LIKE ? || 'Fork research: %'`,
+			[
+				FORK_PROPOSED_REASON_PREFIX,
+				FORK_PROPOSED_REASON_PREFIX,
+				FORK_PROPOSED_REASON_PREFIX,
+			],
+		);
+		db.run(
+			`UPDATE tasks SET needs_reason = replace(needs_reason, '. Accept to start it, edit the prompt first, or cancel to decline.', '. Accept starts it. Edit task changes the prompt first. Cancel task declines it.') WHERE needs_reason LIKE '%Accept to start it, edit the prompt first, or cancel to decline.'`,
+		);
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 		// updates a live table, so converge additively like the tasks columns above.
 		const prCols = db

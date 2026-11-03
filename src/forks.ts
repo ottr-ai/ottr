@@ -718,9 +718,9 @@ export function createForkWatcher(deps: {
 					const title = `Fork research: ${fork.owner}/${fork.name} (${range.commits.length} new commits)`;
 					const proposals = result.proposals.slice(0, 5).map((p) => ({
 						prompt: proposalPrompt(fork.owner, fork.name, p),
-						needsReason: forkProposedReason(
-							`Fork research: ${fork.owner}/${fork.name}`,
-						),
+						// owner/name only: the prefix already says "fork research", so the
+						// stored title's label would double it ("the fork research Fork research: …").
+						needsReason: forkProposedReason(`${fork.owner}/${fork.name}`),
 						model: null,
 					}));
 					const open = openProposals(store);
