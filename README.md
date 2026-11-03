@@ -299,6 +299,23 @@ CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; 
 
 For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. It is also the way to refresh the screenshots under `.github/assets/`.
 
+### Screenshot proofs for UI cards
+
+A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board.
+
+1. Start the demo board: `bun run dev`.
+2. Open the UI in a browser tab and drive it to the state you want to show.
+3. Save each shot in one program step with puppeteer `page.screenshot({ path: 'shots/<name>.png' })`. Never move the image bytes through agent text.
+4. Verify each file. The first eight bytes must print `89 50 4e 47 0d 0a 1a 0a`:
+
+   ```sh
+   for f in shots/*.png; do echo "$f: $(od -An -tx1 -N8 "$f")"; done
+   ```
+
+5. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
+
+`/shots/` and `/*.png` sit in `.gitignore`, so the shots stay out of `git status` and never enter a commit.
+
 ## Docs
 
 - [docs/how-it-works.md](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
