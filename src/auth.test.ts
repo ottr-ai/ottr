@@ -1,15 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import {
+	addSession,
 	clearSessionCookie,
+	dropSession,
 	hashPassword,
 	LoginLimiter,
 	newSecret,
+	newSessionId,
 	parseCookies,
 	SESSION_COOKIE,
 	SESSION_MAX_AGE,
+	SESSIONS_CAP,
+	type SessionEntry,
 	secretsEqual,
 	sessionCookie,
+	sessionLabel,
 	signSession,
 	verifyAdminLogin,
 	verifyPassword,
@@ -37,27 +43,47 @@ describe("hashPassword / verifyPassword", () => {
 describe("signSession / verifySession", () => {
 	const secret = newSecret();
 	test("round-trips the name", () => {
-		expect(verifySession(secret, signSession(secret, "ada", 60_000))).toBe(
-			"ada",
-		);
+		expect(verifySession(secret, signSession(secret, "ada", 60_000))).toEqual({
+			name: "ada",
+			id: null,
+		});
 	});
 	test("a name with dots survives (token splits from the END)", () => {
-		expect(verifySession(secret, signSession(secret, "a.b.c", 60_000))).toBe(
-			"a.b.c",
+		expect(verifySession(secret, signSession(secret, "a.b.c", 60_000))).toEqual(
+			{ name: "a.b.c", id: null },
 		);
 	});
 	test("a ';' in the name survives browser cookie truncation", () => {
 		const token = signSession(secret, "a;b", 60_000);
 		expect(token).not.toContain(";");
-		expect(verifySession(secret, token)).toBe("a;b");
+		expect(verifySession(secret, token)).toEqual({ name: "a;b", id: null });
 		// A browser keeps only the value up to the first ';' (RFC 6265). The value the
 		// browser stores must still verify: old code put the raw ';' in the cookie and
 		// truncated to 'a', so every later request got 401.
-		expect(verifySession(secret, token.split(";")[0] ?? "")).toBe("a;b");
+		expect(verifySession(secret, token.split(";")[0] ?? "")).toEqual({
+			name: "a;b",
+			id: null,
+		});
+	});
+	test("an id signs a fourth part and round-trips", () => {
+		// The fixture id uses the exact shape newSessionId mints: the parser
+		// accepts a middle segment as the id only in that shape, so a legacy
+		// name with dots cannot lose its tail to the wider parse.
+		const id = newSessionId();
+		const token = signSession(secret, "ada", 60_000, id);
+		expect(token.split(".").length).toBe(4);
+		expect(verifySession(secret, token)).toEqual({ name: "ada", id });
+	});
+	test("an id-bearing name with dots and semicolons still splits from the END", () => {
+		const id = newSessionId();
+		const token = signSession(secret, "a.b;c", 60_000, id);
+		expect(verifySession(secret, token)).toEqual({ name: "a.b;c", id });
 	});
 	test("expired tokens are rejected", () => {
-		const token = signSession(secret, "ada", -1000);
-		expect(verifySession(secret, token)).toBe(null);
+		expect(verifySession(secret, signSession(secret, "ada", -1000))).toBe(null);
+		expect(verifySession(secret, signSession(secret, "ada", -1000, "i1"))).toBe(
+			null,
+		);
 	});
 	test("tampering with any part is rejected", () => {
 		const token = signSession(secret, "ada", 60_000);
@@ -70,13 +96,93 @@ describe("signSession / verifySession", () => {
 		).toBe(null);
 		const flipped = `${name}.${Number(exp) + 1}.${mac}`;
 		expect(verifySession(secret, flipped)).toBe(null);
-	});
-	test("the wrong secret is rejected, and garbage does not throw", () => {
-		expect(verifySession(newSecret(), signSession(secret, "ada", 60_000))).toBe(
+		const four = signSession(secret, "ada", 60_000, "id0").split(".");
+		const [fname, fid, fexp, fmac] = four;
+		if (fid === undefined || fexp === undefined || fmac === undefined)
+			throw new Error("bad fixture token");
+		expect(verifySession(secret, `eve.${fid}.${fexp}.${fmac}`)).toBe(null);
+		expect(verifySession(secret, `${fname}.${"ff"}.${fexp}.${fmac}`)).toBe(
 			null,
 		);
+	});
+	test("the wrong secret is rejected, and garbage does not throw", () => {
+		expect(
+			verifySession(newSecret(), signSession(secret, "ada", 60_000, "i")),
+		).toBe(null);
 		expect(verifySession(secret, "ada")).toBe(null);
 		expect(verifySession(secret, "")).toBe(null);
+	});
+});
+
+describe("sessionLabel", () => {
+	test("names the common browsers and operating systems", () => {
+		expect(
+			sessionLabel(
+				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			),
+		).toBe("Chrome on macOS");
+		expect(
+			sessionLabel(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+			),
+		).toBe("Firefox on Windows");
+		expect(
+			sessionLabel(
+				"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (Version/17.0 Mobile/15E148 Safari/604.1",
+			),
+		).toBe("Safari on iOS");
+		expect(
+			sessionLabel(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+			),
+		).toBe("Edge on Windows");
+		expect(sessionLabel("curl/8.4.0")).toBe("curl on Unknown OS");
+		expect(sessionLabel(null)).toBe("Unknown browser on Unknown OS");
+		expect(sessionLabel("")).toBe("Unknown browser on Unknown OS");
+	});
+});
+
+describe("addSession / dropSession", () => {
+	const entry = (id: string, lastSeen: number, exp: number): SessionEntry => ({
+		id,
+		label: "l",
+		createdAt: 0,
+		lastSeen,
+		exp,
+	});
+	test("drops expired entries and adds the new one", () => {
+		const now = Date.now();
+		const out = addSession(
+			[entry("old", now, now - 1), entry("live", now, now + 1000)],
+			entry("new", now, now + 1000),
+		);
+		expect(out.map((s) => s.id)).toEqual(["live", "new"]);
+	});
+	test("replaces an entry with the same id", () => {
+		const now = Date.now();
+		const out = addSession(
+			[entry("a", now - 10, now + 1000), entry("b", now, now + 1000)],
+			entry("a", now + 5, now + 1000),
+		);
+		expect(out.length).toBe(2);
+		expect(out.filter((s) => s.id === "a").length).toBe(1);
+	});
+	test("holds the cap at SESSIONS_CAP, dropping the oldest lastSeen", () => {
+		const now = Date.now();
+		const list: SessionEntry[] = [];
+		for (let i = 0; i < SESSIONS_CAP; i++) {
+			list.push(entry(`s${i}`, now + i, now + 3_600_000));
+		}
+		const out = addSession(list, entry("fresh", now + 9999, now + 3_600_000));
+		expect(out.length).toBe(SESSIONS_CAP);
+		expect(out.some((s) => s.id === "fresh")).toBe(true);
+		expect(out.some((s) => s.id === "s0")).toBe(false);
+	});
+	test("dropSession removes only the target", () => {
+		const now = Date.now();
+		const list = [entry("a", now, now + 1000), entry("b", now, now + 1000)];
+		expect(dropSession(list, "a").map((s) => s.id)).toEqual(["b"]);
+		expect(dropSession(list, "zzz").map((s) => s.id)).toEqual(["a", "b"]);
 	});
 });
 
@@ -175,7 +281,10 @@ describe("arch-review changed-line coverage", () => {
 	test("names with spaces and semicolons round-trip and keep the token shape", () => {
 		const token = signSession(secret, "ada lovelace; ok", 60_000);
 		expect(token.split(".")).toHaveLength(3);
-		expect(verifySession(secret, token)).toBe("ada lovelace; ok");
+		expect(verifySession(secret, token)).toEqual({
+			name: "ada lovelace; ok",
+			id: null,
+		});
 	});
 	test("a name part that is not valid percent-encoding is rejected", () => {
 		// "%" alone is a malformed escape: decodeURIComponent throws, and the

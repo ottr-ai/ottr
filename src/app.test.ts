@@ -30,7 +30,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
 import { behindMain, boardWarnings, type Entry } from "./app.ts";
-import { hashPassword } from "./auth.ts";
+import { hashPassword, signSession } from "./auth.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
@@ -5136,7 +5136,7 @@ describe("sign out everywhere", () => {
 			body: body === undefined ? undefined : JSON.stringify(body),
 		});
 
-	test("logout stays per-browser; rotating the secret kills every old cookie", async () => {
+	test("logout drops the caller's session; rotating the secret kills every old cookie", async () => {
 		const login = await call(
 			"/api/login",
 			{},
@@ -5149,14 +5149,26 @@ describe("sign out everywhere", () => {
 		expect(setCookie).toContain("Secure");
 		const session = { cookie: setCookie.split(";")[0] ?? "" };
 		expect((await call("/api/state", session)).status).toBe(200);
-		// Logout clears only the calling browser's cookie: a copied one still works.
+		// Logout clears the cookie and drops the registry entry, so even a copied
+		// cookie of the same session is dead afterwards.
 		await call("/api/logout", session, {});
-		expect((await call("/api/state", session)).status).toBe(200);
-		// Sign out everywhere rotates the secret: the old cookie is dead on every host.
-		expect(
-			(await call("/api/settings/session-secret", session, {})).status,
-		).toBe(200);
 		expect((await call("/api/state", session)).status).toBe(401);
+		// Sign out everywhere rotates the secret: a re-login's fresh cookie is dead
+		// on every host after the rotation.
+		const again = await call(
+			"/api/login",
+			{},
+			{ name: "ada", password: "correct horse" },
+		);
+		expect(again.status).toBe(200);
+		const live = {
+			cookie: (again.headers.get("set-cookie") ?? "").split(";")[0] ?? "",
+		};
+		expect((await call("/api/state", live)).status).toBe(200);
+		expect((await call("/api/settings/session-secret", live, {})).status).toBe(
+			200,
+		);
+		expect((await call("/api/state", live)).status).toBe(401);
 		// Rotation persisted: the stored secret is no longer the one the cookie was signed with.
 		const stored: unknown = g.get("config");
 		expect(
@@ -5166,14 +5178,262 @@ describe("sign out everywhere", () => {
 				stored.sessionSecret !== "revoke-secret",
 		).toBe(true);
 		// And the board still takes logins under the new secret.
-		const again = await call(
+		const fresh = await call(
 			"/api/login",
 			{},
 			{ name: "ada", password: "correct horse" },
 		);
-		expect(again.status).toBe(200);
-		const fresh = (again.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-		expect((await call("/api/state", { cookie: fresh })).status).toBe(200);
+		expect(fresh.status).toBe(200);
+		const freshCookie =
+			(fresh.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		expect((await call("/api/state", { cookie: freshCookie })).status).toBe(
+			200,
+		);
+	});
+});
+
+describe("session registry (OTTR-387)", () => {
+	// Boards opened inside tests register here; one describe-level hook cleans up.
+	const opened: { srv: Server<undefined>; g: GlobalStore }[] = [];
+	afterAll(() => {
+		for (const o of opened) {
+			o.srv.stop(true);
+			o.g.close();
+		}
+	});
+	// A real public host (Host header matches): every request sits behind the auth
+	// wall, like tailscale serve in front of the board. Same shape as the revoke test.
+	function openBoard(name: string, seed: Record<string, unknown> = {}) {
+		const g = GlobalStore.open(join(root, name));
+		g.set("config", {
+			admin: { name: "ada", passHash: hashPassword("correct horse") },
+			apiKey: `${name}-key`,
+			sessionSecret: `${name}-secret`,
+			...seed,
+		});
+		const app = createApp({
+			gstore: g,
+			projects: new Map(),
+			defaultDir: root,
+			cancel: async () => ({ removed: true }),
+			stopTurn: async () => ({ ok: true }),
+			finishKept: async () => ({ ok: true }),
+			claimedPids: () => new Set<number>(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: ["board.example"],
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				removedPaths: [],
+				envValues: {},
+				projectPaths: [],
+			},
+			serverRef: { current: undefined },
+		});
+		const srv = Bun.serve({ port: 0, ...app.serveOptions });
+		app.serverRef.current = srv;
+		opened.push({ srv, g });
+		const call = (
+			path: string,
+			headers: Record<string, string> = {},
+			body?: unknown,
+		) => {
+			// An explicit headers.method (DELETE) wins; it is consumed, not sent as a header.
+			const { method, ...rest } = headers;
+			return fetch(new URL(path, srv.url), {
+				method: method ?? (body === undefined ? "GET" : "POST"),
+				headers: {
+					"content-type": "application/json",
+					Host: "board.example",
+					Origin: "https://board.example",
+					...rest,
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			});
+		};
+		const login = async (ua: string) => {
+			const res = await call(
+				"/api/login",
+				{ "user-agent": ua },
+				{ name: "ada", password: "correct horse" },
+			);
+			const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+			const parts = cookie.replace("ottr.session=", "").split(".");
+			// token = name.id.exp.mac, so the id sits third from the END.
+			return { res, cookie, id: parts[parts.length - 3] ?? "" };
+		};
+		return { g, srv, call, login };
+	}
+
+	test("two logins list two rows, newest first, exactly one current", async () => {
+		const { call, login } = openBoard("g-sess-list");
+		const a = await login("curl/8.4.0");
+		expect(a.res.status).toBe(200);
+		// The server stamps lastSeen from the real clock inside createApp, and no fake-timer
+		// seam crosses the fetch boundary: this real 5ms wait buys a distinct lastSeen.
+		await Bun.sleep(5);
+		const b = await login(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+		);
+		expect(b.res.status).toBe(200);
+		const body = (await (
+			await call("/api/settings/sessions", { cookie: b.cookie })
+		).json()) as {
+			sessions: {
+				id: string;
+				label: string;
+				createdAt: number;
+				lastSeen: number;
+				current: boolean;
+			}[];
+		};
+		expect(body.sessions.length).toBe(2);
+		expect(body.sessions[0]?.id).toBe(b.id);
+		expect(body.sessions[0]?.current).toBe(true);
+		expect(body.sessions[0]?.label).toBe("Firefox on Windows");
+		expect(body.sessions[1]?.id).toBe(a.id);
+		expect(body.sessions[1]?.current).toBe(false);
+		expect(body.sessions[1]?.label).toBe("curl on Unknown OS");
+		expect(body.sessions[1]?.lastSeen).toBeLessThan(
+			body.sessions[0]?.lastSeen ?? 0,
+		);
+	});
+
+	test("revoking A ends A, keeps B; unknown id answers 404", async () => {
+		const { call, login } = openBoard("g-sess-revoke");
+		const a = await login("curl/8.4.0");
+		const b = await login("curl/8.4.0");
+		const del = await call(`/api/settings/sessions/${a.id}`, {
+			method: "DELETE",
+			cookie: b.cookie,
+		});
+		expect(del.status).toBe(200);
+		expect(await del.json()).toEqual({ ok: true });
+		expect((await call("/api/state", { cookie: a.cookie })).status).toBe(401);
+		expect((await call("/api/state", { cookie: b.cookie })).status).toBe(200);
+		const gone = await call("/api/settings/sessions/nope", {
+			method: "DELETE",
+			cookie: b.cookie,
+		});
+		expect(gone.status).toBe(404);
+		expect(await gone.json()).toEqual({ error: "no such session" });
+	});
+
+	test("logout removes only the caller's own entry", async () => {
+		const { call, login } = openBoard("g-sess-logout");
+		const a = await login("curl/8.4.0");
+		const b = await login("curl/8.4.0");
+		await call("/api/logout", { cookie: a.cookie }, {});
+		expect((await call("/api/state", { cookie: a.cookie })).status).toBe(401);
+		const body = (await (
+			await call("/api/settings/sessions", { cookie: b.cookie })
+		).json()) as {
+			sessions: { id: string }[];
+		};
+		expect(body.sessions.map((s) => s.id)).toEqual([b.id]);
+	});
+
+	test("a legacy three-part token works until rotation kills it", async () => {
+		const { call } = openBoard("g-sess-legacy");
+		const legacy = {
+			cookie: `ottr.session=${signSession("g-sess-legacy-secret", "ada", 60_000)}`,
+		};
+		expect((await call("/api/state", legacy)).status).toBe(200);
+		// Legacy tokens are not listed and cannot be revoked one by one.
+		const body = (await (
+			await call("/api/settings/sessions", legacy)
+		).json()) as {
+			sessions: unknown[];
+		};
+		expect(body.sessions).toEqual([]);
+		expect(
+			(await call("/api/settings/session-secret", legacy, {})).status,
+		).toBe(200);
+		expect((await call("/api/state", legacy)).status).toBe(401);
+	});
+
+	test("rotation empties the registry", async () => {
+		const { call, login } = openBoard("g-sess-rotate");
+		const a = await login("curl/8.4.0");
+		expect(
+			(await call("/api/settings/session-secret", { cookie: a.cookie }, {}))
+				.status,
+		).toBe(200);
+		// The old cookie dies with the secret, so the check needs a fresh login.
+		expect(
+			(await call("/api/settings/sessions", { cookie: a.cookie })).status,
+		).toBe(401);
+		const b = await login("curl/8.4.0");
+		const body = (await (
+			await call("/api/settings/sessions", { cookie: b.cookie })
+		).json()) as {
+			sessions: { id: string }[];
+		};
+		// The old entries died with the rotation; b's own fresh login is the only row.
+		expect(body.sessions.map((s) => s.id)).toEqual([b.id]);
+	});
+
+	test("the cap holds at 50 and drops the oldest lastSeen", async () => {
+		const now = Date.now();
+		const stale: {
+			id: string;
+			label: string;
+			createdAt: number;
+			lastSeen: number;
+			exp: number;
+		}[] = [];
+		for (let i = 0; i < 50; i++) {
+			stale.push({
+				id: `stale${i}`,
+				label: "seeded",
+				createdAt: now,
+				lastSeen: now + i,
+				exp: now + 3_600_000,
+			});
+		}
+		const { call, login } = openBoard("g-sess-cap", { sessions: stale });
+		const fresh = await login("curl/8.4.0");
+		expect(fresh.res.status).toBe(200);
+		const body = (await (
+			await call("/api/settings/sessions", { cookie: fresh.cookie })
+		).json()) as {
+			sessions: { id: string }[];
+		};
+		expect(body.sessions.length).toBe(50);
+		expect(body.sessions.some((s) => s.id === "stale0")).toBe(false);
+		expect(body.sessions.some((s) => s.id === fresh.id)).toBe(true);
+	});
+
+	test("guards: 401 without auth, 200 with the key but no current, 403 cross-origin", async () => {
+		const { call, login, srv } = openBoard("g-sess-guard");
+		const a = await login("curl/8.4.0");
+		expect((await call("/api/settings/sessions")).status).toBe(401);
+		const keyed = await call("/api/settings/sessions", {
+			"x-api-key": "g-sess-guard-key",
+		});
+		expect(keyed.status).toBe(200);
+		const keyBody = (await keyed.json()) as {
+			sessions: { id: string; current: boolean }[];
+		};
+		expect(keyBody.sessions.length).toBe(1);
+		expect(keyBody.sessions[0]?.current).toBe(false);
+		expect(keyBody.sessions[0]?.id).toBe(a.id);
+		const cross = await fetch(
+			new URL(`/api/settings/sessions/${a.id}`, srv.url),
+			{
+				method: "DELETE",
+				headers: {
+					Host: "board.example",
+					Origin: "http://evil.example",
+					cookie: a.cookie,
+				},
+			},
+		);
+		expect(cross.status).toBe(403);
+		expect(await cross.json()).toEqual({ error: "forbidden origin" });
 	});
 });
 

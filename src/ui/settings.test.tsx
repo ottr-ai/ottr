@@ -4,7 +4,11 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ProjectView } from "../types.ts";
-import { GitHostsSection, ProjectSettingsForm } from "./settings.tsx";
+import {
+	GitHostsSection,
+	ProjectSettingsForm,
+	SessionSection,
+} from "./settings.tsx";
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -521,6 +525,102 @@ describe("ProjectSettingsForm target branch", () => {
 			});
 			expect(postBody).not.toBeUndefined();
 			expect(postBody?.targetBranch).toBe("develop");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+/** Mounts SessionSection against `fetchMock`, same cleanup as mountSection. */
+async function mountSessions(fetchMock: typeof fetch): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchMock;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(<SessionSection />);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		},
+	};
+}
+
+describe("SessionSection", () => {
+	test("the list renders one row per session and marks only the current browser", async () => {
+		const fetchMock = (async (): Promise<Response> =>
+			new Response(
+				JSON.stringify({
+					sessions: [
+						{
+							id: "a".repeat(24),
+							label: "Firefox on Windows",
+							createdAt: Date.now() - 3 * 86_400_000,
+							lastSeen: Date.now() - 2 * 86_400_000,
+							current: false,
+						},
+						{
+							id: "b".repeat(24),
+							label: "Chrome on Linux",
+							createdAt: Date.now() - 10 * 60_000,
+							lastSeen: Date.now() - 2 * 60_000,
+							current: true,
+						},
+					],
+				}),
+			)) as unknown as typeof fetch;
+		const { container, unmount } = await mountSessions(fetchMock);
+		try {
+			const card = container.querySelector("#session-section");
+			expect(card).not.toBeNull();
+			const rows = card?.querySelectorAll(".session-row");
+			expect(rows?.length).toBe(3); // two sessions + the sign-out-everywhere row
+			expect(container.textContent).toContain("Firefox on Windows");
+			expect(container.textContent).toContain("Chrome on Linux");
+			expect(container.textContent).toContain("This browser");
+			expect(card?.querySelectorAll(".session-current").length).toBe(1);
+			expect(
+				card?.querySelectorAll(
+					'button[aria-label="Log out Firefox on Windows"]',
+				),
+			).toHaveLength(1);
+			expect(
+				card?.querySelectorAll('button[aria-label="Log out Chrome on Linux"]'),
+			).toHaveLength(1);
+			expect(container.textContent).toContain("Sign out everywhere");
+			// Ids are never rendered.
+			expect(container.textContent).not.toContain("a".repeat(24));
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed list fetch shows the failure line and keeps Sign out everywhere", async () => {
+		const fetchMock = (async (): Promise<Response> =>
+			new Response(JSON.stringify({ error: "boom" }), {
+				status: 500,
+			})) as unknown as typeof fetch;
+		const { container, unmount } = await mountSessions(fetchMock);
+		try {
+			const card = container.querySelector("#session-section");
+			expect(card).not.toBeNull();
+			expect(container.textContent).toContain("Sessions could not be loaded.");
+			expect(
+				card?.querySelectorAll('button[aria-label="Sign out everywhere"]'),
+			).toHaveLength(1);
+			expect(container.textContent).not.toContain("Log out ");
 		} finally {
 			await unmount();
 		}

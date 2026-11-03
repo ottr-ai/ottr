@@ -50,6 +50,7 @@ import {
 } from "./models.ts";
 import { SETTINGS_HASH, settingsSub } from "./route.ts";
 import { refreshState } from "./socket.ts";
+import { age } from "./time.ts";
 
 /** Save-button body: the brief saved confirmation, else the plain label. */
 function SaveLabel({ saved }: { saved: boolean }) {
@@ -926,9 +927,56 @@ function ApiKeySection() {
 	);
 }
 
-/** Settings "Session" section: rotate the session secret, revoking every browser's login. */
-function SessionSection() {
+/** One listed login session, as the server returns it. */
+type SessionEntry = {
+	id: string;
+	label: string;
+	createdAt: number;
+	lastSeen: number;
+	current: boolean;
+};
+
+/** Settings "Session" section: the list of logins, per-row logout, and
+ *  "Sign out everywhere", which rotates the session secret and revokes all. */
+export function SessionSection() {
 	const busy = useBusy();
+	const revokeBusy = useBusy();
+	const [sessions, setSessions] = useState<SessionEntry[] | null>(null);
+	const [loadFailed, setLoadFailed] = useState(false);
+	// Which row's logout call is in flight, for that row's spinner.
+	const [revokingId, setRevokingId] = useState<string | null>(null);
+	const load = useCallback(async (): Promise<void> => {
+		const { sessions: list } = await unwrap<{
+			sessions: SessionEntry[];
+		}>(await fetch("/api/settings/sessions"));
+		setLoadFailed(false);
+		setSessions(list);
+	}, []);
+	useEffect(() => {
+		load().catch(() => setLoadFailed(true));
+	}, [load]);
+	const revoke = (entry: SessionEntry): void => {
+		if (!window.confirm(`Log out ${entry.label}?`)) return;
+		setRevokingId(entry.id);
+		revokeBusy.start(async () => {
+			try {
+				await unwrap(
+					await fetch(
+						`/api/settings/sessions/${encodeURIComponent(entry.id)}`,
+						{ method: "DELETE" },
+					),
+				);
+				// Revoking this browser's own session kills its cookie: land on the login gate.
+				if (entry.current) await logOut();
+				else await load();
+				return true;
+			} catch {
+				return false;
+			} finally {
+				setRevokingId(null);
+			}
+		});
+	};
 	const signOutEverywhere = (): void => {
 		if (
 			!window.confirm(
@@ -954,20 +1002,57 @@ function SessionSection() {
 			help="Sign out everywhere ends every login session on every device. Use it when you lose a device or a session cookie leaks."
 			hint="Logout in the top bar signs out only this browser. If a device is lost or a cookie escaped, sign out everywhere: every login session is revoked."
 		>
-			<button
-				type="button"
-				className="icon danger"
-				aria-label="Sign out everywhere"
-				title="Sign out everywhere"
-				onClick={signOutEverywhere}
-				disabled={busy.busy}
-			>
-				{busy.busy ? (
-					<span className="spinner" aria-hidden="true" />
-				) : (
-					<Icon name="log-out" />
-				)}
-			</button>
+			{loadFailed ? (
+				<p className="session-failed">Sessions could not be loaded.</p>
+			) : sessions === null ? null : (
+				<div className="session-rows">
+					{sessions.map((entry) => (
+						<div key={entry.id} className="access-row session-row">
+							<div className="session-info">
+								<div className="session-label">
+									{entry.label}
+									{entry.current && (
+										<span className="session-current">This browser</span>
+									)}
+								</div>
+								<div className="session-times">
+									{`Last seen ${age(entry.lastSeen)} · Signed in ${age(entry.createdAt)}`}
+								</div>
+							</div>
+							<button
+								type="button"
+								className="icon danger"
+								aria-label={`Log out ${entry.label}`}
+								title={`Log out ${entry.label}`}
+								onClick={() => revoke(entry)}
+								disabled={revokeBusy.busy}
+							>
+								{revokingId === entry.id ? (
+									<span className="spinner" aria-hidden="true" />
+								) : (
+									<Icon name="log-out" />
+								)}
+							</button>
+						</div>
+					))}
+				</div>
+			)}
+			<div className="access-row session-row session-signout">
+				<button
+					type="button"
+					className="icon danger"
+					aria-label="Sign out everywhere"
+					title="Sign out everywhere"
+					onClick={signOutEverywhere}
+					disabled={busy.busy}
+				>
+					{busy.busy ? (
+						<span className="spinner" aria-hidden="true" />
+					) : (
+						<Icon name="log-out" />
+					)}
+				</button>
+			</div>
 		</SettingsCard>
 	);
 }

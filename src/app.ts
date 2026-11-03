@@ -23,15 +23,20 @@ import {
 } from "./alate.ts";
 import { aptListPath, workerProjects } from "./apt.ts";
 import {
+	addSession,
 	clearSessionCookie,
+	dropSession,
 	hashPassword,
 	LoginLimiter,
 	newSecret,
+	newSessionId,
 	parseCookies,
 	SESSION_COOKIE,
 	SESSION_MS,
+	type SessionEntry,
 	secretsEqual,
 	sessionCookie,
+	sessionLabel,
 	signSession,
 	verifyAdminLogin,
 	verifySession,
@@ -714,6 +719,8 @@ export function createApp(deps: AppDeps) {
 	let admin: { name: string; passHash: string } | null = null;
 	let apiKey: string | null = null;
 	let sessionSecret: string | null = null;
+	/** Login registry; one entry per signed-in browser, see docs/specs/session-registry.md. */
+	let sessions: SessionEntry[] = [];
 	// Login failures: 10 per source, 100 global, sliding 15 min window.
 	const loginLimiter = new LoginLimiter(15 * 60 * 1000, 10, 100);
 	/** VAPID keys for Web Push; generated lazily on the first push path so boot stays silent. */
@@ -1343,6 +1350,7 @@ export function createApp(deps: AppDeps) {
 			admin,
 			apiKey,
 			sessionSecret,
+			sessions,
 			vapid,
 			alate,
 			githubToken,
@@ -1364,6 +1372,7 @@ export function createApp(deps: AppDeps) {
 		admin?: unknown;
 		apiKey?: unknown;
 		sessionSecret?: unknown;
+		sessions?: unknown;
 		vapid?: unknown;
 		alate?: unknown;
 		githubToken?: unknown;
@@ -1403,6 +1412,20 @@ export function createApp(deps: AppDeps) {
 		if (typeof parsed.apiKey === "string") apiKey = parsed.apiKey;
 		if (typeof parsed.sessionSecret === "string")
 			sessionSecret = parsed.sessionSecret;
+		// Only well-formed entries survive a restore; anything else keeps the default ([]).
+		if (Array.isArray(parsed.sessions)) {
+			sessions = parsed.sessions.filter(
+				(s): s is SessionEntry =>
+					typeof s === "object" &&
+					s !== null &&
+					typeof (s as SessionEntry).id === "string" &&
+					(s as SessionEntry).id !== "" &&
+					typeof (s as SessionEntry).label === "string" &&
+					Number.isFinite((s as SessionEntry).createdAt) &&
+					Number.isFinite((s as SessionEntry).lastSeen) &&
+					Number.isFinite((s as SessionEntry).exp),
+			);
+		}
 		if (
 			typeof parsed.vapid === "object" &&
 			parsed.vapid !== null &&
@@ -1675,7 +1698,20 @@ export function createApp(deps: AppDeps) {
 			return true;
 		if (sessionSecret === null) return false;
 		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
-		return token !== undefined && verifySession(sessionSecret, token) !== null;
+		if (token === undefined) return false;
+		const v = verifySession(sessionSecret, token);
+		if (v === null) return false;
+		// Legacy tokens carry no id and stay valid until natural expiry. A signed id must
+		// still have its registry entry; coarse lastSeen persists at most once per minute.
+		if (v.id === null) return true;
+		const entry = sessions.find((s) => s.id === v.id);
+		if (entry === undefined) return false;
+		const now = Date.now();
+		if (now - entry.lastSeen >= 60_000) {
+			entry.lastSeen = now;
+			saveConfig();
+		}
+		return true;
 	}
 
 	/** True when the request arrived under a public host (HTTPS via tailscale serve). */
@@ -3003,12 +3039,24 @@ export function createApp(deps: AppDeps) {
 					sessionSecret = newSecret();
 					apiKey = newSecret();
 					githubToken = token;
+					const now = Date.now();
+					const id = newSessionId();
+					sessions = addSession(sessions, {
+						id,
+						label: sessionLabel(req.headers.get("user-agent")),
+						createdAt: now,
+						lastSeen: now,
+						exp: now + SESSION_MS,
+					});
 					saveConfig();
 					applyGithubToken();
 					const secure = viaPublicHost(req);
 					return withCookie(
 						json({ ok: true, apiKey }),
-						sessionCookie(signSession(sessionSecret, name, SESSION_MS), secure),
+						sessionCookie(
+							signSession(sessionSecret, name, SESSION_MS, id),
+							secure,
+						),
 					);
 				}),
 		},
@@ -3044,10 +3092,20 @@ export function createApp(deps: AppDeps) {
 						loginLimiter.recordFailed(source);
 						return json({ error: "invalid name or password" }, 401);
 					}
+					const now = Date.now();
+					const id = newSessionId();
+					sessions = addSession(sessions, {
+						id,
+						label: sessionLabel(req.headers.get("user-agent")),
+						createdAt: now,
+						lastSeen: now,
+						exp: now + SESSION_MS,
+					});
+					saveConfig();
 					return withCookie(
 						json({ ok: true }),
 						sessionCookie(
-							signSession(sessionSecret, name, SESSION_MS),
+							signSession(sessionSecret, name, SESSION_MS, id),
 							viaPublicHost(req),
 							remember,
 						),
@@ -3055,13 +3113,26 @@ export function createApp(deps: AppDeps) {
 				}),
 		},
 		"/api/logout": {
+			// Open route: without a valid cookie it only clears the cookie, as before.
 			POST: (req) =>
-				api(req, async () =>
-					withCookie(
+				api(req, async () => {
+					const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+					if (sessionSecret !== null && token !== undefined) {
+						const v = verifySession(sessionSecret, token);
+						if (
+							v !== null &&
+							v.id !== null &&
+							sessions.some((s) => s.id === v.id)
+						) {
+							sessions = dropSession(sessions, v.id);
+							saveConfig();
+						}
+					}
+					return withCookie(
 						json({ ok: true }),
 						clearSessionCookie(viaPublicHost(req)),
-					),
-				),
+					);
+				}),
 		},
 		"/api/settings/api-key": {
 			GET: (req) => api(req, async () => json({ apiKey })),
@@ -3082,6 +3153,46 @@ export function createApp(deps: AppDeps) {
 					if (sessionSecret === null)
 						return json({ error: "no admin configured" }, 400);
 					sessionSecret = newSecret();
+					// The registry dies with the secret: no ghost rows survive the rotation.
+					sessions = [];
+					saveConfig();
+					return json({ ok: true });
+				}),
+		},
+		"/api/settings/sessions": {
+			GET: (req) =>
+				api(req, async () => {
+					const now = Date.now();
+					const live = sessions.filter((s) => s.exp > now);
+					// Lazy pruning: persist only when serving the list actually dropped entries.
+					if (live.length !== sessions.length) {
+						sessions = live;
+						saveConfig();
+					}
+					const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+					const currentId =
+						sessionSecret !== null && token !== undefined
+							? (verifySession(sessionSecret, token)?.id ?? null)
+							: null;
+					return json({
+						sessions: [...live]
+							.sort((a, b) => b.lastSeen - a.lastSeen)
+							.map((s) => ({
+								id: s.id,
+								label: s.label,
+								createdAt: s.createdAt,
+								lastSeen: s.lastSeen,
+								current: s.id === currentId,
+							})),
+					});
+				}),
+		},
+		"/api/settings/sessions/:id": {
+			DELETE: (req) =>
+				api(req, async () => {
+					if (!sessions.some((s) => s.id === req.params.id))
+						return json({ error: "no such session" }, 404);
+					sessions = dropSession(sessions, req.params.id);
 					saveConfig();
 					return json({ ok: true });
 				}),

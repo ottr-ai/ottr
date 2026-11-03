@@ -6118,6 +6118,51 @@ button.diff-path {
 	background: var(--crit-bg);
 	border-color: var(--crit);
 }
+/* Session card: one row per login, secondary "when" line, per-row logout
+   button, and "Sign out everywhere" as the last row. */
+.session-rows {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+.session-row {
+	min-height: 36px;
+	padding: 2px 0;
+	justify-content: space-between;
+}
+.session-row + .session-row {
+	border-top: 1px solid var(--line-soft);
+}
+.session-info {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.session-label {
+	font-size: 12px;
+	color: var(--text);
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+/* Text mark for the caller's own browser; not color alone. */
+.session-current {
+	font-size: 11px;
+	color: var(--dim);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	padding: 0 5px;
+	white-space: nowrap;
+}
+.session-times {
+	font-size: 11px;
+	color: var(--dim);
+}
+.session-failed {
+	font-size: 12px;
+	color: var(--dim);
+}
 /* Auth page: standalone gate when a public host demands credentials. */
 .auth-page {
 	min-height: 100dvh;
