@@ -195,6 +195,7 @@ export async function checkAppInstalls(deps: {
 		url: null,
 		repos: deps.repos,
 		missing: [],
+		private: [],
 		error: null,
 	};
 	const get = (path: string) =>
@@ -219,8 +220,25 @@ export async function checkAppInstalls(deps: {
 				: null;
 		for (const repo of deps.repos) {
 			const res = await get(`/repos/${repo}/installation`);
-			if (res.status === 404) out.missing.push(repo);
-			else if (!res.ok) {
+			if (res.status === 404) {
+				// A repo the app cannot see is private or gone; those get no
+				// outside PRs, so no warning names them.
+				const probe = await get(`/repos/${repo}`);
+				if (probe.status === 404) {
+					out.private.push(repo);
+					continue;
+				}
+				if (!probe.ok) {
+					out.error = `repo lookup for ${repo} answered ${probe.status}`;
+					return out;
+				}
+				const probeBody = (await probe.json()) as { private?: unknown };
+				if (probeBody.private === true) {
+					out.private.push(repo);
+					continue;
+				}
+				out.missing.push(repo);
+			} else if (!res.ok) {
 				out.error = `installation lookup for ${repo} answered ${res.status}`;
 				return out;
 			}

@@ -299,14 +299,17 @@ describe("AppTokenSource", () => {
 });
 
 describe("checkAppInstalls", () => {
-	const run = (responses: Array<Response | { status: number }>) => {
+	const run = (
+		responses: Array<Response | { status: number }>,
+		repos: string[] = ["octo/a", "octo/b", "skare/c"],
+	) => {
 		const { calls, fetchImpl } = recordingFetch(responses);
 		return {
 			calls,
 			check: checkAppInstalls({
 				appId: APP_ID,
 				keyObject: privateKey,
-				repos: ["octo/a", "octo/b", "skare/c"],
+				repos,
 				fetchImpl,
 				now: () => NOW,
 			}),
@@ -319,7 +322,9 @@ describe("checkAppInstalls", () => {
 			okResponse(APP),
 			okResponse(INSTALLATION),
 			{ status: 404 },
+			okResponse({ private: false }),
 			{ status: 404 },
+			okResponse({ private: false }),
 		]);
 		expect(await check).toEqual({
 			at: NOW,
@@ -327,15 +332,60 @@ describe("checkAppInstalls", () => {
 			url: "https://github.com/apps/ottr-ai",
 			repos: ["octo/a", "octo/b", "skare/c"],
 			missing: ["octo/b", "skare/c"],
+			private: [],
 			error: null,
 		});
 		expect(calls.map((c) => c.url)).toEqual([
 			"https://api.github.com/app",
 			"https://api.github.com/repos/octo/a/installation",
 			"https://api.github.com/repos/octo/b/installation",
+			"https://api.github.com/repos/octo/b",
 			"https://api.github.com/repos/skare/c/installation",
+			"https://api.github.com/repos/skare/c",
 		]);
 		expect(headerOf(calls[0]).authorization).toMatch(/^Bearer /);
+	});
+
+	test("a private repo stays out of missing", async () => {
+		const { calls, check } = run(
+			[okResponse(APP), { status: 404 }, okResponse({ private: true })],
+			["octo/a"],
+		);
+		const c = await check;
+		expect(c.missing).toEqual([]);
+		expect(c.private).toEqual(["octo/a"]);
+		expect(c.error).toBeNull();
+		expect(calls.map((x) => x.url)).toEqual([
+			"https://api.github.com/app",
+			"https://api.github.com/repos/octo/a/installation",
+			"https://api.github.com/repos/octo/a",
+		]);
+	});
+
+	test("a repo the app cannot see stays out of missing", async () => {
+		const { check } = run(
+			[okResponse(APP), { status: 404 }, { status: 404 }],
+			["octo/a"],
+		);
+		expect(await check).toEqual({
+			at: NOW,
+			name: "ottr-ai",
+			url: "https://github.com/apps/ottr-ai",
+			repos: ["octo/a"],
+			missing: [],
+			private: ["octo/a"],
+			error: null,
+		});
+	});
+
+	test("a failed repo lookup stops with an error and no key", async () => {
+		const { check } = run(
+			[okResponse(APP), { status: 404 }, { status: 500 }],
+			["octo/a"],
+		);
+		const c = await check;
+		expect(c.error).toBe("repo lookup for octo/a answered 500");
+		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
 	});
 
 	test("a failed app lookup stops before the repos", async () => {
@@ -371,6 +421,7 @@ describe("appCheckWarning", () => {
 		url: "https://github.com/apps/ottr-ai",
 		repos: ["octo/a", "octo/b"],
 		missing: [] as string[],
+		private: [],
 		error: null,
 	};
 	test("no check or no missing repo gives no warning", () => {

@@ -194,6 +194,8 @@ export type AppCheck = {
 	repos: string[];
 	/** Board repos without an installation of the app (lookup 404). */
 	missing: string[];
+	/** Board repos without an installation that the app cannot see as public (private or gone); they get no outside pull requests, so no warning names them. */
+	private: string[];
 	/** First failure other than a 404; never holds the key. */
 	error: string | null;
 };

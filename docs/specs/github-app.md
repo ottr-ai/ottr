@@ -54,15 +54,23 @@ person clicked Post. Spec: [pr-reviews.md](pr-reviews.md).
 - Board repos: `ownerRepo(e.github)` of each project with a GitHub remote, sorted, unique.
 - `GET /app` with the app JWT gives `name` and `html_url` (https only, else null). A non-2xx
   answer stops the check with `app lookup answered <status>`.
-- `GET /repos/{owner}/{repo}/installation` for each repo: 404 adds the repo to `missing`.
-  Another non-2xx answer stops the check with `installation lookup for <repo> answered <status>`.
-- `AppCheck = { at, name, url, repos, missing, error }`. No field holds the key.
+- `GET /repos/{owner}/{repo}/installation` for each repo. A 404 starts one more call,
+  `GET /repos/{owner}/{repo}`:
+  - The repo lookup answers 200 with `private: true`, or 404 (the app cannot see the
+    repo: private or gone), adds the repo to `private`. Those repos get no outside pull
+    requests, so no warning names them.
+  - A 200 with `private: false` adds the repo to `missing`.
+  - Another answer stops the check with `repo lookup for <repo> answered <status>`.
+  - An installation lookup with another non-2xx answer stops the check with
+    `installation lookup for <repo> answered <status>`.
+- `AppCheck = { at, name, url, repos, missing, private, error }`. No field holds the key.
 - `state.warnings` gains one line while the app is set and the check has an error or a
-  missing repo. The error line wins. The missing line names the app, the repos and
-  `<url>/installations/new`.
+  missing repo. The error line wins. The missing line names the app, the public repos
+  without an installation, and `<url>/installations/new`.
 - Settings → Git hosts shows the app name (a link to `url`), then one line: "Installed on all
   N board repos", "Not installed on …" with an install link, or "Check failed: …".
-- Cost: 1 + one call per repo every 10 minutes, far below the app rate limit.
+- Cost: 1 + one call per repo plus one repo lookup per repo without an installation,
+  every 10 minutes, far below the app rate limit.
 
 ## Post route
 
