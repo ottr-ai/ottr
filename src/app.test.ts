@@ -2024,8 +2024,14 @@ describe("alate routes", () => {
 				text: "approved",
 			});
 			expect(res.status).toBe(200);
-			expect(p1.store.getTask(held.id)!.updateMergeHead).toBe("sha-parked");
-			expect(p1.store.getTask(held.id)!.holdHead).toBeNull();
+			const approved = p1.store.getTask(held.id)!;
+			// stage merging + state queued: the scheduler picks it for a merge turn, not a work turn.
+			expect(approved.stage).toBe("merging");
+			expect(approved.state).toBe("queued");
+			expect(approved.updateMergeHead).toBe("sha-parked");
+			expect(approved.holdHead).toBeNull();
+			// The approval itself queues no work prompt.
+			expect(approved.pendingPrompt).toBeNull();
 			// An agent can write the hold text itself (a needs_you question): no settle parked
 			// a head, so the reply approves nothing.
 			const forged = p1.store.createTask("update pins");
@@ -2039,6 +2045,25 @@ describe("alate routes", () => {
 			});
 			expect(fres.status).toBe(200);
 			expect(p1.store.getTask(forged.id)!.updateMergeHead).toBeNull();
+			// A change request keeps the work-reply path: a work turn with the text, the hold stays parked.
+			const revise = p1.store.createTask("update pins");
+			p1.store.updateTask(revise.id, {
+				updateIds: ["x@1"],
+				needsReason: UPDATE_HOLD_REASON,
+				state: "needs_you",
+				holdHead: "sha-parked",
+				stage: "in_progress",
+			});
+			const rres = await post(`/api/projects/p1/tasks/${revise.id}/reply`, {
+				text: "also bump the minor version",
+			});
+			expect(rres.status).toBe(200);
+			const revised = p1.store.getTask(revise.id)!;
+			expect(revised.stage).toBe("in_progress");
+			expect(revised.state).toBe("queued");
+			expect(revised.pendingPrompt).toBe("also bump the minor version");
+			expect(revised.updateMergeHead).toBeNull();
+			expect(revised.holdHead).toBe("sha-parked");
 			// Control: a needs_you card with any other reason keeps the column null.
 			const control = p1.store.createTask("other question");
 			p1.store.updateTask(control.id, {
@@ -2051,6 +2076,7 @@ describe("alate routes", () => {
 			});
 			expect(cres.status).toBe(200);
 			expect(p1.store.getTask(control.id)!.updateMergeHead).toBeNull();
+			expect(p1.store.getTask(control.id)!.holdHead).toBe("sha-parked");
 		});
 
 		test("a reply on a parked merge-mismatch card approves the parked push head", async () => {
@@ -5871,10 +5897,16 @@ describe("fork research routes", () => {
 			holdHead: "sha-parked",
 		});
 		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
-			text: "approve",
+			text: "approved",
 		});
 		expect(res.status).toBe(200);
-		expect(store.getTask(t.id)?.forkMergeHead).toBe("sha-parked");
+		const after = store.getTask(t.id)!;
+		// stage merging + state queued: the next turn is a merge turn.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.forkMergeHead).toBe("sha-parked");
+		expect(after.holdHead).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
 	});
 });
 

@@ -2811,7 +2811,7 @@ describe("turn classify wiring", () => {
 		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
-	test("integrated outcome without an integrated head asks you", async () => {
+	test("a work turn's integrated outcome is rejected without a git look", async () => {
 		const record = baseRecord();
 		const store = freshStore();
 		const loop = createTurnLoop(
@@ -2825,9 +2825,7 @@ describe("turn classify wiring", () => {
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
 		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toBe(
-			"Reported integrated, but HEAD is not on origin/main.",
-		);
+		expect(after.needsReason).toBe("Work turns do not merge; report ready.");
 	});
 
 	test("a worktree that lost its git link settles done from the branch proof", async () => {
@@ -5355,9 +5353,36 @@ describe("lost-process sweep", () => {
 			fakeOps(record, {
 				maxTotalRuns: () => 1,
 				pidAlive: (pid: number) => pid !== 4242,
+				// A review never leaves commits on its base: its answered report settles done.
+				commitsAhead: async () => 0,
 				targetSha: async (_mainPath: string, ref: string) =>
 					ref === "HEAD" ? "abc123def456" : null,
-				startRun: hungRun(record, markStarted),
+				// Run 1 hangs on a dead pid. Run 2 is the review's resume: a review is
+				// read-only, it reports answered. Run 3 is the held merge turn: it lands
+				// and reports integrated (only a merge turn may).
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					if (record.runs.length === 1) {
+						markStarted();
+						return {
+							pid: 4242,
+							done: Promise.withResolvers<RunResult>().promise,
+							kill: async () => {
+								record.killed = true;
+							},
+						};
+					}
+					const outcome =
+						record.runs.length === 2
+							? ({ status: "answered", summary: "did it" } satisfies Outcome)
+							: ({ status: "integrated", summary: "landed" } satisfies Outcome);
+					return {
+						pid: 5050,
+						done: Promise.resolve(runResult({ outcome })),
+						kill: async () => {},
+					};
+				},
 			}),
 		);
 		// The clipshelf shape: a review hangs on a dead pid while it holds every queued merge
@@ -8489,8 +8514,9 @@ describe("turn update-card merge hold (U7)", () => {
 	});
 
 	// AGEN-24: the parked hold text reached the approving turn as a rejected report and the
-	// agent read "reply to approve the merge" as an order to merge itself.
-	test("an approving reply's work-turn prompt carries no rejected-hold line", async () => {
+	// agent read "reply to approve the merge" as an order to merge itself. The approval now
+	// queues a merge turn with no prompt text; a change-request reply still rides alone.
+	test("a change-request reply's work-turn prompt carries no rejected-hold line", async () => {
 		const head = "sha-1";
 		const { store, record, loop } = setup({
 			commitsAhead: async () => 0,
@@ -8503,15 +8529,13 @@ describe("turn update-card merge hold (U7)", () => {
 		saveSession(store, "sess-1");
 		await loop.runTurn(store.name, task.id);
 		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
-		// What POST /reply does (U7): queue the card and approve the parked head.
+		// A non-approval reply queues a work turn with the text; the hold stays parked.
 		store.updateTask(task.id, {
 			pendingPrompt: "Update approved",
 			pendingBy: "user",
 			state: "queued",
 			queuedAt: Date.now(),
 			needsReason: null,
-			updateMergeHead: store.getTask(task.id)!.holdHead,
-			holdHead: null,
 		});
 		await loop.runTurn(store.name, task.id);
 		const prompt = record.runs.at(-1)!.prompt;
@@ -8520,16 +8544,18 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(prompt).not.toContain(
 			"The tracker rejected your last report_outcome",
 		);
-		// The head the settle saw is the approved one: it integrates straight away.
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		// The hold was not spent: the settle parks the card again for an approval.
+		expect(store.getTask(task.id)!.stage).toBe("in_progress");
+		expect(store.getTask(task.id)!.needsReason).toBe(UPDATE_HOLD_REASON);
 	});
 
 	test("an approved card whose worktree is gone and whose head is on the target settles done", async () => {
 		let head: string | null = "sha-1";
-		// AGEN-24: the approving run merges by itself and removes the worktree before it
-		// reports. The worktree is alive at dispatch (the pre-dispatch husk guard must not
-		// settle the card) and gone by the settle: the HEAD read fails there and the target
-		// proves the approved head landed, so the hold settles done instead of parking.
+		// AGEN-33: the approval queues the normal merge turn; the merge agent lands it and
+		// removes the worktree before it reports. The worktree is alive at dispatch (the
+		// pre-dispatch husk guard must not settle the card) and gone by the settle: the HEAD
+		// read fails there and the target proves the approved head landed, so the card
+		// settles done instead of parking.
 		let merged = false;
 		const { store, record, loop } = setup({
 			commitsAhead: async () => 0,
@@ -8570,9 +8596,10 @@ describe("turn update-card merge hold (U7)", () => {
 		store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
 		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		// What POST /reply does now: the approval spends the parked head and queues the
+		// merge turn; no work turn runs for it.
 		store.updateTask(task.id, {
-			pendingPrompt: "Update approved",
-			pendingBy: "user",
+			stage: "merging",
 			state: "queued",
 			queuedAt: Date.now(),
 			needsReason: null,
@@ -8606,7 +8633,8 @@ describe("turn update-card merge hold (U7)", () => {
 			worktree: "/nonexistent/ottr-341-worktree",
 			branch: "ott/update-pins",
 		});
-		// What POST /reply does (U7): queue the card and approve the parked head.
+		// The approval state (the parked head spent, holdHead cleared); the pre-dispatch
+		// guard ignores stage and consumes any queued reply text.
 		store.updateTask(task.id, {
 			pendingPrompt: "Approved.",
 			pendingBy: "user",
@@ -12662,7 +12690,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		expect(after.needsReason ?? "").not.toContain("Turn stopped");
 	});
 
-	test("an interview turn reads integration from its checkout, never the main-repo branch proof", async () => {
+	test("an interview turn's integrated report is rejected like a work turn's", async () => {
 		const { store, loop } = withRun(
 			{ outcome: { status: "integrated", summary: "rules set" } },
 			{
@@ -12679,10 +12707,10 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		);
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
+		// Interviews are question cards: even with the branch proof at hand, an
+		// integrated report from a work-kind turn never lands the card.
 		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toBe(
-			"Reported integrated, but HEAD is not on origin/main.",
-		);
+		expect(after.needsReason).toBe("Work turns do not merge; report ready.");
 	});
 
 	test("a husk check that fails counts as no husk: the worktree decides integration", async () => {
@@ -15170,7 +15198,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		expect(logText(store, task.id)).toContain("worktree removed");
 	});
 
-	test("a work turn that reports integrated pins no CI push sha", async () => {
+	test("a rejected work integrated report pins no CI push sha", async () => {
 		const record = baseRecord();
 		const { store, loop } = setupWith(record, {
 			isIntegrated: async () => true,
@@ -15180,7 +15208,11 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
-		expect(after.stage).toBe("done");
+		// The report is rejected (AGEN-33), so no settle runs and no CI watch starts:
+		// the card never records a push sha it did not earn through a merge turn.
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Work turns do not merge; report ready.");
 		expect(after.pushSha).toBeNull();
 		expect(logText(store, task.id)).not.toContain("CI watch skipped");
 	});

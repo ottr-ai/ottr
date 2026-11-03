@@ -185,6 +185,7 @@ import {
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
 import {
+	APPROVE_REPLY,
 	type AppCheck,
 	answeredCard,
 	type MachineStats,
@@ -5222,12 +5223,14 @@ export function createApp(deps: AppDeps) {
 									decoded.images,
 								)
 							: [];
-					// U7: a reply on a parked update card approves its merge hold for the head the settle
-					// parked (undefined keeps the column). Same for a fork-born card parked by the fork
+					// U7: the approval reply on a parked update card approves its merge hold for the
+					// head the settle parked (undefined keeps the column) and queues the normal merge
+					// turn, so the server push happens. Same for a fork-born card parked by the fork
 					// merge hold, and for a merge-hold mismatch park (OTTR-274: the parked head is the
 					// exact local target head, so the next merge turn pushes it sha-equal). An agent can
 					// write the hold text as its own question, but only a settle sets holdHead, so that
-					// reply approves nothing.
+					// reply approves nothing. AGEN-33: only APPROVE_REPLY approves, and an approval
+					// never queues a work turn.
 					const parked = task.holdHead;
 					const mismatchHold =
 						parked !== null && task.needsReason === MERGE_HOLD_MISMATCH_REASON;
@@ -5239,6 +5242,24 @@ export function createApp(deps: AppDeps) {
 						parked !== null &&
 						(task.needsReason === FORK_HOLD_REASON ||
 							(mismatchHold && task.updateIds.length === 0));
+					if (
+						(approveHold || approveForkHold) &&
+						trimmed === APPROVE_REPLY &&
+						decoded.images.length === 0
+					) {
+						e.store.updateTask(task.id, {
+							stage: "merging",
+							state: "queued",
+							queuedAt: Date.now(),
+							needsReason: null,
+							asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
+							updateMergeHead: approveHold ? parked : undefined,
+							forkMergeHead: approveForkHold ? parked : undefined,
+							holdHead: null,
+						});
+						deps.schedule();
+						return taskResponse(e, task.id);
+					}
 					e.store.updateTask(task.id, {
 						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
 						pendingPrompt: queue(trimmed || "."),
@@ -5251,9 +5272,8 @@ export function createApp(deps: AppDeps) {
 						queuedAt: Date.now(),
 						needsReason: null,
 						asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
-						updateMergeHead: approveHold ? parked : undefined,
-						forkMergeHead: approveForkHold ? parked : undefined,
-						holdHead: null,
+						// A non-approval reply never spends the parked head: the hold stays, and the
+						// settle re-parks the card after the work turn.
 					});
 					deps.schedule();
 					return taskResponse(e, task.id);

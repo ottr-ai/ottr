@@ -567,9 +567,12 @@ export function classify(o: {
 		return needs("The agent finished without calling report_outcome.");
 	}
 
-	// Any turn can report integrated: an agent may integrate in a work turn anyway (e.g. after a
-	// "continue to merging" reply). It can't undo that, so a bounce would trap the card; git decides.
+	// Only a merge turn may report integrated: merging is the merge turn's job (rebase, gates,
+	// server push). A work turn that integrated by hand is rejected once with the reason; the
+	// reply that resumes the card carries it (rejectedReport), so the agent re-reports ready
+	// and the normal merge turn pushes (AGEN-33 landed without a server push this way).
 	if (oc.status === "integrated") {
+		if (kind === "work") return needs("Work turns do not merge; report ready.");
 		if (git.integrated)
 			return { stage: "done", state: "idle", needsReason: null };
 		return needs(

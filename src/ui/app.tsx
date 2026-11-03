@@ -46,6 +46,7 @@ import type {
 	UpdatesView,
 } from "../types.ts";
 import {
+	APPROVE_REPLY,
 	FORK_HOLD_REASON,
 	MERGE_HOLD_MISMATCH_REASON,
 	PERF_RANGES,
@@ -7741,7 +7742,7 @@ export function Drawer({
 								<BusyButton
 									className="primary"
 									title="Sends the approving reply, so the parked merge can land"
-									run={() => sendReply("approved")}
+									run={() => sendReply(APPROVE_REPLY)}
 								>
 									<Icon name="check" />
 									Approve merge

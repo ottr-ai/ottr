@@ -20,6 +20,9 @@ export type RunState =
 export type TurnKind = "work" | "merge";
 export type OutcomeStatus = "ready" | "answered" | "integrated" | "needs_you";
 
+/** The fixed reply text that approves a parked merge hold; the drawer's approve button sends it. */
+export const APPROVE_REPLY = "approved";
+
 export const OUTCOME_STATUSES: readonly OutcomeStatus[] = [
 	"ready",
 	"answered",

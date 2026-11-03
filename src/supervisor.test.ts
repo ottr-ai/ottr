@@ -662,7 +662,7 @@ describe("stale needs_you re-classification", () => {
 		store.close();
 	});
 
-	test("a worktree that lost its git link proves integration from the branch", async () => {
+	test("a work integrated report stays parked: only a merge turn may land", async () => {
 		const { store, t } = staleCard("re-unlinked", {
 			needsReason: "Reported integrated, but HEAD is not on main.",
 			outcome: "integrated",
@@ -678,9 +678,38 @@ describe("stale needs_you re-classification", () => {
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = store.getTask(t.id)!;
+		// A work turn may not report integrated (AGEN-33): resolving done here would bless
+		// a self-merge that never saw the server push, so the park stays for a human reply.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported integrated, but HEAD is not on main.",
+		);
+		expect(integratedCalls).toBe(0);
+		store.close();
+	});
+
+	test("a merge turn's integrated report still resolves from the branch proof", async () => {
+		const dir = join(root, "re-unlinked-merge");
+		mkdirSync(join(dir, ".wt"), { recursive: true });
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Reported integrated, but HEAD is not on main.",
+			branch: "ottr/w",
+			base: "aaaabbbb",
+		});
+		const turn = store.startTurn(t.id, "merge", "w", null);
+		store.finishTurn(turn.id, {
+			endedAt: 999,
+			outcome: "integrated",
+			summary: "did it",
+		});
+		const ops = fakeOps({ integratedNow: true, linkedNow: false });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
-		expect(integratedCalls).toBe(0);
 		store.close();
 	});
 });

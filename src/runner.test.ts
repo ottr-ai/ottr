@@ -1358,29 +1358,21 @@ describe("classify", () => {
 		});
 	});
 
-	test("7. work integrated is verified against git like a merge", () => {
-		expect(
-			run(
-				"work",
-				result({ outcome: outcome({ status: "integrated" }) }),
-				git({ integrated: true }),
-			),
-		).toEqual({
-			stage: "done",
-			state: "idle",
-			needsReason: null,
-		});
-		expect(
-			run(
-				"work",
-				result({ outcome: outcome({ status: "integrated" }) }),
-				git({ integrated: false }),
-			),
-		).toEqual({
-			stage: "in_progress",
-			state: "needs_you",
-			needsReason: "Reported integrated, but HEAD is not on origin/main.",
-		});
+	test("7. a work turn that reports integrated is rejected", () => {
+		// Merging is the merge turn's job (rebase, gates, server push): a work turn's
+		// integrated report is rejected regardless of what git shows (AGEN-33).
+		for (const integrated of [true, false])
+			expect(
+				run(
+					"work",
+					result({ outcome: outcome({ status: "integrated" }) }),
+					git({ integrated }),
+				),
+			).toEqual({
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: "Work turns do not merge; report ready.",
+			});
 	});
 
 	test("8. merge integrated verified against git", () => {
