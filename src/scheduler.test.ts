@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import {
 	applyCheckVerdicts,
+	archReviewView,
 	checkRoleFor,
 	demoteUnquoted,
 	depHold,
@@ -18,6 +19,7 @@ import {
 	findingsSettledAt,
 	isRetro,
 	isReview,
+	lastFullReview,
 	lastFullReviewBase,
 	lastReviewBase,
 	liveCard,
@@ -962,6 +964,101 @@ describe("lastFullReviewBase", () => {
 			"aaa",
 		);
 		expect(lastFullReviewBase([work])).toBeNull();
+	});
+});
+
+describe("archReviewView", () => {
+	test("a done full review names its base and card; a later release leaves both in place", () => {
+		const review = task({
+			kind: "review",
+			base: "aaa",
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		// The delta stub returns the anchor the real archReviewDelta would: the base it was
+		// given, so the view reads the same commit the count starts from.
+		const delta = (anchor: string) => ({
+			delta: 12,
+			reviewed: anchor !== "",
+			anchor,
+		});
+		expect(
+			archReviewView(lastFullReview([review]), delta("aaa"), 30, false),
+		).toEqual({
+			delta: 12,
+			reviewed: true,
+			base: "aaa",
+			reviewCardId: review.id,
+			cap: 30,
+			due: false,
+			running: false,
+		});
+		// The release ran after the full review, so it froze a newer base — but only a full
+		// review resets the counter: base and card id still name the full review.
+		const release = task({
+			kind: "review",
+			releaseVersion: "v1.0.0",
+			base: "bbb",
+			stage: "done",
+			state: "idle",
+			doneAt: 300,
+		});
+		const view = archReviewView(
+			lastFullReview([review, release]),
+			delta("aaa"),
+			30,
+			false,
+		);
+		expect(view.base).toBe("aaa");
+		expect(view.reviewCardId).toBe(review.id);
+	});
+
+	test("a newer baseline docs commit moves the base and drops the card id", () => {
+		const review = task({
+			kind: "review",
+			base: "aaa",
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		// archReviewDelta anchors on the newer docs(arch-review): commit: no card set that base.
+		expect(
+			archReviewView(
+				lastFullReview([review]),
+				{ delta: 1, reviewed: true, anchor: "zzz" },
+				30,
+				false,
+			),
+		).toEqual({
+			delta: 1,
+			reviewed: true,
+			base: "zzz",
+			reviewCardId: null,
+			cap: 30,
+			due: false,
+			running: false,
+		});
+	});
+
+	test("no full review yet: the base is null and the whole history counts", () => {
+		expect(
+			archReviewView(
+				lastFullReview([]),
+				{ delta: 9, reviewed: false, anchor: "" },
+				30,
+				false,
+			),
+		).toEqual({
+			delta: 9,
+			reviewed: false,
+			base: null,
+			reviewCardId: null,
+			cap: 30,
+			// An un-reviewed project is always due, whatever its history size.
+			due: true,
+			running: false,
+		});
 	});
 });
 

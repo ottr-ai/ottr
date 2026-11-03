@@ -1085,6 +1085,7 @@ describe("settings TOC", () => {
 				idleReviews={true}
 				act={async () => true}
 				view="settings"
+				openTask={() => {}}
 			/>,
 		);
 		const blocks = (s: (typeof SETTINGS_TOC)[number]["sections"][number]) =>

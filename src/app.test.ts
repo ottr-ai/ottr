@@ -2496,6 +2496,8 @@ describe("idle auto review tick", () => {
 		e.archReview = {
 			delta: 150,
 			reviewed: true,
+			base: null,
+			reviewCardId: null,
 			cap: 150,
 			due: true,
 			running: false,

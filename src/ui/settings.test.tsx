@@ -3,13 +3,14 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { AppCheck, ProjectView } from "../types.ts";
+import type { AppCheck, ProjectView, TaskCard } from "../types.ts";
 import {
 	AppCheckLines,
 	GitHostsSection,
 	ProjectSettingsForm,
 	SessionSection,
 } from "./settings.tsx";
+import { stamp } from "./time.ts";
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -86,6 +87,19 @@ const onChangeOf = (node: Element): ((e: unknown) => void) => {
 	};
 	if (props.onChange === undefined) throw new Error("node has no onChange");
 	return props.onChange;
+};
+
+/** The production onClick React rendered onto the node, read like onChangeOf. */
+const onClickOf = (node: Element): ((e: unknown) => void) => {
+	const key = Object.getOwnPropertyNames(node).find((k) =>
+		k.startsWith("__reactProps$"),
+	);
+	if (key === undefined) throw new Error("react props missing on node");
+	const props = (node as unknown as Record<string, unknown>)[key] as {
+		onClick?: (e: unknown) => void;
+	};
+	if (props.onClick === undefined) throw new Error("node has no onClick");
+	return props.onClick;
 };
 
 /** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
@@ -459,6 +473,7 @@ describe("ProjectSettingsForm target branch", () => {
 						await fn();
 						return true;
 					}}
+					openTask={() => {}}
 				/>,
 			);
 		});
@@ -751,5 +766,235 @@ describe("AppCheckLines install summary", () => {
 		expect(html).toContain(
 			"Installed on all public board repos; 1 private repo skipped.",
 		);
+	});
+});
+
+describe("ProjectSettingsForm review counter", () => {
+	const FULL_SHA = "4f2c9ab1fullsha0000000000000000000000000";
+	const SHORT = "4f2c9ab";
+	const DONE_AT = 1_730_634_000_000;
+
+	/** A project fixture like the target-branch one, plus the counter's inputs. */
+	const projectWith = (
+		archReview: ProjectView["archReview"],
+		github: string | null,
+	): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github,
+			hasRules: true,
+			gitless: false,
+			archReview,
+			settings: {
+				maxParallel: 2,
+				copyExtra: [],
+				displayName: null,
+				releaseCommand: null,
+				archReviewCap: 30,
+				maxImages: 4,
+				keptWorktreeDays: 7,
+				autoTend: false,
+				autoTendLimit: 5,
+				tendChurnGlobs: [],
+				holdUpdateMerges: false,
+				retroSince: null,
+				retroFilter: true,
+				forkResearch: false,
+				prReviews: false,
+				setupChecklist: false,
+				targetBranch: null,
+				originUrl: null,
+			},
+		}) as unknown as ProjectView;
+
+	/** Mounts the form for one project; the cleanup puts fetch and the DOM back. */
+	async function mount(
+		project: ProjectView,
+		tasks: TaskCard[],
+		openTask: (id: string) => void,
+	): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={tasks}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={openTask}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	const counterLine = (container: HTMLDivElement): Element | null =>
+		container.querySelector("#project-reviews-section .hint");
+
+	test("counts from the review's base: the sha links to the commit, the card id opens the card", async () => {
+		const opened: string[] = [];
+		const review = { id: "R-1", doneAt: DONE_AT } as unknown as TaskCard;
+		const { container, unmount } = await mount(
+			projectWith(
+				{
+					delta: 12,
+					reviewed: true,
+					base: FULL_SHA,
+					reviewCardId: "R-1",
+					cap: 30,
+					due: false,
+					running: false,
+				},
+				"https://github.com/octo/repo",
+			),
+			[review],
+			(id) => opened.push(id),
+		);
+		try {
+			const line = counterLine(container);
+			expect(line?.textContent).toContain("12 of 30 commits since");
+			expect(line?.textContent).toContain(`done ${stamp(DONE_AT)}`);
+			const sha = line?.querySelector("a");
+			expect(sha?.getAttribute("href")).toBe(
+				`https://github.com/octo/repo/commit/${FULL_SHA}`,
+			);
+			expect(sha?.getAttribute("rel")).toBe("noopener noreferrer");
+			expect(sha?.textContent).toBe(SHORT);
+			const cardButton = line?.querySelector("button");
+			expect(cardButton?.getAttribute("aria-label")).toBe(
+				"Open review card #R-1",
+			);
+			expect(cardButton?.textContent).toBe("#R-1");
+			await act(async () => {
+				onClickOf(cardButton!)({});
+			});
+			expect(opened).toEqual(["R-1"]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("no GitHub remote shows the sha as plain code text", async () => {
+		const { container, unmount } = await mount(
+			projectWith(
+				{
+					delta: 12,
+					reviewed: true,
+					base: FULL_SHA,
+					reviewCardId: null,
+					cap: 30,
+					due: false,
+					running: false,
+				},
+				null,
+			),
+			[],
+			() => {},
+		);
+		try {
+			const line = counterLine(container);
+			expect(line?.textContent).toContain("12 of 30 commits since");
+			expect(line?.querySelector("a")).toBeNull();
+			expect(line?.querySelector("button")).toBeNull();
+			expect(line?.querySelector("code")?.textContent).toBe(SHORT);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("no full review yet says the whole history counts", async () => {
+		const { container, unmount } = await mount(
+			projectWith(
+				{
+					delta: 7,
+					reviewed: false,
+					base: null,
+					reviewCardId: null,
+					cap: 30,
+					due: true,
+					running: false,
+				},
+				"https://github.com/octo/repo",
+			),
+			[],
+			() => {},
+		);
+		try {
+			const line = counterLine(container);
+			expect(line?.textContent).toContain(
+				"No full review yet: all 7 commits count",
+			);
+			expect(line?.querySelector("a")).toBeNull();
+			expect(line?.querySelector("button")).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a review open says so on the same line", async () => {
+		const { container, unmount } = await mount(
+			projectWith(
+				{
+					delta: 12,
+					reviewed: true,
+					base: FULL_SHA,
+					reviewCardId: "R-1",
+					cap: 30,
+					due: false,
+					running: true,
+				},
+				null,
+			),
+			[{ id: "R-1", doneAt: DONE_AT } as unknown as TaskCard],
+			() => {},
+		);
+		try {
+			expect(counterLine(container)?.textContent).toContain("review open");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a project with no arch review state shows no counter line", async () => {
+		const { container, unmount } = await mount(
+			projectWith(null, null),
+			[],
+			() => {},
+		);
+		try {
+			expect(counterLine(container)).toBeNull();
+		} finally {
+			await unmount();
+		}
 	});
 });

@@ -148,6 +148,7 @@ import {
 	upgradeRefusal,
 } from "./requestGuards.ts";
 import {
+	archReviewDue,
 	findingsSettledAt,
 	isRetro,
 	lastReviewBase,
@@ -228,7 +229,6 @@ import {
 } from "./webpush.ts";
 import {
 	archReviewDelta,
-	archReviewDue,
 	diffStat,
 	diffText,
 	git,

@@ -720,15 +720,6 @@ export async function archReviewDelta(
 	}
 }
 
-/** A review is due once the delta reaches the cap; a project with no watermark yet is always due. Pure: testable without git. */
-export function archReviewDue(
-	delta: number,
-	cap: number,
-	reviewed: boolean,
-): boolean {
-	return !reviewed || delta >= cap;
-}
-
 /**
  * Resolution ladder for the target, in order:
  * 1. `targetBranch` set (project setting): target = `origin/<targetBranch>`; the main

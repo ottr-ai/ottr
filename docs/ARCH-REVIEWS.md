@@ -4,6 +4,12 @@ Each project can require a whole-repo review after a number of commits
 (**Settings**, per project; default 150). While the review is open, a project
 page shows **Review due (n commits)**.
 
+The project's **Settings** page shows the counter next to the cap: commits
+since the base, the base commit, and the review card that set the base. The
+base commit links to the project's git host when the project has a GitHub
+remote; the card id opens the review card. With no full review yet, all
+commits count. While a review is open, the line says so.
+
 ## When a review starts
 
 - **Cap**: the project has `archReviewCap` or more commits since the last

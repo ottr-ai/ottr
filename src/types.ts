@@ -580,6 +580,10 @@ export interface ArchReview {
 	delta: number;
 	/** False until the target carries an arch-review watermark: a newly added project is un-reviewed, so a review is due whatever the delta. */
 	reviewed: boolean;
+	/** The commit the delta counts from: the frozen base of the newest done full review or a newer `docs(arch-review):` commit; null when no watermark exists yet. */
+	base: string | null;
+	/** The review card whose frozen base is `base`; null when a baseline commit set the base or no watermark exists. */
+	reviewCardId: string | null;
 	/** Process constant: a review is due once delta reaches this many commits. */
 	cap: number;
 	due: boolean;

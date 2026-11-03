@@ -11,6 +11,7 @@ import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import { forProvider } from "../quota.ts";
 import type {
 	AppCheck,
+	ArchReview,
 	GitHubAppView,
 	GithubFacts,
 	ProjectView,
@@ -52,7 +53,7 @@ import {
 } from "./models.ts";
 import { SETTINGS_HASH, settingsSub } from "./route.ts";
 import { refreshState } from "./socket.ts";
-import { age } from "./time.ts";
+import { age, stamp } from "./time.ts";
 
 /** Save-button body: the brief saved confirmation, else the plain label. */
 function SaveLabel({ saved }: { saved: boolean }) {
@@ -4090,6 +4091,7 @@ export function SettingsPage({
 	idleReviews,
 	act,
 	view,
+	openTask,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
@@ -4099,6 +4101,8 @@ export function SettingsPage({
 	idleReviews: boolean;
 	act: Act;
 	view: string;
+	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
+	openTask: (id: string) => void;
 }) {
 	const sub = settingsSub(view);
 	const project =
@@ -4287,6 +4291,7 @@ export function SettingsPage({
 							project={project}
 							tasks={tasks}
 							act={act}
+							openTask={openTask}
 						/>
 					</>
 				)}
@@ -4295,15 +4300,75 @@ export function SettingsPage({
 	);
 }
 
+/** The Reviews card's counter line. Three forms: counted from a review's frozen base (the sha
+ * links to the commit when the project has a GitHub remote), no full review yet, and a review
+ * open on top of either. The card id opens the review card that set the base. */
+function ReviewCounter({
+	review,
+	github,
+	tasks,
+	openTask,
+}: {
+	review: ArchReview;
+	github: string | null;
+	tasks: TaskCard[];
+	openTask: (id: string) => void;
+}) {
+	const cardId = review.reviewCardId;
+	const card =
+		cardId === null ? null : (tasks.find((t) => t.id === cardId) ?? null);
+	return (
+		<>
+			{review.base === null ? (
+				<>No full review yet: all {review.delta} commits count</>
+			) : (
+				<>
+					{review.delta} of {review.cap} commits since{" "}
+					{github !== null ? (
+						<a
+							href={`${github}/commit/${review.base}`}
+							target="_blank"
+							rel="noopener noreferrer"
+							title={`Commit ${review.base}`}
+						>
+							<code>{review.base.slice(0, 7)}</code>
+						</a>
+					) : (
+						<code>{review.base.slice(0, 7)}</code>
+					)}
+				</>
+			)}
+			{cardId !== null && (
+				<>
+					{" · "}
+					<button
+						type="button"
+						className="ghost"
+						onClick={() => openTask(cardId)}
+						aria-label={`Open review card #${cardId}`}
+					>
+						#{cardId}
+					</button>
+					{card?.doneAt != null && <> done {stamp(card.doneAt)}</>}
+				</>
+			)}
+			{review.running && <> · review open</>}
+		</>
+	);
+}
+
 /** One project's settings page: identity, slots, worktrees, releases, reviews, messages, removal. */
 export function ProjectSettingsForm({
 	project,
 	tasks,
 	act,
+	openTask,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
 	act: Act;
+	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
+	openTask: (id: string) => void;
 }) {
 	const [mp, setMp] = useState(
 		project.settings.maxParallel === null
@@ -4733,6 +4798,16 @@ export function ProjectSettingsForm({
 									/>
 								</label>
 							</DefRow>
+							{project.archReview != null && (
+								<p className="hint">
+									<ReviewCounter
+										review={project.archReview}
+										github={project.github}
+										tasks={tasks}
+										openTask={openTask}
+									/>
+								</p>
+							)}
 						</>
 					)}
 				</SaveCard>

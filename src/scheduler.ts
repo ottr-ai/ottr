@@ -1,5 +1,6 @@
 import { statSync } from "node:fs";
 import type {
+	ArchReview,
 	AskQuestion,
 	RecordedFinding,
 	Task,
@@ -235,6 +236,31 @@ export function lastReviewBase(
 	return best?.base ?? null;
 }
 
+/** The newest done full review as the Review-due counter's anchor: its frozen base and the
+ * card that froze it, else null. `lastFullReviewBase` is the base-only view of this. */
+export function lastFullReview(
+	tasks: readonly Pick<
+		Task,
+		| "id"
+		| "kind"
+		| "releaseVersion"
+		| "cancelledAt"
+		| "stage"
+		| "doneAt"
+		| "base"
+	>[],
+): { id: string; base: string } | null {
+	let best: { at: number; id: string; base: string } | null = null;
+	for (const t of tasks) {
+		if (t.cancelledAt !== null || t.stage !== "done" || t.base === null)
+			continue;
+		if (!isReview(t) || t.releaseVersion !== null) continue;
+		const at = t.doneAt ?? 0;
+		if (best === null || at > best.at) best = { at, id: t.id, base: t.base };
+	}
+	return best === null ? null : { id: best.id, base: best.base };
+}
+
 /** The base the Review-due counter counts from: like lastReviewBase, but only a full review (the
  * Review button's card) counts — a release keeps the counter going, so releases are gated by the
  * delta mutation run, not a new full one. lastReviewBase stays for the review-context and
@@ -242,18 +268,47 @@ export function lastReviewBase(
 export function lastFullReviewBase(
 	tasks: readonly Pick<
 		Task,
-		"kind" | "releaseVersion" | "cancelledAt" | "stage" | "doneAt" | "base"
+		| "id"
+		| "kind"
+		| "releaseVersion"
+		| "cancelledAt"
+		| "stage"
+		| "doneAt"
+		| "base"
 	>[],
 ): string | null {
-	let best: { at: number; base: string } | null = null;
-	for (const t of tasks) {
-		if (t.cancelledAt !== null || t.stage !== "done" || t.base === null)
-			continue;
-		if (!isReview(t) || t.releaseVersion !== null) continue;
-		const at = t.doneAt ?? 0;
-		if (best === null || at > best.at) best = { at, base: t.base };
-	}
-	return best?.base ?? null;
+	return lastFullReview(tasks)?.base ?? null;
+}
+
+/** A review is due once the delta reaches the cap; a project with no watermark yet is always due.
+ * Pure, and kept here (not in worktree.ts) so the UI's scheduler imports stay git-free. */
+export function archReviewDue(
+	delta: number,
+	cap: number,
+	reviewed: boolean,
+): boolean {
+	return !reviewed || delta >= cap;
+}
+
+/** The ArchReview view the project ships: the base the delta counts from and the card that set
+ * it, both from the anchor `archReviewDelta` counted with, so the view cannot disagree with the
+ * count. `last` is the newest done full review whose base fed the delta call; an anchor that is
+ * not that base is a newer baseline `docs(arch-review):` commit — a count no card set. */
+export function archReviewView(
+	last: { id: string; base: string } | null,
+	a: { delta: number; reviewed: boolean; anchor: string },
+	cap: number,
+	running: boolean,
+): ArchReview {
+	return {
+		delta: a.delta,
+		reviewed: a.reviewed,
+		base: a.anchor === "" ? null : a.anchor,
+		reviewCardId: last !== null && last.base === a.anchor ? last.id : null,
+		cap,
+		due: archReviewDue(a.delta, cap, a.reviewed),
+		running,
+	};
 }
 
 /** The unfinished dependency cards `t` waits for, in its dependsOn order. A cancelled dependency

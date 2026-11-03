@@ -19,10 +19,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
+import { archReviewDue } from "./scheduler.ts";
 import fc from "./test/properties.ts";
 import {
 	archReviewDelta,
-	archReviewDue,
 	branchMergedOrGone,
 	changedFiles,
 	createWorktree,

@@ -9710,6 +9710,7 @@ function App() {
 							idleReviews={state.idleReviews}
 							act={act}
 							view={view}
+							openTask={openTask}
 						/>
 					) : project === null ? (
 						<Overview

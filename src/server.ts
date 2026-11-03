@@ -27,7 +27,7 @@ import {
 } from "./release.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, workerFromEnv } from "./runner.ts";
-import { lastFullReviewBase, reviewBlocked } from "./scheduler.ts";
+import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
 import {
 	type AdoptResult,
 	adoptSharedProjectData,
@@ -49,7 +49,6 @@ import type { LatestImage } from "./types.ts";
 import { sweepWorker as sweepWorkerRequest } from "./workers.ts";
 import {
 	archReviewDelta,
-	archReviewDue,
 	branchMergedOrGone,
 	changedFiles,
 	commitsAhead,
@@ -207,26 +206,19 @@ async function refreshArchReview(e: Entry): Promise<void> {
 		e.archReview = null;
 		return;
 	}
+	// One anchor for the count and the view: the delta counts from the newest done full
+	// review's base (a release card must not reset it, docs/specs/mutation-delta.md §6), and
+	// archReviewView reads the same base, so Settings cannot disagree with the count.
+	const last = lastFullReview(e.store.listTasks());
 	const a = await archReviewDelta(
 		e.path,
 		e.target,
-		// The due badge counts from the newest full review: a release card must not reset it,
-		// releases gate on the delta mutation run instead (docs/specs/mutation-delta.md §6).
-		lastFullReviewBase(e.store.listTasks()),
+		last === null ? null : last.base,
 	).catch(() => null);
 	const cap = getSettingsLogged(e).archReviewCap;
 	// Running: a review is queued or running, or its findings are still landing.
 	const running = reviewBlocked(e.store.listTasks()) !== null;
-	e.archReview =
-		a === null
-			? null
-			: {
-					delta: a.delta,
-					reviewed: a.reviewed,
-					cap,
-					due: archReviewDue(a.delta, cap, a.reviewed),
-					running,
-				};
+	e.archReview = a === null ? null : archReviewView(last, a, cap, running);
 }
 
 /** Local tip of a ref, else null (quiet rev-parse): the push-sha capture compares local and pushed. */
