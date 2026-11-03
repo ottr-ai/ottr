@@ -158,6 +158,22 @@ describe("releasePrompt", () => {
 			"If the session has no name yet, call the rename tool once",
 		);
 	});
+
+	test("blockers are findings: answered holds the release, needs_you stays for unsolvable blockers", () => {
+		const prompt = releasePrompt({
+			version: "v1.2.3",
+			from: "v1.2.2",
+			sha: "abc1234",
+			commits: 3,
+			notes: "- fix",
+			learnings: [],
+		});
+		expect(prompt).toContain("a blocker is a finding");
+		expect(prompt).toContain("the release waits for those cards");
+		expect(prompt).toContain("no fix card can solve");
+		// No ask-the-blockers step: the board files the findings as cards instead.
+		expect(prompt).not.toContain("call ask with the blockers");
+	});
 });
 
 describe("grillPrompt", () => {

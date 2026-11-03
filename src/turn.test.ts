@@ -8998,6 +8998,61 @@ describe("review findings check", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
+	test("a release's recorded blockers file as findings and park it at merging, unapproved", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Blocker: the notes drop the late commits", 1)];
+		const { store, projects, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
+			commitSubjects: async () => ["a1 fix it upstream"],
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				const result =
+					record.runs.length === 1
+						? runResult({
+								outcome: {
+									status: "answered",
+									summary: "blockers recorded as findings",
+								},
+								recorded: record.recorded,
+							})
+						: runResult({
+								finalText: '[{"id":1,"keep":true,"reason":""}]',
+							});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const release = store.createTask("release v2.0.0");
+		store.updateTask(release.id, {
+			base: "shaR",
+			releaseVersion: "v2.0.0",
+			releaseNotes: "notes body",
+		});
+		await loop.runTurn(store.name, release.id);
+		const after = store.getTask(release.id)!;
+		// The answered report parks the release at merging while the finding is open, not needs_you.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(FINDINGS_HOLD);
+		// The check filed the blocker as a finding card that holds the release.
+		const kids = store.listTasks().filter((t) => t.followUpOf === release.id);
+		expect(kids.map((k) => k.prompt)).toEqual([
+			"Blocker: the notes drop the late commits",
+		]);
+		// Nothing publishes before the user approves.
+		expect(record.publishRelease).toHaveLength(0);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
 	test("with the switch off the top 10 plus security findings file without a check run", async () => {
 		const record = baseRecord();
 		record.recorded = [
