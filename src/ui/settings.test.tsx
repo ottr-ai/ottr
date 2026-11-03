@@ -3,8 +3,9 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { ProjectView } from "../types.ts";
+import type { AppCheck, ProjectView } from "../types.ts";
 import {
+	AppCheckLines,
 	GitHostsSection,
 	ProjectSettingsForm,
 	SessionSection,
@@ -723,5 +724,32 @@ describe("GitHostsSection global SSH key", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+describe("AppCheckLines install summary", () => {
+	const check = (over: Partial<AppCheck>): AppCheck => ({
+		at: 0,
+		name: "ottr-ai",
+		url: "https://github.com/apps/ottr-ai",
+		repos: [],
+		missing: [],
+		private: [],
+		error: null,
+		...over,
+	});
+
+	test("private repos skipped by the install check keep the summary honest", () => {
+		const html = renderToStaticMarkup(
+			<AppCheckLines
+				check={check({
+					repos: ["octo/a", "octo/priv"],
+					private: ["octo/priv"],
+				})}
+			/>,
+		);
+		expect(html).toContain(
+			"Installed on all public board repos; 1 private repo skipped.",
+		);
 	});
 });

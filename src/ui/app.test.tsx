@@ -1036,6 +1036,19 @@ describe("WarningLines", () => {
 	test("no warnings render nothing", () => {
 		expect(renderToStaticMarkup(<WarningLines warnings={[]} />)).toBe("");
 	});
+
+	test("a warning URL renders as a link and the sentence period stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"ottr-ai is not installed on octo/b. PR reviews there post under your own identity. Install it at https://github.com/apps/ottr-ai/installations/new.",
+				]}
+			/>,
+		);
+		expect(html).toContain(
+			'<a class="notif-link" href="https://github.com/apps/ottr-ai/installations/new" target="_blank" rel="noopener noreferrer">https://github.com/apps/ottr-ai/installations/new</a>.',
+		);
+	});
 });
 
 describe("settings TOC", () => {

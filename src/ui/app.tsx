@@ -8316,6 +8316,28 @@ function AreasNav({
 	);
 }
 
+/** https:// URLs inside a server warning render as real links; a trailing sentence
+ * period stays outside the anchor so the href stays valid. */
+export function warningLinks(text: string): ReactNode {
+	return text.split(/(https:\/\/\S+)/g).map((part, i) => {
+		if (!part.startsWith("https://")) return part;
+		const url = part.replace(/\.+$/, "");
+		return (
+			<Fragment key={i}>
+				<a
+					className="notif-link"
+					href={url}
+					target="_blank"
+					rel="noopener noreferrer"
+				>
+					{url}
+				</a>
+				{part.slice(url.length)}
+			</Fragment>
+		);
+	});
+}
+
 /** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
  * No dismiss: state recomputes per poll, so a fixed condition drops its own line. */
 export function WarningLines({ warnings }: { warnings: string[] }) {
@@ -8325,7 +8347,7 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 			{warnings.map((w, i) => (
 				<p className="notif-line" role="note" key={`warn:${i}`}>
 					<Mark kind="warn" />
-					<span>{w}</span>
+					<span>{warningLinks(w)}</span>
 				</p>
 			))}
 		</>

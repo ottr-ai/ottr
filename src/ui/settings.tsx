@@ -1263,7 +1263,9 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 					<span>
 						{check.repos.length === 0
 							? "No board project has a GitHub repo."
-							: `Installed on all ${check.repos.length} board repos.`}
+							: check.private.length === 0
+								? `Installed on all ${check.repos.length} board repos.`
+								: `Installed on all public board repos; ${check.private.length} private repo${check.private.length === 1 ? "" : "s"} skipped.`}
 					</span>
 				</p>
 			) : (

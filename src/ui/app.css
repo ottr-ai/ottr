@@ -5422,7 +5422,8 @@ button.lineage-row:hover .lineage-title {
 button.diff-link,
 button.notif-link,
 button.diff-path,
-button.jump-link {
+button.jump-link,
+a.notif-link {
 	padding: 0;
 	border: 0;
 	background: none;
@@ -5431,6 +5432,7 @@ button.jump-link {
 	color: var(--accent);
 	text-decoration: underline;
 	cursor: pointer;
+	overflow-wrap: anywhere;
 }
 .jump-reply {
 	margin: 0 0 8px;
