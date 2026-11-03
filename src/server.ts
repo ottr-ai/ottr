@@ -117,6 +117,8 @@ const shared: {
 	idleReviews: boolean;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
+	/** Project names in board order, persisted via /api/projects/order. */
+	projectOrder: string[];
 	/** /api/settings/env writes saved values here; the loop reads them per turn. */
 	envValues: Record<string, string>;
 } = {

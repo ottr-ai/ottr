@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import fc from "../test/properties.ts";
 import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
 	donePage,
@@ -7,6 +8,7 @@ import {
 	laneCounts,
 	laneOrder,
 	laneStage,
+	orderBy,
 	reorderIds,
 	seenable,
 	slotUse,
@@ -442,5 +444,38 @@ describe("donePage", () => {
 		const page = donePage(tasks, (t) => t === "t5" || t === "t30", 20);
 		expect(page.shown).toEqual(n(31));
 		expect(page.hidden).toBe(14);
+	});
+});
+
+describe("orderBy", () => {
+	test("a known order applies", () => {
+		expect(orderBy(["a", "b", "c"], ["c", "a", "b"])).toEqual(["c", "a", "b"]);
+	});
+
+	test("names missing from the order follow the known ones in input order", () => {
+		expect(orderBy(["x", "a", "y", "b"], ["b", "a"])).toEqual([
+			"b",
+			"a",
+			"x",
+			"y",
+		]);
+	});
+
+	test("an empty order returns the input unchanged", () => {
+		expect(orderBy(["b", "a"], [])).toEqual(["b", "a"]);
+	});
+
+	test("always a permutation of the input, and idempotent under its own order", () => {
+		fc.assert(
+			fc.property(
+				fc.array(fc.string()),
+				fc.array(fc.string()),
+				(names, order) => {
+					const out = orderBy(names, order);
+					expect([...out].sort()).toEqual([...names].sort());
+					expect(orderBy(out, order)).toEqual(out);
+				},
+			),
+		);
 	});
 });

@@ -29,7 +29,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
-import { behindMain, boardWarnings, type Entry } from "./app.ts";
+import {
+	behindMain,
+	boardWarnings,
+	type Entry,
+	storedProjectPaths,
+} from "./app.ts";
 import { hashPassword, signSession } from "./auth.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
@@ -197,6 +202,7 @@ const shared = {
 	idleReviews: true,
 	removedPaths: [] as string[],
 	projectPaths: [] as string[],
+	projectOrder: [] as string[],
 	envValues: {} as Record<string, string>,
 };
 // Compose turns reach the board at OTTR_BOARD_URL, a host no allowlist covers ("turns' own host").
@@ -252,6 +258,37 @@ projects.set("p1", {
 	path: projectDir,
 	name: "p1",
 	store,
+	target: null,
+	gitless: false,
+	github: null,
+	remote: null,
+	dirty: false,
+	latestRelease: null,
+	latestImage: null,
+	archReview: null,
+});
+// Extra registered projects for the /api/projects/order tests; same shape as p1.
+const projectDir2 = join(root, "p2");
+const store2 = ProjectStore.open(projectDir2);
+projects.set("p2", {
+	path: projectDir2,
+	name: "p2",
+	store: store2,
+	target: null,
+	gitless: false,
+	github: null,
+	remote: null,
+	dirty: false,
+	latestRelease: null,
+	latestImage: null,
+	archReview: null,
+});
+const projectDir3 = join(root, "p3");
+const store3 = ProjectStore.open(projectDir3);
+projects.set("p3", {
+	path: projectDir3,
+	name: "p3",
+	store: store3,
 	target: null,
 	gitless: false,
 	github: null,
@@ -350,6 +387,7 @@ function mount(
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
+			projectOrder: [],
 		},
 		defaultDir: input.defaultDir ?? root,
 		gh: input.gh,
@@ -3671,6 +3709,7 @@ describe("github token", () => {
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
+				projectOrder: [],
 			},
 			serverRef: { current: undefined },
 			// The save probes at once; a stub keeps the test off the network.
@@ -3857,6 +3896,7 @@ describe("hindsight settings", () => {
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
+				projectOrder: [],
 			},
 			serverRef: { current: undefined },
 		});
@@ -4129,6 +4169,7 @@ describe("loopback Host from another machine or container", () => {
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
+			projectOrder: [],
 		},
 		serverRef: { current: undefined },
 	});
@@ -5632,6 +5673,7 @@ describe("sign out everywhere", () => {
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
+			projectOrder: [],
 		},
 		serverRef: { current: undefined },
 	});
@@ -5752,6 +5794,7 @@ describe("session registry (OTTR-387)", () => {
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
+				projectOrder: [],
 			},
 			serverRef: { current: undefined },
 		});
@@ -7751,6 +7794,7 @@ describe("token expiry reminders", () => {
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
+				projectOrder: [],
 			},
 			serverRef: { current: undefined },
 			githubTokenExpiry: async () => {
@@ -8112,5 +8156,136 @@ describe("fixed-path view routes (OTTR-405)", () => {
 		expect((await get("/api/projects/nope/how-it-works")).status).toBe(404);
 		// One segment past a known view is still unknown.
 		expect((await get("/projects/ottr/tasks/OTTR-1/extra")).status).toBe(404);
+	});
+});
+
+describe("project order route", () => {
+	// Own names: earlier describes add and delete "p2"/"p3" on the shared map, so
+	// these tests register their own entries and clean them up after themselves.
+	const orderDirs = ["ord-a", "ord-b", "ord-c"].map((name) => ({
+		name,
+		dir: join(root, name),
+	}));
+	beforeAll(() => {
+		for (const { name, dir } of orderDirs)
+			projects.set(name, {
+				path: dir,
+				name,
+				store: ProjectStore.open(dir),
+				target: null,
+				gitless: false,
+				github: null,
+				remote: null,
+				dirty: false,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			});
+	});
+	afterAll(() => {
+		for (const { name } of orderDirs) {
+			projects.get(name)?.store.close();
+			projects.delete(name);
+		}
+		shared.projectOrder = [];
+	});
+	const stateProjects = async (): Promise<string[]> => {
+		const res = await get("/api/state");
+		expect(res.status).toBe(200);
+		const b: unknown = await res.json();
+		if (typeof b !== "object" || b === null || !("projects" in b)) {
+			throw new Error("state response without projects");
+		}
+		const projects = b.projects as { name: unknown }[];
+		return projects.map((p) => String(p.name));
+	};
+	/** The named projects in state order: other describes leave entries on the shared map, so exact lists would be fragile. */
+	const picked = async (...names: string[]): Promise<string[]> =>
+		(await stateProjects()).filter((n) => names.includes(n));
+	const four = ["p1", "ord-a", "ord-b", "ord-c"];
+
+	test("a full order sorts /api/state projects", async () => {
+		shared.projectOrder = [];
+		const res = await post("/api/projects/order", {
+			order: ["ord-c", "ord-a", "ord-b"],
+		});
+		expect(res.status).toBe(200);
+		const b: unknown = await res.json();
+		expect(b).toEqual({ ok: true });
+		// "p1" stays registered at the module level and is not named in the order;
+		// the merged order appends it last.
+		expect(await picked(...four)).toEqual(["ord-c", "ord-a", "ord-b", "p1"]);
+		expect(calls).toBeGreaterThan(0);
+	});
+
+	test("order must be an array of strings", async () => {
+		const missing = await post("/api/projects/order", {});
+		expect(missing.status).toBe(400);
+		expect(await errorOf(missing)).toBe(
+			"order must be an array of project names",
+		);
+		const notArray = await post("/api/projects/order", { order: "p1" });
+		expect(notArray.status).toBe(400);
+		expect(await errorOf(notArray)).toBe(
+			"order must be an array of project names",
+		);
+		const notString = await post("/api/projects/order", {
+			order: ["ord-a", 3],
+		});
+		expect(notString.status).toBe(400);
+		expect(await errorOf(notString)).toBe(
+			"order must be an array of project names",
+		);
+	});
+
+	test("duplicate and unknown names are rejected", async () => {
+		const dup = await post("/api/projects/order", {
+			order: ["ord-a", "ord-a", "ord-b"],
+		});
+		expect(dup.status).toBe(400);
+		expect(await errorOf(dup)).toBe("order has duplicate names");
+		const unknown = await post("/api/projects/order", {
+			order: ["ord-a", "nope"],
+		});
+		expect(unknown.status).toBe(400);
+		expect(await errorOf(unknown)).toBe("unknown project: nope");
+	});
+
+	test("a partial order appends missing names in map order", async () => {
+		const res = await post("/api/projects/order", { order: ["ord-b"] });
+		expect(res.status).toBe(200);
+		// Map order: p1 first (module level), then the three beforeAll entries.
+		expect(await picked(...four)).toEqual(["ord-b", "p1", "ord-a", "ord-c"]);
+	});
+
+	test("the merged order persists in the config kv", async () => {
+		await post("/api/projects/order", { order: ["ord-b", "ord-c"] });
+		expect(
+			storedProjectPaths(gstore).projectOrder.filter((n) => four.includes(n)),
+		).toEqual(["ord-b", "ord-c", "p1", "ord-a"]);
+	});
+
+	test("property: any permutation posts ok and sorts /api/state", async () => {
+		// fc.assert resolves asynchronously: without the await the property detaches
+		// from the test and races the rest of the file (its writes landed under later tests).
+		await fc.assert(
+			fc.asyncProperty(
+				fc.shuffledSubarray(["ord-a", "ord-b", "ord-c"], {
+					minLength: 3,
+					maxLength: 3,
+				}),
+				async (order) => {
+					const res = await post("/api/projects/order", { order });
+					expect(res.status).toBe(200);
+					expect(await picked(...four)).toEqual([...order, "p1"]);
+					const bad = await post("/api/projects/order", {
+						order: [...order, "nope"],
+					});
+					expect(bad.status).toBe(400);
+					expect(await errorOf(bad)).toBe("unknown project: nope");
+				},
+			),
+			{ seed: 20261103, numRuns: 100 },
+		);
 	});
 });

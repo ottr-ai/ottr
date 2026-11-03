@@ -51,6 +51,7 @@ import {
 	seedStep,
 	useModels,
 } from "./models.ts";
+import { dropBeforeId, orderBy } from "./queue.ts";
 import { SETTINGS_HASH, settingsSub } from "./route.ts";
 import { refreshState } from "./socket.ts";
 import { age, stamp } from "./time.ts";
@@ -896,6 +897,195 @@ function ApiKeySection() {
 					{error}
 				</p>
 			)}
+		</SettingsCard>
+	);
+}
+
+/** Board group, "Projects" card: drag a row (or press Alt+Arrow on it) to reorder the
+ *  projects on the board and in this page. The full order saves to /api/projects/order at
+ *  once; a failed save rolls the optimistic order back. Drag state follows the board's
+ *  queue: the same slot semantics, and both drag states clear before the save runs (bug
+ *  1d1afc9: a sync re-render detaches onDragEnd, so a stale drop would repaint the slot). */
+export function ProjectsOrderSection({
+	projects,
+	act,
+}: {
+	projects: ProjectView[];
+	act: Act;
+}) {
+	const s = useInstantSave(act);
+	// Optimistic saved order: null trusts the props order; cleared once props catch up.
+	const [localOrder, setLocalOrder] = useState<string[] | null>(null);
+	const [dragId, setDragId] = useState<string | null>(null);
+	// undefined = no slot, null = end, string = insert before that project.
+	const [drop, setDrop] = useState<string | null | undefined>(undefined);
+	const listRef = useRef<HTMLUListElement | null>(null);
+
+	const names = projects.map((p) => p.name);
+	const byName = new Map(projects.map((p) => [p.name, p]));
+	// The list the user sees: props order, with the optimistic order applied on top.
+	const view = orderBy(names, localOrder ?? []);
+	useEffect(() => {
+		if (
+			localOrder !== null &&
+			names.length === localOrder.length &&
+			names.every((name, i) => name === localOrder[i])
+		)
+			setLocalOrder(null);
+	}, [localOrder, names]);
+
+	const busy = s.busy;
+	const clear = (): void => {
+		setDragId(null);
+		setDrop(undefined);
+	};
+	// Live row midpoints during the drag; dropBeforeId gives the slot under the pointer.
+	const slotAt = (y: number): string | null | undefined => {
+		const box = listRef.current;
+		if (box === null || dragId === null) return undefined;
+		const rows = Array.from(
+			box.querySelectorAll<HTMLElement>("li[data-name]"),
+			(el) => {
+				const rect = el.getBoundingClientRect();
+				return {
+					id: el.dataset.name as string,
+					middle: (rect.top + rect.bottom) / 2,
+				};
+			},
+		);
+		return dropBeforeId(rows, dragId, y);
+	};
+	// The full order with `id` moved to the `before` slot (null = the end).
+	const moved = (id: string, before: string | null): string[] => {
+		const rest = view.filter((name) => name !== id);
+		const at = before === null ? rest.length : rest.indexOf(before);
+		if (at < 0) return view;
+		return [...rest.slice(0, at), id, ...rest.slice(at)];
+	};
+	// No change, no request: the drop that lands back at the old place saves nothing.
+	const save = (next: string[]): void => {
+		if (next.every((name, i) => name === view[i])) return;
+		setLocalOrder(next);
+		s.run(
+			() => post("/api/projects/order", { order: next }),
+			() => setLocalOrder(null),
+		);
+	};
+	return (
+		<SettingsCard
+			id="projects-section"
+			title="Projects"
+			hint="Drag a project to move it. The new order saves at once."
+			// The footer draws a border, so it only renders while it has a tick to show.
+			footer={
+				busy || s.saved || s.failed ? (
+					<SaveTick busy={busy} saved={s.saved} failed={s.failed} />
+				) : undefined
+			}
+		>
+			<ul
+				className="projects-order"
+				ref={listRef}
+				onDragOver={
+					dragId !== null
+						? (e) => {
+								e.preventDefault();
+								e.dataTransfer.dropEffect = "move";
+								setDrop(slotAt(e.clientY));
+							}
+						: undefined
+				}
+				onDrop={
+					dragId !== null
+						? (e) => {
+								e.preventDefault();
+								const before = slotAt(e.clientY);
+								// Clear both drag states before the save runs: the optimistic
+								// reorder re-renders before the browser dispatches dragend, which
+								// detaches the row's handler, so a stale drop would repaint the
+								// slot after the order confirms.
+								clear();
+								if (before !== undefined) save(moved(dragId, before));
+							}
+						: undefined
+				}
+				onDragLeave={
+					dragId !== null
+						? (e) => {
+								const rect = e.currentTarget.getBoundingClientRect();
+								if (
+									e.clientX < rect.left ||
+									e.clientX > rect.right ||
+									e.clientY < rect.top ||
+									e.clientY > rect.bottom
+								)
+									setDrop(undefined);
+							}
+						: undefined
+				}
+				// Keyboard reorder: Alt+Arrow moves the focused row; blocked while a save runs.
+				onKeyDown={
+					busy
+						? undefined
+						: (e) => {
+								if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown"))
+									return;
+								const id = (e.target as HTMLElement).closest<HTMLElement>(
+									"[data-name]",
+								)?.dataset.name;
+								if (id === undefined) return;
+								const i = view.indexOf(id);
+								if (i < 0) return;
+								if (e.key === "ArrowUp" && i > 0) {
+									e.preventDefault();
+									save(moved(id, view[i - 1]!));
+								} else if (e.key === "ArrowDown" && i < view.length - 1) {
+									e.preventDefault();
+									save(moved(id, i + 2 < view.length ? view[i + 2]! : null));
+								}
+							}
+				}
+			>
+				{view.map((name, i) => {
+					const p = byName.get(name);
+					if (p === undefined) return null;
+					return (
+						<li
+							key={name}
+							data-name={name}
+							draggable={!busy}
+							className={
+								dragId === name
+									? "dragging"
+									: drop === name
+										? "drop-before"
+										: undefined
+							}
+							aria-label={`${projectLabel(p)}, position ${i + 1} of ${view.length}`}
+							onDragStart={(e) => {
+								// Firefox refuses to start a drag with an empty dataTransfer.
+								e.dataTransfer.setData("text/plain", name);
+								e.dataTransfer.effectAllowed = "move";
+								// Dim the row only after the browser has captured it as the drag image.
+								requestAnimationFrame(() => setDragId(name));
+							}}
+							onDragEnd={clear}
+						>
+							<ProjectTag project={p} />
+							<span className="projects-order-name">{projectLabel(p)}</span>
+							{/* The keyboard path: focus the handle, then Alt plus an arrow key moves the row. */}
+							<button
+								type="button"
+								className="icon projects-order-handle"
+								aria-label={`Reorder ${projectLabel(p)}: hold Alt and press ArrowUp or ArrowDown`}
+								title="Hold Alt and press ArrowUp or ArrowDown"
+							>
+								<Icon name="grip-vertical" />
+							</button>
+						</li>
+					);
+				})}
+			</ul>
 		</SettingsCard>
 	);
 }
@@ -3883,6 +4073,7 @@ export const SETTINGS_TOC = [
 		label: "Board",
 		sections: [
 			{ id: "runners-section", label: "Runners" },
+			{ id: "projects-section", label: "Projects" },
 			{ id: "push-section", label: "Push notifications" },
 		],
 	},
@@ -4236,6 +4427,7 @@ export function SettingsPage({
 								allocated={allocated}
 								act={act}
 							/>
+							<ProjectsOrderSection projects={projects} act={act} />
 							<PushSection />
 						</section>
 						<section

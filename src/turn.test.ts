@@ -3305,6 +3305,7 @@ describe("turn release cards", () => {
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
+				projectOrder: [],
 			},
 			serverRef: { current: undefined },
 		});

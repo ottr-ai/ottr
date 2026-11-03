@@ -8,6 +8,7 @@ import {
 	AppCheckLines,
 	GitHostsSection,
 	ProjectSettingsForm,
+	ProjectsOrderSection,
 	SessionSection,
 } from "./settings.tsx";
 import { stamp } from "./time.ts";
@@ -100,6 +101,23 @@ const onClickOf = (node: Element): ((e: unknown) => void) => {
 	};
 	if (props.onClick === undefined) throw new Error("node has no onClick");
 	return props.onClick;
+};
+
+/** The production React handler `prop` on the node, read like onChangeOf. Drag and key
+ * handlers attach conditionally (a drag only once dragstart set the state), so a missing
+ * handler is a test bug and throws. */
+const handlerOf = (node: Element, prop: string): ((e: unknown) => void) => {
+	const key = Object.getOwnPropertyNames(node).find((k) =>
+		k.startsWith("__reactProps$"),
+	);
+	if (key === undefined) throw new Error("react props missing on node");
+	const props = (node as unknown as Record<string, unknown>)[key] as Record<
+		string,
+		((e: unknown) => void) | undefined
+	>;
+	const handler = props[prop];
+	if (handler === undefined) throw new Error(`node has no ${prop}`);
+	return handler;
 };
 
 /** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
@@ -1173,6 +1191,259 @@ describe("ProjectSettingsForm review counter", () => {
 		);
 		try {
 			expect(counterLine(container)).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("ProjectsOrderSection", () => {
+	/** A minimal project: the section reads the name, the icon and the label settings only. */
+	const projectOf = (
+		name: string,
+		displayName: string | null = null,
+	): ProjectView =>
+		({
+			name,
+			icon: null,
+			settings: { displayName, iconText: null },
+		}) as unknown as ProjectView;
+
+	const PROJECTS = [
+		projectOf("alpha", "Alpha"),
+		projectOf("beta"),
+		projectOf("gamma"),
+	];
+
+	/** Mounts the section with `projects` against `fetchMock`, same cleanup as mountSection.
+	 *  The act stub mirrors the app's act: it runs the send and reports false when it throws,
+	 *  so a failed POST reaches the save tick as a failure. */
+	async function mountProjects(
+		fetchMock: typeof fetch,
+		projects: ProjectView[] = PROJECTS,
+	): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectsOrderSection
+					projects={projects}
+					act={async (fn) => {
+						try {
+							await fn();
+							return true;
+						} catch {
+							return false;
+						}
+					}}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	const rowNames = (container: HTMLDivElement): (string | undefined)[] =>
+		Array.from(
+			container.querySelectorAll<HTMLElement>(".projects-order li[data-name]"),
+			(el) => el.dataset.name,
+		);
+
+	/** Fixes the rows' boxes so dropBeforeId can place the slot from the pointer's clientY
+	 *  (happy-dom lays out nothing: every real rect is zero). */
+	const withRowBoxes = (container: HTMLDivElement): void => {
+		container
+			.querySelectorAll<HTMLElement>(".projects-order li[data-name]")
+			.forEach((el, i) => {
+				const top = i * 40;
+				el.getBoundingClientRect = () =>
+					({
+						top,
+						bottom: top + 36,
+						left: 0,
+						right: 200,
+						width: 200,
+						height: 36,
+					}) as unknown as DOMRect;
+			});
+	};
+
+	/** A POST mock for /api/projects/order that records the JSON body. */
+	const orderFetch = (
+		respond: () => Response,
+	): { fetch: typeof fetch; body: () => unknown; calls: () => number } => {
+		let received: unknown;
+		let count = 0;
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/order")) {
+				count += 1;
+				received = JSON.parse(String(init?.body));
+				return respond();
+			}
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		return { fetch: fetchMock, body: () => received, calls: () => count };
+	};
+
+	const ok = (): Response =>
+		new Response(JSON.stringify({ ok: true }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	test("rows render in props order with the label and position in each aria-label", async () => {
+		const fetchMock = (async (): Promise<Response> => {
+			throw new Error("the section fetches nothing on mount");
+		}) as unknown as typeof fetch;
+		const { container, unmount } = await mountProjects(fetchMock);
+		try {
+			expect(rowNames(container)).toEqual(["alpha", "beta", "gamma"]);
+			const labels = Array.from(
+				container.querySelectorAll<HTMLElement>(
+					".projects-order li[data-name]",
+				),
+				(el) => el.getAttribute("aria-label"),
+			);
+			expect(labels).toEqual([
+				"Alpha, position 1 of 3",
+				"beta, position 2 of 3",
+				"gamma, position 3 of 3",
+			]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("dropping row beta above row alpha posts the new full order", async () => {
+		const mock = orderFetch(ok);
+		const { container, unmount } = await mountProjects(mock.fetch);
+		try {
+			withRowBoxes(container);
+			const ul = container.querySelector(".projects-order");
+			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
+			if (ul === null || rowB === null)
+				throw new Error("projects list did not render");
+			// dragstart dims the row only after the browser captured the drag image: one rAF.
+			await act(async () => {
+				handlerOf(
+					rowB,
+					"onDragStart",
+				)({
+					preventDefault() {},
+					dataTransfer: { setData() {}, effectAllowed: "" },
+				});
+				const frame = Promise.withResolvers<void>();
+				setTimeout(frame.resolve, 10);
+				await frame.promise;
+			});
+			await act(async () => {
+				handlerOf(
+					ul,
+					"onDragOver",
+				)({
+					preventDefault() {},
+					clientX: 10,
+					// Above row alpha's midpoint (18): the slot sits before alpha.
+					clientY: 10,
+					currentTarget: ul,
+					dataTransfer: { dropEffect: "" },
+				});
+				handlerOf(
+					ul,
+					"onDrop",
+				)({
+					preventDefault() {},
+					clientX: 10,
+					clientY: 10,
+					currentTarget: ul,
+					dataTransfer: { dropEffect: "" },
+				});
+			});
+			expect(mock.calls()).toBe(1);
+			expect(mock.body()).toEqual({ order: ["beta", "alpha", "gamma"] });
+			// The optimistic order shows at once; the props have not caught up here.
+			expect(rowNames(container)).toEqual(["beta", "alpha", "gamma"]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Alt+ArrowUp on row beta posts the same moved order", async () => {
+		const mock = orderFetch(ok);
+		const { container, unmount } = await mountProjects(mock.fetch);
+		try {
+			const ul = container.querySelector(".projects-order");
+			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
+			if (ul === null || rowB === null)
+				throw new Error("projects list did not render");
+			await act(async () => {
+				handlerOf(
+					ul,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: rowB,
+					preventDefault() {},
+				});
+			});
+			expect(mock.calls()).toBe(1);
+			expect(mock.body()).toEqual({ order: ["beta", "alpha", "gamma"] });
+			expect(rowNames(container)).toEqual(["beta", "alpha", "gamma"]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed save shows Not saved and rolls the rows back to the props order", async () => {
+		const mock = orderFetch(
+			() =>
+				new Response(JSON.stringify({ error: "x" }), {
+					status: 500,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		const { container, unmount } = await mountProjects(mock.fetch);
+		try {
+			const ul = container.querySelector(".projects-order");
+			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
+			if (ul === null || rowB === null)
+				throw new Error("projects list did not render");
+			await act(async () => {
+				handlerOf(
+					ul,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: rowB,
+					preventDefault() {},
+				});
+				// Let the failed POST settle before reading the tick and the rows.
+				const settled = Promise.withResolvers<void>();
+				setTimeout(settled.resolve, 0);
+				await settled.promise;
+			});
+			expect(mock.calls()).toBe(1);
+			expect(container.textContent).toContain("Not saved");
+			expect(rowNames(container)).toEqual(["alpha", "beta", "gamma"]);
 		} finally {
 			await unmount();
 		}

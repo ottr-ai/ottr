@@ -277,6 +277,17 @@ const ICON_PATHS = {
 			<polyline points="7 6 12 11 17 6" />
 		</>
 	),
+	// lucide grip-vertical (ISC): the drag handle of a settings reorder row
+	"grip-vertical": (
+		<>
+			<circle cx="9" cy="5" r="1" />
+			<circle cx="9" cy="12" r="1" />
+			<circle cx="9" cy="19" r="1" />
+			<circle cx="15" cy="5" r="1" />
+			<circle cx="15" cy="12" r="1" />
+			<circle cx="15" cy="19" r="1" />
+		</>
+	),
 	// lucide circle-help (ISC): opens the projects-line mark legend
 	help: (
 		<>

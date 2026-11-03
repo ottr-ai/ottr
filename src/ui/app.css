@@ -4228,6 +4228,52 @@ dialog.confirm-dialog {
 	padding-top: 12px;
 	border-top: 1px solid var(--line-soft);
 }
+/* Projects card: boxed rows in the settings grammar. Drag a row, or focus it and press
+   Alt+Arrow; the order saves at once. The dragged row dims — the drag image is captured
+   before the dim lands. */
+.projects-order {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	align-self: stretch;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.projects-order li {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 7px 10px;
+	background: var(--field);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	cursor: grab;
+}
+.projects-order li:active {
+	cursor: grabbing;
+}
+.projects-order-handle {
+	margin-left: auto;
+}
+.projects-order li.dragging {
+	cursor: grabbing;
+	opacity: 0.55;
+}
+/* Slot preview: a dashed accent line where the row will land, above the target row. */
+.projects-order li.drop-before {
+	margin-top: 10px;
+}
+.projects-order li.drop-before::before {
+	content: "";
+	position: absolute;
+	top: -9px;
+	right: -1px;
+	left: -1px;
+	height: 0;
+	border-top: 2px dashed var(--accent);
+}
 .settings-sec code {
 	overflow-wrap: anywhere;
 }

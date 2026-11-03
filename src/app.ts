@@ -327,6 +327,8 @@ interface AppDeps {
 		idleReviews: boolean;
 		removedPaths: string[];
 		projectPaths: string[];
+		/** Project names in board order; names not listed keep discovery order after them. */
+		projectOrder: string[];
 		/** Secret env values from Settings, one per env.txt name; the only copy. Stored plaintext
 		 * in the config file like githubToken (same trust level), never served back after save.
 		 * The turn loop reads it for redaction and env seeding. */
@@ -390,19 +392,25 @@ export async function behindMain(
 	};
 }
 
-/** The persisted removed/added project paths; boot discovery needs them before createApp runs. */
+/** The persisted removed/added project paths and display order; boot discovery needs them
+ * before createApp runs. */
 export function storedProjectPaths(gstore: GlobalStore): {
 	removedPaths: string[];
 	projectPaths: string[];
+	projectOrder: string[];
 } {
-	const c = gstore.get<{ removed?: unknown; projects?: unknown }>("config");
-	const paths = (v: unknown): string[] =>
-		Array.isArray(v)
-			? v
-					.filter((x): x is string => typeof x === "string")
-					.map((p) => resolve(p))
-			: [];
-	return { removedPaths: paths(c?.removed), projectPaths: paths(c?.projects) };
+	const c = gstore.get<{
+		removed?: unknown;
+		projects?: unknown;
+		projectOrder?: unknown;
+	}>("config");
+	const strs = (v: unknown) =>
+		Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+	return {
+		removedPaths: strs(c?.removed).map((p) => resolve(p)),
+		projectPaths: strs(c?.projects).map((p) => resolve(p)),
+		projectOrder: strs(c?.projectOrder),
+	};
 }
 
 /**
@@ -1475,6 +1483,7 @@ export function createApp(deps: AppDeps) {
 			idleReviews: deps.shared.idleReviews,
 			removed: deps.shared.removedPaths,
 			projects: deps.shared.projectPaths,
+			projectOrder: deps.shared.projectOrder,
 			admin,
 			apiKey,
 			sessionSecret,
@@ -2104,15 +2113,22 @@ export function createApp(deps: AppDeps) {
 		}
 		const roles = modelRoles();
 		const dead = deadSignIns(list, roles);
-		return {
-			projects: [...deps.projects.values()].flatMap((e) => {
+		const rank = (name: string): number => {
+			const i = deps.shared.projectOrder.indexOf(name);
+			return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+		};
+		const projects = [...deps.projects.values()]
+			.flatMap((e) => {
 				try {
 					return [projectView(e)];
 				} catch (err) {
 					logStoreError(e.store.name, err);
 					return [];
 				}
-			}),
+			})
+			.sort((a, b) => rank(a.name) - rank(b.name));
+		return {
+			projects,
 			tasks,
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
@@ -3968,6 +3984,39 @@ export function createApp(deps: AppDeps) {
 								? true
 								: null;
 					return json({ authed: true, user, free, dir, host });
+				}),
+		},
+		"/api/projects/order": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const body = r.body as { order?: unknown };
+					if (
+						!Array.isArray(body.order) ||
+						body.order.some((n) => typeof n !== "string")
+					) {
+						return json(
+							{ error: "order must be an array of project names" },
+							400,
+						);
+					}
+					const order = body.order as string[];
+					if (new Set(order).size !== order.length) {
+						return json({ error: "order has duplicate names" }, 400);
+					}
+					for (const name of order) {
+						if (!deps.projects.has(name)) {
+							return json({ error: `unknown project: ${name}` }, 400);
+						}
+					}
+					const missing = [...deps.projects.keys()].filter(
+						(n) => !order.includes(n),
+					);
+					deps.shared.projectOrder = [...order, ...missing];
+					saveConfig();
+					deps.schedule();
+					return json({ ok: true });
 				}),
 		},
 		"/api/projects": {
