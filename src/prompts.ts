@@ -61,6 +61,7 @@ If this task only researches a topic or answers a question — no code changes n
 Other tasks in flight for this project:
 ${siblings.join("\n")}
 ${RENAME}
+Call rename with a 3-8 word title before your first report_outcome.
 ${NO_DESTRUCTION}
 Before you finish, call report_outcome: ${WORK_OUTCOMES}.
 In a question, link a file change instead of quoting it: a markdown link whose href starts with \`diff:\` names the files, for example \`[the diff](diff:src/prompts.ts)\`.
@@ -82,6 +83,7 @@ If the rebase pulled in commits that touch dependencies, install again in locked
 Then, in the main checkout, fast-forward ${targetBranch} to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so ${targetBranch} holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
 Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated. If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.
 ${RENAME}
+Call rename with a 3-8 word title before your first report_outcome.
 ${NO_DESTRUCTION}
 Call report_outcome: integrated (put the integration output, e.g. release stdout, verbatim in details) or needs_you with the exact question — call ask with it and its options first, then end.
 Add a final line \`topic: <one or two words for the task's subject>\` to the report details — the board groups done tasks by it.

@@ -141,6 +141,17 @@ describe("scratch rule", () => {
 	});
 });
 
+describe("rename before report", () => {
+	test("work and merge prompts order the rename before the first report_outcome", () => {
+		const line =
+			"Call rename with a 3-8 word title before your first report_outcome.";
+		expect(workPrompt({ text: "t", branch: "b", siblings: [] })).toContain(
+			line,
+		);
+		expect(mergePrompt({ branch: "b", target: "main" })).toContain(line);
+	});
+});
+
 describe("restartResumePrompt", () => {
 	test("a clean worktree gets the unchanged-tree hint with a short sha", () => {
 		const p = restartResumePrompt({
