@@ -31,7 +31,7 @@ const NO_DESTRUCTION =
 
 /** Features move; READMEs rot. Work turns can edit, so they fix the README in place (the read-only release review files cards instead). */
 const README_RULE =
-	"Check the project's README against the task's result: if what it describes (features, setup, screenshots) is stale, update it in this task and commit it with the work.";
+	"Check the project's README against the task's result: if what it describes (features, setup, screenshots) is stale, update it in this task and commit it with the work. If the task changes what the board shows (src/ui layout, styles, or visible copy), also run `bun run readme-screenshot` and commit the new `.github/assets/screenshot.png`. Behaviour-only or off-screen UI changes need no new shot.";
 
 /** Note for a fresh omp session on a task whose own session can't be resumed (New session, or never saved). */
 export const LOST_SESSION =

@@ -301,7 +301,7 @@ A running card shows a live **Mutation testing** meter when the card's progress 
 
 CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; weekly workflows add Docker build checks, Trivy and an OWASP ZAP baseline scan. Package versions stay 7 days back (`bunfig.toml`), and every action pins a full commit SHA.
 
-For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. It is also the way to refresh the screenshots under `.github/assets/`.
+For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
 
 ### Screenshot proofs for UI cards
 
@@ -319,6 +319,8 @@ A UI change needs a picture of the new surface. `bun run dev` serves the demo bo
 5. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
 
 `/shots/` and `/*.png` sit in `.gitignore`, so the shots stay out of `git status` and never enter a commit.
+
+The README board screenshot has its own one-command path: `bun run readme-screenshot` starts the demo board, opens the Lumen project in headless Chrome (1440x900, dark theme, `en-US` locale), waits out the entrance animations, and writes `.github/assets/screenshot.png`. Run it in the same work as a `src/ui` change that alters what the board shows; behaviour-only or off-screen changes need no new shot. The script finds Chrome in the puppeteer cache or on `PATH` — `OTTR_SCREENSHOT_CHROME` names a binary directly — and adds no dependency: it drives Chrome over CDP with Bun's WebSocket client. Spec: `docs/specs/readme-screenshot.md`.
 
 ## Docs
 
