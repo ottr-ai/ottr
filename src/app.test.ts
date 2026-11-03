@@ -697,6 +697,29 @@ describe("task routes", () => {
 		expect(await errorOf(refusal)).toBe("task is not waiting for you");
 	});
 
+	test("reply and Resume keep a steer queued before the stop", async () => {
+		const t = store.createTask("stopped while steered");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Turn stopped.",
+			pendingPrompt: "use the fixed config",
+			pendingBy: "user",
+		});
+		await post(`/api/projects/p1/tasks/${t.id}/reply`, { text: "go on" });
+		expect(store.getTask(t.id)?.pendingPrompt).toBe(
+			"use the fixed config\n\ngo on",
+		);
+		const r = store.createTask("stopped, then resumed");
+		store.updateTask(r.id, {
+			state: "needs_you",
+			needsReason: "Turn stopped.",
+			pendingPrompt: "use the fixed config",
+			pendingBy: "user",
+		});
+		await post(`/api/projects/p1/tasks/${r.id}/reply`, { text: "." });
+		expect(store.getTask(r.id)?.pendingPrompt).toBe("use the fixed config");
+	});
+
 	test("star toggles the flag and rejects a non-boolean body", async () => {
 		const t = store.createTask("pin me");
 		expect(store.getTask(t.id)?.starred).toBe(false);

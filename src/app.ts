@@ -5021,6 +5021,13 @@ export function createApp(deps: AppDeps) {
 					// Same rule as steer/follow-up (R1-9): an empty reply would re-send the whole
 					// task prompt as the next turn, and an unbounded one can blow the session.
 					const trimmed = text.trim();
+					// A steer queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.
+					const queue = (next: string): string =>
+						task.pendingPrompt === null
+							? next
+							: next === "."
+								? task.pendingPrompt
+								: `${task.pendingPrompt}\n\n${next}`;
 					if (
 						trimmed.length > 20000 ||
 						(trimmed === "" && decoded.images.length === 0)
@@ -5049,11 +5056,13 @@ export function createApp(deps: AppDeps) {
 						if (trimmed === WORK_CHECK_ASK_SEND_BACK) {
 							const n = task.workCheckSendbacks + 1;
 							e.store.updateTask(task.id, {
-								pendingPrompt: workCheckSendBack({
-									blockers: open,
-									attempt: n,
-									max: n,
-								}),
+								pendingPrompt: queue(
+									workCheckSendBack({
+										blockers: open,
+										attempt: n,
+										max: n,
+									}),
+								),
 								pendingBy: "supervisor",
 								workCheckSendbacks: n,
 								state: "queued",
@@ -5092,9 +5101,12 @@ export function createApp(deps: AppDeps) {
 							(mismatchHold && task.updateIds.length === 0));
 					e.store.updateTask(task.id, {
 						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
-						pendingPrompt: trimmed || ".",
-						pendingBy: "user",
-						pendingImages: names,
+						pendingPrompt: queue(trimmed || "."),
+						pendingBy:
+							task.pendingPrompt !== null && task.pendingBy === "supervisor"
+								? "supervisor"
+								: "user",
+						pendingImages: [...task.pendingImages, ...names],
 						state: "queued",
 						queuedAt: Date.now(),
 						needsReason: null,
