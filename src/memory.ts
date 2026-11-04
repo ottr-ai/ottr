@@ -108,8 +108,13 @@ export async function checkMemoryHealth(
 		}
 	}
 	const homes = [opts?.home ?? process.env.HOME ?? homedir()];
-	if (opts?.boardHome && !homes.includes(opts.boardHome))
-		homes.push(opts.boardHome);
+	// The production tick passes no opts: the board home comes from the env then
+	// (docs/specs/memory-backend.md). null opts out explicitly.
+	const boardHome =
+		opts?.boardHome === undefined
+			? process.env.OTTR_BOARD_OMP_HOME
+			: opts.boardHome;
+	if (boardHome && !homes.includes(boardHome)) homes.push(boardHome);
 	for (const home of homes) {
 		const store = join(home, ".omp", "agent", "memories", "mnemopi");
 		const probe = join(store, MNEMOPI_PROBE);

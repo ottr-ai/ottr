@@ -260,10 +260,13 @@ describe("checkMemoryHealth", () => {
 		}
 	});
 
-	test("no opts: the environment home is probed and its store created", async () => {
+	test("no opts: the environment home and the board home from the env are probed", async () => {
 		const savedHome = process.env.HOME;
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
 		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-envhome-"));
+		const board = mkdtempSync(join(tmpdir(), "ottr-memory-envboard-"));
 		process.env.HOME = dir;
+		process.env.OTTR_BOARD_OMP_HOME = board;
 		try {
 			// No second argument at all: opts itself is undefined in production's tick.
 			const h = await checkMemoryHealth({ backend: "mnemopi" });
@@ -272,10 +275,16 @@ describe("checkMemoryHealth", () => {
 			expect(
 				existsSync(join(dir, ".omp", "agent", "memories", "mnemopi")),
 			).toBe(true);
+			expect(
+				existsSync(join(board, ".omp", "agent", "memories", "mnemopi")),
+			).toBe(true);
 		} finally {
 			if (savedHome === undefined) delete process.env.HOME;
 			else process.env.HOME = savedHome;
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
 			rmSync(dir, { recursive: true, force: true });
+			rmSync(board, { recursive: true, force: true });
 		}
 	});
 
