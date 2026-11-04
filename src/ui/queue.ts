@@ -1,5 +1,6 @@
 import { queueOrder } from "../scheduler.ts";
 import type { RunState, Stage, Task, TaskCard } from "../types.ts";
+import { recommendsSteps } from "../types.ts";
 
 /** Card facts the lane counts and the search filter read. */
 type LaneTask = Pick<
@@ -15,24 +16,56 @@ type LaneTask = Pick<
 	| "asked"
 	| "answered"
 	| "kind"
+	| "research"
+	| "steps"
 >;
 
-/** Cards a read mark can stick to: answered question cards and PR review cards. A cancelled
- * card is final: no read mark, no unread badge (the server's seenableIds drops it too). */
+/** Cards a read mark can stick to: answered question cards, PR review cards, and done research
+ * cards with a resolved steps report. A cancelled card is final: no read mark, no unread badge
+ * (the server's seenableIds drops it too). */
 export function seenable(
-	t: Pick<TaskCard, "answered" | "cancelledAt" | "kind">,
+	t: Pick<
+		TaskCard,
+		"answered" | "cancelledAt" | "kind" | "stage" | "research" | "steps"
+	>,
 ): boolean {
 	return (
-		t.cancelledAt === null && (t.answered === true || t.kind === "pr_review")
+		t.cancelledAt === null &&
+		(t.answered === true ||
+			t.kind === "pr_review" ||
+			(t.research && t.stage === "done" && t.steps !== "unknown"))
 	);
 }
 
 /** Unread: has something to read and no read mark yet. */
 export function isUnread(
-	t: Pick<TaskCard, "id" | "answered" | "cancelledAt" | "kind">,
+	t: Pick<
+		TaskCard,
+		"id" | "answered" | "cancelledAt" | "kind" | "stage" | "research" | "steps"
+	>,
 	seen: ReadonlySet<string>,
 ): boolean {
 	return seenable(t) && !seen.has(t.id);
+}
+
+/** OTTR-488 resolution: how a card's research report treats steps. 'yes' = steps report (pinned until a drawer button clears it), 'no' = pure info (pinned until opened), 'quiet' = nothing to pin (legacy report without steps, or no report). Server views ship resolved steps (app.ts viewSteps), so cards normally carry the stored value; the regex fallback covers direct TaskView reads and keeps the table testable. */
+export function researchSteps(t: {
+	steps: Task["steps"];
+	report?: string | null;
+}): "yes" | "no" | "quiet" {
+	if (t.steps === "yes") return "yes";
+	if (t.steps === "no") return "no";
+	return t.report != null && recommendsSteps(t.report) ? "yes" : "quiet";
+}
+
+/** OTTR-488: opening a card marks it read — except a steps report, which only its drawer buttons clear ('Implement steps' / 'No further steps'). */
+export function autoMarkOnOpen(
+	t: Pick<
+		TaskCard,
+		"answered" | "cancelledAt" | "kind" | "stage" | "research" | "steps"
+	>,
+): boolean {
+	return seenable(t) && researchSteps(t) !== "yes";
 }
 
 const STAGES = [

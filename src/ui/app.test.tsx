@@ -7,6 +7,7 @@ import type {
 	PerfMetrics,
 	PerfStat,
 	ProjectView,
+	Task,
 	TaskCard,
 	TaskView,
 	UpdateRow,
@@ -330,7 +331,9 @@ describe("UpdateRowLine", () => {
 	});
 });
 
-const cardFixture = (over: Partial<TaskCard>): TaskCard =>
+const cardFixture = (
+	over: Partial<TaskCard> & Partial<Pick<Task, "report">>,
+): TaskCard =>
 	({
 		id: "t1",
 		title: "Task one",
@@ -666,7 +669,7 @@ describe("done lane star section", () => {
 		expect(bare).not.toContain("mark-star");
 	});
 
-	test("the Starred section sits below Unread and above normal done cards", () => {
+	test("the Starred section sits below Inbox and above normal done cards", () => {
 		const freshCard = cardFixture({
 			id: "u1",
 			stage: "done",
@@ -689,14 +692,59 @@ describe("done lane star section", () => {
 				unread={(t) => t.id === "u1"}
 			/>,
 		);
-		const unreadAt = html.indexOf(">Unread</p>");
+		const inboxAt = html.indexOf(">Inbox</p>");
 		const starredAt = html.indexOf(">Starred</span>");
 		const normalAt = html.indexOf('data-task-id="n1"');
-		expect(unreadAt).toBeGreaterThanOrEqual(0);
-		expect(starredAt).toBeGreaterThan(unreadAt);
+		expect(inboxAt).toBeGreaterThanOrEqual(0);
+		expect(starredAt).toBeGreaterThan(inboxAt);
 		expect(normalAt).toBeGreaterThan(starredAt);
 		// The starred card left the normal list.
 		expect(html.match(/data-task-id="s1"/g)?.length).toBe(1);
+	});
+
+	test("a done research steps card pins in the Inbox and sits with the read cards once seen", () => {
+		const stepsCard = cardFixture({
+			id: "r1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			steps: "yes",
+			report: "## Recommended steps\n\n1. Buy the rack",
+		});
+		const answered = cardFixture({
+			id: "q1",
+			stage: "done",
+			state: "idle",
+			answered: true,
+		});
+		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		// Static markup cannot fire events, so the seen set is the `unread` callback:
+		// clearing a steps report = the callback stops naming the id, marking it unread again re-pins.
+		const pinned = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[stepsCard, normal, answered]}
+				unread={(t) => t.id === "r1"}
+			/>,
+		);
+		expect(pinned).toContain(">Inbox</p>");
+		expect(pinned.indexOf('data-task-id="r1"')).toBeLessThan(
+			pinned.indexOf("lane-divider"),
+		);
+		// The same id in the seen set rides below the divider with the read cards.
+		const read = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={[stepsCard, normal, answered]}
+				unread={(t) => t.id === "q1"}
+			/>,
+		);
+		expect(read).toContain(">Inbox</p>"); // the answered card keeps its own pin
+		expect(read.indexOf('data-task-id="r1"')).toBeGreaterThan(
+			read.indexOf("lane-divider"),
+		);
 	});
 
 	test("no Starred section renders without a starred card", () => {
@@ -756,7 +804,7 @@ describe("done lane star section", () => {
 				unread={(t) => t.id === "u1"}
 			/>,
 		);
-		// One rule between Unread and Starred, one between Starred and the rest.
+		// One rule between Inbox and Starred, one between Starred and the rest.
 		expect(open.match(/lane-divider/g)?.length).toBe(2);
 		const shut = renderToStaticMarkup(
 			<LaneCol
@@ -1352,6 +1400,7 @@ describe("Drawer parent chip", () => {
 		onFollowed: () => {},
 		read: false,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		onOpenTask: () => {},
 		draining: false,
 		usedTotal: 0,
@@ -1444,6 +1493,7 @@ describe("Drawer cross-project lineage", () => {
 		onFollowed: () => {},
 		read: false,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		onOpenTask: () => {},
 		draining: false,
 		usedTotal: 0,
@@ -1589,6 +1639,7 @@ describe("Drawer prompt markdown", () => {
 		onFollowed: () => {},
 		read: true,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		tasks: [],
 		onOpenTask: () => {},
 		draining: false,
@@ -1994,6 +2045,7 @@ describe("Drawer approve button", () => {
 		onFollowed: () => {},
 		read: true,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		tasks: [],
 		onOpenTask: () => {},
 		draining: false,
@@ -2249,7 +2301,7 @@ describe("cancelled cards on the board", () => {
 		expect(html).not.toContain('class="unread"');
 	});
 
-	test("a cancelled card never joins the Starred section or the Unread lane", () => {
+	test("a cancelled card never joins the Starred section or the Inbox lane", () => {
 		const deadStar = cardFixture({
 			id: "s1",
 			stage: "done",
@@ -2269,7 +2321,7 @@ describe("cancelled cards on the board", () => {
 				more={0}
 			/>,
 		);
-		expect(html).not.toContain("Unread");
+		expect(html).not.toContain("Inbox");
 		expect(html).not.toContain("Starred");
 		expect(html).toContain('data-task-id="s1"');
 		// The star never replaces the cancelled x, not even on a starred card.
@@ -2616,6 +2668,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		onFollowed: () => {},
 		read: true,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		tasks: [],
 		onOpenTask: () => {},
 		draining: false,
@@ -2644,6 +2697,66 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(html).not.toContain("Delete task");
 		expect(html).not.toContain("Mark unread");
 		expect(html).not.toContain("Merge anyway");
+	});
+
+	test("a done steps report offers both drawer buttons", () => {
+		const task = cardFixture({
+			...drawerFields,
+			id: "R-1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			steps: "yes",
+			report: "## Recommended steps\n\n1. Buy the rack",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Implement steps");
+		expect(html).toContain("No further steps");
+	});
+
+	test("a pure-info research card offers neither steps button", () => {
+		const task = cardFixture({
+			...drawerFields,
+			id: "R-2",
+			stage: "done",
+			state: "idle",
+			research: true,
+			steps: "no",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain("Implement steps");
+		expect(html).not.toContain("No further steps");
+	});
+
+	test("a quiet research card with an unmatched report offers neither steps button", () => {
+		const task = cardFixture({
+			...drawerFields,
+			id: "R-3",
+			stage: "done",
+			state: "idle",
+			research: true,
+			steps: "unknown",
+			report: "## Short answer\n\nThe rack fits as-is.",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain("Implement steps");
+		expect(html).not.toContain("No further steps");
+	});
+
+	test("a cancelled steps card stays read-only: no steps buttons", () => {
+		const dead = cardFixture({
+			...drawerFields,
+			id: "R-4",
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1760000000000,
+			research: true,
+			steps: "yes",
+			report: "## Recommended steps\n\n1. Buy the rack",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={dead} />);
+		expect(html).not.toContain("Implement steps");
+		expect(html).not.toContain("No further steps");
 	});
 
 	test("a cancelled non-done card hides triage, editing and the cancel button", () => {
@@ -2869,6 +2982,7 @@ describe("path URL card links", () => {
 		onFollowed: () => {},
 		read: false,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		onOpenTask: () => {},
 		draining: false,
 		usedTotal: 0,

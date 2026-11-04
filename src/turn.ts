@@ -2512,13 +2512,15 @@ export function createTurnLoop(
 						needsReason: `The research report file ${RESEARCH_REPORT} is missing from the worktree. Reply to have the agent write it, or cancel the card.`,
 					};
 			}
-			// OTTR-488: harvest the steps recommendation with the report — 'yes' only when the
-			// report carries the heading, 'no' when a harvested report carries none; no report
-			// (or none harvested this settle) writes nothing and keeps the column.
+			// OTTR-488: harvest the steps recommendation with the report — 'yes' when the report
+			// recommends steps by the same detection the drawer button uses (the exact heading
+			// the prompt asks for, or the older shapes OTTR-468 upgraded the regex to catch, so
+			// a stored row can never lose the button a legacy row keeps), 'no' when a harvested
+			// report carries none; no report (or none harvested this settle) writes nothing.
 			const steps =
 				report === null || report === undefined
 					? undefined
-					: /^##\s+recommended steps\b/im.test(report)
+					: recommendsSteps(report)
 						? ("yes" as const)
 						: ("no" as const);
 			const now = Date.now();

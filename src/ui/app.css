@@ -2670,7 +2670,7 @@ a.release:hover {
 	color: var(--accent);
 	border-color: var(--accent);
 }
-/* Unread answer badge: a done question card whose drawer never opened; opening clears it. */
+/* Inbox badge: a done card with something to read whose drawer never opened; opening clears it (a steps report only its drawer buttons clear). */
 .card .unread {
 	flex-shrink: 0;
 	padding: 0 6px;
@@ -2741,7 +2741,7 @@ a.release:hover {
 .card[data-unread] {
 	border-color: var(--accent);
 }
-/* Group label for the pinned unread answers: quiet small caps, nameable at a glance. */
+/* Group label for the pinned Inbox cards (unread answers and steps reports): quiet small caps, nameable at a glance. */
 .lane-label {
 	margin: 0 2px;
 	font-size: 11px;

@@ -23,36 +23,35 @@ import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
-import type {
-	AddProjectResponse,
-	AskQuestion,
-	GhStatus,
-	KeptChoice,
-	MachineStats,
-	PerfMetrics,
-	PerfRange,
-	PerfResponse,
-	PerfStat,
-	ProjectView,
-	ProvisioningResponse,
-	PrReviewView,
-	QuotaState,
-	ReleasePlan,
-	Stage,
-	StateResponse,
-	TaskCard,
-	TaskView,
-	UpdateRow,
-	UpdatesView,
-} from "../types.ts";
 import {
+	type AddProjectResponse,
 	APPROVE_REPLY,
+	type AskQuestion,
 	FORK_HOLD_REASON,
+	type GhStatus,
+	type KeptChoice,
+	type MachineStats,
 	MERGE_HOLD_MISMATCH_REASON,
 	PERF_RANGES,
+	type PerfMetrics,
+	type PerfRange,
+	type PerfResponse,
+	type PerfStat,
 	PRIORITIES,
+	type ProjectView,
+	type ProvisioningResponse,
+	type PrReviewView,
+	type QuotaState,
 	REVIEW_BODY_MAX,
+	type ReleasePlan,
+	recommendsSteps,
+	type Stage,
+	type StateResponse,
+	type TaskCard,
+	type TaskView,
 	UPDATE_HOLD_REASON,
+	type UpdateRow,
+	type UpdatesView,
 	VERSION_RE,
 } from "../types.ts";
 import { mapRepo } from "../updates.ts";
@@ -134,6 +133,7 @@ import {
 	taskEntryKey,
 } from "./notify.ts";
 import {
+	autoMarkOnOpen,
 	donePage,
 	dropBeforeId,
 	isUnread,
@@ -142,6 +142,7 @@ import {
 	laneStage,
 	onBoard,
 	reorderIds,
+	researchSteps,
 	SLOT_STAGES,
 	type SlotCounts,
 	seenable,
@@ -4592,7 +4593,7 @@ export function LaneCol({
 					{filtering ? "No matches." : EMPTY_STAGE[stage]}
 				</p>
 			)}
-			{fresh.length > 0 && <p className="lane-label">Unread</p>}
+			{fresh.length > 0 && <p className="lane-label">Inbox</p>}
 			{fresh.map(card)}
 			{fresh.length > 0 && fresh.length + starred.length < tasks.length && (
 				<hr className="lane-divider" />
@@ -6237,20 +6238,8 @@ function turnPage<T extends { list: string[]; index: number }>(
 const IMPLEMENT_RECOMMENDATIONS =
 	"Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
-/** True when a research report names steps worth implementing. The research
- * prompt asks for a heading named "## Recommended steps", so the exact heading
- * is the first signal; older reports (OTTR-94, OTTR-283) fall back to the same
- * phrases the follow-up prompt searches for, and a heading holding "recommended
- * … steps" with up to three words between catches shapes like OTTR-449's
- * "## Recommended adoption steps". ponytail: the fallbacks are still a phrase
- * heuristic; a report saying "no next steps are needed" still matches them. */
-export const recommendsSteps = (report: string): boolean =>
-	// The exact heading the research prompt asks for, any level, case-insensitive.
-	/^\s*#{1,6}\s+recommended steps\s*$/im.test(report) ||
-	// Old-report phrases, so the button never promises work the agent cannot find.
-	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report) ||
-	// A heading holding "recommended … steps", up to three words between.
-	/^\s*#{1,6}\s+.*\brecommended(?:\s+\S+){0,3}\s+steps\b/im.test(report);
+/** moved to ../types.ts (the server resolves stored steps too, OTTR-488) */
+export { recommendsSteps };
 
 /** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
  * status words and alarm coding as the meta line; a click opens the card. The href uses each
@@ -6543,6 +6532,7 @@ export function Drawer({
 	onFollowed,
 	read,
 	onMarkUnread,
+	onMarkSeen,
 	delta,
 	tasks,
 	onOpenTask,
@@ -6561,6 +6551,8 @@ export function Drawer({
 	read: boolean;
 	/** Marks the answer unread again and closes the drawer; the board owns the seen set. */
 	onMarkUnread: () => void;
+	/** Marks the steps report read ('No further steps' button); the board owns the seen set. */
+	onMarkSeen: () => void;
 	delta?: number;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
@@ -8312,9 +8304,8 @@ export function Drawer({
 								<Icon name="send" />
 								Follow up
 							</button>
-							{task.research &&
-								task.report !== null &&
-								recommendsSteps(task.report) && (
+							{task.research && researchSteps(task) === "yes" && (
+								<>
 									<BusyButton
 										title="Creates a follow-up task that implements the report's recommended steps"
 										run={() =>
@@ -8330,7 +8321,18 @@ export function Drawer({
 										<Icon name="play" />
 										Implement steps
 									</BusyButton>
-								)}
+									<BusyButton
+										title="Marks the report read and clears it from the Inbox"
+										run={async () => {
+											onMarkSeen();
+											return true;
+										}}
+									>
+										<Icon name="eye-off" />
+										No further steps
+									</BusyButton>
+								</>
+							)}
 							<p className="hint">
 								Creates a new task that continues this one with a full handoff.
 							</p>
@@ -9269,7 +9271,7 @@ export function App() {
 				setView(card.project);
 			}
 			setSelectedId(id);
-			markSeen(card);
+			if (card !== undefined && autoMarkOnOpen(card)) markSeen(card);
 		},
 		[tasks, markSeen],
 	);
@@ -10498,10 +10500,13 @@ export function App() {
 						void markUnread(selected);
 						closeDrawer(); // close so the board shows the card unread; onClose would re-mark it read
 					}}
+					onMarkSeen={() => {
+						if (selected !== null) markSeen(selected);
+					}}
 					onClose={() => {
 						if (selected === null) return; // same deferred close; do not re-mark it read
 						// An answer that landed while the drawer was open counts as read.
-						markSeen(selected);
+						if (autoMarkOnOpen(selected)) markSeen(selected);
 						closeDrawer();
 					}}
 					onFollowed={(id, from) => {

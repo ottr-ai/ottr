@@ -5128,6 +5128,27 @@ describe("turn research cards", () => {
 		expect(store.getTask(task.id)!.steps).toBe("no");
 	});
 
+	test("a loose Recommended-steps heading variant stores steps yes", async () => {
+		const { store, record, projects } = researchStore();
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(
+						join(o.worktreePath, RESEARCH_REPORT),
+						"# findings\n\n## Recommended adoption steps\n\n1. Do it",
+					);
+				},
+			}),
+		);
+		const task = researchTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.steps).toBe("yes");
+	});
+
 	test("a plain work card with no report file keeps steps unknown", async () => {
 		const { store, record, projects } = researchStore();
 		const loop = createTurnLoop(

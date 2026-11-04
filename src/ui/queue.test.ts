@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
+	autoMarkOnOpen,
 	donePage,
 	dropBeforeId,
 	isUnread,
@@ -8,6 +9,7 @@ import {
 	laneOrder,
 	laneStage,
 	reorderIds,
+	researchSteps,
 	seenable,
 	slotUse,
 	spliceColumn,
@@ -37,6 +39,8 @@ const card = (
 			| "asked"
 			| "answered"
 			| "kind"
+			| "research"
+			| "steps"
 		>
 	> = {},
 ) => ({
@@ -51,6 +55,8 @@ const card = (
 	asked: over.asked ?? null,
 	answered: over.answered ?? false,
 	kind: over.kind ?? "work",
+	research: over.research ?? false,
+	steps: over.steps ?? "unknown",
 });
 
 test("slotUse counts running tasks per stage", () => {
@@ -175,6 +181,98 @@ test("a cancelled card is never seenable, so never unread", () => {
 	const live = card("live", "done", "idle", { answered: true });
 	expect(seenable(live)).toBe(true);
 	expect(isUnread(live, new Set())).toBe(true);
+});
+
+test("researchSteps resolves the stored steps value first, then falls back to the report regex", () => {
+	// Stored values from the harvest pass through.
+	expect(researchSteps({ steps: "yes" })).toBe("yes");
+	expect(researchSteps({ steps: "no" })).toBe("no");
+	// 'unknown' falls back to the legacy regex: a matching report resurfaces as a
+	// steps report, a non-matching one or no report stays quiet.
+	expect(
+		researchSteps({
+			steps: "unknown",
+			report: "## Recommended steps\n\n1. Do it",
+		}),
+	).toBe("yes");
+	expect(
+		researchSteps({
+			steps: "unknown",
+			report: "Our recommended steps are listed below.",
+		}),
+	).toBe("yes");
+	expect(
+		researchSteps({
+			steps: "unknown",
+			report: "## Short answer\n\nThe rack fits as-is.",
+		}),
+	).toBe("quiet");
+	// Cards may omit report: no report, nothing to pin.
+	expect(researchSteps({ steps: "unknown" })).toBe("quiet");
+	expect(researchSteps({ steps: "unknown", report: null })).toBe("quiet");
+});
+
+test("autoMarkOnOpen clears everything on open except a steps report", () => {
+	// A steps report pins until its drawer buttons clear it: opening marks nothing.
+	expect(
+		autoMarkOnOpen(
+			card("r1", "done", "idle", { research: true, steps: "yes" }),
+		),
+	).toBe(false);
+	// A pure-info report pins until the drawer is opened, like an answer.
+	expect(
+		autoMarkOnOpen(card("r2", "done", "idle", { research: true, steps: "no" })),
+	).toBe(true);
+	// A quiet research card is not seenable, so auto-mark is off.
+	expect(
+		autoMarkOnOpen(
+			card("r3", "done", "idle", { research: true, steps: "unknown" }),
+		),
+	).toBe(false);
+	// Answers keep the old behavior: opening marks them read.
+	expect(autoMarkOnOpen(card("q1", "done", "idle", { answered: true }))).toBe(
+		true,
+	);
+	// A cancelled card is final: no read mark at all.
+	expect(
+		autoMarkOnOpen(
+			card("r4", "done", "idle", {
+				cancelledAt: 5,
+				research: true,
+				steps: "yes",
+			}),
+		),
+	).toBe(false);
+});
+
+test("seenable pins done research cards with a resolved steps report only", () => {
+	expect(
+		seenable(card("r1", "done", "idle", { research: true, steps: "yes" })),
+	).toBe(true);
+	expect(
+		seenable(card("r2", "done", "idle", { research: true, steps: "no" })),
+	).toBe(true);
+	// A view 'unknown' means quiet: the server resolved the regex already, so
+	// unknown here is a report-less legacy card, never a hidden steps report.
+	expect(
+		seenable(card("r3", "done", "idle", { research: true, steps: "unknown" })),
+	).toBe(false);
+	// Not done yet: a running research card waits in its lane, not the Inbox.
+	expect(
+		seenable(
+			card("r4", "in_progress", "running", { research: true, steps: "yes" }),
+		),
+	).toBe(false);
+	// Cancelled is final, steps or not.
+	expect(
+		seenable(
+			card("r5", "done", "idle", {
+				cancelledAt: 5,
+				research: true,
+				steps: "yes",
+			}),
+		),
+	).toBe(false);
 });
 
 test("slotUse frees the slot of a cancelled running card", () => {
