@@ -92,6 +92,33 @@ describe("mergePrompt fast-forward step", () => {
 	});
 });
 
+describe("security and cleanup steps", () => {
+	test("the merge turn runs diff-security-review before it integrates", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p.indexOf("diff-security-review")).toBeGreaterThan(-1);
+		expect(p.indexOf("diff-security-review")).toBeLessThan(
+			p.indexOf("git merge --ff-only"),
+		);
+	});
+
+	test("both review kinds ask for the cleanup sweep, codeguard rules and host alerts", () => {
+		for (const p of [
+			reviewPrompt({ target: "main", sha: "abc", from: "def", commits: 5 }),
+			releasePrompt({
+				version: "v1.0.0",
+				from: null,
+				sha: "abc",
+				commits: 1,
+				notes: "- n",
+			}),
+		]) {
+			expect(p).toContain("Sweep for cleanup too");
+			expect(p).toContain("rule://codeguard-*");
+			expect(p).toContain("secret-scanning alerts");
+		}
+	});
+});
+
 describe("workPrompt research hatch", () => {
 	test("carries the research contract, report file and answered outcome", () => {
 		const p = workPrompt({

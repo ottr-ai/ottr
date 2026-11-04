@@ -1,6 +1,6 @@
 # Cleanup and hardening in the review
 
-Status: proposal. The change to `src/prompts.ts` needs the user's approval (AGENTS.md hard stop 3).
+Status: approved by the user (2026-11-04) and implemented in `src/prompts.ts`.
 
 ## Decision
 
@@ -61,7 +61,7 @@ The skill's fix flow (fix five items, commit) does not move. The review stays re
 
 Files:
 
-- `src/prompts.ts`: `reviewBody` gains the two paragraphs below. `mergePrompt` gains the one sentence below. Needs approval.
+- `src/prompts.ts`: `reviewBody` gains the two paragraphs below. `mergePrompt` gains the one sentence below.
 - `src/prompts.test.ts`: one test that the review prompt names the cleanup sweep, the codeguard rules and the host alerts, and that the merge prompt names `diff-security-review`. No test pins full wording.
 - `docs/ARCH-REVIEWS.md`: "What the review does" lists the cleanup sweep and the codeguard step.
 - Ottr `AGENTS.md` (local only, not committed): the Review section names `bun run audit:quality` as a review gate after OTTR-459 makes it green.

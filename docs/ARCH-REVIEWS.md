@@ -48,8 +48,15 @@ The review runs read-only at a frozen commit and changes no code:
    full suite with its break thresholds.
 4. Quality reports: duplicate and dead code, cognitive complexity, and the
    project host's open dependency, code scanning and secret scanning alerts.
-5. A full security audit with the `security-audit` skill, then an architecture
-   pass over module seams, coupling and over-engineering.
+   A cleanup sweep records unused exports and files, stale notes, docs that
+   disagree with the code, swallowed errors, network calls with no timeout,
+   and unbounded in-memory growth.
+5. A full security audit with the `security-audit` skill and the
+   `codeguard-*` rules that match the files, then an architecture pass over
+   module seams, coupling and over-engineering.
+
+Each merge turn also runs the `diff-security-review` skill on the branch diff
+before it integrates. A confirmed high or medium finding blocks the merge.
 
 Each kept finding becomes a tracker card, triaged like any task.
 
