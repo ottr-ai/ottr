@@ -278,6 +278,18 @@ describe("push hold (OTTR-506)", () => {
 		expect(pickRunnable([held, retry], opts)).toEqual([held]);
 	});
 
+	test("main unpushed with no retry card holds every merge; work still starts", () => {
+		// The post-mortem state: the retry budget is spent (the repair card parked at
+		// needs_you) or main was left unpushed by hand — no merge may start until the
+		// user repairs main, and the hold must not touch non-merge slots.
+		const heldA = task({ stage: "merging", queuedAt: 100 });
+		const heldB = task({ stage: "merging", queuedAt: 200 });
+		const todo = task({ queuedAt: 300 });
+		expect(
+			pickRunnable([heldA, heldB, todo], { ...opts, mainUnpushed: true }),
+		).toEqual([todo]);
+	});
+
 	test("pushHold: queued merges wait, the retry card and every other stage run", () => {
 		const merging = {
 			stage: "merging",
