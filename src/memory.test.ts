@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -67,9 +70,28 @@ describe("overlay", () => {
 			join("/data", "omp-memory.yml"),
 		);
 		expect(overlayPathFor({ OTTR_DATA_DIR: "" })).toBe(
-			join(tmpdir(), "ottr-omp-memory.yml"),
+			join(tmpdir(), "ottr-omp-memory", "omp-memory.yml"),
 		);
-		expect(overlayPathFor({})).toBe(join(tmpdir(), "ottr-omp-memory.yml"));
+		expect(overlayPathFor({})).toBe(
+			join(tmpdir(), "ottr-omp-memory", "omp-memory.yml"),
+		);
+	});
+
+	test("a worker-planted symlink at the overlay path fails the write, never the target", () => {
+		// R5-1: the data dir is worker-writable; the board must not write through
+		// a plant into a server-only path (OTTR-453 security review).
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-plant-"));
+		try {
+			const target = join(dir, "target.yml");
+			writeFileSync(target, "keep me\n");
+			symlinkSync(target, join(dir, "omp-memory.yml"));
+			expect(() => ensureMemoryOverlay({ OTTR_DATA_DIR: dir })).toThrow(
+				/refusing/,
+			);
+			expect(readFileSync(target, "utf8")).toBe("keep me\n");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -254,6 +276,25 @@ describe("checkMemoryHealth", () => {
 			if (savedHome === undefined) delete process.env.HOME;
 			else process.env.HOME = savedHome;
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a planted memories symlink is refused by the mnemopi probe, not followed", async () => {
+		const home = mkdtempSync(join(tmpdir(), "ottr-memory-plant-home-"));
+		const outside = mkdtempSync(join(tmpdir(), "ottr-memory-outside-"));
+		try {
+			mkdirSync(join(home, ".omp", "agent"), { recursive: true });
+			symlinkSync(outside, join(home, ".omp", "agent", "memories"));
+			const h = await checkMemoryHealth({ backend: "mnemopi" }, { home, now });
+			expect(h.ok).toBe(false);
+			expect(h.reason).toBe(
+				`mnemopi store not writable: ${join(home, ".omp", "agent", "memories", "mnemopi")}`,
+			);
+			// The probe must not have created anything behind the symlink.
+			expect(readdirSync(outside)).toEqual([]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
 		}
 	});
 

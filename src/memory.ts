@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { mkdirBelow, readBelow, unlinkBelow, writeBelow } from "./confine.ts";
 
 export type MemoryBackendName = "hindsight" | "mnemopi";
 
@@ -26,27 +27,37 @@ export function memoryOverlayYaml(choice: MemoryChoice): string {
 	return `memory:\n  backend: ${choice.backend}\n`;
 }
 
+/** The trusted anchor the overlay lives under: the data volume (a mount point) or a per-install temp dir. */
+export function overlayDirFor(env: Record<string, string | undefined>): string {
+	return env.OTTR_DATA_DIR
+		? resolve(env.OTTR_DATA_DIR)
+		: join(tmpdir(), "ottr-omp-memory");
+}
+
 export function overlayPathFor(
 	env: Record<string, string | undefined>,
 ): string {
-	return env.OTTR_DATA_DIR
-		? join(env.OTTR_DATA_DIR, "omp-memory.yml")
-		: join(tmpdir(), "ottr-omp-memory.yml");
+	return join(overlayDirFor(env), "omp-memory.yml");
 }
 
 /** Writes the overlay only when its content differs: cheap to re-run per spawn, and a write failure fails the run loudly. */
 export function ensureMemoryOverlay(
 	env: Record<string, string | undefined> = process.env,
 ): string {
+	const anchor = overlayDirFor(env);
+	// The tmp fallback dir is the board's own (0700); the data dir is a mount point.
+	if (!env.OTTR_DATA_DIR) mkdirSync(anchor, { recursive: true, mode: 0o700 });
 	const path = overlayPathFor(env);
 	const content = memoryOverlayYaml(memoryBackendFromEnv(env));
 	try {
-		if (readFileSync(path, "utf8") === content) return path;
+		const cur = readBelow(anchor, path, 4096);
+		if (cur !== null && cur.toString("utf8") === content) return path;
 	} catch {
-		// missing or unreadable: fall through to the write
+		// a worker-planted symlink: fall through to the write, which refuses it too
 	}
-	mkdirSync(join(path, ".."), { recursive: true });
-	writeFileSync(path, content, "utf8");
+	// R5-1: the data dir and the home volume are worker-writable, so this write must
+	// follow no symlink — a plant at the leaf or a parent fails the spawn instead.
+	writeBelow(anchor, path, content);
 	return path;
 }
 
@@ -101,10 +112,13 @@ export async function checkMemoryHealth(
 		homes.push(opts.boardHome);
 	for (const home of homes) {
 		const store = join(home, ".omp", "agent", "memories", "mnemopi");
+		const probe = join(store, MNEMOPI_PROBE);
 		try {
-			mkdirSync(store, { recursive: true });
-			writeFileSync(join(store, MNEMOPI_PROBE), "probe", "utf8");
-			rmSync(join(store, MNEMOPI_PROBE));
+			// R5-1: the shared home is worker-writable, so the walk below it must
+			// follow no symlink; a plant anywhere on the path reports, never writes.
+			mkdirBelow(home, store);
+			writeBelow(home, probe, "probe");
+			unlinkBelow(home, probe);
 		} catch {
 			return {
 				backend: choice.backend,

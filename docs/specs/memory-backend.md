@@ -43,9 +43,11 @@ stale `backend: hindsight` line in any `config.yml` has no effect.
   installs). In compose, `OTTR_DATA_DIR=/data` is mounted by server and
   workers, so the worker daemon resolves the argv path in its own container.
 - `ensureMemoryOverlay(env)` writes the file when its content differs
-  (idempotent, cheap re-run per spawn). A write failure fails the run loudly —
-  the same data dir holds the run log, so a broken data dir already breaks
-  runs.
+  (idempotent, cheap re-run per spawn). All board-side writes and the mnemopi
+  probe go through `src/confine.ts` anchored at the data dir / the home:
+  a worker-planted symlink at the file or any parent fails the spawn or the
+  probe loudly instead of being written through (R5-1). The tmp fallback dir
+  is per-install and 0700.
 - `buildOmpArgs` gains an optional `memoryConfig` path; when set, it appends
   `--config <path>` after `NO_DISCOVERY_CONFIG` (later overlays win per key;
   the memory key exists only in this overlay). `startRun` computes it per
