@@ -5,6 +5,7 @@
 // line; 2 environment failure (bad args, git, config load, Stryker without a report).
 // Stryker's own exit code is ignored when its report exists: a threshold break must not
 // mask the gate's verdict.
+import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -311,7 +312,14 @@ export async function main(
 	const survivors: Survivor[] = [];
 	let tested = 0;
 	for (const { config, ranges } of groups) {
-		const reportPath = join(tmpdir(), `ott-delta-${config.name}.json`);
+		// tmpdir() is machine-global and the board runs several delta gates in
+		// parallel worktrees: a fixed name let one gate read a report another
+		// card's run had written in between (OTTR-479). One UUID per config run
+		// keeps concurrent gates apart and lets the gate delete its own report.
+		const reportPath = join(
+			tmpdir(),
+			`ott-delta-${config.name}-${randomUUID()}.json`,
+		);
 		// The CLI's --mutate is a comma list (stryker-cli.js): a repeated flag overwrites.
 		// The JSON report path has no CLI form (commander registers no --jsonReporter
 		// flags), so each run extends the real config with the json reporter through a
@@ -333,6 +341,9 @@ export async function main(
 			rmSync(wrapper, { force: true });
 		}
 		const parsed = readReport(reportPath);
+		// The report is one run's tmp state: remove it once read, on a verdict
+		// or on an error, so no finished run leaves a report behind.
+		rmSync(reportPath, { force: true });
 		if ("error" in parsed) {
 			console.error(
 				`mutation delta gate: ${parsed.error} (exit ${run.exitCode})`,

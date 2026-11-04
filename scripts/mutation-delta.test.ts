@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import fc from "../src/test/properties.ts";
 import { gitExe } from "../src/worktree.ts";
@@ -31,11 +31,11 @@ import {
 } from "./mutation-delta.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-mutation-delta-"));
+/** Every tmp report file the fakes planted, for afterAll to remove. */
+const writtenReports: string[] = [];
 afterAll(() => {
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-	// The fakes write exactly these report files into the shared temp dir.
-	for (const name of ["stryker.fixturewide", "stryker.junk"])
-		rmSync(join(tmpdir(), `ott-delta-${name}.json`), { force: true });
+	for (const path of writtenReports) rmSync(path, { force: true });
 });
 
 /** git for fixtures with a throwaway identity — never a main() spawn. */
@@ -118,17 +118,24 @@ const scope: StrykerConfig = {
 	mutate: ["src/turn.ts"],
 };
 
-const reportPath = (configName: string): string =>
-	join(tmpdir(), `ott-delta-${configName}.json`);
+/** The json report file a wrapper config points its json reporter at. */
+function reportFileOf(wrapper: string): string {
+	const raw = /jsonReporter: \{ fileName: ("(?:[^"\\]|\\.)*") \}/.exec(
+		wrapper,
+	)?.[1];
+	if (raw === undefined)
+		throw new Error("wrapper config names no json report file");
+	return JSON.parse(raw) as string;
+}
 
-/** Records a stryker spawn and answers with `body` written to its report path. The run
- * goes through the wrapper config (cmd[2]), whose name names the report file. */
+/** Records a stryker spawn and answers with `body` written to the report file the
+ * wrapper config (cmd[2]) points its json reporter at. */
 function writeReport(cmd: string[], body: unknown, exitCode = 1): SpawnResult {
-	const name = basename(cmd[2] ?? "")
-		.replace(/^ott-delta-/, "")
-		.replace(/\.config\.mjs$/, "");
-	if (name === "") throw new Error("no wrapper config in stryker argv");
-	const path = reportPath(name);
+	const wrapper = cmd[2] ?? "";
+	if (!wrapper.endsWith(".config.mjs"))
+		throw new Error("no wrapper config in stryker argv");
+	const path = reportFileOf(readFileSync(wrapper, "utf8"));
+	writtenReports.push(path);
 	// A string body lands in the file as-is, so a test can plant invalid JSON.
 	writeFileSync(path, typeof body === "string" ? body : JSON.stringify(body));
 	return { exitCode, stdout: "", stderr: "" };
@@ -510,9 +517,15 @@ describe("main", () => {
 				opts: { cwd: repoRoot, stdio: "inherit" },
 			},
 		]);
+		// The json reporter points at a per-run tmp file: the name carries the
+		// config plus one UUID, so two gates never share a report file.
+		const reportFile = reportFileOf(wrapperBody);
+		expect(reportFile).toMatch(
+			/ott-delta-stryker\.fixturewide-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/,
+		);
 		expect(wrapperBody).toBe(
 			`import base from ${JSON.stringify(pathToFileURL(wide.path).href)};\n` +
-				`export default { ...base, reporters: ["clear-text", "json"], jsonReporter: { fileName: ${JSON.stringify(reportPath("stryker.fixturewide"))} } };\n`,
+				`export default { ...base, reporters: ["clear-text", "json"], jsonReporter: { fileName: ${JSON.stringify(reportFile)} } };\n`,
 		);
 		expect(existsSync(wrapper)).toBe(false);
 	});
@@ -603,34 +616,51 @@ describe("main", () => {
 	});
 
 	test("exits 2 when a report is missing", async () => {
-		rmSync(reportPath("stryker.absent"), { force: true });
+		let reportFile = "";
 		const absent: StrykerConfig = { ...wide, name: "stryker.absent" };
-		const { deps, stryker } = fakeDeps(codeRepo.dir, [absent], () => ({
-			exitCode: 0,
-			stdout: "",
-			stderr: "",
-		}));
+		const { deps, stryker } = fakeDeps(codeRepo.dir, [absent], (cmd) => {
+			reportFile = reportFileOf(readFileSync(cmd[2] ?? "", "utf8"));
+			return { exitCode: 0, stdout: "", stderr: "" };
+		});
 		const { code, err } = await captured(() =>
 			main([codeRepo.base, codeRepo.head], deps),
 		);
 		expect(code).toBe(2);
-		expect(err[0]).toContain(
-			`Stryker left no report at ${reportPath("stryker.absent")}`,
-		);
+		expect(err[0]).toContain(`Stryker left no report at ${reportFile}`);
 		expect(stryker).toHaveLength(1);
 	});
 
 	test("exits 2 when a report is unparseable", async () => {
-		const { deps } = fakeDeps(codeRepo.dir, [wide], (cmd) =>
-			writeReport(cmd, "not json"),
-		);
+		let reportFile = "";
+		const { deps } = fakeDeps(codeRepo.dir, [wide], (cmd) => {
+			reportFile = reportFileOf(readFileSync(cmd[2] ?? "", "utf8"));
+			return writeReport(cmd, "not json");
+		});
 		const { code, err } = await captured(() =>
 			main([codeRepo.base, codeRepo.head], deps),
 		);
 		expect(code).toBe(2);
-		expect(err[0]).toContain(
-			`cannot parse report ${reportPath("stryker.fixturewide")}`,
+		expect(err[0]).toContain(`cannot parse report ${reportFile}`);
+	});
+
+	test("two runs in one process name distinct report files", async () => {
+		// Two concurrent gates on one machine used to share one fixed /tmp path
+		// and could read another card's report; each run must name its own file.
+		const paths: string[] = [];
+		const { deps } = fakeDeps(codeRepo.dir, [wide], (cmd) => {
+			paths.push(reportFileOf(readFileSync(cmd[2] ?? "", "utf8")));
+			return writeReport(cmd, { files: {} });
+		});
+		const first = await captured(() =>
+			main([codeRepo.base, codeRepo.head], deps),
 		);
+		const second = await captured(() =>
+			main([codeRepo.base, codeRepo.head], deps),
+		);
+		expect(first.code).toBe(0);
+		expect(second.code).toBe(0);
+		expect(paths).toHaveLength(2);
+		expect(paths[0]).not.toBe(paths[1]);
 	});
 
 	test("exits 2 when the config loader fails", async () => {

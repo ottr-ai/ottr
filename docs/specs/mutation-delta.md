@@ -51,9 +51,17 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   export default {
     ...base,
     reporters: ["clear-text", "json"],
-    jsonReporter: { fileName: "<osTempDir>/ott-delta-<configName>.json" },
+    jsonReporter: {
+      fileName: "<osTempDir>/ott-delta-<configName>-<randomUUID>.json",
+    },
   };
   ```
+
+  `tmpdir()` is machine-global and the board runs several delta gates in parallel worktrees,
+  so a fixed report name let one gate read a report another card's run had written in
+  between (OTTR-479: a verdict from a foreign diff, with no error). The file name therefore
+  carries one `crypto.randomUUID()` per config run, and the gate deletes the report right
+  after reading it, on every exit path: no stray report survives a finished run.
 
   The report is the mutation-testing-elements schema: parse `files[<path>].mutants`, each
   with `status`, `mutatorName`, `replacement` and `location.start.line`.
