@@ -7077,6 +7077,11 @@ export function Drawer({
 		!cancelled;
 	const editValid =
 		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
+	// A start runs the saved prompt, so while the edit is open the start actions wait:
+	// they disable until the edit finishes (Save or Cancel), or the draft dies silently
+	// once the started turn makes the card uneditable.
+	const editOpen = edit !== null;
+	const editGuardTitle = "Save or cancel the prompt edit first";
 	/** Done tasks lead with the implementation's report; the merge turn's integration output stays in its work step. */
 	const report =
 		(task.stage === "done"
@@ -8659,10 +8664,13 @@ export function Drawer({
 											)}
 											<BusyButton
 												title={
-													proposal
-														? "Start the proposed task"
-														: "Continue the interrupted session (sends '.')"
+													editOpen
+														? editGuardTitle
+														: proposal
+															? "Start the proposed task"
+															: "Continue the interrupted session (sends '.')"
 												}
+												disabled={editOpen}
 												run={() => sendReply(".")}
 											>
 												<Icon name="play" />
@@ -8807,7 +8815,12 @@ export function Drawer({
 								<>
 									<button
 										type="button"
-										title="Asks rounds of questions to refine the idea before it runs"
+										title={
+											editOpen
+												? editGuardTitle
+												: "Asks rounds of questions to refine the idea before it runs"
+										}
+										disabled={editOpen}
 										onClick={() => setPick("grill")}
 									>
 										<Icon name="send" />
@@ -8815,7 +8828,12 @@ export function Drawer({
 									</button>
 									<button
 										type="button"
-										title="Puts the card in the todo lane so the agent can start it"
+										title={
+											editOpen
+												? editGuardTitle
+												: "Puts the card in the todo lane so the agent can start it"
+										}
+										disabled={editOpen}
 										onClick={() => setPick("todo")}
 									>
 										<Icon name="plus" />

@@ -2303,6 +2303,192 @@ describe("Drawer queued steering edit (client)", () => {
 	});
 });
 
+describe("Drawer start actions wait for the prompt edit (client)", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the setup mirrors the steering
+	// describe above: happy-dom registers them for this describe, and afterAll
+	// puts the originals back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	// happy-dom's dispatched clicks never reach React's event plugin (same
+	// upstream gap as the steering describe above): call the production
+	// onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+	/** Renders the task, opens the prompt editor, and runs `check` against the
+	 * guarded start action with the editor open and after Cancel finishes it. */
+	const expectGuard = async (
+		task: TaskCard,
+		label: string,
+		freeTitle: string,
+	): Promise<void> => {
+		const realFetch = globalThis.fetch;
+		// The drawer's effects fetch the task detail and degrade to the row on a
+		// failed response, so the fixture's fields (editable, proposal) stay authoritative.
+		globalThis.fetch = (async () =>
+			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		// Buttons are found by their exact label; queries run on the DOM-typed
+		// container, so the casts stay inside the DOM lib's type family.
+		const button = (name: string): HTMLButtonElement => {
+			const node = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent?.trim() === name,
+			);
+			if (node === undefined) throw new Error(`no ${name} button`);
+			return node as HTMLButtonElement;
+		};
+		// The open editor's Cancel, scoped to its form: the drawer-actions row holds a
+		// "Cancel task" button whose text also contains "Cancel".
+		const editorCancel = (): HTMLButtonElement => {
+			const box = container.querySelector("#edit-text")?.closest("form");
+			if (box === undefined || box === null)
+				throw new Error("no prompt edit form");
+			const node = [...box.querySelectorAll("button")].find(
+				(b) => b.textContent?.trim() === "Cancel",
+			);
+			if (node === undefined) throw new Error("no editor cancel button");
+			return node as HTMLButtonElement;
+		};
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={task} />);
+			});
+			const action = button(label);
+			expect(action.disabled).toBe(false);
+			expect(action.title).toBe(freeTitle);
+			await act(async () => {
+				onClickOf(button("Edit task"))({});
+			});
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+			expect(action.disabled).toBe(true);
+			expect(action.title).toBe("Save or cancel the prompt edit first");
+			await act(async () => {
+				onClickOf(editorCancel())({});
+			});
+			expect(action.disabled).toBe(false);
+			expect(action.title).toBe(freeTitle);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	test("a proposal's Accept waits for the prompt edit", async () => {
+		// drawerFields omits turns, so the drawer's detail fallback supplies turns: []
+		// and the never-run proposal card is editable alongside its Accept.
+		await expectGuard(
+			cardFixture({
+				...drawerFields,
+				state: "needs_you",
+				needsReason:
+					"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+				prompt: "do the thing",
+			}),
+			"Accept",
+			"Start the proposed task",
+		);
+	});
+
+	test("a parked card's Plan with agent and Move to todo wait for the edit", async () => {
+		const parked = cardFixture({
+			...drawerFields,
+			stage: "backlog",
+			state: "idle",
+			prompt: "parked idea",
+		});
+		await expectGuard(
+			parked,
+			"Plan with agent",
+			"Asks rounds of questions to refine the idea before it runs",
+		);
+		await expectGuard(
+			parked,
+			"Move to todo",
+			"Puts the card in the todo lane so the agent can start it",
+		);
+	});
+});
+
 describe("Drawer approve button", () => {
 	const project = {
 		name: "proj",
