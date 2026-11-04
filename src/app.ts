@@ -429,14 +429,14 @@ const defineRoutes = <R extends string>(
 ) => r;
 
 /** GitHub's `github-authentication-token-expiration` header ("2027-10-30 00:00:00 UTC") as ISO 8601 UTC; null when absent or unparsable. */
-export function parseGithubExpiry(h: string | null): string | null {
+function parseGithubExpiry(h: string | null): string | null {
 	if (h === null) return null;
 	const d = new Date(h.replace(" ", "T").replace(/ UTC$/, "Z"));
 	return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 /** Whole UTC days from today to the expiry date: 0 on the expiry day itself, negative after. */
-export function tokenDaysLeft(expiresAt: string, now: Date): number {
+function tokenDaysLeft(expiresAt: string, now: Date): number {
 	const midnight = (t: number) => {
 		const d = new Date(t);
 		return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
@@ -447,7 +447,7 @@ export function tokenDaysLeft(expiresAt: string, now: Date): number {
 }
 
 /** Per-token reminder state next to seed-commit (board config, not SQLite; spec 3). */
-export type TokenReminder = {
+type TokenReminder = {
 	expiresAt: string | null;
 	lastPushDay: string | null;
 };
@@ -462,11 +462,11 @@ const emptyReminder = (): TokenReminder => ({
 });
 
 /** token-reminders.json lives next to the board omp home (like seed-commit). */
-export function tokenRemindersPath(): string {
+function tokenRemindersPath(): string {
 	return join(dirname(boardOmpHome()), "token-reminders.json");
 }
 /** The compose-side probe writes the seed token's expiry here (spec 1). */
-export function seedTokenExpiresPath(): string {
+function seedTokenExpiresPath(): string {
 	return join(dirname(boardOmpHome()), "seed-token-expires");
 }
 function readSeedTokenExpires(): string | null {
@@ -478,7 +478,7 @@ function readSeedTokenExpires(): string | null {
 	}
 }
 /** Missing or corrupt file: defaults, no error. */
-export function loadReminders(): ReminderState {
+function loadReminders(): ReminderState {
 	try {
 		const p = JSON.parse(readFileSync(tokenRemindersPath(), "utf8")) as {
 			board?: Partial<TokenReminder>;
@@ -492,12 +492,12 @@ export function loadReminders(): ReminderState {
 		return { board: emptyReminder(), seed: emptyReminder() };
 	}
 }
-export function saveReminders(s: ReminderState): void {
+function saveReminders(s: ReminderState): void {
 	mkdirSync(dirname(tokenRemindersPath()), { recursive: true });
 	writeFileSync(tokenRemindersPath(), `${JSON.stringify(s, null, "\t")}\n`);
 }
 /** The stateless view the warnings and the UI derive from: files + env, no token crosses. */
-export function tokenExpiryView(
+function tokenExpiryView(
 	env: Record<string, string | undefined> = process.env,
 ): TokenExpiryView {
 	return {

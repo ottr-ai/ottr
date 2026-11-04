@@ -11,7 +11,7 @@ export interface StatsSample {
 }
 
 /** Look-back windows in minutes; the first one feeds the top-level cpu and ram fields. */
-export const STATS_WINDOWS_MIN = [15, 60, 1440] as const;
+const STATS_WINDOWS_MIN = [15, 60, 1440] as const;
 /** Samples older than the longest window are dropped. */
 export const STATS_KEEP_MS = STATS_WINDOWS_MIN.at(-1)! * 60_000;
 

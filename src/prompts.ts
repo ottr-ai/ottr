@@ -547,7 +547,7 @@ ${ONE_SHOT}`;
 export const PROPOSED_REASON_PREFIX = "Retro proposal from ";
 
 /** The action sentence names the drawer buttons verbatim, so the box reads as steps. */
-export const PROPOSED_ACTIONS =
+const PROPOSED_ACTIONS =
 	"Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
 
 /** Proposal cards stored before 2026-11 keep this wording; detection must match it too. */

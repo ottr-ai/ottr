@@ -446,7 +446,7 @@ export function matchSweepTarget(
  * worktree mid-run, which turns its cwd link into a " (deleted)" one — still a
  * live run, never a leftover.
  */
-export async function sweepLeftovers(opts?: {
+async function sweepLeftovers(opts?: {
 	roots?: readonly string[];
 	graceMs?: number;
 	keepPids?: Iterable<number>;
