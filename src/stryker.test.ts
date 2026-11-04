@@ -46,9 +46,11 @@ test("progressKey moves only when the numbers move (OTTR-469)", () => {
 		progressKey(`${line(40, "~2h 0m", 2600)}${line(40, "~2h 1m", 2600)}`),
 	).toBe("40/2600/6523");
 	// A mutate.py line moves with its mutant count, survived tallies aside.
-	expect(progressKey(`${mline(19, 116, "KILLED", 1)}${mline(20, 116, "SURVIVED", 2)}`)).toBe(
-		"20/116",
-	);
+	expect(
+		progressKey(
+			`${mline(19, 116, "KILLED", 1)}${mline(20, 116, "SURVIVED", 2)}`,
+		),
+	).toBe("20/116");
 	// A repeated lock wait and texts without numbers carry no movement evidence.
 	expect(progressKey(waitLine(60900))).toBeNull();
 	expect(progressKey(waitLine(60901))).toBeNull();
