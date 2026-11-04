@@ -5,6 +5,7 @@
 import { constants, homedir } from "node:os";
 import { delimiter, resolve } from "node:path";
 import type { Server } from "bun";
+import { demoProgressMap } from "../scripts/demo-data.ts";
 import { createApp, storedProjectPaths } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
@@ -388,6 +389,13 @@ const board = {
 // off the real home.
 const workersHome = process.env.OTTR_WORKERS_HOME;
 const workerTarget = workerFromEnv();
+// Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
+// because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
+// take loop.running only. Static import is safe: the seeder acts only under import.meta.main,
+// so loading it adds no boot work.
+const demoProgress =
+	process.env.OTTR_DEMO === "1" ? demoProgressMap(projects) : null;
+
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
 const loop = createTurnLoop(projects, {
@@ -477,7 +485,9 @@ const app = createApp({
 	finishKept: loop.finishKept,
 	claimedPids,
 	progressOf: (project, id) =>
-		loop.running.get(`${project}/${id}`)?.progress ?? null,
+		loop.running.get(`${project}/${id}`)?.progress ??
+		demoProgress?.get(`${project}/${id}`) ??
+		null,
 	schedule: loop.schedule,
 	serverVersion,
 	port: PORT,

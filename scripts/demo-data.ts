@@ -662,6 +662,47 @@ function refreshLive(root: string, names: string[]): void {
 	}
 }
 
+// The dev board runs no agents (OTTR_DEMO), so loop.running stays empty and a card's
+// progress line never arrives from a live Stryker run. The gate card's meter would never
+// render without a fabricated line; server.ts's progressOf falls back to demoProgressMap.
+const DEMO_MUTATION_PROGRESS =
+	"Stryker 34% · 1891/6523 · 12 survived (0.6%) · 7m elapsed · 1h 12m left";
+const MUTATION_TURN_PROMPT = /mutation (?:gate|testing)/i;
+
+/** Store slice the map builder reads; ProjectStore satisfies it structurally. */
+interface DemoStore {
+	listTasks(): Array<{ id: string; state: string }>;
+	listTurns(taskId: string): Array<{
+		kind: string;
+		endedAt: number | null;
+		prompt: string;
+	}>;
+}
+
+/** Progress lines per `project/task`: one entry per preparing/running card whose open
+ * work turn runs the mutation gate. Deterministic text, like the rest of the pool. */
+export function demoProgressMap(
+	projects: Iterable<[string, { store: DemoStore }]>,
+): Map<string, string> {
+	const lines = new Map<string, string>();
+	for (const [name, { store }] of projects) {
+		for (const t of store.listTasks()) {
+			if (t.state !== "running" && t.state !== "preparing") continue;
+			const gate = store
+				.listTurns(t.id)
+				.find(
+					(tn) =>
+						tn.kind === "work" &&
+						tn.endedAt === null &&
+						MUTATION_TURN_PROMPT.test(tn.prompt),
+				);
+			if (gate !== undefined)
+				lines.set(`${name}/${t.id}`, DEMO_MUTATION_PROGRESS);
+		}
+	}
+	return lines;
+}
+
 /** Make sure the board has an admin login; an existing one always wins. The plain password
  * exists only long enough to be hashed and is never printed or stored. */
 function ensureAdmin(stateDir: string): void {

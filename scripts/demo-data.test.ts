@@ -13,7 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "../src/globalStore.ts";
 import { mergeHold } from "../src/scheduler.ts";
-import { seedDemo } from "./demo-data.ts";
+import { ProjectStore } from "../src/store.ts";
+import { strykerProgress } from "../src/ui/status.ts";
+import { demoProgressMap, seedDemo } from "./demo-data.ts";
 
 type Row = Record<string, any> & { id: string };
 interface ProjectData {
@@ -195,6 +197,25 @@ test("seed covers every display shape with clean checkouts", () => {
 		]);
 		expect(r.stdout.toString()).toBe("");
 	}
+});
+
+// The dev board shows the mutation meter only when progress parses as a Stryker line, so
+// the fabricated line must parse, and only the gate card may carry it.
+test("demo progress fabricates a parseable Stryker line for the gate card alone", () => {
+	const gate = allTasks(firstBoard).find((t) =>
+		/mutation gate/i.test(t.title),
+	)!;
+	const store = ProjectStore.open(join(root, "hollowpine"));
+	const lines = demoProgressMap([["hollowpine", { store }]]);
+	store.close();
+	const line = lines.get(`hollowpine/${gate.id}`);
+	expect(line).toBeDefined();
+	const parsed = strykerProgress(line!);
+	expect(parsed).not.toBeNull();
+	expect(parsed!.pct).toBeGreaterThan(0);
+	expect(parsed!.tested).toBeLessThan(parsed!.total);
+	// no other running card runs the gate, so no other line exists
+	expect(lines.size).toBe(1);
 });
 
 test("admin is bootstrapped without a plain password", () => {
