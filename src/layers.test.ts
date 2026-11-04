@@ -84,7 +84,7 @@ describe("resolveAgentLayer", () => {
 
 describe("pinnedAgentLayer", () => {
 	test("no link -> reason none", () => {
-		expect(pinnedAgentLayer(tempHome(), undefined)).toEqual({
+		expect(pinnedAgentLayer(tempHome())).toEqual({
 			ok: false,
 			reason: "none",
 		});
@@ -94,7 +94,7 @@ describe("pinnedAgentLayer", () => {
 		const home = tempHome();
 		mkdirSync(join(home, ".alate"), { recursive: true });
 		symlinkSync(join("layers", "gone"), join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, HINDSIGHT)).toEqual({
+		expect(pinnedAgentLayer(home)).toEqual({
 			ok: false,
 			reason: "broken",
 		});
@@ -109,25 +109,35 @@ describe("pinnedAgentLayer", () => {
 		mkdirSync(join(dir, ".omp"), { recursive: true });
 		writeFileSync(join(dir, ".omp", "agent"), "not a dir\n");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, HINDSIGHT)).toEqual({
+		expect(pinnedAgentLayer(home)).toEqual({
 			ok: false,
 			reason: "prepare",
 		});
 	});
 
-	test("success returns the layer and the agent dir; the flip applied", () => {
+	test("success returns the layer and the agent dir; config.yml ships as installed", () => {
 		const home = tempHome();
 		const dir = makeLayer(home, "ok1");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		const pin = pinnedAgentLayer(home, HINDSIGHT);
+		const pin = pinnedAgentLayer(home);
 		if (!pin.ok)
 			throw new Error(`expected a pinned layer: ${JSON.stringify(pin)}`);
 		expect(pin.layer.id).toBe("ok1");
 		expect(pin.layer.dir).toBe(realpathSync(dir));
 		expect(pin.agentDir).toBe(join(realpathSync(dir), ".omp", "agent"));
-		expect(
-			readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8"),
-		).toContain("  backend: hindsight");
+		// memory.backend is not layer content (OTTR-453): the pin never rewrites config.yml,
+		// not even when the deployment env names a Hindsight URL.
+		const saved = process.env.HINDSIGHT_API_URL;
+		process.env.HINDSIGHT_API_URL = HINDSIGHT;
+		try {
+			expect(pinnedAgentLayer(home).ok).toBe(true);
+		} finally {
+			if (saved === undefined) delete process.env.HINDSIGHT_API_URL;
+			else process.env.HINDSIGHT_API_URL = saved;
+		}
+		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
+			"model: x\n  backend: mnemopi\n",
+		);
 	});
 });
 
@@ -136,7 +146,7 @@ describe("layer prepare", () => {
 		const home = tempHome();
 		const dir = makeLayer(home, "link1");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		const expectLink = (rel: string): void => {
 			const link = join(dir, rel);
 			expect(lstatSync(link).isSymbolicLink()).toBe(true);
@@ -159,7 +169,7 @@ describe("layer prepare", () => {
 		writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = t\n");
 		mkdirSync(join(home, ".ssh"), { recursive: true });
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		expect(readlinkSync(join(dir, ".gitconfig"))).toBe(
 			join(home, ".gitconfig"),
 		);
@@ -175,8 +185,8 @@ describe("layer prepare", () => {
 		mkdirSync(join(dir, ".cache"), { recursive: true });
 		writeFileSync(join(dir, ".cache", "keep.txt"), "layer content\n");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		expect(readFileSync(join(dir, ".cache", "keep.txt"), "utf8")).toBe(
 			"layer content\n",
 		);
@@ -190,36 +200,38 @@ describe("layer prepare", () => {
 	});
 });
 
-describe("backend flip", () => {
-	function pinConfig(
-		config: string,
-		url: string | undefined,
-	): { text: () => string } {
+describe("memory backend is not layer content", () => {
+	test("the pin never rewrites the layer's config.yml, env or not", () => {
 		const home = tempHome();
-		const dir = makeLayer(home, "flip");
-		writeFileSync(join(dir, ".omp", "agent", "config.yml"), config);
+		const dir = makeLayer(home, "keep");
+		writeFileSync(
+			join(dir, ".omp", "agent", "config.yml"),
+			"keep: a  backend: mnemopi\n  backend: mnemopi # keep\n",
+		);
 		symlinkSync(dir, join(home, ".alate", "current"));
-		pinnedAgentLayer(home, url);
-		return {
-			text: () =>
-				readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8"),
-		};
-	}
-
-	test("mnemopi + URL -> flipped", () => {
-		const c = pinConfig("model: x\n  backend: mnemopi\n", HINDSIGHT);
-		expect(c.text()).toContain("  backend: hindsight");
-		expect(c.text()).not.toContain("mnemopi");
+		const saved = process.env.HINDSIGHT_API_URL;
+		process.env.HINDSIGHT_API_URL = HINDSIGHT;
+		try {
+			expect(pinnedAgentLayer(home).ok).toBe(true);
+		} finally {
+			if (saved === undefined) delete process.env.HINDSIGHT_API_URL;
+			else process.env.HINDSIGHT_API_URL = saved;
+		}
+		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
+			"keep: a  backend: mnemopi\n  backend: mnemopi # keep\n",
+		);
 	});
 
-	test("mnemopi without URL -> untouched", () => {
-		const c = pinConfig("model: x\n  backend: mnemopi\n", undefined);
-		expect(c.text()).toContain("  backend: mnemopi");
-	});
-
-	test("already hindsight -> untouched", () => {
+	test("a layer that already ships hindsight stays byte-identical", () => {
+		const home = tempHome();
+		const dir = makeLayer(home, "keep2");
 		const text = "model: x\n  backend: hindsight\n";
-		expect(pinConfig(text, HINDSIGHT).text()).toBe(text);
+		writeFileSync(join(dir, ".omp", "agent", "config.yml"), text);
+		symlinkSync(dir, join(home, ".alate", "current"));
+		expect(pinnedAgentLayer(home).ok).toBe(true);
+		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
+			text,
+		);
 	});
 
 	test("missing config file -> no-op, the pin still succeeds", () => {
@@ -227,11 +239,10 @@ describe("backend flip", () => {
 		const dir = join(home, ".alate", "layers", "flip");
 		mkdirSync(dir, { recursive: true });
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, HINDSIGHT).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		expect(existsSync(join(dir, ".omp", "agent", "config.yml"))).toBe(false);
 	});
 });
-
 describe("in-use registry", () => {
 	test("add dedups and stamps since; remove drops every entry for the id", () => {
 		const home = tempHome();
@@ -352,7 +363,7 @@ describe("pin hardening", () => {
 		flatWithSources(home);
 		const dir = makeLayer(home, "links");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		for (const rel of IF_EXIST)
 			expect(readlinkSync(join(dir, rel))).toBe(join(home, rel));
 	});
@@ -361,7 +372,7 @@ describe("pin hardening", () => {
 		const home = tempHome();
 		const dir = makeLayer(home, "links");
 		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		expect(pinnedAgentLayer(home).ok).toBe(true);
 		for (const rel of IF_EXIST) {
 			expect(existsSync(join(home, rel))).toBe(false);
 			let inLayer = true;
@@ -372,34 +383,6 @@ describe("pin hardening", () => {
 			}
 			expect(inLayer).toBe(false);
 		}
-	});
-
-	test("a line that only contains the pattern is not flipped", () => {
-		const home = tempHome();
-		const dir = makeLayer(home, "flip-edge");
-		writeFileSync(
-			join(dir, ".omp", "agent", "config.yml"),
-			"keep: a  backend: mnemopi\n",
-		);
-		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, HINDSIGHT).ok).toBe(true);
-		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
-			"keep: a  backend: mnemopi\n",
-		);
-	});
-
-	test("trailing content on the line is not flipped", () => {
-		const home = tempHome();
-		const dir = makeLayer(home, "flip-edge2");
-		writeFileSync(
-			join(dir, ".omp", "agent", "config.yml"),
-			"  backend: mnemopi # keep\n",
-		);
-		symlinkSync(dir, join(home, ".alate", "current"));
-		expect(pinnedAgentLayer(home, HINDSIGHT).ok).toBe(true);
-		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
-			"  backend: mnemopi # keep\n",
-		);
 	});
 });
 

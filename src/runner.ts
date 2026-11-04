@@ -1090,7 +1090,7 @@ export function startRun(o: {
 	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
 	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
 	const layerHome = o.worker ? homedir() : boardOmpHome();
-	const pin = pinnedAgentLayer(layerHome, process.env.HINDSIGHT_API_URL);
+	const pin = pinnedAgentLayer(layerHome);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
 			`! agent layer pin failed (${pin.reason}); running the flat home\n`,

@@ -348,6 +348,9 @@ URL from the environment (`${HINDSIGHT_API_URL:-}`), so set it in the compose en
 compose, for example `HINDSIGHT_API_URL=http://hindsight.local:8888`. **Settings ->
 Hindsight** can also save the address; a URL saved there beats the env seed at every boot,
 so Settings alone turns fleet memory on or off.
+`memory.backend` is not part of the agent layer (OTTR-453): a layer ships the
+`config.yml` as the data repo holds it, and the pin never rewrites it
+([The agent layers](#the-agent-layers)).
 
 The board does not patch any `config.yml`. At every spawn it writes the choice to
 `$OTTR_DATA_DIR/omp-memory.yml` (in compose: `/data/omp-memory.yml`) and appends
@@ -597,10 +600,10 @@ Every omp process the board spawns pins at start: worker and server turns, and t
 auxiliary spawns (`omp login`, `omp models`, `omp usage`, the fork-analysis gateway).
 The pin resolves `<home>/.alate/current` once with `realpath`, prepares the links, and
 runs omp with `HOME` and `PI_CODING_AGENT_DIR` inside the resolved layer directory for
-the run's whole life; a later switch never touches a pinned run. The board applies its
-`memory.backend` flip to the layer at pin time, because each new layer ships `mnemopi`.
-The entry script keeps its boot-time flip of the flat homes for the no-layer era and for
-spawns that stay flat.
+the run's whole life; a later switch never touches a pinned run. `memory.backend` is
+not layer content (OTTR-453 moves the pick to the deployment): the pin never rewrites
+the layer's `config.yml`. The entry script keeps its boot-time flip of the flat homes
+for the no-layer era and for spawns that stay flat.
 
 The board records each pinned layer id in `H/.alate/in-use.json` for the run's life and
 removes it when the run settles. Alate deletes a layer folder only when it is not
@@ -612,8 +615,8 @@ once, then parks it for a human.
 
 Error cases: no layer yet (no `current` link, or an alate that still writes flat) runs
 the flat home, exactly as before; a broken `current` link falls back to the flat home and
-logs a warning into the run log, and the next provision repairs the switch; a link or a
-flip that cannot be written falls back the same way, so a run never fails because of
+logs a warning into the run log, and the next provision repairs the switch; a shared-state
+link that cannot be written falls back the same way, so a run never fails because of
 pinning. The provision tick installs a layer whenever the alate server reports layer
 support (`layers: true` in `GET /health`), with no idle wait; while it does not, the tick
 keeps the old idle gate, because that server writes the flat home under a running turn.

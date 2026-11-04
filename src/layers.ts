@@ -62,15 +62,13 @@ function pinTarget(home: string): string | null {
 }
 
 /**
- * Pin the current layer for one run: resolve it once, prepare the shared-state links and the
- * memory-backend flip, and return the paths the run's env carries. A miss falls back to the
- * flat home; a broken link or a failed prepare does too (reason says which). The flip and the
- * links are idempotent and safe under concurrent pins.
+ * Pin the current layer for one run: resolve it once, prepare the shared-state links, and
+ * return the paths the run's env carries. A miss falls back to the flat home; a broken link
+ * or a failed prepare does too (reason says which). The links are idempotent and safe under
+ * concurrent pins. `memory.backend` in the layer's config.yml is not layer content (the
+ * deployment picks the backend, OTTR-453): the pin never rewrites config.yml.
  */
-export function pinnedAgentLayer(
-	home: string,
-	hindsightUrl: string | undefined,
-): LayerPin {
+export function pinnedAgentLayer(home: string): LayerPin {
 	// A dangling link still lstats: only the lstat absence means "no layer".
 	try {
 		lstatSync(currentLink(home));
@@ -81,7 +79,7 @@ export function pinnedAgentLayer(
 	if (dir === null) return { ok: false, reason: "broken" };
 	const layer = { id: basename(dir), dir };
 	try {
-		prepareLayer(home, layer, hindsightUrl);
+		prepareLayer(home, layer);
 	} catch {
 		return { ok: false, reason: "prepare" };
 	}
@@ -99,57 +97,16 @@ function linkOne(linkPath: string, target: string): void {
 }
 
 /**
- * Link the layer's shared state back to the flat home and flip the memory backend. Safe to
- * call twice; never mutates an entry that already exists in the layer.
+ * Link the layer's shared state back to the flat home. Safe to call twice; never mutates an
+ * entry that already exists in the layer, and never touches the layer's config.yml.
  */
-function prepareLayer(
-	home: string,
-	layer: AgentLayer,
-	hindsightUrl: string | undefined,
-): void {
+function prepareLayer(home: string, layer: AgentLayer): void {
 	for (const rel of LINK_ALWAYS) linkOne(join(layer.dir, rel), join(home, rel));
 	for (const rel of LINK_IF_SOURCE_EXISTS) {
 		const source = join(home, rel);
 		// Missing target stays missing, as today: omp creates it in the layer, where it dies
 		// with the layer at clean-up.
 		if (existsSync(source)) linkOne(join(layer.dir, rel), source);
-	}
-	flipBackend(layer.dir, hindsightUrl);
-}
-
-/**
- * Point the layer's memory backend at Hindsight when the env names a URL and the layer's
- * config.yml still ships `backend: mnemopi`. Atomic write (temp file + rename in the same
- * directory), idempotent, a no-op without the URL, the file or the line.
- */
-function flipBackend(layerDir: string, hindsightUrl: string | undefined): void {
-	if (typeof hindsightUrl !== "string" || hindsightUrl === "") return;
-	const configPath = join(layerDir, ".omp", "agent", "config.yml");
-	let text: string;
-	try {
-		text = readFileSync(configPath, "utf8");
-	} catch {
-		return;
-	}
-	const line = /^ {2}backend: mnemopi$/m;
-	if (!line.test(text)) return;
-	const flipped = text.replace(line, "  backend: hindsight");
-	const tmp = `${configPath}.${process.pid}.tmp`;
-	const fd = openSync(tmp, "w");
-	try {
-		writeSync(fd, flipped);
-	} finally {
-		closeSync(fd);
-	}
-	try {
-		renameSync(tmp, configPath);
-	} catch (err) {
-		try {
-			unlinkSync(tmp);
-		} catch {
-			/* the rename failure is the one that matters */
-		}
-		throw err;
 	}
 }
 

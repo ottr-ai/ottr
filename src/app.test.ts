@@ -3093,8 +3093,8 @@ describe("boardOmpEnv layer pin", () => {
 			expect(readlinkSync(join(layer, ".omp", "agent", "agent.db"))).toBe(
 				join(h, ".omp", "agent", "agent.db"),
 			);
-			// The memory backend flip ran at pin time: the layer ships mnemopi and the env
-			// names a Hindsight URL, so the layer's config reads hindsight afterwards.
+			// The pin never rewrites the layer's config: memory.backend is not layer
+			// content (OTTR-453), so the layer keeps the backend it shipped, env or not.
 			writeFileSync(
 				join(layer, ".omp", "agent", "config.yml"),
 				"memory:\n  backend: mnemopi\n",
@@ -3103,7 +3103,7 @@ describe("boardOmpEnv layer pin", () => {
 			boardOmpEnv();
 			expect(
 				readFileSync(join(layer, ".omp", "agent", "config.yml"), "utf8"),
-			).toContain("backend: hindsight");
+			).toContain("backend: mnemopi");
 			// A broken link falls back to the flat home, exactly as today.
 			rmSync(join(h, ".alate", "current"));
 			expect(boardOmpEnv().HOME).toBe(h);

@@ -3116,10 +3116,11 @@ describe("startRun agent layer pinning", () => {
 			expect(env1.GH_TOKEN).toBeUndefined();
 			expect(env1.OTTR_BOARD_OMP_HOME).toBeUndefined();
 			expect(env1.HINDSIGHT_API_URL).toBe("https://hindsight.example/api");
-			// The pin flipped the layer's memory backend and registered the layer.
+			// The pin registered the layer and never rewrote its config: memory.backend
+			// is not layer content (OTTR-453), so the layer ships the backend as installed.
 			expect(
 				readFileSync(join(aDir, ".omp", "agent", "config.yml"), "utf8"),
-			).toContain("  backend: hindsight");
+			).toContain("  backend: mnemopi");
 			expect(readLayerUse(shared).map((e) => e.id)).toEqual(["A"]);
 
 			// Switch current -> B while run 1 holds A open: run 1 stays on A, run 2 pins B.

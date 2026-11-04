@@ -66,18 +66,17 @@ stays missing, as today):
 Everything else in the layer is layer content: a turn may write new files into
 its own layer home (they die with the layer at clean-up).
 
-### config.yml: the machine part
+### Memory backend: not part of the layer
 
-`config.yml` is mixed content. Alate ships the user part; the machine part is
-the memory backend: the compose entry script (`docker/ottr-entry.sh`) flips
-`backend: mnemopi` to `hindsight` when `HINDSIGHT_API_URL` is set, or a saved
-Hindsight URL wins. Each new layer ships `backend: mnemopi`, so the board
-applies the same flip at pin time: when the env names a Hindsight URL and the
-layer's `.omp/agent/config.yml` holds the `mnemopi` line, the pin writes the
-flipped file with a temp-file + rename (atomic; readers see old or new). The
-flip is idempotent. A turn on a new layer never loses the memory backend, and
-the entry script's boot-time flip of the flat homes keeps working for the
-no-layer era and for spawns that stay flat.
+`config.yml` is mixed content: alate ships the user part, and the
+`memory.backend` line is deployment state, not layer content (OTTR-453 moves
+the pick to the deployment; `mnemopi` stays the default, and the board warns
+when omp runs with no memory). A layer ships whatever `config.yml` the data
+repo holds, and the pin never rewrites it — no flip at pin time, and the
+entry script's sed patch is not copied into new layers. The entry script's
+boot-time flip keeps covering the flat homes (the no-layer era and spawns
+that stay flat); how the deployment's backend choice reaches pinned spawns is
+OTTR-453's contract.
 
 ### Pinning (turn start)
 
@@ -87,7 +86,7 @@ Every omp process the board spawns pins at start. Two entry points, one helper
 1. **Turn runs** (`startRun` in `src/runner.ts`, both dispatches): resolve
    `<home>/.alate/current` once with `realpath()` — worker runs resolve under
    the shared home, local (board) runs under `boardOmpHome()`. On a hit:
-   prepare the links and the backend flip, then run omp with
+   prepare the links, then run omp with
    `HOME=<layer-dir>` and `PI_CODING_AGENT_DIR=<layer-dir>/.omp/agent` (both
    absolute, the resolved target, never the `current` link itself). The worker
    dispatch stops stripping `PI_CODING_AGENT_DIR` only when it pins the layer;
@@ -172,7 +171,7 @@ layers. `agentDir()` (the credential store path) stays flat by definition.
   switch.
 - **Layer deleted under a turn**: prevented by the clean-up rule above
   (`in-use.json` plus keep-last-two). The residual risk is stated above.
-- **Prepare failure** (a link or the flip cannot be written): the spawn falls
+- **Prepare failure** (a shared-state link cannot be written): the spawn falls
   back to the flat home and logs a warning; the run never fails because of
   pinning.
 - **Old alate** (no `layers: true` in health): the tick keeps the idle gate
@@ -211,5 +210,6 @@ layers. `agentDir()` (the credential store path) stays flat by definition.
   deletes a layer a live run pinned.
 - A test proves a pinned run sees its own layer under the paths it expects:
   `HOME` and `PI_CODING_AGENT_DIR` point into the layer, the shared-state
-  links resolve to the flat home, and the config flip applied.
+  links resolve to the flat home, and the layer's config.yml ships byte for
+  byte as installed (the pin never rewrites it).
 - `bun run check`, `bun test` and the delta mutation gate pass.

@@ -182,6 +182,8 @@ services:
       # memory overlay to OTTR_DATA_DIR=/data ($OTTR_DATA_DIR/omp-memory.yml);
       # the workers resolve the same path, and the board passes it as --config
       # at every spawn — server-side runs included.
+      # memory.backend is not agent-layer content (OTTR-453): the pin never
+      # rewrites a layer's config.yml.
       HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
       HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
       # Alate pairing (the `alate` profile below): these seed Settings -> Alate while it

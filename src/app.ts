@@ -97,7 +97,7 @@ import {
 	saveImages,
 	sniffImage,
 } from "./images.ts";
-import { rebuildLayerUse, resolveAgentLayer } from "./layers.ts";
+import { rebuildLayerUse } from "./layers.ts";
 import {
 	agentDir,
 	boardOmpEnv,
