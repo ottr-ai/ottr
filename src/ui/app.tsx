@@ -7048,6 +7048,24 @@ export function Drawer({
 							</ol>
 						</DrawerSec>
 					)}
+					{/* The ask leads the body: an outstanding question is the card's one
+					    action item, so it sits right below the lineage, before the file lists. */}
+					{task.asked !== null && task.state === "needs_you" && (
+						<AskPanel
+							asked={task.asked}
+							taskId={task.id}
+							busy={replySend.busy}
+							failed={replySend.failed}
+							onOpenDiff={setDiffView}
+							onSend={(text) => {
+								replySend.start(async () => {
+									const ok = await sendReply(text);
+									if (ok) clearAskDraft(task.id);
+									return ok;
+								});
+							}}
+						/>
+					)}
 					{waiting.length > 0 && (
 						<DrawerSec id="drawer-waiting" label="Waiting for">
 							<RelatedTasks
@@ -7061,7 +7079,7 @@ export function Drawer({
 						</DrawerSec>
 					)}
 					{/* A live ask round hides its reason: the runner echoes the first question into
-					    it, and the ask panel below already carries the full questions. */}
+					    it, and the ask panel above already carries the full questions. */}
 					{task.needsReason !== null && !askedNow && (
 						<div className="needs-reason">
 							<ProposalReasonLink
@@ -7191,22 +7209,6 @@ export function Drawer({
 								</ul>
 							</DrawerSec>
 						)}
-					{task.asked !== null && task.state === "needs_you" && (
-						<AskPanel
-							asked={task.asked}
-							taskId={task.id}
-							busy={replySend.busy}
-							failed={replySend.failed}
-							onOpenDiff={setDiffView}
-							onSend={(text) => {
-								replySend.start(async () => {
-									const ok = await sendReply(text);
-									if (ok) clearAskDraft(task.id);
-									return ok;
-								});
-							}}
-						/>
-					)}
 					{task.releaseVersion !== null &&
 						(notesEdit === null ? (
 							<DrawerSec

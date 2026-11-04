@@ -2123,7 +2123,7 @@ describe("Drawer approve button", () => {
 		],
 	} satisfies Partial<TaskCard>;
 
-	test("a waiting release card lists late commits above the Approve action", () => {
+	test("a waiting release card lists the ask's Approve action above the late commits", () => {
 		// lateCommits rides the drawer's TaskView, not the board row's TaskCard.
 		const task = cardFixture({
 			...releaseFields,
@@ -2146,8 +2146,8 @@ describe("Drawer approve button", () => {
 			'title="Replies &quot;Approve&quot; to the waiting session"',
 		);
 		const section = html.indexOf("Commits since the review");
-		expect(section).toBeGreaterThanOrEqual(0);
-		expect(section).toBeLessThan(approve);
+		expect(approve).toBeGreaterThanOrEqual(0);
+		expect(section).toBeGreaterThan(approve);
 	});
 
 	test("a waiting release card without late commits renders no section", () => {
