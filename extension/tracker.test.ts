@@ -5,6 +5,12 @@ import {
 } from "../src/prompts.ts";
 import createTracker from "./tracker.ts";
 
+// Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
+// ambient value would flip the refusal tests below into the pinned-name path. tracker.ts reads
+// the pin per call (pinnedName), so clearing it here before any test runs is enough; tests that
+// need a pin set their own.
+delete process.env.OTTR_SESSION_NAME;
+
 /** The seam the extension registers through; omp's real type is not installed. */
 interface RegisteredTool {
 	name: string;
@@ -221,7 +227,8 @@ describe("report_outcome applies the pinned session name", () => {
 	};
 
 	test("an unnamed pinned session records at once and applies the pin", async () => {
-		process.env.OTTR_SESSION_NAME = "Board check";
+		// Padded: pins the trim in tracker.ts pinnedName.
+		process.env.OTTR_SESSION_NAME = " Board check ";
 		runtimeReady = false; // the load-time attempt dies on omp's stub, as in OTTR-413
 		const tools = await freshTools();
 		await settle();

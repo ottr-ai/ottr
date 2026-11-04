@@ -153,7 +153,9 @@ function proposeValidationError(
 }
 
 // The tracker pins review session names via env so every review run gets the same board title.
-const pinned = (process.env.OTTR_SESSION_NAME ?? "").trim();
+// Read per call like runGitSecrets: the env is fixed for the run, but a load-time capture leaks
+// an ambient OTTR_SESSION_NAME into instances loaded before a test cleared it (OTTR-499).
+const pinnedName = (): string => (process.env.OTTR_SESSION_NAME ?? "").trim();
 
 /**
  * Git host secrets this run holds: a merge turn gets per-host tokens as OTTR_GIT_TOKEN_<i>
@@ -256,14 +258,14 @@ export default function (pi: Pi) {
 	// action methods throw until its session initialize() patches them, seconds later in
 	// real runs (OTTR-413: ~23 s), so the one-shot attempt always died in the catch below.
 	// Retry until the methods answer or the cap; a lapsed run gets its pin at report_outcome.
-	if (pinned !== "") {
+	if (pinnedName() !== "") {
 		setTimeout(() => {
 			void (async () => {
 				for (let attempt = 0; attempt < 60; attempt++) {
 					try {
 						const current = await pi.getSessionName();
 						if (typeof current !== "string" || current.trim() === "")
-							await pi.setSessionName(pinned);
+							await pi.setSessionName(pinnedName());
 						return;
 					} catch {
 						await new Promise((r) => setTimeout(r, 500));
@@ -330,9 +332,9 @@ export default function (pi: Pi) {
 				} catch {
 					unnamed = false;
 				}
-				if (unnamed && pinned !== "") {
+				if (unnamed && pinnedName() !== "") {
 					try {
-						await pi.setSessionName(pinned);
+						await pi.setSessionName(pinnedName());
 					} catch {
 						// A failed name must not lose the outcome; record anyway.
 					}
