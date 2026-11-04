@@ -6088,14 +6088,12 @@ function RelatedTasks({
 	project,
 	tasks,
 	onOpenTask,
-	navigate,
 	draining,
 }: {
 	items: TaskCard[];
 	project: ProjectView;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
-	navigate: (path: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 }) {
@@ -6106,13 +6104,7 @@ function RelatedTasks({
 					<a
 						href={taskPath(k.project, k.id)}
 						title={k.sessionTitle ?? k.title}
-						onClick={(e) =>
-							navClick(e, () =>
-								k.project === project.name
-									? onOpenTask(k.id)
-									: openCardInProject(k, navigate, onOpenTask),
-							)
-						}
+						onClick={(e) => navClick(e, () => onOpenTask(k.id))}
 					>
 						<span className="fu-key">{k.id}</span>
 						<span className="fu-title">{k.sessionTitle ?? k.title}</span>
@@ -6278,30 +6270,18 @@ export function reportHtml(title: string, body: string): string {
 	].join("\n");
 }
 
-/** In-app navigation to a card on another project's board: switch the board with the
- * same path navigation the project tabs use, then open the card. The link's href
- * already names the linked card's project, so the navigate lands on it (OTTR-405). */
-export function openCardInProject(
-	card: Pick<TaskCard, "project" | "id">,
-	navigate: (path: string) => void,
-	openTask: (id: string) => void,
-): void {
-	navigate(taskPath(card.project, card.id));
-	openTask(card.id);
-}
-
 /** One card link in the drawer's lineage rail: the one place a drawer renders a link
  * to another card (the parent above, the follow-ups below), so an href change lands
  * on every row at once. The href always uses the LINKED card's project and id, so a
- * cross-project link opens that project's URL; a plain click switches the board to
- * that project, then opens the card, and a middle or Ctrl/Cmd click opens a new tab. */
+ * cross-project link opens that project's URL; a plain click lets openTask select
+ * that project first, then opens the card, and a middle or Ctrl/Cmd click opens a
+ * new tab. */
 function LineageCardLink({
 	card,
 	selfProject,
 	tag,
 	state,
 	onOpenTask,
-	navigate,
 }: {
 	card: TaskCard;
 	selfProject: string;
@@ -6310,20 +6290,13 @@ function LineageCardLink({
 	/** Live state of a follow-up row, rendered after the tags. */
 	state?: ReactNode;
 	onOpenTask: (id: string) => void;
-	navigate: (path: string) => void;
 }) {
 	return (
 		<a
 			className="lineage-row"
 			href={taskPath(card.project, card.id)}
 			title={card.sessionTitle ?? card.title}
-			onClick={(e) =>
-				navClick(e, () =>
-					card.project === selfProject
-						? onOpenTask(card.id)
-						: openCardInProject(card, navigate, onOpenTask),
-				)
-			}
+			onClick={(e) => navClick(e, () => onOpenTask(card.id))}
 		>
 			<span className="lineage-key">{card.id}</span>
 			<span className="lineage-title">{card.sessionTitle ?? card.title}</span>
@@ -6347,13 +6320,11 @@ function ProposalReasonLink({
 	selfProject,
 	tasks,
 	onOpenTask,
-	navigate,
 }: {
 	reason: string;
 	selfProject: string;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
-	navigate: (path: string) => void;
 }) {
 	const m =
 		/^(Retro proposal from |Fork proposal from )(\S+?)(?: \("|\. |$)/.exec(
@@ -6381,13 +6352,7 @@ function ProposalReasonLink({
 					className="reason-card-link"
 					href={taskPath(linked.project, linked.id)}
 					title={linked.sessionTitle ?? linked.title}
-					onClick={(e) =>
-						navClick(e, () =>
-							linked.project === selfProject
-								? onOpenTask(linked.id)
-								: openCardInProject(linked, navigate, onOpenTask),
-						)
-					}
+					onClick={(e) => navClick(e, () => onOpenTask(linked.id))}
 				>
 					{id}
 				</a>
@@ -6409,7 +6374,6 @@ export function Drawer({
 	delta,
 	tasks,
 	onOpenTask,
-	navigate,
 	draining,
 	usedTotal,
 	maxTotal,
@@ -6428,8 +6392,6 @@ export function Drawer({
 	delta?: number;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
-	/** Plain-click navigation to a view path (see navClick); cross-project card links use it. */
-	navigate: (path: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 	/** Agents running machine-wide right now, and the global cap they share. */
@@ -7000,7 +6962,6 @@ export function Drawer({
 												selfProject={row.project}
 												tag="parent"
 												onOpenTask={onOpenTask}
-												navigate={navigate}
 											/>
 										</li>
 									))}
@@ -7021,7 +6982,6 @@ export function Drawer({
 														selfProject={row.project}
 														tag=""
 														onOpenTask={onOpenTask}
-														navigate={navigate}
 														state={
 															<span
 																className={
@@ -7100,7 +7060,6 @@ export function Drawer({
 								project={project}
 								tasks={tasks}
 								onOpenTask={onOpenTask}
-								navigate={navigate}
 								draining={draining}
 							/>
 						</DrawerSec>
@@ -7114,7 +7073,6 @@ export function Drawer({
 								selfProject={row.project}
 								tasks={tasks}
 								onOpenTask={onOpenTask}
-								navigate={navigate}
 							/>
 						</div>
 					)}
@@ -9068,7 +9026,8 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 	);
 }
 
-function App() {
+/** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
+export function App() {
 	// One-time client migration: an old hash URL becomes its path URL before the first
 	// readPath(), so the initial view and card come from the pathname.
 	migrateHash();
@@ -9123,13 +9082,17 @@ function App() {
 		(id: string) => {
 			// Every card open is one history entry, so Back returns to the previous card
 			// (e.g. child → parent → child) before it leaves the page. The URL names the
-			// card: /projects/<project>/tasks/<id>.
+			// card: /projects/<project>/tasks/<id>, and the board follows the URL: a card
+			// of another project selects that project first, so header, rail, lanes and
+			// drawer always agree (OTTR-487). Closing the drawer then stays on that
+			// project. The same value is a no-op: a current-project open changes nothing.
 			const card = tasks.find((t) => t.id === id);
-			history.pushState(
-				{ ompTask: id },
-				"",
-				card === undefined ? location.pathname : taskPath(card.project, id),
-			);
+			if (card === undefined) {
+				history.pushState({ ompTask: id }, "", location.pathname);
+			} else {
+				history.pushState({ ompTask: id }, "", taskPath(card.project, id));
+				setView(card.project);
+			}
 			setSelectedId(id);
 			markSeen(card);
 		},
@@ -10350,7 +10313,6 @@ function App() {
 								t.followUpOfProject === drawerTask.project),
 					)}
 					onOpenTask={openTask}
-					navigate={navigate}
 					draining={draining}
 					usedTotal={usedTotal}
 					maxTotal={state?.maxTotal ?? null}

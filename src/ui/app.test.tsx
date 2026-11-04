@@ -47,7 +47,6 @@ const {
 	reportHtml,
 	Drawer,
 	LogView,
-	openCardInProject,
 	ProjectBoard,
 	SEARCH_APPLY_MS,
 } = await import("./app.tsx");
@@ -1319,7 +1318,6 @@ describe("Drawer parent chip", () => {
 		read: false,
 		onMarkUnread: () => {},
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1412,7 +1410,6 @@ describe("Drawer cross-project lineage", () => {
 		read: false,
 		onMarkUnread: () => {},
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1524,22 +1521,6 @@ describe("Drawer cross-project lineage", () => {
 	});
 });
 
-test("openCardInProject navigates the linked card's path, then opens the card", () => {
-	const navigated: string[] = [];
-	const opened: string[] = [];
-	openCardInProject(
-		{ project: "agent-data", id: "AGEN-30" },
-		(path) => {
-			navigated.push(path);
-		},
-		(id) => {
-			opened.push(id);
-		},
-	);
-	expect(navigated).toEqual(["/projects/agent-data/tasks/AGEN-30"]);
-	expect(opened).toEqual(["AGEN-30"]);
-});
-
 describe("Drawer prompt markdown", () => {
 	// ponytail: render test reads only these fields; the cast keeps the fixture short.
 	const project = {
@@ -1575,7 +1556,6 @@ describe("Drawer prompt markdown", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1659,7 +1639,6 @@ describe("Drawer file-section loading placeholders", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1753,7 +1732,6 @@ describe("Drawer queued steering edit", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1819,7 +1797,6 @@ describe("Drawer queued steering edit (client)", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -1964,7 +1941,6 @@ describe("Drawer approve button", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -2486,7 +2462,6 @@ describe("Drawer research report button", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -2588,7 +2563,6 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		onMarkUnread: () => {},
 		tasks: [],
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
@@ -2841,7 +2815,6 @@ describe("path URL card links", () => {
 		read: false,
 		onMarkUnread: () => {},
 		onOpenTask: () => {},
-		navigate: () => {},
 		draining: false,
 		usedTotal: 0,
 		maxTotal: null,
