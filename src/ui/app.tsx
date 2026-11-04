@@ -6051,14 +6051,22 @@ function turnPage<T extends { list: string[]; index: number }>(
 
 /** Follow-up text behind a research report's "Implement steps" button. */
 const IMPLEMENT_RECOMMENDATIONS =
-	"Implement the recommended steps (also called next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
+	"Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
-/** True when a research report names steps worth implementing. Same phrases the
- * follow-up prompt searches for, so the button never promises work the agent
- * cannot find. ponytail: phrase heuristic; a report saying "no next steps are
- * needed" still matches — an explicit recommendations field would fix that. */
+/** True when a research report names steps worth implementing. The research
+ * prompt asks for a heading named "## Recommended steps", so the exact heading
+ * is the first signal; older reports (OTTR-94, OTTR-283) fall back to the same
+ * phrases the follow-up prompt searches for, and a heading holding "recommended
+ * … steps" with up to three words between catches shapes like OTTR-449's
+ * "## Recommended adoption steps". ponytail: the fallbacks are still a phrase
+ * heuristic; a report saying "no next steps are needed" still matches them. */
 export const recommendsSteps = (report: string): boolean =>
-	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report);
+	// The exact heading the research prompt asks for, any level, case-insensitive.
+	/^\s*#{1,6}\s+recommended steps\s*$/im.test(report) ||
+	// Old-report phrases, so the button never promises work the agent cannot find.
+	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report) ||
+	// A heading holding "recommended … steps", up to three words between.
+	/^\s*#{1,6}\s+.*\brecommended(?:\s+\S+){0,3}\s+steps\b/im.test(report);
 
 /** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
  * status words and alarm coding as the meta line; a click opens the card. The href uses each

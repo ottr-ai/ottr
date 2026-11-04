@@ -8,6 +8,7 @@ import type {
 	PerfStat,
 	ProjectView,
 	TaskCard,
+	TaskView,
 	UpdateRow,
 } from "../types.ts";
 import {
@@ -1233,6 +1234,51 @@ describe("recommendsSteps", () => {
 			),
 		).toBe(false);
 	});
+
+	test("matches the prompt's exact heading and OTTR-449's older shape", () => {
+		// The heading the research prompt asks for, at the lowest and highest level.
+		expect(recommendsSteps("# Recommended steps\n\n1. Buy the rack")).toBe(
+			true,
+		);
+		expect(recommendsSteps("###### Recommended steps\n\n1. Buy the rack")).toBe(
+			true,
+		);
+		// Case-insensitive.
+		expect(recommendsSteps("### RECOMMENDED STEPS\n\n1. Buy the rack")).toBe(
+			true,
+		);
+		// Real shape (OTTR-449): the heading sits mid-report and holds a word
+		// between "recommended" and "steps".
+		expect(
+			recommendsSteps(
+				[
+					"## Short answer",
+					"",
+					"Answer: an explicit recommendations field.",
+					"",
+					"## Recommended adoption steps",
+					"",
+					"1. Add the field to the card state.",
+				].join("\n"),
+			),
+		).toBe(true);
+		expect(recommendsSteps("## Recommended next steps\n\n1. Add a scan.")).toBe(
+			true,
+		);
+		// Up to three words between; four is too many.
+		expect(recommendsSteps("## Recommended one two three steps")).toBe(true);
+		expect(recommendsSteps("## Recommended one two three four steps")).toBe(
+			false,
+		);
+		// A prose mention earns no button: only headings widen the old phrases.
+		expect(
+			recommendsSteps("our recommended adoption steps are listed below."),
+		).toBe(false);
+		// A report with no step section earns no button.
+		expect(recommendsSteps("## Short answer\n\nNo steps are needed.")).toBe(
+			false,
+		);
+	});
 });
 
 describe("reportHtml", () => {
@@ -2293,6 +2339,193 @@ describe("cancelled cards on the board", () => {
 		// cell shows a relative time instead of the empty dash.
 		const ageCell = /<td class="age">([^<]*)<\/td>/.exec(body)![1]!;
 		expect(ageCell).not.toBe("–");
+	});
+});
+
+describe("Drawer research report button", () => {
+	// The drawer fetches the full task (with the report) in an effect, which
+	// renderToStaticMarkup never runs. Mount with happy-dom, the same pattern as
+	// settings.test.tsx, and serve the fetches through a mocked global fetch.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	// OTTR-449's shape: the steps heading sits mid-report and holds a word between
+	// "recommended" and "steps".
+	const report449 = [
+		"## Short answer",
+		"",
+		"Answer: an explicit recommendations field.",
+		"",
+		"## Recommended adoption steps",
+		"",
+		"1. Add the field to the card state.",
+		"2. Read it in the drawer.",
+	].join("\n");
+	// The full task the detail fetch returns; the card fixture's fields plus what
+	// the done view reads beyond the row (turns, check log, hold head, report).
+	const detailBody = {
+		...cardFixture({ id: "R-1", stage: "done", state: "idle", research: true }),
+		turns: [],
+		workCheckLog: [],
+		details: null,
+		report: report449,
+		diffFiles: null,
+		holdHead: null,
+		mergeHead: null,
+		branch: null,
+		base: null,
+		worktree: null,
+		sessionId: null,
+		model: null,
+		commits: [],
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+	} as unknown as TaskView;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+		fetch: (url: unknown): Promise<Response> => {
+			const u = String(url);
+			const body = u.endsWith("/tasks/R-1")
+				? detailBody
+				: u.endsWith("/tasks/R-1/context")
+					? { context: null }
+					: null;
+			return Promise.resolve(
+				body === null
+					? new Response("{}", { status: 404 })
+					: new Response(JSON.stringify(body), {
+							status: 200,
+							headers: { "content-type": "application/json" },
+						}),
+			);
+		},
+	};
+	const originals = new Map<string, unknown>();
+	// Fields the Drawer body reads before the detail fetch lands; cardFixture's
+	// short cast omits them (the cancelled-card fixture carries the same set).
+	const rowFields = {
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	};
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		navigate: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	/** Mounts the drawer for a task row and flushes the detail fetch. */
+	const mountDrawer = async (
+		task: TaskCard,
+	): Promise<{
+		container: HTMLElement;
+		unmount: () => Promise<void>;
+	}> => {
+		const container = document.createElement("div");
+		document.body.append(container);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<Drawer {...base} task={task} />);
+		});
+		await act(async () => {});
+		return {
+			container,
+			// Inside act, so no callback survives the test into the next one.
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+			},
+		};
+	};
+
+	test("a done research card whose report recommends steps shows Implement steps", async () => {
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		try {
+			expect(container.innerHTML).toContain("Follow up");
+			expect(container.innerHTML).toContain("Implement steps");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a done research card without a step section hides Implement steps", async () => {
+		detailBody.report = "## Short answer\n\nNothing to do.";
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		try {
+			expect(container.innerHTML).toContain("Follow up");
+			expect(container.innerHTML).not.toContain("Implement steps");
+		} finally {
+			await unmount();
+		}
 	});
 });
 
