@@ -37,3 +37,15 @@ paths = ['''(^|/)src/ui/index\.html$''']
 [[allowlists]]
 description = "the settings test PEM fixture pairing in commit 9fc23a9, replaced by fake-key-0000 on the tip"
 commits = ["9fc23a988c46bc57a9a8b93cd15155bdbb672c87"]
+
+# Commit 985b7c6 added fake GitHub tokens to the pushAuthKind test in
+# src/gitHosts.test.ts. The 20-character values hold 20 distinct characters,
+# so generic-api-key's entropy bar of 3.7 flags them. The tip commit moves
+# them to the zero-suffix fixture style, but the finding lives in that
+# commit's patch, which history keeps forever. Scoped to the one commit: a
+# real token never looks like `ghp_aaaa0000aaaa0000`, and a secret-shaped
+# string anywhere else stays flagged.
+
+[[allowlists]]
+description = "fake GitHub token fixtures in commit 985b7c6, replaced by the zero-suffix style on the tip"
+commits = ["985b7c6ea775d4f8f923b8d5dcf13d906f4b7026"]

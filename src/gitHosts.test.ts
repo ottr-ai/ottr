@@ -661,7 +661,7 @@ describe("pushAuthKind", () => {
 					{
 						host: "github.com",
 						username: "bob",
-						token: "ghp_abcdef1234567890",
+						token: "ghp_aaaa0000aaaa0000",
 					},
 				],
 			}),
@@ -670,7 +670,7 @@ describe("pushAuthKind", () => {
 			pushAuthKind("https://github.com/o/r.git", {
 				...base,
 				tokens: [
-					{ host: "github.com", username: "ci", token: "ghs_aBcDeFgHiJkLmNoP" },
+					{ host: "github.com", username: "ci", token: "ghs_aaaa0000aaaa0000" },
 				],
 			}),
 		).toContain("GitHub App installation token");
@@ -678,7 +678,7 @@ describe("pushAuthKind", () => {
 			pushAuthKind("https://github.com/o/r.git", {
 				...base,
 				ambientHelpers: [["credential.helper", "/usr/bin/ottr-cred"]],
-				envToken: "ghs_aBcDeFgHiJkLmNoP",
+				envToken: "ghs_aaaa0000aaaa0000",
 			}),
 		).toBe(
 			"a GitHub App installation token through a credential helper (GH_TOKEN)",
@@ -687,7 +687,7 @@ describe("pushAuthKind", () => {
 			pushAuthKind("https://gitlab.example.com/o/r.git", {
 				...base,
 				ambientHelpers: [["credential.helper", "/usr/bin/ottr-cred"]],
-				envToken: "ghp_abcdef1234567890",
+				envToken: "ghp_aaaa0000aaaa0000",
 			}),
 		).toBe("a credential helper from the git config");
 		expect(
