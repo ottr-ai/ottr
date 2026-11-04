@@ -1,18 +1,32 @@
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	acquireMutationLock,
 	isStrykerRun,
 	mutationConcurrency,
+	sandboxTempDirName,
 } from "./scripts/stryker-load.mjs";
 
 // One mutation run at a time on a worker: every Stryker run imports this base module, so the
-// lock next to the temp dir serializes all five Stryker runs here. A second run waits and
-// logs; a lock from a killed run is taken over. Only a run takes the lock, never a plain
-// import: a tool that reads the configs to learn their mutate arrays (scripts/mutation-delta.ts)
-// must not hold the lock its own Stryker children then wait for (OTTR-366).
-const tempDirName = join(tmpdir(), "ott-stryker");
-if (isStrykerRun()) acquireMutationLock(tempDirName);
+// host-global lock (/tmp/ott-stryker.lock) serializes all five Stryker runs here. A second run
+// waits and logs; a lock from a killed run is taken over. Only a run takes the lock, never a
+// plain import: a tool that reads the configs to learn their mutate arrays
+// (scripts/mutation-delta.ts) must not hold the lock its own Stryker children then wait for
+// (OTTR-366). The lock stays host-global even though the sandbox below is per checkout, so
+// parallel runs on loaded hosts keep waiting instead of mass-timing-out (2026-09-30 review).
+const mutationLockBase = join(tmpdir(), "ott-stryker");
+// The sandbox parent is per checkout and wiped at run start (OTTR-500): the machine-global
+// parent let a killed run's leftover sandbox hold a foreign or stale tree, and Stryker's
+// per-test stage 1 then skipped the missing files and ran mutants against it. Different
+// checkouts hash to different parents, and while a run holds the lock no other run is active,
+// so the wipe of this checkout's parent cannot touch a concurrent run. Only a run wipes,
+// never a plain import (same isStrykerRun gate as the lock).
+const tempDirName = sandboxTempDirName();
+if (isStrykerRun()) {
+	acquireMutationLock(mutationLockBase);
+	rmSync(tempDirName, { recursive: true, force: true });
+}
 
 // Mutation testing: `bun run test:mutation` runs this config, then stryker.release.config.mjs,
 // stryker.turn.config.mjs, stryker.worktree.config.mjs and stryker.update-image.config.mjs.
@@ -64,7 +78,8 @@ export default {
   // The dry run (full sequential suite, then each test file alone) took 260 s standalone on a quiet
   // host at 16b3326; the cold sandbox crossed Stryker's 5-minute default (2026-10-30 v0.2.0 review).
   dryRunTimeoutMinutes: 20,
-  // Sandbox outside any repo: a mutant that drops git()'s cwd must fail there, not run git in this repo.
+  // Sandbox outside any repo: a mutant that drops git()'s cwd must fail there, not run git in this
+  // repo. Per checkout and wiped at run start (OTTR-500, see the header above).
   tempDirName,
   // TypeScript 7's JS API has no parseConfigFileTextToJson, which Stryker 10's sandbox tsconfig
   // rewrite calls. Our tsconfig has no extends/references to rewrite, so point it at a missing file.

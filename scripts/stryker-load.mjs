@@ -1,5 +1,30 @@
-import { closeSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
-import os from "node:os";
+import { createHash } from "node:crypto";
+import {
+	closeSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeSync,
+} from "node:fs";
+import os, { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * The Stryker sandbox parent for one checkout: tmpdir()/ott-stryker-<12 hex chars of the repo
+ * root path>. A machine-global parent put every worktree's sandbox next to every other's, and a
+ * killed run's leftover sandbox then held a foreign or stale tree (OTTR-500). Stryker creates a
+ * fresh randomly-named sandbox-N inside the parent per run (mkdtemp), so the parent needs no
+ * per-run name — wiping it at run start (see stryker.config.mjs) clears a killed run's leftover.
+ * The repo root defaults to cwd: every Stryker run here starts at the checkout's root.
+ */
+export function sandboxTempDirName(
+	repoRoot = realpathSync(process.cwd()),
+	tmp = tmpdir(),
+) {
+	const hash = createHash("sha256").update(repoRoot).digest("hex").slice(0, 12);
+	return join(tmp, `ott-stryker-${hash}`);
+}
 
 /**
  * Stryker worker count: half of the host CPUs, at least 1, so a mutation run never asks for more

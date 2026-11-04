@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -13,6 +15,7 @@ import {
 	acquireMutationLock,
 	isStrykerRun,
 	mutationConcurrency,
+	sandboxTempDirName,
 } from "./stryker-load.mjs";
 
 test("mutationConcurrency is half of the CPUs, at least 1", () => {
@@ -38,6 +41,19 @@ test("STRYKER_CONCURRENCY rejects values below 1 and non-integers", () => {
 	expect(() => mutationConcurrency({ STRYKER_CONCURRENCY: "-3" })).toThrow();
 	expect(() => mutationConcurrency({ STRYKER_CONCURRENCY: "2.5" })).toThrow();
 	expect(() => mutationConcurrency({ STRYKER_CONCURRENCY: "abc" })).toThrow();
+});
+
+test("sandboxTempDirName keys the sandbox parent on the checkout root", () => {
+	// Stable for one checkout, distinct across checkouts (OTTR-500): parallel
+	// worktrees must not share a sandbox parent.
+	expect(sandboxTempDirName("/repo-a")).toBe(sandboxTempDirName("/repo-a"));
+	expect(sandboxTempDirName("/repo-a")).not.toBe(sandboxTempDirName("/repo-b"));
+	expect(sandboxTempDirName("/repo-a", "/tmp-x")).toMatch(
+		/^\/tmp-x\/ott-stryker-[0-9a-f]{12}$/,
+	);
+	expect(sandboxTempDirName()).toBe(
+		sandboxTempDirName(realpathSync(process.cwd())),
+	);
 });
 
 const helperUrl = JSON.stringify(
@@ -220,5 +236,61 @@ test("a plain importer then a Stryker child: the child takes the lock itself", (
 			LOCK_FILE: `${sandbox}.lock`,
 		});
 		expect(out).toContain("PARENT-FREE");
+	});
+});
+
+// OTTR-500: a Stryker run wipes its checkout's sandbox parent first, so a killed run's
+// leftover sandbox cannot reach the run; a plain import must touch nothing (it may run
+// while another checkout's run is active). The children run with the test runner's cwd,
+// so the parent the config wipes is the one computed here from the same root.
+function leftoverParent(sandbox: string, name: string): string {
+	const root = sandbox.slice(0, sandbox.lastIndexOf("/"));
+	const parent = sandboxTempDirName(realpathSync(process.cwd()), root);
+	mkdirSync(join(parent, name), { recursive: true });
+	return parent;
+}
+
+test("a Stryker-shaped import of the real config wipes a leftover sandbox parent", () => {
+	withSandbox((sandbox) => {
+		const parent = leftoverParent(sandbox, "sandbox-STALE");
+		const out = runChild(
+			`const { existsSync } = await import("node:fs");
+			process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			process.argv[1] = process.env.FAKE_BIN;
+			await import(${configUrl});
+			if (existsSync(process.env.STALE_DIR))
+				throw new Error("the run kept a leftover sandbox parent");
+			console.log("WIPED");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				STALE_DIR: join(parent, "sandbox-STALE"),
+				FAKE_BIN: join(
+					new URL("..", import.meta.url).pathname,
+					"node_modules",
+					".bin",
+					"stryker",
+				),
+			},
+		);
+		expect(out).toContain("WIPED");
+	});
+});
+
+test("a plain import of the real config leaves a sandbox parent alone", () => {
+	withSandbox((sandbox) => {
+		const parent = leftoverParent(sandbox, "sandbox-KEEP");
+		const out = runChild(
+			`const { existsSync } = await import("node:fs");
+			process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			await import(${configUrl});
+			if (!existsSync(process.env.STALE_DIR))
+				throw new Error("a plain import wiped a sandbox parent");
+			console.log("KEPT");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				STALE_DIR: join(parent, "sandbox-KEEP"),
+			},
+		);
+		expect(out).toContain("KEPT");
 	});
 });

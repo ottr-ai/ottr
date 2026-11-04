@@ -5,6 +5,8 @@ export function mutationConcurrency(
 
 export function isStrykerRun(argv?: unknown[]): boolean;
 
+export function sandboxTempDirName(repoRoot?: string, tmp?: string): string;
+
 export function acquireMutationLock(
 	tempDirName: string,
 	options?: { timeoutMs?: number; log?: (message: string) => void },
