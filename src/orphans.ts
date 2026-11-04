@@ -71,7 +71,8 @@ export function argValues(cmd: string, flag: string): string[] {
 export function runKind(cmd: string): string | null {
 	for (const v of argValues(cmd, "--config")) {
 		const base = basename(v);
-		if (base === "no-discovery.yml") continue;
+		// no-discovery.yml rides along in every board run; it matches no rule below, so
+		// the loop's fall-through already leaves the kind untouched.
 		if (base === "retro.yml" || base === "check.yml")
 			return base.slice(0, -".yml".length);
 	}

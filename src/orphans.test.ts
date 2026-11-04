@@ -6,6 +6,7 @@ import {
 	ORPHAN_GRACE_MS,
 	orphanCache,
 	orphanPids,
+	orphanView,
 	resolveOrphan,
 	runKind,
 	sessionDirOf,
@@ -287,4 +288,56 @@ test("an unknown session-dir resolves nothing", () => {
 	);
 	expect(out.project).toBeNull();
 	expect(out.card).toBeNull();
+});
+
+// ---- Survivor kills for the delta gate (OTTR-463) ----
+
+test("argValues reads a flag value across double spaces", () => {
+	expect(argValues("omp --config  /x", "--config")).toEqual(["/x"]);
+});
+
+test("a trailing flag with no value never names a kind", () => {
+	expect(runKind("bun omp -p --mode json --config")).toBeNull();
+	expect(sessionDirOf("omp -p --mode json --session-dir")).toBeNull();
+});
+
+test("summarizeCmd trims whitespace around the command", () => {
+	expect(summarizeCmd("  omp -p --mode json  ")).toBe("omp -p --mode json");
+});
+
+test("summarizeCmd drops only real KEY names and keeps a bare =", () => {
+	expect(summarizeCmd("_X9=1 omp -p")).toBe("omp -p");
+	expect(summarizeCmd("=9 omp -p")).toBe("=9 omp -p");
+});
+
+test("a cwd that is exactly the worktrees dir resolves nothing", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json"),
+		"/data/ottr/.worktrees/",
+		projectList,
+		same,
+	);
+	expect(out.project).toBeNull();
+	expect(out.card).toBeNull();
+});
+
+test("a worktree cwd wins over another project's session-dir", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json --session-dir /srv/other/.tasks/sessions"),
+		"/data/ottr/.worktrees/OTTR-463",
+		projectList,
+		same,
+	);
+	expect(out.project).toBe("ottr");
+	expect(out.card).toBe("OTTR-463");
+});
+
+test("orphanView keeps a card the store still has and drops a gone one", () => {
+	const cwd = "/data/ottr/.worktrees/OTTR-463";
+	const p = proc(7, "bun omp -p --mode json");
+	const kept = orphanView(p, cwd, projectList, same, () => true);
+	expect(kept.card).toBe("OTTR-463");
+	const gone = orphanView(p, cwd, projectList, same, () => false);
+	expect(gone.card).toBeNull();
+	expect(gone.project).toBe("ottr");
 });
