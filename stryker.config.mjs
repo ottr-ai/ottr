@@ -35,8 +35,8 @@ export default {
     // runs only the test files whose import closure contains the mutated file; stage-1 survivors
     // then run the full suite with --parallel=8. The dry run stays the full sequential suite, so
     // the timeout budget is unchanged; a once-per-run pass runs each test file alone to rule out
-    // stage-1 false kills. The 2 GB data-segment cap stops the runaway mutants in
-    // src/workers.ts:151-153 from OOM-killing the host and falsely killing neighbor mutants:
+    // stage-1 false kills. The 2 GB data-segment cap stops the runaway mutants in the stdout
+    // line-split loop of src/workers.ts from OOM-killing the host and falsely killing neighbor mutants:
     // a runaway dies as a Bun OOM abort, which counts as Killed. ulimit is
     // POSIX-only, so mutation runs need Linux.
   },

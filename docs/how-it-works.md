@@ -142,7 +142,7 @@ stateDiagram-v2
 
 - **todo**, **in_progress**, **merging**, **done**, **backlog** — `Stage` in `src/types.ts`
 - `createTask` — `src/store.ts`
-- `POST /backlog` — `src/app.ts`
+- `POST /api/projects/<project>/tasks/<id>/backlog` — `src/app.ts`
 - Work session starts — `runTurn` `onSession` in `src/turn.ts`
 - Report checks (`ready`, `answered`, `integrated`) — `classify` in `src/runner.ts`
 - Work check blockers — `runTurn` in `src/turn.ts`
@@ -170,6 +170,6 @@ stateDiagram-v2
 - **queued**, **preparing**, **running**, **needs_you**, **idle** — `RunState` in `src/types.ts`
 - `pickRunnable` — `src/scheduler.ts`. `runTurn`, `stopBeforeRun`, `stopTurn`, `cancel`, `finishKept`, `settleLostTurn` — `src/turn.ts`
 - Next stage and retries — `classify` in `src/runner.ts`
-- User reply, restart session, grill, promote — `POST /reply`, `POST /restart-session`, `POST /grill`, `POST /backlog` in `src/app.ts`
+- User reply, restart session, grill, promote — `reply`, `restart-session`, `grill`, `backlog` under `POST /api/projects/<project>/tasks/<id>/` in `src/app.ts`
 - Auto-tend, `hygienePass`, `reclassifyPass` — `src/supervisor.ts`
 - `needs_you` shows as the `!` badge on the card — `src/ui/status.ts`

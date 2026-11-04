@@ -1,4 +1,4 @@
-// Throwaway e2e proof for steering: fake omp shim + scratch git project + real server.
+// E2E proof for steering (`bun run test:e2e`, run in CI): fake omp shim + scratch git project + real server.
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
