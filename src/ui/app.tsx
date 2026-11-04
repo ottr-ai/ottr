@@ -5653,6 +5653,7 @@ export function AskBlock({
 	answered,
 	selected,
 	busy,
+	changed,
 	onOpenDiff,
 	onAnswer,
 }: {
@@ -5662,6 +5663,8 @@ export function AskBlock({
 	answered: boolean;
 	selected: string | null;
 	busy: boolean;
+	/** The task's changed files: bare quoted paths among these become diff links. */
+	changed: string[];
 	/** Opens the diff view scoped to the named files (the question's `diff:` links). */
 	onOpenDiff: (files: string[]) => void;
 	onAnswer: (text: string) => void;
@@ -5706,7 +5709,7 @@ export function AskBlock({
 				{/* One span keeps the parts in normal inline flow: the paragraph is a flex row, and
 					separate flex items per part would wrap the text out of reading order. */}
 				<span>
-					{diffLinkParts(q.question).map((part, pi) =>
+					{diffLinkParts(q.question, changed).map((part, pi) =>
 						part.kind === "text" ? (
 							// biome-ignore lint/suspicious/noArrayIndexKey: static split of the question text; parts are positional
 							<Fragment key={pi}>{part.text}</Fragment>
@@ -5716,7 +5719,11 @@ export function AskBlock({
 								key={pi}
 								type="button"
 								className="diff-link"
-								title="View these files' diff"
+								title={
+									part.files.length === 1
+										? "View this file's diff"
+										: "View these files' diff"
+								}
 								onClick={() => onOpenDiff(part.files)}
 							>
 								{part.label === "" ? part.files.join(", ") : part.label}
@@ -5960,6 +5967,7 @@ function AskPanel({
 	taskId,
 	busy,
 	failed,
+	changed,
 	onOpenDiff,
 	onSend,
 }: {
@@ -5968,6 +5976,8 @@ function AskPanel({
 	taskId: string;
 	busy: boolean;
 	failed: boolean;
+	/** The task's changed files: bare quoted paths among these become diff links. */
+	changed: string[];
 	/** Opens the diff view scoped to the named files (a question's `diff:` links). */
 	onOpenDiff: (files: string[]) => void;
 	onSend: (text: string) => void;
@@ -6009,6 +6019,7 @@ function AskPanel({
 					answered={answers[qi] !== undefined}
 					selected={answers[qi] ?? null}
 					busy={locked}
+					changed={changed}
 					onOpenDiff={onOpenDiff}
 					onAnswer={(t) => {
 						if (asked.length === 1) {
@@ -7045,6 +7056,7 @@ export function Drawer({
 							taskId={task.id}
 							busy={replySend.busy}
 							failed={replySend.failed}
+							changed={diffFiles.map((f) => f.file)}
 							onOpenDiff={setDiffView}
 							onSend={(text) => {
 								replySend.start(async () => {
@@ -7176,6 +7188,7 @@ export function Drawer({
 						</DrawerSec>
 					)}
 					{task.releaseVersion !== null &&
+
 						(notesEdit === null ? (
 							<DrawerSec
 								id="drawer-notes"

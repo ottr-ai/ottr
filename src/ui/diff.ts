@@ -8,8 +8,12 @@ export type DiffLinkPart =
 const DIFF_LINK_RE = /\[([^\]\n]*)\]\((diff:[^()\s]+)\)/g;
 
 /** Splits question text into plain runs and diff links; text outside links stays literal
- *  (a `diff:` href without paths degrades to plain text too). */
-export function diffLinkParts(text: string): DiffLinkPart[] {
+ *  (a `diff:` href without paths degrades to plain text too). A bare quoted path that names
+ *  one of `changed` becomes a link to that file's diff section; unchanged paths stay literal. */
+export function diffLinkParts(
+	text: string,
+	changed?: readonly string[],
+): DiffLinkPart[] {
 	const out: DiffLinkPart[] = [];
 	let last = 0;
 	for (const m of text.matchAll(DIFF_LINK_RE)) {
@@ -22,6 +26,44 @@ export function diffLinkParts(text: string): DiffLinkPart[] {
 		if (files.length === 0) continue;
 		if (start > last) out.push({ kind: "text", text: text.slice(last, start) });
 		out.push({ kind: "link", label: m[1] ?? "", files });
+		last = start + m[0].length;
+	}
+	if (last < text.length) out.push({ kind: "text", text: text.slice(last) });
+	if (changed === undefined || changed.length === 0) return out;
+	return out.flatMap((part) =>
+		part.kind === "text" ? pathLinkParts(part.text, changed) : [part],
+	);
+}
+
+/** Path characters except the dot; the dot needs the two-sided border rule below, since a
+ *  sentence-final dot after a path is prose, not part of a longer name. */
+const PATH_BODY = /[A-Za-z0-9_@~/+-]/;
+/** Characters a file path may continue with: a match bordered by one of these would cut a
+ *  longer token (src/ui/diff.ts inside src/ui/diff.tsx, a path inside a URL) in half. */
+const PATH_BORDER = /[A-Za-z0-9_@~/.+-]/;
+
+/** Splits one plain run so each whole-token occurrence of a changed path becomes a single-file
+ *  link labelled with the path as the question quoted it. Longest path wins, so a changed
+ *  src/ui/diff.tsx beats its own src/ui/diff.ts prefix. The right border allows one trailing
+ *  period: a dot followed by prose or the end is a sentence mark, a dot followed by more path
+ *  text (foo.d.ts) still refuses the match. */
+function pathLinkParts(
+	text: string,
+	changed: readonly string[],
+): DiffLinkPart[] {
+	const alts = [...changed]
+		.sort((a, b) => b.length - a.length)
+		.map((f) => f.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+	const re = new RegExp(
+		`(?<!${PATH_BORDER.source})(?:${alts.join("|")})(?!(?:${PATH_BODY.source}|\\.${PATH_BORDER.source}))`,
+		"g",
+	);
+	const out: DiffLinkPart[] = [];
+	let last = 0;
+	for (const m of text.matchAll(re)) {
+		const start = m.index ?? 0;
+		if (start > last) out.push({ kind: "text", text: text.slice(last, start) });
+		out.push({ kind: "link", label: m[0], files: [m[0]] });
 		last = start + m[0].length;
 	}
 	if (last < text.length) out.push({ kind: "text", text: text.slice(last) });

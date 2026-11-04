@@ -1005,6 +1005,7 @@ describe("AskBlock", () => {
 		answered: false,
 		selected: null,
 		busy: false,
+		changed: [],
 		onOpenDiff: () => {},
 		onAnswer: () => {},
 	};
@@ -1022,6 +1023,38 @@ describe("AskBlock", () => {
 		// Nothing picked and nothing typed: the send stays disabled.
 		expect(html).toContain("Answer");
 		expect(html).toContain("disabled");
+	});
+
+	test("a changed file path quoted in the question renders as a diff link", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				changed={["src/prompts.ts"]}
+				q={{
+					...multiQ,
+					question:
+						"The spec proposes new wording in src/prompts.ts. Do you approve?",
+				}}
+			/>,
+		);
+		// The path is a button that opens the file's diff, not prose.
+		expect(html).toContain(
+			'<button type="button" class="diff-link" title="View this file&#x27;s diff">src/prompts.ts</button>',
+		);
+	});
+
+	test("a quoted path without changes renders as plain text", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={{
+					...multiQ,
+					question: "The spec docs/specs/token-expiry.md proposes wording.",
+				}}
+			/>,
+		);
+		expect(html).not.toContain("diff-link");
+		expect(html).toContain("docs/specs/token-expiry.md");
 	});
 
 	test("a saved multi answer re-checks its presets and counts them", () => {

@@ -296,4 +296,87 @@ describe("diffLinkParts", () => {
 		const text = "open [the site](https://example.com) or [nothing](diff:)";
 		expect(diffLinkParts(text)).toEqual([{ kind: "text", text }]);
 	});
+
+	test("a bare quoted path among the changed files becomes a single-file link", () => {
+		expect(
+			diffLinkParts(
+				"The spec docs/specs/review-cleanup-hardening.md proposes new wording in src/prompts.ts.",
+				["docs/specs/review-cleanup-hardening.md", "src/prompts.ts"],
+			),
+		).toEqual([
+			{ kind: "text", text: "The spec " },
+			{
+				kind: "link",
+				label: "docs/specs/review-cleanup-hardening.md",
+				files: ["docs/specs/review-cleanup-hardening.md"],
+			},
+			{ kind: "text", text: " proposes new wording in " },
+			{ kind: "link", label: "src/prompts.ts", files: ["src/prompts.ts"] },
+			{ kind: "text", text: "." },
+		]);
+	});
+
+	test("a quoted path without changes stays literal text", () => {
+		const text = "The spec docs/specs/token-expiry.md proposes new wording.";
+		expect(diffLinkParts(text, ["src/prompts.ts"])).toEqual([
+			{ kind: "text", text },
+		]);
+	});
+
+	test("no changed files keeps every path literal", () => {
+		expect(diffLinkParts("src/prompts.ts changed.", [])).toEqual([
+			{ kind: "text", text: "src/prompts.ts changed." },
+		]);
+	});
+
+	test("a path inside a longer token never links", () => {
+		// The changed src/ui/diff.ts sits inside the longer diff.tsx token...
+		expect(
+			diffLinkParts("touch src/ui/diff.tsx now", ["src/ui/diff.ts"]),
+		).toEqual([{ kind: "text", text: "touch src/ui/diff.tsx now" }]);
+		// ...and inside a URL the slash borders the path on the left.
+		expect(
+			diffLinkParts("see https://example.com/src/prompts.ts today", [
+				"src/prompts.ts",
+			]),
+		).toEqual([
+			{ kind: "text", text: "see https://example.com/src/prompts.ts today" },
+		]);
+	});
+
+	test("the longest changed path wins when one prefixes the other", () => {
+		expect(
+			diffLinkParts("edit src/ui/diff.tsx please", [
+				"src/ui/diff.ts",
+				"src/ui/diff.tsx",
+			]),
+		).toEqual([
+			{ kind: "text", text: "edit " },
+			{ kind: "link", label: "src/ui/diff.tsx", files: ["src/ui/diff.tsx"] },
+			{ kind: "text", text: " please" },
+		]);
+	});
+
+	test("an explicit diff link keeps its label while bare paths around it link", () => {
+		expect(
+			diffLinkParts("[the diff](diff:src/a.ts) and also src/b.ts, please", [
+				"src/b.ts",
+			]),
+		).toEqual([
+			{ kind: "link", label: "the diff", files: ["src/a.ts"] },
+			{ kind: "text", text: " and also " },
+			{ kind: "link", label: "src/b.ts", files: ["src/b.ts"] },
+			{ kind: "text", text: ", please" },
+		]);
+	});
+
+	test("a path quoted in backticks links and keeps the quotes as text", () => {
+		expect(
+			diffLinkParts("check `src/prompts.ts` first", ["src/prompts.ts"]),
+		).toEqual([
+			{ kind: "text", text: "check `" },
+			{ kind: "link", label: "src/prompts.ts", files: ["src/prompts.ts"] },
+			{ kind: "text", text: "` first" },
+		]);
+	});
 });
