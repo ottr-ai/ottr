@@ -6428,6 +6428,8 @@ export function Drawer({
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	const [reply, setReply] = useState("");
 	const [steer, setSteer] = useState("");
+	/** Non-null while the queued steering's text editor is open: holds the editor's draft. */
+	const [steerEdit, setSteerEdit] = useState<string | null>(null);
 	const [modelQuery, setModelQuery] = useState("");
 	const [copied, flashCopied] = useFlash(1500);
 	const [copiedId, flashCopiedId] = useFlash(1500);
@@ -6751,6 +6753,15 @@ export function Drawer({
 				{},
 			);
 		});
+	/** Saves an edit of the queued steering: replaces its text before the agent's next turn sends it. */
+	const saveSteerEdit = (text: string): Promise<boolean> =>
+		act(async () => {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/steer/edit`,
+				{ text },
+			);
+			setSteerEdit(null);
+		});
 	/** Switches the model the agent's next turn runs with; lands in-between turns like a steer. */
 	const switchModel = (m: string): void => {
 		void act(async () => {
@@ -6761,6 +6772,7 @@ export function Drawer({
 		});
 	};
 	const editSave = useBusy();
+	const steerEditSave = useBusy();
 	const replySend = useBusy();
 	const steerSend = useBusy();
 
@@ -7857,30 +7869,90 @@ export function Drawer({
 											<span className="you-head">
 												Queued
 												{task.pendingPrompt.trim() !== "." && (
-													<BusyButton
-														className="ghost"
-														ariaLabel="Cancel the queued steering"
-														run={async () =>
-															(await confirmDialog(
-																"Discard the queued steering?",
-																{ ok: "Discard", danger: true },
-															))
-																? cancelSteer()
-																: Promise.resolve(true)
-														}
-													>
-														Cancel
-													</BusyButton>
+													<>
+														<BusyButton
+															className="ghost"
+															ariaLabel="Edit the queued steering"
+															run={() => {
+																setSteerEdit(task.pendingPrompt);
+																return Promise.resolve(true);
+															}}
+														>
+															Edit
+														</BusyButton>
+														<BusyButton
+															className="ghost"
+															ariaLabel="Cancel the queued steering"
+															run={async () =>
+																(await confirmDialog(
+																	"Discard the queued steering?",
+																	{ ok: "Discard", danger: true },
+																))
+																	? cancelSteer()
+																	: Promise.resolve(true)
+															}
+														>
+															Cancel
+														</BusyButton>
+													</>
 												)}
 											</span>
 											<div className="you-bubble">
 												{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
 												{task.pendingPrompt.trim() === "." ? (
 													<span className="you-chip">Resume</span>
-												) : (
+												) : steerEdit === null ? (
 													<div className="you-msg">
 														<Markdown text={task.pendingPrompt} />
 													</div>
+												) : (
+													<form
+														className="reply-form"
+														onSubmit={(e) => {
+															e.preventDefault();
+															if (steerEdit.trim().length === 0) return;
+															steerEditSave.start(() =>
+																saveSteerEdit(steerEdit),
+															);
+														}}
+													>
+														<label htmlFor="steer-edit-text">Steering</label>
+														<textarea
+															id="steer-edit-text"
+															rows={4}
+															value={steerEdit}
+															onChange={(e) => setSteerEdit(e.target.value)}
+														/>
+														<div className="reply-actions">
+															<button
+																type="button"
+																onClick={() => setSteerEdit(null)}
+															>
+																Cancel
+															</button>
+															<button
+																type="submit"
+																className={
+																	"primary" +
+																	(steerEditSave.failed ? " failed" : "")
+																}
+																disabled={
+																	steerEdit.trim().length === 0 ||
+																	steerEditSave.busy
+																}
+																aria-busy={steerEditSave.busy || undefined}
+															>
+																{steerEditSave.busy && (
+																	<span
+																		className="spinner"
+																		aria-hidden="true"
+																	/>
+																)}
+																<Icon name="send" />
+																Save
+															</button>
+														</div>
+													</form>
 												)}
 												{task.pendingImages.length > 0 && (
 													<p className="you-msg dim">

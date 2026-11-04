@@ -5616,6 +5616,39 @@ export function createApp(deps: AppDeps) {
 					return json(taskView(e, t));
 				}),
 		},
+		"/api/projects/:project/tasks/:id/steer/edit": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { e, task } = found;
+					if (task.cancelledAt !== null)
+						return json({ error: "task is cancelled" }, 404);
+					if (task.pendingPrompt === null)
+						return json({ error: "no steering is queued" }, 409);
+					// "." is the auto-resume marker, not user steering; rewriting it would
+					// strand a task the turn loop would otherwise heal.
+					if (task.pendingPrompt.trim() === ".")
+						return json(
+							{ error: "the queued turn is an automatic resume, not steering" },
+							409,
+						);
+					const text = r.body.text;
+					if (typeof text !== "string" || text.trim().length === 0)
+						return json({ error: "text must be a non-empty string" }, 400);
+					// Check and write are sync, so the scheduler (same event loop) cannot start a
+					// turn in between: the queued text never changes after the pre-edit read.
+					// Queued images stay; this edits the words. A human rewrote the text, so it is
+					// no longer the supervisor's park even when the queue carried one.
+					const t = e.store.updateTask(task.id, {
+						pendingPrompt: text.trim(),
+						pendingBy: "user",
+					});
+					return json(taskView(e, t));
+				}),
+		},
 		"/api/projects/:project/tasks/:id/model": {
 			POST: (req) =>
 				api(req, async () => {

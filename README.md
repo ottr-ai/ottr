@@ -44,7 +44,7 @@ A **backlog** card holds a feature idea that is not thought through yet. Park a 
 
 For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card when a run fails. Once an hour it turns each open Dependabot pull request into a card that runs like any task.
 
-A card with **!** needs you. Reply in its drawer and the agent continues in the same session. You can also steer a running task, stop its current turn, cancel any card, paste images, and start follow-ups from Done cards. The bell in the header collects everything that needs you; desktop and phone push notifications are optional. Cards can carry a **triage rank** (P0-P3, set in the drawer): the Overview triage ranks them ahead of wait time, and a close-candidate badge marks cards you plan to cancel.
+A card with **!** needs you. Reply in its drawer and the agent continues in the same session. You can also steer a running task, edit a queued steer before the agent gets it, stop its current turn, cancel any card, paste images, and start follow-ups from Done cards. The bell in the header collects everything that needs you; desktop and phone push notifications are optional. Cards can carry a **triage rank** (P0-P3, set in the drawer): the Overview triage ranks them ahead of wait time, and a close-candidate badge marks cards you plan to cancel.
 
 When a running turn writes nothing to its task log for 2 hours, its card shows a warning: the agent may wait on a hung command. Ottr does not stop the run. Steer, stop, or cancel the card. The warning goes away when the log grows again. A log that reached its 2 MiB limit keeps no new text, but new output still clears the warning.
 

@@ -3518,6 +3518,100 @@ describe("steer cancel route", () => {
 	});
 });
 
+describe("steer edit route", () => {
+	test("replaces the queued steering text before the agent sees it", async () => {
+		const t = store.createTask("typo in the steer");
+		store.updateTask(t.id, {
+			state: "running",
+			pendingPrompt: "gardening should have been hardening",
+			pendingBy: "user",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "hardening, not gardening",
+		});
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt).toBe("hardening, not gardening");
+		expect(after.pendingImages).toEqual([]);
+		expect(after.state).toBe("running");
+	});
+
+	test("trims the replacement text and keeps queued images", async () => {
+		const t = store.createTask("steer with a picture");
+		store.updateTask(t.id, {
+			stage: "in_progress",
+			state: "queued",
+			pendingPrompt: "one more thing",
+			pendingBy: "user",
+			pendingImages: ["a.png"],
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "  one more thing, then stop  ",
+		});
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt).toBe("one more thing, then stop");
+		expect(after.pendingImages).toEqual(["a.png"]);
+		// Unlike cancel, an edit keeps a card that is queued only for the steer queued.
+		expect(after.state).toBe("queued");
+	});
+
+	test("rewriting a supervisor park makes the text the user's", async () => {
+		const t = store.createTask("parked by the tracker");
+		store.updateTask(t.id, {
+			state: "running",
+			pendingPrompt: "the merge is held: resolve the conflict",
+			pendingBy: "supervisor",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "the merge is held: take their version",
+		});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.pendingBy).toBe("user");
+	});
+
+	test("nothing queued, an automatic resume, and empty text are rejected", async () => {
+		const t = store.createTask("nothing queued");
+		store.updateTask(t.id, { state: "running" });
+		const none = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "hello",
+		});
+		expect(none.status).toBe(409);
+		expect(await errorOf(none)).toBe("no steering is queued");
+		store.updateTask(t.id, { pendingPrompt: "." });
+		const resume = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "hello",
+		});
+		expect(resume.status).toBe(409);
+		expect(await errorOf(resume)).toBe(
+			"the queued turn is an automatic resume, not steering",
+		);
+		expect(store.getTask(t.id)!.pendingPrompt).toBe(".");
+		store.updateTask(t.id, { pendingPrompt: "hold on", pendingBy: "user" });
+		const blank = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "   ",
+		});
+		expect(blank.status).toBe(400);
+		expect(await errorOf(blank)).toBe("text must be a non-empty string");
+		const notText = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {});
+		expect(notText.status).toBe(400);
+		expect(store.getTask(t.id)!.pendingPrompt).toBe("hold on");
+	});
+
+	test("cancelled task and unknown id are 404", async () => {
+		const t = store.createTask("gone");
+		store.updateTask(t.id, { cancelledAt: Date.now(), state: "idle" });
+		const dead = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "hello",
+		});
+		expect(dead.status).toBe(404);
+		const unknown = await post("/api/projects/p1/tasks/ffffffff/steer/edit", {
+			text: "hello",
+		});
+		expect(unknown.status).toBe(404);
+	});
+});
+
 describe("unmark research route", () => {
 	test("clears the flag and leaves turns, commits, and the report alone", async () => {
 		const t = store.createTask("coerced card");

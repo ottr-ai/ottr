@@ -1570,6 +1570,73 @@ describe("Drawer prompt markdown", () => {
 	});
 });
 
+describe("Drawer queued steering edit", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		navigate: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+
+	test("queued steering offers Edit next to Cancel", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			pendingPrompt: "gardening should have been hardening",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('aria-label="Edit the queued steering"');
+		expect(html).toContain('aria-label="Cancel the queued steering"');
+	});
+
+	test("the resume marker hides Edit and Cancel", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			pendingPrompt: ".",
+			pendingBy: "supervisor",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('class="you-chip"');
+		expect(html).not.toContain('aria-label="Edit the queued steering"');
+		expect(html).not.toContain('aria-label="Cancel the queued steering"');
+	});
+});
+
 describe("Drawer approve button", () => {
 	const project = {
 		name: "proj",
