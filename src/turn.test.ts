@@ -300,6 +300,35 @@ afterEach(() => {
 });
 
 describe("turn loop", () => {
+	test("a finished run records ranOn on the turn; a run without one leaves it null", async () => {
+		const { store, loop } = setup({
+			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							ranOn: "worker-a (abc)",
+							outcome: { status: "answered", summary: "did it" },
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("worker run");
+		await loop.runTurn(store.name, task.id);
+		const turns = store.listTurns(task.id);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]!.ranOn).toBe("worker-a (abc)");
+		expect(turns[0]!.outcome).toBe("answered");
+
+		const { store: plainStore, loop: plainLoop } = setup();
+		const plain = plainStore.createTask("plain run");
+		await plainLoop.runTurn(plainStore.name, plain.id);
+		expect(plainStore.listTurns(plain.id)[0]!.ranOn).toBeNull();
+	});
+
 	test("queued work turn lands done: branch, session, commits, worktree removed", async () => {
 		const store = freshStore();
 		const record: Recorded = {

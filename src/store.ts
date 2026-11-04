@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS turns (
   error TEXT,
   model TEXT,
   layer TEXT,
+  ran_on TEXT,
   tokens_in INTEGER,
   tokens_out INTEGER,
   cache_read INTEGER,
@@ -347,6 +348,7 @@ interface TurnRow {
 	error: string | null;
 	model: string | null;
 	layer: string | null;
+	ran_on: string | null;
 }
 
 function toTask(project: string, r: TaskRow): Task {
@@ -539,6 +541,7 @@ function toTurn(r: TurnRow): Turn {
 		error: r.error,
 		model: r.model,
 		layer: r.layer,
+		ranOn: r.ran_on,
 	};
 }
 
@@ -615,6 +618,7 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	input: "input",
 	inputBy: "input_by",
 	layer: "layer",
+	ranOn: "ran_on",
 };
 
 /**
@@ -1222,6 +1226,9 @@ export class ProjectStore {
 			.map((c) => c.name);
 		if (!turnCols.includes("model"))
 			db.exec("ALTER TABLE turns ADD COLUMN model TEXT");
+		// Where the turn's run executed; null for turns recorded before OTTR-503.
+		if (!turnCols.includes("ran_on"))
+			db.exec("ALTER TABLE turns ADD COLUMN ran_on TEXT");
 		if (!turnCols.includes("input"))
 			db.exec("ALTER TABLE turns ADD COLUMN input TEXT");
 		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".

@@ -25,6 +25,7 @@ const turn = (id: number, kind: TurnKind, startedAt: number): TurnView => ({
 	error: null,
 	model: null,
 	layer: null,
+	ranOn: null,
 });
 
 const check = (at: number): WorkCheckRun => ({

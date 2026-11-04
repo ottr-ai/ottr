@@ -13,7 +13,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
@@ -2142,10 +2142,11 @@ describe("startRun", () => {
 				dataRoot: dir,
 				launcher,
 			});
-			await handle.done;
+			const r = await handle.done;
 			expect(seen[0]).toContain("--no-extensions");
 			expect(seen[0]).toContain("--no-lsp");
 			expect(seen[0]).toContain(NO_DISCOVERY_CONFIG);
+			expect(r.ranOn).toBe(`board (${hostname()})`);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -2394,6 +2395,7 @@ describe("startRun worker dispatch", () => {
 			expect(r.killed).toBe(false);
 			expect(r.sessionId).toBe("sess-worker");
 			expect(r.sawTerminalEnd).toBe(true);
+			expect(r.ranOn).toMatch(/^worker 127\.0\.0\.1 \(.+\)$/);
 			expect(launched).toBe(0);
 			const log = readFileSync(logPath, "utf8");
 			expect(log).toContain("worker: dispatching to");

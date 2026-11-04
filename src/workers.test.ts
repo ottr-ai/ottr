@@ -216,10 +216,16 @@ describe("serveWorker", () => {
 		expect(echoed.cwd).toBe(dir);
 		expect(echoed.env.FOO).toBe("bar");
 		const sentinel = JSON.parse(lines[1]!) as {
-			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+			[WORKER_DONE]: {
+				exitCode: number | null;
+				stderrTail: string;
+				host: string;
+			};
 		};
 		expect(sentinel[WORKER_DONE].exitCode).toBe(3);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("");
+		expect(typeof sentinel[WORKER_DONE].host).toBe("string");
+		expect(sentinel[WORKER_DONE].host.length).toBeGreaterThan(0);
 	}, 30_000);
 
 	test("omp never sees the worker's own token, from its env or the request", async () => {
@@ -326,10 +332,16 @@ describe("serveWorker", () => {
 		});
 		const lines = await readLines(res);
 		const sentinel = JSON.parse(lines.at(-1)!) as {
-			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+			[WORKER_DONE]: {
+				exitCode: number | null;
+				stderrTail: string;
+				host: string;
+			};
 		};
 		expect(sentinel[WORKER_DONE].exitCode).toBe(1);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("boom one\nboom two\n");
+		expect(typeof sentinel[WORKER_DONE].host).toBe("string");
+		expect(sentinel[WORKER_DONE].host.length).toBeGreaterThan(0);
 	}, 30_000);
 
 	test("the project's package list installs before omp; its notes ride stdout, not the stderr tail", async () => {
@@ -354,7 +366,11 @@ describe("serveWorker", () => {
 		});
 		const lines = await readLines(res);
 		const sentinel = JSON.parse(lines.at(-1)!) as {
-			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+			[WORKER_DONE]: {
+				exitCode: number | null;
+				stderrTail: string;
+				host: string;
+			};
 		};
 		expect(asked).toEqual(["velvarr"]);
 		expect(sentinel[WORKER_DONE].exitCode).toBe(3); // omp still ran
@@ -366,6 +382,8 @@ describe("serveWorker", () => {
 		expect(JSON.parse(lines[1]!)).toHaveProperty("argv");
 		expect(lines).toHaveLength(3);
 		expect(sentinel[WORKER_DONE].stderrTail).toBe("");
+		expect(typeof sentinel[WORKER_DONE].host).toBe("string");
+		expect(sentinel[WORKER_DONE].host.length).toBeGreaterThan(0);
 	}, 30_000);
 
 	test("a failed install ends the run with apt's error, and omp never starts", async () => {
@@ -617,6 +635,42 @@ describe("runWorker", () => {
 		expect(result.workerLost).toBeUndefined();
 		// The worker's stderr tail is relayed to the log as "! ..." lines.
 		expect(sink.lines).toContain("! bad thing\n");
+	}, 30_000);
+
+	test("a sentinel with a host settles the result with worker ranOn (hostname without port)", async () => {
+		const hostPath = join(dir, "host-sentinel-omp.js");
+		writeFileSync(
+			hostPath,
+			`process.stdout.write(JSON.stringify({ ${JSON.stringify(WORKER_DONE)}: { exitCode: 0, stderrTail: "", host: "abc-123" } }) + "\\n");\nprocess.exit(0);`,
+		);
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "h1", argv: [hostPath], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		expect(result.ranOn).toBe(`worker ${new URL(url).hostname} (abc-123)`);
+	}, 30_000);
+
+	test("a sentinel without a host settles the result with no ranOn", async () => {
+		const noHostPath = join(dir, "no-host-sentinel-omp.js");
+		writeFileSync(
+			noHostPath,
+			`process.stdout.write(JSON.stringify({ ${JSON.stringify(WORKER_DONE)}: { exitCode: 0, stderrTail: "" } }) + "\\n");\nprocess.exit(0);`,
+		);
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "h2", argv: [noHostPath], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		expect(result.ranOn).toBeUndefined();
 	}, 30_000);
 
 	test("round-robins across urls", async () => {

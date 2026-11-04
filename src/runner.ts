@@ -4,7 +4,7 @@ import {
 	spawn,
 } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import {
@@ -1154,6 +1154,7 @@ export function startRun(o: {
 					exitCode: code,
 					killed,
 					stderrTail: sink.tail(),
+					ranOn: `board (${hostname()})`,
 					dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
 				}),
 			);

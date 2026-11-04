@@ -10,6 +10,7 @@ import type {
 	Task,
 	TaskCard,
 	TaskView,
+	TurnView,
 	UpdateRow,
 } from "../types.ts";
 import {
@@ -54,6 +55,7 @@ const {
 	ComposeDialog,
 	DeepenReview,
 	OrphanNotice,
+	ranOnLabel,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -1644,6 +1646,97 @@ describe("Drawer parent chip", () => {
 		const branch = html.slice(html.indexOf('class="lineage-branch"'));
 		expect(html.indexOf('class="lineage-branch"')).toBeGreaterThan(at("S-1"));
 		for (const id of ["K-1", "K-2", "K-3"]) expect(branch).toContain(`>${id}<`);
+	});
+});
+
+describe("ranOnLabel", () => {
+	const turn = (over: Partial<TurnView>): TurnView =>
+		({
+			id: 1,
+			taskId: "t1",
+			kind: "work",
+			input: null,
+			inputBy: null,
+			startedAt: 0,
+			endedAt: 1,
+			pid: null,
+			exitCode: 0,
+			outcome: "answered",
+			summary: null,
+			details: null,
+			question: null,
+			error: null,
+			model: null,
+			ranOn: null,
+			...over,
+		}) as unknown as TurnView;
+
+	test("the newest work turn that recorded a run wins", () => {
+		expect(
+			ranOnLabel([
+				turn({ id: 1, ranOn: "worker-a (aaaa)" }),
+				turn({ id: 2, kind: "merge", ranOn: "board (ottr-server)" }),
+				turn({ id: 3, ranOn: "worker-b (bbbb)" }),
+			]),
+		).toBe("worker-b (bbbb)");
+	});
+
+	test("a merge turn backs a history whose work turns predate the column", () => {
+		expect(
+			ranOnLabel([
+				turn({ id: 1, ranOn: null }),
+				turn({ id: 2, kind: "merge", ranOn: "board (ottr-server)" }),
+			]),
+		).toBe("board (ottr-server)");
+	});
+
+	test("no recorded run reads null", () => {
+		expect(ranOnLabel([turn({}), turn({ id: 2, kind: "merge" })])).toBeNull();
+		expect(ranOnLabel([])).toBeNull();
+	});
+});
+
+describe("Drawer meta ran-on row", () => {
+	const card = cardFixture({
+		id: "M-1",
+		stage: "done",
+		state: "idle",
+		workCheckLog: [],
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		updateIds: [],
+	});
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+
+	test("the Meta section names where the card ran", () => {
+		const html = renderToStaticMarkup(
+			<Drawer
+				task={card}
+				project={project}
+				act={async () => true}
+				onClose={() => {}}
+				onFollowed={() => {}}
+				read={false}
+				onMarkUnread={() => {}}
+				onOpenTask={() => {}}
+				draining={false}
+				usedTotal={0}
+				maxTotal={null}
+				tasks={[]}
+			/>,
+		);
+		// The static render has no detail fetch: no turns arrived yet, so the row
+		// shows the placeholder until the detail fill replaces it.
+		const m = /Ran on<\/dt><dd>([^<]*)<\/dd>/.exec(html);
+		expect(m?.[1]).toBe("-");
 	});
 });
 

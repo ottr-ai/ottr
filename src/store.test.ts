@@ -86,6 +86,19 @@ describe("turn model", () => {
 		store.close();
 	});
 
+	test("finishTurn stores ranOn and listTurns returns it", () => {
+		const store = open(join(root, "ran-on"));
+		const task = store.createTask("do things");
+		const turn = store.startTurn(task.id, "work", "do things", null);
+		expect(turn.ranOn).toBeNull();
+		store.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			ranOn: "worker-a (abc)",
+		});
+		expect(store.listTurns(task.id)[0]?.ranOn).toBe("worker-a (abc)");
+		store.close();
+	});
+
 	test("lastTurnModel returns the newest turn that recorded a model", () => {
 		const store = open(join(root, "last-model"));
 		const task = store.createTask("snapshot");
@@ -1907,13 +1920,17 @@ describe("preparing migration", () => {
 		const store = open(dir);
 		store.updateTask("leg1", { pushSha: "abc", dependsOn: ["x"] });
 		store.startTurn("leg1", "work", "legacy turn", null, "turn input");
-		store.finishTurn(store.listTurns("leg1")[0]!.id, { model: "glm" });
+		store.finishTurn(store.listTurns("leg1")[0]!.id, {
+			model: "glm",
+			ranOn: "worker-a (abc)",
+		});
 		store.close();
 
 		const reopened = open(dir);
 		expect(reopened.getTask("leg1")?.pushSha).toBe("abc");
 		expect(reopened.getTask("leg1")?.dependsOn).toEqual(["x"]);
 		expect(reopened.listTurns("leg1")[0]?.model).toBe("glm");
+		expect(reopened.listTurns("leg1")[0]?.ranOn).toBe("worker-a (abc)");
 		expect(reopened.listTurns("leg1")[0]?.input).toBe("turn input");
 		reopened.close();
 

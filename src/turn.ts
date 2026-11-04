@@ -2753,6 +2753,7 @@ export function createTurnLoop(
 				// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
 				// Without a served model (a crash before message_start) the dispatch snapshot stands.
 				model: turnModel(result.model, runModel) ?? turn.model,
+				ranOn: result.ranOn ?? null,
 				outcome: result.outcome?.status ?? null,
 				summary: result.outcome?.summary ?? null,
 				details: result.outcome?.details ?? (result.finalText || null),

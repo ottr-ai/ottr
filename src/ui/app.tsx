@@ -23,6 +23,7 @@ import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
+
 import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
@@ -49,6 +50,7 @@ import {
 	type StateResponse,
 	type TaskCard,
 	type TaskView,
+	type TurnView,
 	UPDATE_HOLD_REASON,
 	type UpdateRow,
 	type UpdatesView,
@@ -6779,6 +6781,17 @@ function ProposalReasonLink({
 	);
 }
 
+/** Where the card ran, for the Meta row: the newest work turn that recorded it, else the newest
+ * turn of any kind (a merge-only history), else null — the row shows "-". The string names the
+ * worker or the board plus the docker container hostname the run executed in. */
+export function ranOnLabel(turns: readonly TurnView[]): string | null {
+	return (
+		turns.findLast((t) => t.kind === "work" && t.ranOn !== null)?.ranOn ??
+		turns.findLast((t) => t.ranOn !== null)?.ranOn ??
+		null
+	);
+}
+
 export function Drawer({
 	open = true,
 	task: row,
@@ -8890,6 +8903,10 @@ export function Drawer({
 							<div>
 								<dt>Session</dt>
 								<dd>{task.sessionId ?? "-"}</dd>
+							</div>
+							<div>
+								<dt>Ran on</dt>
+								<dd>{ranOnLabel(task.turns) ?? "-"}</dd>
 							</div>
 							{project.github !== null && (
 								<div>

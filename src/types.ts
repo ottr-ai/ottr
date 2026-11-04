@@ -422,6 +422,10 @@ export interface Turn {
 	model: string | null;
 	/** Agent layer id (the `.alate/layers/<id>` folder name) this turn's omp run pinned; null when the run stayed on the flat home or the row predates the field. */
 	layer: string | null;
+	/** Where the run executed, recorded at settle: `worker <url hostname> (<container hostname>)`
+	 * for a worker dispatch, `board (<server hostname>)` for a local spawn; null when unrecorded
+	 * (the run is still going, a lost worker never started, or the row predates the column). */
+	ranOn: string | null;
 }
 
 /** One finding a review recorded with propose_task. Ottr checks the best-ranked ones with a
@@ -462,6 +466,10 @@ export interface RunResult {
 	killed: boolean;
 	/** Last 4000 chars of stderr. */
 	stderrTail: string;
+	/** Where the run executed: `worker <url hostname> (<container hostname>)` for a worker dispatch
+	 * (the container hostname rides the worker's done sentinel), `board (<server hostname>)` for a
+	 * local spawn. Absent when the run never started (lost worker, dispatch failure). */
+	ranOn?: string;
 	/** Last assistant provider error; a later successful message clears it. */
 	providerError?: string | null;
 	/** How the run was dispatched: mode (local / worker URL), argv

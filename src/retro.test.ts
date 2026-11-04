@@ -31,6 +31,7 @@ function turn(p: Partial<Turn> = {}): Turn {
 		model: null,
 		layer: null,
 		inputBy: null,
+		ranOn: null,
 		...p,
 	};
 }

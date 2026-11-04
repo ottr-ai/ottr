@@ -6,6 +6,7 @@ import {
 	readlinkSync,
 	statSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { isAbsolute } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
 import { platform } from "./platform/index.ts";
@@ -237,7 +238,7 @@ export function serveWorker(opts: {
 						stopWatch();
 						if (partial.length > 0) push(`${partial}\n`);
 						push(
-							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail } })}\n`,
+							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail, host: hostname() } })}\n`,
 						);
 						if (!closed) controller.close(); // else the client aborted; the stream is gone
 					});
@@ -261,17 +262,23 @@ export class WorkerConnectError extends Error {}
 
 function parseSentinel(
 	line: string,
-): { exitCode: number | null; stderrTail: string } | null {
+): { exitCode: number | null; stderrTail: string; host?: string } | null {
 	try {
 		const v = JSON.parse(line) as Record<string, unknown>;
-		const done = v[WORKER_DONE];
+		const done = v[WORKER_DONE] as Record<string, unknown> | undefined;
 		if (
 			typeof done === "object" &&
 			done !== null &&
 			"exitCode" in done &&
-			typeof (done as Record<string, unknown>).stderrTail === "string"
+			typeof done.stderrTail === "string"
 		)
-			return done as { exitCode: number | null; stderrTail: string };
+			return {
+				exitCode: done.exitCode as number | null,
+				stderrTail: done.stderrTail,
+				...(typeof done.host === "string" && done.host !== ""
+					? { host: done.host }
+					: {}),
+			};
 	} catch {
 		// not JSON, not the sentinel
 	}
@@ -368,6 +375,11 @@ export function runWorker(
 								exitCode: sentinel.exitCode,
 								killed: false,
 								stderrTail: sentinel.stderrTail,
+								...(typeof sentinel.host === "string" && sentinel.host !== ""
+									? {
+											ranOn: `worker ${new URL(url).hostname} (${sentinel.host})`,
+										}
+									: {}),
 							}),
 						);
 						return;
