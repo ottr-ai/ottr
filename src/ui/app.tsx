@@ -6528,6 +6528,13 @@ export function Drawer({
 		report: null,
 		diffFiles: null,
 	};
+	// The drawer live-polls the server: the queued text the steering editor was opened
+	// with can be delivered or appended to while the editor sits open. A stale draft
+	// must never open over — and a later Save replace — newer steering, so any
+	// pendingPrompt change clears it.
+	useEffect(() => {
+		setSteerEdit(null);
+	}, [task.pendingPrompt]);
 	// Work steps rail: this card's turns, its work check runs, its retro's turns and its
 	// review's finding turns by start time.
 	const steps = workSteps(

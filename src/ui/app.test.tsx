@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { type Node as HappyNode, Window } from "happy-dom";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type {
 	PerfMetrics,
@@ -1634,6 +1637,151 @@ describe("Drawer queued steering edit", () => {
 		expect(html).toContain('class="you-chip"');
 		expect(html).not.toContain('aria-label="Edit the queued steering"');
 		expect(html).not.toContain('aria-label="Cancel the queued steering"');
+	});
+});
+
+describe("Drawer queued steering edit (client)", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		navigate: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the setup mirrors settings.test.tsx:
+	// happy-dom registers them for this describe, and afterAll puts the originals
+	// back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	// happy-dom's dispatched clicks never reach React's event plugin (same
+	// upstream gap as settings.test.tsx's onChangeOf): call the production
+	// onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	test("a replaced steer never reopens the editor with the stale draft", async () => {
+		const realFetch = globalThis.fetch;
+		// The drawer's effects fetch the task detail, session context and model
+		// catalog; every one degrades to null on a failed response, so a 404 keeps
+		// the row's own fields (pendingPrompt included) authoritative.
+		globalThis.fetch = (async () =>
+			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const task = (prompt: string) =>
+			cardFixture({
+				...drawerFields,
+				stage: "todo",
+				state: "queued",
+				pendingPrompt: prompt,
+			});
+		const editButton = (): Element => {
+			const node = container.querySelector(
+				'button[aria-label="Edit the queued steering"]',
+			);
+			if (node === null) throw new Error("no Edit button");
+			return node;
+		};
+		const editor = (): HTMLTextAreaElement | null =>
+			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={task("first steer")} />);
+			});
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("first steer");
+			// The steer the editor was opened on is replaced while the draft sits
+			// open (delivered, or edited away server-side): the pendingPrompt change
+			// must reset the draft, or a later Save would overwrite the new steer
+			// with the stale text.
+			await act(async () => {
+				root.render(<Drawer {...base} task={task("second steer")} />);
+			});
+			expect(editor()).toBeNull();
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("second steer");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 
