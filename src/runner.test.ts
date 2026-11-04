@@ -3305,4 +3305,47 @@ describe("startRun agent layer pinning", () => {
 			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
 		}
 	});
+	test("a worker dispatch failure unregisters the pinned layer from the registry", async () => {
+		const saved = saveEnv();
+		const shared = mkdtempSync(join(tmpdir(), "ottr-layer-dead-"));
+		mkdirSync(join(shared, ".alate", "layers", "A", ".omp", "agent"), {
+			recursive: true,
+		});
+		symlinkSync(join("layers", "A"), join(shared, ".alate", "current"));
+		const dir = mkdtempSync(join(tmpdir(), "ottr-layer-dead-run-"));
+		// A server that was stopped: the port refuses connections immediately.
+		const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
+		const deadUrl = `http://127.0.0.1:${dead.port}`;
+		dead.stop(true);
+		try {
+			testHome = shared; // the worker branch resolves its shared home via homedir()
+			let spawned = 0;
+			const launcher: RunLauncher = () => {
+				spawned++;
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const r = await startRun({
+				cwd: dir,
+				prompt: "p",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				worker: { urls: [deadUrl] },
+				launcher,
+			}).done;
+			expect(spawned).toBe(0); // fail closed: never run a worker turn locally
+			expect(r.workerLost).toBe(true);
+			// The failed dispatch released the layer: alate's clean-up sees no in-use entry.
+			expect(readLayerUse(shared)).toEqual([]);
+		} finally {
+			restoreEnv(saved);
+			testHome = null;
+			rmSync(shared, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
 });

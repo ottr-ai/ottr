@@ -322,3 +322,141 @@ describe("clean-up contract (board-side rule)", () => {
 		expect(layersDeletable(home, "B")).toEqual(["A"]);
 	});
 });
+
+describe("pin hardening", () => {
+	/** A flat home that holds every if-exist source as a real file or directory. */
+	function flatWithSources(home: string): void {
+		writeFileSync(join(home, ".gitconfig"), "[user]\n");
+		mkdirSync(join(home, ".config", "git"), { recursive: true });
+		mkdirSync(join(home, ".config", "gh"), { recursive: true });
+		mkdirSync(join(home, ".ssh"), { recursive: true });
+		writeFileSync(join(home, ".claude"), "ctx\n");
+		mkdirSync(join(home, ".npm"), { recursive: true });
+		mkdirSync(join(home, ".bun"), { recursive: true });
+		mkdirSync(join(home, ".local"), { recursive: true });
+	}
+
+	const IF_EXIST = [
+		".gitconfig",
+		".config/git",
+		".config/gh",
+		".ssh",
+		".claude",
+		".npm",
+		".bun",
+		".local",
+	];
+
+	test("every if-exist source present in the flat home is linked into the layer", () => {
+		const home = tempHome();
+		flatWithSources(home);
+		const dir = makeLayer(home, "links");
+		symlinkSync(dir, join(home, ".alate", "current"));
+		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		for (const rel of IF_EXIST)
+			expect(readlinkSync(join(dir, rel))).toBe(join(home, rel));
+	});
+
+	test("an absent if-exist source stays absent in the layer (no dangling link)", () => {
+		const home = tempHome();
+		const dir = makeLayer(home, "links");
+		symlinkSync(dir, join(home, ".alate", "current"));
+		expect(pinnedAgentLayer(home, undefined).ok).toBe(true);
+		for (const rel of IF_EXIST) {
+			expect(existsSync(join(home, rel))).toBe(false);
+			let inLayer = true;
+			try {
+				lstatSync(join(dir, rel));
+			} catch {
+				inLayer = false;
+			}
+			expect(inLayer).toBe(false);
+		}
+	});
+
+	test("a line that only contains the pattern is not flipped", () => {
+		const home = tempHome();
+		const dir = makeLayer(home, "flip-edge");
+		writeFileSync(
+			join(dir, ".omp", "agent", "config.yml"),
+			"keep: a  backend: mnemopi\n",
+		);
+		symlinkSync(dir, join(home, ".alate", "current"));
+		expect(pinnedAgentLayer(home, HINDSIGHT).ok).toBe(true);
+		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
+			"keep: a  backend: mnemopi\n",
+		);
+	});
+
+	test("trailing content on the line is not flipped", () => {
+		const home = tempHome();
+		const dir = makeLayer(home, "flip-edge2");
+		writeFileSync(
+			join(dir, ".omp", "agent", "config.yml"),
+			"  backend: mnemopi # keep\n",
+		);
+		symlinkSync(dir, join(home, ".alate", "current"));
+		expect(pinnedAgentLayer(home, HINDSIGHT).ok).toBe(true);
+		expect(readFileSync(join(dir, ".omp", "agent", "config.yml"), "utf8")).toBe(
+			"  backend: mnemopi # keep\n",
+		);
+	});
+});
+
+describe("in-use registry hardening", () => {
+	function writeRaw(home: string, text: string): void {
+		mkdirSync(join(home, ".alate"), { recursive: true });
+		writeFileSync(join(home, ".alate", "in-use.json"), text);
+	}
+
+	test("a registry whose layers value is not an array reads as empty", () => {
+		const home = tempHome();
+		writeRaw(home, '{"layers":"nope"}');
+		expect(readLayerUse(home)).toEqual([]);
+	});
+
+	test("invalid entries are skipped, valid ones kept", () => {
+		const home = tempHome();
+		writeRaw(
+			home,
+			JSON.stringify({
+				layers: [
+					null,
+					5,
+					{ since: 1 },
+					{ id: "a" },
+					{ id: "b", since: "x" },
+					{ id: "ok", since: 7 },
+				],
+			}),
+		);
+		expect(readLayerUse(home)).toEqual([{ id: "ok", since: 7 }]);
+	});
+});
+
+describe("registry write failures are best-effort", () => {
+	test("a failed write warns, leaves no tmp file, and reads empty", () => {
+		const home = tempHome();
+		// The registry path is a directory: the final rename fails (EISDIR/ENOTDIR/…),
+		// so writeRegistry takes its catch path: warn, unlink the tmp file, stay [].
+		mkdirSync(join(home, ".alate", "in-use.json"), { recursive: true });
+		const warns: string[] = [];
+		const original = console.warn;
+		console.warn = (...parts: unknown[]) => warns.push(parts.join(" "));
+		try {
+			addLayerUse(home, "a");
+			removeLayerUse(home, "a");
+			rebuildLayerUse(home, ["a"]);
+		} finally {
+			console.warn = original;
+		}
+		expect(
+			warns.filter((w) => w.includes("! agent layer registry")).length,
+		).toBeGreaterThanOrEqual(3);
+		const left = readdirSync(join(home, ".alate")).filter((f) =>
+			f.endsWith(".tmp"),
+		);
+		expect(left).toEqual([]);
+		expect(readLayerUse(home)).toEqual([]);
+	});
+});
