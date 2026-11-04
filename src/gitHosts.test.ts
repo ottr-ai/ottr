@@ -19,11 +19,13 @@ import {
 	generatePendingKey,
 	gitAuthEnv,
 	gitSecrets,
+	gitTokenKind,
 	importPendingKey,
 	keyInfo,
 	parseGitToken,
 	parseGitUrl,
 	promoteKey,
+	pushAuthKind,
 	redact,
 	removeKey,
 	setGitSecrets,
@@ -631,6 +633,75 @@ describe("redact and git secrets", () => {
 		setGitSecrets(["s1", "s2"]);
 		expect(gitSecrets()).toEqual(["s1", "s2"]);
 		setGitSecrets([]);
+	});
+});
+
+describe("pushAuthKind", () => {
+	const base = {
+		tokens: [] as { host: string; username: string; token: string }[],
+		ambientHelpers: [] as [string, string][],
+		key: false,
+		envToken: null as string | null,
+		githubHost: "github.com",
+	};
+
+	test("gitTokenKind reads the kind from the prefix, never the value", () => {
+		expect(gitTokenKind("ghs_abc123")).toBe("GitHub App installation token");
+		expect(gitTokenKind(" ghs_abc123 ")).toBe("GitHub App installation token");
+		expect(gitTokenKind("ghp_abc123")).toBe("personal access token");
+		expect(gitTokenKind("github_pat_abc123")).toBe("personal access token");
+		expect(gitTokenKind("glpat-abc123")).toBe("personal access token");
+	});
+
+	test("names the board token, the GH_TOKEN kind and the ssh key, never a value", () => {
+		expect(
+			pushAuthKind("https://github.com/o/r.git", {
+				...base,
+				tokens: [
+					{
+						host: "github.com",
+						username: "bob",
+						token: "ghp_abcdef1234567890",
+					},
+				],
+			}),
+		).toBe("a board-stored token for github.com (personal access token)");
+		expect(
+			pushAuthKind("https://github.com/o/r.git", {
+				...base,
+				tokens: [
+					{ host: "github.com", username: "ci", token: "ghs_aBcDeFgHiJkLmNoP" },
+				],
+			}),
+		).toContain("GitHub App installation token");
+		expect(
+			pushAuthKind("https://github.com/o/r.git", {
+				...base,
+				ambientHelpers: [["credential.helper", "/usr/bin/ottr-cred"]],
+				envToken: "ghs_aBcDeFgHiJkLmNoP",
+			}),
+		).toBe(
+			"a GitHub App installation token through a credential helper (GH_TOKEN)",
+		);
+		expect(
+			pushAuthKind("https://gitlab.example.com/o/r.git", {
+				...base,
+				ambientHelpers: [["credential.helper", "/usr/bin/ottr-cred"]],
+				envToken: "ghp_abcdef1234567890",
+			}),
+		).toBe("a credential helper from the git config");
+		expect(
+			pushAuthKind("ssh://git.example.com/o/r.git", { ...base, key: true }),
+		).toBe("the server's ssh key");
+		expect(pushAuthKind("ssh://git.example.com/o/r.git", base)).toBe(
+			"no ssh key",
+		);
+		expect(pushAuthKind("https://github.com/o/r.git", base)).toBe(
+			"no credential the board knows of",
+		);
+		// A local pin carries no network credential at all.
+		expect(pushAuthKind("/tmp/origin.git", base)).toBeNull();
+		expect(pushAuthKind("/tmp/origin.git", { ...base, key: true })).toBeNull();
 	});
 });
 

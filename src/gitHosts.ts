@@ -566,6 +566,52 @@ export function gitAuthEnv(o: {
 export const GIT_AUTH_ENV_RE =
 	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROXY_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
 
+/** The kind of a git host token from its prefix, for card logs; never the value. */
+export function gitTokenKind(token: string): string {
+	return /^ghs_/.test(token.trim())
+		? "GitHub App installation token"
+		: "personal access token";
+}
+
+/**
+ * The credential kinds the server's git can reach for a push or fetch to url's host — one
+ * card-log line, never a value (OTTR-465): a missing GitHub App installation on a repo
+ * shows as a bare permission failure, and the line is what names the installation token the
+ * push went out with. null when the pin is not a network URL (a local path), where no
+ * credential applies.
+ */
+export function pushAuthKind(
+	url: string,
+	o: {
+		tokens: readonly GitToken[];
+		ambientHelpers: readonly (readonly [string, string])[];
+		key: boolean;
+		envToken: string | null;
+		githubHost: string;
+	},
+): string | null {
+	const remote = parseGitUrl(url);
+	if ("error" in remote) return null;
+	// Token helpers answer https only; an ssh remote uses the server's key alone.
+	if (remote.scheme === "ssh")
+		return o.key ? "the server's ssh key" : "no ssh key";
+	const kinds: string[] = [];
+	for (const t of o.tokens)
+		if (t.host === remote.hostKey)
+			kinds.push(
+				`a board-stored token for ${t.host} (${gitTokenKind(t.token)})`,
+			);
+	if (o.ambientHelpers.length > 0)
+		kinds.push(
+			o.envToken !== null && remote.host === o.githubHost
+				? `a ${gitTokenKind(o.envToken)} through a credential helper (GH_TOKEN)`
+				: "a credential helper from the git config",
+		);
+	return kinds.length === 0
+		? "no credential the board knows of"
+		: kinds.join("; ");
+}
+
 // git names these when it cannot authenticate; " 401"/" 403" cover raw HTTP status text.
 /** git's wording when it cannot authenticate (also for the merge push the server takes over). */
 export const GIT_AUTH_FAILURE =

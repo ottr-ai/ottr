@@ -1213,6 +1213,31 @@ export async function originRemoteUrl(
 }
 
 /**
+ * Replaces userinfo in URLs ("//user:pass@host") with "[REDACTED]": git echoes the configured
+ * URL in push and fetch errors, and a pinned origin URL may embed credentials. Hosts without
+ * userinfo stay byte-identical; scp-style remotes ("git@host:path") carry no credential.
+ */
+export function redactUrlCredentials(text: string): string {
+	return text.replace(
+		/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s@/]*@/g,
+		(m) => `${m.slice(0, m.indexOf("://") + 3)}[REDACTED]@`,
+	);
+}
+
+/** stderr lines that name a push failure's cause; hint lines stay out of needsReason. */
+const PUSH_REASON_LINE = /^\s*(?:!\s*\[|error:|fatal:|remote:)/;
+/** Card-log cap for a push's full output; the reason lines stay complete above it (same shape as the hold diff cap). */
+const PUSH_OUTPUT_MAX = 200_000;
+
+/** The push's full output for the card log; undefined when git said nothing. */
+function cappedPushOutput(text: string): string | undefined {
+	if (text === "") return undefined;
+	return text.length > PUSH_OUTPUT_MAX
+		? `${text.slice(0, PUSH_OUTPUT_MAX)}\n… push output truncated at 200 KB`
+		: text;
+}
+
+/**
  * The server's merge push (no agent holds git host credentials; the merge prompt tells the
  * agent not to push). Pushes the local target branch to the pinned origin when origin lacks
  * its tip and the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
@@ -1229,7 +1254,10 @@ export async function originRemoteUrl(
  * named repo's pre-receive hook would run here. A null pin, or one checkPinnedRemote
  * refuses, fails closed. A push git rejects because the remote moved (a non-fast-forward,
  * "fetch first", or a --force-with-lease "stale info") returns `rejected` (OTTR-394), so the
- * merge turn can queue its own rebase; any other failure stays `failed`.
+ * merge turn can queue its own rebase; any other failure stays `failed`. A failed or
+ * rejected push carries `error` with every reason line ("! [rejected]", "remote:", "fatal:",
+ * "error:") and `output` with git's complete output (OTTR-465), so the card log shows the
+ * cause a permission failure points at.
  */
 export async function serverMergePush(
 	mainPath: string,
@@ -1241,8 +1269,8 @@ export async function serverMergePush(
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
-	| { status: "failed"; error: string }
-	| { status: "rejected"; error: string }
+	| { status: "failed"; error: string; output?: string }
+	| { status: "rejected"; error: string; output?: string }
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
@@ -1308,7 +1336,24 @@ export async function serverMergePush(
 		await git(["update-ref", `refs/remotes/origin/${branch}`, local], mainPath);
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
 	}
-	const last = r.stderr.trim().split("\n").filter(Boolean).pop();
+	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
+	// needsReason keeps every reason line — "! [rejected]", "remote:", "fatal:" and the
+	// "error:" line — not only one line, so a push the server could not write shows its
+	// cause (a missing App installation, a token scope) instead of a bare summary.
+	const output = cappedPushOutput(
+		redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+	);
+	const reasons = r.stderr
+		.split("\n")
+		.filter((line) => PUSH_REASON_LINE.test(line))
+		.join("\n")
+		.trim();
+	const error = redactUrlCredentials(
+		reasons !== ""
+			? reasons
+			: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git push exited ${r.code}`),
+	);
 	// OTTR-394: git's rejection of a remote that moved while the merge ran ("fetch first" is
 	// the same rejection worded for a still-fast-forwardable local side); "(stale info)" is a
 	// --force-with-lease rejection, which the caller refuses to retry on a held push. Any
@@ -1318,8 +1363,8 @@ export async function serverMergePush(
 			r.stderr,
 		)
 	)
-		return { status: "rejected", error: last ?? `git push exited ${r.code}` };
-	return { status: "failed", error: last ?? `git push exited ${r.code}` };
+		return { status: "rejected", error, output };
+	return { status: "failed", error, output };
 }
 
 /**
@@ -1349,8 +1394,10 @@ export async function fetchOriginBranch(
 	);
 	return r.code === 0
 		? null
-		: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
-				`git fetch exited ${r.code}`);
+		: redactUrlCredentials(
+				r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git fetch exited ${r.code}`,
+			);
 }
 
 /**

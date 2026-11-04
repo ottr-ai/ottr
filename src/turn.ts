@@ -317,6 +317,10 @@ export interface TurnOps {
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
 	fetchOriginBranch: typeof fetchOriginBranch;
+	/** OTTR-465: the credential kinds the server's git can use for a push to a URL (a card-log line, never a value); null for a non-URL pin. */
+	pushAuthKind?: (url: string) => string | null;
+	/** OTTR-465: wait before the single origin-unchanged push retry (default 30 s); tests pass 0. */
+	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
 	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
@@ -412,6 +416,10 @@ const CANCEL_KEPT_PREFIX = "Cancel kept the worktree: ";
 // OTTR-394: automatic rebase retries a card may spend when a merge push is rejected
 // because origin moved. Beyond the budget the card parks at needs_you with git's reason.
 const MERGE_PUSH_RETRIES = 2;
+// OTTR-465: wait before the single origin-unchanged push retry; a transient failure (a
+// dropped connection, a token-refresh hiccup) clears in seconds. ALAT-60's failed push
+// landed unchanged on a later merge turn.
+const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 // ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -1956,6 +1964,10 @@ export function createTurnLoop(
 			let pushError: string | null = null;
 			// OTTR-394: the push failed as a rejected non-fast-forward (origin moved).
 			let pushRejected = false;
+			// OTTR-465: git's complete push output for the card log, and a failed origin
+			// re-check ahead of the retry — both reach the card log and the park reason.
+			let pushOutput: string | null = null;
+			let recheckError: string | null = null;
 			// The head a settle parks for a hold: a work-settle hold parks the worktree HEAD, a
 			// merge-hold mismatch park the local target head. A reply approves exactly this head.
 			let holdHead: string | null = null;
@@ -2046,10 +2058,17 @@ export function createTurnLoop(
 						branch,
 						ops,
 					);
-					const p =
+					const runPush = (): Promise<
+						| { status: "skipped" }
+						| { status: "pushed"; output: string }
+						| { status: "failed" | "rejected"; error: string; output?: string }
+					> =>
 						refused !== null
-							? { status: "failed" as const, error: refused }
-							: await ops
+							? Promise.resolve({
+									status: "failed" as const,
+									error: refused,
+								})
+							: ops
 									.serverMergePush(
 										e.path,
 										wt,
@@ -2062,37 +2081,114 @@ export function createTurnLoop(
 										status: "failed" as const,
 										error: errmsg(err),
 									}));
-					if (p.status === "pushed") {
-						log(`- pushed ${target} from the server`);
-						// The agent's own push has no credentials (D6). A merge agent that stopped at
-						// needs_you on that authentication failure did integrate: the server push landed
-						// it, so the report becomes integrated with the push output in details.
-						const o = result.outcome;
-						const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
-						if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
-							result = {
-								...result,
-								asked: null,
-								outcome: {
-									...o,
-									status: "integrated",
-									question: undefined,
-									details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
-								},
-							};
-							log(
-								"- needs_you on a push authentication failure resolved: the server pushed",
-							);
+					let p = await runPush();
+					let authLogged = false;
+					for (let attempt = 1; ; attempt++) {
+						if (p.status === "skipped") break;
+						if (p.status === "pushed") {
+							// A retry that landed erases the earlier failure: the card lands instead
+							// of parking on an error the second push already resolved.
+							pushError = null;
+							pushOutput = null;
+							pushRejected = false;
+							log(`- pushed ${target} from the server`);
+							// The agent's own push has no credentials (D6). A merge agent that stopped at
+							// needs_you on that authentication failure did integrate: the server push landed
+							// it, so the report becomes integrated with the push output in details.
+							const o = result.outcome;
+							const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
+							if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
+								result = {
+									...result,
+									asked: null,
+									outcome: {
+										...o,
+										status: "integrated",
+										question: undefined,
+										details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
+									},
+								};
+								log(
+									"- needs_you on a push authentication failure resolved: the server pushed",
+								);
+							}
+							break;
 						}
-					}
-					if (p.status === "rejected") {
-						pushRejected = true;
+						pushRejected = p.status === "rejected";
 						pushError = p.error;
-						log(`! server push of ${target} rejected: ${p.error}`);
-					}
-					if (p.status === "failed") {
-						pushError = p.error;
-						log(`! server push of ${target} failed: ${p.error}`);
+						pushOutput = p.output ?? null;
+						log(
+							`! server push of ${target} ${pushRejected ? "rejected" : "failed"}: ${p.error}`,
+						);
+						// OTTR-465: the card log keeps git's complete output, so the cause a
+						// permission failure points at (a missing App installation, a token scope)
+						// stays visible, and one line names the credential kinds the push could use.
+						if (pushOutput !== null)
+							log(`git's full push output:\n${pushOutput}`);
+						if (!authLogged) {
+							authLogged = true;
+							const kind =
+								settings.originUrl === null
+									? null
+									: (ops.pushAuthKind?.(settings.originUrl) ?? null);
+							if (kind !== null) log(`- push auth: ${kind}`);
+						}
+						// OTTR-465: a push can fail while origin never moved (a dropped connection,
+						// a token-refresh hiccup): ALAT-60 landed unchanged on a later merge turn.
+						// One retry, when a fetch proves the push should still be a fast-forward —
+						// origin's tip still sits at the base the merge started from, or the local
+						// head is a fast-forward of it. A rejected push (origin moved) takes the
+						// OTTR-394 rebase path below instead.
+						if (
+							pushRejected ||
+							refused !== null ||
+							branch === null ||
+							attempt > 1
+						)
+							break;
+						if (settings.originUrl === null) {
+							log(
+								"! no pinned origin URL; cannot re-check origin's tip before a push retry",
+							);
+							break;
+						}
+						const fetchError = await ops
+							.fetchOriginBranch(e.path, branch, settings.originUrl)
+							.then(() => null)
+							.catch((err: unknown) => errmsg(err));
+						if (fetchError !== null) {
+							// The re-check's own reason (a network error, a token-refresh failure)
+							// rides the park reason; the retry stays off without a proven origin tip.
+							recheckError = fetchError;
+							log(
+								`! origin re-check before a push retry failed: ${fetchError}`,
+							);
+							break;
+						}
+						const originTip = await ops
+							.targetSha(e.path, `refs/remotes/origin/${branch}`)
+							.catch(() => null);
+						const localTip = await ops
+							.targetSha(e.path, `refs/heads/${branch}`)
+							.catch(() => null);
+						const fastForward =
+							originTip !== null &&
+							localTip !== null &&
+							(await ops
+								.targetContains(e.path, originTip, localTip)
+								.catch(() => false));
+						if (!fastForward) {
+							log(
+								"! origin moved or its tip is unreadable; not retrying the push",
+							);
+							break;
+						}
+						const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
+						log(
+							`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
+						);
+						await new Promise<void>((r) => setTimeout(r, waitMs));
+						p = await runPush();
 					}
 				}
 			}
@@ -2195,7 +2291,7 @@ export function createTurnLoop(
 					next = {
 						stage: "merging",
 						state: "needs_you",
-						needsReason: `Server push to origin failed: ${pushError}`,
+						needsReason: `Server push to origin failed: ${pushError}${recheckError === null ? "" : `\norigin re-check failed: ${recheckError}`}`,
 					};
 				}
 			}

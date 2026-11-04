@@ -4552,6 +4552,8 @@ describe("turn ci watch pinning", () => {
 		expect(t.needsReason).toBe(
 			"Server push to origin failed: fatal: [REDACTED] rejected",
 		);
+		// OTTR-465: without a pinned URL no re-check can run, so the retry stays off and says so.
+		expect(logText(store, task.id)).toContain("no pinned origin URL");
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
@@ -4660,6 +4662,151 @@ describe("turn ci watch pinning", () => {
 			"Server push to origin failed: ! [rejected] main -> main (stale info)",
 		);
 		expect(t.pushRetries).toBe(0);
+	});
+
+	test("a failed push retries once when origin did not move, and the card lands", async () => {
+		let pushes = 0;
+		const fetches: string[] = [];
+		const error =
+			"remote: Permission to Skare69/agent-data.git denied to ottr-board\nfatal: unable to access 'https://github.com/Skare69/agent-data.git/': The requested URL returned error: 403\nerror: failed to push some refs to 'https://github.com/Skare69/agent-data.git'";
+		const { store, record, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return pushes === 1
+					? {
+							status: "failed" as const,
+							error,
+							output: `Enumerating objects: 5, done.\n${error}`,
+						}
+					: { status: "pushed" as const, output: "" };
+			},
+			fetchOriginBranch: async (
+				_mainPath: string,
+				branch: string,
+				originUrl: string,
+			) => {
+				fetches.push(`${branch}@${originUrl}`);
+				return null;
+			},
+			// The fetched origin tip still sits at the merge's base, so the local head is a
+			// fast-forward of it: the exact situation ALAT-60 recovered from on a later turn.
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/remotes/origin/main" ? "sha-base" : "sha-head",
+			targetContains: async () => true,
+			pushRetryDelayMs: 0,
+		});
+		store.setSettings({
+			originUrl: "https://github.com/Skare69/agent-data.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("done");
+		expect(t.needsReason).toBeNull();
+		// The rebase-retry budget stays untouched: this retry never queued a turn.
+		expect(t.pushRetries).toBe(0);
+		expect(pushes).toBe(2);
+		expect(fetches).toEqual(["main@https://github.com/Skare69/agent-data.git"]);
+		const text = logText(store, task.id);
+		expect(text).toContain(
+			"remote: Permission to Skare69/agent-data.git denied to ottr-board",
+		);
+		expect(text).toContain("Enumerating objects: 5, done.");
+		expect(text).toContain("retrying the server push once");
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("two failed pushes park with every reason line, the full output and the push auth", async () => {
+		let pushes = 0;
+		const error =
+			"remote: Permission to Skare69/agent-data.git denied to ottr-board\nerror: failed to push some refs to 'https://github.com/Skare69/agent-data.git'";
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return {
+					status: "failed" as const,
+					error,
+					output: `Enumerating objects: 3, done.\n${error}`,
+				};
+			},
+			fetchOriginBranch: async () => null,
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/remotes/origin/main" ? "sha-base" : "sha-head",
+			targetContains: async () => true,
+			pushRetryDelayMs: 0,
+			pushAuthKind: (url: string) =>
+				url === "https://github.com/Skare69/agent-data.git"
+					? "a board-stored token for github.com (personal access token)"
+					: null,
+		});
+		store.setSettings({
+			originUrl: "https://github.com/Skare69/agent-data.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(`Server push to origin failed: ${error}`);
+		expect(pushes).toBe(2);
+		const text = logText(store, task.id);
+		expect(text).toContain(
+			"remote: Permission to Skare69/agent-data.git denied to ottr-board",
+		);
+		expect(text).toContain("Enumerating objects: 3, done.");
+		expect(text).toContain(
+			"push auth: a board-stored token for github.com (personal access token)",
+		);
+	});
+
+	test("a failed origin re-check parks with its own reason and no retry", async () => {
+		let pushes = 0;
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return { status: "failed" as const, error: "fatal: denied" };
+			},
+			fetchOriginBranch: async () => {
+				throw new Error("ssh: token refresh failed");
+			},
+			pushRetryDelayMs: 0,
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(
+			"Server push to origin failed: fatal: denied\norigin re-check failed: ssh: token refresh failed",
+		);
+		expect(pushes).toBe(1);
+	});
+
+	test("origin moved: the failed push does not retry", async () => {
+		let pushes = 0;
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return { status: "failed" as const, error: "fatal: denied" };
+			},
+			fetchOriginBranch: async () => null,
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/remotes/origin/main" ? "sha-moved" : "sha-head",
+			targetContains: async () => false,
+			pushRetryDelayMs: 0,
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe("Server push to origin failed: fatal: denied");
+		expect(pushes).toBe(1);
+		expect(logText(store, task.id)).toContain("not retrying the push");
 	});
 });
 

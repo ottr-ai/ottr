@@ -64,6 +64,7 @@ import {
 	parseGitToken,
 	parseGitUrl,
 	promoteKey,
+	pushAuthKind,
 	readAmbientHelpers,
 	realKeyscan,
 	redact,
@@ -6173,6 +6174,17 @@ export function createApp(deps: AppDeps) {
 		publishSoon,
 		notifyLog,
 		drained: () => Date.now() < drainUntil,
+		// OTTR-465: the credential kinds the server's git can use for a push to a URL, for the
+		// card log; never a value. A missing App installation on a repo shows as a permission
+		// failure, and this line is what names the installation token the push went out with.
+		pushAuthKind: (url: string): string | null =>
+			pushAuthKind(url, {
+				tokens: gitTokens,
+				ambientHelpers,
+				key: existsSync(sshPaths(sshDir).global),
+				envToken: process.env.GH_TOKEN ?? null,
+				githubHost: githubHost().host,
+			}),
 		socketCount: () => sockets,
 		sampleStats,
 		alateProvisionTick,

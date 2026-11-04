@@ -49,6 +49,7 @@ import {
 	quarantineUntracked,
 	redact,
 	redactingWriter,
+	redactUrlCredentials,
 	remoteUrl,
 	removeWorktree,
 	resetBranchTo,
@@ -154,6 +155,27 @@ describe("git output redaction lifetime", () => {
 		);
 		expect(r.stderr).not.toContain(secret);
 		expect(r.stderr).toContain("[REDACTED]");
+	});
+});
+
+describe("redactUrlCredentials", () => {
+	test("URL userinfo becomes [REDACTED]; hosts without userinfo stay", () => {
+		expect(
+			redactUrlCredentials(
+				"fatal: unable to access 'https://user:tok@github.com/o/r.git/': The requested URL returned error: 403",
+			),
+		).toBe(
+			"fatal: unable to access 'https://[REDACTED]@github.com/o/r.git/': The requested URL returned error: 403",
+		);
+		expect(
+			redactUrlCredentials(
+				"error: failed to push some refs to 'https://github.com/o/r.git'",
+			),
+		).toBe("error: failed to push some refs to 'https://github.com/o/r.git'");
+		// A username is userinfo too: redacting it cannot leak, so the safe side wins.
+		expect(redactUrlCredentials("ssh://git@host.example/o/r.git")).toBe(
+			"ssh://[REDACTED]@host.example/o/r.git",
+		);
 	});
 });
 
@@ -295,10 +317,14 @@ describe("serverMergePush", () => {
 				null,
 				f.bare,
 			);
-			if (r.status === "rejected")
-				// git's last stderr line is the fast-forward hint — the text OTTR-391 parked on.
-				expect(r.error).toContain("Note about fast-forwards");
-			else throw new Error(`expected a rejected push, got ${r.status}`);
+			if (r.status === "rejected") {
+				// OTTR-465: needsReason keeps the reason lines; the fast-forward hint lives in
+				// the full output the card log keeps.
+				expect(r.error).toContain("! [rejected]");
+				expect(r.error).toContain("(fetch first)");
+				expect(r.error).toContain("failed to push some refs");
+				expect(r.output).toContain("Note about fast-forwards");
+			} else throw new Error(`expected a rejected push, got ${r.status}`);
 			// The board fetches origin with its own credentials; the tracking ref catches up,
 			// so the queued rebase turn rebases onto the moved tip.
 			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
@@ -415,6 +441,40 @@ describe("serverMergePush", () => {
 			);
 			expect(r.status).toBe("failed");
 			expect("error" in r && r.error.length > 0).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed push keeps every reason line and git's full output", async () => {
+		const f = fixture();
+		try {
+			// A pre-receive hook stands in for the remote's refusal: its stderr reaches the
+			// client as "remote:" lines, and git adds the rejected line and the error line.
+			writeFileSync(
+				join(f.bare, "hooks", "pre-receive"),
+				"#!/bin/sh\necho 'remote: Permission to Skare69/agent-data.git denied to ottr-board.'\necho 'remote: no App installation covers this repo.'\nexit 1\n",
+				{ mode: 0o755 },
+			);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			if (r.status !== "failed")
+				throw new Error(`expected a failed push, got ${r.status}`);
+			expect(r.error).toContain(
+				"remote: Permission to Skare69/agent-data.git denied to ottr-board.",
+			);
+			expect(r.error).toContain("error: failed to push some refs");
+			expect(r.error).not.toContain("hint:");
+			expect(r.output).toContain(
+				"remote: no App installation covers this repo.",
+			);
+			expect(r.output).toContain("error: failed to push some refs");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
