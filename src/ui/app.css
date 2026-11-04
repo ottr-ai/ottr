@@ -1500,75 +1500,17 @@ button.notif-link {
 	width: 13px;
 	height: 13px;
 }
-/* The label reads as a divider: a clear step below Overview with a hairline and the legend toggle,
-   so it never passes for a row. The narrow-viewport block later in this file hides it. */
+/* "Projects" in sentence case at the rows' dim colour, no rule: the 10px gap above divides. */
 .areas-label {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	margin: 18px 10px 4px;
-	font-size: 12.5px;
+	margin: 10px 6px 2px;
+	font-size: 12px;
 	color: var(--dim);
 }
-.areas-rule {
-	flex: 1;
-	height: 1px;
-	background: var(--line-soft);
-}
-/* Ghost icon button; overrides the base 32px bordered control. */
-.areas-help {
-	min-height: 0;
-	padding: 0;
-	width: 18px;
-	height: 18px;
-	color: var(--dim);
-	background: transparent;
-	border: none;
-	border-radius: 50%;
-}
-.areas-help:hover,
-.areas-help[aria-expanded="true"] {
-	color: var(--text);
-	background: transparent;
-}
-/* Badge legend behind the (?) toggle: the row marks mean running / needs action / asked /
-   waiting, and a mark without a visible label is a guess (touch screens have no hover). */
-.areas-legend {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 2px 12px;
-	margin: 0 10px 6px;
-	font-size: 12.5px;
-	color: var(--dim);
-}
-.areas-legend span {
-	display: inline-flex;
-	align-items: center;
-	gap: 4px;
-}
-.areas-legend .mark {
-	width: 9px;
-	height: 9px;
-}
+/* Add project is a row like the links around it: left-aligned, bare until hover. */
 .area-add {
 	justify-content: flex-start;
 	width: 100%;
-	margin-top: 8px;
-	color: var(--text);
 	background: transparent;
-	border-style: dashed;
-}
-.area-add:hover {
-	border-style: solid;
-}
-.menu-foot {
-	display: flex;
-	gap: 8px;
-	align-items: baseline;
-	justify-content: center;
-	margin-top: auto;
-	padding: 10px;
-	font-size: 12.5px;
 }
 .menu-brand {
 	font-weight: 700;
@@ -1609,25 +1551,30 @@ button.notif-link {
 .rail > :not(a, button) {
 	cursor: auto;
 }
-/* Rows stay bare until hover; the open page is a raised button: fill plus border. */
-.rail .area {
+/* Rows stay bare until hover; the open page is a raised button: fill plus border. The phone
+   popout lists the same rows, so these row rules match there too. */
+:is(.rail, .areas-pop) .area {
 	gap: 10px;
 	min-height: 40px;
 	padding: 0 6px;
 }
-/* Add project sits right under Overview, as a second top row. */
-.rail .area-add {
-	margin-top: 0;
-}
 /* Rail rows (projects, Overview, Add project, the account) hover with a fill and an outline;
    the open page keeps the outline at rest. */
-.rail .area:hover {
+:is(.rail, .areas-pop) .area:hover {
 	background: var(--card-hover);
 	border-color: var(--line-hover);
 }
-.rail .area[aria-current="page"] {
+:is(.rail, .areas-pop) .area[aria-current="page"] {
 	background: var(--card);
 	border-color: var(--line-hover);
+}
+/* The popout stacks its rows like the rail; only an open popover gets the flex box, so the
+   closed one stays hidden. */
+.areas-pop:popover-open {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 8px 8px 6px;
 }
 .rail-plate {
 	position: relative;
@@ -1647,7 +1594,7 @@ button.notif-link {
 /* The row highlight is the only marker an area needs: its icon shows bare, so a
    transparent project icon sits straight on the row and the monogram loses its
    plate here (the header and the New task dialog keep it). */
-.rail .area .ptag {
+:is(.rail, .areas-pop) .area .ptag {
 	background: none;
 	border-color: transparent;
 }
@@ -1665,14 +1612,9 @@ button.notif-link {
 	width: 9px;
 	height: 9px;
 }
-/* "Projects" in sentence case at the rows' dim colour, no rule: the 10px gap above divides. */
-.rail .areas-label {
-	margin: 10px 6px 2px;
-	font-size: 12px;
-}
 /* Two rows: the centered "Ottr <version>" line, then the account chip (with its name).
    Collapsed, the version and chip stack in one centered column. Settings lives in the
-   account menu. */
+   account menu. The phone popout has only the ident line: the bar carries its account chip. */
 .rail-foot {
 	display: flex;
 	flex-wrap: wrap;

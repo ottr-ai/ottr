@@ -149,7 +149,6 @@ import {
 	navClick,
 	projectPath,
 	readPath,
-	SETTINGS_HASH,
 	settingsPath,
 	settingsSub,
 	taskPath,
@@ -8655,171 +8654,128 @@ function railRow(p: ProjectView, tasks: TaskCard[]) {
 	return { p, running, needs, asks, waiting, top, summary };
 }
 
-/** Project links with live indicators; the desktop rail renders it, and on phones the areas popout reuses it. */
-function AreasNav({
+/** The project rail's rows: Overview, Add project, one link per project with its one ranked
+ * mark, and the "Ottr <version>" footer line. The desktop rail renders it, and the phone
+ * popout under the bar's grid button reuses it (always expanded there). */
+function RailRows({
 	projects,
 	tasks,
 	project,
-	view,
+	overviewCurrent,
+	version,
+	collapsed,
 	navigate,
 	onAdd,
+	onPick,
+	children,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	project: ProjectView | null;
-	view: string;
+	/** Overview is the open page (no project and no settings page). */
+	overviewCurrent: boolean;
+	version: string | null;
+	/** Folded desktop rail: the rows show only their plates, so each one gets a title tooltip. */
+	collapsed: boolean;
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 	onAdd: () => void;
+	/** Runs after any row click; the phone popout closes itself here. */
+	onPick?: () => void;
+	/** More footer content after the ident line (the desktop account chip). */
+	children?: ReactNode;
 }) {
-	// Closes the phone popout on selection; in the desktop rail the popover is already shut (no-op).
-	const closePop = (): void =>
-		document.getElementById("areas-pop")?.hidePopover();
-	const [legendOpen, setLegendOpen] = useState(false);
+	const go = (e: ReactMouseEvent<HTMLAnchorElement>): void => {
+		navClick(e, navigate);
+		onPick?.();
+	};
 	return (
 		<>
 			<a
 				className="area"
-				aria-current={
-					project === null && !settingsSub(view).onSettings ? "page" : undefined
-				}
+				aria-current={overviewCurrent ? "page" : undefined}
 				href="/"
-				onClick={(e) => {
-					navClick(e, navigate);
-					closePop();
+				onClick={go}
+				title={collapsed ? "Overview" : undefined}
+			>
+				<span className="rail-plate icon">
+					<Icon name="grid" size={13} />
+				</span>
+				<span className="area-name rail-label">Overview</span>
+			</a>
+			<button
+				type="button"
+				className="area area-add"
+				aria-label="Add project"
+				title={collapsed ? "Add project" : undefined}
+				onClick={() => {
+					onPick?.();
+					onAdd();
 				}}
 			>
-				<Icon name="grid" />
-				<span className="area-name">Overview</span>
-			</a>
-			<a
-				className="area"
-				href={settingsPath(null)}
-				aria-current={
-					view === SETTINGS_HASH || view.startsWith(`${SETTINGS_HASH}/`)
-						? "page"
-						: undefined
-				}
-				onClick={(e) => {
-					navClick(e, navigate);
-					closePop();
-				}}
-			>
-				<Icon name="gear" />
-				<span className="area-name">Settings</span>
-			</a>
-			<p className="areas-label">
-				PROJECTS
-				<span className="areas-rule" aria-hidden="true" />
-				<button
-					type="button"
-					className="areas-help"
-					aria-expanded={legendOpen}
-					aria-controls="areas-legend"
-					title="What the task marks mean"
-					onClick={() => setLegendOpen((open) => !open)}
-				>
-					<Icon name="help" size={13} />
-				</button>
-			</p>
-			{/* The marks carry meaning, so the legend stays one click away (NN/g: tooltips must
-			    not carry information vital to the task) — click, not hover, so touch works too. */}
-			{legendOpen && (
-				<p className="areas-legend" id="areas-legend">
-					<span>
-						<Mark kind="running" /> running
-					</span>
-					<span>
-						<Mark kind="needs" /> needs action
-					</span>
-					<span>
-						<Mark kind="asked" /> asked
-					</span>
-					<span>
-						<Mark kind="queued" /> waiting
-					</span>
-				</p>
-			)}
+				<span className="rail-plate icon">
+					<Icon name="plus" size={13} />
+				</span>
+				<span className="rail-label">Add project</span>
+			</button>
+			<p className="areas-label">Projects</p>
 			<ul>
 				{projects.map((p) => {
-					const own = tasks.filter((t) => t.project === p.name);
-					const split = splitAlarms(own);
-					const needs = split.needs.length;
-					const asks = split.asks.length;
-					const running = split.running.length;
-					// StateResponse.tasks carries cancelled cards too, but a cancel leaves the
-					// row state "idle": none of the splits below (needs_you, running, queued)
-					// counts one. Queued and running/preparing are exclusive states, so no card
-					// counts in two badges; Merging cards appear in none (the Merging lane and
-					// Agents meter cover them).
-					const waiting = own.filter((t) => t.state === "queued").length;
+					const r = railRow(p, tasks);
 					return (
 						<li key={p.name}>
 							<a
 								className="area"
 								href={projectPath(p.name)}
 								aria-current={project?.name === p.name ? "page" : undefined}
-								onClick={(e) => {
-									navClick(e, navigate);
-									closePop();
-								}}
+								onClick={go}
+								title={
+									collapsed
+										? `${projectLabel(p)}${r.summary === "" ? "" : `: ${r.summary}`}`
+										: undefined
+								}
 							>
-								<ProjectTag project={p} />
-								<span className="area-name">{projectLabel(p)}</span>
-								{running > 0 && (
-									<span className="area-ind">
-										<Mark kind="running" />
-										{running}
-										<span className="sr"> running</span>
+								<span className="rail-plate">
+									<ProjectTag project={p} />
+									{r.top !== null && (
+										<span className="rail-badge">
+											<Mark kind={r.top} />
+										</span>
+									)}
+								</span>
+								<span className="area-name rail-label">{projectLabel(p)}</span>
+								{/* One mark, the highest ranked; the full counts sit in the title and
+								    for screen readers. */}
+								{r.top !== null && (
+									<span className={`area-ind ${r.top}`} title={r.summary}>
+										<Mark kind={r.top} />
 									</span>
 								)}
-								{needs > 0 && (
-									<span className="area-ind needs">
-										<Mark kind="needs" />
-										{needs}
-										<span className="sr"> need action</span>
-									</span>
-								)}
-								{asks > 0 && (
-									<span className="area-ind asked">
-										<Mark kind="asked" />
-										{asks}
-										<span className="sr"> asked</span>
-									</span>
-								)}
-								{waiting > 0 && (
-									<span className="area-ind waiting">
-										<Mark kind="queued" />
-										{waiting}
-										<span className="sr"> waiting</span>
-									</span>
-								)}
+								{r.summary !== "" && <span className="sr">: {r.summary}</span>}
 							</a>
 						</li>
 					);
 				})}
 			</ul>
-			<button
-				type="button"
-				className="area-add"
-				onClick={() => {
-					closePop();
-					onAdd();
-				}}
-			>
-				<Icon name="plus" />
-				Add project
-			</button>
-			<footer className="menu-foot">
-				<a
-					className="menu-brand"
-					href={REPO}
-					target="_blank"
-					rel="noopener noreferrer"
-					title="Ottr on GitHub"
-				>
-					Ottr
-				</a>
+			<footer className="rail-foot">
+				<p className="rail-ident">
+					<a
+						className="menu-brand"
+						href={REPO}
+						target="_blank"
+						rel="noopener noreferrer"
+						title="Ottr on GitHub"
+						onClick={onPick}
+					>
+						Ottr
+					</a>
+					{version !== null && (
+						<span className="rail-ver" title={version}>
+							{version}
+						</span>
+					)}
+				</p>
+				{children}
 			</footer>
 		</>
 	);
@@ -9342,7 +9298,7 @@ function App() {
 	// the global cap (SystemBar shows the same count in the app bar).
 	const slotsAll = slotUse(tasks);
 	const usedTotal = SLOT_STAGES.reduce((n, s) => n + slotsAll[s], 0);
-	// One split for the bell, the popover groups and the counts (shared with AreasNav/Overview).
+	// One split for the bell, the popover groups and the counts (shared with the rail rows/Overview).
 	const { needs: needTasks, asks: askCards } = splitAlarms(tasks);
 	const alarmLine = alarmLabel(needTasks.length, askCards.length);
 	const alarmCount = needTasks.length + askCards.length;
@@ -9744,13 +9700,16 @@ function App() {
 					popover="auto"
 					className="popover notif-pop areas-pop"
 				>
-					<AreasNav
+					<RailRows
 						projects={projects}
 						tasks={tasks}
 						project={project}
-						view={view}
+						overviewCurrent={project === null && !settingsRoute.onSettings}
+						version={bootVersion}
+						collapsed={false}
 						navigate={navigate}
 						onAdd={() => setShowAdd(true)}
+						onPick={() => document.getElementById("areas-pop")?.hidePopover()}
 					/>
 				</div>
 				<button
@@ -9968,92 +9927,16 @@ function App() {
 						if (e.target === e.currentTarget) toggleRail();
 					}}
 				>
-					<a
-						className="area"
-						aria-current={
-							project === null && !settingsRoute.onSettings ? "page" : undefined
-						}
-						href="/"
-						onClick={(e) => navClick(e, navigate)}
-						title={railCollapsed ? "Overview" : undefined}
+					<RailRows
+						projects={projects}
+						tasks={tasks}
+						project={project}
+						overviewCurrent={project === null && !settingsRoute.onSettings}
+						version={bootVersion}
+						collapsed={railCollapsed}
+						navigate={navigate}
+						onAdd={() => setShowAdd(true)}
 					>
-						<span className="rail-plate icon">
-							<Icon name="grid" size={13} />
-						</span>
-						<span className="area-name rail-label">Overview</span>
-					</a>
-					<button
-						type="button"
-						className="area area-add"
-						aria-label="Add project"
-						title={railCollapsed ? "Add project" : undefined}
-						onClick={() => setShowAdd(true)}
-					>
-						<span className="rail-plate icon">
-							<Icon name="plus" size={13} />
-						</span>
-						<span className="rail-label">Add project</span>
-					</button>
-					<p className="areas-label">Projects</p>
-					<ul>
-						{projects.map((p) => {
-							const r = railRow(p, tasks);
-							return (
-								<li key={p.name}>
-									<a
-										className="area"
-										href={projectPath(p.name)}
-										aria-current={project?.name === p.name ? "page" : undefined}
-										onClick={(e) => navClick(e, navigate)}
-										title={
-											railCollapsed
-												? `${projectLabel(p)}${r.summary === "" ? "" : `: ${r.summary}`}`
-												: undefined
-										}
-									>
-										<span className="rail-plate">
-											<ProjectTag project={p} />
-											{r.top !== null && (
-												<span className="rail-badge">
-													<Mark kind={r.top} />
-												</span>
-											)}
-										</span>
-										<span className="area-name rail-label">
-											{projectLabel(p)}
-										</span>
-										{/* One mark, the highest ranked; the full counts sit in the title and
-										    for screen readers. */}
-										{r.top !== null && (
-											<span className={`area-ind ${r.top}`} title={r.summary}>
-												<Mark kind={r.top} />
-											</span>
-										)}
-										{r.summary !== "" && (
-											<span className="sr">: {r.summary}</span>
-										)}
-									</a>
-								</li>
-							);
-						})}
-					</ul>
-					<footer className="rail-foot">
-						<p className="rail-ident">
-							<a
-								className="menu-brand"
-								href={REPO}
-								target="_blank"
-								rel="noopener noreferrer"
-								title="Ottr on GitHub"
-							>
-								Ottr
-							</a>
-							{bootVersion !== null && (
-								<span className="rail-ver" title={bootVersion}>
-									{bootVersion}
-								</span>
-							)}
-						</p>
 						{/* ponytail: placeholder account chip; swap in the user's avatar and name when
 				    		    Ottr gets user accounts. */}
 						<button
@@ -10071,7 +9954,7 @@ function App() {
 								<Icon name="chevron-right" size={12} />
 							</span>
 						</button>
-					</footer>
+					</RailRows>
 				</nav>
 				<div id="user-menu" popover="auto" className="user-menu">
 					<p className="menu-who">
