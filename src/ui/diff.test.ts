@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	diffLineClass,
 	diffLinkParts,
+	lineDiff,
 	numberDiffLines,
 	pickDiffSections,
 	splitDiffSections,
@@ -405,5 +406,57 @@ describe("diffLinkParts", () => {
 			{ kind: "link", label: "docs/a.md b.md", files: ["docs/a.md b.md"] },
 			{ kind: "text", text: " now" },
 		]);
+	});
+});
+
+describe("lineDiff", () => {
+	const kinds = (rows: ReturnType<typeof lineDiff>) =>
+		rows.map((r) => `${r.kind}:${r.text}`);
+	test("identical text is all same", () => {
+		expect(kinds(lineDiff("a\nb", "a\nb"))).toEqual(["same:a", "same:b"]);
+	});
+	test("a pure addition keeps the old lines and adds the new one", () => {
+		expect(kinds(lineDiff("a\nb", "a\nb\nc"))).toEqual([
+			"same:a",
+			"same:b",
+			"add:c",
+		]);
+	});
+	test("a pure removal marks the gone line as del", () => {
+		expect(kinds(lineDiff("a\nb\nc", "a\nc"))).toEqual([
+			"same:a",
+			"del:b",
+			"same:c",
+		]);
+	});
+	test("a mixed edit aligns the kept lines around the change", () => {
+		expect(kinds(lineDiff("x\nkeep\ny", "x\nkept\ny\nz"))).toEqual([
+			"same:x",
+			"del:keep",
+			"add:kept",
+			"same:y",
+			"add:z",
+		]);
+	});
+	test("an empty old side is one add per new line; an empty new side is one del per old line", () => {
+		expect(kinds(lineDiff("", "a\nb"))).toEqual(["add:a", "add:b"]);
+		expect(kinds(lineDiff("a\nb", ""))).toEqual(["del:a", "del:b"]);
+	});
+	test("beyond 2000 lines both sides come back whole, old as del and new as add", () => {
+		const old = Array.from({ length: 2001 }, (_, i) => `o${i}`).join("\n");
+		const neu = Array.from({ length: 2001 }, (_, i) => `n${i}`).join("\n");
+		const rows = lineDiff(old, neu);
+		expect(rows).toHaveLength(4002);
+		expect(
+			rows.every((r, i) => (i < 2001 ? r.kind === "del" : r.kind === "add")),
+		).toBe(true);
+		expect(rows[0]).toEqual({ kind: "del", text: "o0" });
+		expect(rows[2001]).toEqual({ kind: "add", text: "n0" });
+	});
+	test("exactly 2000 lines still aligns", () => {
+		const a = Array.from({ length: 2000 }, (_, i) => `${i}`).join("\n");
+		const rows = lineDiff(a, a);
+		expect(rows).toHaveLength(2000);
+		expect(rows.every((r) => r.kind === "same")).toBe(true);
 	});
 });

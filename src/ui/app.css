@@ -3774,6 +3774,43 @@ dialog.diff-view {
 .dl-text {
 	padding-right: 14px;
 }
+/* Deepen: the button row under the composer textarea, the review block, and its scrollable diff. */
+.deepen-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+.deepen-hint {
+	font-size: 12px;
+	color: var(--dim);
+}
+.deepen-review {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.deepen-diff {
+	overflow: auto;
+	max-height: 240px;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.5;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	padding: 4px 0;
+}
+.deepen-diff div {
+	display: grid;
+	grid-template-columns: 1.5em 1fr;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.deepen-glyph {
+	text-align: center;
+	user-select: none;
+	color: var(--dim);
+}
 .dl-add {
 	color: var(--diff-add);
 	background: var(--diff-add-bg);

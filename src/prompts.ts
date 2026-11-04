@@ -176,6 +176,20 @@ When the idea is refined, call report_outcome with status "ready". Put the compl
 The tracker parks this card in backlog after your report; it never merges anything from this session.`;
 }
 
+/** The task composer's opt-in Deepen rewrite contract: the model rewrites the draft into a
+ * deeper version and answers with only the rewritten text. Additive export; existing prompt
+ * wording stays untouched (AGENTS.md hard stop 3). */
+export const deepenSystem: string = `Rewrite the user's task prompt into a deeper version.
+Answer with only the rewritten prompt text: no preamble, no quotes, no markdown fences, no commentary.
+Keep the user's intent and their words where they carry meaning.
+Add what a top professional would bring: the goal behind the task (altitude), the expert method, the raw material they would start from, the tools and methods they would use, and an outside check (a test, a command, a number, or another observable result that shows the work is right).
+The rewrite is a deeper version, never a bigger one: no features, tasks, or requirements the user did not ask for; no invented details. Keep the length close to the original; cut filler. Write in the language of the original.`;
+
+/** The Deepen user message that carries the draft. */
+export function deepenPrompt(text: string): string {
+	return `Rewrite this task prompt:\n\n${text}`;
+}
+
 /** The review both buttons start: Review runs it alone, Create release runs it before the publish.
  * Read-only at the frozen sha; each finding is recorded with propose_task (a rank, plus a confirmed
  * security severity), then Ottr checks the best ones with a second model and files the kept ones as

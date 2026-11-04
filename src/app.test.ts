@@ -233,6 +233,11 @@ const loopStubs = () => ({
 	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
 	claimedPids: () => new Set<number>(),
 });
+// Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
+let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
+	async () => {
+		throw new Error("deepen not stubbed");
+	};
 const app = createApp({
 	gstore,
 	defaultDir: root,
@@ -242,6 +247,7 @@ const app = createApp({
 	workersHome: root,
 	projects,
 	...loopStubs(),
+	deepen: (prompt, model) => deepenImpl(prompt, model),
 	schedule: () => {
 		calls++;
 	},
@@ -7053,6 +7059,84 @@ describe("backlog routes", () => {
 		const r2 = await post(`/api/projects/p1/tasks/${busy.id}/grill`, {});
 		expect(r2.status).toBe(409);
 		expect(await errorOf(r2)).toBe("the grill is already queued or running");
+	});
+
+	test("deepen returns the rewrite through the seam", async () => {
+		const seen: Array<{ prompt: string; model: string | null }> = [];
+		const prev = deepenImpl;
+		deepenImpl = async (prompt, model) => {
+			seen.push({ prompt, model });
+			return "  deeper draft  ";
+		};
+		try {
+			const res = await post("/api/projects/p1/deepen", {
+				prompt: "  my draft  ",
+				model: "openai/gpt-5",
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ deepened: "  deeper draft  " });
+			// The seam sees the trimmed prompt and the model passthrough.
+			expect(seen).toEqual([{ prompt: "my draft", model: "openai/gpt-5" }]);
+			const noModel = await post("/api/projects/p1/deepen", {
+				prompt: "my draft",
+			});
+			expect(noModel.status).toBe(200);
+			expect(seen[1]).toEqual({ prompt: "my draft", model: null });
+		} finally {
+			deepenImpl = prev;
+		}
+	});
+
+	test("deepen validates the prompt and the model", async () => {
+		const nonString = await post("/api/projects/p1/deepen", { prompt: 7 });
+		expect(nonString.status).toBe(400);
+		expect(await errorOf(nonString)).toBe("prompt must be a string");
+		const empty = await post("/api/projects/p1/deepen", { prompt: "   " });
+		expect(empty.status).toBe(400);
+		expect(await errorOf(empty)).toBe("prompt must be 1-20000 characters");
+		const long = await post("/api/projects/p1/deepen", {
+			prompt: "x".repeat(20001),
+		});
+		expect(long.status).toBe(400);
+		expect(await errorOf(long)).toBe("prompt must be 1-20000 characters");
+		const badModel = await post("/api/projects/p1/deepen", {
+			prompt: "x",
+			model: 42,
+		});
+		expect(badModel.status).toBe(400);
+		expect(await errorOf(badModel)).toBe("model must be a string");
+		const unknown = await post("/api/projects/ghost/deepen", {
+			prompt: "x",
+		});
+		expect(unknown.status).toBe(404);
+		expect(await errorOf(unknown)).toBe("unknown project");
+	});
+
+	test("deepen maps a throwing seam to 502 and keeps the draft's side effect-free path", async () => {
+		const prev = deepenImpl;
+		deepenImpl = async () => {
+			throw new Error("gateway exploded");
+		};
+		try {
+			const res = await post("/api/projects/p1/deepen", { prompt: "x" });
+			expect(res.status).toBe(502);
+			expect(await errorOf(res)).toBe(
+				"the model call failed: gateway exploded",
+			);
+		} finally {
+			deepenImpl = prev;
+		}
+		const prev2 = deepenImpl;
+		deepenImpl = async () => {
+			throw "not an error";
+		};
+		try {
+			const res = await post("/api/projects/p1/deepen", { prompt: "x" });
+			expect(res.status).toBe(502);
+			expect(await errorOf(res)).toBe("the model call failed: unknown error");
+		} finally {
+			deepenImpl = prev2;
+		}
 	});
 
 	test("backlog to-todo folds the latest grill report into the prompt", async () => {

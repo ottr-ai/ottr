@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
 	ARCH_REVIEW_MARKER,
+	deepenPrompt,
+	deepenSystem,
 	grillPrompt,
 	handoffMarkdown,
 	isProposalReason,
@@ -713,5 +715,39 @@ describe("handoffMarkdown research report", () => {
 				sessionsDir: "/s",
 			}),
 		).not.toContain("## Research report");
+	});
+});
+
+describe("deepen prompt contract", () => {
+	test("the system prompt holds the rewrite contract", () => {
+		expect(deepenSystem).toContain(
+			"Rewrite the user's task prompt into a deeper version",
+		);
+		expect(deepenSystem).toContain(
+			"only the rewritten prompt text: no preamble, no quotes, no markdown fences, no commentary",
+		);
+		expect(deepenSystem).toContain(
+			"Keep the user's intent and their words where they carry meaning",
+		);
+		for (const part of [
+			"the goal behind the task (altitude)",
+			"the expert method",
+			"the raw material they would start from",
+			"the tools and methods they would use",
+			"an outside check",
+		]) {
+			expect(deepenSystem).toContain(part);
+		}
+		expect(deepenSystem).toContain(
+			"The rewrite is a deeper version, never a bigger one",
+		);
+		expect(deepenSystem).toContain("no invented details");
+		expect(deepenSystem).toContain("Write in the language of the original");
+	});
+
+	test("the user message carries the draft", () => {
+		expect(deepenPrompt("my draft")).toBe(
+			"Rewrite this task prompt:\n\nmy draft",
+		);
 	});
 });

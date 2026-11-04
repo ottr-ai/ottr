@@ -43,6 +43,7 @@ import {
 } from "./auth.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
+import { deepenDraft } from "./deepen.ts";
 import { errmsg } from "./errmsg.ts";
 import {
 	createForkWatcher,
@@ -306,6 +307,8 @@ interface AppDeps {
 	gstore: GlobalStore;
 	/** gh CLI seam; defaults to runGh. Tests inject a stub for the /github route. */
 	gh?: GhFn;
+	/** Deepen seam for the composer route; defaults to deepenDraft (one gateway call). Tests inject a stub so no spawn happens. */
+	deepen?: (prompt: string, model: string | null) => Promise<string>;
 	/** Server-side projects root (compose: /workspace via OMP_TRACKER_ROOTS[0]); Add project clones/creates under it. */
 	defaultDir: string;
 	projects: Map<string, Entry>;
@@ -4832,6 +4835,40 @@ export function createApp(deps: AppDeps) {
 						);
 					deps.schedule();
 					return json({ ok: true });
+				}),
+		},
+		// The composer's opt-in Deepen: a model rewrites the draft; the user accepts before anything runs.
+		"/api/projects/:project/deepen": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					const prompt = r.body.prompt;
+					if (typeof prompt !== "string")
+						return json({ error: "prompt must be a string" }, 400);
+					const trimmed = prompt.trim();
+					if (!trimmed || trimmed.length > 20000)
+						return json({ error: "prompt must be 1-20000 characters" }, 400);
+					const model = modelParam(r.body);
+					if (model instanceof Response) return model;
+					try {
+						const deepened = await (
+							deps.deepen ?? ((prompt, model) => deepenDraft({ prompt, model }))
+						)(trimmed, model);
+						return json({ deepened });
+					} catch (err) {
+						logError("deepen", err);
+						return json(
+							{
+								error: `the model call failed: ${
+									err instanceof Error ? err.message : "unknown error"
+								}`,
+							},
+							502,
+						);
+					}
 				}),
 		},
 		"/api/projects/:project/tasks": {

@@ -49,6 +49,8 @@ const {
 	LogView,
 	ProjectBoard,
 	SEARCH_APPLY_MS,
+	ComposeDialog,
+	DeepenReview,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -3134,5 +3136,78 @@ describe("ProjectBoard search delay", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+/** Minimal ComposeDialog props: the copy the three callers pin, with a no-op send and act. */
+const compose = (extra?: Partial<Parameters<typeof ComposeDialog>[0]>) => ({
+	open: true,
+	onClose: () => {},
+	act: () => Promise.resolve(true),
+	draftKey: "test:new",
+	label: "New task for demo",
+	heading: "New task",
+	sub: null,
+	inputLabel: "What should the agent do?",
+	placeholder: "Describe the task",
+	hint: "hint",
+	icon: "plus" as const,
+	submitLabel: "Add task",
+	send: () => Promise.resolve(),
+	...extra,
+});
+
+describe("ComposeDialog deepen", () => {
+	test("a deepen-enabled composer shows the Help badge, the Deepen button and its hint; both buttons start disabled on an empty draft", () => {
+		const html = renderToStaticMarkup(
+			<ComposeDialog
+				{...compose({
+					deepen: () => Promise.resolve({ deepened: "x" }),
+				})}
+			/>,
+		);
+		expect(html).toContain('aria-label="About Deepen"');
+		expect(html).toContain("Deepen");
+		expect(html).toContain("deepen-row");
+		expect(html).toContain("deepen-hint");
+		// Empty draft: Deepen and the submit button are both disabled in the markup.
+		expect(html).toContain('class="deepen-btn" disabled=""');
+		expect(html).toContain('type="submit" class="primary" disabled=""');
+		expect(html).not.toContain("Use rewrite");
+	});
+	test("without the deepen prop no badge and no Deepen button render, and the submit button is untouched", () => {
+		const html = renderToStaticMarkup(<ComposeDialog {...compose()} />);
+		expect(html).not.toContain('aria-label="About Deepen"');
+		expect(html).not.toContain("deepen-btn");
+		expect(html).toContain('type="submit"');
+	});
+});
+
+describe("DeepenReview", () => {
+	const review = (original: string, deepened: string) =>
+		renderToStaticMarkup(
+			<DeepenReview
+				original={original}
+				deepened={deepened}
+				onUse={() => {}}
+				onDiscard={() => {}}
+			/>,
+		);
+	test("a mixed rewrite renders add and del rows, each with its +/- glyph", () => {
+		const html = review("keep\nold", "keep\nnew");
+		expect(html).toContain("dl-add");
+		expect(html).toContain("dl-del");
+		expect(html).toContain("+");
+		expect(html).toContain("\u2212");
+		expect(html).toContain(">old</span>");
+		expect(html).toContain(">new</span>");
+		expect(html).toContain("Use rewrite");
+		expect(html).toContain("Discard");
+	});
+	test("a rewrite that differs in no line says so instead of an empty diff box", () => {
+		const html = review("same\ntext", "same\ntext");
+		expect(html).not.toContain("dl-add");
+		expect(html).toContain("matches the draft line for line");
+		expect(html).toContain("Use rewrite");
 	});
 });

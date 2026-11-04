@@ -1,5 +1,59 @@
 /** Client-side slicing and line classification for unified git diffs. */
 
+/** One row of a line-level diff between two drafts: kept, added or removed. */
+export type DiffRow = { kind: "same" | "add" | "del"; text: string };
+
+/** Line count above which lineDiff skips the LCS: the whole old side becomes del rows, the whole new side add rows (bounded memory, no O(n·m) table). */
+const LINE_DIFF_MAX = 2000;
+
+/** Line-level LCS diff of `a` vs `b`, split on "\n". Beyond the cap both sides come back whole: old as del, new as add. */
+export function lineDiff(a: string, b: string): DiffRow[] {
+	// A wholly empty side is no lines, not one empty line: "" and "a" differ by one add.
+	const al = a === "" ? [] : a.split("\n");
+	const bl = b === "" ? [] : b.split("\n");
+	if (al.length > LINE_DIFF_MAX || bl.length > LINE_DIFF_MAX) {
+		return [
+			...al.map((text) => ({ kind: "del", text }) as const),
+			...bl.map((text) => ({ kind: "add", text }) as const),
+		];
+	}
+	// dp[i][j] = LCS length of al[i..] vs bl[j..]; one row of Uint32Array per old line keeps this allocation flat.
+	// Indices are proven in bounds (i < m, j < n), so the reads assert non-undefined.
+	const m = al.length;
+	const n = bl.length;
+	const dp: Uint32Array[] = [];
+	for (let i = 0; i <= m; i++) dp.push(new Uint32Array(n + 1));
+	for (let i = m - 1; i >= 0; i--) {
+		const row = dp[i]!;
+		const below = dp[i + 1]!;
+		for (let j = n - 1; j >= 0; j--) {
+			row[j] =
+				al[i] === bl[j] ? below[j + 1]! + 1 : Math.max(below[j]!, row[j + 1]!);
+		}
+	}
+	const out: DiffRow[] = [];
+	let i = 0;
+	let j = 0;
+	while (i < m && j < n) {
+		const ai = al[i]!;
+		const bj = bl[j]!;
+		if (ai === bj) {
+			out.push({ kind: "same", text: ai });
+			i++;
+			j++;
+		} else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
+			out.push({ kind: "del", text: ai });
+			i++;
+		} else {
+			out.push({ kind: "add", text: bj });
+			j++;
+		}
+	}
+	while (i < m) out.push({ kind: "del", text: al[i++]! });
+	while (j < n) out.push({ kind: "add", text: bl[j++]! });
+	return out;
+}
+
 /** A question's diff link `[label](diff:a.ts,b.ts)`: opens those files' diff sections. */
 export type DiffLinkPart =
 	| { kind: "text"; text: string }

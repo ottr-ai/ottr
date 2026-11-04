@@ -63,6 +63,7 @@ import {
 } from "./attach.ts";
 import {
 	diffLinkParts,
+	lineDiff,
 	numberDiffLines,
 	pickDiffSections,
 	splitDiffSections,
@@ -78,6 +79,7 @@ import {
 	clamp,
 	confirmDialog,
 	copyText,
+	Help,
 	Icon,
 	interviewMsg,
 	LOGOUT_KEY,
@@ -444,6 +446,7 @@ function ComposerActions({
 /** The shared text+image input behind New task, Reply/follow-up and Steer: paste, drop or browse images. */
 function PromptInput({
 	label,
+	labelExtra,
 	value,
 	placeholder,
 	rows = 3,
@@ -454,6 +457,8 @@ function PromptInput({
 	onView,
 }: {
 	label: string;
+	/** Rendered inside the label after its text; the deepen composers put the Help badge here. */
+	labelExtra?: ReactNode;
 	value: string;
 	placeholder: string;
 	rows?: number;
@@ -468,7 +473,10 @@ function PromptInput({
 	const id = useId();
 	return (
 		<div className="prompt-field">
-			<label htmlFor={id}>{label}</label>
+			<label htmlFor={id}>
+				{label}
+				{labelExtra}
+			</label>
 			<textarea
 				id={id}
 				rows={rows}
@@ -1746,9 +1754,77 @@ function ModelField({
 	);
 }
 
+/** The deepen rewrite review: the line diff of draft vs rewrite with +/- glyphs, plus Use rewrite and Discard. */
+export function DeepenReview({
+	original,
+	deepened,
+	onUse,
+	onDiscard,
+}: {
+	original: string;
+	deepened: string;
+	onUse: () => void;
+	onDiscard: () => void;
+}) {
+	const rows = lineDiff(original, deepened);
+	const changed = rows.some((r) => r.kind !== "same");
+	return (
+		<section className="deepen-review" aria-label="Deepen review">
+			{changed ? (
+				<div className="deepen-diff">
+					{rows.map((r, i) => (
+						<div
+							key={i}
+							className={
+								r.kind === "add"
+									? "dl-add"
+									: r.kind === "del"
+										? "dl-del"
+										: undefined
+							}
+						>
+							<span className="deepen-glyph" aria-hidden="true">
+								{r.kind === "add" ? "+" : r.kind === "del" ? "\u2212" : ""}
+							</span>
+							<span className="dl-text">{r.text}</span>
+						</div>
+					))}
+				</div>
+			) : (
+				<p className="hint">
+					The rewrite matches the draft line for line; nothing to change.
+				</p>
+			)}
+			<div className="dialog-actions">
+				<button type="button" onClick={onDiscard}>
+					Discard
+				</button>
+				<button type="button" className="primary" onClick={onUse}>
+					Use rewrite
+				</button>
+			</div>
+		</section>
+	);
+}
+
+/** The Help pop-over text next to the composer label: what makes a good prompt, and what Deepen does. */
+const DEEPEN_HELP = (
+	<>
+		<p>
+			A good prompt states the goal behind the task, what the work must not
+			touch, and how to check the result.
+		</p>
+		<p>
+			Deepen asks a model to rewrite the draft with four questions: the expert
+			method, the raw material, the tools, and an outside check. The rewrite
+			opens as a diff; nothing changes until you accept it.
+		</p>
+	</>
+);
+
 /** The shared compose dialog behind New task and Follow up: same hooks, draft reset and
     submit flow; callers pass the copy, the icon and a `send` that does the POST. */
-function ComposeDialog({
+export function ComposeDialog({
 	open,
 	onClose,
 	act,
@@ -1762,6 +1838,7 @@ function ComposeDialog({
 	icon,
 	submitLabel,
 	send,
+	deepen,
 	/** Show the model picker; the draft mask hides it because a draft runs no agent. */
 	showModel,
 }: {
@@ -1785,6 +1862,8 @@ function ComposeDialog({
 		images: string[];
 		model: string;
 	}) => Promise<void>;
+	/** Deepen the draft: POST /api/projects/:project/deepen. Absent on the backlog draft dialog. */
+	deepen?: (text: string, model: string) => Promise<{ deepened: string }>;
 	showModel?: boolean;
 }) {
 	const [text, setText] = useState("");
@@ -1793,6 +1872,13 @@ function ComposeDialog({
 	const catalog = useModels();
 	const images = useAttachedImages();
 	const sendState = useBusy();
+	const deepenState = useBusy();
+	/** Deepen result awaiting accept/edit: the diffed pair; null while no review is open. */
+	const [review, setReview] = useState<{
+		original: string;
+		deepened: string;
+	} | null>(null);
+	const [deepenErr, setDeepenErr] = useState<string | null>(null);
 	/** Full-size URL of a pasted image shown in the lightbox; null while closed. */
 	const [viewing, setViewing] = useState<string | null>(null);
 	const [err, setErr] = useState<string | null>(null);
@@ -1807,6 +1893,8 @@ function ComposeDialog({
 		setViewing(null);
 		images.clear();
 		setErr(null);
+		setReview(null);
+		setDeepenErr(null);
 	}, [open, images.clear]);
 	// Opening restores the cached draft. Images are not cached: pasted base64 can exceed quota.
 	useEffect(() => {
@@ -1825,6 +1913,28 @@ function ComposeDialog({
 	const editModel = (m: string): void => {
 		setModel(m);
 		if (open) saveComposeDraft(draftKey, { text, model: m });
+	};
+	// Own button, never the form's submit: a failed deepen shows its own error line and keeps the draft.
+	const runDeepen = (): void => {
+		if (deepen === undefined || text.trim().length === 0 || deepenState.busy)
+			return;
+		setDeepenErr(null);
+		deepenState.start(async () => {
+			try {
+				const { deepened } = await deepen(text, model);
+				setReview({ original: text, deepened });
+				return true;
+			} catch (e) {
+				setDeepenErr(e instanceof Error ? e.message : String(e));
+				return false;
+			}
+		});
+	};
+	// Through the draft path: the textarea (and the on-device cache) hold the rewrite, still editable.
+	const useRewrite = (): void => {
+		if (review === null) return;
+		editText(review.deepened);
+		setReview(null);
 	};
 	const submit = (): void => {
 		if (text.trim().length === 0) return;
@@ -1868,6 +1978,11 @@ function ComposeDialog({
 					</div>
 					<PromptInput
 						label={inputLabel}
+						labelExtra={
+							deepen !== undefined ? (
+								<Help label="Deepen" text={DEEPEN_HELP} />
+							) : undefined
+						}
 						value={text}
 						rows={4}
 						autoFocus
@@ -1877,6 +1992,40 @@ function ComposeDialog({
 						images={images}
 						onView={(i) => setViewing(images.images[i]?.url ?? null)}
 					/>
+					{deepen !== undefined && (
+						<div className="deepen-row">
+							<button
+								type="button"
+								className="deepen-btn"
+								disabled={text.trim().length === 0 || deepenState.busy}
+								aria-busy={deepenState.busy || undefined}
+								onClick={runDeepen}
+							>
+								{deepenState.busy && (
+									<span className="spinner" aria-hidden="true" />
+								)}
+								<Icon name="edit" size={14} />
+								Deepen
+							</button>
+							<span className="deepen-hint">
+								Ask a model to rewrite the draft as a diff; nothing changes
+								until you accept it.
+							</span>
+						</div>
+					)}
+					{deepen !== undefined && review !== null && (
+						<DeepenReview
+							original={review.original}
+							deepened={review.deepened}
+							onUse={useRewrite}
+							onDiscard={() => setReview(null)}
+						/>
+					)}
+					{deepen !== undefined && deepenErr !== null && (
+						<p className="auth-error" role="alert">
+							Deepen failed: {deepenErr} The draft is unchanged — try again.
+						</p>
+					)}
 					{showModel !== false && (
 						<ModelField
 							catalog={catalog}
@@ -1957,6 +2106,12 @@ function NewTaskDialog({
 			hint="Enter adds the task. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="plus"
 			submitLabel="Add task"
+			deepen={async (text, model) =>
+				post<{ deepened: string }>(
+					`/api/projects/${encodeURIComponent(project.name)}/deepen`,
+					{ prompt: text, model: model || undefined },
+				)
+			}
 			send={async ({ text, images, model }) => {
 				await post(`/api/projects/${encodeURIComponent(project.name)}/tasks`, {
 					prompt: text,
@@ -2144,6 +2299,12 @@ function FollowUpDialog({
 			hint="Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
 			submitLabel="Follow up"
+			deepen={async (text, model) =>
+				post<{ deepened: string }>(
+					`/api/projects/${encodeURIComponent(task.project)}/deepen`,
+					{ prompt: text, model: model || undefined },
+				)
+			}
 			send={async ({ text, images, model }) => {
 				const next = await post<TaskView>(
 					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/follow-up`,
