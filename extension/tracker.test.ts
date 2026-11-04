@@ -266,6 +266,14 @@ describe("report_outcome applies the pinned session name", () => {
 	test("an unnamed session without a pinned name still refuses once", async () => {
 		const tools = await freshTools();
 		await expect(call(tools)).rejects.toThrow(/rename/);
+		// Yield one macrotask: a wrongly scheduled load-time naming loop (setTimeout 0) then
+		// fires before the assertion, and with no pin none may run, let alone set an empty
+		// name — this kills the registration-guard mutants at tracker.ts's pinnedName guard.
+		// Real scheduling, not fake timers: bun:test 1.4.4's fake timers lack
+		// advanceTimersByTimeAsync (see the settle helper above).
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve);
+		await promise;
 		expect(setSessionNameCalls).toEqual([]);
 	});
 });
