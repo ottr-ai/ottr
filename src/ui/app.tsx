@@ -7188,7 +7188,6 @@ export function Drawer({
 						</DrawerSec>
 					)}
 					{task.releaseVersion !== null &&
-
 						(notesEdit === null ? (
 							<DrawerSec
 								id="drawer-notes"
