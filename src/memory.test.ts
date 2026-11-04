@@ -177,8 +177,8 @@ describe("checkMemoryHealth", () => {
 		});
 	});
 
-	test("hindsight 401 and 500 produce the spec reasons; the token never appears", async () => {
-		for (const status of [401, 500]) {
+	test("hindsight 401, 403 and 500 produce the spec reasons; the token never appears", async () => {
+		for (const status of [401, 403, 500]) {
 			const fetchImpl = (async () =>
 				new Response("nope", { status })) as unknown as typeof fetch;
 			const h = await checkMemoryHealth(
@@ -186,12 +186,14 @@ describe("checkMemoryHealth", () => {
 				{ fetchImpl, now },
 			);
 			expect(h.ok).toBe(false);
-			if (status === 401)
+			if (status === 401 || status === 403)
 				expect(h.reason).toBe(
-					"Hindsight at http://h:8888 rejected the key (HTTP 401)",
+					`Hindsight at http://h:8888 rejected the key (HTTP ${status})`,
 				);
 			else
-				expect(h.reason).toBe("Hindsight at http://h:8888 answered HTTP 500");
+				expect(h.reason).toBe(
+					`Hindsight at http://h:8888 answered HTTP ${status}`,
+				);
 			expect(h.reason).not.toContain("sekret");
 		}
 	});
