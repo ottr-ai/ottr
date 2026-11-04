@@ -1573,7 +1573,11 @@ describe("Drawer prompt markdown", () => {
 	});
 });
 
-describe("Drawer queued steering edit", () => {
+describe("Drawer file-section loading placeholders", () => {
+	// OTTR-473: while the drawer fetches the detail, the file sections hold their space with a
+	// loading line, gated by what the board row predicts (a worktree for worktree files; a
+	// build card for changed files). The static render never resolves the fetch, so it sees
+	// exactly the loading state.
 	const project = {
 		name: "proj",
 		github: null,
@@ -1613,6 +1617,99 @@ describe("Drawer queued steering edit", () => {
 		maxTotal: null,
 	};
 
+	test("a build card with a worktree holds both sections while the detail loads", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "idle",
+			worktree: "/tmp/proj/.worktrees/t1",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-wt"');
+		expect(html).toContain('id="drawer-diff"');
+		expect(html).toContain('class="spinner"');
+		expect(html).toContain('role="status"');
+		expect(html).toContain("Loading…");
+	});
+
+	test("a card without a worktree holds only the changed-files section", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain('id="drawer-wt"');
+		expect(html).toContain('id="drawer-diff"');
+	});
+
+	test("a research card holds the worktree placeholder but no changed-files one", () => {
+		const task = cardFixture({
+			...drawerFields,
+			research: true,
+			stage: "in_progress",
+			state: "idle",
+			worktree: "/tmp/proj/.worktrees/t1",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-wt"');
+		expect(html).not.toContain('id="drawer-diff"');
+	});
+
+	test("a release card holds no file-section placeholders", () => {
+		const task = cardFixture({
+			...drawerFields,
+			releaseVersion: "v1.2.3",
+			releaseNotes: null,
+			stage: "merging",
+			state: "queued",
+			worktree: null,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain('id="drawer-diff"');
+		expect(html).not.toContain('id="drawer-wt"');
+	});
+});
+
+describe("Drawer queued steering edit", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		navigate: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
 	test("queued steering offers Edit next to Cancel", () => {
 		const task = cardFixture({
 			...drawerFields,

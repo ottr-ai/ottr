@@ -5932,6 +5932,16 @@ function DrawerSec({
 	);
 }
 
+/** The in-flight line a lazy drawer section holds its space with (Work steps, the file lists). */
+function DrawerLoading() {
+	return (
+		<p className="dim" role="status">
+			<span className="spinner" aria-hidden="true" />
+			Loading…
+		</p>
+	);
+}
+
 /** The ask: a single question answers in one click; several collect answers first so one reply covers them all. */
 function AskPanel({
 	asked,
@@ -6555,6 +6565,17 @@ export function Drawer({
 	const diffFiles = task.diffFiles ?? [];
 	const diffPlus = diffFiles.reduce((n, f) => n + (f.plus ?? 0), 0);
 	const diffMinus = diffFiles.reduce((n, f) => n + (f.minus ?? 0), 0);
+	// The two file sections ride the fetched detail; while it is in flight the drawer holds
+	// their space with a loading line, so the loaded lists fill in instead of popping the
+	// body down. The row predicts which sections can appear, with the server's detail rules:
+	// worktree files need a live worktree; a diff needs a build card (work kind, not research,
+	// not a release), done cards serve the stat captured at merge start.
+	const wtLoading = detail === null && row.worktree !== null;
+	const diffLoading =
+		detail === null &&
+		row.kind === "work" &&
+		!row.research &&
+		row.releaseVersion === null;
 	/** Done tasks answer with a follow-up task (handoff + fresh session) instead of a reply.
 	 * A cancelled card's drawer is read-only: no follow-up, no edit, no action. */
 	const cancelled = task.cancelledAt !== null;
@@ -7058,6 +7079,17 @@ export function Drawer({
 					)}
 					{task.state === "needs_you" && task.keptFiles.length > 0 && (
 						<KeptFilesPanel task={task} act={act} onClose={onClose} />
+					)}
+					{/* Loading placeholders in the loaded sections' slots, so the headers stay put. */}
+					{wtLoading && (
+						<DrawerSec id="drawer-wt" label="Worktree files">
+							<DrawerLoading />
+						</DrawerSec>
+					)}
+					{diffLoading && (
+						<DrawerSec id="drawer-diff" label="Changed files">
+							<DrawerLoading />
+						</DrawerSec>
 					)}
 					{(task.worktreeFiles?.length ?? 0) > 0 && (
 						<DrawerSec id="drawer-wt" label="Worktree files">
@@ -7582,10 +7614,7 @@ export function Drawer({
 						}
 					>
 						{detail === null ? (
-							<p className="dim" role="status">
-								<span className="spinner" aria-hidden="true" />
-								Loading…
-							</p>
+							<DrawerLoading />
 						) : (
 							steps.length === 0 && <p className="dim">No turns yet.</p>
 						)}
