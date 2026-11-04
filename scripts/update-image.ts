@@ -964,6 +964,8 @@ async function recreate(
 		"--wait",
 		service,
 	);
+	// ponytail: up.out is always a defined string (the docker dep never returns
+	// undefined out), so the trim's optional-chain mutant is a no-op.
 	return up.code === 0
 		? null
 		: stop(`docker compose up --wait ${service} failed: ${up.out.trim()}`);
@@ -1068,6 +1070,8 @@ async function rollRunner(
 		d.log(
 			`the board cannot end ${service}'s hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
 		);
+	// ponytail: the caller treats any non-stop/non-stuck tag as rolled, so an
+	// empty or mislabeled kind cannot change the flow.
 	return { kind: "rolled" };
 }
 
@@ -1097,6 +1101,10 @@ async function rollServer(
 	changed: boolean,
 	stop: (why: string) => number,
 ): Promise<ServerRoll> {
+	// Nothing changed and no seed waits: the done path and the fallen-through
+	// path both no-op (a final up with unchanged images, recordSeed with seeded
+	// false), and the caller treats any non-early/non-deferred kind as done.
+	// ponytail: mutants of the done literal are behavior-preserving.
 	if (!changed && !seeded) return { kind: "done" };
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
@@ -1236,6 +1244,8 @@ async function rollAndRestart(
 	if (!serverWasRunning) {
 		d.log("no running board to count turns in; restarting anyway");
 		const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
+		// ponytail: up.out is always a defined string, so the trim's
+		// optional-chain mutant is a no-op.
 		if (up.code !== 0)
 			return {
 				early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
@@ -1315,6 +1325,8 @@ async function rollAndRestart(
 	// The whole-stack up only starts a service that is not running and waits for the
 	// server's health: every changed container was rolled per service above.
 	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
+	// ponytail: up.out is always a defined string, so the trim's
+	// optional-chain mutant is a no-op.
 	if (up.code !== 0)
 		return {
 			early: stop(`docker compose up --wait failed: ${up.out.trim()}`),

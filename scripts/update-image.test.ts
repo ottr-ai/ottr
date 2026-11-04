@@ -308,6 +308,9 @@ function fakes(
 				// older has no GET /api/drain, and the run keeps the whole-board flow.
 				if (gets === undefined) return { code: 1, out: "HTTP 404\n" };
 				const g = gets[Math.min(getCalls++, gets.length - 1)] ?? "{}";
+				// A deliberate failed read: the exec exits non-zero with HTTP text,
+				// like a board whose GET /api/drain answered 500.
+				if (g === "!fail") return { code: 1, out: "HTTP 500\n" };
 				return { code: 0, out: `${g}\n` };
 			}
 			if (free) {
@@ -1220,7 +1223,13 @@ describe("rolling restart", () => {
 				`http://127.0.0.1:${server.port}`,
 			);
 			const p = Bun.spawn([process.execPath, "-e", src], {
-				env: { ...process.env, PORT: String(server.port) },
+				// WORKER_PORT serves the detach script, which reads it like the
+				// worker's own container env; the other scripts never read it.
+				env: {
+					...process.env,
+					PORT: String(server.port),
+					WORKER_PORT: String(server.port),
+				},
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -1578,6 +1587,20 @@ describe("rolling restart", () => {
 			.filter((l) => l.includes("'POST'"))
 			.map((_, i) => postBody(f, i)))
 			expect(body).toHaveProperty("runner");
+		// Local holds exactly once (the server step's hold), and no detach exec
+		// ever targets the server container or the idle local runner.
+		expect(
+			f.drains
+				.filter((l) => l.includes("'POST'"))
+				.map((_, i) => postBody(f, i)),
+		).toEqual([
+			{ runner: "local" },
+			{ runner: "worker-a" },
+			{ runner: "worker-b" },
+		]);
+		expect(f.calls.join("\n")).not.toMatch(
+			/exec -T (server|local) bun -e <detach>/,
+		);
 	}, 60_000);
 
 	test("a busy worker detaches before the server recreates with a new image", async () => {
@@ -2176,6 +2199,225 @@ describe("rolling restart", () => {
 		expect(f.logs.join("\n")).toContain(
 			"stopped: docker compose restart server failed: restart failed",
 		);
+	}, 60_000);
+
+	test("the detach script fails closed on a 404 with the HTTP status", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(1, 0)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		const scripts = new Set<string>();
+		const docker: Deps["docker"] = (...a) => {
+			if (a.at(-2) === "-e") scripts.add(a.at(-1)!);
+			return f.deps.docker(...a);
+		};
+		await updateImage(
+			main,
+			["-f c.yml"],
+			{ ...f.deps, docker },
+			{
+				ALATE_DATA: data.main,
+			},
+		);
+		const detach = [...scripts].find((s) => s.includes("'/detach'"))!;
+		// An old worker image answers 404: the script prints the status and exits 1,
+		// so the run's deferred log can name the reason.
+		expect(
+			await runOnBoard(detach, () => new Response("", { status: 404 })),
+		).toEqual({ code: 1, out: "HTTP 404" });
+		// A ok answer prints nothing and exits 0.
+		expect(await runOnBoard(detach, () => new Response("ok"))).toEqual({
+			code: 0,
+			out: "",
+		});
+	}, 60_000);
+
+	test("a refused local hold stops the server step before any worker hold", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			hold: [1], // the first hold of the server step is local's, and it is refused
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board cannot hold local: HTTP 404",
+		);
+		// The run stops at once: the workers keep no hold, and no restart runs.
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		expect(f.calls).not.toContain(DETACH_SVC("worker-a"));
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed fresh read after the local hold stops the server step", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0), "!fail"], // the probe answers, the server step's read fails
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
+		);
+		// The local hold released, and the run stopped before the worker holds.
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a busy local logs its note once, and the restart follows on the next poll", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0), stl(0, 0, 1), stl(0, 0, 0)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.logs.filter((l) => l.includes("still runs its turns"))).toEqual([
+			"local still runs its turns: the server restart follows when they finish",
+		]);
+		expect(f.waits).toEqual([30_000]);
+		expect(f.calls).toContain(RESTART);
+	}, 60_000);
+
+	test("a failed read mid-wait stops the server step and releases local", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0), stl(0, 0, 1), "!fail"], // the first wait poll's read fails
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
+		);
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a refused local renewal defers the server step, and every hold releases", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0), stl(0, 0, 1), stl(0, 0, 1)], // local keeps its turn
+			hold: [0, 1], // the initial hold is accepted, the renewal is refused
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"the board cannot hold local any more: the holds end, and the server step waits for a later run",
+		);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		expect(f.seedWrites).toEqual([]);
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+	}, 60_000);
+
+	test("a refused worker hold in the server step stops the run", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0), stl(0, 0, 0)], // local is idle, so the wait ends at once
+			hold: [0, 1], // local holds, worker-a's hold is refused
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board cannot hold worker-a: HTTP 404",
+		);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		expect(f.calls).not.toContain(DETACH_SVC("worker-a"));
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed server recreate stops the run and leaves the seed unwritten", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			upBy: {
+				"worker-a": { code: 0 },
+				"worker-b": { code: 0 },
+				server: { code: 1, out: "boom" },
+			},
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.calls).toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose up --wait server failed: boom",
+		);
+		expect(f.seedWrites).toEqual([]);
 	}, 60_000);
 });
 
