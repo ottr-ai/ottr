@@ -20,6 +20,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { eachWorkerProject, PROJECT } from "./apt.ts";
+import { resolveAgentLayer } from "./layers.ts";
 
 // One line per package: a pinned name==version plus at least one sha256 hash. No options, no
 // extras, no URL or VCS requirements: an injected `--index-url` here would redirect the pip run
@@ -33,14 +34,17 @@ export interface RequirementLine {
 	hashes: string[];
 }
 
-/** Where alate provisions a project's requirements list. */
+/** Where alate provisions a project's requirements list, resolved for a read: under the
+ *  home's current agent layer when one exists, else the flat home (the other `.ottr/workers`
+ *  lists resolve the same way). */
 export function requirementsListPath(
 	project: string,
 	home = homedir(),
 ): string {
 	if (!PROJECT.test(project))
 		throw new Error(`pip: unsafe project name ${JSON.stringify(project)}`);
-	return join(home, ".ottr", "workers", project, "requirements.txt");
+	const layer = resolveAgentLayer(home)?.dir ?? home;
+	return join(layer, ".ottr", "workers", project, "requirements.txt");
 }
 
 /** requirements.txt: one pinned, hashed line per package; `#` comments and blank lines are ignored. */

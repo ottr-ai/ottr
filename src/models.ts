@@ -4,8 +4,8 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-
-import { agentDir, boardOmpEnv } from "./login.ts";
+import { resolveAgentLayer } from "./layers.ts";
+import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
 
 export interface ModelOption {
 	id: string;
@@ -81,11 +81,26 @@ export function modelList(
 	return promise;
 }
 
+/**
+ * The board's omp agent config.yml a roles read targets: the current agent layer's copy when
+ * the board home resolves one, else the flat agent dir
+ * (docs/specs/agent-layer-switch.md, "Layer-following reads"). Read-only: a roles read never
+ * prepares or pins.
+ */
+function defaultRolesPath(): string {
+	const layer = resolveAgentLayer(boardOmpHome());
+	return layer === null
+		? join(agentDir(), "config.yml")
+		: join(layer.dir, ".omp", "agent", "config.yml");
+}
+
 /** Role→model selectors from the board's omp agent config.yml (`modelRoles`, any `:level` thinking
  * suffix kept — omp selectors are `provider/model:level`); nonempty string values only; {} when
- * unreadable. */
+ * unreadable. The default path follows the board home's current agent layer when one resolves,
+ * else the flat agent dir as today.
+ */
 export function modelRoles(
-	configPath: string = join(agentDir(), "config.yml"),
+	configPath: string = defaultRolesPath(),
 ): Record<string, string> {
 	try {
 		const roles = (

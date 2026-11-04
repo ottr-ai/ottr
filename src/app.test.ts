@@ -20,6 +20,8 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readlinkSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -33,6 +35,7 @@ import {
 	behindMain,
 	boardWarnings,
 	type Entry,
+	reconcileLayerUse,
 	storedProjectPaths,
 } from "./app.ts";
 import { hashPassword, signSession } from "./auth.ts";
@@ -41,7 +44,7 @@ import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
-import { type SignIn, signIns } from "./login.ts";
+import { boardOmpEnv, type SignIn, signIns } from "./login.ts";
 import { modelRoles } from "./models.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
@@ -2720,10 +2723,11 @@ describe("alate env seeding", () => {
 });
 
 describe("alate provision trigger (U9)", () => {
-	// Fake provider: /health reports a mutable pending flag; /provision flips it like the
-	// real server and can be told to fail.
+	// Fake provider: /health reports a mutable pending flag and the agent-layer capability
+	// flag; /provision flips it like the real server and can be told to fail.
 	let pending = true;
 	let running = false;
+	let layers = true;
 	let provisionStatus = 200;
 	let provisions = 0;
 	let lastAuth: string | null = null;
@@ -2739,7 +2743,7 @@ describe("alate provision trigger (U9)", () => {
 				pending = false;
 				return Response.json({ ok: true, results: [] });
 			}
-			return Response.json({ ok: true, pending, running });
+			return Response.json({ ok: true, pending, running, layers });
 		},
 	});
 	afterAll(() => {
@@ -2792,13 +2796,36 @@ describe("alate provision trigger (U9)", () => {
 		expect(v.lastProvisionError).toBe(null);
 	});
 
-	test("does not provision while a turn runs", async () => {
+	test("provisions while a turn runs when alate reports agent layers", async () => {
+		// A layered provision installs a new layer and switches a symlink, so a running
+		// turn keeps the layer it started with: no idle wait (docs/specs/
+		// agent-layer-switch.md, "Provision trigger").
 		pending = true; // a new import arrived
 		const t = tickStore.createTask("busy");
 		tickStore.updateTask(t.id, { state: "running" });
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(1);
+		expect(provisions).toBe(2);
+		expect(lastAuth).toBe("Bearer tick_secret");
+		// The provision consumed the import; a fresh one arrives for the next cases.
+		pending = true;
 		tickStore.updateTask(t.id, { state: "idle" });
+	});
+
+	test("keeps the idle gate while a turn runs when alate lacks agent layers", async () => {
+		// An old alate writes the flat home under running turns, so the old idle gate
+		// defers this attempt (docs/specs/agent-layer-switch.md, "Provision trigger").
+		layers = false;
+		const t = tickStore.createTask("busy flat");
+		tickStore.updateTask(t.id, { state: "running" });
+		await m.app.alateProvisionTick();
+		expect(provisions).toBe(2);
+		// An idle board without the flag still provisions: the flag only decides whether
+		// a busy board defers, never whether an idle one does (today's behavior kept).
+		tickStore.updateTask(t.id, { state: "idle" });
+		await m.app.alateProvisionTick();
+		expect(provisions).toBe(3);
+		layers = true;
+		pending = true; // a fresh import for the next cases
 	});
 
 	test("a provision already running on alate defers the trigger", async () => {
@@ -2807,7 +2834,7 @@ describe("alate provision trigger (U9)", () => {
 		// recorded as a failure.
 		running = true;
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(1);
+		expect(provisions).toBe(3);
 		const v = (await (await m.call("/api/alate")).json()) as {
 			lastProvisionError: string | null;
 		};
@@ -2844,21 +2871,21 @@ describe("alate provision trigger (U9)", () => {
 		expect(v.lastProvisionError).toBe(null);
 		// No backoff either: the next tick attempts again and the fake flips pending.
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(2);
+		expect(provisions).toBe(4);
 	});
 
 	test("waits an hour after a failure and shows the error", async () => {
 		provisionStatus = 500;
 		pending = true; // the timed-out attempt above consumed the earlier import
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(3);
+		expect(provisions).toBe(5);
 		const v = (await (await m.call("/api/alate")).json()) as {
 			lastProvisionError: string | null;
 		};
 		expect(v.lastProvisionError).toBe("nope");
 		// Backoff: pending is still true and the board is idle, yet no retry happens.
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(3);
+		expect(provisions).toBe(5);
 		// A manual success clears the recorded error.
 		provisionStatus = 200;
 		pending = false;
@@ -2872,10 +2899,11 @@ describe("alate provision trigger (U9)", () => {
 
 	test("records the pending episode even when a turn defers provisioning", async () => {
 		pending = true; // a new import arrived
+		layers = false; // an old alate: the idle gate defers the attempt below
 		const t = tickStore.createTask("busy again");
 		tickStore.updateTask(t.id, { state: "running" });
 		await m.app.alateProvisionTick();
-		expect(provisions).toBe(4); // gated: no provision attempt
+		expect(provisions).toBe(6); // gated: no provision attempt
 		const state = (await (await m.call("/api/state")).json()) as {
 			alatePendingSince: number | null;
 		};
@@ -2888,6 +2916,7 @@ describe("alate provision trigger (U9)", () => {
 		};
 		expect(again.alatePendingSince).toBe(first);
 		tickStore.updateTask(t.id, { state: "idle" });
+		layers = true;
 	});
 
 	test("clears the episode when the provider stops reporting pending", async () => {
@@ -2924,6 +2953,166 @@ describe("alate provision trigger (U9)", () => {
 			lastProvisionError: string | null;
 		};
 		expect(after.lastProvisionError).toBe(null);
+	});
+
+	test("an hour of backoff after a failure holds without agent layers too", async () => {
+		// Own mount: the describe's instance is idle between tests. The backoff gate runs
+		// before the capability gate, so the one-hour hold is mode-independent — the test
+		// pins that for the old-alate mode.
+		const m3 = mount({ projects: tickProjects });
+		const cfg = await m3.call("/api/alate", {
+			url: fake.url.origin,
+			key: "tick_secret",
+		});
+		expect(cfg.status).toBe(200);
+		provisionStatus = 500;
+		pending = true;
+		layers = false;
+		await m3.app.alateProvisionTick();
+		expect(provisions).toBe(8);
+		const v = (await (await m3.call("/api/alate")).json()) as {
+			lastProvisionError: string | null;
+		};
+		expect(v.lastProvisionError).toBe("nope");
+		await m3.app.alateProvisionTick();
+		expect(provisions).toBe(8); // the hour holds
+		provisionStatus = 200;
+		pending = false;
+		layers = true;
+	});
+});
+
+describe("agent layer boot reconcile", () => {
+	/** The registry ids one home's in-use.json holds. */
+	const registry = (home: string): string[] => {
+		const parsed = JSON.parse(
+			readFileSync(join(home, ".alate", "in-use.json"), "utf8"),
+		) as { layers: { id: string }[] };
+		return parsed.layers.map((l) => l.id);
+	};
+
+	test("boot rebuilds each home's registry from the stores' open turns", () => {
+		// Two homes with layer folders; the stores hold open turns on "bbb", on "gone"
+		// (no folder anywhere) and on "../escape" (never a folder name). Both registries
+		// keep only "bbb": an open turn pins it and its folder exists in each home — an
+		// unpinned folder ("aaa") and a pinned id without a folder ("gone") drop out.
+		const suffix = Math.random().toString(36).slice(2, 8);
+		const shared = join(root, `rec-shared-${suffix}`);
+		const board = join(root, `rec-board-${suffix}`);
+		mkdirSync(join(shared, ".alate", "layers", "aaa"), { recursive: true });
+		mkdirSync(join(shared, ".alate", "layers", "bbb"), { recursive: true });
+		mkdirSync(join(board, ".alate", "layers", "bbb"), { recursive: true });
+		const dir = join(root, `rec-proj-${suffix}`);
+		const store = ProjectStore.open(dir);
+		const tasks = [
+			store.createTask("open bbb"),
+			store.createTask("open gone"),
+			store.createTask("open escape"),
+		];
+		store.startTurn(tasks[0]!.id, "work", "p", null, null, null, null, "bbb");
+		store.startTurn(tasks[1]!.id, "work", "p", null, null, null, null, "gone");
+		store.startTurn(
+			tasks[2]!.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"../escape",
+		);
+		const projects = new Map<string, Entry>();
+		projects.set("rec", {
+			path: dir,
+			name: "rec",
+			store,
+			target: null,
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		const savedHome = process.env.HOME;
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.HOME = shared;
+		process.env.OTTR_BOARD_OMP_HOME = board;
+		try {
+			mount({ projects }); // createApp runs the reconcile once, with the projects open
+		} finally {
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+			store.close();
+		}
+		expect([...registry(shared)].sort()).toEqual(["bbb"]);
+		expect(registry(board)).toEqual(["bbb"]);
+	});
+
+	test("reconcileLayerUse drops stale and unsafe ids, skips homes without layers", () => {
+		const home = join(
+			root,
+			`rec-direct-${Math.random().toString(36).slice(2, 8)}`,
+		);
+		mkdirSync(join(home, ".alate", "layers", "real"), { recursive: true });
+		writeFileSync(
+			join(home, ".alate", "in-use.json"),
+			'{"layers":[{"id":"stale","since":1}]}',
+		);
+		reconcileLayerUse(["stale", "../escape", "real"], [home]);
+		expect(registry(home)).toEqual(["real"]);
+		// No `.alate` dir: nothing to reconcile, and no registry is created there.
+		const bare = join(
+			root,
+			`rec-bare-${Math.random().toString(36).slice(2, 8)}`,
+		);
+		reconcileLayerUse(["real"], [bare]);
+		expect(existsSync(join(bare, ".alate"))).toBe(false);
+	});
+});
+
+describe("boardOmpEnv layer pin", () => {
+	test("HOME follows the board home's current layer, with shared state linked", () => {
+		const saved = {
+			board: process.env.OTTR_BOARD_OMP_HOME,
+			url: process.env.HINDSIGHT_API_URL,
+		};
+		const h = join(root, `omp-env-${Math.random().toString(36).slice(2, 8)}`);
+		const layer = join(h, ".alate", "layers", "lay1");
+		mkdirSync(join(layer, ".omp", "agent"), { recursive: true });
+		symlinkSync(join("layers", "lay1"), join(h, ".alate", "current"));
+		process.env.OTTR_BOARD_OMP_HOME = h;
+		try {
+			const env = boardOmpEnv();
+			expect(env.HOME).toBe(realpathSync(layer));
+			// pinnedAgentLayer prepared the links: the credential store inside the layer
+			// points at the flat home's agent.db (one store per stack).
+			expect(readlinkSync(join(layer, ".omp", "agent", "agent.db"))).toBe(
+				join(h, ".omp", "agent", "agent.db"),
+			);
+			// The memory backend flip ran at pin time: the layer ships mnemopi and the env
+			// names a Hindsight URL, so the layer's config reads hindsight afterwards.
+			writeFileSync(
+				join(layer, ".omp", "agent", "config.yml"),
+				"memory:\n  backend: mnemopi\n",
+			);
+			process.env.HINDSIGHT_API_URL = "http://127.0.0.1:9";
+			boardOmpEnv();
+			expect(
+				readFileSync(join(layer, ".omp", "agent", "config.yml"), "utf8"),
+			).toContain("backend: hindsight");
+			// A broken link falls back to the flat home, exactly as today.
+			rmSync(join(h, ".alate", "current"));
+			expect(boardOmpEnv().HOME).toBe(h);
+		} finally {
+			if (saved.board === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = saved.board;
+			if (saved.url === undefined) delete process.env.HINDSIGHT_API_URL;
+			else process.env.HINDSIGHT_API_URL = saved.url;
+		}
 	});
 });
 

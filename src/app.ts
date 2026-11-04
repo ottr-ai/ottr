@@ -97,6 +97,7 @@ import {
 	saveImages,
 	sniffImage,
 } from "./images.ts";
+import { rebuildLayerUse, resolveAgentLayer } from "./layers.ts";
 import {
 	agentDir,
 	boardOmpEnv,
@@ -187,6 +188,7 @@ import { derivedTaskPrefix, ProjectStore } from "./store.ts";
 import {
 	ENV_NAME,
 	envListPath,
+	layerHome,
 	listedEnvNames,
 	toolsListPath,
 } from "./tools.ts";
@@ -636,6 +638,36 @@ export function boardWarnings(
 		if (w !== null) out.push(w);
 	return out;
 }
+/**
+ * Boot reconcile of the layer in-use registries (docs/specs/agent-layer-switch.md, "Record"):
+ * rebuilds each home's `<home>/.alate/in-use.json` from `openLayers`, the layer ids the stores'
+ * open turns still pin. A home keeps only the ids whose layer folder exists there: alate's
+ * clean-up never deletes a layer a crashed-but-live turn reads, and an id whose folder is
+ * already gone stops blocking it. Never throws: `rebuildLayerUse` is best-effort, and a home
+ * without a `.alate` dir (no layer was ever installed) is left alone.
+ */
+export function reconcileLayerUse(
+	openLayers: string[],
+	// process.env.HOME first (loginStores() pattern): os.homedir() caches under Bun, so a
+	// retargeted $HOME would never reach the reconcile — in tests and in a future shell.
+	homes: readonly string[] = [
+		process.env.HOME?.trim() ? resolve(process.env.HOME) : homedir(),
+		boardOmpHome(),
+	],
+): void {
+	for (const home of new Set(homes)) {
+		if (!existsSync(join(home, ".alate"))) continue;
+		const ids = openLayers.filter(
+			(id) =>
+				basename(id) === id &&
+				id !== "." &&
+				id !== ".." &&
+				existsSync(join(home, ".alate", "layers", id)),
+		);
+		rebuildLayerUse(home, ids);
+	}
+}
+
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
 	// GitHub App mint and review post; the seam keeps both off the real network in tests.
@@ -653,6 +685,17 @@ export function createApp(deps: AppDeps) {
 	const workersHome = deps.workersHome ?? boardOmpHome();
 	const keyscan = deps.keyscan ?? realKeyscan;
 	const ambientHelpers = readAmbientHelpers();
+	// Boot reconcile (docs/specs/agent-layer-switch.md, "Record"): the stores' open turns
+	// (turn rows without ended_at) decide which layer folders stay registered as in use,
+	// so alate's clean-up never deletes a layer a crashed-but-live turn reads. Fail-soft:
+	// a broken store or registry only degrades clean-up, it never breaks the boot.
+	try {
+		reconcileLayerUse(
+			[...deps.projects.values()].flatMap((e) => e.store.listOpenTurnLayers()),
+		);
+	} catch (err) {
+		console.warn(`layers: in-use reconcile failed: ${errmsg(err)}`);
+	}
 	/** Sorted task ids marked as read; missing/corrupt row = empty. */
 	function loadSeen(): string[] {
 		const parsed: unknown = deps.gstore.get<unknown>("seen_answers");
@@ -1356,9 +1399,12 @@ export function createApp(deps: AppDeps) {
 	}
 	/**
 	 * U9 background provision trigger, run every 5 minutes (src/server.ts): when the
-	 * provider holds an unprovisioned import and no turn runs, run the manual provision
-	 * path. A success leaves pending false, so the provider flag ends the loop; a failed
-	 * attempt waits an hour and surfaces in alateView for the settings section.
+	 * provider holds an unprovisioned import, run the manual provision path. With alate's
+	 * agent-layer support (health `layers`) the provision never waits: running turns keep
+	 * the layer they started with. Without the flag, alate writes the flat home, so the
+	 * old "no turn runs" gate stays for that attempt. A success leaves pending false, so
+	 * the provider flag ends the loop; a failed attempt waits an hour and surfaces in
+	 * alateView for the settings section.
 	 */
 	async function alateProvisionTick(): Promise<void> {
 		if (alate.url === null) return;
@@ -1374,7 +1420,13 @@ export function createApp(deps: AppDeps) {
 		}
 		if (alate.key === null) return;
 		if (Date.now() < alateBackoffUntil) return;
-		if (anyTurnActive()) return;
+		// With agent-layer support (alate health layers:true) a provision installs a new
+		// layer and switches a symlink: running turns keep the layer they started with,
+		// so the provision never waits for an idle board. Without the flag — or when the
+		// health probe failed and says nothing — alate may write the flat home under
+		// running turns, so the old idle gate stays for that attempt
+		// (docs/specs/agent-layer-switch.md).
+		if ((h.ok ? h.body.layers : undefined) !== true && anyTurnActive()) return;
 		if (!h.ok) {
 			alateProvisionError = h.error;
 			alateBackoffUntil = Date.now() + 60 * 60_000;
@@ -4315,13 +4367,17 @@ export function createApp(deps: AppDeps) {
 					// One home, the same one the env routes read: the shared workers home
 					// when the deploy passes one, else the board's own home (R5-1: never a
 					// worker-writable directory for the env list).
-					const workers = workerProjects(workersHome).map((name) => ({
-						name,
-						apt: existsSync(aptListPath(name, workersHome)),
-						tools: existsSync(toolsListPath(name, workersHome)),
-						requirements: existsSync(requirementsListPath(name, workersHome)),
-						env: existsSync(envListPath(name, workersHome)),
-					}));
+					const workers = workerProjects(layerHome(workersHome)).map(
+						(name) => ({
+							name,
+							apt: existsSync(aptListPath(name, workersHome)),
+							tools: existsSync(toolsListPath(name, workersHome)),
+							requirements: existsSync(
+								requirementsListPath(name, workersHome),
+							),
+							env: existsSync(envListPath(name, workersHome)),
+						}),
+					);
 					return json({ server, workers } satisfies ProvisioningResponse);
 				}),
 		},

@@ -213,6 +213,44 @@ describe("paths", () => {
 	test("a missing env.txt lists nothing", () => {
 		expect(listedEnvNames(mkdtempSync(join(home, "empty-")))).toEqual([]);
 	});
+
+	test("list reads follow the home's current agent layer", () => {
+		// Alate installs the .ottr/workers lists into every layer and may prune the flat
+		// ones, so a read resolves <home>/.alate/current first
+		// (docs/specs/agent-layer-switch.md, "Layer-following reads").
+		const h = mkdtempSync(join(home, "layered-"));
+		const layer = join(h, ".alate", "layers", "lay1");
+		mkdirSync(layer, { recursive: true });
+		symlinkSync(join("layers", "lay1"), join(h, ".alate", "current"));
+		provision("p", [], ["LAYER_ONLY"], layer);
+		// The flat home holds different lists: the layer wins, the flat ones are unread.
+		provision("p", [], ["FLAT_ONLY"], h);
+		expect(toolsListPath("p", h)).toBe(
+			join(layer, ".ottr", "workers", "p", "tools.json"),
+		);
+		expect(envListPath("p", h)).toBe(
+			join(layer, ".ottr", "workers", "p", "env.txt"),
+		);
+		expect(listedEnvNames(h)).toEqual([
+			{ name: "LAYER_ONLY", projects: ["p"] },
+		]);
+		expect(turnEnvValues("p", { LAYER_ONLY: "v", FLAT_ONLY: "x" }, h)).toEqual({
+			env: { LAYER_ONLY: "v" },
+			missing: [],
+		});
+	});
+
+	test("a missing or dangling current link reads the flat home", () => {
+		const h = mkdtempSync(join(home, "dangling-"));
+		mkdirSync(join(h, ".alate", "layers", "gone"), { recursive: true });
+		symlinkSync(join("layers", "gone"), join(h, ".alate", "current"));
+		rmSync(join(h, ".alate", "layers", "gone"), { recursive: true });
+		provision("p", [], ["FLAT_ONLY"], h);
+		expect(listedEnvNames(h)).toEqual([{ name: "FLAT_ONLY", projects: ["p"] }]);
+		expect(toolsListPath("p", h)).toBe(
+			join(h, ".ottr", "workers", "p", "tools.json"),
+		);
+	});
 });
 
 describe("ensureProjectTools", () => {

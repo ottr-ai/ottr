@@ -206,11 +206,10 @@ No data repo yet? Alate's `create-data-repo` skill builds a private one from the
 
 The Alate lines in the quick start write `COMPOSE_PROFILES`, `ALATE_URL`, and `ALATE_API_KEY` into `.env`, and start the bundled Alate server (compose profile `alate`) together with the board. The board reads `ALATE_URL` and `ALATE_API_KEY` at boot and seeds **Settings → Alate** with them. A value saved under Settings wins over the env at every boot. A user whose Alate server already runs omits the Alate block and pairs the board under **Settings → Alate** instead.
 
-The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570>. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once, and restart the board (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). Replace `OWNER/NAME` with your data repo. The lines are the same in bash and PowerShell:
+The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570>. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). The seed installs a layer and switches it in place, so no restart is needed. Replace `OWNER/NAME` with your data repo. The line is the same in bash and PowerShell:
 
 ```sh
 docker compose run --rm board-seed --repo OWNER/NAME
-docker compose restart server
 ```
 
 The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA` (a local data-repo checkout) or `ALATE_DATA_REPO` (`owner/name`). The board shows a notice while its agent layer is not seeded, or while a model role's provider has no active sign-in.
@@ -241,7 +240,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 
 ## Alate
 
-[Alate](https://github.com/ottr-ai/alate) is the provisioning side of the pair. It installs agent rules, skills, plugins and the omp user layer from a data repo onto this machine and into Ottr's Docker workers, so every agent and worker runs the same setup. Ottr integrates with it under **Settings → Alate**: point it at the alate server URL and API key, and **Provision** (or the automatic check every 5 minutes) installs pending imports. With the URL set, Ottr also pulls the provider's update list each hour and offers upstream updates through the header bell. When an import waits longer than 30 minutes (the automatic check defers while cards run), the bell also shows "Alate is waiting to provision an import" with a link to the Settings section. The Overview page shows the provisioning state at a glance: the server's version and probe result, and which project lists (packages, tools, env) alate provisioned, under **Provisioning**.
+[Alate](https://github.com/ottr-ai/alate) is the provisioning side of the pair. It installs agent rules, skills, plugins and the omp user layer from a data repo onto this machine and into Ottr's Docker workers, so every agent and worker runs the same setup. Ottr integrates with it under **Settings → Alate**: point it at the alate server URL and API key, and **Provision** (or the automatic check every 5 minutes) installs pending imports; an alate that reports layer support provisions while cards run, and an older alate defers the check while cards run. With the URL set, Ottr also pulls the provider's update list each hour and offers upstream updates through the header bell. When an import waits longer than 30 minutes, the bell also shows "Alate is waiting to provision an import" with a link to the Settings section. The Overview page shows the provisioning state at a glance: the server's version and probe result, and which project lists (packages, tools, env) alate provisioned, under **Provisioning**.
 
 ## Configuration
 

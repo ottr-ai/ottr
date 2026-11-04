@@ -29,6 +29,7 @@ function turn(p: Partial<Turn> = {}): Turn {
 		question: null,
 		error: null,
 		model: null,
+		layer: null,
 		inputBy: null,
 		...p,
 	};

@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS turns (
   question TEXT,
   error TEXT,
   model TEXT,
+  layer TEXT,
   tokens_in INTEGER,
   tokens_out INTEGER,
   cache_read INTEGER,
@@ -345,6 +346,7 @@ interface TurnRow {
 	question: string | null;
 	error: string | null;
 	model: string | null;
+	layer: string | null;
 }
 
 function toTask(project: string, r: TaskRow): Task {
@@ -536,6 +538,7 @@ function toTurn(r: TurnRow): Turn {
 		question: r.question,
 		error: r.error,
 		model: r.model,
+		layer: r.layer,
 	};
 }
 
@@ -611,6 +614,7 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	model: "model",
 	input: "input",
 	inputBy: "input_by",
+	layer: "layer",
 };
 
 /**
@@ -1236,6 +1240,8 @@ export class ProjectStore {
 		}
 		if (!turnCols.includes("cost"))
 			db.exec("ALTER TABLE turns ADD COLUMN cost REAL");
+		if (!turnCols.includes("layer"))
+			db.exec("ALTER TABLE turns ADD COLUMN layer TEXT");
 		// One-time-per-open cost backfill: finished turns without captured cost read their
 		// task's transcript once per task and fill each turn by its timestamp window. Never
 		// throws (spec): a failure or a missing transcript leaves the columns NULL and the
@@ -2042,11 +2048,12 @@ export class ProjectStore {
 		input: string | null = null,
 		model: string | null = null,
 		inputBy: "user" | "supervisor" | null = null,
+		layer: string | null = null,
 	): Turn {
 		const now = Date.now();
 		const { lastInsertRowid } = this.db.run(
-			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			[taskId, kind, prompt, input, inputBy, now, pid, model],
+			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			[taskId, kind, prompt, input, inputBy, now, pid, model, layer],
 		);
 		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 		const row = this.db
@@ -2151,6 +2158,16 @@ export class ProjectStore {
 			)
 			.all(taskId)
 			.map(toTurn);
+	}
+
+	/** Layers of turns that never ended (boot reconcile source for in-use.json); distinct, null-free. */
+	listOpenTurnLayers(): string[] {
+		return this.db
+			.query<{ layer: string }, []>(
+				"SELECT DISTINCT layer FROM turns WHERE ended_at IS NULL AND layer IS NOT NULL",
+			)
+			.all()
+			.map((r) => r.layer);
 	}
 
 	/** Model of the task's newest turn that saw one (a run's snapshot); null when no turn recorded a model. */

@@ -1809,6 +1809,8 @@ export function createTurnLoop(
 				// live was read with raw, so its pendingBy is raw's authorship (a mid-run steer
 				// lands after this read and rides the next turn).
 				turnInput !== null ? live.pendingBy : null,
+				// The layer this run pinned at start (null = flat home); a record only, clean-up reads in-use.json.
+				handle.layerId ?? null,
 			);
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.

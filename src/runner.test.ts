@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
@@ -7,12 +7,15 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import type { EventState, RunLauncher } from "./runner.ts";
@@ -2980,4 +2983,326 @@ describe("arch-review changed-line coverage", () => {
 			}
 		},
 	);
+});
+
+// --- Agent layer pinning (OTTR-451) -----------------------------------------
+
+import * as realOsNamespace from "node:os";
+import { homedir as realHomedir } from "node:os";
+
+// Bun caches os.homedir() per process, so a test cannot redirect the worker branch's
+// shared-home resolution through $HOME. Patch the module instead; the patch falls back
+// to the real homedir whenever testHome is null (reset in every finally).
+const realHome = realHomedir(); // captured before the patch (Bun caches homedir anyway)
+let testHome: string | null = null;
+mock.module("node:os", () => ({
+	...realOsNamespace,
+	homedir: () => testHome ?? realHome,
+}));
+
+// A compiled worker omp stand-in that reports its env and holds the run open until a
+// release file appears, so the test can switch the layer under a live run.
+const layerOmpDir = mkdtempSync(join(tmpdir(), "ottr-layer-omp-"));
+const layerOmp = join(layerOmpDir, "layer-omp.exe");
+writeFileSync(
+	join(layerOmpDir, "layer-omp.js"),
+	`import { writeFileSync, existsSync } from "node:fs";
+writeFileSync(process.env.LAYER_ENV_OUT, JSON.stringify(process.env));
+const release = process.env.LAYER_RELEASE;
+const t0 = Date.now();
+while (!existsSync(release) && Date.now() - t0 < 20000) {}
+process.stdout.write(JSON.stringify({ type: "session", id: "sess-layer" }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
+`,
+);
+Bun.spawnSync([
+	process.execPath,
+	"build",
+	"--compile",
+	join(layerOmpDir, "layer-omp.js"),
+	"--outfile",
+	layerOmp,
+]);
+afterAll(() =>
+	rmSync(layerOmpDir, { recursive: true, force: true, maxRetries: 5 }),
+);
+
+/** A minimal installed layer with its mnemopi config, the shape alate ships. */
+function makeLayerDir(home: string, id: string): string {
+	const dir = join(home, ".alate", "layers", id);
+	mkdirSync(join(dir, ".omp", "agent"), { recursive: true });
+	mkdirSync(join(dir, ".omp", "plugins"), { recursive: true });
+	mkdirSync(join(dir, ".agents"), { recursive: true });
+	writeFileSync(
+		join(dir, ".omp", "agent", "config.yml"),
+		"model: x\n  backend: mnemopi\n",
+	);
+	return dir;
+}
+
+/** Atomic current-switch, the way alate does it: temp symlink + rename. */
+function switchCurrentTo(home: string, id: string): void {
+	const tmp = join(home, ".alate", `current.${process.pid}.tmp`);
+	symlinkSync(join("layers", id), tmp);
+	renameSync(tmp, join(home, ".alate", "current"));
+}
+
+/** Poll until the predicate holds (the fake omp child signals through files). */
+async function until(pred: () => boolean): Promise<void> {
+	for (let i = 0; i < 200 && !pred(); i++)
+		await new Promise((r) => setTimeout(r, 25));
+	if (!pred()) throw new Error("timed out waiting for the fake omp child");
+}
+
+describe("startRun agent layer pinning", () => {
+	const ENV_KEYS = [
+		"HOME",
+		"HINDSIGHT_API_URL",
+		"OTTR_BOARD_OMP_HOME",
+		"GH_TOKEN",
+		"PI_CODING_AGENT_DIR",
+	];
+	function saveEnv(): Record<string, string | undefined> {
+		const saved: Record<string, string | undefined> = {};
+		for (const k of ENV_KEYS) saved[k] = process.env[k];
+		return saved;
+	}
+	function restoreEnv(saved: Record<string, string | undefined>): void {
+		for (const k of ENV_KEYS) {
+			if (saved[k] === undefined) delete process.env[k];
+			else process.env[k] = saved[k];
+		}
+	}
+
+	test("worker dispatch pins the current layer: env carries the resolved layer, the registry records it, a switch under the live run never moves it", async () => {
+		const saved = saveEnv();
+		const shared = mkdtempSync(join(tmpdir(), "ottr-layer-shared-"));
+		const aDir = makeLayerDir(shared, "A");
+		symlinkSync(aDir, join(shared, ".alate", "current"));
+		const rel1 = join(shared, "release-1");
+		const out1 = join(shared, "env-1.json");
+		const rel2 = join(shared, "release-2");
+		const out2 = join(shared, "env-2.json");
+		const dir = mkdtempSync(join(tmpdir(), "ottr-layer-run-"));
+		const server = serveWorker({ port: 0, ompPath: layerOmp });
+		try {
+			testHome = shared; // the worker branch resolves its shared home via homedir()
+			process.env.HINDSIGHT_API_URL = "https://hindsight.example/api";
+			process.env.GH_TOKEN = "gh-secret";
+			delete process.env.OTTR_BOARD_OMP_HOME;
+			const workerOpts = (out: string, rel: string) => ({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath: join(dir, `run-${basename(out)}.log`),
+				dataRoot: dir,
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				env: { LAYER_ENV_OUT: out, LAYER_RELEASE: rel },
+			});
+
+			const h1 = startRun(workerOpts(out1, rel1));
+			expect(h1.pid).toBeNull();
+			expect(h1.layerId).toBe("A");
+			await until(() => existsSync(out1));
+			const env1: Record<string, string> = JSON.parse(
+				readFileSync(out1, "utf8"),
+			);
+			expect(env1.HOME).toBe(realpathSync(aDir));
+			expect(env1.PI_CODING_AGENT_DIR).toBe(
+				join(realpathSync(aDir), ".omp", "agent"),
+			);
+			expect(env1.GH_TOKEN).toBeUndefined();
+			expect(env1.OTTR_BOARD_OMP_HOME).toBeUndefined();
+			expect(env1.HINDSIGHT_API_URL).toBe("https://hindsight.example/api");
+			// The pin flipped the layer's memory backend and registered the layer.
+			expect(
+				readFileSync(join(aDir, ".omp", "agent", "config.yml"), "utf8"),
+			).toContain("  backend: hindsight");
+			expect(readLayerUse(shared).map((e) => e.id)).toEqual(["A"]);
+
+			// Switch current -> B while run 1 holds A open: run 1 stays on A, run 2 pins B.
+			const bDir = makeLayerDir(shared, "B");
+			switchCurrentTo(shared, "B");
+			const h2 = startRun(workerOpts(out2, rel2));
+			expect(h2.layerId).toBe("B");
+			await until(() => existsSync(out2));
+			const env2: Record<string, string> = JSON.parse(
+				readFileSync(out2, "utf8"),
+			);
+			expect(env1.HOME).toBe(realpathSync(aDir)); // run 1 never moved
+			expect(env2.HOME).toBe(realpathSync(bDir));
+			expect(env2.PI_CODING_AGENT_DIR).toBe(
+				join(realpathSync(bDir), ".omp", "agent"),
+			);
+			expect(
+				readLayerUse(shared)
+					.map((e) => e.id)
+					.sort(),
+			).toEqual(["A", "B"]);
+
+			writeFileSync(rel1, "go\n");
+			writeFileSync(rel2, "go\n");
+			const [r1, r2] = await Promise.all([h1.done, h2.done]);
+			expect(r1.exitCode).toBe(0);
+			expect(r2.exitCode).toBe(0);
+			// Both runs settled: the registry drops both ids, so clean-up may run.
+			expect(readLayerUse(shared)).toEqual([]);
+		} finally {
+			server.stop(true);
+			testHome = null;
+			restoreEnv(saved);
+			rmSync(shared, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 30_000);
+
+	test("local dispatch pins the board home's current layer", async () => {
+		const saved = saveEnv();
+		const board = mkdtempSync(join(tmpdir(), "ottr-layer-board-"));
+		const dir = mkdtempSync(join(tmpdir(), "ottr-layer-local-"));
+		try {
+			const aDir = makeLayerDir(board, "A");
+			symlinkSync(aDir, join(board, ".alate", "current"));
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			process.env.HINDSIGHT_API_URL = "https://hindsight.example/api";
+			delete process.env.PI_CODING_AGENT_DIR;
+			delete process.env.GH_TOKEN;
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const logPath = join(dir, "run.log");
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath,
+				dataRoot: dir,
+				launcher,
+			});
+			expect(handle.layerId).toBe("A");
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.env?.HOME).toBe(realpathSync(aDir));
+			expect(seen[0]?.env?.PI_CODING_AGENT_DIR).toBe(
+				join(realpathSync(aDir), ".omp", "agent"),
+			);
+			// The run settled: the board home's registry is empty again.
+			expect(readLayerUse(board)).toEqual([]);
+		} finally {
+			restoreEnv(saved);
+			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("no layer: the env stays exactly as today and no warning is logged", async () => {
+		const saved = saveEnv();
+		const board = mkdtempSync(join(tmpdir(), "ottr-layer-flat-"));
+		const dir = mkdtempSync(join(tmpdir(), "ottr-layer-nolayer-"));
+		try {
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			delete process.env.PI_CODING_AGENT_DIR;
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const logPath = join(dir, "run.log");
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath,
+				dataRoot: dir,
+				launcher,
+			});
+			expect(handle.layerId).toBeNull();
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.env?.HOME).toBe(board); // the flat board home, unchanged
+			expect(seen[0]?.env?.PI_CODING_AGENT_DIR).toBeUndefined();
+			// No warning mark: a missing layer is the normal migration state, not a failure.
+			expect(existsSync(logPath)).toBe(false);
+		} finally {
+			restoreEnv(saved);
+			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a broken current link: warning mark logged, the run falls back to the flat home", async () => {
+		const saved = saveEnv();
+		const board = mkdtempSync(join(tmpdir(), "ottr-layer-broken-"));
+		const dir = mkdtempSync(join(tmpdir(), "ottr-layer-brokenrun-"));
+		try {
+			mkdirSync(join(board, ".alate"), { recursive: true });
+			symlinkSync(join("layers", "gone"), join(board, ".alate", "current"));
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			delete process.env.PI_CODING_AGENT_DIR;
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const logPath = join(dir, "run.log");
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath,
+				dataRoot: dir,
+				launcher,
+			});
+			expect(handle.layerId).toBeNull();
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.env?.HOME).toBe(board); // flat fallback
+			expect(seen[0]?.env?.PI_CODING_AGENT_DIR).toBeUndefined();
+			expect(readFileSync(logPath, "utf8")).toContain(
+				"! agent layer pin failed (broken); running the flat home",
+			);
+		} finally {
+			restoreEnv(saved);
+			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("http400Dirs follows each home's current layer (moment-in-time)", () => {
+		// White-box: the reader must include a layer dir's http-400 root alongside the flat
+		// homes. Exercised through findHttp400Rejection with the board home pinned to a temp
+		// home whose layer holds the entry.
+		const saved = saveEnv();
+		const board = mkdtempSync(join(tmpdir(), "http400-layer-"));
+		try {
+			const layer = makeLayerDir(board, "L");
+			symlinkSync(layer, join(board, ".alate", "current"));
+			const logs = join(layer, ".omp", "logs", "http-400-requests");
+			mkdirSync(logs, { recursive: true });
+			writeFileSync(join(logs, "9791198198684-layer.json"), "{}");
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			expect(
+				findHttp400Rejection({ from: 9791198198000, to: 9791198199000 }),
+			).toBe("9791198198684-layer.json");
+		} finally {
+			restoreEnv(saved);
+			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
 });

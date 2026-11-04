@@ -31,10 +31,15 @@ x-worker: &worker
   volumes:
     - workspace:/workspace
     - ottr-data:/data
-    # Agent layer (rules, config, skills, plugins): alate provisions it here. Shared with
-    # the board's home, so it is worker-plantable by design; the board pins its git/gh
-    # config and its own omp agent dir to the server-only board-config volume instead
-    # (R5-1, see the server service env) and never copies from this home.
+    # Agent layer (rules, config, skills, plugins): alate provisions it here as layers
+    # under /root/.alate/layers/<id> and switches /root/.alate/current with one atomic
+    # rename (docs/specs/agent-layer-switch.md). A turn pins the layer it started with:
+    # its HOME and agent dir resolve once at spawn and stay there for the run's life.
+    # Shared state (agent.db, oauth, logs, caches, git/gh config) stays at its flat path
+    # and is linked into each layer. The home is shared with the board's home, so it is
+    # worker-plantable by design; the board pins its git/gh config and its own omp agent
+    # dir to the server-only board-config volume instead (R5-1, see the server service
+    # env) and never copies from this home.
     - home:/root
     # Credentials stay on the host; the named home volume holds writable
     # state and the oauth dir is mounted read-only over it.
@@ -154,17 +159,24 @@ services:
       # extensions, sessions) lives on the board-config volume, which no worker mounts, so
       # a turn cannot plant config or code the board's privileged turns (merge, release
       # review, release) would read or execute. The entry script never copies it from the
-      # shared home: it starts empty and the entry script logs that it is unseeded. The
-      # board-seed one-off fills it from the data repo. Settings sign-in runs one omp login
-      # for this store and a second one for the shared worker store, so each store keeps
-      # its own refresh token (docs/specs/provider-credentials.md).
+      # shared home: it starts empty and the entry script logs that it is unseeded while
+      # no layer seeds the board home either. The board-seed one-off fills the board home
+      # from the data repo; the board's own turns pin the current board-home layer at
+      # spawn, and HOME and this variable then point into the layer dir for that run
+      # (docs/specs/agent-layer-switch.md). This flat path stays the no-layer fallback and
+      # the location of the credential store, which every layer links. Settings sign-in
+      # runs one omp login for this store and a second one for the shared worker store, so
+      # each store keeps its own refresh token (docs/specs/provider-credentials.md).
       PI_CODING_AGENT_DIR: /etc/ottr/home/.omp/agent
       # R5-1: omp reads its plugins ($HOME/.omp/plugins) and the user skills and context
       # files (~/.agents, ~/.claude, ...) from HOME, never from PI_CODING_AGENT_DIR, and HOME
       # here is the worker-writable shared home. The board's own omp spawns (merge, release
       # review, release, models, usage, sign-in) run with this server-only HOME instead,
-      # the one board-seed installs into; the board's own reads of the shared home (apt
-      # lists, shared store) keep /root.
+      # the one board-seed installs into: board-seed installs the agent layer here under
+      # .alate/layers/<id> and switches .alate/current with one atomic rename, and the
+      # board's spawns pin the layer the link names at spawn. The flat copy of the layer
+      # remains only as the no-layer fallback. The board's own reads of the shared home
+      # (apt lists, shared store) keep /root.
       OTTR_BOARD_OMP_HOME: /etc/ottr/home
       # One shared home volume carries one agent config. The server writes the
       # memory overlay to OTTR_DATA_DIR=/data ($OTTR_DATA_DIR/omp-memory.yml);
@@ -196,15 +208,18 @@ services:
 
   # R5-1 trusted seed of the board-config volume: a one-off of the Alate image. It restores
   # the user layer from the data repo with the same SkillSpector scan as worker provisioning
-  # (fail-closed), then installs the rules. The profile keeps `docker compose up` from
-  # starting it. Usage:
+  # (fail-closed), then installs the rules. It installs into /etc/ottr/home/.alate/layers/<id>
+  # and switches /etc/ottr/home/.alate/current with one atomic rename, and keeps writing
+  # /etc/ottr/seed-commit next to the home (the paired alate change is ALAT-63). Safe while
+  # turns run: they keep the layer they pinned at spawn, and new turns pin the new layer, so
+  # a seed needs no restart. The profile keeps `docker compose up` from starting it. Usage:
   #   docker compose run --rm board-seed --repo <owner/name>
   #   docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data
   # then `docker compose restart server` (a restart re-derives the memory
   # backend from the env).
-  # --force: the data repo wins over board-local edits. Plugins install into
-  # /etc/ottr/home/.omp/plugins: the server's OTTR_BOARD_OMP_HOME, the HOME that the
-  # board's own omp reads plugins and user skills from.
+  # --force: the data repo wins over board-local edits. Plugins install into the layer the
+  # switch selects: the server's OTTR_BOARD_OMP_HOME tree, the HOME that the board's own
+  # omp reads plugins and user skills from.
   board-seed:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [seed]
@@ -228,7 +243,11 @@ services:
   # Alate server already runs keeps today's setup. The board reaches it at
   # http://alate:4570 on the default network; the dashboard is loopback-only on the
   # host. ALATE_URL and ALATE_API_KEY (server env above) seed Settings -> Alate, and a
-  # value saved there wins. The key never reaches a log.
+  # value saved there wins. The key never reaches a log. Alate provisions the agent
+  # layer as layers under /root/.alate/layers/<id> and switches /root/.alate/current
+  # with one atomic rename; it reads /root/.alate/in-use.json (the board's registry of
+  # layers that live runs pinned) before a clean-up, which keeps the current layer, the
+  # one before it, and every layer in the registry (docs/specs/agent-layer-switch.md).
   alate:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [alate]

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { modelRoles } from "./models.ts";
@@ -108,5 +108,38 @@ describe("default config path", () => {
 			else process.env.PI_CODING_AGENT_DIR = saved;
 		}
 		rmSync(pinned, { recursive: true, force: true });
+	});
+
+	test("the default path follows the board home's current agent layer", () => {
+		// Layer-following read (docs/specs/agent-layer-switch.md): the layer's copy
+		// answers when the board home resolves one; read-only, so the flat file and the
+		// links stay untouched. Without a link, the flat agent dir answers as today.
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		const savedPin = process.env.PI_CODING_AGENT_DIR;
+		const h = join(dir, `layered-${Math.random().toString(36).slice(2, 8)}`);
+		const layer = join(h, ".alate", "layers", "lay1");
+		mkdirSync(join(layer, ".omp", "agent"), { recursive: true });
+		symlinkSync(join("layers", "lay1"), join(h, ".alate", "current"));
+		writeFileSync(
+			join(layer, ".omp", "agent", "config.yml"),
+			"modelRoles: {default: layer/model}\n",
+		);
+		mkdirSync(join(h, ".omp", "agent"), { recursive: true });
+		writeFileSync(
+			join(h, ".omp", "agent", "config.yml"),
+			"modelRoles: {default: flat/model}\n",
+		);
+		delete process.env.PI_CODING_AGENT_DIR;
+		process.env.OTTR_BOARD_OMP_HOME = h;
+		try {
+			expect(modelRoles()).toEqual({ default: "layer/model" });
+			rmSync(join(h, ".alate", "current"));
+			expect(modelRoles()).toEqual({ default: "flat/model" });
+		} finally {
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+			if (savedPin === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedPin;
+		}
 	});
 });

@@ -420,6 +420,8 @@ export interface Turn {
 	error: string | null;
 	/** Model that served the run's assistant messages, e.g. "zai/glm-5.3-flash"; null when unseen. */
 	model: string | null;
+	/** Agent layer id (the `.alate/layers/<id>` folder name) this turn's omp run pinned; null when the run stayed on the flat home or the row predates the field. */
+	layer: string | null;
 }
 
 /** One finding a review recorded with propose_task. Ottr checks the best-ranked ones with a

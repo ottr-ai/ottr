@@ -6,6 +6,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,6 +29,7 @@ function fixture(): {
 	gitconfig: string;
 	gh: string;
 	agent: string;
+	board: string;
 } {
 	const dir = join(root, String(cases++));
 	const home = join(dir, "home");
@@ -38,6 +40,7 @@ function fixture(): {
 		gitconfig: join(etc, "gitconfig"),
 		gh: join(etc, "gh"),
 		agent: join(etc, "home", ".omp", "agent"),
+		board: join(etc, "home"),
 	};
 }
 
@@ -168,5 +171,47 @@ describe.skipIf(process.platform === "win32")("ottr-entry.sh", () => {
 		expect(r.code).toBe(0);
 		expect(r.stdout).toBe("ran\n");
 		expect(readFileSync(sibling, "utf8")).toBe(IDENTITY);
+	});
+
+	test("a seeded layer in the board home counts as seeded", () => {
+		const f = fixture();
+		const layer = join(f.board, ".alate", "layers", "x");
+		write(join(layer, ".omp", "agent", "config.yml"), MNEMOPI);
+		symlinkSync(layer, join(f.board, ".alate", "current"), "dir");
+		const r = run(
+			{
+				HOME: f.home,
+				PI_CODING_AGENT_DIR: f.agent,
+				OTTR_BOARD_OMP_HOME: f.board,
+			},
+			"echo",
+			"ran",
+		);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe("ran\n");
+		expect(r.stderr).toBe("");
+		expect(readdirSync(f.agent)).toEqual([]);
+	});
+
+	test("a broken current link in the board home keeps the warning", () => {
+		const f = fixture();
+		mkdirSync(join(f.board, ".alate"), { recursive: true });
+		symlinkSync(
+			join(f.board, ".alate", "layers", "gone"),
+			join(f.board, ".alate", "current"),
+			"dir",
+		);
+		const r = run(
+			{
+				HOME: f.home,
+				PI_CODING_AGENT_DIR: f.agent,
+				OTTR_BOARD_OMP_HOME: f.board,
+			},
+			"echo",
+			"ran",
+		);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe("ran\n");
+		expect(r.stderr).toContain(`ottr-entry: R5-1: ${f.agent} is not seeded`);
 	});
 });

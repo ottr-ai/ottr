@@ -1287,6 +1287,118 @@ describe("turn cost capture", () => {
 	});
 });
 
+describe("turn layer", () => {
+	test("startTurn persists and returns the layer; the default stays null", () => {
+		const store = open(join(root, "turn-layer-basic"));
+		const task = store.createTask("layered things");
+		const flat = store.startTurn(task.id, "work", "p", null);
+		expect(flat.layer).toBeNull();
+		const pinned = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"abc123",
+		);
+		expect(pinned.layer).toBe("abc123");
+		// The read-back row carries it: a fresh list sees the stored layer too.
+		expect(store.listTurns(task.id).map((t) => t.layer)).toEqual([
+			null,
+			"abc123",
+		]);
+		store.close();
+	});
+
+	test("listOpenTurnLayers returns distinct layers of open turns only", () => {
+		const store = open(join(root, "turn-layer-open"));
+		const task = store.createTask("open layers");
+		const a = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"a",
+		);
+		const a2 = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"a",
+		); // dup layer
+		const b = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"b",
+		);
+		store.startTurn(task.id, "work", "p", null); // flat, never listed
+		store.finishTurn(a.id, { endedAt: Date.now() }); // one "a" turn finished...
+		expect(store.listOpenTurnLayers()).toEqual(["a", "b"]); // ...its dup still holds "a"
+		store.finishTurn(a2.id, { endedAt: Date.now() });
+		expect(store.listOpenTurnLayers()).toEqual(["b"]);
+		store.finishTurn(b.id, { endedAt: Date.now() });
+		expect(store.listOpenTurnLayers()).toEqual([]);
+		store.close();
+	});
+
+	test("open adds the layer column to a database created before it", () => {
+		const dir = join(root, "layer-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
+			create: true,
+		});
+		// The turns schema as it was before the layer column existed.
+		legacy.exec(
+			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT, model TEXT, tokens_in INTEGER, tokens_out INTEGER, cache_read INTEGER, cache_write INTEGER, cost REAL)",
+		);
+		legacy.exec(
+			"INSERT INTO turns (task_id, kind, prompt, started_at) VALUES ('leg1', 'work', 'old turn', 1)",
+		);
+		legacy.close();
+		const store = open(dir);
+		const task = store.createTask("after layer migration");
+		const turn = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			"fresh-layer",
+		);
+		expect(turn.layer).toBe("fresh-layer");
+		// The pre-migration row reads as null (flat-home era), not as an error.
+		expect(store.listTurns(task.id).map((t) => t.layer)).toEqual([
+			"fresh-layer",
+		]);
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		expect(
+			raw
+				.query<{ layer: string | null }, []>(
+					"SELECT layer FROM turns WHERE task_id = 'leg1'",
+				)
+				.get()?.layer,
+		).toBeNull();
+		raw.close();
+	});
+});
+
 describe("done task context capture", () => {
 	const sid = "eeee0000-0000-0000-0000-000000000401";
 

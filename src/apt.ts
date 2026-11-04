@@ -6,6 +6,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { resolveAgentLayer } from "./layers.ts";
+
 // Debian package names (policy 5.6.1): a list entry can never turn into an apt-get option.
 const PACKAGE = /^[a-z0-9][a-z0-9+.-]+$/;
 // One path segment that cannot climb out of the workers dir; mirrors the New tab, which
@@ -21,11 +23,13 @@ export function workerProjects(home = homedir()): string[] {
 		.filter((p) => PROJECT.test(p));
 }
 
-/** Where alate provisions a project's package list. */
+/** Where alate provisions a project's package list, resolved for a read: under the home's
+ *  current agent layer when one exists, else the flat home (docs/specs/agent-layer-switch.md). */
 export function aptListPath(project: string, home = homedir()): string {
 	if (!PROJECT.test(project))
 		throw new Error(`apt: unsafe project name ${JSON.stringify(project)}`);
-	return join(home, ".ottr", "workers", project, "apt.txt");
+	const layer = resolveAgentLayer(home)?.dir ?? home;
+	return join(layer, ".ottr", "workers", project, "apt.txt");
 }
 
 /**
@@ -38,7 +42,7 @@ export async function eachWorkerProject(
 	ensure: (project: string, home: string) => Promise<string[]>,
 ): Promise<string[]> {
 	const lines: string[] = [];
-	for (const project of workerProjects(home)) {
+	for (const project of workerProjects(resolveAgentLayer(home)?.dir ?? home)) {
 		try {
 			lines.push(...(await ensure(project, home)));
 		} catch (err) {

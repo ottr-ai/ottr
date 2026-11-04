@@ -7,6 +7,12 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import {
+	addLayerUse,
+	pinnedAgentLayer,
+	removeLayerUse,
+	resolveAgentLayer,
+} from "./layers.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { ensureMemoryOverlay } from "./memory.ts";
 import { platform } from "./platform/index.ts";
@@ -333,17 +339,24 @@ export const MODEL_RESTORE = "This board cannot load the session's model";
  * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
  * runs with even when PI_CODING_AGENT_DIR pins the agent dir — omp skips the XDG state-root probe
  * under the override. Worker turns write to the shared home, the
- * board's own turns to boardOmpHome(), so the reader scans both. The shared one is
+ * board's own turns to boardOmpHome(), so the reader scans both; a pinned turn writes into its
+ * layer's shared-state `.omp/logs` link, so the reader also scans each home's current layer
+ * (moment-in-time, no pin). All of these resolve to the same flat logs through the link while
+ * a layer lives; the Set dedups them. The shared one is
  * worker-writable, but only the file name (never the body) is read; a plant can forge a file
  * name at worst.
  */
-const http400Dirs = (): string[] => [
-	...new Set(
-		[homedir(), boardOmpHome()].map((h) =>
-			join(h, ".omp", "logs", "http-400-requests"),
-		),
-	),
-];
+const http400Dirs = (): string[] => {
+	const homes = [homedir(), boardOmpHome()];
+	const roots = [...homes];
+	for (const h of homes) {
+		const layer = resolveAgentLayer(h);
+		if (layer !== null) roots.push(layer.dir);
+	}
+	return [
+		...new Set(roots.map((h) => join(h, ".omp", "logs", "http-400-requests"))),
+	];
+};
 
 /** Newest omp HTTP-400 log entry whose timestamp falls inside [from, to], as the file name,
  * or null. Best-effort: a missing or unreadable log is no evidence, the caller falls back to
@@ -819,6 +832,8 @@ interface RunHandle {
 	pid: number | null;
 	done: Promise<RunResult>;
 	kill(): Promise<void>;
+	/** Id of the agent layer the run pinned at start; null when it ran the flat home. */
+	layerId?: string | null;
 }
 
 /** Narrow seam for tests: anything that can launch a piped child process. */
@@ -1071,9 +1086,32 @@ export function startRun(o: {
 	const args = buildOmpArgs({ ...o, memoryConfig });
 	const startedAt = Date.now();
 
+	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
+	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
+	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
+	const layerHome = o.worker ? homedir() : boardOmpHome();
+	const pin = pinnedAgentLayer(layerHome, process.env.HINDSIGHT_API_URL);
+	if (!pin.ok && pin.reason !== "none")
+		sink.logMark(
+			`! agent layer pin failed (${pin.reason}); running the flat home\n`,
+		);
+	let unregistered = false;
+	const unregisterLayer = (): void => {
+		if (!pin.ok || unregistered) return;
+		unregistered = true;
+		removeLayerUse(layerHome, pin.layer.id);
+	};
+	if (pin.ok) addLayerUse(layerHome, pin.layer.id);
+	/** Shared-state overrides a pinned run carries on top of its dispatch's base env. */
+	const layerEnv = pin.ok
+		? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
+		: null;
+
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const startLocal = (): RunHandle => {
 		const launch: RunLauncher = o.launcher ?? spawn;
+		const base = boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env }));
+		if (layerEnv !== null) Object.assign(base, layerEnv);
 		const child = launch("omp", args, {
 			cwd: o.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -1084,7 +1122,7 @@ export function startRun(o: {
 				// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
 				// replacing it would strip PATH and the provider auth the child needs. HOME moves
 				// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
-				base: boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env })),
+				base,
 				stripBoard: o.stripBoard,
 			}),
 		});
@@ -1110,6 +1148,7 @@ export function startRun(o: {
 		const settle = (code: number | null): void => {
 			if (settled) return;
 			settled = true;
+			unregisterLayer();
 			resolveDone(
 				sink.result({
 					exitCode: code,
@@ -1139,6 +1178,7 @@ export function startRun(o: {
 				if (child.pid !== undefined) platform.killTree(child.pid);
 				return Promise.resolve();
 			},
+			layerId: pin.ok ? pin.layer.id : null,
 		};
 	};
 
@@ -1149,20 +1189,24 @@ export function startRun(o: {
 	// credentials do not (childEnv strips them), and neither does the board's GitHub
 	// token: work turns only commit locally, push credentials never leave the server (D6).
 	// serveWorker also strips every git host token from the worker container's own env.
-	// The pinned PI_CODING_AGENT_DIR and OTTR_BOARD_OMP_HOME stay out too (R5-1): a turn that
-	// ran the board's own agent dir or home could rewrite the config, skills and plugins the
-	// board's privileged turns execute, and a worker without its own shared store would find
-	// no credentials. The worker turn keeps the shared HOME.
+	// The board's pinned PI_CODING_AGENT_DIR and OTTR_BOARD_OMP_HOME stay out (R5-1): a turn
+	// that ran the board's own agent dir or home could rewrite the config, skills and plugins
+	// the board's privileged turns execute, and a worker without its own shared store would
+	// find no credentials. When the shared home holds an agent layer, the pin replaces the
+	// strip only with layer paths inside the shared home (HOME moves to the resolved layer,
+	// PI_CODING_AGENT_DIR to its agent dir); the board's private pins stay stripped.
+	const workerBase = withoutGitAuth({
+		...process.env,
+		...o.env,
+		GH_TOKEN: undefined,
+		PI_CODING_AGENT_DIR: undefined,
+		OTTR_BOARD_OMP_HOME: undefined,
+	});
+	if (layerEnv !== null) Object.assign(workerBase, layerEnv);
 	const env = childEnv({
 		sessionName: o.sessionName,
 		board: o.board ?? null,
-		base: withoutGitAuth({
-			...process.env,
-			...o.env,
-			GH_TOKEN: undefined,
-			PI_CODING_AGENT_DIR: undefined,
-			OTTR_BOARD_OMP_HOME: undefined,
-		}),
+		base: workerBase,
 		stripBoard: o.stripBoard,
 	});
 	const workerHandle = runWorker(
@@ -1184,8 +1228,12 @@ export function startRun(o: {
 		pid: null,
 		done: workerHandle.done
 			// The worker's own pid is in its container namespace; only the wall duration is local.
-			.then((r) => ({ ...r, dispatch: dispatch() }))
+			.then((r) => {
+				unregisterLayer();
+				return { ...r, dispatch: dispatch() };
+			})
 			.catch((err) => {
+				unregisterLayer();
 				if (!(err instanceof WorkerConnectError)) throw err;
 				// Fail closed: never run a worker turn in the server, which mounts server-only
 				// volumes (board config, tracker state, tokens, ssh keys). Settle as a lost worker:
@@ -1200,6 +1248,7 @@ export function startRun(o: {
 				});
 			}),
 		kill: async () => workerHandle.kill(),
+		layerId: pin.ok ? pin.layer.id : null,
 	};
 }
 

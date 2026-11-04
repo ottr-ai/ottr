@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { type Subprocess, stripANSI } from "bun";
 import { errmsg } from "./errmsg.ts";
+import { pinnedAgentLayer } from "./layers.ts";
 
 interface LoginView {
 	provider: string;
@@ -363,11 +364,17 @@ export const boardOmpHome = (): string => {
 /**
  * Env for every omp the board spawns for itself (merge, release review and release turns,
  * `omp models`, `omp usage`, `omp login`, the fork-analysis gateway): `base` with HOME moved to
- * boardOmpHome(). Worker turns keep the shared home.
+ * the board home's current agent layer when one resolves — pinnedAgentLayer also prepares the
+ * shared-state links and the memory-backend flip for these short-lived spawns — else to
+ * boardOmpHome() (docs/specs/agent-layer-switch.md, "Pinning"). Worker turns keep the shared
+ * home.
  */
 export const boardOmpEnv = (
 	base: Record<string, string | undefined> = process.env,
-): Record<string, string | undefined> => ({ ...base, HOME: boardOmpHome() });
+): Record<string, string | undefined> => {
+	const pin = pinnedAgentLayer(boardOmpHome(), process.env.HINDSIGHT_API_URL);
+	return { ...base, HOME: pin.ok ? pin.layer.dir : boardOmpHome() };
+};
 
 /**
  * The board's own omp agent dir: config.yml, agent.db, skills, extensions. omp resolves it from

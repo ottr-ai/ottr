@@ -21,7 +21,18 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { eachWorkerProject, PROJECT, workerProjects } from "./apt.ts";
+import { resolveAgentLayer } from "./layers.ts";
 import { boardOmpHome } from "./login.ts";
+
+/**
+ * The home a board list read targets: the current agent layer's dir when `<home>/.alate/current`
+ * resolves, else the flat home (docs/specs/agent-layer-switch.md, "Layer-following reads").
+ * Alate installs the `.ottr/workers` lists into every new layer and may prune the flat ones, so
+ * a read follows the layer at read time; a missing or broken link reads the flat home as today.
+ */
+export function layerHome(home: string): string {
+	return resolveAgentLayer(home)?.dir ?? home;
+}
 
 // PATH command names, unique within one file; a list entry can never escape its target dir.
 const NAME = /^[a-z0-9][a-z0-9._-]*$/;
@@ -101,11 +112,15 @@ export function parseToolsJson(text: string): ToolEntry[] {
 	return entries;
 }
 
-/** Where alate provisions a project's tool list. */
+/**
+ * Where alate provisions a project's tool list, resolved for a board read: under the home's
+ * current agent layer when one exists, else the flat home. The installs themselves (the
+ * `.ottr/tools` content) stay in the flat home; only the list read follows the layer.
+ */
 export function toolsListPath(project: string, home = homedir()): string {
 	if (!PROJECT.test(project))
 		throw new Error(`tools: unsafe project name ${JSON.stringify(project)}`);
-	return join(home, ".ottr", "workers", project, "tools.json");
+	return join(layerHome(home), ".ottr", "workers", project, "tools.json");
 }
 
 /** env.txt: one env var name per line; `#` comments and blank lines are ignored. */
@@ -121,17 +136,19 @@ export function parseEnvTxt(text: string): string[] {
 }
 
 /**
- * Where the board reads a project's env var name list. R5-1: the names decide which saved
+ * Where the board reads a project's env var name list, resolved for a read: under the home's
+ * current agent layer when one exists, else the flat home. R5-1: the names decide which saved
  * secrets a turn gets, so the default is the board's server-only home (compose: the
- * board-seed copy under OTTR_BOARD_OMP_HOME), never the shared home that turns can write.
+ * board-seed copy under OTTR_BOARD_OMP_HOME), never the shared home that turns can write —
+ * and the layer inside that board home, not its flat content.
  */
 export function envListPath(project: string, home = boardOmpHome()): string {
 	if (!PROJECT.test(project))
 		throw new Error(`env: unsafe project name ${JSON.stringify(project)}`);
-	return join(home, ".ottr", "workers", project, "env.txt");
+	return join(layerHome(home), ".ottr", "workers", project, "env.txt");
 }
 
-/** The names a project's env.txt lists; a missing file lists nothing. */
+/** The names a project's env.txt lists (envListPath resolves the layer); a missing file lists nothing. */
 function readEnvNames(project: string, home = boardOmpHome()): string[] {
 	const file = envListPath(project, home);
 	if (!existsSync(file)) return [];
@@ -146,6 +163,9 @@ export function listedEnvNames(
 	home = boardOmpHome(),
 ): { name: string; projects: string[] }[] {
 	const byName = new Map<string, string[]>();
+	// One resolve for the folder list and the reads: workerProjects has no layer
+	// resolution of its own (apt.ts), and a switch mid-read must not mix two layers.
+	home = layerHome(home);
 	for (const project of workerProjects(home)) {
 		let names: string[];
 		try {
@@ -384,6 +404,9 @@ export function turnEnvValues(
 	values: Record<string, string>,
 	home = boardOmpHome(),
 ): { env: Record<string, string>; missing: string[] } {
+	// One resolve for both reads (readEnvNames resolves again, a no-op on a layer dir):
+	// a switch mid-read must not mix two layers' name lists.
+	home = layerHome(home);
 	const names = [
 		...new Set([...readEnvNames("_all", home), ...readEnvNames(project, home)]),
 	];

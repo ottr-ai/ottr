@@ -8,7 +8,8 @@ Chrome sits at `/opt/google/chrome/chrome`, where the agent layer's chrome-devto
 server looks for it. Tools a project pins beyond the image (e.g. Godot) come from the data
 repo at runtime (see "System packages per project" below). The agent layer (rules,
 config, skills, plugins) is not in the image: alate
-provisions it from its data repo snapshot into the shared home volume (`/root`), and runs
+provisions it from its data repo snapshot into the shared home volume (`/root`) as
+layers under `/root/.alate` ([The agent layers](#the-agent-layers)), and runs
 chrome-devtools there headless, isolated and without Chrome's sandbox (workers run as
 root). Skill folders are statically scanned for prompt injection, exfiltration,
 credential harvesting, and supply-chain risk (NVIDIA SkillSpector, static mode) before
@@ -25,9 +26,13 @@ docker compose up -d
 ```
 
 The board also provisions on its own: every 5 minutes it reads the alate server's
-`GET /health`, and when the server reports an unprovisioned import (`pending`) and no
-turn is preparing or running, it calls the same provisioning API as
-**Settings → Alate → Provision**. A failed attempt waits an hour before it tries
+`GET /health`, and when the server reports an unprovisioned import (`pending`), it calls
+the same provisioning API as **Settings → Alate → Provision**. When the server reports
+agent-layer support (`layers: true`), the install lands in a new layer and the switch is
+one atomic rename, so the tick provisions while turns run
+(docs/specs/agent-layer-switch.md). On an older alate without that flag, the install
+writes the flat home, so the tick keeps the old gate and waits until no turn is preparing
+or running. A failed attempt waits an hour before it tries
 again; the error shows in the Alate settings section.
 
 At run time git authenticates with the board's GitHub token (asked for at
@@ -105,13 +110,17 @@ turns and work turns all get the new omp. Two parts do the work:
    build that changes the running image restarts that service at once
    (`up -d --no-deps --wait`). Such a restart needs no idle board: no turn calls the
    service — a worker installs the packages the shared home volume already holds, and the
-   board's provision trigger fires only when no turn runs. The checkout itself
+   board's provision trigger lands a layer with one atomic switch, so it needs no idle
+   board either (on an alate without layer support it still waits for one). The checkout
+   itself
    fast-forwards to `origin/main` only when it is clean and on `main`. Else it stays as it
    is, with one log line.
 
 The deploy also brings new Ottr commits from `main`. The run also seeds the board's agent
 layer when the env file sets `ALATE_DATA` or `ALATE_DATA_REPO`
-([Seed the board config](#seed-the-board-config)). The script's arguments go to
+([Seed the board config](#seed-the-board-config)). The seed installs a layer and switches
+it with one atomic rename, so it does not wait for turns; only the restart that follows
+still drains running turns. The script's arguments go to
 every `docker compose` call. Run it every hour. On Windows:
 
 ```powershell
@@ -198,7 +207,9 @@ Before a turn links a `none` tool, it checks the installed binary against
 A turn that runs in the server (a merge turn, or a work turn with no worker) does
 not use the shared home volume for tools. The server reads `tools.json` and
 installs the tools under its own home (`OTTR_BOARD_OMP_HOME`, `/etc/ottr/home` on
-compose). The board-seed one-off copies the lists there. The reason is R5-1: a
+compose). The seed installs the lists into the board home's layers
+([The agent layers](#the-agent-layers)), and the board reads them from the current
+layer at read time. The reason is R5-1: a
 worker turn can write the shared home, so a binary there must never run in the
 server. Until a seed runs, server-side turns get no tools.
 
@@ -210,8 +221,9 @@ A listed name with no value does not stop the turn; the card log names it.
 The board reads these lists only from its own home (`OTTR_BOARD_OMP_HOME`,
 `/etc/ottr/home` on compose), never from the shared home volume. The reason is
 R5-1: a turn can write the shared home, and a list there could give the secrets
-of project A to project B. The board-seed one-off copies the lists to the board
-home; the hourly deploy runs it when it seeds the board ("Seed the board
+of project A to project B. The seed installs the lists into the board home's
+layers ([The agent layers](#the-agent-layers)); the hourly deploy runs it when
+it seeds the board ("Seed the board
 config"). Until a seed runs, turns get no env values.
 
 ### Python packages per project
@@ -307,7 +319,8 @@ new list (its `WORKER_FILES`), no list reaches a home and every build is a no-op
   env file). The service serves its dashboard on `127.0.0.1:4570` on the host
   and `http://alate:4570` on the compose network. Its state lives on the
   `alate-state` volume, and it provisions the workers through the shared
-  `home` volume. `ALATE_URL` and `ALATE_API_KEY` pair the board with it: the
+  `home` volume, as layers under `/root/.alate`
+  ([The agent layers](#the-agent-layers)). `ALATE_URL` and `ALATE_API_KEY` pair the board with it: the
   board reads the two values only while **Settings -> Alate** holds no URL or
   key, and a value saved there wins at every boot. Set both in the env file,
   for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
@@ -521,17 +534,22 @@ planted skills, extensions or plugins would load into the board's privileged tur
 release review, release). The compose file pins the board's `PI_CODING_AGENT_DIR` to
 `/etc/ottr/home/.omp/agent` on the `board-config` volume. omp resolves its agent dir
 (config.yml, agent.db, skills, extensions, sessions) from that variable. The entry script
-creates this directory empty and logs an `ottr-entry: R5-1:` line while it is unseeded.
-The agent layer comes only from the trusted `board-seed` service, a one-off of the Alate
-image (see [Seed the board config](#seed-the-board-config)). The board decides the memory
+creates this directory empty and logs an `ottr-entry: R5-1:` line while nothing seeds it;
+the line stays away when the board home carries a seeded layer
+([The agent layers](#the-agent-layers)). The agent layer comes only from the trusted
+`board-seed` service, a one-off of the Alate image (see
+[Seed the board config](#seed-the-board-config)). The board decides the memory
 backend at spawn time, so the seeded `config.yml` needs no `memory:` backend line.
 The board's own config readers
 (`src/models.ts` model roles, the Settings Hindsight section, the sign-in store in
 `src/login.ts`) resolve the same variable. A worker dispatch strips the variable from the
-turn env: a worker keeps its shared home, and a turn that ran locally would otherwise hold
-the directory the board executes. The board's layer does not follow Alate provisions of
-the shared home. The hourly deploy seeds the layer again by itself when the env file names
-the data repo (see [Seed the board config](#seed-the-board-config)). The board shows a
+turn env, unless the dispatch pins the worker's own layer: the strip
+never carries the board's private agent dir into a turn (R5-1), and a pinned turn instead
+gets the layer dir of the shared home. The board's layer does not follow Alate provisions
+of the shared home. The hourly deploy seeds the layer again by itself when the env file names
+the data repo (see [Seed the board config](#seed-the-board-config)). The layer
+layout of both homes, the pinning, the shared-state links, the in-use registry and the
+clean-up rule are in [The agent layers](#the-agent-layers). The board shows a
 notice while the layer is not seeded, or while a model role's provider has no active
 sign-in in the board's store.
 
@@ -548,6 +566,58 @@ keeps the shared home. The board's own reads of the shared home keep
 `/root`: the apt lists, the shared credential store, and the shared `config.yml` (its
 memory backend is inert there; the spawn-time overlay decides).
 
+#### The agent layers
+
+Both homes hold the agent layer the same way (docs/specs/agent-layer-switch.md). In a
+home `H`, `H/.alate/layers/<id>/` holds one installed layer: exactly what an alate
+install writes today — the `.omp/agent` config, rules, skills and extensions,
+`.omp/plugins`, `.agents`, and the `.ottr/workers` lists. `H/.alate/current` is a symlink
+to one layer, and alate switches it with one atomic rename: before the switch, nothing a
+running turn reads changes. The shared home (`/root` on compose) and the board home
+(`OTTR_BOARD_OMP_HOME`, `/etc/ottr/home`) each keep their own layers and their own
+switch: alate provisions the workers' home, and `board-seed` provisions the board's.
+
+A layer never carries per-run or credential state, and a provision never writes it. That
+state stays at its flat path in the home, and at turn start the board links each entry
+inside the layer to the flat path (the link exists even when the target does not, so omp
+creates the target through the link):
+
+- `.omp/agent/agent.db`: the credential store, one per stack.
+- `.omp/agent/sessions`: `--resume` works across switches.
+- `.omp/oauth`: the provider token cache.
+- `.omp/logs`: the http-400 logs stay in one place.
+- `.cache`: test and package caches stay shared.
+
+When the flat home has one of `.gitconfig`, `.config/git`, `.config/gh`, `.ssh`,
+`.claude`, `.npm`, `.bun`, `.local`, the layer links it too; a missing one stays missing,
+as today. Everything else in the layer is layer content: a turn may write new files into
+its own layer home, and they die with the layer at clean-up.
+
+Every omp process the board spawns pins at start: worker and server turns, and the
+auxiliary spawns (`omp login`, `omp models`, `omp usage`, the fork-analysis gateway).
+The pin resolves `<home>/.alate/current` once with `realpath`, prepares the links, and
+runs omp with `HOME` and `PI_CODING_AGENT_DIR` inside the resolved layer directory for
+the run's whole life; a later switch never touches a pinned run. The board applies its
+`memory.backend` flip to the layer at pin time, because each new layer ships `mnemopi`.
+The entry script keeps its boot-time flip of the flat homes for the no-layer era and for
+spawns that stay flat.
+
+The board records each pinned layer id in `H/.alate/in-use.json` for the run's life and
+removes it when the run settles. Alate deletes a layer folder only when it is not
+`current`, not the layer `current` named before the last switch, and absent from
+`in-use.json`. A corrupt `in-use.json` never fails a run, and clean-up then still keeps
+the last two layers. The bound a pinned run can hit: a turn that outlives two switches
+(a 9 h mutation run can) loses its layer, the turn fails, and classification requeues it
+once, then parks it for a human.
+
+Error cases: no layer yet (no `current` link, or an alate that still writes flat) runs
+the flat home, exactly as before; a broken `current` link falls back to the flat home and
+logs a warning into the run log, and the next provision repairs the switch; a link or a
+flip that cannot be written falls back the same way, so a run never fails because of
+pinning. The provision tick installs a layer whenever the alate server reports layer
+support (`layers: true` in `GET /health`), with no idle wait; while it does not, the tick
+keeps the old idle gate, because that server writes the flat home under a running turn.
+
 #### Seed the board config
 
 Do these steps once after the first `docker compose up`. The hourly deploy repeats the
@@ -558,8 +628,10 @@ change also needs them: an existing stack starts with an empty `board-config` vo
    `docker compose run --rm board-seed --repo <owner/name>`.
    To use a local checkout of the data repo, run
    `docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data`.
-2. Restart the board: `docker compose restart server`.
-3. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
+   No restart follows: the seed installs a layer and switches `.alate/current`
+   ([The agent layers](#the-agent-layers)), turns pin the current layer at spawn, and
+   the board's config readers follow the current layer at read time.
+2. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
    keys (`ANTHROPIC_API_KEY`, ...) in the env.
 
 To seed with no hand step, set one of these in the compose env file:
@@ -571,29 +643,33 @@ To seed with no hand step, set one of these in the compose env file:
 
 At each hourly run, the updater reads the data repo's head commit and compares it with the
 commit recorded at `/etc/ottr/seed-commit` in the `board-config` volume. When they differ,
-it runs `board-seed` once and restarts the board when no turn runs, with the same hold as
-an image update. The record lands only after the board took the seed: when turns still run
-past the hold, the restart waits for a later run, and that run seeds again. A failed seed
-keeps the recorded commit, and
-the run exits non-zero. The updater takes the alate image from `ALATE_IMAGE` in the env
+it runs `board-seed` once, with no idle wait: the seed installs a layer and switches it
+with one atomic rename, so running turns keep the layer they pinned at spawn and new
+turns pin the new one ([The agent layers](#the-agent-layers)). The seed writes the record
+when it switches; a failed seed keeps the recorded commit, and
+the run exits non-zero. The restart that the updater may pair with the seed or a new
+image keeps the turn hold as before: a container restart ends its turns. The updater
+takes the alate image from `ALATE_IMAGE` in the env
 file, or from the running alate container. Set `ALATE_IMAGE` when no alate container runs.
 When `GH_TOKEN` is set with `ALATE_DATA_REPO`, the updater also probes the token's expiry
 and records the date (or `none`) at `/etc/ottr/seed-token-expires` in the same volume.
 
 The seed uses the same SkillSpector scan as worker provisioning, and a failed scan stops
 it. `--force` lets the data repo win over board-local edits. The seed installs the whole
-user layer under `/etc/ottr/home`, which is the board's omp home (`OTTR_BOARD_OMP_HOME`,
-see above). This includes the plugins in `/etc/ottr/home/.omp/plugins` and the user skills
-in `/etc/ottr/home/.agents/skills`.
+user layer as a new layer under `/etc/ottr/home/.alate/layers/<id>` and switches
+`/etc/ottr/home/.alate/current` (`OTTR_BOARD_OMP_HOME`, see above). This includes the
+plugins and the user skills in the layer, under `.omp/plugins` and `.agents/skills`.
 
 To verify the seed:
 
-- `docker compose logs server` shows no `ottr-entry: R5-1:` line about an unseeded agent
-  dir.
-- `docker compose exec server ls /etc/ottr/home/.omp/agent` lists `config.yml`, `rules`
-  and `skills`.
-- `docker compose exec server env HOME=/etc/ottr/home omp plugin list` lists the data
-  repo's plugins.
+- `docker compose exec server readlink /etc/ottr/home/.alate/current` prints a
+  `layers/<id>` path.
+- `docker compose exec server ls /etc/ottr/home/.alate/current/.omp/agent` lists
+  `config.yml`, `rules` and `skills`.
+- `docker compose exec server sh -c 'env HOME="$(readlink -f /etc/ottr/home/.alate/current)" omp plugin list'`
+  lists the data repo's plugins.
+- The boots after the first seed log no new `ottr-entry: R5-1:` line about an unseeded
+  agent dir.
 
 #### Credentials
 
@@ -601,7 +677,8 @@ Provider sign-in is one sign-in per provider, done on the board. The spec is
 `docs/specs/provider-credentials.md`.
 
 - The board store is `/etc/ottr/home/.omp/agent/agent.db` on the `board-config`
-  volume. It holds the provider's credential and its refresh token.
+  volume. It holds the provider's credential and its refresh token. The path stays
+  flat, and each layer links it ([The agent layers](#the-agent-layers)).
 - The worker store is `/root/.omp/agent/agent.db` in the shared home. It keeps
   no credential that the board manages.
 
@@ -666,7 +743,8 @@ board call that merges in a worker
 checkout must use the stub or pin the merge driver. On the omp side, omp
 writes the http-400 dump directory under `$HOME/.omp/logs` of the HOME it runs with,
 because its state root does not follow `PI_CODING_AGENT_DIR`. The reader in
-`src/runner.ts` thus scans the shared home and the board's omp home. The board reads only
+`src/runner.ts` thus scans the shared home and the board's omp home, plus each home's
+current layer at read time ([The agent layers](#the-agent-layers)). The board reads only
 file names there, never the request bodies, so a plant forges a name in one failure message
 at worst. Project skills and context files (`.agents/skills`, `AGENTS.md` in the checkout
 and its parents) stay worker-writable, the same as the main checkout's `.git/config`.
