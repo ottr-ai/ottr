@@ -65,9 +65,9 @@ Nothing in the board's flow depends on the script existing.
   service name, so the script maps service ↔ runner id without new config.
 - The server's own runner id is `local`. Its drain exists so server-local turns
   (merge, retro, board check, release publish, and work turns in local-spawn
-  mode) can stop while workers keep working. The update script does not use
-  `local` alone: the server step holds the whole board (below), which is
-  strictly stronger.
+  mode) can stop while workers keep working. The update script uses it in the
+  server step: server-local turns are children of the server process and must
+  finish before the restart, while worker turns detach and survive it.
 
 ### Drain state (src/app.ts)
 
@@ -204,23 +204,76 @@ block becomes:
    - The wait renews the runner hold each poll (one POST holds `DRAIN_MS`, the
      wait can reach `HOLD_LIMIT_MS`); a refused renewal ends the wait and the
      runner lands in the stuck path below.
-3. Server roll, only when no runner is stuck:
-   - Server image changed or a fresh seed waits: board-wide hold
-     (`POST /api/drain` with the commit subjects, as today), poll the turn
-     count to zero with the 1 h limit and the existing `releaseHold` behavior,
-     then `up -d --no-deps --wait server` (image changed) or
-     `compose restart server` (seed only, image unchanged). The recreate or
-     restart clears every in-memory drain, so no undrain is needed.
-   - Not stuck but nothing to do for the server: no server step.
-   - Any stuck runner: no server step; the server restart waits for a later
-     run, because a server restart kills the stuck worker's turn.
+3. Server step — the server restarts without a board-wide hold, and worker turns
+   survive it:
+   - Trigger: the server's image changed or a fresh seed waits, exactly as before.
+   - Hold `local` (per-runner hold) and wait until `local` turns reach 0, with the
+     1 h limit; server-local turns (merge, retro, board check, release publish)
+     are children of the server process and cannot survive the restart, so they
+     must finish first. Work turns on workers keep starting and running — the
+     queue never stalls for them.
+   - Hold every worker runner (per-runner holds). New dispatches defer (the cards
+     stay queued) for the seconds of the restart window; no board-wide notice
+     shows, because these are per-runner holds.
+   - Detach every busy worker through a worker exec (the worker's own token from
+     its container env): `POST /detach` makes the worker release the `/run`
+     streams and keep its omp children running. The result (exit code, stderr
+     tail) is captured when the child exits.
+   - A busy worker that cannot detach (an old image that has not rolled yet
+     answers 404) blocks the restart: release every hold, log that the server
+     step waits for a later run, and exit 0. The server update is not worth
+     killing that worker's turn.
+   - Recreate the server (`up -d --no-deps --wait server`) or restart it
+     (`compose restart server`, seed only). The old server's death drops the
+     detached streams; the children keep running on the workers. The new server's
+     boot recovery re-binds the detached runs to their open turn rows (below), so
+     no turn is lost and nothing is requeued for the restart. The recreate or
+     restart also clears every in-memory drain, so the held runners release
+     without an undrain call and queued cards start again.
+   - The script does not wait for worker turns at any point of the server step.
+
 4. Final `up -d --wait` (no `--no-deps`): starts a service that is not running
-   and waits for the server's health, as today. It recreates nothing (all
-   changed containers were rolled per service), and it never runs on a run
-   with a stuck runner: `compose up` would recreate the stuck worker and the
-   server, and that kills the stuck turn.
+   and waits for the server's health, as today. It runs only when every running
+   service now matches the build — each changed container was rolled per service
+   above, and the server stepped in step 3. When a worker is stuck or the
+   server step deferred, the run skips the whole-stack up and exits 0:
+   `compose up` would recreate exactly the containers whose turns are still
+   running un-detached.
 5. A run that rolled at least one worker but left another stuck exits 0 (like
    today's "waits for a later run"); a run whose seed failed exits 1 as today.
+
+### Worker detach protocol (src/workers.ts)
+
+A detached run keeps its omp child when the server's `/run` stream drops. The
+worker tracks every live run by its request id. Three token-authed routes
+(`x-otwr-token`, like `/run`):
+
+- `POST /detach`: every live run detaches — the worker closes the stream, the
+  child keeps running, and the abort handlers no longer kill it. The child's
+  final result (exit code, stderr tail) is captured when it exits.
+- `GET /detached`: the detached runs as
+  `[{id, cwd, pid, running, startedAt, result?: {exitCode, stderrTail}}]`.
+  Entries live in memory and expire after 24 h; a worker restart loses them, and
+  rows the server cannot re-bind settle as lost, as today.
+- `POST /detach/kill {id}`: kills one detached run (the cancel path for a
+  re-bound row).
+
+The library exports `detachedRuns(url, token)` for the server and tests.
+
+### Boot recovery re-binds detached runs (src/turn.ts, src/server.ts)
+
+`recoverRestarted`, before it settles an open worker turn (pid null) as lost,
+asks every configured worker for detached runs and matches one to the row by
+cwd (the row's worktree path). A match that still runs keeps the row open: the
+sweep pass polls it, and when the run finishes, the row settles through today's
+lost-and-resume path — the card resumes from the finished session and files the
+outcome, and the work the turn did is not thrown away. A match that already
+finished settles at once. No match keeps today's behavior. A detached
+completion is never a worker failure: the resume it triggers does not count
+toward the lost-worker parking. Cancelling a re-bound row kills the detached
+run through `/detach/kill`. The server reaches the workers through the exported
+`detachedRuns(url, token)`; the loop takes it as an optional op, so tests inject
+it.
 
 ### Mixed versions
 
@@ -232,8 +285,9 @@ Workers roll first, the server last. The only mixed pairs are:
   the server's requests to it stay compatible for one version in this
   direction; the worker API gains only optional response fields.
 - new server ↔ old worker: never persists. The server rolls after every worker
-  rolled, and the board-wide hold before the server step means no turn runs on
-  an old worker while the new server boots.
+  rolled, and the per-runner holds and detach before the server step mean no
+  turn of the roll runs on an old worker while the new server boots. A worker
+  that could not roll (stuck on the old image) defers the server step instead.
 
 Tests pin the order (worker recreate and health steps happen before any server
 `up`/`restart`; a worker health failure stops before the server step) and the
@@ -244,7 +298,11 @@ fallback (a board without `GET /api/drain` keeps the legacy whole-board flow).
 - Per runner: the same `HOLD_LIMIT_MS` (1 h). A runner that does not drain is
   released (undrained), left on the old image, and retried by the next hourly
   run. The roll continues with the other runners.
-- The server step keeps today's whole-board hold limit and release behavior.
+- The server step's `local` wait uses the same limit; an expired wait releases
+  the hold and defers the server step to the next hourly run.
+- The board never takes a board-wide hold in any step: the per-runner holds are
+  the only holds, and the server step's worker holds live for the seconds of
+  the restart window.
 
 ## Acceptance checks
 
@@ -259,10 +317,20 @@ fallback (a board without `GET /api/drain` keeps the legacy whole-board flow).
    `runner` behavior including the 400 for an unknown runner.
 3. Gates: `bun run check`, `bun test`, `bun run test:mutation:delta` over the
    changed lines.
-4. Smoke run on the compose stack (if a docker host is available in the
-   environment): start the stack, run a turn on worker-a, run the update; the
-   roll finishes worker-a's drain only after its turn ends, worker-b keeps
-   working, no failed turn, no board-wide hold during the worker roll.
+4. The card's acceptance, met end to end: an update while a turn runs on
+   worker-a finishes with no failed turn and no board-wide hold. The worker
+   roll never touches the other runners; the server step detaches worker-a's
+   turn, restarts the server, and the turn keeps running and completes — the
+   board-wide `POST /api/drain` is not called in any step, so no hourly hold
+   stalls the queue.
+5. `src/workers.test.ts` (or the worker tests): `/detach` keeps the child alive
+   and captures its result; `/detached` lists running and finished entries;
+   `/detach/kill` kills one entry; the abort of a detached run does not kill
+   the child.
+6. `src/turn.test.ts` (or the app tests): boot recovery re-binds a detached run
+   by cwd, keeps a running one open, settles a finished one without a worker
+   loss, and leaves an unmatched row on today's lost path; a cancelled re-bound
+   row kills the detached run.
 
 ## Non-goals
 

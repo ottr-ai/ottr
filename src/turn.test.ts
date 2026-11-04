@@ -76,6 +76,7 @@ import type {
 	RunResult,
 	WorkCheckRun,
 } from "./types.ts";
+import type { DetachedRun } from "./workers.ts";
 import {
 	isClean as gitIsClean,
 	statusFiles as realStatusFiles,
@@ -16154,5 +16155,205 @@ describe("per-runner drain gates (OTTR-454)", () => {
 			workers: { "worker-a": 2 },
 			preparing: 3,
 		});
+	});
+});
+
+describe("detached re-bind after the restart", () => {
+	const WT = "/srv/wt-x";
+	const RESTART_ERROR =
+		"the update restarted the board; the turn finished on the worker";
+	const RESTART_REASON =
+		"The update restarted the board and the turn finished on the worker - resuming automatically. Cancel to stop it instead.";
+
+	/** A running card with an open pid-null worker row whose worktree matches the worker answer. */
+	function seededWorkerRow(store: ProjectStore) {
+		const task = store.createTask("work please");
+		store.updateTask(task.id, {
+			state: "running",
+			stage: "in_progress",
+			sessionId: "sess-9",
+			worktree: WT,
+			branch: "ott/x",
+		});
+		store.startTurn(task.id, "work", "old prompt", null);
+		return task;
+	}
+
+	/** setup whose worker answers `runs` per probe; killDetached records into `killed`. */
+	function rebindSetup(
+		runs: () => DetachedRun[],
+		killed: { id: string; token: string | undefined }[] = [],
+	) {
+		return setup({
+			// Cap 0: the sweep ticks settle but start no resumed run.
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "HEAD" ? "abc123def" : null,
+			isClean: async () => true,
+			detachedRuns: async () => runs(),
+			killDetached: async (_url: string, token, id) => {
+				killed.push({ id, token });
+			},
+		});
+	}
+
+	test("recoverRestarted re-binds a running detached run and leaves the card running", async () => {
+		const running = true;
+		const { store, record, loop } = rebindSetup(() => [
+			{ id: "run-1", cwd: WT, pid: null, running, startedAt: 1 },
+		]);
+		const task = seededWorkerRow(store);
+
+		await loop.recoverRestarted();
+
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+		expect(record.runs).toHaveLength(0);
+		// The sweep keeps polling the watcher: a still-running run leaves the row open.
+		loop.schedule();
+		await flushPromises();
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+	});
+
+	test("a finished detached run settles at recovery through the resume route", async () => {
+		const { store, loop } = rebindSetup(() => [
+			{
+				id: "run-1",
+				cwd: WT,
+				pid: null,
+				running: false,
+				startedAt: 1,
+				result: { exitCode: 0, stderrTail: "" },
+			},
+		]);
+		const task = seededWorkerRow(store);
+
+		await loop.recoverRestarted();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe(RESTART_ERROR);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		// A detached completion is not a worker failure: the reason names the restart, and
+		// no lost-worker parking is involved.
+		expect(after.needsReason).toBe(RESTART_REASON);
+		expect(after.pendingPrompt).toBe(
+			restartResumePrompt({ sha: "abc123def", clean: true }),
+		);
+	});
+
+	test("an unmatched row keeps the lost settle", async () => {
+		const { store, loop } = rebindSetup(() => [
+			{
+				id: "run-1",
+				cwd: "/srv/other",
+				pid: null,
+				running: true,
+				startedAt: 1,
+			},
+		]);
+		const task = seededWorkerRow(store);
+
+		await loop.recoverRestarted();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe("tracker restarted");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBe(
+			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
+		);
+	});
+
+	test("an unreachable worker keeps the lost settle", async () => {
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
+			detachedRuns: async () => {
+				throw new Error("connection refused");
+			},
+		});
+		const task = seededWorkerRow(store);
+
+		await loop.recoverRestarted();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe("tracker restarted");
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("the sweep settles a re-bound row once the worker reports it finished", async () => {
+		let running = true;
+		const { store, loop } = rebindSetup(() => [
+			{ id: "run-1", cwd: WT, pid: null, running, startedAt: 1 },
+		]);
+		const task = seededWorkerRow(store);
+		await loop.recoverRestarted();
+
+		loop.schedule();
+		await flushPromises();
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+
+		running = false;
+		loop.schedule();
+		await flushPromises();
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe(RESTART_ERROR);
+		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect(store.getTask(task.id)!.needsReason).toBe(RESTART_REASON);
+
+		// The watcher is dropped: a further sweep settles nothing again.
+		loop.schedule();
+		await flushPromises();
+		expect(store.listTurns(task.id)).toHaveLength(1);
+	});
+
+	test("cancel of a re-bound row kills the detached run and drops the watcher", async () => {
+		const killed: { id: string; token: string | undefined }[] = [];
+		const { store, projects, loop } = rebindSetup(
+			() => [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }],
+			killed,
+		);
+		const task = seededWorkerRow(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await loop.cancel(e, task.id, true);
+
+		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
+		expect(store.getTask(task.id)!.state).toBe("idle");
+		// The watcher is gone: a further sweep probes and kills nothing again.
+		loop.schedule();
+		await flushPromises();
+		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
+	});
+
+	test("stop of a re-bound row kills the detached run and parks the card stopped", async () => {
+		const killed: { id: string; token: string | undefined }[] = [];
+		const { store, projects, loop } = rebindSetup(
+			() => [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }],
+			killed,
+		);
+		const task = seededWorkerRow(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
+
+		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.error).toBe("stopped");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.",
+		);
 	});
 });

@@ -107,6 +107,7 @@ import {
 	recommendsSteps,
 	UPDATE_HOLD_REASON,
 } from "./types.ts";
+import type { DetachedRun } from "./workers.ts";
 
 import type {
 	ArchReviewDelta,
@@ -430,6 +431,14 @@ export interface TurnOps {
 	pidAlive: typeof pidAlive;
 	/** Parsed once at boot from OTTR_WORKER_URLS; null = local spawn. Merge turns never use it (D6). */
 	workerTarget?: WorkerTarget | null;
+	/** OTTR-454: asks a worker for the runs its restart detached; absent (tests, local spawn) keeps the re-bind off. */
+	detachedRuns?: (url: string, token: string) => Promise<DetachedRun[]>;
+	/** OTTR-454: kills a detached run on its worker (/detach/kill). */
+	killDetached?: (
+		url: string,
+		token: string | undefined,
+		id: string,
+	) => Promise<void>;
 	startRun: typeof startRun;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
@@ -710,6 +719,45 @@ export function createTurnLoop(
 	 * publishReleaseCard to the caller's final card write: cancel refuses these keys, so a
 	 * cancel can neither lose to the tag/push nor be overwritten by "Released". */
 	const publishing = new Set<string>();
+	/** OTTR-454: worker runs re-bound after a restart, keyed "project/id". The sweep polls each
+	 * one and cancel kills it; nothing persists, so a server restart re-registers them from the
+	 * workers' answers in recoverRestarted. */
+	const detached = new Map<string, { url: string; runId: string }>();
+
+	/** Asks every configured worker for its detached runs and returns the one whose cwd matches
+	 * the card's worktree, or null: no ops wiring, no worktree, no match anywhere, or a worker
+	 * that cannot be reached (a probe failure is swallowed per worker). */
+	async function matchDetached(
+		worktree: string | null,
+	): Promise<{ run: DetachedRun; url: string } | null> {
+		if (!ops.detachedRuns || !ops.workerTarget || worktree === null)
+			return null;
+		for (const url of ops.workerTarget.urls) {
+			const runs = await ops
+				.detachedRuns(url, ops.workerTarget.token ?? "")
+				.catch(() => []);
+			const run = runs.find((r) => r.cwd === worktree);
+			if (run) return { run, url };
+		}
+		return null;
+	}
+
+	/** Settles a re-bound row whose detached run finished (at recovery or on a later sweep): the
+	 * same lost-and-resume route as sweepLostTurns, but the reason names the restart, and a
+	 * detached completion is not a worker failure. */
+	async function settleDetached(
+		e: TurnProject,
+		t: Task,
+		turnId: number | null,
+	): Promise<void> {
+		await settleLostTurn(
+			e,
+			t,
+			turnId,
+			"the update restarted the board; the turn finished on the worker",
+			"The update restarted the board and the turn finished on the worker - resuming automatically. Cancel to stop it instead.",
+		);
+	}
 
 	/** Shared settle-and-requeue for the lost-run sweep and the boot restart sweep: end the open
 	 * row (null turnId: the crash landed before the row existed, or the last row is already
@@ -854,6 +902,36 @@ export function createTurnLoop(
 					);
 					continue;
 				}
+				// OTTR-454: a pid-null row is a worker run the update detached instead of losing.
+				// Ask the workers before settling it lost: a still-running match keeps the row
+				// open and registers a watcher the sweep polls; a finished one settles through
+				// the resume route with the restart reason. No match (or an unreachable worker)
+				// keeps the lost settle below.
+				if (
+					ops.detachedRuns &&
+					t.cancelledAt === null &&
+					turn &&
+					turn.endedAt === null &&
+					turn.pid === null
+				) {
+					const match = await matchDetached(t.worktree);
+					if (match) {
+						if (match.run.running) {
+							detached.set(`${e.name}/${t.id}`, {
+								url: match.url,
+								runId: match.run.id,
+							});
+							appendLog(
+								e.store,
+								t.id,
+								`- re-bound detached run ${match.run.id} on ${new URL(match.url).host}; the card stays running`,
+							);
+							continue;
+						}
+						await settleDetached(e, t, turn.id);
+						continue;
+					}
+				}
 				// null turnId: the crash landed before store.startTurn created the row (git/apt
 				// preparation), or the last row is already settled — requeue without finishing a row.
 				try {
@@ -886,6 +964,34 @@ export function createTurnLoop(
 	async function sweepLostTurns(): Promise<void> {
 		// Same fabricated data: the lost-turn sweep runs on every schedule tick.
 		if (demoBoard()) return;
+		// OTTR-454: poll every re-bound detached run first. Still running: leave its row to the
+		// scan below untouched this tick. Finished or gone: settle through the restart-resume
+		// route and drop the watcher (only after the settle write, so a concurrent tick's scan
+		// cannot double-settle the row). An unreachable worker keeps the watcher and the row.
+		for (const [key, watch] of [...detached]) {
+			if (!ops.detachedRuns) break;
+			const runs = await ops
+				.detachedRuns(watch.url, ops.workerTarget?.token ?? "")
+				.catch(() => null);
+			// Probe failure is not proof of a loss: leave the row open and retry next tick.
+			if (runs === null) continue;
+			if (runs.find((r) => r.id === watch.runId)?.running) continue;
+			const sep = key.indexOf("/");
+			const e = projects.get(key.slice(0, sep));
+			const t = e?.store.getTask(key.slice(sep + 1));
+			const turn = t && e ? e.store.listTurns(t.id).at(-1) : null;
+			if (!e || !t || !turn || turn.endedAt !== null) {
+				detached.delete(key);
+				continue;
+			}
+			try {
+				await settleDetached(e, t, turn.id);
+				detached.delete(key);
+			} catch (err) {
+				// Keep the watcher: the next tick retries the settle through the same route.
+				logStoreError(e.store.name, err);
+			}
+		}
 		// Synchronous scan: claimed entries leave `running` before the first await, so a re-entrant
 		// schedule() cannot double-settle a row.
 		const lost: {
@@ -950,7 +1056,9 @@ export function createTurnLoop(
 					// stores pid null too but settles its row in runTurn's catch; and running.set precedes
 					// store.startTurn synchronously, so a sweep can never see an open pid-null row for a
 					// live local run. A pid-null lost row therefore has no live entry to abandon by
-					// construction — the abandonment block below is pid-path only.
+					// construction — the abandonment block below is pid-path only. A re-bound detached
+					// run is its own liveness proof: the watcher poll above settles it when it ends.
+					if (detached.has(key)) continue;
 					if (running.get(key)?.pid === null) continue;
 					lost.push({ e, id: t.id, turnId: turn.id, pid: null });
 					continue;
@@ -3506,6 +3614,36 @@ export function createTurnLoop(
 		if (task.cancelledAt !== null)
 			return { error: "task is cancelled", status: 409 };
 		const handle = running.get(`${store.name}/${id}`);
+		// OTTR-454: a re-bound detached run has no local handle, so Esc kills it on its worker
+		// and settles the row here — the same stopped park a live kill gets from runTurn.
+		const watch = detached.get(`${store.name}/${id}`);
+		if (!handle && !watch) return { error: "no turn is running", status: 409 };
+		if (watch) {
+			detached.delete(`${store.name}/${id}`);
+			try {
+				await ops.killDetached?.(
+					watch.url,
+					ops.workerTarget?.token,
+					watch.runId,
+				);
+			} catch (err) {
+				appendLog(store, id, `! stop killDetached: ${errmsg(err)}`);
+			}
+			const turn = store.listTurns(id).at(-1);
+			if (turn && turn.endedAt === null)
+				store.finishTurn(turn.id, {
+					endedAt: Date.now(),
+					exitCode: null,
+					error: "stopped",
+				});
+			store.updateTask(id, {
+				state: "needs_you",
+				needsReason:
+					"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.",
+			});
+			return { ok: true };
+		}
+		// A watcher row returned above, so handle is set here; the guard keeps TS exact.
 		if (!handle) return { error: "no turn is running", status: 409 };
 		stopping.add(`${store.name}/${id}`);
 		await handle.kill();
@@ -3530,6 +3668,21 @@ export function createTurnLoop(
 		if (publishing.has(`${store.name}/${id}`))
 			return { error: "release already publishing", status: 409 };
 		store.updateTask(id, { cancelledAt: Date.now() });
+		// OTTR-454: a re-bound detached run has no local handle; the worker kills it, and the
+		// flow below settles the card like any cancel without a live run.
+		const watch = detached.get(`${store.name}/${id}`);
+		if (watch) {
+			detached.delete(`${store.name}/${id}`);
+			try {
+				await ops.killDetached?.(
+					watch.url,
+					ops.workerTarget?.token,
+					watch.runId,
+				);
+			} catch (err) {
+				appendLog(store, id, `! cancel killDetached: ${errmsg(err)}`);
+			}
+		}
 		const handle = running.get(`${store.name}/${id}`);
 		if (handle) {
 			await handle.kill();

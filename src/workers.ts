@@ -41,6 +41,27 @@ export interface WorkerRequest {
 	env: Record<string, string>;
 }
 
+/**
+ * One live or detached run. A detached entry stays in runChildren (its keep-set), keeps
+ * the child when the stream drops, and gains `result` or `killed` when the child ends.
+ */
+interface ActiveRun extends DetachedRun {
+	/** Set by /detach: the stream is gone, and nothing on the dead request kills the child. */
+	detached: boolean;
+	/** Ends the client stream without touching the child; the push helper guards closed. */
+	closeStream(): void;
+}
+
+export interface DetachedRun {
+	id: string;
+	cwd: string;
+	pid: number | null;
+	running: boolean;
+	startedAt: number;
+	result?: { exitCode: number | null; stderrTail: string };
+	killed?: boolean;
+}
+
 export function serveWorker(opts: {
 	port?: number;
 	token?: string | null;
@@ -58,11 +79,25 @@ export function serveWorker(opts: {
 	sweepRoots?: readonly string[];
 	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
 	sweepGraceMs?: number;
+	/** Only for tests: the expiry of /detached entries instead of 24 h. */
+	detachedTtlMs?: number;
 }): Bun.Server<never> {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
 	// ends in " (deleted)" while the turn still has to push and report. Removed on close.
 	const runChildren = new Set<number>();
+	// Live /run children by the server's run id, plus the runs that detached from a dying
+	// server: a rolling restart drops the stream but must keep the child, and boot
+	// recovery re-binds it through /detached. Detached entries expire after 24 h; a
+	// worker restart loses them, and rows the server cannot re-bind settle as lost.
+	const active = new Map<string, ActiveRun>();
+	const detached = new Map<string, ActiveRun>();
+	const pruneDetached = (): void => {
+		const ttl = opts.detachedTtlMs ?? 24 * 60 * 60 * 1000;
+		const now = Date.now();
+		for (const [id, e] of detached)
+			if (now - e.startedAt > ttl) detached.delete(id);
+	};
 	return Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
@@ -89,6 +124,53 @@ export function serveWorker(opts: {
 							status: 500,
 						},
 					);
+				}
+			}
+			if (
+				url.pathname === "/detach" ||
+				url.pathname === "/detached" ||
+				url.pathname === "/detach/kill"
+			) {
+				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
+					return new Response("unauthorized", { status: 401 });
+				if (request.method === "POST" && url.pathname === "/detach") {
+					// The restart drops every /run stream: release them all, keep the children.
+					// The abort and cancel handlers no longer kill; the close handler records
+					// the result into the detached entry instead of a gone stream.
+					let n = 0;
+					for (const [id, e] of active) {
+						e.detached = true;
+						e.closeStream();
+						detached.set(id, e);
+						active.delete(id);
+						n++;
+					}
+					return Response.json({ detached: n });
+				}
+				if (request.method === "GET" && url.pathname === "/detached") {
+					pruneDetached();
+					return Response.json(
+						[...detached.values()].map(
+							// The internal detach flag and the stream closure stay off the wire.
+							({ closeStream: _c, detached: _d, ...entry }) => entry,
+						),
+					);
+				}
+				if (request.method === "POST" && url.pathname === "/detach/kill") {
+					pruneDetached();
+					let body: { id?: string };
+					try {
+						body = (await request.json()) as { id?: string };
+					} catch {
+						return new Response("bad json", { status: 400 });
+					}
+					const e =
+						typeof body.id === "string" ? detached.get(body.id) : undefined;
+					if (!e) return new Response("not found", { status: 404 });
+					if (e.pid !== null && e.running) platform.killTree(e.pid);
+					e.killed = true;
+					e.running = false;
+					return Response.json({ killed: true });
 				}
 			}
 			if (request.method !== "POST" || url.pathname !== "/run")
@@ -176,11 +258,26 @@ export function serveWorker(opts: {
 			const forgetChild = (): void => {
 				if (child.pid !== undefined) runChildren.delete(child.pid);
 			};
-			child.on("close", forgetChild);
 			// A spawn error never fires "close", so forget here too.
 			child.on("error", forgetChild);
 			if (child.pid !== undefined) runChildren.add(child.pid);
+			const entry: ActiveRun = {
+				id: body.id,
+				cwd: body.cwd,
+				pid: child.pid ?? null,
+				running: true,
+				startedAt: Date.now(),
+				detached: false,
+				closeStream: (): void => {},
+			};
+			active.set(entry.id, entry);
+			const forgetEntry = (): void => {
+				if (active.get(entry.id) === entry) active.delete(entry.id);
+			};
 			const killTree = (): void => {
+				// Detach releases the client on purpose: nothing on the dead request may kill
+				// the child afterwards, and the push helper's closed path lands here too.
+				if (entry.detached) return;
 				if (child.pid !== undefined) platform.killTree(child.pid);
 			};
 			// stderrTail stays reserved for omp's stderr: classify's no-stderr death rules
@@ -193,6 +290,7 @@ export function serveWorker(opts: {
 					.slice(-4000);
 			});
 			child.on("error", (err: Error) => {
+				forgetEntry();
 				stderrTail = `${stderrTail}${err.message}\n`
 					.replace(/\r\n/g, "\n")
 					.slice(-4000);
@@ -203,6 +301,16 @@ export function serveWorker(opts: {
 			let stopWatch = (): void => {};
 			const stream = new ReadableStream({
 				start(controller) {
+					entry.closeStream = (): void => {
+						if (closed) return;
+						closed = true;
+						stopWatch();
+						try {
+							controller.close();
+						} catch {
+							// already gone
+						}
+					};
 					// Lines omp wrote before the kill still drain from the pipe after the client
 					// left; a push into the gone stream throws from an event handler, which crashes
 					// this daemon (no crash trap) and every turn it runs.
@@ -236,6 +344,15 @@ export function serveWorker(opts: {
 					child.stdin?.end();
 					child.on("close", (code) => {
 						stopWatch();
+						forgetChild();
+						forgetEntry();
+						if (entry.detached) {
+							// No client listens any more: the result waits in /detached for boot
+							// recovery instead of a sentinel on a gone stream.
+							entry.running = false;
+							entry.result = { exitCode: code ?? null, stderrTail };
+							return;
+						}
 						if (partial.length > 0) push(`${partial}\n`);
 						push(
 							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail, host: hostname() } })}\n`,
@@ -575,4 +692,66 @@ export async function sweepWorker(
 	if (!Array.isArray(stopped))
 		throw new WorkerConnectError(`worker ${url}/sweep sent a non-array body`);
 	return stopped as SweptProcess[];
+}
+
+/** GET /detached from a worker: the runs that outlive a dropped /run stream. */
+export async function detachedRuns(
+	url: string,
+	token?: string,
+): Promise<DetachedRun[]> {
+	let res: Response;
+	try {
+		res = await fetch(`${url}/detached`, {
+			headers: {
+				...(token ? { "x-otwr-token": token } : {}),
+			},
+			// redirect: "manual": the worker token must never follow a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(10_000),
+		});
+	} catch (err) {
+		throw new WorkerConnectError(String(err));
+	}
+	if (res.status !== 200) {
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url}/detached responded ${res.status}${body ? `: ${body}` : ""}`,
+		);
+	}
+	const runs = (await res.json()) as unknown;
+	if (!Array.isArray(runs))
+		throw new WorkerConnectError(
+			`worker ${url}/detached sent a non-array body`,
+		);
+	return runs as DetachedRun[];
+}
+
+/** POST /detach/kill to a worker: the cancel path for a re-bound detached run. */
+export async function killDetached(
+	url: string,
+	token: string | undefined,
+	id: string,
+): Promise<void> {
+	let res: Response;
+	try {
+		res = await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(token ? { "x-otwr-token": token } : {}),
+			},
+			body: JSON.stringify({ id }),
+			// redirect: "manual": the worker token must never follow a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(10_000),
+		});
+	} catch (err) {
+		throw new WorkerConnectError(String(err));
+	}
+	if (res.status !== 200) {
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url}/detach/kill responded ${res.status}${body ? `: ${body}` : ""}`,
+		);
+	}
 }

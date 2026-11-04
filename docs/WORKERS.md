@@ -111,30 +111,46 @@ turns and work turns all get the new omp. Two parts do the work:
      A worker hostname that no runner lists (not in `OTTR_WORKER_URLS`, so no turn
      can reach it) recreates without a hold and without the turns wait.
 
-   The server rolls last, only when no worker is stuck, because a server restart
-   kills every turn it runs itself and every turn a worker streams to it:
+   The server rolls last, only when no worker is stuck, and with no board-wide
+   hold: the workers hold per runner for the seconds of the restart window, and
+   a busy worker keeps its turn alive by detaching it, so worker turns survive
+   the restart:
 
-   - When the server's image changed or a fresh seed waits, the script holds new
-     turns on the whole board (`POST /api/drain`, 30 minutes per call). The
-     running turns finish, and no new turn, merge or release starts. The card of
-     the **Check the board** button is the one exception: it only reads the board,
-     so it starts at once, and the restart waits for it like for any other turn.
-     The hold carries the subjects of the commits the restart brings, and the
-     board lists them under the update notice. The board's **Notices** shows the
-     hold. The script counts the turns every 30 s and renews the hold each time.
-     When no turn runs, it recreates the server (`up -d --no-deps --wait server`)
-     when its image changed, or restarts it (`restart server`) when only the seed
-     moved. The recreate or restart clears every hold, so no undrain is needed. A
-     hold lasts at most 1 hour; if turns still run then, the script ends the hold
-     (`DELETE /api/drain`), so the queued cards start, and a later run tries the
-     restart again. While it waits, the scheduled task starts no second run
-     (`-MultipleInstances
-     IgnoreNew` below), so the restart uses the image that this run built, and a
-     later run deploys newer commits. If the board refuses a renewal, the script
-     stops waiting, and the hold stops 30 minutes after the last renewal.
-   - When a worker is stuck, the server restart waits for a later run, and that
-     run seeds and records again. When the server's image is unchanged and no
+   - When the server's image changed or a fresh seed waits, the script holds
+     `local` (`POST /api/drain` with `runner: local`). The server's own turns
+     (merge turns, retro, the board check, the release publish) are children of
+     the server process and cannot survive the restart, so they finish first,
+     while work turns on the workers keep starting and running. The script polls
+     every 30 s and renews the hold each time. The hold lasts at most 1 hour; if
+     a local turn still runs then, the script ends the holds (DELETE
+     `?runner=` for `local` and every worker), so the queued cards start, and a
+     later run tries the restart again. If the board refuses a renewal, the
+     script stops waiting the same way. While it waits, the scheduled task
+     starts no second run (`-MultipleInstances IgnoreNew` below), so the
+     restart uses the image that this run built, and a later run deploys newer
+     commits.
+   - The script then holds every worker runner. The holds stop new dispatches
+     for the seconds of the restart window; the cards stay queued, and no
+     board-wide notice shows, because these are per-runner holds.
+   - Every busy worker detaches its running turn: the script runs, inside that
+     worker's own container, a `bun -e` snippet that calls its token-gated
+     `POST /detach`. The worker then releases the `/run` stream and keeps its
+     `omp` child running. An idle worker skips the detach call.
+   - A busy worker that cannot detach (an old worker image that has not rolled
+     yet answers 404) blocks the restart: the script releases every hold, logs
+     that the server step waits for a later run, and exits 0. No turn is
+     killed — the update is not worth killing that worker's turn.
+   - Finally the script recreates the server (`up -d --no-deps --wait server`)
+     when its image changed, or restarts it (`restart server`) when only the
+     seed moved. The server's death drops only the detached streams; the
+     workers' `omp` children keep running, and the new server's boot recovery
+     re-binds them to their open turns, so no turn is lost and nothing is
+     requeued for the restart. The recreate or restart clears every in-memory
+     hold, so no undrain is needed. When the server's image is unchanged and no
      seed waits, no server step runs.
+   - When the server step defers (a local turn that will not end, or a worker
+     that cannot detach), the run skips the final whole-stack up, leaves the
+     seed record unwritten, and a later run seeds and records again.
 
    The last step runs `up -d --wait` for the whole stack: it starts a service
    that is not running and waits for the server's health; it recreates nothing.
@@ -142,9 +158,9 @@ turns and work turns all get the new omp. Two parts do the work:
    Versions can mix only as old server with new worker, during a roll and after a
    stopped roll. The worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`)
    stays compatible for one version in this direction. New server with old worker
-   never persists: the server rolls after every worker rolled, and the whole-board
-   hold before the server step means no turn runs on an old worker while the new
-   server boots.
+   never persists: the server rolls after every worker rolled, and the per-runner
+   holds and the detach before the server step mean no undetached turn runs on an
+   old worker while the new server boots.
 
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule: it holds new turns on the

@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRunSink, type RunSink } from "./runner.ts";
 import {
+	detachedRuns,
+	killDetached,
 	matchSweepTarget,
 	runWorker,
 	serveWorker,
@@ -63,6 +65,16 @@ writeFileSync(
 	`require("node:fs").writeFileSync(process.argv[2], String(process.pid));
 setInterval(() => {}, 1000);
 setTimeout(() => process.exit(0), 60000);`,
+);
+
+// Linger omp: emits one stderr line, then exits on its own a bit later — the
+// detached run that finishes without a client attached.
+const lingerPath = join(dir, "linger-omp.js");
+writeFileSync(
+	lingerPath,
+	`process.stdout.write('{"type":"tick"}\\n');
+process.stderr.write("detach tail\\n");
+setTimeout(() => process.exit(7), 2000);`,
 );
 
 // Every test below that runs one of these fakes through serveWorker or runWorker spawns a real
@@ -1080,4 +1092,275 @@ describe("matchSweepTarget", () => {
 			matchSweepTarget("/workspace/other/proj/.worktrees/T5 (deleted)", roots),
 		).toEqual({ project: "proj", cardId: "T5" });
 	});
+});
+
+describe("detach protocol", () => {
+	// Real children boot unbounded under load: the same 30 s budget as above. The
+	// awaited conditions are process facts (pid liveness, /detached state) that no
+	// fake timer can drive; each poll is a check, not a guessed duration.
+	async function pollUntil(
+		cond: () => Promise<boolean> | boolean,
+		what: string,
+	): Promise<void> {
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			if (await cond()) return;
+			if (Date.now() > deadline) throw new Error(`${what}: never happened`);
+			await Bun.sleep(50);
+		}
+	}
+
+	const alive = (pid: number): boolean => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	async function run(
+		url: string,
+		token: string | undefined,
+		id: string,
+		argv: string[],
+		cwd: string = dir,
+	): Promise<Response> {
+		return await fetch(`${url}/run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(token ? { "x-otwr-token": token } : {}),
+			},
+			body: JSON.stringify({ id, argv, cwd, stdin: "", env: {} }),
+		});
+	}
+
+	interface Entry {
+		id: string;
+		cwd: string;
+		pid: number;
+		running: boolean;
+		startedAt: number;
+		result?: { exitCode: number | null; stderrTail: string };
+		killed?: boolean;
+	}
+
+	async function detachedList(url: string, token?: string): Promise<Entry[]> {
+		const res = await fetch(`${url}/detached`, {
+			headers: token ? { "x-otwr-token": token } : {},
+		});
+		expect(res.status).toBe(200);
+		return (await res.json()) as Entry[];
+	}
+
+	test("POST /detach closes the stream, keeps the child, and captures the result", async () => {
+		const url = start({ ompPath: process.execPath });
+		const res = await run(url, undefined, "d1", [lingerPath]);
+		expect(res.status).toBe(200);
+		const reader = res.body!.getReader();
+		// The child's first stdout line proves it spawned; no guessed delay.
+		await reader.read();
+		expect(await detachedList(url)).toEqual([]);
+		const detach = await fetch(`${url}/detach`, { method: "POST" });
+		expect(detach.status).toBe(200);
+		expect(await detach.json()).toEqual({ detached: 1 });
+		// The /run stream closed, with no sentinel on a released stream.
+		expect((await reader.read()).done).toBe(true);
+		// Listed while running, never killed, then finished with the child's own
+		// exit code and stderr tail.
+		let entry: Entry | undefined;
+		await pollUntil(async () => {
+			entry = (await detachedList(url))[0];
+			return entry !== undefined;
+		}, "entry");
+		expect(entry?.running).toBe(true);
+		expect(entry?.cwd).toBe(dir);
+		expect(typeof entry?.pid).toBe("number");
+		expect(entry?.killed).toBeUndefined();
+		expect(entry?.result).toBeUndefined();
+		await pollUntil(
+			async () => (await detachedList(url))[0]?.running === false,
+			"child exit",
+		);
+		entry = (await detachedList(url))[0];
+		expect(entry?.result).toEqual({ exitCode: 7, stderrTail: "detach tail\n" });
+		// An empty active set answers zero.
+		const again = await fetch(`${url}/detach`, { method: "POST" });
+		expect(await again.json()).toEqual({ detached: 0 });
+	}, 30_000);
+
+	test("POST /detach/kill kills the child and marks the entry; unknown id is 404", async () => {
+		const url = start({ ompPath: process.execPath });
+		const res = await run(url, undefined, "d2", [sleepPath]);
+		expect(res.status).toBe(200);
+		// No cancel before detach: a client abort would kill the child. The detach
+		// below closes the stream; drain it afterwards.
+		expect(
+			await (await fetch(`${url}/detach`, { method: "POST" })).json(),
+		).toEqual({ detached: 1 });
+		// The released stream carries what the child streamed live before the
+		// detach — its tick line — and nothing from the close: no partial tail and
+		// no sentinel, which /detached holds instead of the drained stream.
+		const drained = await res.text();
+		expect(drained.startsWith('{"type":"tick"}\n')).toBe(true);
+		expect(drained.includes(WORKER_DONE)).toBe(false);
+		let entry: Entry | undefined;
+		await pollUntil(async () => {
+			entry = (await detachedList(url))[0];
+			return entry !== undefined;
+		}, "entry");
+		expect(entry?.running).toBe(true);
+		const pid = entry!.pid;
+		expect(alive(pid)).toBe(true);
+		const miss = await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "nope" }),
+		});
+		expect(miss.status).toBe(404);
+		const kill = await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "d2" }),
+		});
+		expect(kill.status).toBe(200);
+		expect(await kill.json()).toEqual({ killed: true });
+		await pollUntil(() => !alive(pid), "kill landing");
+		expect((await detachedList(url))[0]?.killed).toBe(true);
+	}, 30_000);
+
+	test("/sweep does not stop a detached child", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-detach-sweep-"));
+		const cwd = join(root, "proj", ".worktrees", "T9");
+		mkdirSync(cwd, { recursive: true });
+		const pidFile = join(dir, "detach-sweep.pid");
+		const url = start({
+			ompPath: process.execPath,
+			sweepRoots: [root],
+			sweepGraceMs: 100,
+		});
+		try {
+			// The child writes no stdout, so Bun's client only resolves the /run
+			// response when the stream closes: start it un-awaited and let the pid
+			// file prove the spawn instead. The cwd is the worktree the sweep roots
+			// watch: its death mid-run is the merge-turn shape this test builds.
+			const resP = run(url, undefined, "d3", [sweepSleepPath, pidFile], cwd);
+			let ompPid = 0;
+			await pollUntil(() => {
+				try {
+					ompPid = Number(readFileSync(pidFile, "utf8"));
+					return Number.isInteger(ompPid) && ompPid > 0;
+				} catch {
+					return false;
+				}
+			}, "child pid file");
+			rmSync(root, { recursive: true, force: true });
+			// The merge-turn shape: the worktree is gone while the child still runs.
+			await pollUntil(() => {
+				try {
+					return readlinkSync(`/proc/${ompPid}/cwd`).endsWith(" (deleted)");
+				} catch {
+					return false;
+				}
+			}, "deleted cwd link");
+			expect(
+				await (await fetch(`${url}/detach`, { method: "POST" })).json(),
+			).toEqual({ detached: 1 });
+			// The detach closed the silent stream: the head resolves now, status 200,
+			// and the drain carries nothing — the child never wrote stdout and the
+			// close added no sentinel.
+			const res = await resP;
+			expect(res.status).toBe(200);
+			expect((await res.text()).length).toBe(0);
+			// The keep-set must cover a detached run: no leftover sweep, ever.
+			const sweep = await fetch(`${url}/sweep`, {
+				method: "POST",
+			});
+			expect(sweep.status).toBe(200);
+			expect(await sweep.json()).toEqual([]);
+			expect(alive(ompPid)).toBe(true);
+			// Clean up the 60 s sleeper.
+			await fetch(`${url}/detach/kill`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ id: "d3" }),
+			});
+			await pollUntil(() => !alive(ompPid), "kill landing");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("the detach routes answer 401 without the token", async () => {
+		const url = start({ token: "sekrit", ompPath: process.execPath });
+		expect((await fetch(`${url}/detach`, { method: "POST" })).status).toBe(401);
+		expect((await fetch(`${url}/detached`)).status).toBe(401);
+		expect(
+			(
+				await fetch(`${url}/detach/kill`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ id: "x" }),
+				})
+			).status,
+		).toBe(401);
+	}, 30_000);
+
+	test("detached entries expire after the ttl", async () => {
+		const url = start({ ompPath: process.execPath, detachedTtlMs: 1500 });
+		const res = await run(url, undefined, "d4", [lingerPath]);
+		expect(res.status).toBe(200);
+		await fetch(`${url}/detach`, { method: "POST" });
+		await res.text();
+		await pollUntil(
+			async () => (await detachedList(url)).length === 1,
+			"entry",
+		);
+		// Fake-timer-free: the ttl is a real worker feature against its own clock; the
+		// second poll names the expiry, not a guessed wait.
+		await pollUntil(
+			async () => (await detachedList(url)).length === 0,
+			"expiry",
+		);
+	}, 30_000);
+
+	test("detachedRuns parses the list and throws WorkerConnectError on non-200", async () => {
+		const url = start({ token: "sekrit" });
+		const runs = await detachedRuns(url, "sekrit");
+		expect(runs).toEqual([]);
+		// Wrong token: the worker answers 401, which surfaces as WorkerConnectError.
+		await expect(detachedRuns(url, "wrong")).rejects.toBeInstanceOf(
+			WorkerConnectError,
+		);
+		// Unreachable worker: same error class for the caller.
+		await expect(detachedRuns("http://127.0.0.1:9")).rejects.toBeInstanceOf(
+			WorkerConnectError,
+		);
+	}, 30_000);
+
+	test("killDetached posts the id and throws WorkerConnectError on non-200", async () => {
+		const url = start({ token: "sekrit", ompPath: process.execPath });
+		const res = await run(url, "sekrit", "d6", [sleepPath]);
+		expect(res.status).toBe(200);
+		await fetch(`${url}/detach`, {
+			method: "POST",
+			headers: { "x-otwr-token": "sekrit" },
+		});
+		await res.text();
+		let listed: Entry[] = [];
+		await pollUntil(async () => {
+			listed = await detachedList(url, "sekrit");
+			return listed.length === 1;
+		}, "entry");
+		await killDetached(url, "sekrit", "d6");
+		await pollUntil(
+			async () => (await detachedList(url, "sekrit"))[0]?.killed === true,
+			"kill landing",
+		);
+		// Unknown id: the worker answers 404, which surfaces as WorkerConnectError.
+		await expect(killDetached(url, "sekrit", "nope")).rejects.toBeInstanceOf(
+			WorkerConnectError,
+		);
+	}, 30_000);
 });

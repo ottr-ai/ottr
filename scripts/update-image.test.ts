@@ -125,8 +125,10 @@ function fakes(
 		 *  them the board answers 404 (one version older) and the run keeps the legacy
 		 *  whole-board flow. */
 		gets?: string[];
-		/** Exit codes of the worker healthz probes in call order, the last one repeating. */
+		/** Exit codes of the healthz probes in call order, the last one repeating. */
 		health?: number | number[];
+		/** Exit codes of the worker /detach execs in call order, the last one repeating. */
+		detach?: number | number[];
 		/** Runs after each poll wait: work that lands in the checkout mid-hold. */
 		onWait?: () => void;
 	} = {},
@@ -143,12 +145,15 @@ function fakes(
 	const holds = typeof o.hold === "number" ? [o.hold] : (o.hold ?? [0]);
 	const healths = typeof o.health === "number" ? [o.health] : (o.health ?? [0]);
 	const frees = typeof o.free === "number" ? [o.free] : (o.free ?? [0]);
+	const detaches =
+		typeof o.detach === "number" ? [o.detach] : (o.detach ?? [0]);
 	const gets = o.gets;
 	let counted = 0;
 	let holdCalls = 0;
 	let getCalls = 0;
 	let healthCalls = 0;
 	let freeCalls = 0;
+	let detachCalls = 0;
 	// A real epoch, not 0: the hold limit must measure the time since the hold, not the clock.
 	let clock = Date.UTC(2026, 9, 16);
 	const deps: Deps = {
@@ -161,6 +166,7 @@ function fakes(
 			const free = drain && line.includes("'DELETE'");
 			const get = drain && !free && !line.includes("'POST'");
 			const health = line.includes("/healthz");
+			const detach = !drain && !health && line.includes("'/detach'");
 			if (drain) drains.push(line);
 			if (args.includes("board-seed")) {
 				seedRuns.push(line);
@@ -200,7 +206,9 @@ function fakes(
 								? " -e <hold>"
 								: health
 									? " -e <health>"
-									: " -e <count>",
+									: detach
+										? " -e <detach>"
+										: " -e <count>",
 				),
 			);
 			if (args.includes("build")) {
@@ -310,6 +318,12 @@ function fakes(
 				const code = holds[Math.min(holdCalls++, holds.length - 1)] ?? 0;
 				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
 			}
+			if (detach) {
+				const code =
+					detaches[Math.min(detachCalls++, detaches.length - 1)] ?? 0;
+				// A failed detach prints the worker's HTTP status, like the other scripts.
+				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
+			}
 			if (args.includes("restart"))
 				return o.restart
 					? { code: o.restart, out: o.restartOut ?? "" }
@@ -399,6 +413,20 @@ const HEALTH = "compose -f c.yml exec -T server bun -e <health>";
 const RUNNING3 = "server\nworker-a\nworker-b";
 const UP_SVC = (s: string) => `compose -f c.yml up -d --no-deps --wait ${s}`;
 const RESTART = "compose -f c.yml restart server";
+const DETACH_SVC = (s: string) =>
+	`compose -f c.yml exec -T ${s} bun -e <detach>`;
+/** A GET /api/drain answer like st(), but with a `local` turn count. */
+const stl = (a: number, b: number, local: number) =>
+	JSON.stringify({
+		drainUntil: null,
+		drainCommits: null,
+		preparing: 0,
+		runners: [
+			{ id: "worker-a", url: "http://worker-a:8787", until: null, turns: a },
+			{ id: "worker-b", url: "http://worker-b:8787", until: null, turns: b },
+			{ id: "local", url: null, until: null, turns: local },
+		],
+	});
 const COMPARE_SVC = (s: string) => [
 	`compose -f c.yml ps -q ${s}`,
 	`inspect -f {{json .ImageManifestDescriptor}} ${s}`,
@@ -1215,7 +1243,7 @@ describe("rolling restart", () => {
 			running: RUNNING3,
 			gets: [st(1, 0), st(0, 0)],
 		});
-		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
 			BUILD,
 			CFGJSON,
@@ -1236,18 +1264,27 @@ describe("rolling restart", () => {
 			HEALTH,
 			FREE,
 			...COMPARE_SVC("server"),
+			// The server step holds local, reads the runners fresh (its first
+			// turns poll), and holds both workers per runner; the workers are
+			// idle, so no detach runs, and the recreate takes the new image.
 			HOLD,
-			COUNT,
+			GET,
+			HOLD,
+			HOLD,
 			UP_SVC("server"),
 			UP,
 			PRUNE,
 		]);
 		// Each hold names only its own runner, and the renewal re-holds worker-a;
-		// the server step holds the whole board with the commit subjects.
+		// the server step holds local first, then the workers. No board-wide hold
+		// with commit subjects exists any more, and COUNT_TURNS never runs.
 		expect(postBody(f, 0)).toEqual({ runner: "worker-a" });
 		expect(postBody(f, 1)).toEqual({ runner: "worker-a" });
 		expect(postBody(f, 2)).toEqual({ runner: "worker-b" });
-		expect(postBody(f, 3)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
+		expect(postBody(f, 3)).toEqual({ runner: "local" });
+		expect(postBody(f, 4)).toEqual({ runner: "worker-a" });
+		expect(postBody(f, 5)).toEqual({ runner: "worker-b" });
+		expect(f.calls).not.toContain(COUNT);
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
 		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
@@ -1410,8 +1447,12 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			...COMPARE_SVC("server"),
+			// The step holds local, reads the runners fresh, then holds the idle
+			// worker-a; no runner lists local, so the wait ends at once, and no
+			// detach runs.
 			HOLD,
-			COUNT,
+			GET,
+			HOLD,
 			UP_SVC("server"),
 			UP,
 			PRUNE,
@@ -1471,17 +1512,144 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
+			// Seed only, so the server restarts instead of recreating; the idle
+			// workers hold and skip their detach.
 			HOLD,
-			COUNT,
+			GET,
+			HOLD,
+			HOLD,
 			RESTART,
 			UP,
 			write,
 			PRUNE,
 		]);
-		expect(postBody(f, 0)).toEqual({
-			commits: [`board agent layer seed ${head.slice(0, 12)}`],
-		});
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(f.calls).not.toContain(COUNT);
 		expect(f.seedWrites).toEqual([write]);
+	}, 60_000);
+
+	test("a busy worker detaches before the server restarts, and the idle one skips", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		// The images are unchanged, so the workers do not roll and worker-a stays
+		// busy into the server step; the seed alone moves the server.
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(1, 0)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// The busy worker detaches in its own container; the idle worker-b gets no
+		// detach call, and no board-wide count ever runs.
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
+			"compose -f c.yml ps -q alate",
+			"inspect -f {{.Config.Image}} alate123",
+			seedRun,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			...COMPARE_SVC("worker-b"),
+			...COMPARE_SVC("server"),
+			HOLD,
+			GET,
+			HOLD,
+			HOLD,
+			DETACH_SVC("worker-a"),
+			RESTART,
+			UP,
+			write,
+			PRUNE,
+		]);
+		expect(f.calls).not.toContain(COUNT);
+		// No board-wide hold: every POST names one runner, and none carries commits.
+		for (const body of f.drains
+			.filter((l) => l.includes("'POST'"))
+			.map((_, i) => postBody(f, i)))
+			expect(body).toHaveProperty("runner");
+	}, 60_000);
+
+	test("a busy worker detaches before the server recreates with a new image", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// worker-b's image changed and it is idle; the first read is idle, so
+		// worker-b rolls at once, and only the server step's fresh read sees
+		// worker-a busy (it keeps its image, so it never rolls).
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [stl(0, 0, 0), stl(2, 0, 0)],
+		});
+		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			UP_SVC("worker-a"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("worker-b"),
+			HOLD,
+			UP_SVC("worker-b"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("server"),
+			HOLD,
+			GET,
+			HOLD,
+			HOLD,
+			DETACH_SVC("worker-a"),
+			UP_SVC("server"),
+			UP,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a worker that cannot detach defers the server step, and every hold releases", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(1, 0)],
+			detach: 1, // an old worker image answers 404 on /detach
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// The turn stays alive: no server recreate or restart, and the whole-stack
+		// up waits for a later run like the run itself.
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP);
+		// Every hold released: local and both workers, so queued cards start again.
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a cannot detach its turn (HTTP 404): the holds end, and the server step waits for a later run",
+		);
+		// The seed record waits for the run that actually rolls the server.
+		expect(f.seedWrites).toEqual([]);
 	}, 60_000);
 
 	test("a preparing turn holds every runner idle until it starts", async () => {
@@ -1683,9 +1851,9 @@ describe("rolling restart", () => {
 		);
 		expect(f.logs.join("\n")).not.toContain("cannot end");
 		// One POST holds 30 min: worker-a's initial hold, three renewals, worker-b's
-		// initial hold, and the board-wide server hold.
+		// initial hold, and the server step's holds for local and both workers.
 		const posts = f.drains.filter((l) => l.includes("'POST'"));
-		expect(posts).toHaveLength(6);
+		expect(posts).toHaveLength(8);
 	}, 60_000);
 
 	test("a runner body that is no JSON keeps the whole-board flow", async () => {
@@ -1870,21 +2038,30 @@ describe("rolling restart", () => {
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
-			gets: [st(0, 0)],
-			turns: "1", // the server step's board-wide hold never reaches zero
+			gets: [stl(0, 0, 1)], // the local hold never reaches zero turns
 			seedCode: 1,
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
 		});
 		expect(
-			await updateImage(main, ["-f", "c.yml"], f.deps, {
+			await updateImage(main, ["-f c.yml"], f.deps, {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(1);
-		// The expired hold waits for a later run: no server recreate, no seed record.
+		// The expired local hold waits for a later run: no server recreate, no seed
+		// record, and every hold released so queued cards start again.
+		expect(f.waits).toHaveLength(120);
 		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
 		expect(f.seedWrites).toEqual([]);
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+		expect(f.logs.join("\n")).toContain(
+			"local keeps a turn after 60 min: the holds end, and the server step waits for a later run",
+		);
 	}, 60_000);
 
 	test("a server hold that expires waits for a later run without a recreate", async () => {
@@ -1893,15 +2070,19 @@ describe("rolling restart", () => {
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
-			gets: [st(0, 0)],
-			turns: "1",
+			gets: [stl(0, 0, 1)], // the local hold never reaches zero turns
 		});
-		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		// The whole-board hold expired, so the server step and the whole-stack up
-		// wait for a later run: the success line does not print.
+		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
+		// The local hold expired, so the server step and the whole-stack up wait for
+		// a later run: the success line does not print.
+		expect(f.waits).toHaveLength(120);
 		expect(f.calls).not.toContain(UP_SVC("server"));
 		expect(f.calls).not.toContain(UP);
+		expect(f.calls).not.toContain(COUNT);
 		expect(f.logs.join("\n")).not.toContain("the stack runs main at");
+		expect(f.logs.join("\n")).toContain(
+			"the server step waits for a later run",
+		);
 	}, 60_000);
 
 	test("a failed whole-stack up stops the run and leaves the seed unwritten", async () => {

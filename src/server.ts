@@ -48,7 +48,11 @@ import {
 	type TurnLoop,
 } from "./turn.ts";
 import type { LatestImage } from "./types.ts";
-import { sweepWorker as sweepWorkerRequest } from "./workers.ts";
+import {
+	detachedRuns as detachedRunsRequest,
+	killDetached as killDetachedRequest,
+	sweepWorker as sweepWorkerRequest,
+} from "./workers.ts";
 import {
 	archReviewDelta,
 	branchMergedOrGone,
@@ -444,6 +448,10 @@ const loop = createTurnLoop(projects, {
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).
 	workerTarget,
 	startRun,
+	// OTTR-454: the restart re-bind asks the workers for their detached runs and kills one on
+	// cancel; with no workerTarget configured the loop never probes.
+	detachedRuns: (url, token) => detachedRunsRequest(url, token),
+	killDetached: (url, token, id) => killDetachedRequest(url, token, id),
 	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
 		turnEnv(project, model, shared.envValues, { home: workersHome }),
