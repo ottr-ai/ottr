@@ -730,9 +730,13 @@ export function createTurnLoop(
 	async function matchDetached(
 		worktree: string | null,
 	): Promise<{ run: DetachedRun; url: string } | null> {
+		// ponytail: recoverRestarted re-checks ops.detachedRuns before calling, so mutants
+		// firing only while the op is absent cannot change the outcome here.
 		if (!ops.detachedRuns || !ops.workerTarget || worktree === null)
 			return null;
 		for (const url of ops.workerTarget.urls) {
+			// ponytail: token is string|undefined so ?? equals ||, and the catch's []
+			// contents carry no cwd — neither mutant can change which run matches.
 			const runs = await ops
 				.detachedRuns(url, ops.workerTarget.token ?? "")
 				.catch(() => []);
@@ -907,6 +911,8 @@ export function createTurnLoop(
 				// open and registers a watcher the sweep polls; a finished one settles through
 				// the resume route with the restart reason. No match (or an unreachable worker)
 				// keeps the lost settle below.
+				// ponytail: matchDetached re-guards ops.detachedRuns, so this first conjunct
+				// is redundant; the remaining conjuncts are pinned by the re-bind tests.
 				if (
 					ops.detachedRuns &&
 					t.cancelledAt === null &&
@@ -970,6 +976,8 @@ export function createTurnLoop(
 		// cannot double-settle the row). An unreachable worker keeps the watcher and the row.
 		for (const [key, watch] of [...detached]) {
 			if (!ops.detachedRuns) break;
+			// ponytail: a watcher exists only because workerTarget answered at recovery, so
+			// the optional chain cannot see null, and ?? equals || for string|undefined.
 			const runs = await ops
 				.detachedRuns(watch.url, ops.workerTarget?.token ?? "")
 				.catch(() => null);
@@ -980,6 +988,8 @@ export function createTurnLoop(
 			const e = projects.get(key.slice(0, sep));
 			const t = e?.store.getTask(key.slice(sep + 1));
 			const turn = t && e ? e.store.listTurns(t.id).at(-1) : null;
+			// ponytail: the t && e lookup above turns a missing project or task into a null
+			// turn, so !e and !t are backstopped by !turn.
 			if (!e || !t || !turn || turn.endedAt !== null) {
 				detached.delete(key);
 				continue;
@@ -989,6 +999,8 @@ export function createTurnLoop(
 				detached.delete(key);
 			} catch (err) {
 				// Keep the watcher: the next tick retries the settle through the same route.
+				// ponytail: log-only — the watcher's fate (kept) is decided by the delete
+				// that never ran.
 				logStoreError(e.store.name, err);
 			}
 		}
@@ -3621,6 +3633,8 @@ export function createTurnLoop(
 		if (watch) {
 			detached.delete(`${store.name}/${id}`);
 			try {
+				// ponytail: a watcher exists only because workerTarget answered at recovery,
+				// so the optional chain on the token cannot see null here.
 				await ops.killDetached?.(
 					watch.url,
 					ops.workerTarget?.token,
@@ -3674,6 +3688,8 @@ export function createTurnLoop(
 		if (watch) {
 			detached.delete(`${store.name}/${id}`);
 			try {
+				// ponytail: a watcher exists only because workerTarget answered at recovery,
+				// so the optional chain on the token cannot see null here.
 				await ops.killDetached?.(
 					watch.url,
 					ops.workerTarget?.token,

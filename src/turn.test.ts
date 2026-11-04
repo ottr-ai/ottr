@@ -16357,3 +16357,524 @@ describe("detached re-bind after the restart", () => {
 		);
 	});
 });
+
+describe("detached re-bind survivor pins", () => {
+	const WT = "/srv/wt-x";
+	const URL_A = "http://worker-a:8787";
+	const URL_B = "http://worker-b:8787";
+	const RESTART_ERROR =
+		"the update restarted the board; the turn finished on the worker";
+	const RESTART_REASON =
+		"The update restarted the board and the turn finished on the worker - resuming automatically. Cancel to stop it instead.";
+	const TRACKER_REASON =
+		"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.";
+	const STOP_REASON =
+		"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
+	const RESTART_RESUME = restartResumePrompt({ sha: "abc123def", clean: true });
+
+	const run1 = (running: boolean): DetachedRun => ({
+		id: "run-1",
+		cwd: WT,
+		pid: null,
+		running,
+		startedAt: 1,
+	});
+	const finished1 = (): DetachedRun => ({
+		...run1(false),
+		result: { exitCode: 0, stderrTail: "" },
+	});
+
+	/** A running card, worktree WT, with an open worker row (pid null unless opts.pid). */
+	function row(
+		store: ProjectStore,
+		opts: {
+			pid?: number | null;
+			cancelled?: boolean;
+			worktree?: string | null;
+			noRow?: boolean;
+		} = {},
+	) {
+		const task = store.createTask("work please");
+		store.updateTask(task.id, {
+			state: "running",
+			stage: "in_progress",
+			sessionId: "sess-9",
+			worktree: opts.worktree === undefined ? WT : opts.worktree,
+			branch: "ott/x",
+			...(opts.cancelled ? { cancelledAt: Date.now() } : {}),
+		});
+		if (!opts.noRow)
+			store.startTurn(task.id, "work", "old prompt", opts.pid ?? null);
+		return task;
+	}
+
+	function endRow(store: ProjectStore, id: string, error: string) {
+		store.finishTurn(store.listTurns(id)[0]!.id, {
+			endedAt: Date.now(),
+			exitCode: null,
+			error,
+		});
+	}
+
+	/** setup with probe/kill recording; `answer(nth, url)` scripts each probe result. */
+	function watchSetup(
+		answer: (nth: number, url: string) => DetachedRun[],
+		opts: {
+			urls?: string[];
+			/** null sends no token at all (WorkerTarget.token absent). */
+			token?: string | null;
+			kill?: false;
+			killError?: string;
+		} = {},
+	) {
+		const probes: { url: string; token: string }[] = [];
+		const killed: { url: string; token: string | undefined; id: string }[] = [];
+		let nth = 0;
+		const store = freshStore();
+		const record = baseRecord();
+		// A target so a redone non-forced cancel (clean tree) removes the worktree.
+		const projects = new Map([
+			[store.name, { ...fakeProject(store), target: "origin/main" }],
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				workerTarget: {
+					urls: opts.urls ?? [URL_A],
+					...(opts.token === null ? {} : { token: opts.token ?? "tok" }),
+				},
+				targetSha: async (_mainPath: string, ref: string) =>
+					ref === "HEAD" ? "abc123def" : null,
+				detachedRuns: async (url: string, token: string) => {
+					probes.push({ url, token });
+					return answer(nth++, url);
+				},
+				...(opts.kill === false
+					? {}
+					: {
+							killDetached: async (
+								url: string,
+								token: string | undefined,
+								id: string,
+							) => {
+								killed.push({ url, token, id });
+								if (opts.killError) throw new Error(opts.killError);
+							},
+						}),
+			}),
+		);
+		return { store, record, projects, loop, probes, killed };
+	}
+
+	test("a live agent pid owns the card and is never probed for detached runs", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store, { pid: 4344 });
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+		const log = logText(store, task.id);
+		expect(log).toContain(
+			"agent pid 4344 survived the tracker restart; leaving the card running",
+		);
+		expect(log).not.toContain("re-bound detached run");
+	});
+
+	test("a cancelled card is never re-bound; its interrupted cancel finishes", async () => {
+		const { store, record, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store, { cancelled: true });
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("idle");
+		// The dead cancel was redone: the worktree is gone and the card is idle.
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("a running card with no turn row requeues without probing", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store, { noRow: true });
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBe(TRACKER_REASON);
+		expect(after.pendingPrompt).toBe(RESTART_RESUME);
+	});
+
+	test("an ended pid-null row requeues without probing", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store);
+		endRow(store, task.id, "earlier");
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		expect(store.listTurns(task.id)[0]!.error).toBe("earlier");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe(RESTART_RESUME);
+	});
+
+	test("an ended row with a live pid requeues too", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store, { pid: 4344 });
+		endRow(store, task.id, "earlier");
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		expect(store.listTurns(task.id)[0]!.error).toBe("earlier");
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("a null-worktree row is never probed; it keeps the lost settle", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store, { worktree: null });
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([]);
+		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("a missing worker target keeps the lost settle without probing", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				detachedRuns: async () => [run1(true)],
+				// No workerTarget: the re-bind has nowhere to ask.
+			}),
+		);
+		const task = row(store);
+
+		await loop.recoverRestarted();
+
+		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("matchDetached asks workers in order and re-binds the first cwd match", async () => {
+		const { store, loop, probes } = watchSetup(
+			(_nth, url) => (url === URL_A ? [] : [run1(true)]),
+			{ urls: [URL_A, URL_B] },
+		);
+		const task = row(store);
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([
+			{ url: URL_A, token: "tok" },
+			{ url: URL_B, token: "tok" },
+		]);
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+		expect(logText(store, task.id)).toContain(
+			"- re-bound detached run run-1 on worker-b:8787; the card stays running",
+		);
+	});
+
+	test("a failing worker probe falls through to the next worker at recovery", async () => {
+		const { store, loop, probes } = watchSetup(
+			(_nth, url) => {
+				if (url === URL_A) throw new Error("connection refused");
+				return [finished1()];
+			},
+			{ urls: [URL_A, URL_B] },
+		);
+		const task = row(store);
+
+		await loop.recoverRestarted();
+
+		expect(probes).toEqual([
+			{ url: URL_A, token: "tok" },
+			{ url: URL_B, token: "tok" },
+		]);
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.error).toBe(RESTART_ERROR);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBe(RESTART_REASON);
+		expect(after.pendingPrompt).toBe(RESTART_RESUME);
+	});
+
+	test("an absent worker token probes with the empty token", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)], {
+			token: null,
+		});
+		const task = row(store);
+
+		await loop.recoverRestarted();
+		expect(probes).toEqual([{ url: URL_A, token: "" }]);
+
+		// The sweep's watcher poll probes with the same empty token.
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toEqual([
+			{ url: URL_A, token: "" },
+			{ url: URL_A, token: "" },
+		]);
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+	});
+
+	test("the lost scan leaves a re-bound row to its watcher", async () => {
+		const { store, loop, probes } = watchSetup(() => [run1(true)]);
+		const task = row(store);
+		await loop.recoverRestarted();
+		expect(probes).toHaveLength(1);
+
+		loop.schedule();
+		await flushPromises();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.endedAt).toBeNull();
+		expect(turn.error).toBeNull();
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("running");
+		expect(after.needsReason).toBeNull();
+		expect(probes).toHaveLength(2);
+		expect(logText(store, task.id)).not.toContain("lost agent process");
+	});
+
+	test("a vanished run settles through the restart route and drops the watcher", async () => {
+		const { store, loop, probes } = watchSetup((nth) =>
+			nth === 0 ? [run1(true)] : [],
+		);
+		const task = row(store);
+		await loop.recoverRestarted();
+
+		loop.schedule();
+		await flushPromises();
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.error).toBe(RESTART_ERROR);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBe(RESTART_REASON);
+		expect(probes).toHaveLength(2);
+
+		// The watcher is gone: no further probes, no second settle.
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toHaveLength(2);
+		expect(store.listTurns(task.id)).toHaveLength(1);
+	});
+
+	test("a probe failure keeps its watcher while other rows settle", async () => {
+		const { store, loop, probes } = watchSetup((nth) => {
+			if (nth < 2) return [run1(true)];
+			if (nth === 2) throw new Error("worker down mid-watch");
+			return [finished1()];
+		});
+		const task1 = row(store);
+		const task2 = row(store);
+		await loop.recoverRestarted();
+		expect(probes).toHaveLength(2);
+
+		loop.schedule();
+		await flushPromises();
+		// The failed probe leaves its own row to its watcher; the other row settles.
+		// (Watcher order follows the store's task order, so don't pin which is which.)
+		const openId =
+			store.listTurns(task1.id)[0]!.endedAt === null ? task1.id : task2.id;
+		const settledId = openId === task1.id ? task2.id : task1.id;
+		expect(store.listTurns(openId)[0]!.endedAt).toBeNull();
+		expect(store.getTask(openId)!.state).toBe("running");
+		expect(store.listTurns(settledId)[0]!.error).toBe(RESTART_ERROR);
+		expect(store.getTask(settledId)!.state).toBe("queued");
+		expect(probes).toHaveLength(4);
+
+		// The kept watcher settles its row on the next tick.
+		loop.schedule();
+		await flushPromises();
+		expect(store.listTurns(openId)[0]!.error).toBe(RESTART_ERROR);
+		expect(store.getTask(openId)!.state).toBe("queued");
+		expect(probes).toHaveLength(5);
+	});
+
+	test("a stale watcher on an ended row drops itself without a second settle", async () => {
+		const { store, loop, probes } = watchSetup((nth) =>
+			nth === 0 ? [run1(true)] : [finished1()],
+		);
+		const task = row(store);
+		await loop.recoverRestarted();
+		endRow(store, task.id, "manual");
+
+		loop.schedule();
+		await flushPromises();
+
+		expect(store.listTurns(task.id)[0]!.error).toBe("manual");
+		expect(probes).toHaveLength(2);
+
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toHaveLength(2);
+	});
+
+	test("a watcher whose project vanished drops itself without settling", async () => {
+		const { store, projects, loop, probes } = watchSetup((nth) =>
+			nth === 0 ? [run1(true)] : [finished1()],
+		);
+		const task = row(store);
+		await loop.recoverRestarted();
+		projects.delete(store.name);
+
+		loop.schedule();
+		await flushPromises();
+
+		// The row is untouched: no project object exists to settle through.
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.getTask(task.id)!.state).toBe("running");
+		expect(probes).toHaveLength(2);
+
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toHaveLength(2);
+	});
+
+	test("stop of a re-bound row works without a killDetached op", async () => {
+		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+			kill: false,
+		});
+		const task = row(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
+
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.error).toBe("stopped");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(STOP_REASON);
+		expect(logText(store, task.id)).not.toContain("! stop killDetached");
+	});
+
+	test("a failed stop kill logs the failure and still parks the card", async () => {
+		const { store, projects, loop, killed } = watchSetup(() => [run1(true)], {
+			killError: "boom",
+		});
+		const task = row(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
+
+		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
+		const turn = store.listTurns(task.id)[0]!;
+		expect(turn.error).toBe("stopped");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(STOP_REASON);
+		expect(logText(store, task.id)).toContain("! stop killDetached: boom");
+	});
+
+	test("stop of an already-ended watched row keeps that row's error", async () => {
+		const { store, projects, loop, probes, killed } = watchSetup(() => [
+			run1(true),
+		]);
+		const task = row(store);
+		await loop.recoverRestarted();
+		endRow(store, task.id, "manual");
+		const e = projects.get(store.name)!;
+
+		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
+
+		expect(store.listTurns(task.id)[0]!.error).toBe("manual");
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
+		// The watcher is dropped with the stop: no further probes.
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toHaveLength(1);
+	});
+
+	test("cancel drops the watcher before any further probe", async () => {
+		const { store, projects, loop, probes, killed } = watchSetup(() => [
+			run1(true),
+		]);
+		const task = row(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await loop.cancel(e, task.id, true);
+
+		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
+		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect(probes).toHaveLength(1);
+
+		loop.schedule();
+		await flushPromises();
+		expect(probes).toHaveLength(1);
+		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
+	});
+
+	test("a failed cancel kill logs the failure and the cancel proceeds", async () => {
+		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+			killError: "boom",
+		});
+		const task = row(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await expect(loop.cancel(e, task.id, true)).resolves.toEqual({
+			removed: true,
+		});
+
+		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect(logText(store, task.id)).toContain("! cancel killDetached: boom");
+	});
+
+	test("cancel works without a killDetached op", async () => {
+		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+			kill: false,
+		});
+		const task = row(store);
+		await loop.recoverRestarted();
+		const e = projects.get(store.name)!;
+
+		await expect(loop.cancel(e, task.id, true)).resolves.toEqual({
+			removed: true,
+		});
+
+		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect(logText(store, task.id)).not.toContain("! cancel killDetached");
+	});
+
+	test("a plain cancel of a live local run never touches the detach path", async () => {
+		const { store, projects, loop, killed } = watchSetup(() => [run1(true)]);
+		const task = store.createTask("local work");
+		let kills = 0;
+		loop.running.set(`${store.name}/${task.id}`, {
+			pid: 4242,
+			done: Promise.resolve(),
+			kill: async () => {
+				kills += 1;
+			},
+		});
+		const e = projects.get(store.name)!;
+
+		await loop.cancel(e, task.id, true);
+
+		expect(kills).toBe(1);
+		expect(killed).toEqual([]);
+		expect(store.getTask(task.id)!.state).toBe("idle");
+		// No detach-path error was logged: the task's log file was never even created.
+		expect(existsSync(store.logPath(task.id))).toBe(false);
+	});
+});
