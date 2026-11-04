@@ -3659,10 +3659,8 @@ dialog.lightbox {
 .lightbox .frame {
 	position: relative;
 }
-.lightbox .page {
-	position: absolute;
-	top: 50%;
-	transform: translateY(-50%);
+.lightbox .page,
+.lightbox .zoomable .zoom-btn {
 	display: grid;
 	place-items: center;
 	width: 40px;
@@ -3674,11 +3672,34 @@ dialog.lightbox {
 	color: #fff;
 	cursor: pointer;
 }
+.lightbox .page {
+	position: absolute;
+	top: 50%;
+	transform: translateY(-50%);
+}
 .lightbox .page.prev {
 	left: 8px;
 }
 .lightbox .page.next {
 	right: 8px;
+}
+/* Lightbox zoom controls: same round buttons as the page arrows, stacked top right. */
+.lightbox .zoomable {
+	position: relative;
+}
+.lightbox .zoomable img {
+	user-select: none;
+	-webkit-user-drag: none;
+}
+.lightbox .zoomable .zoom-btn {
+	position: absolute;
+	right: 8px;
+}
+.lightbox .zoomable .zoom-btn.zoom-in {
+	top: 8px;
+}
+.lightbox .zoomable .zoom-btn.zoom-out {
+	top: 56px;
 }
 /* Screenshot file name, overlaid on the image foot like the page buttons. */
 .lightbox .caption {

@@ -96,6 +96,7 @@ import {
 	useFlash,
 	useQuota,
 	windowGone,
+	ZoomableImage,
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
 import {
@@ -1921,7 +1922,9 @@ function ComposeDialog({
 				label="Attached image"
 				className="lightbox"
 			>
-				{viewing !== null && <img src={viewing} alt="Attachment, full size" />}
+				{viewing !== null && (
+					<ZoomableImage src={viewing} alt="Attachment, full size" />
+				)}
 			</Modal>
 		</>
 	);
@@ -8569,8 +8572,9 @@ export function Drawer({
 			>
 				{viewing !== null && (
 					<div className="frame">
-						<img
-							src={viewing.list[viewing.index]}
+						{/* index is always in range: thumbs set it and turnPage wraps. */}
+						<ZoomableImage
+							src={viewing.list[viewing.index] ?? ""}
 							alt="Attachment, full size"
 						/>
 						{viewing.names?.[viewing.index] !== undefined && (

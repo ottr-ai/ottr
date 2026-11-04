@@ -298,6 +298,21 @@ const ICON_PATHS = {
 	),
 	// lucide activity (ISC): the dev-only Check the board button
 	activity: <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />,
+	// feather zoom-in / zoom-out (MIT): lightbox image zoom buttons
+	"zoom-in": (
+		<>
+			<circle cx="11" cy="11" r="8" />
+			<line x1="21" y1="21" x2="16.65" y2="16.65" />
+			<line x1="11" y1="8" x2="11" y2="14" />
+			<line x1="8" y1="11" x2="14" y2="11" />
+		</>
+	),
+	"zoom-out": (
+		<>
+			<circle cx="11" cy="11" r="8" />
+			<line x1="21" y1="21" x2="16.65" y2="16.65" />
+		</>
+	),
 } satisfies Record<string, ReactNode>;
 
 /** Every glyph name the board's Icon set knows. */
@@ -888,5 +903,265 @@ export function ProjectLogo({ project }: { project: ProjectView }) {
 		>
 			<ProjectTag project={project} />
 		</a>
+	);
+}
+
+export type ZoomState = { scale: number; x: number; y: number };
+
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 8;
+const ZOOM_STEP = 1.25;
+const ZOOM_TAP_TARGET = 2.5;
+const ZOOM_TAP_MS = 300;
+const ZOOM_TAP_PX = 20;
+
+/** Anchor-preserving zoom: the image point under the cursor stays under it after the scale change. */
+export function zoomAt(
+	z: ZoomState,
+	rect: { left: number; top: number },
+	clientX: number,
+	clientY: number,
+	nextScale: number,
+): ZoomState {
+	const s = clamp(nextScale, ZOOM_MIN, ZOOM_MAX);
+	const px = (clientX - rect.left - z.x) / z.scale;
+	const py = (clientY - rect.top - z.y) / z.scale;
+	return {
+		scale: s,
+		x: clientX - rect.left - px * s,
+		y: clientY - rect.top - py * s,
+	};
+}
+
+/** Keeps the zoomed image covering its box: translate is clamped, scale 1 snaps back to identity. */
+export function clampPan(z: ZoomState, w: number, h: number): ZoomState {
+	if (z.scale <= 1) return { scale: 1, x: 0, y: 0 };
+	return {
+		scale: z.scale,
+		x: clamp(z.x, w * (1 - z.scale), 0),
+		y: clamp(z.y, h * (1 - z.scale), 0),
+	};
+}
+
+/** Wheel zoom factor from a wheel event's deltaY, per the shared lightbox zoom constants. */
+function wheelFactor(dy: number, deltaMode: number): number {
+	const y = deltaMode === 1 ? dy * 16 : dy;
+	return Math.exp(-y * 0.002);
+}
+
+/**
+ * Zoom-able lightbox image: mouse wheel, trackpad pinch, touch pinch, drag pan,
+ * double-click/double-tap, plus keyboard-reachable zoom buttons. Pure hand-rolled,
+ * no dependencies; reset to identity whenever the source changes.
+ */
+export function ZoomableImage({ src, alt }: { src: string; alt: string }) {
+	const wrapRef = useRef<HTMLDivElement>(null);
+	const imgRef = useRef<HTMLImageElement>(null);
+	const [zoom, setZoom] = useState<ZoomState>({ scale: 1, x: 0, y: 0 });
+	const [panning, setPanning] = useState(false);
+	const pointers = useRef(new Map<number, { x: number; y: number }>());
+	const pinch = useRef<{
+		dist: number;
+		mid: { x: number; y: number };
+		zoom: ZoomState;
+	} | null>(null);
+	const pan = useRef<{ px: number; py: number; zoom: ZoomState } | null>(null);
+	const lastTap = useRef<{
+		t: number;
+		x: number;
+		y: number;
+		type: string;
+	} | null>(null);
+
+	useEffect(() => {
+		setZoom({ scale: 1, x: 0, y: 0 });
+	}, [src]);
+
+	const applyZoom = useCallback((next: ZoomState) => {
+		const img = imgRef.current;
+		if (img === null) return;
+		setZoom(clampPan(next, img.offsetWidth || 1, img.offsetHeight || 1));
+	}, []);
+
+	const zoomBy = useCallback(
+		(factor: number) => {
+			const img = imgRef.current;
+			if (img === null) return;
+			const rect = img.getBoundingClientRect();
+			applyZoom(
+				zoomAt(
+					zoom,
+					rect,
+					rect.left + rect.width / 2,
+					rect.top + rect.height / 2,
+					zoom.scale * factor,
+				),
+			);
+		},
+		[applyZoom, zoom],
+	);
+
+	useEffect(() => {
+		const wrap = wrapRef.current;
+		if (wrap === null) return;
+		const onWheel = (e: WheelEvent) => {
+			const img = imgRef.current;
+			if (img === null) return;
+			// Trackpad pinch arrives as ctrl+wheel; always stop the browser page zoom.
+			e.preventDefault();
+			const rect = img.getBoundingClientRect();
+			applyZoom(
+				zoomAt(
+					zoom,
+					rect,
+					e.clientX,
+					e.clientY,
+					zoom.scale * wheelFactor(e.deltaY, e.deltaMode),
+				),
+			);
+		};
+		wrap.addEventListener("wheel", onWheel, { passive: false });
+		return () => wrap.removeEventListener("wheel", onWheel);
+	}, [applyZoom, zoom]);
+
+	const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+		if (e.target !== imgRef.current) return;
+		pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+		wrapRef.current?.setPointerCapture(e.pointerId);
+		const prev = lastTap.current;
+		if (
+			prev !== null &&
+			prev.type === e.pointerType &&
+			e.timeStamp - prev.t < ZOOM_TAP_MS &&
+			Math.hypot(e.clientX - prev.x, e.clientY - prev.y) < ZOOM_TAP_PX
+		) {
+			lastTap.current = null;
+			if (zoom.scale > 1) {
+				setZoom({ scale: 1, x: 0, y: 0 });
+			} else {
+				const img = imgRef.current;
+				if (img !== null) {
+					const rect = img.getBoundingClientRect();
+					applyZoom(zoomAt(zoom, rect, e.clientX, e.clientY, ZOOM_TAP_TARGET));
+				}
+			}
+			return;
+		}
+		lastTap.current = {
+			t: e.timeStamp,
+			x: e.clientX,
+			y: e.clientY,
+			type: e.pointerType,
+		};
+		if (pointers.current.size === 1 && zoom.scale > 1) {
+			pan.current = { px: e.clientX, py: e.clientY, zoom };
+			setPanning(true);
+		} else if (pointers.current.size === 2) {
+			const [a, b] = [...pointers.current.values()];
+			if (a === undefined || b === undefined) return;
+			pinch.current = {
+				dist: Math.hypot(a.x - b.x, a.y - b.y),
+				mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+				zoom,
+			};
+			pan.current = null;
+		}
+	};
+
+	const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+		if (!pointers.current.has(e.pointerId)) return;
+		pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+		const pts = [...pointers.current.values()];
+		if (pinch.current !== null && pts.length >= 2) {
+			const [a, b] = pts;
+			if (a === undefined || b === undefined) return;
+			const dist = Math.hypot(a.x - b.x, a.y - b.y);
+			const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+			const img = imgRef.current;
+			if (img === null || pinch.current.dist === 0) return;
+			const rect = img.getBoundingClientRect();
+			const next = zoomAt(
+				pinch.current.zoom,
+				rect,
+				mid.x,
+				mid.y,
+				pinch.current.zoom.scale * (dist / pinch.current.dist),
+			);
+			applyZoom({
+				...next,
+				x: next.x + mid.x - pinch.current.mid.x,
+				y: next.y + mid.y - pinch.current.mid.y,
+			});
+			pinch.current = { dist, mid, zoom: pinch.current.zoom };
+		} else if (pan.current !== null && pts.length === 1) {
+			applyZoom({
+				...pan.current.zoom,
+				x: pan.current.zoom.x + e.clientX - pan.current.px,
+				y: pan.current.zoom.y + e.clientY - pan.current.py,
+			});
+			pan.current = {
+				px: e.clientX,
+				py: e.clientY,
+				zoom: pan.current.zoom,
+			};
+		}
+	};
+
+	const settle = () => {
+		if (pointers.current.size === 0) {
+			pan.current = null;
+			pinch.current = null;
+			setPanning(false);
+			setZoom((z) => (z.scale <= 1.001 ? { scale: 1, x: 0, y: 0 } : z));
+		}
+	};
+
+	const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+		pointers.current.delete(e.pointerId);
+		settle();
+	};
+
+	const cursor = panning ? "grabbing" : zoom.scale > 1 ? "grab" : "zoom-in";
+
+	return (
+		<div
+			className="zoomable"
+			ref={wrapRef}
+			style={{ cursor }}
+			onPointerDown={onPointerDown}
+			onPointerMove={onPointerMove}
+			onPointerUp={onPointerUp}
+			onPointerCancel={onPointerUp}
+		>
+			<img
+				ref={imgRef}
+				src={src}
+				alt={alt}
+				draggable={false}
+				style={{
+					transform: `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.scale})`,
+					transformOrigin: "0 0",
+					touchAction: "none",
+				}}
+			/>
+			<button
+				type="button"
+				className="zoom-btn zoom-in"
+				aria-label="Zoom in"
+				onPointerDown={(e) => e.stopPropagation()}
+				onClick={() => zoomBy(ZOOM_STEP)}
+			>
+				<Icon name="zoom-in" />
+			</button>
+			<button
+				type="button"
+				className="zoom-btn zoom-out"
+				aria-label="Zoom out"
+				onPointerDown={(e) => e.stopPropagation()}
+				onClick={() => zoomBy(1 / ZOOM_STEP)}
+			>
+				<Icon name="zoom-out" />
+			</button>
+		</div>
 	);
 }
