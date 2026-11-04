@@ -813,7 +813,19 @@ describe("keptFiles", () => {
 		const task = store.getTask("res1");
 		expect(task?.research).toBe(false);
 		expect(task?.report).toBe(null);
+		expect(task?.steps).toBe("unknown");
 		store.close();
+	});
+
+	test("steps round-trips a close and reopen", () => {
+		const store = open(join(root, "steps-roundtrip"));
+		const task = store.createTask("steps card");
+		expect(task.steps).toBe("unknown");
+		store.updateTask(task.id, { steps: "yes" });
+		store.close();
+		const reopened = open(join(root, "steps-roundtrip"));
+		expect(reopened.getTask(task.id)?.steps).toBe("yes");
+		reopened.close();
 	});
 
 	test("opening a pre-kept_files database backfills the column", () => {

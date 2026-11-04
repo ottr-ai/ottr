@@ -664,6 +664,7 @@ describe("handoffMarkdown research report", () => {
 		report: null,
 		research: true,
 		starred: false,
+		steps: "unknown" as const,
 		createdAt: 1,
 		updatedAt: 1,
 		queuedAt: null,

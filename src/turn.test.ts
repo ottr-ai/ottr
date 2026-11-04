@@ -5089,6 +5089,56 @@ describe("turn research cards", () => {
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
 	});
 
+	test("a harvested report with a Recommended steps heading stores steps yes", async () => {
+		const { store, record, projects } = researchStore();
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(
+						join(o.worktreePath, RESEARCH_REPORT),
+						"# findings\n\n## Recommended steps\n\n- do it",
+					);
+				},
+			}),
+		);
+		const task = researchTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.steps).toBe("yes");
+	});
+
+	test("a harvested report without the heading stores steps no", async () => {
+		const { store, record, projects } = researchStore();
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# findings");
+				},
+			}),
+		);
+		const task = researchTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.steps).toBe("no");
+	});
+
+	test("a plain work card with no report file keeps steps unknown", async () => {
+		const { store, record, projects } = researchStore();
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, { commitsAhead: async () => 0 }),
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.steps).toBe("unknown");
+	});
+
 	// OTTR-233: a refused report holds every work card — a plain card too — before the
 	// untracked-file quarantine and the worktree removal, and never copies the target.
 	for (const research of [false, true])

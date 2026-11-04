@@ -296,6 +296,8 @@ export interface Task {
 	report: string | null;
 	/** Research card: answers a question instead of changing code; ends answered with a report file, never integrates. */
 	research: boolean;
+	/** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */
+	steps: ResearchSteps;
 	/** Pinned by the user on a done research card so its report stays findable; UI-only, no pipeline effect. */
 	starred: boolean;
 	/** Epoch milliseconds. */
@@ -734,6 +736,9 @@ export type TaskCard = Omit<
 	heldMerges?: string[];
 };
 
+/** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */
+export type ResearchSteps = "yes" | "no" | "unknown";
+
 /** A done card is question-only when the last work turn reported `answered` (a later follow-up replaces it). */
 export function answeredCard(
 	turns: Array<Pick<Turn, "kind" | "outcome">>,
@@ -744,6 +749,14 @@ export function answeredCard(
 	}
 	return false;
 }
+
+/** True when a research report names steps worth implementing. Same phrases the
+ * follow-up prompt searches for, so the button never promises work the agent
+ * cannot find. ponytail: phrase heuristic; a report saying "no next steps are
+ * needed" still matches — an explicit recommendations field would fix that.
+ * OTTR-488: the server also resolves stored steps against this regex at view build. */
+export const recommendsSteps = (report: string): boolean =>
+	/\brecommended steps\b|\bnext steps\b|\baction items\b/i.test(report);
 
 /** One upstream item kind, as the provider contract allows (U3). */
 export type UpdateKind = "image-pin" | "mcp" | "rule-set" | "skill" | "plugin";

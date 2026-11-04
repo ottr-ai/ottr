@@ -103,6 +103,7 @@ import type {
 import {
 	FORK_HOLD_REASON,
 	MERGE_HOLD_MISMATCH_REASON,
+	recommendsSteps,
 	UPDATE_HOLD_REASON,
 } from "./types.ts";
 
@@ -2511,6 +2512,15 @@ export function createTurnLoop(
 						needsReason: `The research report file ${RESEARCH_REPORT} is missing from the worktree. Reply to have the agent write it, or cancel the card.`,
 					};
 			}
+			// OTTR-488: harvest the steps recommendation with the report — 'yes' only when the
+			// report carries the heading, 'no' when a harvested report carries none; no report
+			// (or none harvested this settle) writes nothing and keeps the column.
+			const steps =
+				report === null || report === undefined
+					? undefined
+					: /^##\s+recommended steps\b/im.test(report)
+						? ("yes" as const)
+						: ("no" as const);
 			const now = Date.now();
 			if (unsaved)
 				next = {
@@ -2690,6 +2700,7 @@ export function createTurnLoop(
 				commits,
 				mergeHead,
 				report,
+				steps,
 				keptFiles,
 				holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
 				// A merge-hold mismatch park serves the reviewer the exact push-side delta it

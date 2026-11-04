@@ -103,6 +103,7 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   details TEXT,
   report TEXT,
   research INTEGER NOT NULL DEFAULT 0,
+  research_steps TEXT NOT NULL DEFAULT 'unknown',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   queued_at INTEGER,
@@ -230,6 +231,7 @@ interface TaskRow {
 	details: string | null;
 	report: string | null;
 	research: number;
+	research_steps: string;
 	starred: number;
 	created_at: number;
 	updated_at: number;
@@ -365,6 +367,12 @@ function toTask(project: string, r: TaskRow): Task {
 		details: r.details,
 		report: r.report,
 		research: r.research === 1,
+		steps:
+			r.research_steps === "yes"
+				? "yes"
+				: r.research_steps === "no"
+					? "no"
+					: "unknown",
 		starred: r.starred === 1,
 		mergeHead: r.merge_head,
 		createdAt: r.created_at,
@@ -558,6 +566,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	details: "details",
 	report: "report",
 	research: "research",
+	steps: "research_steps",
 	starred: "starred",
 	mergeHead: "merge_head",
 	queuedAt: "queued_at",
@@ -1008,6 +1017,10 @@ export class ProjectStore {
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN research INTEGER NOT NULL DEFAULT 0",
 			);
+		if (!cols.includes("research_steps"))
+			db.exec(
+				"ALTER TABLE tasks ADD COLUMN research_steps TEXT NOT NULL DEFAULT 'unknown'",
+			);
 		if (!cols.includes("update_ids"))
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN update_ids TEXT NOT NULL DEFAULT '[]'",
@@ -1157,7 +1170,7 @@ export class ProjectStore {
 					"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
 				);
 				const names = `id, title, prompt, stage, state, needs_reason, pending_prompt,
-					branch, base, worktree, session_id, summary, details, report, research,
+					branch, base, worktree, session_id, summary, details, report, research, research_steps,
 					created_at, updated_at, queued_at, cancelled_at, images, pending_images,
 					release_version, release_notes, session_title, asked, model, kept_files,
 					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,

@@ -208,6 +208,7 @@ import {
 	type QuotaState,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
+	recommendsSteps,
 	type ServerMessage,
 	type StateResponse,
 	type Task,
@@ -653,8 +654,18 @@ export function createApp(deps: AppDeps) {
 		deps.gstore.set("seen_answers", [...new Set(ids)].sort());
 	}
 
+	/** OTTR-488: card-view steps — the stored value, except legacy 'unknown' rows resolve against the stored report at read time (no row rewrite). 'unknown' in a view means quiet. */
+	function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
+		return t.steps !== "unknown"
+			? t.steps
+			: t.report !== null && recommendsSteps(t.report)
+				? "yes"
+				: "unknown";
+	}
+
 	/** Ids of the cards a read mark can stick to right now, by the same rule the state frame
-	 * ships (stateResponse): question-only answered cards and pr_review cards. Marks a client
+	 * ships (stateResponse): question-only answered cards, pr_review cards, and done research
+	 * cards whose report resolves to a steps value. Marks a client
 	 * sends for anything else are stale — a pre-server-sync tab imported marks for cards it merely
 	 * had open — so /api/seen drops them and the store decays instead of poisoning the board. */
 	function seenableIds(): Set<string> {
@@ -667,7 +678,11 @@ export function createApp(deps: AppDeps) {
 						(t.kind === "pr_review" ||
 							(t.stage === "done" &&
 								!isRetro(t) &&
-								answeredCard(e.store.listTurns(t.id))))
+								answeredCard(e.store.listTurns(t.id))) ||
+							(t.research &&
+								t.stage === "done" &&
+								t.report !== null &&
+								viewSteps(t) !== "unknown"))
 					)
 						ids.add(t.id);
 				}
@@ -2056,6 +2071,7 @@ export function createApp(deps: AppDeps) {
 					const silent = silentSince(t, e.store.logPath(t.id), now);
 					cards.push({
 						...card,
+						steps: viewSteps(t),
 						sessionTitle: e.store.frozenTitle(t),
 						answered:
 							t.stage === "done" &&
@@ -2159,6 +2175,7 @@ export function createApp(deps: AppDeps) {
 						);
 		return {
 			...task,
+			steps: viewSteps(t),
 			turns: e.store
 				.listTurns(t.id)
 				.map(({ prompt: _prompt, ...turn }) => turn),
