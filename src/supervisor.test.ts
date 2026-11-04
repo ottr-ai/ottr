@@ -932,6 +932,187 @@ function keptCard(
 	return { store, t };
 }
 
+// ---- fresh read before pass writes ------------------------------------------
+
+describe("fresh read before pass writes", () => {
+	/** The write src/app.ts's reply route makes when a user answers a parked card. */
+	function replyLands(store: ProjectStore, id: string): void {
+		store.updateTask(id, {
+			pendingPrompt: "keep my draft and add the tests",
+			pendingBy: "user",
+			pendingImages: [],
+			state: "queued",
+			queuedAt: 42,
+			needsReason: null,
+			asked: null,
+		});
+	}
+
+	/** A needs_you card stuck on a git-proof reason, with one finished work turn row. */
+	function staleCard(name: string, needsReason: string) {
+		const dir = join(root, name);
+		mkdirSync(join(dir, ".wt"), { recursive: true });
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason,
+			branch: "ottr/w",
+			base: "aaaabbbb",
+			worktree: join(dir, ".wt"),
+		});
+		const turn = store.startTurn(t.id, "work", "w", null);
+		store.finishTurn(turn.id, {
+			endedAt: 999,
+			outcome: "ready",
+			summary: "did it",
+		});
+		return { store, t };
+	}
+
+	test("reclassify: a reply landing during the git awaits keeps its text (resume path)", async () => {
+		const { store, t } = staleCard(
+			"fresh-re-queue",
+			"Reported ready, but git shows 2 commit(s) ahead of the base.",
+		);
+		// An admin update-merge hold forces classify's queued verdict (the resume write).
+		store.updateTask(t.id, { updateIds: ["a@1"] });
+		store.setSettings({ holdUpdateMerges: true });
+		const ops = fakeOps({ commitsAheadNow: 2 });
+		ops.isClean = async () => {
+			replyLands(store, t.id);
+			return true;
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("queued"); // the reply's state, not the pass's write
+		expect(after.stage).toBe("todo"); // the pass would have moved it to in_progress
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests"); // not "."
+		expect(after.pendingBy).toBe("user");
+		expect(after.queuedAt).toBe(42);
+		expect(ops.calls.scheduled).toBe(0);
+		store.close();
+	});
+
+	test("reclassify: a reply landing during targetCommits keeps its text (done path)", async () => {
+		const { store, t } = staleCard(
+			"fresh-re-done",
+			"Reported ready, but git shows 0 commit(s) ahead of the base and uncommitted changes.",
+		);
+		const ops = fakeOps({ cleanNow: false, integratedNow: true });
+		ops.targetCommits = async () => {
+			replyLands(store, t.id);
+			return 3;
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("queued"); // the pass would have written "idle"
+		expect(after.stage).toBe("todo"); // the pass would have written "done"
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		expect(after.commits).toBeNull(); // the pass would have written 3
+		store.close();
+	});
+
+	test("hygiene: a reply landing during the git checks stops the quarantine", async () => {
+		const dir = join(root, "fresh-hyg-gate");
+		mkdirSync(join(dir, ".wt"), { recursive: true });
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const wt = join(dir, ".wt");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Kept the worktree: unsaved changes.",
+			worktree: wt,
+			keptFiles: ["scratch.txt"],
+		});
+		const ops = fakeOps({ time: Date.now() + 8 * 86_400_000 });
+		ops.commitsAhead = async () => {
+			replyLands(store, t.id);
+			return 0;
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(ops.calls.quarantine).toEqual([]);
+		expect(ops.calls.remove).toEqual([]);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("queued"); // the pass would have written "idle"
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		expect(after.worktree).toBe(wt); // the pass would have nulled it
+		store.close();
+	});
+
+	test("hygiene: a reply landing during quarantine still keeps the write off", async () => {
+		const dir = join(root, "fresh-hyg-write");
+		mkdirSync(join(dir, ".wt"), { recursive: true });
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const wt = join(dir, ".wt");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Kept the worktree: unsaved changes.",
+			worktree: wt,
+			keptFiles: ["scratch.txt"],
+		});
+		const ops = fakeOps({ time: Date.now() + 8 * 86_400_000 });
+		ops.quarantineUntracked = async (worktreePath, quarantineDir) => {
+			ops.calls.quarantine.push({ worktreePath, quarantineDir });
+			replyLands(store, t.id);
+			return [];
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		expect(after.worktree).toBe(wt); // write skipped: the column keeps the now-stale path
+		expect(after.needsReason).toBeNull(); // the reply cleared it; the pass must not resurrect it
+	});
+
+	test("CI watch: a reply landing during the gh call stops the pushSha write", async () => {
+		const dir = join(root, "fresh-ci");
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("parent");
+		store.updateTask(t.id, { pushSha: "abc1234567890", state: "idle" });
+		const ops = fakeOps();
+		ops.gh = async (args) => {
+			if (args[0] === "pr") return { code: 0, stdout: "[]", stderr: "" };
+			replyLands(store, t.id);
+			return {
+				code: 0,
+				stdout: runsJson([
+					{ status: "completed", conclusion: "success", name: "ci" },
+				]),
+				stderr: "",
+			};
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.pushSha).toBe("abc1234567890"); // the pass would have cleared it
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		store.close();
+	});
+
+	test("cleanup: a reply landing during the unsaved check stops the removal", async () => {
+		const dir = join(root, "fresh-cleanup");
+		mkdirSync(join(dir, ".wt"), { recursive: true });
+		const store = ProjectStore.open(dir);
+		const t = store.createTask("w");
+		const wt = join(dir, ".wt");
+		store.updateTask(t.id, { stage: "done", state: "idle", worktree: wt });
+		const ops = fakeOps();
+		ops.unsavedWork = async () => {
+			replyLands(store, t.id);
+			return null;
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(ops.calls.remove).toEqual([]);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		expect(after.worktree).toBe(wt);
+		store.close();
+	});
+});
+
 describe("auto-tend", () => {
 	test("rule 1: scratch-shaped kept worktree gets exactly one tend reply, then silence", async () => {
 		const { store, t } = keptCard("tend-scratch");

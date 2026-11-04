@@ -94,6 +94,23 @@ function errmsg(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * A pass is about to write task columns it read from the tick's start snapshot; a reply,
+ * steer, restart or cancel can have landed during the pass's awaits. Re-read the card and
+ * skip the write when anything the pass guards on moved, or a queued prompt is waiting (the
+ * pending turn must start on the card as the user left it).
+ */
+function wentStale(store: ProjectStore, t: Task): boolean {
+	const fresh = store.getTask(t.id);
+	return (
+		fresh === null ||
+		fresh.state !== t.state ||
+		fresh.needsReason !== t.needsReason ||
+		fresh.cancelledAt !== t.cancelledAt ||
+		fresh.pendingPrompt !== null
+	);
+}
+
 /** Failing check names a CI follow-up prompt lists (lines `- Name: conclusion - URL`); [] when the prompt is not a CI follow-up. Pure. */
 export function failedCheckNames(prompt: string): string[] {
 	if (!prompt.startsWith("CI failed on the merge push")) return [];
@@ -318,6 +335,9 @@ export function createSupervisor(
 			cleanup.set(key, state);
 			return;
 		}
+		// A reply, steer, restart or cancel may have landed during the unsaved-work await;
+		// the removal below must not run under a card the user just picked back up.
+		if (wentStale(e.store, t)) return;
 		try {
 			await ops.removeWorktree({
 				mainPath: e.path,
@@ -473,6 +493,9 @@ export function createSupervisor(
 			previousError: last.error,
 		});
 		if (next.state === "needs_you") return; // still stuck the same way; leave it
+		// A reply, steer or cancel may have landed during the git awaits above; the writes
+		// below must not overwrite it.
+		if (wentStale(e.store, t)) return;
 		if (next.state === "queued") {
 			// Only a work report re-classifies to queued (merging). The turn settle runs the work
 			// check and the update/fork merge holds on that path; promoting here would skip them,
@@ -492,13 +515,17 @@ export function createSupervisor(
 			);
 			ops.schedule();
 		} else if (next.stage === "done") {
+			const commits = await ops.targetCommits(e.path, e.target);
+			// Re-checked past the targetCommits await: a reply landing there must not lose
+			// its queued prompt to this write.
+			if (wentStale(e.store, t)) return;
 			// ponytail: a tick-done card skips the finish path's kept-files UI; quarantine already
 			// cleared scratch, and cleanupPass keeps the worktree (logged) if tracked changes remain.
 			e.store.updateTask(t.id, {
 				stage: "done",
 				state: "idle",
 				needsReason: null,
-				commits: await ops.targetCommits(e.path, e.target),
+				commits,
 			});
 			ops.appendLog(
 				e.store,
@@ -557,6 +584,9 @@ export function createSupervisor(
 			}
 			return;
 		}
+		// A reply landing since the snapshot must stop the removal: the pending turn has to
+		// start on the worktree as the user left it.
+		if (wentStale(e.store, t)) return;
 		let moved: string[];
 		try {
 			moved = await ops.quarantineUntracked(
@@ -589,6 +619,9 @@ export function createSupervisor(
 			);
 			return;
 		}
+		// Re-checked past the quarantine and removal awaits: a reply landing there must not
+		// lose its queued prompt to this write.
+		if (wentStale(e.store, t)) return;
 		e.store.updateTask(t.id, {
 			worktree: null,
 			keptFiles: [],
@@ -851,6 +884,9 @@ export function createSupervisor(
 		if (t.pushSha === null) return;
 		const key = `${e.name}/${t.id}`;
 		const stop = (line?: string): void => {
+			// A reply, steer or cancel may have landed during the gh awaits; skip the write
+			// and re-decide on fresh facts next tick.
+			if (wentStale(e.store, t)) return;
 			e.store.updateTask(t.id, { pushSha: null });
 			if (line) ops.appendLog(e.store, t.id, `supervisor: ${line}`);
 		};
