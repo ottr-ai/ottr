@@ -16,34 +16,37 @@ if (isStrykerRun()) acquireMutationLock(tempDirName);
 
 // Mutation testing: `bun run test:mutation` runs this config, then stryker.release.config.mjs,
 // stryker.turn.config.mjs, stryker.worktree.config.mjs and stryker.update-image.config.mjs.
-// ponytail: Stryker's built-in command runner re-runs the whole suite per mutant, so there is no per-test
-// coverage (no "NoCoverage" status). @hughescr/stryker-bun-runner would add it; retried 2026-09-30 on
-// 1.4.0 + bun 1.3.14: its generated preload still imports a mangled path (ode_modules@hughescr...js,
-// separators eaten on Windows). Retry when a release fixes that.
+// @hughescr/stryker-bun-runner runs bun test with per-test coverage: each mutant runs only the
+// tests that reach it, and unreached mutants are reported NoCoverage. The 2026-09-30 retry
+// blocker (a mangled Windows preload path) is gone: releases 1.5/1.6 fixed it and mutation runs
+// are Linux-only since the ulimit days anyway. Measured at 053838a (2026-11-04): the turn run
+// fell 4.5 h -> 66 min with 99.75% identical verdicts; 42 mutants turned NoCoverage and 7
+// order-dependent kills in turn.test.ts became survivors.
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
-  testRunner: "command",
-  // worktree.test.ts and release.test.ts drive real git repos. A git spawn costs ~0.5-1 s on Windows,
-  // so those suites cost ~75 s a run; both are isolated into their own configs and only the matching
-  // module's mutants pay for them. scripts/dev-updater.test.js and scripts/update-image.test.ts drive
-  // real git too and test no file this config mutates. --bail: a killed mutant needs only the first
-  // failing test (same pattern as the isolated configs); verdicts are unchanged — a surviving mutant
-  // still runs the whole suite, and bail never turns a killed mutant into a survivor.
-  commandRunner: {
-    command: "ulimit -d 2097152 && bun scripts/mutant-run.ts",
-    // The runner script holds the dry run, --bail and the five --path-ignore-patterns. Stage 1
-    // runs only the test files whose import closure contains the mutated file; stage-1 survivors
-    // then run the full suite with --parallel=8. The dry run stays the full sequential suite, so
-    // the timeout budget is unchanged; a once-per-run pass runs each test file alone to rule out
-    // stage-1 false kills. The 2 GB data-segment cap stops the runaway mutants in the stdout
-    // line-split loop of src/workers.ts from OOM-killing the host and falsely killing neighbor mutants:
-    // a runaway dies as a Bun OOM abort, which counts as Killed. ulimit is
-    // POSIX-only, so mutation runs need Linux.
+  appendPlugins: ["@hughescr/stryker-bun-runner"],
+  testRunner: "bun",
+  bun: {
+    // Bounds the dry run's single `bun test` process (the full sequential suite; the whole suite
+    // measured 8 m 16 s under this runner at 053838a). Mutant runs get Stryker's per-mutant
+    // budget instead: timeoutMS + timeoutFactor x the dry-run time of their covering tests.
+    timeout: 1_200_000,
+    // Replaces the command runner's `ulimit -d 2097152`: the runaway mutants in the stdout
+    // line-split loop of src/workers.ts must not OOM the host and falsely kill neighbor
+    // mutants. A bun test child over the 2 GB ceiling is killed and scored Timeout
+    // (detected), like the ulimit OOM abort was Killed before. ulimit is POSIX-only, so
+    // mutation runs needed Linux; the RSS ceiling works everywhere the runner does.
+    maxChildRss: 2_147_483_648,
   },
-  coverageAnalysis: "off",
-  // No `incremental`: with the command runner the cache detects changed mutants only, never
-  // changed tests, so a Killed mutant survives its killing test being deleted or weakened
-  // (finding R8-3, 2026-10-12 review). Every run re-tests everything; do not re-enable.
+  coverageAnalysis: "perTest",
+  // Mutant runs bail at the first failing test (Stryker's default), so a killed mutant pays
+  // only its covering tests up to the killer. The dry run never bails. worktree.test.ts and
+  // release.test.ts drive real git repos and stay isolated into their own configs, so only the
+  // matching module's mutants pay for them.
+  // No `incremental`: the five configs share one default cache path, so each run would reuse
+  // the previous config's verdicts (update-image.config.mjs already forces it off). With
+  // perTest coverage the cache would now track changed tests too (the command runner's R8-3
+  // staleness is gone), but the shared path keeps it off. Every run re-tests everything.
   // Half of the host CPUs (os.availableParallelism()), at least 1, so a run never asks for more
   // CPU than the host has; STRYKER_CONCURRENCY wins when set. Capped at the measured 24: each
   // worker runs under the 2 GB cap, the 421-mutant uniform sample kept every verdict identical

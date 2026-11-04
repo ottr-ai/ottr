@@ -8,11 +8,11 @@ import { mutationConcurrency } from "./scripts/stryker-load.mjs";
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
   ...base,
-  // The 2 GB cap matches the main config, so a runaway aborts (Bun OOM, counts as Killed) instead
-  // of OOMing the host. --bail cannot change a verdict: a surviving mutant still runs all tests, a
-  // killed one stops at the first failure. scripts/mutant-run.ts gives each run a private TMPDIR
-  // and removes it afterwards: no fixture or mutant touches the worker's shared /tmp.
-  commandRunner: { command: "ulimit -d 2097152 && bun scripts/mutant-run.ts bun test --bail src/turn.test.ts" },
+  // The runner runs exactly src/turn.test.ts, and perTest coverage selects only the covering
+  // tests per mutant, bailing at the first failure: a surviving mutant still runs all its
+  // covering tests, a killed one stops at the first. base.bun's 2 GB maxChildRss keeps a
+  // runaway from OOMing the host; the runner's own temp dirs are removed when the run ends.
+  bun: { ...base.bun, timeout: 300_000, testFiles: ["src/turn.test.ts"] },
   mutate: ["src/turn.ts"],
   // The base cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
   // 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite. The CPU-derived value and

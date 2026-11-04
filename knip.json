@@ -11,7 +11,8 @@
   "ignoreDependencies": [
     "@stryker-mutator/api",
     "@stryker-mutator/command-runner",
-    "@stryker-mutator/instrumenter"
+    "@stryker-mutator/instrumenter",
+    "@hughescr/stryker-bun-runner"
   ],
   "ignoreUnresolved": ["src/server.ts"]
 }

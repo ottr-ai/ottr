@@ -69,8 +69,9 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   with `status`, `mutatorName`, `replacement` and `location.start.line`.
 - Gate verdict per mutant: its start line lies inside one of that config's ranges and its
   status is `Survived` or `NoCoverage` → failure. `Timeout` counts as detected, like today.
-  The main configs run `coverageAnalysis: "off"`, so `NoCoverage` normally never appears; the
-  gate keeps the check for configs that enable coverage.
+  Every config runs `coverageAnalysis: "perTest"` (the bun test runner reports which tests
+  reach each mutant), so `NoCoverage` appears whenever a changed line has no covering test,
+  and the gate fails on it.
 - Exit codes: `0` pass or no ranges; `1` gate failure (any survivor or no-coverage mutant);
   `2` environment failure (bad arguments, git failure, config load failure, Stryker crash or
   a missing report file). Stryker's own exit code is ignored when a report file exists: a

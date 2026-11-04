@@ -6,9 +6,15 @@ import { mutationConcurrency } from "./scripts/stryker-load.mjs";
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
   ...base,
-  // scripts/mutant-run.ts gives each run a private TMPDIR and removes it afterwards, also after a
-  // bail that skips afterAll: no fixture or mutant touches the worker's shared /tmp.
-  commandRunner: { command: "ulimit -d 2097152 && bun scripts/mutant-run.ts bun test --bail --timeout 60000 src/worktree.test.ts" },
+  // The runner runs exactly src/worktree.test.ts and bails at the first failing test. bunArgs
+  // keeps the file's 60 s bun per-test timeout; the runner's own temp dirs are removed when the
+  // run ends, and base.bun's 2 GB maxChildRss keeps a runaway from OOMing the host.
+  bun: {
+    ...base.bun,
+    timeout: 600_000,
+    testFiles: ["src/worktree.test.ts"],
+    bunArgs: ["--timeout=60000"],
+  },
   mutate: ["src/worktree.ts"],
   // 8, not the base cap: this git-spawn-heavy suite timed out at 16-way on the loaded machine
   // (2026-09-30, 32/38 in the first minutes); 8 keeps runs inside the budget below. The
