@@ -1587,6 +1587,26 @@ describe("Drawer prompt markdown", () => {
 		expect(html).toContain("<code>align</code>");
 	});
 
+	test("a parked backlog card shows the Edit task button; other stages do not", () => {
+		const parked = cardFixture({
+			...drawerFields,
+			stage: "backlog",
+			state: "idle",
+			prompt: "parked idea",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={parked} />);
+		expect(html).toContain('class="task-prompt"');
+		expect(html).toContain("Edit task");
+		const done = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+		});
+		const merged = renderToStaticMarkup(<Drawer {...base} task={done} />);
+		expect(merged).toContain('class="prompt-text"');
+		expect(merged).not.toContain("Edit task");
+	});
+
 	test("queued steering renders markdown in the you bubble", () => {
 		const task = cardFixture({
 			...drawerFields,

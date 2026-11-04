@@ -5137,7 +5137,7 @@ export function createApp(deps: AppDeps) {
 					)
 						return json(
 							{
-								error: "only todo tasks that have not started can be edited",
+								error: "only unstarted todo or backlog tasks can be edited",
 							},
 							409,
 						);

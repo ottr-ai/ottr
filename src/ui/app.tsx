@@ -6633,10 +6633,12 @@ export function Drawer({
 			}),
 		);
 	};
-	// Non-null while the prompt editor is open; only unstarted todo tasks get one.
+	// Non-null while the prompt editor is open; unstarted todo and parked backlog cards get one.
 	const [edit, setEdit] = useState<string | null>(null);
 	const editable =
-		task.stage === "todo" && task.turns.length === 0 && !cancelled;
+		(task.stage === "todo" || task.stage === "backlog") &&
+		task.turns.length === 0 &&
+		!cancelled;
 	const editValid =
 		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
 	/** Done tasks lead with the implementation's report; the merge turn's integration output stays in its work step. */
