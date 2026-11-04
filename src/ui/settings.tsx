@@ -53,7 +53,13 @@ import {
 	useModels,
 } from "./models.ts";
 import { dropBeforeId } from "./queue.ts";
-import { SETTINGS_HASH, settingsSub } from "./route.ts";
+import {
+	navClick,
+	SETTINGS_HASH,
+	settingsNavigate,
+	settingsPath,
+	settingsSub,
+} from "./route.ts";
 import { refreshState } from "./socket.ts";
 import { age, stamp } from "./time.ts";
 
@@ -3487,29 +3493,42 @@ export function provisionWatchStep(
 	return elapsedMs >= ALATE_WATCH_DEADLINE_MS ? "expired" : "wait";
 }
 
-/** Opens Settings and scrolls to the given section; the page remounts on the hash change, so the
+/** Scrolls to the section once it exists: the page remounts on a settings navigation, so the
  *  poll waits out the mount instead of racing it, and a second pass re-scrolls after the async
- *  sections above finish loading. Advisory link only — it never runs provisioning. */
-export function openSettingsSection(
-	sectionId: string,
-	hash: string = SETTINGS_HASH,
-): void {
+ *  sections above finish loading. Returns the cancel — a caller with a lifecycle (the
+ *  deep-link effect, a test) stops the wait instead of leaving timers behind. */
+function scrollToSectionWhenPresent(sectionId: string): () => void {
 	const scroll = () => {
 		const el = document.getElementById(sectionId);
 		el?.scrollIntoView({ block: "start" });
 		el?.focus({ preventScroll: true });
 	};
-	location.hash = `#${hash}`;
 	let tries = 0;
+	let re: ReturnType<typeof setTimeout> | undefined;
 	const t = setInterval(() => {
 		if (document.getElementById(sectionId) !== null) {
 			clearInterval(t);
 			scroll();
-			setTimeout(scroll, 600);
+			re = setTimeout(scroll, 600);
 		} else if (++tries > 40) {
 			clearInterval(t);
 		}
 	}, 50);
+	return () => {
+		clearInterval(t);
+		clearTimeout(re);
+	};
+}
+
+/** Opens Settings at the given section: navigate like a history entry, then wait the
+ *  scroll out. Advisory link only — it never runs provisioning. The returned cancel
+ *  stops the scroll wait; fire-and-forget callers may drop it. */
+export function openSettingsSection(
+	sectionId: string,
+	view: string = SETTINGS_HASH,
+): () => void {
+	settingsNavigate(view, sectionId);
+	return scrollToSectionWhenPresent(sectionId);
 }
 
 /** Settings "Alate" section: provisioning config + one-shot provision trigger. */
@@ -4366,6 +4385,40 @@ export function SettingsPage({
 				document.removeEventListener(t, unpin, { capture: true });
 		};
 	}, [general, view]);
+	// Deep links: the URL's fragment names a TOC id of this page. Read it on mount and on
+	// Back/Forward, pin it like a TOC pick, and wait the scroll out like a TOC click. An
+	// unknown or malformed fragment opens the page normally, without scrolling.
+	useEffect(() => {
+		let cancel: (() => void) | null = null;
+		const apply = () => {
+			cancel?.();
+			cancel = null;
+			let id = location.hash.slice(1);
+			try {
+				id = decodeURIComponent(id);
+			} catch {
+				// A malformed escape names nothing; give up.
+				return;
+			}
+			if (
+				!tocIds(
+					(general ? SETTINGS_TOC : PROJECT_TOC).flatMap(
+						(g): readonly TocSection[] => g.sections,
+					),
+				).includes(id)
+			)
+				return;
+			pinned.current = id;
+			setActive(id);
+			cancel = scrollToSectionWhenPresent(id);
+		};
+		apply();
+		window.addEventListener("popstate", apply);
+		return () => {
+			window.removeEventListener("popstate", apply);
+			cancel?.();
+		};
+	}, [general, view]);
 	const map = (
 		<SettingsMap
 			groups={project === null ? SETTINGS_TOC : PROJECT_TOC}
@@ -4380,8 +4433,9 @@ export function SettingsPage({
 				{/* Own grammar, not the main rail's boxed rows: a text index, the current page on the steel edge. */}
 				<a
 					className="snb"
-					href={`#${SETTINGS_HASH}`}
+					href={settingsPath(null)}
 					aria-current={general ? "page" : undefined}
+					onClick={(e) => navClick(e, () => settingsNavigate(SETTINGS_HASH))}
 				>
 					General
 				</a>
@@ -4391,8 +4445,13 @@ export function SettingsPage({
 					<Fragment key={p.name}>
 						<a
 							className="snb"
-							href={`#${SETTINGS_HASH}/${encodeURIComponent(p.name)}`}
+							href={settingsPath(p.name)}
 							aria-current={project?.name === p.name ? "page" : undefined}
+							onClick={(e) =>
+								navClick(e, () =>
+									settingsNavigate(`${SETTINGS_HASH}/${p.name}`),
+								)
+							}
 						>
 							{projectLabel(p)}
 						</a>
@@ -4757,7 +4816,7 @@ export function ProjectSettingsForm({
 							taskIdPrefix: prefix.trim() || null,
 						});
 						if (r.name !== project.name)
-							location.hash = `#${SETTINGS_HASH}/${encodeURIComponent(r.name)}`;
+							settingsNavigate(`${SETTINGS_HASH}/${r.name}`);
 					}}
 					title="Identity"
 					status={
@@ -5173,7 +5232,7 @@ export function ProjectSettingsForm({
 												`/api/projects/${encodeURIComponent(project.name)}/remove`,
 												{},
 											);
-											location.hash = `#${SETTINGS_HASH}`;
+											settingsNavigate(SETTINGS_HASH);
 										})
 									: Promise.resolve(true)
 							}

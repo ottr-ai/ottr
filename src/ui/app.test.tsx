@@ -1067,7 +1067,12 @@ describe("WarningLines", () => {
 			<WarningLines warnings={[text, "second warning"]} />,
 		);
 		expect(html).toContain('role="note"');
-		expect(html).toContain(text);
+		// The `Settings - Provider sign-in` phrase is an anchor; the sentence around it stays text.
+		expect(html).toContain("sign in under ");
+		expect(html).toContain(
+			'<a class="notif-link" href="/settings#signin-section">Settings - Provider sign-in</a>',
+		);
+		expect(html).toContain(", or set its API key in the environment.");
 		expect(html).toContain("second warning");
 		expect(html.match(/notif-line/g)?.length).toBe(2);
 	});
@@ -1086,6 +1091,46 @@ describe("WarningLines", () => {
 		);
 		expect(html).toContain(
 			'<a class="notif-link" href="https://github.com/apps/ottr-ai/installations/new" target="_blank" rel="noopener noreferrer">https://github.com/apps/ottr-ai/installations/new</a>.',
+		);
+	});
+
+	test("the GitHub App check message links Settings - Git hosts with the period outside", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"The GitHub App check failed (app lookup answered 401). PR reviews can post under your own identity: check the App ID and key under Settings - Git hosts.",
+				]}
+			/>,
+		);
+		expect(html).toContain(
+			'check the App ID and key under <a class="notif-link" href="/settings#git-hosts-section">Settings - Git hosts</a>.',
+		);
+	});
+
+	test("a settings chain anchors the whole phrase to the deepest block", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Re-probe the token under Settings → Git hosts → GitHub token; the expiry notice follows at once.",
+				]}
+			/>,
+		);
+		expect(html).toContain(
+			'under <a class="notif-link" href="/settings#github-token-block">Settings → Git hosts → GitHub token</a>; the expiry notice follows at once.',
+		);
+	});
+
+	test("an unknown label and a bare Settings word stay plain text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Settings - Bogus is not a card, and the word Settings alone stays text too.",
+				]}
+			/>,
+		);
+		expect(html).not.toContain("<a ");
+		expect(html).toContain(
+			"Settings - Bogus is not a card, and the word Settings alone stays text too.",
 		);
 	});
 });

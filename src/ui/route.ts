@@ -92,8 +92,11 @@ export function viewPath(view: string): string {
 }
 
 /** One-time client migration of the old hash URLs: "#p1" → "/projects/p1", "#settings/a"
- * → "/settings/a", "#settings" → "/settings". replaceState never adds a history entry. */
+ * → "/settings/a", "#settings" → "/settings". replaceState never adds a history entry.
+ * The legacy scheme only ever produced URLs at pathname "/", so a fragment on any other
+ * path is not a view name — it is a live deep link (settings sections) and stays. */
 export function migrateHash(): void {
+	if (location.pathname !== "/") return;
 	const raw = location.hash.slice(1);
 	if (raw === "") return;
 	let view = "";
@@ -103,6 +106,17 @@ export function migrateHash(): void {
 		// Malformed escape: viewPath("") sends the browser to the overview.
 	}
 	history.replaceState(null, "", viewPath(view));
+}
+
+/** Programmatic settings navigation: push the view's URL (plus the section fragment when
+ * given) as a history entry, then dispatch popstate. The App's popstate listener owns the
+ * view and drawer transitions, so a programmatic entry must walk the same path a Back or
+ * Forward traversal walks. `view` speaks the app's decoded vocabulary: "settings" or
+ * "settings/<project>", the strings settingsSub() parses. */
+export function settingsNavigate(view: string, sectionId?: string): void {
+	const url = `${viewPath(view)}${sectionId === undefined ? "" : `#${sectionId}`}`;
+	history.pushState(null, "", url);
+	window.dispatchEvent(new PopStateEvent("popstate", { state: null }));
 }
 
 /** Shared anchor click handling: a middle click or a modifier click returns untouched so the

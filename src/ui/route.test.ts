@@ -6,33 +6,60 @@ import {
 	projectPath,
 	readPath,
 	SETTINGS_HASH,
+	settingsNavigate,
 	settingsPath,
 	settingsSub,
 	taskPath,
 	viewPath,
 } from "./route.ts";
 
-// readPath()/migrateHash() read location and history; bun test has neither.
+// readPath()/migrateHash()/settingsNavigate() read location and history; bun test has
+// neither.
 const g = globalThis as unknown as Record<string, unknown>;
 const originals = {
 	location: g.location,
 	history: g.history,
+	window: g.window,
+	PopStateEvent: g.PopStateEvent,
 };
 let pathname = "/";
 let replaced: string | null = null;
+let pushed: string | null = null;
+const popstateListeners = new Set<() => void>();
 function install(path: string, hash = ""): void {
 	pathname = path;
 	replaced = null;
+	pushed = null;
+	popstateListeners.clear();
 	g.location = { pathname, hash };
 	g.history = {
 		replaceState: (_s: unknown, _t: unknown, url: string) => {
 			replaced = url;
 		},
+		pushState: (_s: unknown, _t: unknown, url: string) => {
+			pushed = url;
+		},
+	};
+	// settingsNavigate() dispatches popstate on window; a fake window with a real
+	// dispatch lets a test register a listener and watch it run.
+	g.window = {
+		dispatchEvent: (_e: unknown) => {
+			for (const l of popstateListeners) l();
+			return true;
+		},
+	};
+	g.PopStateEvent = class {
+		type: string;
+		constructor(type: string) {
+			this.type = type;
+		}
 	};
 }
 afterEach(() => {
-	g.location = originals.location;
-	g.history = originals.history;
+	for (const [key, value] of Object.entries(originals)) {
+		if (value === undefined) delete g[key];
+		else g[key] = value;
+	}
 });
 
 // Regression (R6-3): a project name containing "%" must survive the route round-trip.
@@ -102,18 +129,49 @@ test("path builders encode every segment exactly once", () => {
 });
 
 test("migrateHash rewrites the old hash URLs to paths", () => {
-	install("/ignored", "#p1");
+	// The legacy scheme only ever produced URLs at "/", so the rewrite runs there.
+	install("/", "#p1");
 	migrateHash();
 	expect(replaced).toBe("/projects/p1");
-	install("/ignored", "#settings/a");
+	install("/", "#settings/a");
 	migrateHash();
 	expect(replaced).toBe("/settings/a");
-	install("/ignored", "#settings");
+	install("/", "#settings");
 	migrateHash();
 	expect(replaced).toBe("/settings");
-	install("/projects/p1", "");
+	install("/", "");
 	migrateHash();
 	expect(replaced).toBeNull();
+});
+
+test("migrateHash leaves fragments on other paths alone: they are deep links now", () => {
+	install("/settings", "#settings/a");
+	migrateHash();
+	expect(replaced).toBeNull();
+	install("/settings", "#git-hosts-section");
+	migrateHash();
+	expect(replaced).toBeNull();
+});
+
+test("settingsNavigate pushes the exact URL and walks the popstate path", () => {
+	install("/");
+	const seen: string[] = [];
+	popstateListeners.add(() => seen.push("pop"));
+	settingsNavigate(SETTINGS_HASH, "git-hosts-section");
+	expect(pushed).toBe("/settings#git-hosts-section");
+	expect(seen.length).toBe(1);
+});
+
+test("settingsNavigate without a section pushes the bare settings path", () => {
+	install("/");
+	settingsNavigate(SETTINGS_HASH);
+	expect(pushed).toBe("/settings");
+});
+
+test("settingsNavigate encodes a project view's name exactly once", () => {
+	install("/");
+	settingsNavigate(`${SETTINGS_HASH}/Café 2`);
+	expect(pushed).toBe("/settings/Caf%C3%A9%202");
 });
 
 test("navClick leaves middle and modifier clicks to the browser", () => {

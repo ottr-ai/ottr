@@ -7,9 +7,11 @@ import type { AppCheck, ProjectView, TaskCard } from "../types.ts";
 import {
 	AppCheckLines,
 	GitHostsSection,
+	openSettingsSection,
 	ProjectSettingsForm,
 	ProjectsOrderSection,
 	SessionSection,
+	SettingsPage,
 } from "./settings.tsx";
 import { stamp } from "./time.ts";
 
@@ -23,6 +25,9 @@ const browserGlobals: Record<string, unknown> = {
 	window,
 	document: window.document,
 	navigator: window.navigator,
+	location: window.location,
+	history: window.history,
+	PopStateEvent: window.PopStateEvent,
 	Event: window.Event,
 	HTMLElement: window.HTMLElement,
 	HTMLInputElement: window.HTMLInputElement,
@@ -1446,6 +1451,136 @@ describe("ProjectsOrderSection", () => {
 			expect(rowNames(container)).toEqual(["alpha", "beta", "gamma"]);
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+/** Mounts the full General settings page; the fetch stub never resolves, so the
+ *  sections stay idle and the test stays deterministic. Cleanup unmounts and
+ *  puts fetch back. */
+async function mountPage(): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Promise<Response>(() => {})) as unknown as typeof fetch;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(
+			<SettingsPage
+				projects={[]}
+				tasks={[]}
+				maxTotal={null}
+				reviewCheck={false}
+				workCheck={false}
+				idleReviews={false}
+				act={async () => true}
+				view="settings"
+				openTask={() => {}}
+			/>,
+		);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		},
+	};
+}
+
+/** The TOC row (a .smap-row button) currently pinned as `aria-current="location"`. */
+const pinnedRow = (container: HTMLDivElement): string | null =>
+	container.querySelector<HTMLElement>('.smap-row[aria-current="location"]')
+		?.textContent ?? null;
+
+describe("settings deep links", () => {
+	test(
+		"openSettingsSection pushes the settings path with the fragment and runs" +
+			" the app's popstate listener",
+		async () => {
+			const pushed: string[] = [];
+			const history = window.history;
+			const realPush = history.pushState.bind(history);
+			history.pushState = ((_s: unknown, _t: unknown, url: string) => {
+				pushed.push(url);
+			}) as typeof history.pushState;
+			const seen: string[] = [];
+			const listener = () => seen.push("pop");
+			window.addEventListener("popstate", listener);
+			let cancel: (() => void) | undefined;
+			try {
+				cancel = openSettingsSection("git-hosts-section");
+				expect(pushed).toEqual(["/settings#git-hosts-section"]);
+				expect(seen).toEqual(["pop"]);
+			} finally {
+				cancel?.();
+				window.removeEventListener("popstate", listener);
+				history.pushState = realPush;
+			}
+		},
+	);
+
+	test(
+		"a deep link fragment pins the matching TOC row and the section exists" +
+			" on mount",
+		async () => {
+			window.location.hash = "#git-hosts-section";
+			const { container, unmount } = await mountPage();
+			try {
+				expect(pinnedRow(container)).toBe("Git hosts");
+				expect(
+					container.querySelector('[id="git-hosts-section"]'),
+				).not.toBeNull();
+			} finally {
+				await unmount();
+				window.location.hash = "";
+			}
+		},
+	);
+
+	test("a popstate to another fragment moves the pin to that row", async () => {
+		window.location.hash = "#git-hosts-section";
+		const { container, unmount } = await mountPage();
+		try {
+			expect(pinnedRow(container)).toBe("Git hosts");
+			await act(async () => {
+				window.location.hash = "#env-section";
+				window.dispatchEvent(
+					new window.PopStateEvent("popstate", { state: null }),
+				);
+			});
+			expect(pinnedRow(container)).toBe("Env");
+		} finally {
+			await unmount();
+			window.location.hash = "";
+		}
+	});
+
+	test("a fragment naming nothing on the page pins nothing of its own", async () => {
+		window.location.hash = "#bogus";
+		const { container, unmount } = await mountPage();
+		try {
+			// The scroll-spy may mark a row current on its own; the bogus fragment
+			// must not pin the row it names.
+			const current = [
+				...container.querySelectorAll('.smap-row[aria-current="location"]'),
+			].map((r) => r.textContent);
+			expect(current).not.toContain("Git hosts");
+			expect(
+				container.querySelector('[id="git-hosts-section"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+			window.location.hash = "";
 		}
 	});
 });

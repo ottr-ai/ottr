@@ -164,6 +164,7 @@ import {
 	type PendingKeyInfo,
 	PendingKeyRow,
 	ProjectSetupSteps,
+	SETTINGS_TOC,
 	SettingsPage,
 	SetupWizardModal,
 	SshTestRow,
@@ -8822,26 +8823,100 @@ function RailRows({
 	);
 }
 
-/** https:// URLs inside a server warning render as real links; a trailing sentence
- * period stays outside the anchor so the href stays valid. */
+/** General-page TOC labels (sections and blocks) mapped to their scroll-target ids;
+ * the warning-link grammar below matches exactly these labels. */
+const SETTINGS_LABEL_IDS: ReadonlyMap<string, string> = new Map(
+	SETTINGS_TOC.flatMap((group) =>
+		group.sections.flatMap((section) => [
+			[section.label, section.id] as const,
+			...("blocks" in section
+				? section.blocks.map((block) => [block.label, block.id] as const)
+				: []),
+		]),
+	),
+);
+
+const SETTINGS_SEP = String.raw`\s*(?:→|->|–|—|-)\s*`;
+const SETTINGS_LABELS = [...SETTINGS_LABEL_IDS.keys()]
+	.sort((a, b) => b.length - a.length)
+	.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+	.join("|");
+/** One scan for both link rules: a https:// URL, or a settings phrase — the word
+ * plus one or more `<separator> <label>` steps. The trailing lookahead keeps a
+ * longer word ("Settings - Envelope") from matching the "Env" label, and sentence
+ * punctuation can never join a label, so it stays outside the anchor naturally. */
+const WARNING_LINK_RE = new RegExp(
+	`(https://\\S+)|(\\bSettings(?:${SETTINGS_SEP}(?:${SETTINGS_LABELS}))+)(?![A-Za-z0-9])`,
+	"g",
+);
+/** The label steps of a matched settings phrase, for the deepest-id walk. */
+const SETTINGS_PHRASE_LABEL_RE = new RegExp(
+	`${SETTINGS_SEP}(${SETTINGS_LABELS})`,
+	"g",
+);
+
+/** Deepest TOC id for a matched settings phrase: walk its labels from the end and
+ * keep the first one that resolves, so a chain anchors to its last step. */
+function settingsPhraseId(phrase: string): string {
+	const labels = [...phrase.matchAll(SETTINGS_PHRASE_LABEL_RE)]
+		.map((m) => m[1] ?? "")
+		.reverse();
+	for (const label of labels) {
+		const id = SETTINGS_LABEL_IDS.get(label);
+		if (id !== undefined) return id;
+	}
+	// Unreachable: the phrase grammar only admits known labels.
+	return "";
+}
+
+/** Links inside a server warning: https:// URLs open in a new tab, and a
+ * `Settings <sep> <label>` phrase opens that General settings section in-tab (a
+ * chain like `Settings → Git hosts → GitHub token` anchors the whole phrase to
+ * the deepest step). A trailing sentence period stays outside the anchor so the
+ * href stays valid. */
 export function warningLinks(text: string): ReactNode {
-	return text.split(/(https:\/\/\S+)/g).map((part, i) => {
-		if (!part.startsWith("https://")) return part;
-		const url = part.replace(/\.+$/, "");
-		return (
-			<Fragment key={i}>
+	const out: ReactNode[] = [];
+	let last = 0;
+	for (const m of text.matchAll(WARNING_LINK_RE)) {
+		const { index = 0 } = m;
+		const url = m[1];
+		const phrase = m[2] ?? "";
+		if (index > last) out.push(text.slice(last, index));
+		if (url !== undefined) {
+			const link = url.replace(/\.+$/, "");
+			out.push(
+				<Fragment key={out.length}>
+					<a
+						className="notif-link"
+						href={link}
+						target="_blank"
+						rel="noopener noreferrer"
+					>
+						{link}
+					</a>
+					{url.slice(link.length)}
+				</Fragment>,
+			);
+		} else {
+			const id = settingsPhraseId(phrase);
+			out.push(
 				<a
+					key={out.length}
 					className="notif-link"
-					href={url}
-					target="_blank"
-					rel="noopener noreferrer"
+					href={`${settingsPath(null)}#${id}`}
+					onClick={(e) => {
+						e.preventDefault();
+						openSettingsSection(id);
+					}}
 				>
-					{url}
-				</a>
-				{part.slice(url.length)}
-			</Fragment>
-		);
-	});
+					{phrase}
+				</a>,
+			);
+		}
+		last = index + m[0].length;
+	}
+	if (last < text.length) out.push(text.slice(last));
+	return out;
 }
 
 /** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
