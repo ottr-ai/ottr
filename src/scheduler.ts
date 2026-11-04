@@ -13,6 +13,14 @@ import type {
  * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
 export const SILENT_LOG_MS = 2 * 60 * 60_000;
 
+/** How long an open prompt edit keeps a queued card from starting: the drawer's editor claims
+ * the hold (edit/start) and renews it while it sits open, so no starter — clicked button or
+ * scheduler tick — runs the saved prompt over an unsaved draft. An editor that never closes
+ * (crashed tab) releases the card at most this long after its last heartbeat. */
+export const PROMPT_EDIT_HOLD_MS = 30_000;
+/** The drawer renews the hold at a third of its TTL, so three lost beats still hold. */
+export const PROMPT_EDIT_HEARTBEAT_MS = 10_000;
+
 /** Last activity of a preparing or running card once it has been silent past SILENT_LOG_MS;
  * null for other states, fresher activity, or no activity yet. Activity is the later of the
  * log's last write and the running turn's last live-progress movement (`progressAt`, set by

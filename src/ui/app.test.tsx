@@ -2388,6 +2388,15 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		if (props.onClick === undefined) throw new Error("node has no onClick");
 		return props.onClick;
 	};
+	// Buttons are found by their exact label; queries run on the DOM-typed
+	// container, so the casts stay inside the DOM lib's type family.
+	const button = (box: ParentNode, name: string): HTMLButtonElement => {
+		const node = [...box.querySelectorAll("button")].find(
+			(b) => b.textContent?.trim() === name,
+		);
+		if (node === undefined) throw new Error(`no ${name} button`);
+		return node as HTMLButtonElement;
+	};
 	/** Renders the task, opens the prompt editor, and runs `check` against the
 	 * guarded start action with the editor open and after Cancel finishes it. */
 	const expectGuard = async (
@@ -2405,15 +2414,6 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
-		// Buttons are found by their exact label; queries run on the DOM-typed
-		// container, so the casts stay inside the DOM lib's type family.
-		const button = (name: string): HTMLButtonElement => {
-			const node = [...container.querySelectorAll("button")].find(
-				(b) => b.textContent?.trim() === name,
-			);
-			if (node === undefined) throw new Error(`no ${name} button`);
-			return node as HTMLButtonElement;
-		};
 		// The open editor's Cancel, scoped to its form: the drawer-actions row holds a
 		// "Cancel task" button whose text also contains "Cancel".
 		const editorCancel = (): HTMLButtonElement => {
@@ -2430,11 +2430,11 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} task={task} />);
 			});
-			const action = button(label);
+			const action = button(container, label);
 			expect(action.disabled).toBe(false);
 			expect(action.title).toBe(freeTitle);
 			await act(async () => {
-				onClickOf(button("Edit task"))({});
+				onClickOf(button(container, "Edit task"))({});
 			});
 			expect(container.querySelector("#edit-text")).not.toBeNull();
 			expect(action.disabled).toBe(true);
@@ -2486,6 +2486,50 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			"Move to todo",
 			"Puts the card in the todo lane so the agent can start it",
 		);
+	});
+
+	test("the open editor holds the card server-side and releases it on close", async () => {
+		const realFetch = globalThis.fetch;
+		// Record the hold calls; every other request degrades to null detail as above.
+		const holds: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/edit/start") || url.endsWith("/edit/stop"))
+				holds.push(url.endsWith("start") ? "start" : "stop");
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		// A queued todo card: the scheduler could start it at any tick, so its open
+		// editor must claim the hold (start) and release it when the editor is gone.
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			prompt: "do the thing",
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={task} />);
+			});
+			expect(holds).toEqual([]);
+			await act(async () => {
+				onClickOf(button(container, "Edit task"))({});
+			});
+			expect(holds).toEqual(["start"]);
+			// The drawer unmounts with the editor open (Esc, X, drawer switch): the
+			// cleanup must release the hold, or the card waits out the whole TTL.
+			await act(async () => {
+				root.unmount();
+			});
+			expect(holds).toEqual(["start", "stop"]);
+		} finally {
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 

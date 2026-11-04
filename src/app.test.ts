@@ -978,6 +978,52 @@ describe("task routes", () => {
 		);
 		expect(grillingRes.status).toBe(409);
 		expect(store.getTask(backlog.id)?.prompt).toBe("edited while parked");
+	test("an open prompt edit holds the card and every close path releases it", async () => {
+		const created = store.createTask("edited while queued");
+		// The drawer's editor claims the hold; pickRunnable defers a held card like any
+		// usage-limit hold, so the scheduler cannot start the card over the open draft.
+		const started = await post(
+			`/api/projects/p1/tasks/${created.id}/edit/start`,
+			{},
+		);
+		expect(started.status).toBe(200);
+		const held = store.getTask(created.id)!;
+		expect(held.holdUntil).not.toBeNull();
+		expect(held.holdUntil!).toBeGreaterThan(Date.now());
+		// Saving finishes the edit: the hold clears in the same write as the prompt.
+		const saved = await post(`/api/projects/p1/tasks/${created.id}/edit`, {
+			prompt: "saved draft",
+		});
+		expect(saved.status).toBe(200);
+		expect(store.getTask(created.id)?.holdUntil).toBeNull();
+		// A cancel (or any editor close) releases the hold without an edit.
+		await post(`/api/projects/p1/tasks/${created.id}/edit/start`, {});
+		expect(store.getTask(created.id)?.holdUntil).not.toBeNull();
+		const stopped = await post(
+			`/api/projects/p1/tasks/${created.id}/edit/stop`,
+			{},
+		);
+		expect(stopped.status).toBe(200);
+		expect(store.getTask(created.id)?.holdUntil).toBeNull();
+		// Started cards keep their holds: a turn means no editable prompt, and a stray
+		// hold must never stall a started card's next queue entry.
+		const run = store.createTask("started card");
+		store.startTurn(run.id, "work", "started card", null);
+		const refused = await post(
+			`/api/projects/p1/tasks/${run.id}/edit/start`,
+			{},
+		);
+		expect(refused.status).toBe(409);
+		expect(await errorOf(refused)).toBe(
+			"only a queued todo task or a parked backlog task can be edited",
+		);
+		expect(store.getTask(run.id)?.holdUntil).toBeNull();
+		// stop is guard-free: an editor closing on a just-started card still releases.
+		const released = await post(
+			`/api/projects/p1/tasks/${run.id}/edit/stop`,
+			{},
+		);
+		expect(released.status).toBe(200);
 	});
 
 	test("a retro id passes the route checks; a traversal shape still fails", async () => {

@@ -1625,6 +1625,36 @@ describe("turn schedule", () => {
 		expect(record.runs).toHaveLength(3);
 	});
 
+	test("a prompt-edit hold starts no turn until it clears", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => null,
+			// The run hangs, so the one start this test expects stays the only one.
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o as never);
+				return {
+					pid: 4242,
+					done: Promise.withResolvers<RunResult>().promise,
+					kill: async () => {},
+				};
+			},
+		});
+		store.setSettings({ maxParallel: null });
+		const task = store.createTask("queued work");
+		// The drawer's open editor claims the hold (edit/start): a scheduler tick must
+		// defer the card, or the agent runs the saved prompt over the unsaved draft.
+		store.updateTask(task.id, { holdUntil: Date.now() + 60_000 });
+		loop.schedule();
+		await flushPromises();
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)?.state).toBe("queued");
+		// Saving (editTask) or closing the editor (edit/stop) clears the hold; the
+		// next tick starts the card.
+		store.updateTask(task.id, { holdUntil: null });
+		loop.schedule();
+		await flushPromises();
+		expect(record.runs).toHaveLength(1);
+	});
+
 	test("an update's hold starts no new turn until it lapses", async () => {
 		let held = true;
 		const { store, record, loop } = setup({

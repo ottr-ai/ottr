@@ -174,6 +174,7 @@ import {
 	liveCard,
 	mergeAnywayPatch,
 	openWorkBlockers,
+	PROMPT_EDIT_HOLD_MS,
 	type ReviewTask,
 	releaseHeldMerges,
 	reviewBlocked,
@@ -5480,6 +5481,53 @@ export function createApp(deps: AppDeps) {
 						);
 					const t = e.store.editTask(task.id, trimmed);
 					return json(taskView(e, t));
+				}),
+		},
+		// The prompt-edit hold: while a drawer has the editor open, the card must not start —
+		// a scheduler tick would run the saved prompt and strand the unsaved draft (a started
+		// card can never be edited again). start claims the hold and doubles as the heartbeat;
+		// every editor close posts stop, and a save clears the hold in the store's editTask.
+		"/api/projects/:project/tasks/:id/edit/start": {
+			POST: (req) =>
+				api(req, async () => {
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { e, task } = found;
+					// Same rule as /edit: only a queued todo card or a parked backlog card has a
+					// prompt worth guarding — and a hold on a started card could stall a later
+					// reply turn.
+					if (
+						!(
+							(task.stage === "todo" && task.state === "queued") ||
+							(task.stage === "backlog" && task.state === "idle")
+						) ||
+						task.cancelledAt !== null ||
+						e.store.listTurns(task.id).length > 0
+					)
+						return json(
+							{
+								error:
+									"only a queued todo task or a parked backlog task can be edited",
+							},
+							409,
+						);
+					e.store.updateTask(task.id, {
+						holdUntil: Date.now() + PROMPT_EDIT_HOLD_MS,
+					});
+					return json({ ok: true });
+				}),
+		},
+		"/api/projects/:project/tasks/:id/edit/stop": {
+			POST: (req) =>
+				api(req, async () => {
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { e, task } = found;
+					// Idempotent, and guard-free on purpose: the drawer posts it on every editor
+					// close (a save already cleared the hold), and clearing can only let a card
+					// start sooner — it never stalls one.
+					e.store.updateTask(task.id, { holdUntil: null });
+					return json({ ok: true });
 				}),
 		},
 		"/api/projects/:project/tasks/:id/triage": {

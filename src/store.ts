@@ -1971,9 +1971,14 @@ export class ProjectStore {
 		return task;
 	}
 
-	/** Rewrites an unstarted task's prompt; the title re-derives like on create. */
+	/** Rewrites an unstarted task's prompt; the title re-derives like on create. Clears the
+	 * prompt-edit hold in the same write: the edit finished, so the card may start. */
 	editTask(id: string, prompt: string): Task {
-		return this.updateTask(id, { prompt, title: deriveTitle(prompt) });
+		return this.updateTask(id, {
+			prompt,
+			title: deriveTitle(prompt),
+			holdUntil: null,
+		});
 	}
 
 	getTask(id: string): Task | null {
