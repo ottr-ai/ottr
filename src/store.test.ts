@@ -236,6 +236,28 @@ describe("frozenTitle", () => {
 		);
 		store.close();
 	});
+
+	test("a pending title retry holds the transcript title back; the prefix never displays", () => {
+		const store = open(join(root, "frozen-title-hold"));
+		const sid = "bbbb0000-0000-0000-0000-000000000301";
+		const task = store.updateTask(store.createTask("still untitled").id, {
+			sessionId: sid,
+		});
+		mkdirSync(store.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			'{"type":"title","v":1,"title":"🩻 SKELE: Prefixed name"}\n{"type":"session"}\n{"type":"title_change","title":"🩻 SKELE: Prefixed name"}\n',
+		);
+		store.holdTitle(task.id, () => {});
+		// While the generation retry is pending, the transcript title stays unused.
+		expect(store.sessionTitle(task)).toBeNull();
+		expect(store.frozenTitle(task)).toBe(shortTitle("still untitled"));
+		// The retry settled: the hold ends and the transcript title names the card, clean.
+		expect(store.releaseTitleHold(task.id)).toBe(true);
+		expect(store.frozenTitle(task)).toBe("Prefixed name");
+		expect(store.releaseTitleHold(task.id)).toBe(false); // already released
+		store.close();
+	});
 });
 
 describe("shortTitle", () => {

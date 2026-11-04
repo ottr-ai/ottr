@@ -245,16 +245,28 @@ export function readTranscript(
 }
 
 /**
+ * omp 18.13.x heads its session titles with a small card: an icon or emoji, then a short
+ * upper-case tag and a colon (`🩻 SKELE: Add loading skeletons …`). The tag is the titler's
+ * category, not the task's name, so the whole head is stripped on read. The icon is
+ * required: a title that starts with an upper-case tag and a colon but carries no icon is a
+ * plain title ("CI: fix flaky test") and keeps its tag. Without the tag-and-colon head
+ * nothing is stripped, not even a lone leading icon.
+ */
+const CARD_TITLE_PREFIX =
+	/^\p{Extended_Pictographic}[\uFE0F\p{Emoji_Modifier}]?\s*[A-Z0-9]{2,8}:\s/u;
+
+/**
  * Strips the Markdown a titler model echoes into a card title: leading heading marks and
- * emphasis runs at the string edges (`**bold**`, `__ul__`, `*em*`, `` `code` ``). Marks in the
- * middle stay: `_` and `*` are real in identifiers like `__init__` or `*args`, and a board
- * title is prose, so only wrapped noise needs removing.
+ * emphasis runs at the string edges (`**bold**`, `__ul__`, `*em*`, `` `code` ``), plus omp's
+ * card prefix. Marks in the middle stay: `_` and `*` are real in identifiers like
+ * `__init__` or `*args`, and a board title is prose, so only wrapped noise needs removing.
  */
 export function cleanTitle(raw: string): string {
 	return raw
 		.replace(/^\s*#+\s*/, "")
 		.replace(/^[*_`]+/, "")
 		.replace(/[*_`]+$/, "")
+		.replace(CARD_TITLE_PREFIX, "")
 		.replace(/\s+/g, " ")
 		.trim();
 }

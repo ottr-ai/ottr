@@ -1454,9 +1454,36 @@ export class ProjectStore {
 		return join(this.tasksDir, "images", taskId);
 	}
 
+	/** OTTR-486: tasks with a failed prepare-phase title generation whose single retry has
+	 * not settled; the value cancels the scheduled retry. While a hold is live, sessionTitle
+	 * keeps the transcript title back, so the retry can still name the card before omp's
+	 * card-prefixed transcript title lands. In-memory only: a restart drops the hold and
+	 * the retry, and the card falls back to using the transcript title as before. */
+	private titleHolds = new Map<string, () => void>();
+
+	/** Holds the task's transcript title back until a pending generation retry settles. */
+	holdTitle(id: string, cancelRetry: () => void): void {
+		this.titleHolds.get(id)?.();
+		this.titleHolds.set(id, cancelRetry);
+	}
+
+	/** Ends the hold and cancels the scheduled retry; true when a hold was live. */
+	releaseTitleHold(id: string): boolean {
+		const cancel = this.titleHolds.get(id);
+		if (cancel === undefined) return false;
+		this.titleHolds.delete(id);
+		cancel();
+		return true;
+	}
+
+	/** True while a title-generation retry is pending for the task. */
+	titleHold(id: string): boolean {
+		return this.titleHolds.has(id);
+	}
+
 	/** The task's own session title: the stored one, or the first title in the session
-	 * transcript; null when neither exists yet. Markdown from the titler is stripped on
-	 * read, so rows written before the cleaning also display clean. */
+	 * transcript; null when neither exists yet. Markdown from the titler and omp's card
+	 * prefix are stripped on read, so rows written before the cleaning also display clean. */
 	sessionTitle(task: Task): string | null {
 		const row = this.db
 			.query<{ session_title: string | null }, [string]>(
@@ -1464,6 +1491,7 @@ export class ProjectStore {
 			)
 			.get(task.id);
 		if (row?.session_title) return cleanTitle(row.session_title);
+		if (this.titleHolds.has(task.id)) return null; // a pending generation retry outraces it
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
 		return fromSession === null ? null : cleanTitle(fromSession);
 	}

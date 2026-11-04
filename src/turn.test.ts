@@ -252,6 +252,8 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		ensurePackages: async () => [],
 		// The default keeps work turns unnamed exactly as before the prepare-phase titler.
 		genTitle: async () => null,
+		// A failed generation schedules its one retry; keep that wait out of the tests' way.
+		titleRetryDelayMs: 5,
 		publishRelease: async () => "published",
 		runReleaseCommand: async () => "ran",
 		archReviewDelta: async () => ({ delta: 0, reviewed: true, anchor: "a" }),
@@ -12285,6 +12287,87 @@ describe("turn survivor round 5 — run setup", () => {
 		expect(log).not.toContain("+ title:");
 	});
 
+	test("a failed title generation retries once and the retry names the card", async () => {
+		let calls = 0;
+		// The test resumes on the retry's generation call, never on a guessed wait.
+		const { promise: retried, resolve: sawRetry } =
+			Promise.withResolvers<void>();
+		// The run stalls, so no later turn's prepare can claim the retry before the timer does.
+		const { promise: finishRun, resolve: finish } =
+			Promise.withResolvers<RunResult>();
+		const { store, record, loop } = setup({
+			genTitle: async (_prompt, _spawn, onFail) => {
+				calls += 1;
+				if (calls === 1) {
+					onFail?.("gateway status 502: bad gateway");
+					return null;
+				}
+				sawRetry();
+				return "Named on retry";
+			},
+			startRun: (o) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return { pid: 4242, done: finishRun, kill: async () => {} };
+			},
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		const key = `${store.name}/${task.id}`;
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		await retried; // the scheduled retry ran while the stalled run holds the card
+		await Promise.resolve(); // let the retry's nameTask land
+		expect(calls).toBe(2);
+		expect(store.titleHold(task.id)).toBe(false);
+		expect(store.frozenTitle(store.getTask(task.id)!)).toBe("Named on retry");
+		expect(logText(store, task.id)).toContain(
+			"+ title: Named on retry (retry after a failed first attempt)",
+		);
+		// A later turn never generates again: the one retry is spent.
+		finish(runResult({ outcome: { status: "answered", summary: "did it" } }));
+		await run;
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(2);
+	});
+
+	test("a failed generation retries at the next turn start, once", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			genTitle: async (_prompt, _spawn, onFail) => {
+				calls += 1;
+				if (calls === 1) {
+					onFail?.("gateway status 502: bad gateway");
+					return null;
+				}
+				return "Named on turn two";
+			},
+			// Only a turn start may claim the retry in this test; the timer must not fire first.
+			titleRetryDelayMs: 3_600_000,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBeNull();
+		// The work turn's write schedules its merge turn on the loop; wait for that prepare:
+		// it sees the hold, generates again, and names the card. The log line proves prepare,
+		// not the timer, claimed the retry.
+		for (
+			let i = 0;
+			i < 100 && !logText(store, task.id).includes("Named on turn two");
+			i++
+		)
+			await flushPromises();
+		expect(logText(store, task.id)).toContain("+ title: Named on turn two\n");
+		expect(calls).toBe(2);
+		expect(store.titleHold(task.id)).toBe(false);
+		expect(store.frozenTitle(store.getTask(task.id)!)).toBe(
+			"Named on turn two",
+		);
+		// A later turn never generates again: the one retry is spent.
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(2);
+	});
+
 	test("a release card keeps its fixed session name and never generates a title", async () => {
 		let generated = 0;
 		const { store, record, loop } = setup({
@@ -15719,5 +15802,81 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		expect(huskCalls).toBe(0);
 		expect(record.removeWorktree).toHaveLength(0);
 		expect(store.getTask(task.id)!.state).toBe("needs_you");
+	});
+});
+
+describe("generateTitle failure causes", () => {
+	const gatewaySpawn = (lines: unknown[]) => async () => ({
+		code: 0,
+		stdout: lines.map((line) => JSON.stringify(line)).join("\n"),
+		stderr: "",
+	});
+
+	test("a success returns the cleaned title, card prefix stripped", async () => {
+		const title = await generateTitle(
+			"fix the gate",
+			gatewaySpawn([
+				{ ready: true },
+				{
+					id: 1,
+					status: 200,
+					body: {
+						choices: [{ message: { content: "🩻 SKELE: Fix the gate" } }],
+					},
+				},
+			]),
+		);
+		expect(title).toBe("Fix the gate");
+	});
+
+	test("a non-200 gateway status is reported as the cause", async () => {
+		const causes: string[] = [];
+		const title = await generateTitle(
+			"fix the gate",
+			gatewaySpawn([
+				{ ready: true },
+				{ id: 1, status: 502, body: { error: { message: "no quota" } } },
+			]),
+			(cause) => causes.push(cause),
+		);
+		expect(title).toBeNull();
+		expect(causes).toEqual(["gateway status 502: no quota"]);
+	});
+
+	test("an empty reply is reported as the cause", async () => {
+		const causes: string[] = [];
+		const title = await generateTitle(
+			"fix the gate",
+			gatewaySpawn([
+				{ ready: true },
+				{
+					id: 1,
+					status: 200,
+					body: { choices: [{ message: { content: "   " } }] },
+				},
+			]),
+			(cause) => causes.push(cause),
+		);
+		expect(title).toBeNull();
+		expect(causes).toEqual(["empty reply"]);
+	});
+
+	test("a hung gateway is reported as a timeout cause", async () => {
+		// The deadline is generateTitle's own timer, so fake clocks drive it deterministically.
+		jest.useFakeTimers();
+		try {
+			const causes: string[] = [];
+			const pending = generateTitle(
+				"fix the gate",
+				async () => new Promise<never>(() => {}),
+				(cause) => causes.push(cause),
+				20,
+			);
+			jest.advanceTimersByTime(20);
+			await expect(pending).resolves.toBeNull();
+			expect(causes).toEqual(["timed out after 20ms"]);
+		} finally {
+			jest.useRealTimers();
+		}
 	});
 });

@@ -306,4 +306,30 @@ describe("cleanTitle", () => {
 		expect(cleanTitle("  spaced   out  ")).toBe("spaced out");
 		expect(cleanTitle("Plain title")).toBe("Plain title");
 	});
+
+	test("strips omp's card prefix when an icon heads the upper-case tag", () => {
+		expect(
+			cleanTitle("🩻 SKELE: Add loading skeletons to task drawer sections"),
+		).toBe("Add loading skeletons to task drawer sections");
+		expect(
+			cleanTitle("🔌 FRAME: Close Progress Relay Socket on Frame Errors"),
+		).toBe("Close Progress Relay Socket on Frame Errors");
+		// The prefix match stops at the head: the inner "CI" in the remainder stays.
+		expect(cleanTitle("✅ CI: Fix CI failure and merge the fix")).toBe(
+			"Fix CI failure and merge the fix",
+		);
+		expect(cleanTitle("🃏 BOARD: Check board cards and dirty checkouts")).toBe(
+			"Check board cards and dirty checkouts",
+		);
+	});
+
+	test("keeps titles without a card head: no icon, or no upper-case tag with colon", () => {
+		// No icon: a plain title keeps its tag, even upper-case before a colon.
+		expect(cleanTitle("CI: fix flaky test")).toBe("CI: fix flaky test");
+		// No upper-case tag + colon: nothing to strip, not even a lone leading icon.
+		expect(cleanTitle("Add HTTP/2 support")).toBe("Add HTTP/2 support");
+		expect(cleanTitle("🩻 Add loading skeletons")).toBe(
+			"🩻 Add loading skeletons",
+		);
+	});
 });
