@@ -67,4 +67,10 @@ export const windows = {
 	samePath(a: string, b: string): boolean {
 		return a.toLowerCase() === b.toLowerCase();
 	},
+
+	// Windows exposes no cheap cwd of a foreign process (no /proc, no CIM field), so orphan
+	// facts resolve only through --session-dir there; "" is the documented "unknown".
+	cwdOf(_pid: number): string {
+		return "";
+	},
 } satisfies Platform;

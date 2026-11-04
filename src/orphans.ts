@@ -1,6 +1,17 @@
 // Pure orphan detection: which running agent processes nobody tracks anymore. Advisory only —
 // the tracker never kills anything; it just reports.
+import { basename, join, sep } from "node:path";
 import type { ProcessInfo } from "./platform/index.ts";
+import type { OrphanProcess } from "./types.ts";
+
+/** A process younger than this is starting up or winding down; never report it. */
+export const ORPHAN_GRACE_MS = 600_000;
+
+export interface OrphanProject {
+	name: string;
+	path: string;
+	sessionsDir: string;
+}
 
 /** Strips quotes, directories and script extensions; lowercases for comparison. */
 function tokenBasename(token: string): string {
@@ -25,18 +36,124 @@ export function matchAgentLauncher(cmd: string): boolean {
 	return false;
 }
 
+/**
+ * Agent-launcher pids nobody claims, each older than the grace window. `started === 0` (unknown
+ * age) stays reported: an untrackable process is exactly what this scan is for.
+ */
 export function orphanPids(
 	processes: readonly ProcessInfo[],
 	claimed: ReadonlySet<number>,
 	ownPid: number,
+	now: number = Date.now(),
 ): ProcessInfo[] {
 	return processes.filter(
 		(p) =>
 			p.pid > 0 &&
 			p.pid !== ownPid &&
 			!claimed.has(p.pid) &&
-			matchAgentLauncher(p.cmd),
+			matchAgentLauncher(p.cmd) &&
+			(p.started === 0 || now - p.started >= ORPHAN_GRACE_MS),
 	);
+}
+
+/** Values of every `--flag <value>` occurrence; the board passes two --config flags. */
+export function argValues(cmd: string, flag: string): string[] {
+	const tokens = cmd.trim().split(/\s+/);
+	const out: string[] = [];
+	for (let i = 0; i + 1 < tokens.length; i++) {
+		const v = tokens[i + 1];
+		if (tokens[i] === flag && v !== undefined) out.push(v);
+	}
+	return out;
+}
+
+/** "retro" | "check" | "turn" when the argv names the run kind; null when it does not. */
+export function runKind(cmd: string): string | null {
+	for (const v of argValues(cmd, "--config")) {
+		const base = basename(v);
+		if (base === "no-discovery.yml") continue;
+		if (base === "retro.yml" || base === "check.yml")
+			return base.slice(0, -".yml".length);
+	}
+	if (argValues(cmd, "--extension").length > 0) return "turn";
+	return null;
+}
+
+/** First --session-dir value of the argv; null when absent. */
+export function sessionDirOf(cmd: string): string | null {
+	return argValues(cmd, "--session-dir")[0] ?? null;
+}
+
+/** Drops leading KEY=value launcher tokens, collapses whitespace, caps at 160 chars. */
+export function summarizeCmd(cmd: string): string {
+	let t = cmd.trim();
+	while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+		t = t.split(/\s+/).slice(1).join(" ");
+	t = t.replace(/\s+/g, " ");
+	return t.length > 160 ? t.slice(0, 160) + "…" : t;
+}
+
+const DELETED_SUFFIX = " (deleted)";
+
+/**
+ * Resolves one scanned process to its orphan facts. Project and raw card id come from the cwd
+ * first (`<project.path>/.worktrees/<cardId>`); the caller validates the card id against the
+ * store. Otherwise the --session-dir names the project through `samePath`. All facts are null
+ * when nothing matches. Pure: no store or platform access.
+ */
+export function resolveOrphan(
+	p: ProcessInfo,
+	cwd: string,
+	projects: readonly OrphanProject[],
+	samePath: (a: string, b: string) => boolean,
+): OrphanProcess {
+	let project: OrphanProject | null = null;
+	let card: string | null = null;
+	if (cwd !== "") {
+		for (const pr of projects) {
+			const marker = join(pr.path, ".worktrees") + sep;
+			if (!cwd.startsWith(marker)) continue;
+			const seg = cwd.slice(marker.length).split(sep)[0] ?? "";
+			if (seg === "") continue;
+			project = pr;
+			card = seg.endsWith(DELETED_SUFFIX)
+				? seg.slice(0, -DELETED_SUFFIX.length)
+				: seg;
+			break;
+		}
+	}
+	if (project === null) {
+		const sdir = sessionDirOf(p.cmd);
+		if (sdir !== null) {
+			for (const pr of projects) {
+				if (samePath(sdir, pr.sessionsDir)) {
+					project = pr;
+					break;
+				}
+			}
+		}
+	}
+	return {
+		pid: p.pid,
+		started: p.started,
+		cmd: summarizeCmd(p.cmd),
+		project: project === null ? null : project.name,
+		card,
+		kind: runKind(p.cmd),
+	};
+}
+
+/** The store-backed facts the pure resolver cannot see: card existence. */
+export function orphanView(
+	p: ProcessInfo,
+	cwd: string,
+	projects: readonly OrphanProject[],
+	samePath: (a: string, b: string) => boolean,
+	getCard: (project: string | null, card: string) => boolean,
+): OrphanProcess {
+	const view = resolveOrphan(p, cwd, projects, samePath);
+	if (view.card !== null && !getCard(view.project, view.card)) view.card = null;
+	return view;
 }
 
 interface Cache {
@@ -70,7 +187,7 @@ export function orphanCache(
 			return { orphans: cache.value, error: null };
 		let value: ProcessInfo[];
 		try {
-			value = orphanPids(list(), claimed(), process.pid);
+			value = orphanPids(list(), claimed(), process.pid, now);
 		} catch (err) {
 			return {
 				orphans: [],

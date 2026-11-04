@@ -6448,6 +6448,141 @@ export function reportHtml(title: string, body: string): string {
 	].join("\n");
 }
 
+/** One agent process no card owns; the inbox advisory shows what it is, and a human
+ * decides whether to stop it. Ottr itself never kills these. */
+export interface OrphanRow {
+	pid: number;
+	started: number;
+	cmd: string;
+	project: string | null;
+	card: string | null;
+	kind: string | null;
+}
+
+/** The orphan advisory: a definition line, then one row per process (at most five)
+ * with the card link, the command summary, a copy action and a confirm-gated stop. */
+export function OrphanNotice(props: {
+	orphans: OrphanRow[];
+	fresh: boolean;
+	nowMs: number;
+	openTask: (id: string) => void;
+}): ReactNode {
+	const { orphans, fresh, nowMs, openTask } = props;
+	// In-flight stop requests keyed by pid, so one slow request never disables the others.
+	const [stopping, setStopping] = useState<ReadonlySet<number>>(
+		() => new Set(),
+	);
+	// Pids whose clipboard write failed; the row then shows the command as text.
+	const [copyFailed, setCopyFailed] = useState<ReadonlySet<number>>(
+		() => new Set(),
+	);
+
+	const copyKill = async (o: OrphanRow): Promise<void> => {
+		try {
+			await navigator.clipboard.writeText(`kill ${o.pid}`);
+			setCopyFailed((s) => {
+				const next = new Set(s);
+				next.delete(o.pid);
+				return next;
+			});
+		} catch {
+			setCopyFailed((s) => new Set(s).add(o.pid));
+		}
+	};
+
+	const stop = async (o: OrphanRow): Promise<void> => {
+		const cardName = o.card ?? "unknown card";
+		if (
+			!window.confirm(
+				`Stop process ${o.pid}? Card: ${cardName}. Command: ${o.cmd}`,
+			)
+		)
+			return;
+		setStopping((s) => new Set(s).add(o.pid));
+		try {
+			await post("/api/orphans/stop", {
+				pid: o.pid,
+				started: o.started,
+				cmd: o.cmd,
+			});
+		} catch (err) {
+			window.alert(err instanceof Error ? err.message : String(err));
+		} finally {
+			setStopping((s) => {
+				const next = new Set(s);
+				next.delete(o.pid);
+				return next;
+			});
+		}
+	};
+
+	return (
+		<>
+			<p className="notif-line">
+				<Icon name="info" size={16} />
+				<span>
+					An orphan is an agent run that no card owns any more. Check each
+					process before you stop it. Ottr never kills a process on its own.
+					{fresh && <span className="new-tag">New</span>}
+				</span>
+			</p>
+			{orphans.slice(0, 5).map((o) => {
+				// Narrowed locals: the closures below need non-null card, and property
+				// narrowing does not survive into a callback.
+				const card = o.card;
+				return (
+					<p className="notif-line" key={`orphan:${o.pid}`}>
+						<Icon name="info" size={16} />
+						<span>
+							pid {o.pid}
+							{o.started > 0 && <> · started {age(o.started, nowMs)} ago</>}
+							{o.kind !== null && <> · {o.kind}</>}
+							{o.project !== null && <> · {o.project}</>} ·{" "}
+							{card !== null && (
+								<button
+									type="button"
+									className="notif-link"
+									title={`Open card ${card}`}
+									onClick={() => openTask(card)}
+								>
+									{card}
+								</button>
+							)}
+							<code title={o.cmd}>{o.cmd}</code>{" "}
+							<button
+								type="button"
+								className="notif-link"
+								onClick={() => void copyKill(o)}
+							>
+								Copy kill command
+							</button>{" "}
+							<button
+								type="button"
+								className="notif-link"
+								disabled={stopping.has(o.pid)}
+								onClick={() => void stop(o)}
+							>
+								Stop process
+							</button>
+							{copyFailed.has(o.pid) && (
+								<>
+									{" "}
+									Copy failed. Run: <code>kill {o.pid}</code>
+								</>
+							)}
+						</span>
+					</p>
+				);
+			})}
+			{orphans.length > 5 && (
+				<p className="notif-line">
+					<Icon name="info" size={16} />
+					<span>… {orphans.length - 5} more orphaned processes.</span>
+				</p>
+			)}
+		</>
+	);
+}
 /** One card link in the drawer's lineage rail: the one place a drawer renders a link
  * to another card (the parent above, the follow-ups below), so an href change lands
  * on every row at once. The href always uses the LINKED card's project and id, so a
@@ -9896,26 +10031,12 @@ export function App() {
 					</p>
 				)}
 				{orphanList.length > 0 && (
-					<p className="notif-line">
-						<Icon name="info" size={16} />
-						<span>
-							{orphanList.length} agent process
-							{orphanList.length === 1 ? "" : "es"} no turn claims:{" "}
-							{orphanList
-								.slice(0, 5)
-								.map((o) =>
-									o.started > 0
-										? `pid ${o.pid} (running ${age(o.started, nowMs)})`
-										: `pid ${o.pid}`,
-								)
-								.join(", ")}
-							{orphanList.length > 5 ? " …" : ""} — stop them manually if stale;
-							Ottr never kills processes.
-						</span>
-						{orphansKey !== null && inboxFresh.has(orphansKey) && (
-							<span className="new-tag">New</span>
-						)}
-					</p>
+					<OrphanNotice
+						orphans={orphanList}
+						fresh={orphansKey !== null && inboxFresh.has(orphansKey)}
+						nowMs={nowMs}
+						openTask={openTask}
+					/>
 				)}
 				{keptCount.held > 0 && (
 					<p className="notif-line">

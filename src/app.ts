@@ -123,7 +123,12 @@ import {
 	validateRoles,
 } from "./modelRoles.ts";
 import { type ModelOption, modelList, modelRoles } from "./models.ts";
-import { orphanCache } from "./orphans.ts";
+import {
+	type OrphanProject,
+	orphanCache,
+	orphanView,
+	summarizeCmd,
+} from "./orphans.ts";
 import { perfMetrics } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
 import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
@@ -199,6 +204,7 @@ import {
 	type AppCheck,
 	answeredCard,
 	type MachineStats,
+	type OrphanProcess,
 	type PerfRange,
 	PRIORITIES,
 	type Priority,
@@ -357,6 +363,8 @@ interface AppDeps {
 	board?: { url: string; token: string };
 	/** Orphan process snapshot source; injectable for tests. Defaults to platform.listProcesses. */
 	listProcesses?: () => ProcessInfo[];
+	/** Orphan stop seam; injectable for tests. Defaults to platform.killTree. */
+	killTree?: (pid: number) => void;
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -2016,7 +2024,7 @@ export function createApp(deps: AppDeps) {
 	const orphanSnapshot = orphanCache();
 	/** Agent processes no live turn claims, cached for a few minutes; advisory only, never killed. */
 	function currentOrphanScan(): {
-		orphans: { pid: number; started: number }[];
+		orphans: OrphanProcess[];
 		error: string | null;
 	} {
 		const scan = orphanSnapshot(
@@ -2028,8 +2036,25 @@ export function createApp(deps: AppDeps) {
 			},
 			Date.now(),
 		);
+		const projects: OrphanProject[] = [...deps.projects.values()].map((e) => ({
+			name: e.name,
+			path: e.path,
+			sessionsDir: e.store.sessionsDir,
+		}));
 		return {
-			orphans: scan.orphans.map(({ pid, started }) => ({ pid, started })),
+			orphans: scan.orphans.map((p) =>
+				orphanView(
+					p,
+					platform.cwdOf(p.pid),
+					projects,
+					platform.samePath,
+					// A worktree card id counts only when that store still has the card.
+					(project, card) => {
+						const e = project === null ? undefined : deps.projects.get(project);
+						return e !== undefined && e.store.getTask(card) !== null;
+					},
+				),
+			),
 			error: scan.error,
 		};
 	}
@@ -3902,6 +3927,42 @@ export function createApp(deps: AppDeps) {
 				api(req, async () => {
 					const scan = currentOrphanScan();
 					return json({ orphans: scan.orphans, orphansError: scan.error });
+				}),
+		},
+		"/api/orphans/stop": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const { pid, started, cmd } = r.body as Record<string, unknown>;
+					if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
+						return json({ error: "invalid pid" }, 400);
+					if (typeof cmd !== "string" || cmd === "")
+						return json({ error: "invalid cmd" }, 400);
+					if (typeof started !== "number" || started < 0)
+						return json({ error: "invalid started" }, 400);
+					// Advisory stays advisory: kill only what the last scan reported, and only
+					// when the live process table still names the same command. Any drift
+					// (pid reuse, restart, a now-claimed turn) refuses, so the operator decides.
+					if (pid === process.pid)
+						return json({ error: "refusing to stop the tracker itself" }, 409);
+					const claimed = deps.claimedPids();
+					if (claimed.has(pid))
+						return json({ error: "a live turn claims this pid" }, 409);
+					const fresh = (
+						deps.listProcesses ?? (() => platform.listProcesses())
+					)();
+					const live = fresh.find((p) => p.pid === pid);
+					if (live === undefined)
+						return json({ error: "process is gone" }, 409);
+					// The state carries the summarized command, so compare shapes, not bytes:
+					// the start-time guard below is what pins the pid against reuse.
+					if (summarizeCmd(live.cmd) !== cmd)
+						return json({ error: "command differs" }, 409);
+					if (Math.abs(live.started - started) > 30_000)
+						return json({ error: "start time drifted" }, 409);
+					(deps.killTree ?? ((p) => platform.killTree(p)))(pid);
+					return json({ ok: true });
 				}),
 		},
 		"/api/stats": {

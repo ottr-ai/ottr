@@ -1,7 +1,22 @@
 import { expect, test } from "bun:test";
-import { matchAgentLauncher, orphanCache, orphanPids } from "./orphans.ts";
+import type { OrphanProject } from "./orphans.ts";
+import {
+	argValues,
+	matchAgentLauncher,
+	ORPHAN_GRACE_MS,
+	orphanCache,
+	orphanPids,
+	resolveOrphan,
+	runKind,
+	sessionDirOf,
+	summarizeCmd,
+} from "./orphans.ts";
 
-const proc = (pid: number, cmd: string) => ({ pid, cmd, started: 0 });
+const proc = (pid: number, cmd: string, started = 0) => ({
+	pid,
+	cmd,
+	started,
+});
 
 test("a tracker turn under a bun shebang is reported", () => {
 	// omp is a bun script: argv[0] is the runtime, the omp binary is argv[1] (R5-6).
@@ -136,4 +151,140 @@ test("a custom ttlMs narrows the cache window", () => {
 	expect(calls).toBe(1);
 	orphans(list, () => new Set(), 2500); // past TTL: rescans
 	expect(calls).toBe(2);
+});
+
+// ---- Grace window (OTTR-463) ----
+
+test("a process inside the grace window is not reported", () => {
+	const now = 1_000_000;
+	const ps = [proc(9, "omp -p --mode json", now - 180_000)];
+	expect(orphanPids(ps, new Set(), 1, now)).toEqual([]);
+});
+
+test("a process past the grace window is reported", () => {
+	const now = 1_000_000;
+	const ps = [proc(9, "omp -p --mode json", now - 660_000)];
+	expect(orphanPids(ps, new Set(), 1, now)).toEqual(ps);
+	expect(ORPHAN_GRACE_MS).toBe(600_000);
+});
+
+test("a process with unknown age stays reported", () => {
+	const now = 1_000_000;
+	const ps = [proc(9, "omp -p --mode json", 0)];
+	expect(orphanPids(ps, new Set(), 1, now)).toEqual(ps);
+});
+
+// ---- Orphan facts (OTTR-463) ----
+
+const checkCmd =
+	"OMP_PID=7 bun omp -p --mode json --session-dir /data/ottr/.tasks/sessions --config /x/check.yml --config /e/no-discovery.yml";
+
+const projectList: OrphanProject[] = [
+	{
+		name: "ottr",
+		path: "/data/ottr",
+		sessionsDir: "/data/ottr/.tasks/sessions",
+	},
+	{
+		name: "other",
+		path: "/srv/other",
+		sessionsDir: "/srv/other/.tasks/sessions",
+	},
+];
+const same = (a: string, b: string) => a === b;
+
+test("argValues reads every --flag value occurrence", () => {
+	expect(argValues(checkCmd, "--config")).toEqual([
+		"/x/check.yml",
+		"/e/no-discovery.yml",
+	]);
+	expect(argValues(checkCmd, "--session-dir")).toEqual([
+		"/data/ottr/.tasks/sessions",
+	]);
+	expect(argValues(checkCmd, "--missing")).toEqual([]);
+});
+
+test("runKind names the config kinds and the turn kind", () => {
+	expect(runKind(checkCmd)).toBe("check");
+	expect(runKind("bun omp -p --mode json --config /x/retro.yml")).toBe("retro");
+	expect(runKind("bun omp -p --mode json --extension omp")).toBe("turn");
+	expect(runKind("bun omp -p --mode json")).toBeNull();
+	// no-discovery.yml rides along but never names the kind.
+	expect(
+		runKind("bun omp -p --mode json --config /e/no-discovery.yml"),
+	).toBeNull();
+});
+
+test("sessionDirOf returns the first --session-dir value", () => {
+	expect(sessionDirOf(checkCmd)).toBe("/data/ottr/.tasks/sessions");
+	expect(sessionDirOf("omp -p --mode json")).toBeNull();
+});
+
+test("summarizeCmd drops leading env tokens and caps long commands", () => {
+	expect(summarizeCmd(checkCmd)).toBe(
+		"bun omp -p --mode json --session-dir /data/ottr/.tasks/sessions --config /x/check.yml --config /e/no-discovery.yml",
+	);
+	expect(summarizeCmd("A=1 B=2  omp   -p --mode json")).toBe(
+		"omp -p --mode json",
+	);
+	const long = "omp -p --mode json " + "x".repeat(200);
+	const out = summarizeCmd(long);
+	expect(out.length).toBe(161);
+	expect(out.endsWith("…")).toBe(true);
+});
+
+test("a session-dir match resolves the project and nulls the card", () => {
+	const out = resolveOrphan(proc(7, checkCmd), "", projectList, same);
+	expect(out).toEqual({
+		pid: 7,
+		started: 0,
+		cmd: summarizeCmd(checkCmd),
+		project: "ottr",
+		card: null,
+		kind: "check",
+	});
+});
+
+test("a worktree cwd resolves the project and the raw card id", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json"),
+		"/data/ottr/.worktrees/OTTR-463",
+		projectList,
+		same,
+	);
+	expect(out.project).toBe("ottr");
+	expect(out.card).toBe("OTTR-463");
+	expect(out.kind).toBeNull();
+});
+
+test("a deleted worktree suffix is stripped from the card id", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json"),
+		"/data/ottr/.worktrees/OTTR-463 (deleted)",
+		projectList,
+		same,
+	);
+	expect(out.card).toBe("OTTR-463");
+});
+
+test("a cwd outside every project resolves nothing", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json"),
+		"/elsewhere/.worktrees/X",
+		projectList,
+		same,
+	);
+	expect(out.project).toBeNull();
+	expect(out.card).toBeNull();
+});
+
+test("an unknown session-dir resolves nothing", () => {
+	const out = resolveOrphan(
+		proc(7, "bun omp -p --mode json --session-dir /nope/.tasks/sessions"),
+		"",
+		projectList,
+		same,
+	);
+	expect(out.project).toBeNull();
+	expect(out.card).toBeNull();
 });

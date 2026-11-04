@@ -124,3 +124,7 @@ describe("windows platform", () => {
 		});
 	});
 });
+
+test("cwdOf is always empty: Windows exposes no cwd of a foreign process", () => {
+	expect(windows.cwdOf(process.pid)).toBe("");
+});

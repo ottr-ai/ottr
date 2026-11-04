@@ -1,5 +1,6 @@
 // Unix (Linux today, macOS later) implementation of the Platform contract (see index.ts).
 import { spawnSync } from "node:child_process";
+import { readlinkSync } from "node:fs";
 import type { Platform, ProcessInfo } from "./index.ts";
 
 // ponytail: 32 MiB caps the ps snapshots (~1 MiB today under Stryker load, full argv listing >1 MiB).
@@ -64,6 +65,7 @@ export const unix = {
 
 	// One snapshot of every process: pid, uptime in seconds, full command line; start time is
 	// derived from the current clock, so it is approximate.
+
 	listProcesses(run: typeof spawnSync = spawnSync): ProcessInfo[] {
 		const ps = run("ps", ["-eo", "pid=,etimes=,args="], {
 			stdio: ["ignore", "pipe", "ignore"],
@@ -89,5 +91,14 @@ export const unix = {
 
 	samePath(a: string, b: string): boolean {
 		return a === b;
+	},
+
+	// /proc/<pid>/cwd is a symlink to the process working dir; a gone or unreadable pid yields "".
+	cwdOf(pid: number): string {
+		try {
+			return readlinkSync(`/proc/${pid}/cwd`);
+		} catch {
+			return "";
+		}
 	},
 } satisfies Platform;

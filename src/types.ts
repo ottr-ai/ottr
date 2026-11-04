@@ -836,6 +836,20 @@ export interface ProvisioningResponse {
 	}[];
 }
 
+export interface OrphanProcess {
+	pid: number;
+	/** Process start time as epoch ms; 0 when the platform does not report it. */
+	started: number;
+	/** Short command summary: leading KEY=value tokens dropped, whitespace collapsed, capped at 160 chars with a "…" suffix. Never env values (ps args hold none). */
+	cmd: string;
+	/** Project name when the run's cwd or --session-dir resolves to a project; null otherwise. */
+	project: string | null;
+	/** Card id when the cwd sits in the project's .worktrees/<id> and the card exists in that store; null otherwise. */
+	card: string | null;
+	/** Run kind when the argv says it: "retro" (retro.yml), "check" (check.yml), "turn" (tracker --extension present); null otherwise. */
+	kind: string | null;
+}
+
 export interface StateResponse {
 	projects: ProjectView[];
 	/** Non-cancelled tasks of all projects, newest first. */
@@ -859,7 +873,7 @@ export interface StateResponse {
 	/** Task ids the user has read; global, server-persisted. */
 	seenAnswers: string[];
 	/** Advisory: agent-launcher processes no running turn claims (machine-global); the tracker never kills them. */
-	orphans: { pid: number; started: number }[];
+	orphans: OrphanProcess[];
 	/** Error from the last orphan process scan; null when the scan succeeded. Advisory only. */
 	orphansError: string | null;
 	/** Cancelled cards still holding a kept worktree: held total, stale past the keptWorktreeDays threshold. */

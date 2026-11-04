@@ -161,3 +161,8 @@ describe.skipIf(process.platform === "win32")("unix platform", () => {
 		expect(list[41999]!.cmd).toBe("fake-proc-42000 --flag");
 	});
 });
+
+test("cwdOf reads /proc/<pid>/cwd and empty-strings a gone pid", () => {
+	expect(unix.cwdOf(process.pid)).toBe(process.cwd());
+	expect(unix.cwdOf(2_000_000_000)).toBe("");
+});

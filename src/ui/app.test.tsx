@@ -1,5 +1,494 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { type Node as HappyNode, Window } from "happy-dom";
+describe("LogView log slice controls", () => {
+	const project = { name: "proj", settings: {} } as unknown as ProjectView;
+	test("an expanded turn offers its section and the full log, slice active", () => {
+		const html = renderToStaticMarkup(
+			<LogView project={project} taskId="t1" startedAt={1_000} />,
+		);
+		expect(html).toContain("Turn log");
+		expect(html).toContain("Full log");
+		// Default is the turn's own section; the full log is the opt-in.
+		expect(html).toContain('aria-pressed="true"');
+		expect(html).toContain("(no log output yet)");
+	});
+});
+
+describe("ProjectBoard search delay", () => {
+	// React interaction needs browser globals; bun test has none. The same happy-dom
+	// swap as settings.test.tsx: installed after app.tsx's import (its browser mount
+	// guard reads document at module load), removed after this file's tests.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	/** The production onChange React rendered onto the node; happy-dom's dispatched
+	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	/** The board with three queued cards: "docs" matches exactly one. */
+	async function mountBoard(): Promise<{
+		container: HTMLDivElement;
+		input: HTMLInputElement;
+		unmount: () => Promise<void>;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const tasks = [
+			cardFixture({ id: "t1", title: "Fix bug", sessionTitle: "Fix bug" }),
+			cardFixture({
+				id: "t2",
+				title: "Write docs",
+				sessionTitle: "Write docs",
+			}),
+			cardFixture({ id: "t3", title: "Add icon", sessionTitle: "Add icon" }),
+		];
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		await act(async () => {
+			root.render(
+				<ProjectBoard
+					project={project}
+					tasks={tasks}
+					deltas={new Map()}
+					open={() => {}}
+					seenAnswers={new Set()}
+					compose={() => {}}
+					composeDraft={() => {}}
+					act={async () => true}
+					onNotice={() => {}}
+					draining={false}
+				/>,
+			);
+		});
+		const input = container.querySelector(
+			'input[aria-label="Search tasks"]',
+		) as HTMLInputElement | null;
+		if (input === null) throw new Error("search input missing");
+		return {
+			container,
+			input,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+			},
+		};
+	}
+
+	test("the task search re-filters only after the typing settles", async () => {
+		const { container, input, unmount } = await mountBoard();
+		try {
+			const count = (): string | null =>
+				container.querySelector(".search-count")?.textContent ?? null;
+			const cards = (): string[] =>
+				[...container.querySelectorAll("[data-task-id]")].map(
+					(el) => (el as HTMLElement).dataset.taskId ?? "",
+				);
+			expect(count()).toBe("3");
+			expect(input.value).toBe("");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			// Each phase is its own act: React defers an update from the apply timer to
+			// the act scope's exit, so the flush lands between phases, before the assert.
+			await act(async () => {
+				typeInto(input, "docs");
+				onChangeOf(input)({ target: { value: "docs" } });
+			});
+			// Inside the wait window the deadline has not passed: nothing filters.
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS - 100);
+			});
+			expect(count()).toBe("3");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			// Past the deadline, one card matches and the count box says so.
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 60);
+			});
+			expect(count()).toBe("1/3");
+			expect(cards()).toEqual(["t2"]);
+			// Clearing waits the same way, then brings every card back.
+			await act(async () => {
+				typeInto(input, "");
+				onChangeOf(input)({ target: { value: "" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS - 100);
+			});
+			expect(count()).toBe("1/3");
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 60);
+			});
+			expect(count()).toBe("3");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			expect(
+				container
+					.querySelector(".search-group")
+					?.classList.contains("filtered"),
+			).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+/** Minimal ComposeDialog props: the copy the three callers pin, with a no-op send and act. */
+const compose = (extra?: Partial<Parameters<typeof ComposeDialog>[0]>) => ({
+	open: true,
+	onClose: () => {},
+	act: () => Promise.resolve(true),
+	draftKey: "test:new",
+	label: "New task for demo",
+	heading: "New task",
+	sub: null,
+	inputLabel: "What should the agent do?",
+	placeholder: "Describe the task",
+	hint: "hint",
+	icon: "plus" as const,
+	submitLabel: "Add task",
+	send: () => Promise.resolve(),
+	...extra,
+});
+describe("OrphanNotice", () => {
+	const row = {
+		pid: 4242,
+		started: 90_000,
+		cmd: "bun run retro --card O-9",
+		project: "ottr",
+		card: "O-9",
+		kind: "retro",
+	};
+
+	test("the definition line renders once above the rows", () => {
+		const html = renderToStaticMarkup(
+			<OrphanNotice
+				orphans={[row]}
+				fresh={false}
+				nowMs={210_000}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html).toContain(
+			"An orphan is an agent run that no card owns any more.",
+		);
+		expect(html).toContain("Ottr never kills a process on its own.");
+	});
+
+	test("a row with project and card renders a card button for the card id", () => {
+		const opened: string[] = [];
+		const html = renderToStaticMarkup(
+			<OrphanNotice
+				orphans={[row]}
+				fresh={false}
+				nowMs={210_000}
+				openTask={(id) => {
+					opened.push(id);
+				}}
+			/>,
+		);
+		expect(html).toContain("pid 4242");
+		expect(html).toContain("started 2m ago");
+		expect(html).toContain("retro");
+		expect(html).toContain("ottr");
+		// The command summary is a code element whose title repeats it for hover.
+		expect(html).toContain('<code title="bun run retro --card O-9">');
+		const html2 = renderToStaticMarkup(
+			<OrphanNotice
+				orphans={[row]}
+				fresh={false}
+				nowMs={210_000}
+				openTask={(id) => {
+					opened.push(id);
+				}}
+			/>,
+		);
+		expect(html2).toContain(">O-9</button>");
+		// Static markup cannot fire events; the click wiring is tested in the actions describe.
+	});
+
+	test("a row without a card renders no card button", () => {
+		const html = renderToStaticMarkup(
+			<OrphanNotice
+				orphans={[{ ...row, card: null, project: null }]}
+				fresh={false}
+				nowMs={210_000}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html).not.toContain(">O-9</button>");
+	});
+
+	test("the list caps at five rows and marks the overflow", () => {
+		const rows = Array.from({ length: 7 }, (_, i) => ({
+			...row,
+			pid: 100 + i,
+			started: 0,
+		}));
+		const html = renderToStaticMarkup(
+			<OrphanNotice
+				orphans={rows}
+				fresh={false}
+				nowMs={210_000}
+				openTask={() => {}}
+			/>,
+		);
+		expect(html.match(/Stop process/g)?.length).toBe(5);
+		expect(html).toContain("2 more orphaned processes");
+	});
+
+
+});
+
+describe("OrphanNotice actions", () => {
+	// React interaction needs browser globals; bun test has none. happy-dom registers
+	// them here; afterAll puts the originals back (same pattern as settings.test.tsx).
+	const win = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window: win,
+		document: win.document,
+		navigator: win.navigator,
+		Event: win.Event,
+		HTMLElement: win.HTMLElement,
+		Node: win.Node,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const onClickOf = (node: Element): (() => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: () => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	const buttonOf = (container: HTMLDivElement, label: string): Element => {
+		const el = Array.from(container.querySelectorAll("button")).find(
+			(b) => b.textContent === label,
+		);
+		if (el === undefined) throw new Error(`no ${label} button`);
+		return el;
+	};
+
+	const row = {
+		pid: 4242,
+		started: 90_000,
+		cmd: "bun run retro --card O-9",
+		project: "ottr",
+		card: "O-9",
+		kind: "retro",
+	};
+
+	async function mount(
+		open: (id: string) => void = () => {},
+	): Promise<{
+		container: HTMLDivElement;
+		unmount: () => void;
+	}> {
+		// happy-dom's DOM classes do not structurally match lib.dom's; convert once here.
+		const container = win.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		win.document.body.append(container as never);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<OrphanNotice
+					orphans={[row]}
+					fresh={false}
+					nowMs={210_000}
+					openTask={open}
+					/>,
+			);
+		});
+		return { container, unmount: () => root.unmount() };
+	}
+
+	// happy-dom's Window type omits the dialog methods; speak them through this cast.
+	const w = win as unknown as { confirm: (m: string) => boolean };
+
+	test("stop without confirm does not post", async () => {
+		const posts: string[] = [];
+		const realConfirm = w.confirm;
+		const realFetch = globalThis.fetch;
+		w.confirm = () => false;
+		globalThis.fetch = ((input: unknown) => {
+			posts.push(String(input));
+			throw new Error("must not fetch");
+		}) as unknown as typeof fetch;
+		const { container, unmount } = await mount();
+		try {
+			await act(async () => {
+				onClickOf(buttonOf(container, "Stop process"))();
+			});
+			expect(posts).toEqual([]);
+		} finally {
+			w.confirm = realConfirm;
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("stop with confirm posts the orphan identity to /api/orphans/stop", async () => {
+		let body: unknown = null;
+		let url = "";
+		const realConfirm = w.confirm;
+		const realFetch = globalThis.fetch;
+		w.confirm = () => true;
+		globalThis.fetch = ((
+			input: unknown,
+			init?: { method?: string; body?: string },
+		) => {
+			url = String(input);
+			body = JSON.parse(init?.body ?? "null");
+			return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+		}) as unknown as typeof fetch;
+		const { container, unmount } = await mount();
+		try {
+			await act(async () => {
+				onClickOf(buttonOf(container, "Stop process"))();
+			});
+			expect(url).toBe("/api/orphans/stop");
+			expect(body).toEqual({
+				pid: 4242,
+				started: 90_000,
+				cmd: "bun run retro --card O-9",
+			});
+		} finally {
+			w.confirm = realConfirm;
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("copy writes kill <pid> to the clipboard", async () => {
+		const written: string[] = [];
+		const realNavigator = host.navigator;
+		host.navigator = {
+			clipboard: {
+				writeText: (text: string) => {
+					written.push(text);
+					return Promise.resolve();
+				},
+			},
+		};
+		const { container, unmount } = await mount();
+		try {
+			await act(async () => {
+				onClickOf(buttonOf(container, "Copy kill command"))();
+			});
+			expect(written).toEqual(["kill 4242"]);
+		} finally {
+			host.navigator = realNavigator;
+			await act(async () => {
+				unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("the card button opens the card through openTask", async () => {
+		const opened: string[] = [];
+		const { container, unmount } = await mount((id) => {
+			opened.push(id);
+		});
+		try {
+			await act(async () => {
+				onClickOf(buttonOf(container, "O-9"))();
+			});
+			expect(opened).toEqual(["O-9"]);
+		} finally {
+			await act(async () => {
+				unmount();
+			});
+			container.remove();
+		}
+	});
+});
+
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -53,6 +542,7 @@ const {
 	SEARCH_APPLY_MS,
 	ComposeDialog,
 	DeepenReview,
+	OrphanNotice,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -3124,265 +3614,3 @@ describe("path URL card links", () => {
 	});
 });
 
-describe("LogView log slice controls", () => {
-	const project = { name: "proj", settings: {} } as unknown as ProjectView;
-	test("an expanded turn offers its section and the full log, slice active", () => {
-		const html = renderToStaticMarkup(
-			<LogView project={project} taskId="t1" startedAt={1_000} />,
-		);
-		expect(html).toContain("Turn log");
-		expect(html).toContain("Full log");
-		// Default is the turn's own section; the full log is the opt-in.
-		expect(html).toContain('aria-pressed="true"');
-		expect(html).toContain("(no log output yet)");
-	});
-});
-
-describe("ProjectBoard search delay", () => {
-	// React interaction needs browser globals; bun test has none. The same happy-dom
-	// swap as settings.test.tsx: installed after app.tsx's import (its browser mount
-	// guard reads document at module load), removed after this file's tests.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
-	const typeInto = (el: HTMLInputElement, value: string): void => {
-		const setter = Object.getOwnPropertyDescriptor(
-			window.HTMLInputElement.prototype,
-			"value",
-		)?.set;
-		if (setter === undefined) throw new Error("value setter missing");
-		setter.call(el, value);
-	};
-
-	/** The production onChange React rendered onto the node; happy-dom's dispatched
-	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
-
-	/** The board with three queued cards: "docs" matches exactly one. */
-	async function mountBoard(): Promise<{
-		container: HTMLDivElement;
-		input: HTMLInputElement;
-		unmount: () => Promise<void>;
-	}> {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const tasks = [
-			cardFixture({ id: "t1", title: "Fix bug", sessionTitle: "Fix bug" }),
-			cardFixture({
-				id: "t2",
-				title: "Write docs",
-				sessionTitle: "Write docs",
-			}),
-			cardFixture({ id: "t3", title: "Add icon", sessionTitle: "Add icon" }),
-		];
-		const project = {
-			name: "proj",
-			hasRules: true,
-			github: null,
-			gitless: false,
-			dirty: false,
-			archReview: null,
-			latestRelease: null,
-			latestImage: null,
-			settings: { setupChecklist: false },
-			sessionsDir: "/tmp/s",
-		} as unknown as ProjectView;
-		await act(async () => {
-			root.render(
-				<ProjectBoard
-					project={project}
-					tasks={tasks}
-					deltas={new Map()}
-					open={() => {}}
-					seenAnswers={new Set()}
-					compose={() => {}}
-					composeDraft={() => {}}
-					act={async () => true}
-					onNotice={() => {}}
-					draining={false}
-				/>,
-			);
-		});
-		const input = container.querySelector(
-			'input[aria-label="Search tasks"]',
-		) as HTMLInputElement | null;
-		if (input === null) throw new Error("search input missing");
-		return {
-			container,
-			input,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-			},
-		};
-	}
-
-	test("the task search re-filters only after the typing settles", async () => {
-		const { container, input, unmount } = await mountBoard();
-		try {
-			const count = (): string | null =>
-				container.querySelector(".search-count")?.textContent ?? null;
-			const cards = (): string[] =>
-				[...container.querySelectorAll("[data-task-id]")].map(
-					(el) => (el as HTMLElement).dataset.taskId ?? "",
-				);
-			expect(count()).toBe("3");
-			expect(input.value).toBe("");
-			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
-			// Each phase is its own act: React defers an update from the apply timer to
-			// the act scope's exit, so the flush lands between phases, before the assert.
-			await act(async () => {
-				typeInto(input, "docs");
-				onChangeOf(input)({ target: { value: "docs" } });
-			});
-			// Inside the wait window the deadline has not passed: nothing filters.
-			await act(async () => {
-				await Bun.sleep(SEARCH_APPLY_MS - 100);
-			});
-			expect(count()).toBe("3");
-			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
-			// Past the deadline, one card matches and the count box says so.
-			await act(async () => {
-				await Bun.sleep(SEARCH_APPLY_MS + 60);
-			});
-			expect(count()).toBe("1/3");
-			expect(cards()).toEqual(["t2"]);
-			// Clearing waits the same way, then brings every card back.
-			await act(async () => {
-				typeInto(input, "");
-				onChangeOf(input)({ target: { value: "" } });
-			});
-			await act(async () => {
-				await Bun.sleep(SEARCH_APPLY_MS - 100);
-			});
-			expect(count()).toBe("1/3");
-			await act(async () => {
-				await Bun.sleep(SEARCH_APPLY_MS + 60);
-			});
-			expect(count()).toBe("3");
-			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
-			expect(
-				container
-					.querySelector(".search-group")
-					?.classList.contains("filtered"),
-			).toBe(false);
-		} finally {
-			await unmount();
-		}
-	});
-});
-
-/** Minimal ComposeDialog props: the copy the three callers pin, with a no-op send and act. */
-const compose = (extra?: Partial<Parameters<typeof ComposeDialog>[0]>) => ({
-	open: true,
-	onClose: () => {},
-	act: () => Promise.resolve(true),
-	draftKey: "test:new",
-	label: "New task for demo",
-	heading: "New task",
-	sub: null,
-	inputLabel: "What should the agent do?",
-	placeholder: "Describe the task",
-	hint: "hint",
-	icon: "plus" as const,
-	submitLabel: "Add task",
-	send: () => Promise.resolve(),
-	...extra,
-});
-
-describe("ComposeDialog deepen", () => {
-	test("a deepen-enabled composer shows the Help badge, the Deepen button and its hint; both buttons start disabled on an empty draft", () => {
-		const html = renderToStaticMarkup(
-			<ComposeDialog
-				{...compose({
-					deepen: () => Promise.resolve({ deepened: "x" }),
-				})}
-			/>,
-		);
-		expect(html).toContain('aria-label="About Deepen"');
-		expect(html).toContain("Deepen");
-		expect(html).toContain("deepen-row");
-		expect(html).toContain("deepen-hint");
-		// Empty draft: Deepen and the submit button are both disabled in the markup.
-		expect(html).toContain('class="deepen-btn" disabled=""');
-		expect(html).toContain('type="submit" class="primary" disabled=""');
-		expect(html).not.toContain("Use rewrite");
-	});
-	test("without the deepen prop no badge and no Deepen button render, and the submit button is untouched", () => {
-		const html = renderToStaticMarkup(<ComposeDialog {...compose()} />);
-		expect(html).not.toContain('aria-label="About Deepen"');
-		expect(html).not.toContain("deepen-btn");
-		expect(html).toContain('type="submit"');
-	});
-});
-
-describe("DeepenReview", () => {
-	const review = (original: string, deepened: string) =>
-		renderToStaticMarkup(
-			<DeepenReview
-				original={original}
-				deepened={deepened}
-				onUse={() => {}}
-				onDiscard={() => {}}
-			/>,
-		);
-	test("a mixed rewrite renders add and del rows, each with its +/- glyph", () => {
-		const html = review("keep\nold", "keep\nnew");
-		expect(html).toContain("dl-add");
-		expect(html).toContain("dl-del");
-		expect(html).toContain("+");
-		expect(html).toContain("\u2212");
-		expect(html).toContain(">old</span>");
-		expect(html).toContain(">new</span>");
-		expect(html).toContain("Use rewrite");
-		expect(html).toContain("Discard");
-	});
-	test("a rewrite that differs in no line says so instead of an empty diff box", () => {
-		const html = review("same\ntext", "same\ntext");
-		expect(html).not.toContain("dl-add");
-		expect(html).toContain("matches the draft line for line");
-		expect(html).toContain("Use rewrite");
-	});
-});

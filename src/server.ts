@@ -603,7 +603,12 @@ serverRef.current = Bun.serve({
 // kills them; the operator decides (also on demand via GET /api/orphans and /api/state).
 try {
 	const claimed = claimedPids();
-	const orphans = orphanPids(platform.listProcesses(), claimed, process.pid);
+	const orphans = orphanPids(
+		platform.listProcesses(),
+		claimed,
+		process.pid,
+		Date.now(),
+	);
 	if (orphans.length === 0) console.log("orphans: none");
 	else
 		for (const o of orphans)

@@ -20,6 +20,11 @@ export interface Platform {
 	 * callers must surface that, never treat it as an empty list.
 	 */
 	listProcesses(): ProcessInfo[];
+	/**
+	 * Working directory of `pid`, absolute; "" when the platform cannot report it (process gone,
+	 * no permission, or the OS exposes no cwd). Advisory input for orphan facts only.
+	 */
+	cwdOf(pid: number): string;
 	/** True when two absolute, slash-normalized paths name the same folder under the OS's case rules. */
 	samePath(a: string, b: string): boolean;
 }

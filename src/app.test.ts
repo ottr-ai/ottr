@@ -42,6 +42,7 @@ import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { modelRoles } from "./models.ts";
+import { summarizeCmd } from "./orphans.ts";
 import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
@@ -5893,7 +5894,8 @@ describe("orphan scan failures", () => {
 				{
 					pid: 4242,
 					cmd: "omp -p --mode json --session-dir d1",
-					started: Date.now() - 60_000,
+					// Past the 10-minute grace window, so the scan reports it.
+					started: Date.now() - 660_000,
 				},
 			];
 		},
@@ -5920,7 +5922,182 @@ describe("orphan scan failures", () => {
 		failScan = false;
 		const state = await (await getFailing("/api/state")).json();
 		expect(state.orphansError).toBeNull();
-		expect(state.orphans).toEqual([{ pid: 4242, started: expect.any(Number) }]);
+		// OTTR-463: the advisory carries the resolved facts, not just pid and start time.
+		expect(state.orphans).toEqual([
+			{
+				pid: 4242,
+				started: expect.any(Number),
+				cmd: "omp -p --mode json --session-dir d1",
+				project: null,
+				card: null,
+				kind: null,
+			},
+		]);
+	});
+});
+
+describe("orphan facts and stop (OTTR-463)", () => {
+	const g = GlobalStore.open(join(root, "g-orphans"));
+	const dir = join(root, "orph");
+	const ostore = ProjectStore.open(dir);
+	const projs = new Map<string, Entry>();
+	projs.set("orph", {
+		path: dir,
+		name: "orph",
+		store: ostore,
+		target: null,
+		gitless: false,
+		github: null,
+		remote: null,
+		dirty: false,
+		latestRelease: null,
+		latestImage: null,
+		archReview: null,
+	});
+	// ps reports the full argv; the state carries summarizeCmd of it. The stop route
+	// compares shapes, so these tests post the summarized form, like the UI does.
+	const psCmd =
+		"OMP_PID=9 bun omp -p --mode json --session-dir " + ostore.sessionsDir;
+	const cmd = summarizeCmd(psCmd);
+	const pid = 4321;
+	let listed: { pid: number; cmd: string; started: number }[] = [];
+	let claimed: number[] = [];
+	const killed: number[] = [];
+	const appO = createApp({
+		gstore: g,
+		defaultDir: root,
+		projects: projs,
+		...loopStubs(),
+		claimedPids: () => new Set(claimed),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared,
+		serverRef: { current: undefined },
+		listProcesses: () => listed,
+		killTree: (p) => killed.push(p),
+	});
+	const srvO = Bun.serve({ port: 0, ...appO.serveOptions });
+	appO.serverRef.current = srvO;
+	mounted.push(srvO);
+	const call = (path: string, body?: unknown) =>
+		fetch(new URL(path, srvO.url), {
+			method: body === undefined ? "GET" : "POST",
+			headers: {
+				"content-type": "application/json",
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+			},
+			body: body === undefined ? undefined : JSON.stringify(body),
+		});
+
+	test("state.orphans carries the enriched facts", async () => {
+		listed = [{ pid, cmd: psCmd, started: Date.now() - 660_000 }];
+		claimed = [];
+		const state = await (await call("/api/state")).json();
+		expect(state.orphans).toEqual([
+			{
+				pid,
+				started: expect.any(Number),
+				cmd: "bun omp -p --mode json --session-dir " + ostore.sessionsDir,
+				project: "orph",
+				card: null,
+				kind: null,
+			},
+		]);
+		const orphans = await (await call("/api/orphans")).json();
+		expect(orphans.orphans).toEqual(state.orphans);
+	});
+
+	test("stop kills on an exact match", async () => {
+		listed = [{ pid, cmd: psCmd, started: Date.now() - 660_000 }];
+		claimed = [];
+		const res = await call("/api/orphans/stop", {
+			pid,
+			started: listed[0]!.started,
+			cmd,
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		expect(killed).toEqual([pid]);
+	});
+
+	test("stop kills when the posted summary is all the state kept of a long argv", async () => {
+		// A real omp argv often passes 160 chars; the UI only holds the capped summary.
+		const long = `${psCmd} --config ${"/opt/tracker/".repeat(8)}retro.yml`;
+		expect(summarizeCmd(long).length).toBeGreaterThan(100);
+		listed = [{ pid, cmd: long, started: Date.now() - 660_000 }];
+		claimed = [];
+		const killsBefore = killed.length;
+		const res = await call("/api/orphans/stop", {
+			pid,
+			started: listed[0]!.started,
+			cmd: summarizeCmd(long),
+		});
+		expect(res.status).toBe(200);
+		expect(killed.length).toBe(killsBefore + 1);
+	});
+
+	test("stop refuses a gone pid", async () => {
+		listed = [];
+		const killsBefore = killed.length;
+		const res = await call("/api/orphans/stop", { pid, started: 0, cmd });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("process is gone");
+		expect(killed.length).toBe(killsBefore);
+	});
+
+	test("stop refuses a changed command", async () => {
+		listed = [
+			{ pid, cmd: "bun omp -p --mode json --config /x/retro.yml", started: 0 },
+		];
+		const res = await call("/api/orphans/stop", { pid, started: 0, cmd });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("command differs");
+	});
+
+	test("stop refuses a start time drift beyond 30 s", async () => {
+		listed = [{ pid, cmd: psCmd, started: 100_000 }];
+		const res = await call("/api/orphans/stop", {
+			pid,
+			started: 100_000 + 31_000,
+			cmd,
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("start time drifted");
+	});
+
+	test("stop refuses a claimed pid", async () => {
+		listed = [{ pid, cmd: psCmd, started: 0 }];
+		claimed = [pid];
+		const res = await call("/api/orphans/stop", { pid, started: 0, cmd });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("a live turn claims this pid");
+	});
+
+	test("stop refuses the tracker's own pid", async () => {
+		listed = [{ pid: process.pid, cmd: psCmd, started: 0 }];
+		const res = await call("/api/orphans/stop", {
+			pid: process.pid,
+			started: 0,
+			cmd,
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("refusing to stop the tracker itself");
+	});
+
+	test("stop rejects an invalid body", async () => {
+		for (const body of [
+			{ pid: 0, started: 0, cmd: "x" },
+			{ pid: 1.5, started: 0, cmd: "x" },
+			{ pid: 7, started: -1, cmd: "x" },
+			{ pid: 7, started: 0, cmd: "" },
+			{ pid: 7, started: "0", cmd: "x" },
+		]) {
+			const res = await call("/api/orphans/stop", body);
+			expect(res.status).toBe(400);
+		}
 	});
 });
 
