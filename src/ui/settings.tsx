@@ -66,7 +66,7 @@ import { age, stamp } from "./time.ts";
 /** Save-button body: the brief saved confirmation, else the plain label. */
 function SaveLabel({ saved }: { saved: boolean }) {
 	return saved ? (
-		<span role="status">
+		<span role="status" className="save-label">
 			<Mark kind="done" />
 			Saved
 		</span>

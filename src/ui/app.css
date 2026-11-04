@@ -4554,6 +4554,13 @@ dialog.confirm-dialog {
 	justify-content: center;
 	min-width: 72px;
 }
+/* The saved flash inside the button: flex-center the check against the label — inline
+   layout would baseline-align the mark's 14px box and ride it above the text's band. */
+.save-label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
 /* Save tick beside a control that saves at once. The spinner waits 250ms before it shows,
    so a quick save goes straight to the check; the check draws its stroke, then fades. */
 .save-tick {
