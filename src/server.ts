@@ -17,6 +17,7 @@ import { GlobalStore } from "./globalStore.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
 	highestTag,
@@ -445,12 +446,25 @@ const loop = createTurnLoop(projects, {
 	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
 		turnEnv(project, model, shared.envValues, { home: workersHome }),
-	// R5-1: a server-local turn reads tools.json and installs under the board's server-only
-	// home (the board-seed copy), never the shared home a worker turn can write.
-	prepareTurn: async (project) => ({
-		lines: await ensureProjectTools(project, workersHome ?? boardOmpHome()),
-		pathDir: buildToolsPath(project, workersHome ?? boardOmpHome()),
-	}),
+	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the
+	// board's server-only home (the board-seed copy), never the shared home a worker turn can
+	// write. The project venv's bin dir joins the tools link dir on the turn PATH, so a merge
+	// turn re-runs the gates against the declared package set with no install step and no
+	// question (docs/specs/merge-turn-packages.md).
+	prepareTurn: async (project) => {
+		const home = workersHome ?? boardOmpHome();
+		const lines = [
+			...(await ensureProjectTools(project, home)),
+			...(await ensureProjectPython(project, home)),
+		];
+		const venvBin = pythonPathDir(project, home);
+		if (venvBin !== "")
+			lines.push("pip: the project venv's bin dir is on this turn's PATH");
+		const pathDir =
+			[buildToolsPath(project, home), venvBin].filter(Boolean).join(":") ||
+			null;
+		return { lines, pathDir };
+	},
 	publishRelease,
 	runReleaseCommand,
 	archReviewDelta,

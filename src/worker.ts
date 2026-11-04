@@ -1,4 +1,5 @@
 import { ensureAllPackages } from "./apt.ts";
+import { ensureAllPython } from "./python.ts";
 import { sweepTmpDirs } from "./tmpsweep.ts";
 import { ensureAllTools } from "./tools.ts";
 import { serveWorker } from "./workers.ts";
@@ -30,6 +31,12 @@ Promise.all([
 		(lines) => lines,
 		(err) => {
 			throw new Error(`tools: ${err instanceof Error ? err.message : err}`);
+		},
+	),
+	ensureAllPython().then(
+		(lines) => lines,
+		(err) => {
+			throw new Error(`pip: ${err instanceof Error ? err.message : err}`);
 		},
 	),
 ]).then(

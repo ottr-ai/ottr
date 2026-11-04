@@ -137,6 +137,7 @@ import {
 	workCheckSendBack,
 } from "./prompts.ts";
 import { createPrWatcher, prUrl } from "./prs.ts";
+import { requirementsListPath } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
 	includedTasks,
@@ -4233,6 +4234,7 @@ export function createApp(deps: AppDeps) {
 						name,
 						apt: existsSync(aptListPath(name, workersHome)),
 						tools: existsSync(toolsListPath(name, workersHome)),
+						requirements: existsSync(requirementsListPath(name, workersHome)),
 						env: existsSync(envListPath(name, workersHome)),
 					}));
 					return json({ server, workers } satisfies ProvisioningResponse);

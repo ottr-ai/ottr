@@ -71,7 +71,7 @@ RUN apt-get update \
       "curl=${CURL_VERSION}" \
       "openssh-client=${OPENSSH_CLIENT_VERSION}" \
       ca-certificates \
-      python3 make g++ pkg-config unzip \
+      python3 python3-venv make g++ pkg-config unzip \
     && rm -rf /var/lib/apt/lists \
     && git --version \
     && git lfs install --system --skip-repo \

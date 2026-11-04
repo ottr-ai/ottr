@@ -806,7 +806,13 @@ export interface ProvisioningResponse {
 			| { state: "down" };
 	};
 	/** Projects alate provisioned lists for, sorted; booleans say which lists exist. */
-	workers: { name: string; apt: boolean; tools: boolean; env: boolean }[];
+	workers: {
+		name: string;
+		apt: boolean;
+		tools: boolean;
+		requirements: boolean;
+		env: boolean;
+	}[];
 }
 
 export interface StateResponse {

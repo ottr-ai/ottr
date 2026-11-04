@@ -214,6 +214,33 @@ of project A to project B. The board-seed one-off copies the lists to the board
 home; the hourly deploy runs it when it seeds the board ("Seed the board
 config"). Until a seed runs, turns get no env values.
 
+### Python packages per project
+
+Python packages a project's turns need go into `workers/<project>/requirements.txt`,
+beside the other lists (`workers/_all/requirements.txt` for the fleet). One line
+per package, transitive dependencies included, each pinned and hashed:
+
+    numpy==1.26.4 --hash=sha256:<64 hex>
+
+`#` comments are allowed. No options, no `-r`, no `--index-url`, no extras: pip
+installs with `--require-hashes`, so nothing unpinned can slip in, in either home.
+Alate provisions the file like `tools.json`, and the board seed copies it into the
+board home. The project's lines win over the `_all` lines for the same package
+name. The board's provisioning view shows the list as the Python column.
+
+The machine that runs a turn builds a venv under its own home,
+`~/.ottr/pip/<sha256 of the merged list>/`, once per list: `python3 -m venv` plus
+`pip install --require-hashes`, built in a temp dir and moved in with one rename,
+so a rerun is a no-op and a failed build leaves nothing behind. A server-side turn
+(a merge turn, or a work turn with no worker) gets the venv's bin dir on its PATH,
+behind the tools link dir: a merge turn re-runs the gates against the declared set
+with no install step and no question, and its turn log names the venv. A work turn
+on a worker keeps its own flow: the venv stays off its PATH, so an ad-hoc
+`pip --user` install keeps working. A build or install failure stops the turn,
+like a failed apt install. The turn image carries `python3-venv`
+(Dockerfile.worker); Debian ships no pip without it. Until alate provisions the
+new list (its `WORKER_FILES`), no list reaches a home and every build is a no-op.
+
 ## Env settings
 
 - Server: `OTTR_WORKER_URLS` (comma-separated, e.g.

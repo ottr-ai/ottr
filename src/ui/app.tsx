@@ -3499,6 +3499,7 @@ export function serverLine(s: ProvisioningResponse["server"]): {
 const PROV_LISTS = [
 	{ key: "apt", label: "Packages" },
 	{ key: "tools", label: "Tools" },
+	{ key: "requirements", label: "Python" },
 	{ key: "env", label: "Env" },
 ] as const;
 

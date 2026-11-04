@@ -9,6 +9,7 @@ import {
 import { isAbsolute } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
 import { platform } from "./platform/index.ts";
+import { ensureProjectPython } from "./python.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
 import { buildToolsPath, ensureProjectTools } from "./tools.ts";
@@ -48,6 +49,8 @@ export function serveWorker(opts: {
 	ensurePackages?: typeof ensureProjectPackages;
 	/** Only for tests: replaces the tools.json install that runs before omp. */
 	ensureTools?: typeof ensureProjectTools;
+	/** Only for tests: replaces the requirements.txt venv build that runs before omp. */
+	ensurePython?: typeof ensureProjectPython;
 	/** Only for tests: replaces the link dir prepended to the child's PATH. */
 	buildPath?: typeof buildToolsPath;
 	/** Only for tests: roots the /sweep scan instead of /workspace. */
@@ -121,8 +124,16 @@ export function serveWorker(opts: {
 					const toolLines = await (opts.ensureTools ?? ensureProjectTools)(
 						project,
 					);
+					// The venv builds into the shared home, but stays off the PATH: a worker work
+					// turn keeps its ad-hoc pip --user flow, and a venv bin dir first on PATH would
+					// shadow the user site it installs into (docs/specs/merge-turn-packages.md).
+					const pipLines = await (opts.ensurePython ?? ensureProjectPython)(
+						project,
+					);
 					pathDir = (opts.buildPath ?? buildToolsPath)(project);
-					notes = [...aptLines, ...toolLines].map((l) => `${l}\n`).join("");
+					notes = [...aptLines, ...toolLines, ...pipLines]
+						.map((l) => `${l}\n`)
+						.join("");
 				} catch (err) {
 					const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
 					return new Response(

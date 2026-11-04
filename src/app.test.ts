@@ -2470,6 +2470,11 @@ describe("alate routes", () => {
 		await post("/api/alate", { url: null, key: null });
 		provList("p-a", "apt.txt", "curl\n");
 		provList("p-a", "tools.json", "[]\n");
+		provList(
+			"p-a",
+			"requirements.txt",
+			`idna==3.10 --hash=sha256:${"a".repeat(64)}\n`,
+		);
 		provList("p-b", "env.txt", "FOO\n");
 		try {
 			const res = await get("/api/provisioning");
@@ -2477,8 +2482,20 @@ describe("alate routes", () => {
 			expect(await res.json()).toEqual({
 				server: null,
 				workers: [
-					{ name: "p-a", apt: true, tools: true, env: false },
-					{ name: "p-b", apt: false, tools: false, env: true },
+					{
+						name: "p-a",
+						apt: true,
+						tools: true,
+						requirements: true,
+						env: false,
+					},
+					{
+						name: "p-b",
+						apt: false,
+						tools: false,
+						requirements: false,
+						env: true,
+					},
 				],
 			});
 		} finally {
@@ -2516,8 +2533,20 @@ describe("alate routes", () => {
 					},
 				},
 				workers: [
-					{ name: "p-a", apt: true, tools: true, env: false },
-					{ name: "p-b", apt: false, tools: false, env: true },
+					{
+						name: "p-a",
+						apt: true,
+						tools: true,
+						requirements: false,
+						env: false,
+					},
+					{
+						name: "p-b",
+						apt: false,
+						tools: false,
+						requirements: false,
+						env: true,
+					},
 				],
 			});
 		} finally {
