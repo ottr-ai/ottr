@@ -6238,6 +6238,23 @@ function turnPage<T extends { list: string[]; index: number }>(
 const IMPLEMENT_RECOMMENDATIONS =
 	"Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
+/** Runs the drawer's "Implement steps" button: posts the follow-up handoff, then clears the
+ * steps report's Inbox pin (OTTR-488: only the drawer buttons clear it) and hands the new
+ * card to the board. Marking waits for the follow-up: a failed post keeps the pin up.
+ * Exported for tests. */
+export async function implementSteps(o: {
+	task: Pick<TaskView, "project" | "id">;
+	onMarkSeen: () => void;
+	onFollowed: (id: string, from: string) => void;
+}): Promise<void> {
+	const next = await post<TaskView>(
+		`/api/projects/${encodeURIComponent(o.task.project)}/tasks/${o.task.id}/follow-up`,
+		{ text: IMPLEMENT_RECOMMENDATIONS },
+	);
+	o.onMarkSeen();
+	o.onFollowed(next.id, o.task.id);
+}
+
 /** moved to ../types.ts (the server resolves stored steps too, OTTR-488) */
 export { recommendsSteps };
 
@@ -8309,13 +8326,9 @@ export function Drawer({
 									<BusyButton
 										title="Creates a follow-up task that implements the report's recommended steps"
 										run={() =>
-											act(async () => {
-												const next = await post<TaskView>(
-													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/follow-up`,
-													{ text: IMPLEMENT_RECOMMENDATIONS },
-												);
-												onFollowed(next.id, task.id);
-											})
+											act(() =>
+												implementSteps({ task, onMarkSeen, onFollowed }),
+											)
 										}
 									>
 										<Icon name="play" />

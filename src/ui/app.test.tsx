@@ -41,6 +41,7 @@ const {
 	KpiStrip,
 	PerfTable,
 	coveredUpdateIds,
+	implementSteps,
 	recommendsSteps,
 	serverLine,
 	gateAfterLostSession,
@@ -2948,6 +2949,62 @@ describe("Overview Context, max tile and column", () => {
 		expect(html).toContain("Context (max)");
 		expect(html).toContain("130k");
 		expect(html).toContain(`title="Open ottr big-2"`);
+	});
+});
+
+describe("implementSteps", () => {
+	/** Fetch stub recording each URL; answers one JSON body. */
+	function stubFetch(responses: Array<{ status: number; body: unknown }>) {
+		const calls: string[] = [];
+		const real = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			calls.push(String(input));
+			const next = responses.shift()!;
+			return new Response(JSON.stringify(next.body), { status: next.status });
+		}) as typeof fetch;
+		return {
+			calls,
+			restore: () => {
+				globalThis.fetch = real;
+			},
+		};
+	}
+
+	test("clears the pin after the follow-up lands, then hands off", async () => {
+		const stub = stubFetch([
+			{ status: 200, body: { id: "NEXT-1", project: "proj" } },
+		]);
+		try {
+			await implementSteps({
+				task: { project: "proj", id: "R-1" },
+				onMarkSeen: () => stub.calls.push("markSeen"),
+				onFollowed: (id, from) => stub.calls.push(`followed:${id}:${from}`),
+			});
+		} finally {
+			stub.restore();
+		}
+		expect(stub.calls).toEqual([
+			"/api/projects/proj/tasks/R-1/follow-up",
+			"markSeen",
+			"followed:NEXT-1:R-1",
+		]);
+	});
+
+	test("a failed follow-up leaves the pin up", async () => {
+		const stub = stubFetch([{ status: 500, body: { error: "nope" } }]);
+		try {
+			await expect(
+				implementSteps({
+					task: { project: "proj", id: "R-1" },
+					onMarkSeen: () => stub.calls.push("markSeen"),
+					onFollowed: () => stub.calls.push("followed"),
+				}),
+			).rejects.toThrow("nope");
+		} finally {
+			stub.restore();
+		}
+		// Only the failed fetch ran: nothing marked, nothing followed.
+		expect(stub.calls).toEqual(["/api/projects/proj/tasks/R-1/follow-up"]);
 	});
 });
 
