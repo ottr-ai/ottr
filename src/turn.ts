@@ -1286,6 +1286,9 @@ export function createTurnLoop(
 		const preRetro = isRetro(task);
 		const preBoardCheck = store.boardCheckId() === id;
 		const target = ops.workerTarget ?? null;
+		// ponytail: `target !== null` appears here and in the ternary below; either
+		// `true`-replacement alone cannot change the branch (the other check re-derives
+		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
 		const toWorker =
 			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
 		const runnerDrained =

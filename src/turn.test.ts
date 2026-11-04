@@ -16042,12 +16042,48 @@ describe("per-runner drain gates (OTTR-454)", () => {
 	test("every worker drained leaves the card queued and starts no run", async () => {
 		const { store, record, loop } = setup({
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			drainedRunner: () => true,
+			// Selective: "local" stays undrained, so the deferral must come from the
+			// workers' check, not from the local branch that merge turns take.
+			drainedRunner: (id) => id !== "local",
 		});
 		const task = store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
 		expect(store.getTask(task.id)?.state).toBe("queued");
+	});
+
+	test("a board check starts while every worker is drained", async () => {
+		// The check runs on the server's local runner: a workers-only hold must not
+		// defer it, and the gate must take the workers' branch for nothing else.
+		const { store, record, loop } = setup({
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			drainedRunner: (id) => id !== "local",
+		});
+		const check = store.createTask(BOARD_CHECK_PROMPT);
+		store.setBoardCheckId(check.id);
+		await loop.runTurn(store.name, check.id);
+		expect(record.runs).toHaveLength(1);
+	});
+
+	test("a drain that lands while the turn prepares parks the card", async () => {
+		// Race path: the hold covers every worker only after the claim. Dispatching
+		// would be fail-open, so the prepared turn parks for a human instead.
+		let drained = false;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			drainedRunner: (id) => drained && id === "worker-a",
+			resolveTarget: async () => {
+				drained = true; // the update holds the runner mid-prepare
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		const card = store.getTask(task.id);
+		expect(card?.state).toBe("needs_you");
+		expect(card?.needsReason).toContain("Every worker is drained");
 	});
 
 	test("a local drain defers a merge turn but a worker turn still starts", async () => {
@@ -16088,22 +16124,35 @@ describe("per-runner drain gates (OTTR-454)", () => {
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				// A local run (merge, board check) carries no url: the entry counts local.
+				if (o.worker == null)
+					return {
+						pid: 4321,
+						done: Promise.withResolvers<RunResult>().promise,
+						kill: async () => {},
+					};
 				return {
 					pid: null,
 					// The fake worker dispatch records the target url the entry carries.
-					url: (o.worker as { urls: string[] }).urls[0]!,
+					url: o.worker.urls[0]!,
 					done: Promise.withResolvers<RunResult>().promise,
 					kill: async () => {},
 				};
 			},
 		});
-		const work = store.createTask("queued work");
-		void loop.runTurn(store.name, work.id);
+		const check = store.createTask(BOARD_CHECK_PROMPT);
+		store.setBoardCheckId(check.id);
+		void loop.runTurn(store.name, check.id);
+		const first = store.createTask("queued work");
+		void loop.runTurn(store.name, first.id);
+		const second = store.createTask("more work");
+		void loop.runTurn(store.name, second.id);
 		await flushPromises();
+		// Two live runs share worker-a's hostname, and the local check counts apart.
 		expect(loop.runnerTurns()).toEqual({
-			local: 0,
-			workers: { "worker-a": 1 },
-			preparing: 1,
+			local: 1,
+			workers: { "worker-a": 2 },
+			preparing: 3,
 		});
 	});
 });
