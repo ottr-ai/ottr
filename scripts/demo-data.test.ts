@@ -110,6 +110,15 @@ test("seed covers every display shape with clean checkouts", () => {
 	);
 	expect(preparingTurn?.pid).toBeNull();
 	expect(tasks.some((t) => t.state === "running")).toBe(true);
+	// the mutation-gate card: in progress and running, its open work turn runs the gate
+	const gate = tasks.find((t) => /mutation gate/i.test(t.title));
+	expect(gate?.stage).toBe("in_progress");
+	expect(gate?.state).toBe("running");
+	const gateTurn = Object.values(firstBoard)
+		.flatMap((p) => p.turns)
+		.find((tn: Row) => tn.task_id === gate!.id && tn.kind === "work");
+	expect(gateTurn?.ended_at).toBeNull();
+	expect(gateTurn?.prompt).toMatch(/mutation gate/i);
 	const action = tasks.find((t) => t.state === "needs_you" && t.asked === null);
 	expect(action?.needs_reason).toBeTruthy();
 	const asked = tasks.find((t) => t.state === "needs_you" && t.asked !== null);

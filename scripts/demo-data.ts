@@ -24,7 +24,7 @@ import { ProjectStore } from "../src/store.ts";
 
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
-const POOL_VERSION = 4;
+const POOL_VERSION = 5;
 
 type Stage = "todo" | "in_progress" | "merging" | "done";
 type RunState = "queued" | "preparing" | "running" | "needs_you" | "idle";
@@ -215,6 +215,15 @@ const POOL: ProjectSpec[] = [
 				stage: "in_progress",
 				state: "preparing",
 				age: 0.1,
+				work: 0,
+			},
+			{
+				title: "Run the delta mutation gate on the save-loader rewrite",
+				prompt:
+					"Run the delta mutation gate over the save-loader rewrite; fix every survivor it finds.",
+				stage: "in_progress",
+				state: "running",
+				age: 0.2,
 				work: 0,
 			},
 			{
