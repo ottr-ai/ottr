@@ -159,9 +159,9 @@ inside the shared home, and it never copies from it.
 Reads of layer content by the board follow the current layer at read time
 (moment-in-time, no pin): `modelRoles()` (config path),
 `envListPath`/`readEnvNames`/`listedEnvNames`/`workerProjects` (board home),
-`toolsListPath` (shared home), and `http400Dirs` scans both homes plus their
-current layers. `agentDir()` (the credential store path) stays flat by
-definition.
+`toolsListPath`, `aptListPath` and the `eachWorkerProject` boot installs (the
+`.ottr/workers` lists), and `http400Dirs` scans both homes plus their current
+layers. `agentDir()` (the credential store path) stays flat by definition.
 
 ## Error cases
 
