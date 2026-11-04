@@ -858,6 +858,9 @@ async function readRunners(
 	exec: (code: string) => Promise<{ code: number; out: string }>,
 ): Promise<{ preparing: number; runners: Runner[] } | null> {
 	const r = await exec(READ_RUNNERS);
+	// ponytail: the exec prints only HTTP text when the route fails, so JSON.parse
+	// would throw on it anyway — this check fails fast, and its false-mutant cannot
+	// change the outcome (the catch below returns null all the same).
 	if (r.code !== 0) return null;
 	try {
 		const s = JSON.parse(lastLine(r.out)) as {
@@ -905,6 +908,9 @@ async function legacyDrainAndRestart(
 		r.changed || seeded,
 		stop,
 	);
+	// ponytail: seedFailed forces exit 1 at the end regardless, and stop() always
+	// returns 1, so this mapping cannot change the run's exit — Stryker's mutants of
+	// it are behavior-preserving.
 	if (early !== null) return early === 0 && seedFailed ? 1 : early;
 	// --wait fails the run when the recreated board never turns healthy, so the script
 	// never logs success for a crash-loop.
@@ -954,7 +960,10 @@ async function recreate(
 }
 
 /** One listed runner's roll: the run stops early, the runner is stuck, or the service rolled. */
-type RollOne = { stop: number } | { stuck: true } | { rolled: true };
+type RollOne =
+	| { kind: "stop"; early: number }
+	| { kind: "stuck" }
+	| { kind: "rolled" };
 
 /**
  * Rolls one listed runner: holds it, waits its turns out (the wait renews the hold each
@@ -973,12 +982,15 @@ async function rollRunner(
 	const held = await exec(holdRunner(service));
 	if (held.code !== 0)
 		return {
-			stop: stop(`the board cannot hold ${service}: ${lastLine(held.out)}`),
+			kind: "stop",
+			early: stop(`the board cannot hold ${service}: ${lastLine(held.out)}`),
 		};
 	// The runner's turns drain while the other runners keep working. `preparing` is
 	// not attributable to one runner, so a preparing turn holds every runner idle.
 	const since = d.now();
 	let busy = true;
+	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
+	// exclusive to the first pass, so Stryker's i-- mutant prints the same note.
 	for (let i = 0; ; i++) {
 		const r = board.runners.find((x) => x.id === service);
 		if (r !== undefined && r.turns === 0 && board.preparing === 0) {
@@ -995,7 +1007,8 @@ async function rollRunner(
 		const next = await readRunners(exec);
 		if (next === null)
 			return {
-				stop: stop(
+				kind: "stop",
+				early: stop(
 					`the board's runners cannot be read: the hold on ${service} lapses 30 min after the last renewal`,
 				),
 			};
@@ -1017,12 +1030,12 @@ async function rollRunner(
 				? `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min: its hold ends, and its restart waits for a later run`
 				: `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min, and the board cannot end its hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
 		);
-		return { stuck: true };
+		return { kind: "stuck" };
 	}
 	// --wait waits for the worker's own compose healthcheck; a failed recreate is a
 	// failed health check: the roll stops, and the other containers stay on the old image.
 	const failed = await recreate(d, compose, service, stop);
-	if (failed !== null) return { stop: failed };
+	if (failed !== null) return { kind: "stop", early: failed };
 	if (runner.url !== null) {
 		// Healthy is not connected: the roll goes on only when the server reaches
 		// the new worker again.
@@ -1032,7 +1045,8 @@ async function rollRunner(
 			if (h.code === 0) break;
 			if (d.now() - cSince + POLL_MS > CONNECT_LIMIT_MS)
 				return {
-					stop: stop(
+					kind: "stop",
+					early: stop(
 						`${service} never answers ${runner.url}/healthz: ${lastLine(h.out)}`,
 					),
 				};
@@ -1044,7 +1058,7 @@ async function rollRunner(
 		d.log(
 			`the board cannot end ${service}'s hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
 		);
-	return { rolled: true };
+	return { kind: "rolled" };
 }
 
 /**
@@ -1068,6 +1082,8 @@ async function rollServer(
 		? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
 		: commits;
 	const early = await drainRunningBoard(d, compose, holdCommits, true, stop);
+	// ponytail: as in legacyDrainAndRestart — seedFailed dominates the final exit,
+	// so this mapping's mutants cannot change the run's exit.
 	if (early !== null) return early === 0 && seedFailed ? 1 : early;
 	if (changed) return recreate(d, compose, "server", stop);
 	const rs = await d.docker("compose", ...compose, "restart", "server");
@@ -1075,6 +1091,11 @@ async function rollServer(
 		? null
 		: stop(`docker compose restart server failed: ${rs.out.trim()}`);
 }
+
+/** The roll's outcome: an early exit code (the run stops or waits for a later run),
+ * or a stack that is up and took the seed. `settled` is only read on the no-early
+ * variants, so the early returns carry no flag a mutant could flip in the dark. */
+type RollOutcome = { early: number } | { early: null; settled: boolean };
 
 async function rollAndRestart(
 	d: Deps,
@@ -1086,7 +1107,7 @@ async function rollAndRestart(
 	serverWasRunning: boolean,
 	wantedSha: string,
 	stop: (why: string) => number,
-): Promise<{ early: number | null; settled: boolean }> {
+): Promise<RollOutcome> {
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
 	// No running board, no turn can run: workers kill a turn when the board's request
@@ -1097,7 +1118,6 @@ async function rollAndRestart(
 		if (up.code !== 0)
 			return {
 				early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
-				settled: false,
 			};
 		return { early: null, settled: true };
 	}
@@ -1114,7 +1134,7 @@ async function rollAndRestart(
 			wantedSha,
 			stop,
 		);
-		return { early, settled: early === null };
+		return early !== null ? { early } : { early: null, settled: true };
 	}
 	// Workers roll first, one at a time, in compose ps order; the server rolls last.
 	let stuck = false;
@@ -1135,7 +1155,7 @@ async function rollAndRestart(
 				`${service} is no runner on the board: it recreates without a hold`,
 			);
 			const failed = await recreate(d, compose, service, stop);
-			if (failed !== null) return { early: failed, settled: false };
+			if (failed !== null) return { early: failed };
 			continue;
 		}
 		const one = await rollRunner(
@@ -1147,8 +1167,8 @@ async function rollAndRestart(
 			board,
 			stop,
 		);
-		if ("stop" in one) return { early: one.stop, settled: false };
-		if ("stuck" in one) stuck = true;
+		if (one.kind === "stop") return { early: one.early };
+		if (one.kind === "stuck") stuck = true;
 	}
 	// The server is the last runner: a restart kills every turn it runs itself and every
 	// turn a worker streams to it, so a stuck runner's turn forbids the restart.
@@ -1164,7 +1184,6 @@ async function rollAndRestart(
 			early: stop(
 				`the server's image cannot be compared with the build: ${ch.error}`,
 			),
-			settled: false,
 		};
 	const early = await rollServer(
 		d,
@@ -1176,14 +1195,13 @@ async function rollAndRestart(
 		wantedSha,
 		stop,
 	);
-	if (early !== null) return { early, settled: false };
+	if (early !== null) return { early };
 	// The whole-stack up only starts a service that is not running and waits for the
 	// server's health: every changed container was rolled per service above.
 	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
 	if (up.code !== 0)
 		return {
 			early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
-			settled: false,
 		};
 	return { early: null, settled: true };
 }

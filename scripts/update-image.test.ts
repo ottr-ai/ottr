@@ -118,6 +118,9 @@ function fakes(
 		upOut?: string;
 		/** Exit code and output of `up -d --no-deps --wait <service>`, per service. */
 		upBy?: Record<string, { code?: number; out?: string }>;
+		/** Exit code and output of `compose restart server` (a failed seed-only restart). */
+		restart?: number;
+		restartOut?: string;
 		/** The board's answers to GET /api/drain, in order; the last one repeats. Without
 		 *  them the board answers 404 (one version older) and the run keeps the legacy
 		 *  whole-board flow. */
@@ -307,6 +310,10 @@ function fakes(
 				const code = holds[Math.min(holdCalls++, holds.length - 1)] ?? 0;
 				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
 			}
+			if (args.includes("restart"))
+				return o.restart
+					? { code: o.restart, out: o.restartOut ?? "" }
+					: { code: 0, out: "" };
 			if (args.includes("exec"))
 				return {
 					code: 0,
@@ -411,6 +418,18 @@ const st = (a: number, b: number, preparing = 0) =>
 			{ id: "local", url: null, until: null, turns: 0 },
 		],
 	});
+/** A runner list that names only worker-b (worker-a is no runner on the board). */
+function onlyB(): string {
+	return JSON.stringify({
+		drainUntil: null,
+		drainCommits: null,
+		preparing: 0,
+		runners: [
+			{ id: "worker-b", url: "http://worker-b:8787", until: null, turns: 0 },
+		],
+	});
+}
+
 /** The JSON body of the n-th POST to /api/drain, parsed out of the bun -e code. */
 function postBody(f: FakeRun, n: number): unknown {
 	const posts = f.drains.filter((l) => l.includes("'POST'"));
@@ -1631,6 +1650,351 @@ describe("rolling restart", () => {
 			/^DELETE \/api\/drain\?runner=worker-a http:\/\/127\.0\.0\.1:\d+$/,
 		);
 		expect(freeRes).toEqual({ code: 0, out: "" });
+		// The failure handlers name the HTTP status and exit 1: the run logs that
+		// text and fails closed on it.
+		expect(
+			await runOnBoard(hold, () => new Response("", { status: 404 })),
+		).toEqual({ code: 1, out: "HTTP 404" });
+		expect(
+			await runOnBoard(free, () => new Response("", { status: 404 })),
+		).toEqual({ code: 1, out: "HTTP 404" });
+		expect(
+			await runOnBoard(health, () => new Response("", { status: 500 })),
+		).toEqual({ code: 1, out: "HTTP 500" });
+	}, 60_000);
+
+	test("the first busy poll logs once, and each poll renews the hold", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// worker-a runs its turn over three polls, then the roll proceeds.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0), st(1, 0), st(1, 0), st(0, 0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The busy note names the runner once, and a clean roll never logs a hold
+		// the board could not end.
+		expect(
+			f.logs.filter((l) => l.includes("still runs its turns")),
+		).toHaveLength(1);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a still runs its turns: the roll follows when they finish",
+		);
+		expect(f.logs.join("\n")).not.toContain("cannot end");
+		// One POST holds 30 min: worker-a's initial hold, three renewals, worker-b's
+		// initial hold, and the board-wide server hold.
+		const posts = f.drains.filter((l) => l.includes("'POST'"));
+		expect(posts).toHaveLength(6);
+	}, 60_000);
+
+	test("a runner body that is no JSON keeps the whole-board flow", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({ newImage: true, running: RUNNING3, gets: ["not json"] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The probe failed to answer runners, so the legacy whole-board hold ran.
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			HOLD,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a runner body without a runner list keeps the whole-board flow", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: ['{"preparing":1}'],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			HOLD,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+	}, 60_000);
+
+	test("a worker whose image cannot be compared skips, and the server's compare stops", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			imagesCode: 1,
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		const log = f.logs.join("\n");
+		expect(log).toContain(
+			"skipping worker-a: its image cannot be compared with the build",
+		);
+		expect(log).toContain(
+			"stopped: the server's image cannot be compared with the build",
+		);
+		// The roll stopped before any recreate, and the seed record waits for a run
+		// whose server actually rolled.
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed recreate of an unlisted worker stops before the next rolls", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// Only worker-b is a runner on the board; worker-a recreates holdless and its
+		// recreate fails: the roll stops before worker-b.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [onlyB()],
+			upBy: { "worker-a": { code: 1, out: "boom" } },
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose up --wait worker-a failed: boom",
+		);
+		expect(f.calls).not.toContain(UP_SVC("worker-b"));
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed recreate leaves the seed record unwritten", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			upBy: { "worker-a": { code: 1, out: "container worker-a exited (1)" } },
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed start with no board leaves the seed record unwritten", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: "",
+			up: 1,
+			upOut: "boom",
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose up --wait failed: boom",
+		);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a start with no board records the seed", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			running: "",
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedWrites).toHaveLength(1);
+	}, 60_000);
+
+	test("a legacy stop leaves the seed record unwritten", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// No runner API: the legacy whole-board flow, and its compare fails.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			imagesCode: 1,
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a seed-failed run whose server hold expires exits 1 without a recreate", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			turns: "1", // the server step's board-wide hold never reaches zero
+			seedCode: 1,
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		// The expired hold waits for a later run: no server recreate, no seed record.
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a server hold that expires waits for a later run without a recreate", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			turns: "1",
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The whole-board hold expired, so the server step and the whole-stack up
+		// wait for a later run: the success line does not print.
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
+		expect(f.logs.join("\n")).not.toContain("the stack runs main at");
+	}, 60_000);
+
+	test("a failed whole-stack up stops the run and leaves the seed unwritten", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			// The per-service recreates succeed; only the whole-stack up fails.
+			upBy: {
+				"worker-a": { code: 0 },
+				"worker-b": { code: 0 },
+				server: { code: 0 },
+			},
+			up: 1,
+			upOut: "boom",
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose up --wait failed: boom",
+		);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a worker that vanishes from the runner list mid-hold keeps polling", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// The probe lists worker-a with a running turn (it holds); every later read
+		// drops worker-a entirely (the board restarted and lost its hold). The roll
+		// keeps polling instead of treating the vanished runner as idle, and waits
+		// for a later run.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0), onlyB(), onlyB()],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+	}, 60_000);
+
+	test("a worker with no url in the runner list rolls without a health probe", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const noUrl = JSON.stringify({
+			drainUntil: null,
+			drainCommits: null,
+			preparing: 0,
+			runners: [
+				{ id: "worker-a", url: null, until: null, turns: 0 },
+				{ id: "local", url: null, until: null, turns: 0 },
+			],
+		});
+		const f = fakes({ newImage: true, running: RUNNING3, gets: [noUrl] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// Nothing can answer a health probe for a runner without a url, so the roll
+		// skips the wait instead of stopping on a probe that cannot succeed.
+		expect(f.calls).not.toContain(HEALTH);
+		expect(f.calls).toContain(UP_SVC("worker-a"));
+	}, 60_000);
+
+	test("a failed seed-only restart stops the run", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			newImage: false,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			restart: 1,
+			restartOut: "restart failed",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.calls).toContain(RESTART);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose restart server failed: restart failed",
+		);
 	}, 60_000);
 });
 
