@@ -9620,6 +9620,9 @@ function App() {
 														? t.project
 														: projectLabel(owner)}
 												</span>
+												<span className="alarm-key" title={`Task ${t.id}`}>
+													{t.id}
+												</span>
 												<span className="alarm-title">
 													{t.sessionTitle ?? t.title}
 												</span>

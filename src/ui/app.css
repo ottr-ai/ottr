@@ -1347,10 +1347,12 @@ button.notif-link {
 }
 .alarm-link {
 	display: inline-flex;
+	align-items: center;
 	justify-content: flex-start;
 	gap: 8px;
 	width: 100%;
-	padding: 0 8px;
+	/* Vertical and horizontal padding keep the state mark off the hover background. */
+	padding: 4px 10px;
 	font-size: 13px;
 	text-align: left;
 	text-decoration: none;
@@ -1367,6 +1369,13 @@ button.notif-link {
 	font-size: 12px;
 	color: var(--dim);
 	font-weight: 600;
+}
+.alarm-key {
+	flex: none;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim); /* at least 4.5:1 on --card */
+	font-variant-numeric: tabular-nums;
 }
 .alarm-title {
 	flex: 1;
