@@ -8,6 +8,7 @@ import {
 import type { ForkProject, GhFn } from "./forks.ts";
 import { githubHost } from "./githubHost.ts";
 import { ownerRepo, runGh } from "./release.ts";
+import { singleFlightTick } from "./singleFlight.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -175,10 +176,6 @@ export function createPrWatcher(deps: {
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
 
-	// One scan at a time per watcher. `running` is the running scan's project (undefined = all).
-	let inFlight: Promise<void> | null = null;
-	let running: string | undefined;
-
 	async function scanProject(project: ForkProject): Promise<void> {
 		const store = project.store;
 		const repo =
@@ -332,24 +329,5 @@ export function createPrWatcher(deps: {
 		}
 	}
 
-	return {
-		tick(opts?: { manual?: string }): Promise<void> {
-			const want = opts?.manual;
-			if (inFlight !== null) {
-				if (running === undefined || running === want) return inFlight;
-				// The running scan skips the requested project: scan it next, whatever the first scan's outcome.
-				const next = () => this.tick(opts);
-				return inFlight.then(next, next);
-			}
-			running = want;
-			inFlight = (async () => {
-				try {
-					await scan(opts);
-				} finally {
-					inFlight = null;
-				}
-			})();
-			return inFlight;
-		},
-	};
+	return { tick: singleFlightTick(scan) };
 }
