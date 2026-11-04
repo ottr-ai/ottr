@@ -379,4 +379,31 @@ describe("diffLinkParts", () => {
 			{ kind: "text", text: "` first" },
 		]);
 	});
+
+	test("a path ending the text adds no trailing empty part", () => {
+		// A match that ends exactly at the text end must not append a final "" text run.
+		expect(diffLinkParts("check src/prompts.ts", ["src/prompts.ts"])).toEqual([
+			{ kind: "text", text: "check " },
+			{ kind: "link", label: "src/prompts.ts", files: ["src/prompts.ts"] },
+		]);
+	});
+
+	test("an empty changed list links nothing, even around stray punctuation", () => {
+		// With no changed files the scan returns the runs untouched: no phantom parts.
+		expect(diffLinkParts("src/a.ts (!) stays literal", [])).toEqual([
+			{ kind: "text", text: "src/a.ts (!) stays literal" },
+		]);
+	});
+
+	test("a name that extends a shorter one past a space wins the link", () => {
+		// Git names may carry spaces: the border accepts the space after docs/a.md, so the
+		// sort must put the longer name first or the link cuts the name short.
+		expect(
+			diffLinkParts("edit docs/a.md b.md now", ["docs/a.md", "docs/a.md b.md"]),
+		).toEqual([
+			{ kind: "text", text: "edit " },
+			{ kind: "link", label: "docs/a.md b.md", files: ["docs/a.md b.md"] },
+			{ kind: "text", text: " now" },
+		]);
+	});
 });
