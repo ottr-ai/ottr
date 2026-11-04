@@ -51,7 +51,7 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   export default {
     ...base,
     reporters: ["clear-text", "json"],
-    jsonReporter: {
+5:     jsonReporter: {
       fileName: "<osTempDir>/ott-delta-<configName>-<randomUUID>.json",
     },
   };
@@ -61,7 +61,9 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   so a fixed report name let one gate read a report another card's run had written in
   between (OTTR-479: a verdict from a foreign diff, with no error). The file name therefore
   carries one `crypto.randomUUID()` per config run, and the gate deletes the report right
-  after reading it, on every exit path: no stray report survives a finished run.
+  after reading it, on every exit path: no stray report survives a finished run. A crashed
+  run leaves its own report unread, and the gate exits 2 with `Stryker left no report`
+  instead of blessing a stale verdict (OTTR-474).
 
   The report is the mutation-testing-elements schema: parse `files[<path>].mutants`, each
   with `status`, `mutatorName`, `replacement` and `location.start.line`.
@@ -167,6 +169,19 @@ Unchanged. `ARCH_REVIEW_MARKER` stays; the manual route behaves as today.
   with a pointer to docs/ARCH-REVIEWS.md, matching the table's style.
 - AGENTS.md is local-only: the work turn reports the new step-3 text and the new Review
   section text for the user to apply.
+
+## 10. Case study: a survivor that is real (OTTR-474)
+
+The delta gate over OTTR-453 reported `src/memory.ts:85 [ConditionalExpression] false` as Survived twice, while the hindsight test in `src/memory.test.ts` seemed to kill exactly that change by hand. The investigation found no harness fault. The report line hides three distinct mutants: for a condition `a || b`, Stryker's ConditionalExpression mutator emits `true` and `false` for the whole disjunction, `false` for the left operand, and `false` for the right operand (`node_modules/@stryker-mutator/instrumenter/dist/src/mutators/conditional-expression-mutator.js`). The survivor was the right-operand mutant: `res.status === 401 || false` behaves like `res.status === 401 || res.status === 403` for every HTTP status except 403, and the killing test sent only 401 and 500.
+
+Evidence: the JSON report gives each mutant's span, and the survivor's span (line 85, columns 27–45) is exactly `res.status === 403`. Stage 1 ran `memory.test.ts` among 6 selected test files and all passed, so the verdict was honest; the same verdict reproduces by hand-applying `401 || false` and running the harness. Hand-applying the whole condition as `false` fails the test, which is what the earlier hand check had done — a same-text twin, not the survivor. Adding a 403 case that asserts the original reason (`rejected the key (HTTP 403)`) makes the harness kill the survivor in stage 1.
+
+Rules from this case:
+
+- Triage a survivor by its span, not by its report line: read `location.start`/`end` from the JSON report, reconstruct the mutated expression, and name the input that distinguishes it from the original.
+- A hand check of a same-text twin proves nothing about the survivor. For a ternary over `a || b`, the killing test must exercise the right operand alone.
+- Stage verdicts are process exit codes. Under a loaded host, a stage-2 test timeout can turn a real survivor into a Timeout, which counts as a kill: read the report's `statusReason` before quoting a verdict.
+- Environment: `src/gitHosts.test.ts` ("a native start keeps keys outside the Ottr checkout") fails in any checkout whose parent directory is the OS temp dir, because its `mkdtemp` home lands inside `resolve(repo, "..")`. Run gates from a checkout outside the temp tree.
 
 ## Acceptance checks
 

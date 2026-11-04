@@ -3,8 +3,13 @@
 // so a file that fails alone cannot cause stage-1 false kills later.
 // Mutant run: stage 1 runs only the test files whose import closure contains the
 // mutated file; a map miss skips stage 1 and only the full suite runs — slower,
-// never wrong. The parent shell runs under `ulimit -d 2097152`; children inherit
-// it. Linux-only: relies on POSIX grep and the ulimit.
+// never wrong. A survivor whose killing test ran in stage 1 is a real survivor:
+// read the mutant's exact span before suspecting the harness. For
+// `a || b ? x : y` the ConditionalExpression mutator emits three distinct
+// "false" mutants (whole test, left operand, right operand); the right-operand
+// one only differs where the left operand is false (OTTR-474,
+// docs/specs/mutation-delta.md). The parent shell runs under `ulimit -d 2097152`;
+// children inherit it. Linux-only: relies on POSIX grep and the ulimit.
 // With arguments (`bun scripts/mutant-run.ts bun test --bail src/turn.test.ts`), it runs only that
 // command, in the same private TMPDIR: the isolated configs use this, so a mutant's file
 // operations stay off the worker's shared /tmp.
