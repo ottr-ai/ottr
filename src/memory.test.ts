@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -81,14 +89,16 @@ describe("ensureMemoryOverlay", () => {
 		}
 	});
 
-	test("an already-correct file is left byte-identical (no rewrite needed)", () => {
-		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-"));
+	test("a matching overlay is left untouched: no rewrite touches the mtime", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-same-"));
 		try {
 			const path = join(dir, "omp-memory.yml");
 			writeFileSync(path, "memory:\n  backend: mnemopi\n");
-			const before = readFileSync(path, "utf8");
+			// A rewrite would stamp the current time; the seeded mtime pins no-write.
+			utimesSync(path, new Date(1000), new Date(1000));
 			ensureMemoryOverlay({ OTTR_DATA_DIR: dir });
-			expect(readFileSync(path, "utf8")).toBe(before);
+			expect(readFileSync(path, "utf8")).toBe("memory:\n  backend: mnemopi\n");
+			expect(statSync(path).mtimeMs).toBe(1000);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -209,6 +219,40 @@ describe("checkMemoryHealth", () => {
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 			rmSync(board, { recursive: true, force: true });
+		}
+	});
+
+	test("an unwritable shared home names its store path (no board home passed)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-blocked-"));
+		try {
+			// The home sits under a plain file: mkdir fails there even for root.
+			const home = join(dir, "file");
+			writeFileSync(home, "x");
+			const h = await checkMemoryHealth({ backend: "mnemopi" }, { home, now });
+			expect(h.ok).toBe(false);
+			expect(h.reason).toBe(
+				`mnemopi store not writable: ${join(home, ".omp", "agent", "memories", "mnemopi")}`,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("no opts: the environment home is probed and its store created", async () => {
+		const savedHome = process.env.HOME;
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-envhome-"));
+		process.env.HOME = dir;
+		try {
+			const h = await checkMemoryHealth({ backend: "mnemopi" }, { now });
+			expect(h.ok).toBe(true);
+			expect(h.reason).toBe(null);
+			expect(
+				existsSync(join(dir, ".omp", "agent", "memories", "mnemopi")),
+			).toBe(true);
+		} finally {
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

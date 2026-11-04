@@ -2181,6 +2181,49 @@ describe("startRun", () => {
 		}
 	});
 
+	test("without memoryConfigPath the overlay comes from the deployment env", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-default-"));
+		const savedUrl = process.env.HINDSIGHT_API_URL;
+		const savedData = process.env.OTTR_DATA_DIR;
+		process.env.HINDSIGHT_API_URL = "http://h:8888";
+		process.env.OTTR_DATA_DIR = dir;
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			});
+			await handle.done;
+			const overlay = join(dir, "omp-memory.yml");
+			const i = seen[0]!.indexOf(
+				"--config",
+				seen[0]!.indexOf(NO_DISCOVERY_CONFIG),
+			);
+			expect(seen[0]!.slice(i, i + 2)).toEqual(["--config", overlay]);
+			expect(readFileSync(overlay, "utf8")).toBe(
+				"memory:\n  backend: hindsight\n",
+			);
+		} finally {
+			if (savedUrl === undefined) delete process.env.HINDSIGHT_API_URL;
+			else process.env.HINDSIGHT_API_URL = savedUrl;
+			if (savedData === undefined) delete process.env.OTTR_DATA_DIR;
+			else process.env.OTTR_DATA_DIR = savedData;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("splits JSON events across chunks, writes the prompt, and settles the result", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
 		try {
