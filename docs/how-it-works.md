@@ -128,8 +128,8 @@ A task has two fields. `stage` is the board column. `state` is the run state ins
 stateDiagram-v2
   [*] --> todo: createTask
   [*] --> backlog: createTask with backlog
-  backlog --> todo: POST /backlog (promote)
-  todo --> backlog: POST /backlog (park)
+  backlog --> todo: POST …/backlog (promote)
+  todo --> backlog: POST …/backlog (park)
   todo --> in_progress: work session starts
   in_progress --> in_progress: work check blocker, user reply
   in_progress --> merging: ready with commits ahead
