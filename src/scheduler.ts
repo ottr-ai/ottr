@@ -137,13 +137,33 @@ function findingsOpen(
 	);
 }
 
+/** OTTR-506: why the push hold parks a queued merge while the project's local target branch
+ * has commits origin lacks (a rejected server push left it ahead), else null. The rejected
+ * card's own rebase retry (pushRetries > 0, queued at merging) stays runnable: it rebases
+ * main onto origin, re-runs the gates, and its server push ends the hold. Every other queued
+ * merge waits, so one rejection cannot pile merges onto an unpushed main. Pure: `mainUnpushed`
+ * is the git fact (worktree.ts branchUnpushed), passed in because the scheduler stays git-free. */
+export const PUSH_HOLD = "waiting for main to reach origin/main";
+
+export function pushHold(
+	mainUnpushed: boolean,
+	t: Pick<Task, "stage" | "state" | "pushRetries">,
+): string | null {
+	if (!mainUnpushed || t.stage !== "merging" || t.state !== "queued")
+		return null;
+	return t.pushRetries > 0 ? null : PUSH_HOLD;
+}
+
 /** Why the tracker holds a queued merge, else null. While a review runs, and until its findings are
  * done, only its findings merge; every other card waits in merging. So the next review counts from
  * exactly the commit this one saw, and a release ships only reviewed work plus the fixes it asked
- * for. Findings themselves never wait: holding one could deadlock the review that waits for it. */
+ * for. Findings themselves never wait: holding one could deadlock the review that waits for it.
+ * While local main has commits origin lacks (a rejected server push, `o.mainUnpushed`), every
+ * queued merge but the rejected card's rebase retry waits too (pushHold). */
 export function mergeHold(
 	tasks: readonly ReviewTask[],
-	merge: Pick<Task, "id">,
+	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries">,
+	o: { mainUnpushed?: boolean } = {},
 ): string | null {
 	for (const r of tasks) {
 		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
@@ -160,6 +180,10 @@ export function mergeHold(
 			findings.some((f) => f.cancelledAt === null && f.stage !== "done")
 		)
 			return "waiting for the review's findings to be implemented";
+	}
+	if (o.mainUnpushed === true) {
+		const held = pushHold(true, merge);
+		if (held !== null) return held;
 	}
 	return null;
 }
@@ -179,10 +203,9 @@ export function findingsHold(
 /** The queued merges mergeHold parks behind the open release `review` ("waiting for release
  * <version>"): the cards its hold names, its own findings excluded (they merge while it runs).
  * A done or cancelled review, and the Review button's card (no releaseVersion), holds nothing. */
-export function releaseHeldMerges<T extends ReviewTask & Pick<Task, "state">>(
-	tasks: readonly T[],
-	review: ReviewTask & Pick<Task, "state">,
-): T[] {
+export function releaseHeldMerges<
+	T extends ReviewTask & Pick<Task, "state" | "stage" | "pushRetries">,
+>(tasks: readonly T[], review: ReviewTask & Pick<Task, "state">): T[] {
 	if (
 		review.cancelledAt !== null ||
 		review.releaseVersion === null ||
@@ -368,6 +391,10 @@ export function pickRunnable(
 		only?: string | null;
 		/** A queued card waits until its holdUntil, e.g. a check held until a usage limit resets. */
 		now?: number;
+		/** OTTR-506: true while the project's local target branch has commits origin lacks (a
+		 * rejected server push). Every queued merge but the rejected card's rebase retry waits
+		 * (pushHold); the retry runs first, and its push ends the hold. */
+		mainUnpushed?: boolean;
 	},
 ): Task[] {
 	const live = tasks.filter((t) => t.cancelledAt === null);
@@ -388,12 +415,14 @@ export function pickRunnable(
 
 	// The merge slot: only if no merge turn is already running, take the oldest queued merge that no
 	// open review holds. An open release holds every merge but its findings', so no merge can race
-	// its publish (mergeHold).
+	// its publish (mergeHold). While local main has commits origin lacks, only the rejected
+	// card's rebase retry may start (pushHold), so the retry repairs main before anything merges.
 	if (!running.some((t) => t.stage === "merging")) {
 		const merge = queued.find(
 			(t) =>
 				t.stage === "merging" &&
-				mergeHold(live, t) === null &&
+				mergeHold(live, t, { mainUnpushed: o.mainUnpushed === true }) ===
+					null &&
 				depHold(live, t) === null,
 		);
 		if (merge) {

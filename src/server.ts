@@ -56,6 +56,7 @@ import {
 import {
 	archReviewDelta,
 	branchMergedOrGone,
+	branchUnpushed,
 	changedFiles,
 	commitsAhead,
 	createWorktree,
@@ -318,6 +319,7 @@ for (const p of discoverProjects(
 		github: null,
 		remote: null,
 		dirty: false,
+		mainUnpushed: false,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -439,6 +441,7 @@ const loop = createTurnLoop(projects, {
 	targetCommits,
 	targetSha,
 	targetContains,
+	branchUnpushed,
 	serverMergePush,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),

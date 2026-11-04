@@ -745,6 +745,10 @@ export type TaskCard = Omit<
 	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
+	/** OTTR-506: stamped on queued merges the push hold parks while local main has commits
+	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
+	 * gets no git, so the server derives the fact (pushHold) and stamps it. */
+	pushHold?: boolean;
 };
 
 /** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */

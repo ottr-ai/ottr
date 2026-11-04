@@ -175,6 +175,7 @@ import {
 	mergeAnywayPatch,
 	openWorkBlockers,
 	PROMPT_EDIT_HELD,
+	pushHold,
 	type ReviewTask,
 	releaseHeldMerges,
 	reviewBlocked,
@@ -575,7 +576,8 @@ export function boardWarnings(
 	roles: Readonly<Record<string, string>>,
 	env: Record<string, string | undefined> = process.env,
 	expiry: TokenExpiryView = tokenExpiryView(env),
-	tasks: readonly (ReviewTask & Pick<Task, "state" | "project">)[] = [],
+	tasks: readonly (ReviewTask &
+		Pick<Task, "state" | "project" | "stage" | "pushRetries">)[] = [],
 	now: number = Date.now(),
 ): string[] {
 	if (!existsSync(join(agentDir(), "config.yml")))
@@ -610,7 +612,7 @@ export function boardWarnings(
 	// flat cross-project list.
 	const byProject = new Map<
 		string,
-		(ReviewTask & Pick<Task, "state" | "project">)[]
+		(ReviewTask & Pick<Task, "state" | "project" | "stage" | "pushRetries">)[]
 	>();
 	for (const t of tasks) {
 		const group = byProject.get(t.project);
@@ -2197,6 +2199,14 @@ export function createApp(deps: AppDeps) {
 					const held = releaseHeldMerges(cards, card);
 					if (held.length > 0) card.heldMerges = held.map((h) => h.id);
 				}
+				// OTTR-506: stamp the queued merges the push hold parks (local main has commits
+				// origin lacks), so the board names the hold — the browser gets no git.
+				if (e.mainUnpushed === true) {
+					for (const card of cards) {
+						if (card.cancelledAt === null && pushHold(true, card) !== null)
+							card.pushHold = true;
+					}
+				}
 				tasks.push(...cards);
 			} catch (err) {
 				// A sick store skips its own cards; the rest of the board still renders.
@@ -2972,6 +2982,7 @@ export function createApp(deps: AppDeps) {
 			github: null,
 			remote: null,
 			dirty: false,
+			mainUnpushed: false,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,

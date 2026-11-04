@@ -112,6 +112,7 @@ import type { DetachedRun } from "./workers.ts";
 import type {
 	ArchReviewDelta,
 	branchMergedOrGone,
+	branchUnpushed,
 	changedFiles,
 	commitsAhead,
 	createWorktree,
@@ -337,6 +338,11 @@ export interface TurnProject {
 	remote: string | null;
 	/** Main checkout has uncommitted changes; refreshed by the scheduler tick, read-only elsewhere. */
 	dirty: boolean;
+	/** OTTR-506: true while the local target branch has commits origin lacks — the state a
+	 * rejected server push leaves main in. Refreshed by the scheduler tick's branchUnpushed
+	 * check like dirty, and set eagerly by the turn that saw the rejection or landed the
+	 * repairing push, so the merge hold gates the very next tick. Read-only elsewhere. */
+	mainUnpushed: boolean;
 	/** Highest vX.Y.Z tag merged into the target; refreshed by the scheduler tick, read-only elsewhere. */
 	latestRelease: string | null;
 	/** Public ghcr.io image of the repo; probed on a TTL by the scheduler tick, read-only elsewhere. */
@@ -418,6 +424,8 @@ export interface TurnOps {
 	targetSha(mainPath: string, ref: string): Promise<string | null>;
 	/** AGEN-24: true when target already contains sha (the approved hold head landed). */
 	targetContains: typeof targetContains;
+	/** OTTR-506: true while the local target branch has commits origin lacks (the merge hold's git fact). */
+	branchUnpushed: typeof branchUnpushed;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
@@ -1146,6 +1154,21 @@ export function createTurnLoop(
 				.catch(() => {
 					// git failed (e.g. the folder vanished): keep the last dirty flag; the next tick retries.
 				});
+			// OTTR-506: the merge hold's git fact, refreshed like the dirty flag — a failed
+			// check keeps the last value and the next tick retries.
+			const branch =
+				e.target !== null && e.target.startsWith("origin/")
+					? e.target.slice("origin/".length)
+					: null;
+			if (branch !== null)
+				void ops
+					.branchUnpushed(e.path, branch)
+					.then((unpushed) => {
+						e.mainUnpushed = unpushed;
+					})
+					.catch(() => {
+						// git failed: keep the last mainUnpushed flag; the next tick retries.
+					});
 			void ops.refreshRelease(e);
 			void ops.refreshArchReview(e);
 		}
@@ -1168,6 +1191,7 @@ export function createTurnLoop(
 					maxParallel: settings.maxParallel,
 					hasRules: ops.hasRules(e.path),
 					only: drained ? e.store.boardCheckId() : undefined,
+					mainUnpushed: e.mainUnpushed === true,
 				});
 				for (const t of runnable) {
 					if (cap !== null && active() >= cap) return;
@@ -2388,6 +2412,9 @@ export function createTurnLoop(
 							pushError = null;
 							pushOutput = null;
 							pushRejected = false;
+							// OTTR-506: the push put the target on origin, so the merge hold lifts
+							// at once instead of waiting for the tick's branchUnpushed refresh.
+							e.mainUnpushed = false;
 							log(`- pushed ${target} from the server`);
 							// The agent's own push has no credentials (D6). A merge agent that stopped at
 							// needs_you on that authentication failure did integrate: the server push landed
@@ -2539,6 +2566,9 @@ export function createTurnLoop(
 			// whose lease pins one exact head (OTTR-274), and the pinned origin URL all still
 			// take today's needs_you with git's reason.
 			if (pushError !== null) {
+				// OTTR-506: the rejection left local main with commits origin lacks, so the
+				// merge hold must gate the very next tick, not wait for the refresh.
+				if (pushRejected) e.mainUnpushed = true;
 				const branch = target.startsWith("origin/")
 					? target.slice("origin/".length)
 					: null;

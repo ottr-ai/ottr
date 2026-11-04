@@ -408,3 +408,19 @@ test("releaseHolding finds the release naming a card, via heldMerges", () => {
 	});
 	expect(releaseHolding(card({ id: "m2" }), [r, m1])).toBeNull();
 });
+
+test("holdFor names the stamped push hold, only on the held card", () => {
+	// The server stamps queued merges the push hold parks (main has commits origin
+	// lacks); the browser has no git, so the reason rides the card.
+	const held = card({
+		id: "m1",
+		stage: "merging",
+		state: "queued",
+		pushHold: true,
+	});
+	expect(holdFor(held, [])).toBe("waiting for main to reach origin/main");
+	// Without the stamp no hold shows: the stamp is the server's derived fact, like heldMerges.
+	expect(
+		holdFor(card({ id: "m2", stage: "merging", state: "queued" }), []),
+	).toBeNull();
+});

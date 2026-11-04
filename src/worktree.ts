@@ -1699,6 +1699,38 @@ export async function branchMergedOrGone(
 	return r.code === 0;
 }
 
+/** OTTR-506: true while the local `branch` in the main checkout holds commits the fetched
+ * `origin/<branch>` lacks — the state a rejected server push leaves the target in. The
+ * scheduler holds every queued merge but the rejected card's rebase retry while this is true,
+ * so one rejection cannot pile merges onto an unpushed main. Missing refs (no local branch,
+ * no origin branch yet) count as pushed: there is nothing to reconcile. A git failure counts
+ * as unpushed: the hold errs conservative and the next refresh re-checks. */
+export async function branchUnpushed(
+	mainPath: string,
+	branch: string,
+): Promise<boolean> {
+	const origin = `refs/remotes/origin/${branch}`;
+	const tip = async (ref: string): Promise<string | null> => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", ref],
+			mainPath,
+		).catch(() => null);
+		return r !== null && r.code === 0 ? r.stdout.trim() : null;
+	};
+	const [local, pushed] = await Promise.all([
+		tip(`refs/heads/${branch}`),
+		tip(origin),
+	]);
+	if (local === null || pushed === null || local === pushed) return false;
+	// is-ancestor answers 0 when local is contained in origin (behind is fine: a merge may
+	// fast-forward); anything else holds commits origin lacks.
+	const r = await git(
+		["merge-base", "--is-ancestor", local, origin],
+		mainPath,
+	).catch(() => null);
+	return r === null || r.code !== 0;
+}
+
 /** True when the main checkout's target already contains sha (AGEN-24: the approving turn
  * merged by itself and removed the worktree; the settle then finishes instead of parking again). */
 export async function targetContains(

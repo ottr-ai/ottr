@@ -1,6 +1,7 @@
 import {
 	depHold,
 	mergeHold,
+	PUSH_HOLD,
 	type ReviewTask,
 	reviewFindings,
 } from "../scheduler.ts";
@@ -122,16 +123,22 @@ export function cardMark(
 
 /** The hold statusLine shows for `t`, over the whole project (`tasks` spans every lane): a
  * queued merge waits on its own mergeHold (an open review, unless the card is one of its
- * findings, as in pickRunnable), then any stage on its unfinished dependencies (one missing
- * from `tasks` counts as done); a done card is never held. */
+ * findings, as in pickRunnable) or on the push hold the server stamped (`pushHold`, OTTR-506:
+ * local main has commits origin lacks; the browser gets no git), then any stage on its
+ * unfinished dependencies (one missing from `tasks` counts as done); a done card is never held. */
 export function holdFor(
-	t: Pick<Task, "id" | "stage" | "dependsOn">,
+	t: Pick<Task, "id" | "stage" | "state" | "dependsOn" | "pushRetries"> & {
+		pushHold?: boolean;
+	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
 ): string | null {
 	if (t.stage === "done") return null;
-	return (
-		(t.stage === "merging" ? mergeHold(tasks, t) : null) ?? depHold(tasks, t)
-	);
+	if (t.stage === "merging") {
+		const held =
+			mergeHold(tasks, t) ?? (t.pushHold === true ? PUSH_HOLD : null);
+		if (held !== null) return held;
+	}
+	return depHold(tasks, t);
 }
 
 /** The release card's re-release view, else null: parked for the user (needs_you or idle, not

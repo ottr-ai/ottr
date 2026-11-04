@@ -59,6 +59,8 @@ const toReview = (t: Row) => ({
 	releaseVersion: t.release_version,
 	cancelledAt: t.cancelled_at,
 	stage: t.stage,
+	state: t.state,
+	pushRetries: t.push_retries,
 	createdAt: t.created_at,
 	doneAt: t.done_at,
 	dependsOn: t.depends_on,
@@ -153,13 +155,13 @@ test("seed covers every display shape with clean checkouts", () => {
 		(t) => t.stage === "merging" && t.state === "queued",
 	);
 	expect(plainMerge).toBeDefined();
-	expect(mergeHold(hollow, plainMerge!)).toBeNull();
+	expect(mergeHold(hollow, toReview(plainMerge!))).toBeNull();
 	const held = firstBoard.lumen!.tasks.find(
 		(t) => t.stage === "merging" && t.state === "queued",
 	);
 	expect(held).toBeDefined();
 	expect(
-		mergeHold(firstBoard.lumen!.tasks.map(toReview), held!),
+		mergeHold(firstBoard.lumen!.tasks.map(toReview), toReview(held!)),
 	).not.toBeNull();
 	const liveMerge = tasks.find(
 		(t) => t.stage === "merging" && t.state === "running",

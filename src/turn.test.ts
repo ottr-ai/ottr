@@ -290,6 +290,7 @@ function fakeProject(store: ProjectStore): TurnProject {
 		github: null,
 		remote: null,
 		dirty: false,
+		mainUnpushed: false,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -4939,6 +4940,70 @@ describe("turn ci watch pinning", () => {
 		expect(t.pendingPrompt).toBeNull();
 		expect(t.pushRetries).toBe(0);
 		expect(pushes).toBe(1);
+	});
+
+	test("a rejected push holds the project's other merges until main reaches origin", async () => {
+		let pushes = 0;
+		const {
+			store,
+			record,
+			loop,
+			projects,
+			task: a,
+		} = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return pushes === 1
+					? {
+							status: "rejected" as const,
+							error: "! [rejected] main -> main (non-fast-forward)",
+						}
+					: { status: "pushed" as const, output: "" };
+			},
+			fetchOriginBranch: async () => null,
+			// The tick's refresh reads the same git fact the eager flag writes: unpushed
+			// between the rejected push and the repairing one, pushed after it.
+			branchUnpushed: async () => pushes === 1,
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		// Card b queued before a's rejection: queue order alone would start b first and
+		// pile its merge onto the unpushed main (the 2026-11-04 incident). The hold must
+		// invert the order: the rejected card's rebase retry repairs main first.
+		const b = store.createTask("merge b please");
+		store.updateTask(b.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/b",
+		});
+		await loop.runTurn(store.name, a.id);
+		const after = store.getTask(a.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.pushRetries).toBe(1);
+		// The rejection holds the project's merges at once, before any tick's refresh.
+		expect(projects.get(store.name)!.mainUnpushed).toBe(true);
+		// Exactly the gate schedule() runs: only the retry card may start; once main
+		// reached origin, b is the runnable merge again.
+		const gate = (unpushed: boolean) =>
+			pickRunnable(store.listTasks(), {
+				maxParallel: null,
+				hasRules: true,
+				mainUnpushed: unpushed,
+			}).map((t) => t.id);
+		expect(gate(true)).toEqual([a.id]);
+		expect(gate(false)).toEqual([b.id]);
+		// The retry turn rebases, the server push lands, and the hold lifts.
+		await loop.runTurn(store.name, a.id);
+		expect(store.getTask(a.id)!.stage).toBe("done");
+		expect(projects.get(store.name)!.mainUnpushed).toBe(false);
+		expect(pushes).toBe(2);
+		// The second card merges after the repaired main, and its push succeeds.
+		await loop.runTurn(store.name, b.id);
+		expect(store.getTask(b.id)!.stage).toBe("done");
+		expect(pushes).toBe(3);
+		expect(record.removeWorktree).toHaveLength(2);
 	});
 
 	test("the third rejected push parks the card at needs_you with git's reason", async () => {

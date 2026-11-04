@@ -280,6 +280,7 @@ projects.set("p1", {
 	github: null,
 	remote: null,
 	dirty: false,
+	mainUnpushed: false,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -296,6 +297,7 @@ projects.set("p2", {
 	github: null,
 	remote: null,
 	dirty: false,
+	mainUnpushed: false,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -311,6 +313,7 @@ projects.set("p3", {
 	github: null,
 	remote: null,
 	dirty: false,
+	mainUnpushed: false,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -699,6 +702,7 @@ describe("task routes", () => {
 				github: null,
 				remote: null,
 				dirty: false,
+				mainUnpushed: false,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,
@@ -712,6 +716,7 @@ describe("task routes", () => {
 				github: null,
 				remote: null,
 				dirty: false,
+				mainUnpushed: false,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,
@@ -2840,6 +2845,7 @@ describe("alate provision trigger (U9)", () => {
 		github: null,
 		remote: null,
 		dirty: false,
+		mainUnpushed: false,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -7425,6 +7431,7 @@ describe("PR review routes", () => {
 		github: "acme/widget",
 		remote: null,
 		dirty: false,
+		mainUnpushed: false,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -8956,14 +8963,18 @@ describe("board warnings", () => {
 			writeFileSync(join(dir, "config.yml"), "modelRoles: {}\n");
 			const now = 1_762_000_000_000;
 			const card = (
-				over: Partial<ReviewTask & Pick<Task, "state" | "project">>,
-			): ReviewTask & Pick<Task, "state" | "project"> => ({
+				over: Partial<
+					ReviewTask & Pick<Task, "state" | "project" | "stage" | "pushRetries">
+				>,
+			): ReviewTask &
+				Pick<Task, "state" | "project" | "stage" | "pushRetries"> => ({
 				id: "x",
 				kind: "work",
 				releaseVersion: null,
 				cancelledAt: null,
 				stage: "todo",
 				state: "queued",
+				pushRetries: 0,
 				project: "p",
 				createdAt: now - 10_000,
 				doneAt: null,
@@ -9052,7 +9063,8 @@ describe("board warnings", () => {
 			// only its own project's held merges, never the other project's.
 			const twin = (
 				project: string,
-			): (ReviewTask & Pick<Task, "state" | "project">)[] => [
+			): (ReviewTask &
+				Pick<Task, "state" | "project" | "stage" | "pushRetries">)[] => [
 				card({
 					id: `${project}-release`,
 					project,
@@ -9506,6 +9518,7 @@ describe("project order route", () => {
 				github: null,
 				remote: null,
 				dirty: false,
+				mainUnpushed: false,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,

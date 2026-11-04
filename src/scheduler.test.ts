@@ -27,9 +27,11 @@ import {
 	mergeHold,
 	openWorkBlockers,
 	overrideWorkBlockers,
+	PUSH_HOLD,
 	parseCheckVerdicts,
 	parseWorkCheck,
 	pickRunnable,
+	pushHold,
 	queueOrder,
 	releaseHeldMerges,
 	reviewBlocked,
@@ -258,6 +260,54 @@ describe("queueOrder", () => {
 		const running = task({ state: "running", queuedAt: 100 });
 		const cancelled = task({ cancelledAt: 500, queuedAt: 100 });
 		expect(queueOrder([running, cancelled, queued])).toEqual([queued]);
+	});
+});
+
+describe("push hold (OTTR-506)", () => {
+	const opts = { maxParallel: 8, hasRules: true };
+
+	test("while main is unpushed the merge slot takes only the rebase retry card", () => {
+		// Card b queued first, the rejected card's retry second: queue order alone would
+		// start b and pile its merge onto the unpushed main. The hold inverts the order.
+		const held = task({ stage: "merging", queuedAt: 100 });
+		const retry = task({ stage: "merging", queuedAt: 200, pushRetries: 1 });
+		expect(
+			pickRunnable([held, retry], { ...opts, mainUnpushed: true }),
+		).toEqual([retry]);
+		// Once main reached origin, the hold lifts and the queued merge starts.
+		expect(pickRunnable([held, retry], opts)).toEqual([held]);
+	});
+
+	test("pushHold: queued merges wait, the retry card and every other stage run", () => {
+		const merging = {
+			stage: "merging",
+			state: "queued",
+			pushRetries: 0,
+		} as const;
+		expect(pushHold(true, merging)).toBe(PUSH_HOLD);
+		expect(pushHold(true, { ...merging, pushRetries: 2 })).toBeNull();
+		expect(pushHold(true, { ...merging, state: "needs_you" })).toBeNull();
+		expect(pushHold(true, { ...merging, state: "idle" })).toBeNull();
+		expect(
+			pushHold(true, { stage: "todo", state: "queued", pushRetries: 0 }),
+		).toBeNull();
+		expect(pushHold(false, merging)).toBeNull();
+	});
+
+	test("mergeHold reports the push hold, behind a review hold", () => {
+		const release = task({
+			stage: "merging",
+			state: "idle",
+			releaseVersion: "v1.0.0",
+			base: "abc",
+		});
+		const merge = task({ stage: "merging" });
+		expect(mergeHold([release, merge], merge, { mainUnpushed: true })).toBe(
+			"waiting for release v1.0.0",
+		);
+		expect(mergeHold([merge], merge, { mainUnpushed: true })).toBe(PUSH_HOLD);
+		// The git fact is the caller's input: without it the hold stays silent.
+		expect(mergeHold([merge], merge)).toBeNull();
 	});
 });
 

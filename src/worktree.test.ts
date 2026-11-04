@@ -24,6 +24,7 @@ import fc from "./test/properties.ts";
 import {
 	archReviewDelta,
 	branchMergedOrGone,
+	branchUnpushed,
 	changedFiles,
 	createWorktree,
 	describeVersion,
@@ -1311,6 +1312,67 @@ describe("pinned origin URL (OTTR-348)", () => {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	}, 60_000);
+});
+
+describe("branchUnpushed", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	/** Origin (bare) plus a clone whose main holds one pushed commit; `other` is a second
+	 * checkout on the same repo for moving origin without touching main. */
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-bu-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		const other = join(dir, "other");
+		run(main, "worktree", "add", "-q", "--detach", other);
+		return { dir, bare, main, other };
+	};
+
+	test("equal, behind, diverged and ahead map to false, false, true, true", async () => {
+		const f = fixture();
+		try {
+			// Pushed and equal: nothing to reconcile.
+			expect(await branchUnpushed(f.main, "main")).toBe(false);
+			// Origin one ahead, local an ancestor: merges may fast-forward, no hold.
+			writeFileSync(join(f.other, "o.txt"), "o");
+			run(f.other, ...id, "add", ".");
+			run(f.other, ...id, "commit", "-qm", "O1");
+			run(f.other, "push", "-q", "origin", "HEAD:main");
+			run(f.main, "fetch", "-q", "origin");
+			expect(await branchUnpushed(f.main, "main")).toBe(false);
+			// Local commits on top of a moved origin: diverged, the next push is rejected.
+			writeFileSync(join(f.main, "b.txt"), "b");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "L1");
+			expect(await branchUnpushed(f.main, "main")).toBe(true);
+			// Pure ahead in a clone that holds a commit origin lacks: local is no ancestor.
+			const clone = join(f.dir, "clone");
+			run(f.dir, "clone", "-q", f.bare, clone);
+			writeFileSync(join(clone, "c.txt"), "c");
+			run(clone, ...id, "add", ".");
+			run(clone, ...id, "commit", "-qm", "L2");
+			expect(await branchUnpushed(clone, "main")).toBe(true);
+			// A branch without refs on either side counts as pushed.
+			expect(await branchUnpushed(f.main, "ghost")).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("resetBranchTo", () => {
