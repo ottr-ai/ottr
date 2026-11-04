@@ -407,6 +407,7 @@ const loop = createTurnLoop(projects, {
 	workCheck: () => shared.workCheck,
 	quota: () => fetchQuota(boardOmpEnv()),
 	drained: () => app.drained(),
+	drainedRunner: (id) => app.drainedRunner(id),
 	publishSoon: () => app.publishSoon(),
 	notifyLog: (project, id) => app.notifyLog(project, id),
 	refreshRelease,
@@ -499,6 +500,16 @@ const app = createApp({
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,
 	finishKept: loop.finishKept,
+	// OTTR-454: the runners GET /api/drain lists (worker hostnames, then local) and the
+	// live per-runner counts from the turn loop.
+	runners: [
+		...(workerTarget?.urls ?? []).map((u) => ({
+			id: new URL(u).hostname,
+			url: u,
+		})),
+		{ id: "local", url: null },
+	],
+	runnerTurns: () => loop.runnerTurns(),
 	claimedPids,
 	progressOf: (project, id) => {
 		const entry = loop.running.get(`${project}/${id}`);

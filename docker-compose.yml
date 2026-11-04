@@ -20,6 +20,19 @@ x-worker: &worker
   # tini as PID 1 reaps the orphans that omp and test runs leave behind: with bun as
   # PID 1, worker-a held 5,434 zombies after 7 hours.
   init: true
+  # `up -d --wait <worker>` (the rolling update) waits for this: the worker answers its
+  # own GET /healthz, so a recreated worker counts as done only when it is connected.
+  healthcheck:
+    test:
+      - CMD
+      - bun
+      - -e
+      # Quoted: the plain scalar's " : " made YAML read this item as a mapping.
+      - "process.exit((await fetch('http://127.0.0.1:' + (process.env.WORKER_PORT || 8787) + '/healthz')).ok ? 0 : 1)"
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
   logging: *logging
   # ponytail: estimate (Chrome + bun test + agent turns), not a measured peak. Run
   # `docker stats` under load and set about 2x the peak in the compose env file.

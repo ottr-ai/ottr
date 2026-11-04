@@ -830,6 +830,9 @@ export function applyEvent(
 
 interface RunHandle {
 	pid: number | null;
+	/** OTTR-454: the dispatched worker's url; absent for a local run. The turn engine
+	 * buckets live runs by it for GET /api/drain. */
+	url?: string;
 	done: Promise<RunResult>;
 	kill(): Promise<void>;
 	/** Id of the agent layer the run pinned at start; null when it ran the flat home. */
@@ -1227,6 +1230,8 @@ export function startRun(o: {
 		// pid is null while omp lives in the worker container's namespace; sweepLostTurns
 		// treats an open pid-null row without a live entry as lost after a tracker restart.
 		pid: null,
+		// OTTR-454: the turn engine buckets live runs by this url for GET /api/drain.
+		url: workerHandle.url,
 		done: workerHandle.done
 			// The worker's own pid is in its container namespace; only the wall duration is local.
 			.then((r) => {

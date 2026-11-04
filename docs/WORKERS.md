@@ -74,32 +74,80 @@ turns and work turns all get the new omp. Two parts do the work:
    only place that moves the pin. The pin sits above the omp layer, near the end of
    the file, so a bump rebuilds only the last layers.
 2. Each host that runs the stack deploys `main` with `scripts/update-image.ts`, from
-   a clean `main` checkout. It fast-forwards `main` and builds the image. When the
-   board runs and no turn runs, it restarts the stack (`docker compose up -d --wait`
-   recreates only the containers whose image changed, then waits for the `/api/boot`
-   healthcheck, so a board that never comes healthy fails the run instead of
-   logging success) and removes the old images. When the build gives the server a
-   new image, the script first holds new turns on the board (`POST /api/drain`, 30
-   minutes per call). The running turns finish, and no new turn, merge or release
-   starts. The card of the **Check the board** button is the one exception: it only
-   reads the board, so it starts at once, and the restart waits for it like for any
-   other turn. The hold carries the subjects of the commits the restart brings, and the
-   board lists them under the update notice. The board's **Notices** shows the hold.
-   The script counts the turns every 30 s and renews the hold each time. When no turn
-   runs, it restarts the stack at once. A hold lasts at most 1 hour. If turns still run
-   then, the script ends the hold (`DELETE /api/drain`), so the queued cards start, and
-   a later run tries the restart again. Thus a long turn, for example a mutation run of
-   several hours, stops new turns for 1 hour at most. While it waits, the scheduled task starts no
-   second run (`-MultipleInstances
-   IgnoreNew` below), so the restart uses the image that this run built, and a later
-   run deploys newer commits. If the board refuses a renewal, the script stops
-   waiting, and the hold stops 30 minutes after the last renewal. An unchanged image,
-   and a board too old for the hold, keep the old rule: while turns run, the old
-   containers stay until a later run. When no board runs at all, it restarts without
-   counting turns. It stops when the checkout has uncommitted changes or commits that
-   origin lacks, when `docker compose ps` fails, or when it cannot compare the
-   server's image with the build. It never pushes: a host needs read access to the
-   repo only.
+   a clean `main` checkout. It fast-forwards `main` and builds the image, then it
+   rolls the stack one runner at a time. A runner is a worker (its hostname, the
+   compose service name) or the server itself (`local`). It stops when the
+   checkout has uncommitted changes or commits that origin lacks, when
+   `docker compose ps` fails, or when it cannot compare the server's image with
+   the build. A worker whose image cannot be compared is skipped with one log
+   line. It never pushes: a host needs read access to the repo only. The last
+   step prunes the worker images no container runs, so even a run that leaves a
+   worker stuck never takes the image that its container runs.
+
+   Workers roll first, one at a time, in `compose ps` order, and only a worker whose
+   image changed:
+
+   - The script holds that one worker's new turns (`POST /api/drain` with
+     `runner`). The worker finishes its running turns while every other worker and
+     the server keep working, and no hold shows in the **Notices**.
+   - The script polls every 30 s until that worker runs no turn and nothing is
+     preparing. A hold lasts at most 1 hour. If the worker still runs a turn then,
+     the script ends its hold (`DELETE /api/drain?runner=`), the worker stays on
+     the old image, and a later run tries again. The roll goes on with the next
+     worker, and the run exits 0.
+   - When the worker is idle, the script recreates only its container
+     (`up -d --no-deps --wait <service>`). The worker's compose healthcheck probes
+     its own `GET /healthz`, so the `--wait` fails when the new container never
+     turns healthy. A failed recreate stops the roll at once (exit 1): the workers
+     that did not roll yet stay on the old image, and the server does not restart.
+   - Healthy is not connected: the script then waits, from the server, until it
+     reaches the worker's `/healthz` again (at most 5 minutes). A failure here
+     stops the roll like a failed health check.
+   - Connected: the script releases the worker's hold, and the next worker rolls.
+     A worker hostname that no runner lists (not in `OTTR_WORKER_URLS`, so no turn
+     can reach it) recreates without a hold and without the turns wait.
+
+   The server rolls last, only when no worker is stuck, because a server restart
+   kills every turn it runs itself and every turn a worker streams to it:
+
+   - When the server's image changed or a fresh seed waits, the script holds new
+     turns on the whole board (`POST /api/drain`, 30 minutes per call). The
+     running turns finish, and no new turn, merge or release starts. The card of
+     the **Check the board** button is the one exception: it only reads the board,
+     so it starts at once, and the restart waits for it like for any other turn.
+     The hold carries the subjects of the commits the restart brings, and the
+     board lists them under the update notice. The board's **Notices** shows the
+     hold. The script counts the turns every 30 s and renews the hold each time.
+     When no turn runs, it recreates the server (`up -d --no-deps --wait server`)
+     when its image changed, or restarts it (`restart server`) when only the seed
+     moved. The recreate or restart clears every hold, so no undrain is needed. A
+     hold lasts at most 1 hour; if turns still run then, the script ends the hold
+     (`DELETE /api/drain`), so the queued cards start, and a later run tries the
+     restart again. While it waits, the scheduled task starts no second run
+     (`-MultipleInstances
+     IgnoreNew` below), so the restart uses the image that this run built, and a
+     later run deploys newer commits. If the board refuses a renewal, the script
+     stops waiting, and the hold stops 30 minutes after the last renewal.
+   - When a worker is stuck, the server restart waits for a later run, and that
+     run seeds and records again. When the server's image is unchanged and no
+     seed waits, no server step runs.
+
+   The last step runs `up -d --wait` for the whole stack: it starts a service
+   that is not running and waits for the server's health; it recreates nothing.
+
+   Versions can mix only as old server with new worker, during a roll and after a
+   stopped roll. The worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`)
+   stays compatible for one version in this direction. New server with old worker
+   never persists: the server rolls after every worker rolled, and the whole-board
+   hold before the server step means no turn runs on an old worker while the new
+   server boots.
+
+   When the board is too old for the runner API (`GET /api/drain` answers
+   nothing), the script keeps the old whole-board rule: it holds new turns on the
+   whole board, waits for at most 1 hour, and restarts the stack at once with
+   `up -d --wait` when no turn runs. A board too old for the hold keeps the old
+   containers until a later run. When no board runs at all, it starts the stack
+   without counting turns.
 
 3. A host-only override can build further services from their own local git checkouts
    (the compose files in this repo name none, so the script discovers them in

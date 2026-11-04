@@ -7107,6 +7107,157 @@ describe("drain route", () => {
 		expect(state.drainUntil).toBeNull();
 		expect(state.drainCommits).toBeNull();
 	});
+
+	test("a local hold rides the runner branch on the fallback runner list", async () => {
+		// The mount passes no runners, so the fallback list holds only "local".
+		const res = await post("/api/drain", { runner: "local" });
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { until: number };
+		expect(body.until).toBeGreaterThan(Date.now());
+		expect(app.drainedRunner("local")).toBe(true);
+		// The board-wide hold stays off.
+		expect(app.drained()).toBe(false);
+		const clear = await fetch(new URL("/api/drain?runner=local", server.url), {
+			method: "DELETE",
+			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+		});
+		expect(clear.status).toBe(200);
+		expect(app.drainedRunner("local")).toBe(false);
+	});
+});
+
+describe("per-runner drain routes (OTTR-454)", () => {
+	// Own app so the tests can inject a worker list and live counts; same guard
+	// headers as the main mount (port 0).
+	const runnerApp = createApp({
+		gstore,
+		projects,
+		defaultDir: root,
+		cancel: async () => ({ removed: true }),
+		stopTurn: async () => ({ ok: true }),
+		finishKept: async () => ({ ok: true }),
+		claimedPids: () => new Set<number>(),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared,
+		serverRef: { current: undefined },
+		runners: [
+			{ id: "worker-a", url: "http://worker-a:8787" },
+			{ id: "worker-b", url: "http://worker-b:8787" },
+			{ id: "local", url: null },
+		],
+		runnerTurns: () => ({
+			local: 2,
+			workers: { "worker-a": 1 },
+			preparing: 3,
+		}),
+	});
+	const runnerServer = Bun.serve({ port: 0, ...runnerApp.serveOptions });
+	runnerApp.serverRef.current = runnerServer;
+	afterAll(() => runnerServer.stop(true));
+	const runnerCall = (path: string, body?: unknown, method?: string) =>
+		fetch(new URL(path, runnerServer.url), {
+			method: method ?? (body === undefined ? "GET" : "POST"),
+			headers: {
+				...(body === undefined ? {} : { "content-type": "application/json" }),
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+			},
+			body: body === undefined ? undefined : JSON.stringify(body),
+		});
+
+	test("GET lists every runner with its url, hold and live turn counts", async () => {
+		const res = await runnerCall("/api/drain");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			drainUntil: number | null;
+			drainCommits: string[] | null;
+			preparing: number;
+			runners: {
+				id: string;
+				url: string | null;
+				until: number | null;
+				turns: number;
+			}[];
+		};
+		expect(body.drainUntil).toBeNull();
+		expect(body.drainCommits).toBeNull();
+		expect(body.preparing).toBe(3);
+		expect(body.runners).toEqual([
+			{ id: "worker-a", url: "http://worker-a:8787", until: null, turns: 1 },
+			{ id: "worker-b", url: "http://worker-b:8787", until: null, turns: 0 },
+			{ id: "local", url: null, until: null, turns: 2 },
+		]);
+	});
+
+	test("POST {runner} holds one runner for DRAIN_MS and leaves the board untouched", async () => {
+		const before = Date.now();
+		const res = await runnerCall("/api/drain", { runner: "worker-a" });
+		expect(res.status).toBe(200);
+		const { until } = (await res.json()) as { until: number };
+		// One DRAIN_MS window from the request, not the board-wide hold length logic.
+		expect(until).toBeGreaterThanOrEqual(before + 30 * 60_000);
+		expect(until).toBeLessThanOrEqual(Date.now() + 30 * 60_000);
+		// Renewal moves the hold to the new request's window.
+		const again = await runnerCall("/api/drain", { runner: "worker-a" });
+		const renewed = (await again.json()) as { until: number };
+		expect(renewed.until).toBeGreaterThanOrEqual(until);
+		const get = await runnerCall("/api/drain");
+		const body = (await get.json()) as {
+			drainUntil: number | null;
+			runners: { id: string; until: number | null }[];
+		};
+		const a = body.runners.find((r) => r.id === "worker-a")!;
+		const b = body.runners.find((r) => r.id === "worker-b")!;
+		expect(a.until).not.toBeNull();
+		expect(b.until).toBeNull();
+		expect(body.drainUntil).toBeNull();
+		const state = (await (await runnerCall("/api/state")).json()) as {
+			drainUntil: number | null;
+			drainCommits: string[] | null;
+		};
+		expect(state.drainUntil).toBeNull();
+		expect(state.drainCommits).toBeNull();
+	});
+
+	test("POST rejects an unknown or non-string runner", async () => {
+		const unknown = await runnerCall("/api/drain", { runner: "worker-c" });
+		expect(unknown.status).toBe(400);
+		expect(await errorOf(unknown)).toContain("unknown runner");
+		const junk = await runnerCall("/api/drain", { runner: 42 });
+		expect(junk.status).toBe(400);
+	});
+
+	test("DELETE ?runner clears only that hold; the board-wide clear leaves runner holds", async () => {
+		await runnerCall("/api/drain", { runner: "worker-a" });
+		await runnerCall("/api/drain", { runner: "worker-b" });
+		// Board-wide hold, so the two spaces cannot leak into each other.
+		await runnerCall("/api/drain", { commits: ["one"] });
+		const clearA = await runnerCall(
+			"/api/drain?runner=worker-a",
+			undefined,
+			"DELETE",
+		);
+		expect(clearA.status).toBe(200);
+		expect((await clearA.json()) as unknown).toEqual({ until: null });
+		let body = (await (await runnerCall("/api/drain")).json()) as {
+			drainUntil: number | null;
+			runners: { id: string; until: number | null }[];
+		};
+		expect(body.runners.find((r) => r.id === "worker-a")!.until).toBeNull();
+		expect(body.runners.find((r) => r.id === "worker-b")!.until).not.toBeNull();
+		// The board-wide hold survives a per-runner clear.
+		expect(body.drainUntil).not.toBeNull();
+		const clearBoard = await runnerCall("/api/drain", undefined, "DELETE");
+		expect((await clearBoard.json()) as unknown).toEqual({
+			drainUntil: null,
+		});
+		body = (await (await runnerCall("/api/drain")).json()) as typeof body;
+		expect(body.drainUntil).toBeNull();
+		expect(body.runners.find((r) => r.id === "worker-b")!.until).not.toBeNull();
+	});
 });
 
 describe("fork research routes", () => {

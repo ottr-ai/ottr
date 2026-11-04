@@ -1,8 +1,12 @@
 #!/usr/bin/env bun
 // Deploys main to a compose stack. Run it on a schedule from a clean `main` checkout
-// (docs/WORKERS.md, "Updates"): it fast-forwards main, builds the image, and restarts the
-// stack once no turn runs. While a new image waits, it holds new turns on the board for at
-// most 1 h, so the running turns finish. With ALATE_DATA or ALATE_DATA_REPO in the env file
+// (docs/WORKERS.md, "Updates"): it fast-forwards main, builds the image, and rolls the
+// stack one runner at a time: it holds one worker's new turns, recreates that worker
+// with the new image, waits until it is healthy and connected, releases it, and goes to
+// the next worker. The server rolls last, only when no turn runs anywhere. A worker
+// that keeps a turn past 1 h is released, and its restart waits for a later run. A
+// board without the runner API holds the whole board and restarts it at once. With
+// ALATE_DATA or ALATE_DATA_REPO in the env file
 // it also seeds the board's agent layer (docs/WORKERS.md, "Seed the board config"). The omp
 // pin moves on main only
 // (.github/workflows/omp-bump.yml), so a host needs read access and never pushes.
@@ -51,12 +55,46 @@ const FREE_TURNS =
 	"const u = 'http://127.0.0.1:' + process.env.PORT;" +
 	"const r = await fetch(u + '/api/drain', { method: 'DELETE', headers: { origin: u } });" +
 	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }";
+// The runner state the roll reads (GET /api/drain): per-runner holds and turn counts.
+// A GET needs no origin. A board older than the runner API answers 404, and the run
+// takes the whole-board path.
+const READ_RUNNERS =
+	"const u = 'http://127.0.0.1:' + process.env.PORT;" +
+	"const r = await fetch(u + '/api/drain');" +
+	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }" +
+	"console.log(await r.text());";
+// Holds one runner (a worker hostname) for 30 min (POST /api/drain), with the same
+// origin and double-encoded body as holdTurns.
+const holdRunner = (runner: string): string => {
+	const body = JSON.stringify(JSON.stringify({ runner }));
+	return (
+		"const u = 'http://127.0.0.1:' + process.env.PORT;" +
+		`const r = await fetch(u + '/api/drain', { method: 'POST', headers: { origin: u, 'content-type': 'application/json' }, body: ${body} });` +
+		"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }"
+	);
+};
+// Ends one runner's hold (DELETE /api/drain?runner=), with the same origin as the hold.
+// The runner id is a plain string, so one encode: the double-encoded body style above
+// is for JSON text, and a second encode here would send quotes in the query param.
+const freeRunner = (runner: string): string =>
+	"const u = 'http://127.0.0.1:' + process.env.PORT;" +
+	`const r = await fetch(u + '/api/drain?runner=' + encodeURIComponent(${JSON.stringify(runner)}), { method: 'DELETE', headers: { origin: u } });` +
+	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }";
+// Probes a new worker's own /healthz from the server, so the roll knows the worker is
+// connected before the next one rolls. The url comes from the board's runner list, as
+// one string: a second encode would fetch a quoted literal and never reach the worker.
+const probeRunner = (url: string): string =>
+	`const r = await fetch(${JSON.stringify(url + "/healthz")});` +
+	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }";
 // While a new image waits, the count repeats every 30 s until no turn runs. The scheduled task
 // starts no second run meanwhile (IgnoreNew), so the run that built the image restarts the stack.
 const POLL_MS = 30_000;
 // A hold lasts at most 1 h, so a long turn (a mutation run of several hours) stops the queue
 // of new turns for 1 h at most. Then the run ends the hold, and a later run tries again.
 const HOLD_LIMIT_MS = 60 * 60_000;
+// A rolled worker must answer its healthz soon: at most 5 min, then the roll stops and
+// keeps the not-yet-rolled containers on the old image.
+const CONNECT_LIMIT_MS = HOLD_LIMIT_MS / 12;
 
 /** The real docker dep puts stderr first: compose warnings come before the answer's last line. */
 const lastLine = (out: string): string =>
@@ -803,12 +841,43 @@ async function seedBoard(
 	return runSeed(d, compose, env, seed, outcome);
 }
 
+/** One runner the board reports on GET /api/drain: a worker hostname, or local for the server. */
+type Runner = {
+	id: string;
+	url: string | null;
+	until: number | null;
+	turns: number;
+};
+
 /**
- * Waits out the running board's turns before the restart. Returns the early exit
- * code, or null when `compose up` may proceed. serverImageChanged says whether the
- * running server's image differs from the build, so up must not restart it again.
+ * The board's answer to GET /api/drain, or null when no board answers the route (a
+ * board one version older, or a failed read). A failed read falls to the legacy path,
+ * which holds and restarts the whole board or stops — it never rolls half-blind.
  */
-async function drainTurns(
+async function readRunners(
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+): Promise<{ preparing: number; runners: Runner[] } | null> {
+	const r = await exec(READ_RUNNERS);
+	if (r.code !== 0) return null;
+	try {
+		const s = JSON.parse(lastLine(r.out)) as {
+			preparing?: number;
+			runners?: Runner[];
+		};
+		if (!Array.isArray(s.runners)) return null;
+		return { preparing: s.preparing ?? 0, runners: s.runners };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The whole-board flow a board older than the runner API keeps, unchanged: hold new
+ * turns on the whole board, wait them out, `up -d --wait`, and restart a running
+ * server that keeps its image but took a seed. Returns the early exit code, or null
+ * when the stack is up.
+ */
+async function legacyDrainAndRestart(
 	d: Deps,
 	compose: string[],
 	commits: string[],
@@ -817,22 +886,15 @@ async function drainTurns(
 	serverWasRunning: boolean,
 	wantedSha: string,
 	stop: (why: string) => number,
-): Promise<{ early: number | null; serverImageChanged: boolean }> {
-	if (!serverWasRunning) {
-		d.log("no running board to count turns in; restarting anyway");
-		return { early: null, serverImageChanged: false };
-	}
+): Promise<number | null> {
 	// The build tags the server's image name; a server on another image means that the
 	// restart brings a new image. imageChanged compares the platform manifests where
 	// the containerd image store reports them: the image ids differ on every build.
 	const r = await imageChanged(d, compose, "server");
 	if ("error" in r)
-		return {
-			early: stop(
-				`the server's image cannot be compared with the build: ${r.error}`,
-			),
-			serverImageChanged: false,
-		};
+		return stop(
+			`the server's image cannot be compared with the build: ${r.error}`,
+		);
 	const holdCommits = seeded
 		? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
 		: commits;
@@ -843,40 +905,7 @@ async function drainTurns(
 		r.changed || seeded,
 		stop,
 	);
-	return {
-		early: early === 0 && seedFailed ? 1 : early,
-		serverImageChanged: r.changed,
-	};
-}
-
-/**
- * Waits out the running turns and brings the stack up with --wait, and restarts a
- * running server that keeps its image but took a seed. Returns the early exit code,
- * or null when the stack is up.
- */
-async function drainAndRestart(
-	d: Deps,
-	compose: string[],
-	commits: string[],
-	seeded: boolean,
-	seedFailed: boolean,
-	serverWasRunning: boolean,
-	wantedSha: string,
-	stop: (why: string) => number,
-): Promise<number | null> {
-	// No running board, no turn can run: merge turns die with the board and workers
-	// kill a turn when the board's request drops. Skip counting and go straight to up.
-	const drained = await drainTurns(
-		d,
-		compose,
-		commits,
-		seeded,
-		seedFailed,
-		serverWasRunning,
-		wantedSha,
-		stop,
-	);
-	if (drained.early !== null) return drained.early;
+	if (early !== null) return early === 0 && seedFailed ? 1 : early;
 	// --wait fails the run when the recreated board never turns healthy, so the script
 	// never logs success for a crash-loop.
 	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
@@ -884,12 +913,279 @@ async function drainAndRestart(
 		return stop(`docker compose up --wait failed: ${up.out.trim()}`);
 	// The recreate already rebooted a server whose image changed, and up started a board
 	// that was down with the seed. Only a running board that keeps its image restarts.
-	if (seeded && serverWasRunning && !drained.serverImageChanged) {
+	if (seeded && serverWasRunning && !r.changed) {
 		const rs = await d.docker("compose", ...compose, "restart", "server");
 		if (rs.code !== 0)
 			return stop(`docker compose restart server failed: ${rs.out.trim()}`);
 	}
 	return null;
+}
+
+/**
+ * Rolls the stack one runner at a time. Each running worker whose image changed holds
+ * its runner (POST /api/drain {runner}), waits until its turns end, recreates alone
+ * (`up -d --no-deps --wait`), waits until it answers its healthz, and releases its
+ * hold; a runner that keeps a turn past HOLD_LIMIT_MS is released, left on the old
+ * image, and rolled by a later run. The server rolls last and only when no runner is
+ * stuck, because a server restart kills the stuck worker's turn. A board without the
+ * runner API (GET /api/drain answers nothing) keeps the legacy whole-board flow, and a
+ * board that is not running just starts. Returns the early exit code, and whether the
+ * board took the seed (or restarted), so the seed record is only written then.
+ */
+/** Recreates one service alone and waits for its compose healthcheck; null when it is up. */
+async function recreate(
+	d: Deps,
+	compose: string[],
+	service: string,
+	stop: (why: string) => number,
+): Promise<number | null> {
+	const up = await d.docker(
+		"compose",
+		...compose,
+		"up",
+		"-d",
+		"--no-deps",
+		"--wait",
+		service,
+	);
+	return up.code === 0
+		? null
+		: stop(`docker compose up --wait ${service} failed: ${up.out.trim()}`);
+}
+
+/** One listed runner's roll: the run stops early, the runner is stuck, or the service rolled. */
+type RollOne = { stop: number } | { stuck: true } | { rolled: true };
+
+/**
+ * Rolls one listed runner: holds it, waits its turns out (the wait renews the hold each
+ * poll), recreates only its container, waits until the server reaches it again, and
+ * releases it. `board` carries the live runner state and is refreshed in place.
+ */
+async function rollRunner(
+	d: Deps,
+	compose: string[],
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	runner: Runner,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<RollOne> {
+	const held = await exec(holdRunner(service));
+	if (held.code !== 0)
+		return {
+			stop: stop(`the board cannot hold ${service}: ${lastLine(held.out)}`),
+		};
+	// The runner's turns drain while the other runners keep working. `preparing` is
+	// not attributable to one runner, so a preparing turn holds every runner idle.
+	const since = d.now();
+	let busy = true;
+	for (let i = 0; ; i++) {
+		const r = board.runners.find((x) => x.id === service);
+		if (r !== undefined && r.turns === 0 && board.preparing === 0) {
+			busy = false;
+			break;
+		}
+		// The next poll would end past the limit.
+		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) break;
+		if (i === 0)
+			d.log(
+				`${service} still runs its turns: the roll follows when they finish`,
+			);
+		await d.wait(POLL_MS);
+		const next = await readRunners(exec);
+		if (next === null)
+			return {
+				stop: stop(
+					`the board's runners cannot be read: the hold on ${service} lapses 30 min after the last renewal`,
+				),
+			};
+		board.preparing = next.preparing;
+		board.runners = next.runners;
+		// One POST holds the runner for DRAIN_MS (30 min), and this wait can reach
+		// HOLD_LIMIT_MS (1 h): renew each poll like the whole-board hold does, or the
+		// hold lapses mid-wait and the worker takes turns again before its recreate.
+		// A refused renewal lands in the busy path below: release, and a later run rolls.
+		const renewed = await exec(holdRunner(service));
+		if (renewed.code !== 0) break;
+	}
+	if (busy) {
+		// The runner keeps its turn: release it, leave it on the old image, and let
+		// a later run roll it.
+		const freed = await exec(freeRunner(service));
+		d.log(
+			freed.code === 0
+				? `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min: its hold ends, and its restart waits for a later run`
+				: `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min, and the board cannot end its hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
+		);
+		return { stuck: true };
+	}
+	// --wait waits for the worker's own compose healthcheck; a failed recreate is a
+	// failed health check: the roll stops, and the other containers stay on the old image.
+	const failed = await recreate(d, compose, service, stop);
+	if (failed !== null) return { stop: failed };
+	if (runner.url !== null) {
+		// Healthy is not connected: the roll goes on only when the server reaches
+		// the new worker again.
+		const cSince = d.now();
+		for (;;) {
+			const h = await exec(probeRunner(runner.url));
+			if (h.code === 0) break;
+			if (d.now() - cSince + POLL_MS > CONNECT_LIMIT_MS)
+				return {
+					stop: stop(
+						`${service} never answers ${runner.url}/healthz: ${lastLine(h.out)}`,
+					),
+				};
+			await d.wait(POLL_MS);
+		}
+	}
+	const freed = await exec(freeRunner(service));
+	if (freed.code !== 0)
+		d.log(
+			`the board cannot end ${service}'s hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
+		);
+	return { rolled: true };
+}
+
+/**
+ * The server's own roll, always last: the whole-board hold carries the commit subjects
+ * and the notices show it, then the recreate (a new image) or the restart (a seed only)
+ * takes the seed. The recreate or restart clears every in-memory drain, so no undrain
+ * is needed. Returns the early exit code, or null when the board took the seed.
+ */
+async function rollServer(
+	d: Deps,
+	compose: string[],
+	commits: string[],
+	seeded: boolean,
+	seedFailed: boolean,
+	changed: boolean,
+	wantedSha: string,
+	stop: (why: string) => number,
+): Promise<number | null> {
+	if (!changed && !seeded) return null;
+	const holdCommits = seeded
+		? [...commits, `board agent layer seed ${wantedSha.slice(0, 12)}`]
+		: commits;
+	const early = await drainRunningBoard(d, compose, holdCommits, true, stop);
+	if (early !== null) return early === 0 && seedFailed ? 1 : early;
+	if (changed) return recreate(d, compose, "server", stop);
+	const rs = await d.docker("compose", ...compose, "restart", "server");
+	return rs.code === 0
+		? null
+		: stop(`docker compose restart server failed: ${rs.out.trim()}`);
+}
+
+async function rollAndRestart(
+	d: Deps,
+	compose: string[],
+	services: string[],
+	commits: string[],
+	seeded: boolean,
+	seedFailed: boolean,
+	serverWasRunning: boolean,
+	wantedSha: string,
+	stop: (why: string) => number,
+): Promise<{ early: number | null; settled: boolean }> {
+	const exec = (code: string) =>
+		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
+	// No running board, no turn can run: workers kill a turn when the board's request
+	// drops, and merge turns die with the board. Skip the roll and start the stack.
+	if (!serverWasRunning) {
+		d.log("no running board to count turns in; restarting anyway");
+		const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
+		if (up.code !== 0)
+			return {
+				early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
+				settled: false,
+			};
+		return { early: null, settled: true };
+	}
+	const board = await readRunners(exec);
+	if (board === null) {
+		// A board one version older has none of the per-runner parts.
+		const early = await legacyDrainAndRestart(
+			d,
+			compose,
+			commits,
+			seeded,
+			seedFailed,
+			serverWasRunning,
+			wantedSha,
+			stop,
+		);
+		return { early, settled: early === null };
+	}
+	// Workers roll first, one at a time, in compose ps order; the server rolls last.
+	let stuck = false;
+	for (const service of services.filter((s) => s !== "server")) {
+		const ch = await imageChanged(d, compose, service);
+		if ("error" in ch) {
+			d.log(
+				`skipping ${service}: its image cannot be compared with the build: ${ch.error}`,
+			);
+			continue;
+		}
+		if (!ch.changed) continue;
+		const runner = board.runners.find((r) => r.id === service);
+		if (runner === undefined) {
+			// No runner lists this hostname, so no turn can reach it: it recreates
+			// without a hold and without a turns wait, like a sidecar service does.
+			d.log(
+				`${service} is no runner on the board: it recreates without a hold`,
+			);
+			const failed = await recreate(d, compose, service, stop);
+			if (failed !== null) return { early: failed, settled: false };
+			continue;
+		}
+		const one = await rollRunner(
+			d,
+			compose,
+			exec,
+			service,
+			runner,
+			board,
+			stop,
+		);
+		if ("stop" in one) return { early: one.stop, settled: false };
+		if ("stuck" in one) stuck = true;
+	}
+	// The server is the last runner: a restart kills every turn it runs itself and every
+	// turn a worker streams to it, so a stuck runner's turn forbids the restart.
+	if (stuck) {
+		d.log(
+			"a runner keeps its turn: the server restart waits for a later run, because a restart kills that turn",
+		);
+		return { early: null, settled: false };
+	}
+	const ch = await imageChanged(d, compose, "server");
+	if ("error" in ch)
+		return {
+			early: stop(
+				`the server's image cannot be compared with the build: ${ch.error}`,
+			),
+			settled: false,
+		};
+	const early = await rollServer(
+		d,
+		compose,
+		commits,
+		seeded,
+		seedFailed,
+		ch.changed,
+		wantedSha,
+		stop,
+	);
+	if (early !== null) return { early, settled: false };
+	// The whole-stack up only starts a service that is not running and waits for the
+	// server's health: every changed container was rolled per service above.
+	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
+	if (up.code !== 0)
+		return {
+			early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
+			settled: false,
+		};
+	return { early: null, settled: true };
 }
 
 /**
@@ -970,9 +1266,10 @@ export async function updateImage(
 
 	const seed = await seedBoard(d, compose, repo, env, serverWasRunning);
 
-	const early = await drainAndRestart(
+	const rolled = await rollAndRestart(
 		d,
 		compose,
+		services,
 		meta.commits,
 		seed.seeded,
 		seed.failed,
@@ -980,15 +1277,13 @@ export async function updateImage(
 		seed.wantedSha,
 		stop,
 	);
-	if (early !== null) return early;
-
-	const recordFailed = await recordSeed(
-		d,
-		compose,
-		seed.seeded,
-		seed.wantedSha,
-		seed.expires,
-	);
+	if (rolled.early !== null) return rolled.early;
+	// The record lands only after the board took the seed (a rolled server, a legacy
+	// restart, or a start): a stuck runner defers the restart, and the next run seeds
+	// again and retries.
+	const recordFailed = rolled.settled
+		? await recordSeed(d, compose, seed.seeded, seed.wantedSha, seed.expires)
+		: false;
 	await d.docker(
 		"image",
 		"prune",

@@ -152,6 +152,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		board: { url: "http://127.0.0.1:4747", token: "boot-token" },
 		maxTotalRuns: () => 10,
 		drained: () => false,
+		drainedRunner: () => false,
 		// A neutral default role (no provider lends it) unless a test sets one: the real
 		// modelRoles reads this machine's config.yml, and a worker turn needs a model to run.
 		modelRoles: () => ({ default: "fake/default-model" }),
@@ -16018,5 +16019,91 @@ describe("generateTitle failure causes", () => {
 		} finally {
 			jest.useRealTimers();
 		}
+	});
+});
+
+describe("per-runner drain gates (OTTR-454)", () => {
+	test("a drained worker gets no dispatch while the other still does", async () => {
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: {
+				urls: ["http://worker-a:8787", "http://worker-b:8787"],
+			},
+			drainedRunner: (id) => id === "worker-a",
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(1);
+		expect((record.runs[0]!.worker as { urls: string[] }).urls).toEqual([
+			"http://worker-b:8787",
+		]);
+	});
+
+	test("every worker drained leaves the card queued and starts no run", async () => {
+		const { store, record, loop } = setup({
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			drainedRunner: () => true,
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)?.state).toBe("queued");
+	});
+
+	test("a local drain defers a merge turn but a worker turn still starts", async () => {
+		const { store, record, loop } = setup({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			drainedRunner: (id) => id === "local",
+		});
+		const merge = store.createTask("merge please");
+		store.updateTask(merge.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, merge.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(merge.id)?.state).toBe("queued");
+
+		const work = store.createTask("queued work");
+		await loop.runTurn(store.name, work.id);
+		expect(record.runs).toHaveLength(1);
+	});
+
+	test("a local drain defers the board check too", async () => {
+		const { store, record, loop } = setup({
+			drainedRunner: () => true,
+		});
+		const check = store.createTask(BOARD_CHECK_PROMPT);
+		store.setBoardCheckId(check.id);
+		await loop.runTurn(store.name, check.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(check.id)?.state).toBe("queued");
+	});
+
+	test("runnerTurns buckets live runs by worker hostname and counts preparing", async () => {
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				return {
+					pid: null,
+					// The fake worker dispatch records the target url the entry carries.
+					url: (o.worker as { urls: string[] }).urls[0]!,
+					done: Promise.withResolvers<RunResult>().promise,
+					kill: async () => {},
+				};
+			},
+		});
+		const work = store.createTask("queued work");
+		void loop.runTurn(store.name, work.id);
+		await flushPromises();
+		expect(loop.runnerTurns()).toEqual({
+			local: 0,
+			workers: { "worker-a": 1 },
+			preparing: 1,
+		});
 	});
 });

@@ -357,6 +357,8 @@ type RunEntry = {
 	/** When the progress's moving part (progressKey) last changed: the live activity the
 	 * silent-log warning reads beside the log mtime. Undefined until the first numbered status. */
 	progressAt?: number;
+	/** The dispatched worker's url; absent for a server-local run. runnerTurns() buckets by it. */
+	url?: string;
 };
 
 export interface TurnOps {
@@ -382,6 +384,8 @@ export interface TurnOps {
 	commitSubjects?: typeof commitSubjects;
 	/** True while an update holds new turns (POST /api/drain): running turns finish, nothing new starts. */
 	drained(): boolean;
+	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
+	drainedRunner(id: string): boolean;
 	publishSoon(): void;
 	notifyLog(project: string, id: string): void;
 	refreshRelease(e: TurnProject): Promise<void>;
@@ -637,6 +641,12 @@ export interface TurnLoop {
 		choices: unknown,
 	): Promise<FinishKeptOutcome>;
 	readonly running: Map<string, RunEntry>;
+	/** OTTR-454: live runs per runner (worker hostname buckets via entry.url, else local) plus the preparing count. */
+	runnerTurns(): {
+		local: number;
+		workers: Record<string, number>;
+		preparing: number;
+	};
 	/** Boot restart sweep: settle open rows left by a dead tracker process and requeue. */
 	recoverRestarted(): Promise<void>;
 }
@@ -1268,6 +1278,21 @@ export function createTurnLoop(
 		)
 			return;
 		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
+		// OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
+		// the card stays queued, and the next schedule tick retries. The board-wide gate
+		// (ops.drained() in schedule()) is unchanged; its board-check exception does not apply
+		// here — a "local" hold stops board checks too. Flags read before the claim: they are
+		// the same ones the worker decision below makes.
+		const preRetro = isRetro(task);
+		const preBoardCheck = store.boardCheckId() === id;
+		const target = ops.workerTarget ?? null;
+		const toWorker =
+			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+		const runnerDrained =
+			toWorker && target !== null
+				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
+				: ops.drainedRunner("local");
+		if (runnerDrained) return;
 		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
 		store.updateTask(id, {
 			state: "preparing",
@@ -1614,6 +1639,8 @@ export function createTurnLoop(
 			// read-only run — a per-run env channel for workers is the upgrade path.
 			// A board check stays here as well: only loopback in the server's own container reaches
 			// the whole board API, and the turns' host on a worker only files cards.
+			// OTTR-454: drop workers under a per-runner drain so the round-robin only
+			// sees live workers; the empty-list guard sits after stopBeforeRun below.
 			const worker =
 				retroCard || boardCheck || kind === "merge"
 					? null
@@ -1646,6 +1673,26 @@ export function createTurnLoop(
 					return;
 				store.updateTask(id, { state: "needs_you", needsReason: reason });
 			};
+			// The worker target with drained runners dropped; fail closed on an empty list
+			// (a drain landed while the turn prepared): park instead of dispatching to a
+			// drained worker or falling back to the server. A drain that lands after this
+			// point cannot strand the turn: the update script counts every live run on the
+			// runner (the entry's url) before it recreates.
+			const liveWorker =
+				worker === null
+					? null
+					: {
+							urls: worker.urls.filter(
+								(u) => !ops.drainedRunner(new URL(u).hostname),
+							),
+							token: worker.token,
+						};
+			if (liveWorker !== null && liveWorker.urls.length === 0) {
+				stopBeforeRun(
+					"Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
+				);
+				return;
+			}
 			if (worker !== null && execModel === null) {
 				stopBeforeRun(
 					"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
@@ -1720,7 +1767,7 @@ export function createTurnLoop(
 				resumeId: plan.resumeId,
 				model: runModel,
 				sessionName,
-				worker,
+				worker: liveWorker,
 				secrets: turnEnv.secrets,
 				// Retro flags: the retro.yml config sits next to the tracker extension, the
 				// skill is pinned, and the board env is stripped (the proposal files here).
@@ -3632,6 +3679,25 @@ export function createTurnLoop(
 		return { ok: true };
 	}
 
+	/** OTTR-454: live runs per runner for GET /api/drain. A worker turn's entry carries the
+	 * dispatched worker's url; a local run (merge, retro, board check, local spawn) has none. */
+	function runnerTurns(): {
+		local: number;
+		workers: Record<string, number>;
+		preparing: number;
+	} {
+		const workers: Record<string, number> = {};
+		let local = 0;
+		for (const entry of running.values()) {
+			if (entry.url === undefined) local++;
+			else {
+				const host = new URL(entry.url).hostname;
+				workers[host] = (workers[host] ?? 0) + 1;
+			}
+		}
+		return { local, workers, preparing: preparing.size };
+	}
+
 	return {
 		schedule,
 		runTurn,
@@ -3640,5 +3706,6 @@ export function createTurnLoop(
 		finishKept,
 		recoverRestarted,
 		running,
+		runnerTurns,
 	};
 }

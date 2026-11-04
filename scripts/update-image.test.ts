@@ -112,10 +112,18 @@ function fakes(
 		 *  POST /api/drain). */
 		hold?: number | number[];
 		/** Exit code of the hold's early end (a board older than DELETE /api/drain). */
-		free?: number;
+		free?: number | number[];
 		up?: number;
 		/** Output of a failing `up` (its error text). */
 		upOut?: string;
+		/** Exit code and output of `up -d --no-deps --wait <service>`, per service. */
+		upBy?: Record<string, { code?: number; out?: string }>;
+		/** The board's answers to GET /api/drain, in order; the last one repeats. Without
+		 *  them the board answers 404 (one version older) and the run keeps the legacy
+		 *  whole-board flow. */
+		gets?: string[];
+		/** Exit codes of the worker healthz probes in call order, the last one repeating. */
+		health?: number | number[];
 		/** Runs after each poll wait: work that lands in the checkout mid-hold. */
 		onWait?: () => void;
 	} = {},
@@ -130,8 +138,14 @@ function fakes(
 	const built: FakeRun["built"] = [];
 	const turns = typeof o.turns === "string" ? [o.turns] : (o.turns ?? ["0"]);
 	const holds = typeof o.hold === "number" ? [o.hold] : (o.hold ?? [0]);
+	const healths = typeof o.health === "number" ? [o.health] : (o.health ?? [0]);
+	const frees = typeof o.free === "number" ? [o.free] : (o.free ?? [0]);
+	const gets = o.gets;
 	let counted = 0;
 	let holdCalls = 0;
+	let getCalls = 0;
+	let healthCalls = 0;
+	let freeCalls = 0;
 	// A real epoch, not 0: the hold limit must measure the time since the hold, not the clock.
 	let clock = Date.UTC(2026, 9, 16);
 	const deps: Deps = {
@@ -142,6 +156,8 @@ function fakes(
 			const line = args.join(" ");
 			const drain = line.includes("/api/drain");
 			const free = drain && line.includes("'DELETE'");
+			const get = drain && !free && !line.includes("'POST'");
+			const health = line.includes("/healthz");
 			if (drain) drains.push(line);
 			if (args.includes("board-seed")) {
 				seedRuns.push(line);
@@ -173,7 +189,15 @@ function fakes(
 			calls.push(
 				line.replace(
 					/ -e .*/s,
-					free ? " -e <free>" : drain ? " -e <hold>" : " -e <count>",
+					free
+						? " -e <free>"
+						: get
+							? " -e <get>"
+							: drain
+								? " -e <hold>"
+								: health
+									? " -e <health>"
+									: " -e <count>",
 				),
 			);
 			if (args.includes("build")) {
@@ -262,10 +286,23 @@ function fakes(
 							: fresh,
 				};
 			}
-			if (free)
-				return o.free
-					? { code: o.free, out: "HTTP 404\n" }
-					: { code: 0, out: "" };
+			if (health) {
+				const code = healths[Math.min(healthCalls++, healths.length - 1)] ?? 0;
+				return code
+					? { code, out: "HTTP 500\n" }
+					: { code: 0, out: '{"ok":true}\n' };
+			}
+			if (get) {
+				// No answer at all is the mixed-version fallback: a board one version
+				// older has no GET /api/drain, and the run keeps the whole-board flow.
+				if (gets === undefined) return { code: 1, out: "HTTP 404\n" };
+				const g = gets[Math.min(getCalls++, gets.length - 1)] ?? "{}";
+				return { code: 0, out: `${g}\n` };
+			}
+			if (free) {
+				const code = frees[Math.min(freeCalls++, frees.length - 1)] ?? 0;
+				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
+			}
 			if (drain) {
 				const code = holds[Math.min(holdCalls++, holds.length - 1)] ?? 0;
 				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
@@ -275,13 +312,21 @@ function fakes(
 					code: 0,
 					out: turns[Math.min(counted++, turns.length - 1)] ?? "0",
 				};
-			if (args.includes("up"))
+			if (args.includes("up")) {
+				const svc = args.at(-1)!;
+				const by = o.upBy?.[svc];
+				if (by)
+					return {
+						code: by.code ?? 0,
+						out: by.out ?? (by.code ? `container ${svc} is unhealthy` : ""),
+					};
 				return args.at(-1) === o.sidecar?.name
 					? {
 							code: o.sidecarUp ?? 0,
 							out: o.sidecarUp ? "container sidecar exited (1)" : "",
 						}
 					: { code: o.up ?? 0, out: o.upOut ?? "" };
+			}
 			return { code: 0, out: "" };
 		},
 		log: (line) => logs.push(line),
@@ -342,6 +387,37 @@ const SIDE_COMPARE = [
 ];
 const UP = "compose -f c.yml up -d --wait";
 const PRUNE = "image prune --force --filter label=ottr.image=worker";
+const GET = "compose -f c.yml exec -T server bun -e <get>";
+const HEALTH = "compose -f c.yml exec -T server bun -e <health>";
+const RUNNING3 = "server\nworker-a\nworker-b";
+const UP_SVC = (s: string) => `compose -f c.yml up -d --no-deps --wait ${s}`;
+const RESTART = "compose -f c.yml restart server";
+const COMPARE_SVC = (s: string) => [
+	`compose -f c.yml ps -q ${s}`,
+	`inspect -f {{json .ImageManifestDescriptor}} ${s}`,
+	`compose -f c.yml images -q ${s}`,
+	`compose -f c.yml config --images ${s}`,
+	`image inspect -f {{.Id}} ottr-worker:local`,
+];
+/** A GET /api/drain answer: worker-a and worker-b turn counts, `preparing` total. */
+const st = (a: number, b: number, preparing = 0) =>
+	JSON.stringify({
+		drainUntil: null,
+		drainCommits: null,
+		preparing,
+		runners: [
+			{ id: "worker-a", url: "http://worker-a:8787", until: null, turns: a },
+			{ id: "worker-b", url: "http://worker-b:8787", until: null, turns: b },
+			{ id: "local", url: null, until: null, turns: 0 },
+		],
+	});
+/** The JSON body of the n-th POST to /api/drain, parsed out of the bun -e code. */
+function postBody(f: FakeRun, n: number): unknown {
+	const posts = f.drains.filter((l) => l.includes("'POST'"));
+	const m = /body: (".*?") \}\);/.exec(posts[n] ?? "");
+	expect(m).toBeTruthy();
+	return JSON.parse(JSON.parse(m![1]!));
+}
 
 /** What fakes hands back: the fake docker dep plus everything the tests assert on. */
 interface FakeRun {
@@ -362,8 +438,8 @@ interface FakeRun {
 
 /** The JSON body of the first hold's POST, parsed out of the embedded bun -e code. */
 function drainBody(f: FakeRun): unknown {
-	const first = f.drains[0] ?? "";
-	const m = first.match(/body: (".*?") \}\);/s);
+	const hold = f.drains.find((l) => l.includes("body: "));
+	const m = /body: (".*?") \}\);/.exec(hold ?? "");
 	expect(m).toBeTruthy();
 	return JSON.parse(JSON.parse(m![1]!));
 }
@@ -383,6 +459,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -424,7 +501,7 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run: the restart waits for a later run",
 		);
@@ -442,6 +519,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			SERVER,
 			MANIFEST,
 			CONFIG,
@@ -469,6 +547,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			SERVER,
 			MANIFEST,
 			CONFIG,
@@ -526,6 +605,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -541,7 +621,7 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ newImage: true, hold: 1, turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, HOLD, COUNT]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, HOLD, COUNT]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("the board cannot hold new turns: HTTP 404");
 		expect(log).toContain("2 turns run: the restart waits for a later run");
@@ -551,7 +631,9 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ imagesCode: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE]);
+		// The runner probe runs first; no board answers it (404), so the legacy flow
+		// compares the server and stops before any hold or restart.
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE]);
 		expect(f.logs.join("\n")).toContain("cannot be compared with the build");
 	}, 60_000);
 
@@ -591,7 +673,7 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ turns: "" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
 	}, 60_000);
 
 	test("a compose warning ahead of a two-digit count still holds the restart", async () => {
@@ -602,7 +684,7 @@ describe("updateImage", () => {
 				"WARN[0000] Found orphan containers ([ottr-old-1]) for this project.\n10\n",
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
 		expect(f.logs.join("\n")).toContain("10 turns run");
 	}, 60_000);
 
@@ -620,7 +702,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ up: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT, UP]);
 		expect(f.logs.join("\n")).toContain("up --wait failed");
 		expect(f.logs.join("\n")).not.toContain("the stack runs main");
 	}, 60_000);
@@ -643,6 +725,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -653,7 +736,8 @@ describe("updateImage", () => {
 		]);
 		expect(drainBody(f)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
 		// The list is computed once: both renewals embed the same body.
-		expect(f.drains[1]).toBe(f.drains[0]);
+		const posts = f.drains.filter((l) => l.includes("'POST'"));
+		expect(posts[1]).toBe(posts[0]);
 	}, 60_000);
 
 	test("no new commits sends an empty list, and the hold still works", async () => {
@@ -711,7 +795,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ newImage: true, turns: ["1", "0"] });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		const hold = f.drains[0] ?? "";
+		const hold = f.drains.find((l) => l.includes("'POST'")) ?? "";
 		// The board is reached on its own container port only, and a refused hold must
 		// end the wait instead of idling the board until the hold lapses.
 		expect(hold).toContain("'http://127.0.0.1:' + process.env.PORT");
@@ -751,6 +835,7 @@ describe("updateImage", () => {
 			...SIDE_COMPARE,
 			SIDE_UP,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -795,6 +880,7 @@ describe("updateImage", () => {
 			SIDE_BUILD,
 			...SIDE_COMPARE,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -838,6 +924,7 @@ describe("updateImage", () => {
 			...SIDE_COMPARE,
 			SIDE_UP,
 			PS,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -858,7 +945,16 @@ describe("updateImage", () => {
 		expect(f.logs.join("\n")).toContain(
 			"skipping sidecar: git fetch origin main failed in",
 		);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
 	}, 60_000);
 
 	test("a failed restart of the service logs docker's text, and the server deploy goes on", async () => {
@@ -891,6 +987,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -910,6 +1007,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -924,6 +1022,7 @@ describe("updateImage", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -954,6 +1053,7 @@ describe("updateImage", () => {
 			SIDE_BUILD,
 			...SIDE_COMPARE,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -994,6 +1094,7 @@ describe("updateImage", () => {
 			CFGJSON,
 			SIDE_BUILD,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -1040,6 +1141,7 @@ describe("updateImage", () => {
 			SIDE_BUILD,
 			...SIDE_COMPARE,
 			PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -1055,6 +1157,481 @@ describe("updateImage", () => {
 	//   the sentinel is never a valid revision, so the range fails either way.
 	// - `.trim()` dropped: git strips a subject's outer whitespace itself, so %s never
 	//   prints a padded line for the trim to matter; the /api/drain route re-trims anyway.
+});
+
+describe("rolling restart", () => {
+	/** Runs a bun -e script with PORT on a local fake board: its exit code and stdout. */
+	async function runOnBoard(
+		script: string,
+		board: (req: Request) => Response,
+	): Promise<{ code: number; out: string }> {
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: board });
+		try {
+			// A healthz probe names the worker's own url; point it at the fake board.
+			const src = script.replace(
+				"http://worker-a:8787",
+				`http://127.0.0.1:${server.port}`,
+			);
+			const p = Bun.spawn([process.execPath, "-e", src], {
+				env: { ...process.env, PORT: String(server.port) },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [out, code] = await Promise.all([
+				new Response(p.stdout).text(),
+				p.exited,
+			]);
+			return { code, out: out.trim() };
+		} finally {
+			server.stop(true);
+		}
+	}
+
+	test("the roll drains, recreates, probes and releases one worker at a time, and the server rolls last", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// worker-a runs one turn at probe time; it drains over one poll.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0), st(0, 0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			GET,
+			// The wait renews the runner hold: one POST holds 30 min, the wait may
+			// reach 1 h, and a lapsed hold would take turns again before the recreate.
+			HOLD,
+			UP_SVC("worker-a"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("worker-b"),
+			HOLD,
+			UP_SVC("worker-b"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("server"),
+			HOLD,
+			COUNT,
+			UP_SVC("server"),
+			UP,
+			PRUNE,
+		]);
+		// Each hold names only its own runner, and the renewal re-holds worker-a;
+		// the server step holds the whole board with the commit subjects.
+		expect(postBody(f, 0)).toEqual({ runner: "worker-a" });
+		expect(postBody(f, 1)).toEqual({ runner: "worker-a" });
+		expect(postBody(f, 2)).toEqual({ runner: "worker-b" });
+		expect(postBody(f, 3)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+	}, 60_000);
+
+	test("a stuck runner is released, the roll goes on, and the server step waits for a later run", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const unrecorded = "0".repeat(40);
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// 120 polls of 30 s fill worker-a's hour; then the runner is released.
+		expect(f.waits).toHaveLength(120);
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(RESTART);
+		// The roll still finishes the idle worker. The whole-stack up must not run: it
+		// would recreate the stuck worker and the server, and that kills the stuck turn.
+		expect(f.calls).toContain(UP_SVC("worker-b"));
+		expect(f.calls).not.toContain(UP);
+		expect(f.calls.slice(-2)).toEqual([FREE, PRUNE]);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+		expect(f.logs.join("\n")).toContain(
+			"the server restart waits for a later run",
+		);
+		// The stuck runner is undrained, and the seed record waits for the restart.
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a refused renewal ends the wait: the runner is released and the roll stops", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0)], // worker-a keeps its turn at every read
+			hold: [0, 1], // the initial hold is accepted, the renewal is refused
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		// The refused renewal ends worker-a's wait at the first poll, not at the hour;
+		// a lapsed hold would let the worker take turns again before its recreate.
+		expect(f.waits).toHaveLength(1);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.logs.join("\n")).toContain(
+			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+	}, 60_000);
+
+	test("a failed recreate of a worker stops the roll, and no other container gets a call", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			upBy: { "worker-a": { code: 1, out: "container worker-a exited (1)" } },
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			UP_SVC("worker-a"),
+		]);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: docker compose up --wait worker-a failed: container worker-a exited (1)",
+		);
+		// The failed worker keeps no hold (it lapses on its own), and no undrain ran.
+		expect(f.drains.some((l) => l.includes("'DELETE'"))).toBe(false);
+	}, 60_000);
+
+	test("a worker that never answers its healthz stops the roll like a failed health check", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			health: 1,
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		// 10 waits of 30 s fill the 5 min connected limit; the 11th probe stops the run.
+		expect(f.waits).toHaveLength(10);
+		expect(f.calls.slice(-11)).toEqual(Array(11).fill(HEALTH));
+		expect(f.calls).not.toContain(UP);
+		expect(f.calls).not.toContain(UP_SVC("worker-b"));
+		expect(f.logs.join("\n")).toContain(
+			"stopped: worker-a never answers http://worker-a:8787/healthz: HTTP 500",
+		);
+		expect(f.drains.some((l) => l.includes("'DELETE'"))).toBe(false);
+	}, 60_000);
+
+	test("a board one version older keeps the whole-board flow", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({ newImage: true, turns: ["1", "0"] }); // GET /api/drain answers 404
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The probe ran, but no runner hold: the whole-board flow holds and restarts all.
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			HOLD,
+			COUNT,
+			HOLD,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
+		expect(postBody(f, 0)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
+	}, 60_000);
+
+	test("a worker hostname no runner lists recreates without a hold", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const onlyA = JSON.stringify({
+			drainUntil: null,
+			drainCommits: null,
+			preparing: 0,
+			runners: [
+				{
+					id: "worker-a",
+					url: "http://worker-a:8787",
+					until: null,
+					turns: 0,
+				},
+			],
+		});
+		const f = fakes({ newImage: true, running: RUNNING3, gets: [onlyA] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			UP_SVC("worker-a"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			...COMPARE_SVC("server"),
+			HOLD,
+			COUNT,
+			UP_SVC("server"),
+			UP,
+			PRUNE,
+		]);
+		expect(f.logs.join("\n")).toContain(
+			"worker-b is no runner on the board: it recreates without a hold",
+		);
+		expect(f.drains.join("\n")).not.toContain("worker-b");
+	}, 60_000);
+
+	test("unchanged worker images roll nothing", async () => {
+		const { main } = checkout();
+		const f = fakes({ running: RUNNING3, gets: [st(0, 0)] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			...COMPARE_SVC("worker-b"),
+			...COMPARE_SVC("server"),
+			UP,
+			PRUNE,
+		]);
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+	}, 60_000);
+
+	test("a fresh seed with unchanged images restarts only the server after the workers", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const unrecorded = "0".repeat(40);
+		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		const f = fakes({
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
+			"compose -f c.yml ps -q alate",
+			"inspect -f {{.Config.Image}} alate123",
+			seedRun,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			...COMPARE_SVC("worker-b"),
+			...COMPARE_SVC("server"),
+			HOLD,
+			COUNT,
+			RESTART,
+			UP,
+			write,
+			PRUNE,
+		]);
+		expect(postBody(f, 0)).toEqual({
+			commits: [`board agent layer seed ${head.slice(0, 12)}`],
+		});
+		expect(f.seedWrites).toEqual([write]);
+	}, 60_000);
+
+	test("a preparing turn holds every runner idle until it starts", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// preparing is not attributable to one runner: the roll waits one poll for it.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0, 1), st(0, 0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toContain(GET);
+		expect(f.waits).toHaveLength(1);
+		expect(f.calls).toContain(UP_SVC("worker-a"));
+	}, 60_000);
+
+	test("a refused runner hold stops the roll before that worker rolls", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			hold: [0, 1], // worker-a's hold is accepted, worker-b's is refused
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			UP_SVC("worker-a"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("worker-b"),
+			HOLD,
+		]);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board cannot hold worker-b: HTTP 404",
+		);
+	}, 60_000);
+
+	test("a failed undrain after a successful roll logs and the run goes on", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			free: [0, 1], // worker-a releases, worker-b's undrain fails
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"the board cannot end worker-b's hold (HTTP 404): it lapses 30 min after the last renewal",
+		);
+		// The failed undrain does not stop the roll: the server still rolls last.
+		expect(f.calls).toContain(UP_SVC("server"));
+	}, 60_000);
+
+	test("a runner state that cannot be read mid-hold stops the roll", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({ newImage: true, running: RUNNING3, gets: [st(1, 0)] });
+		let gets = 0;
+		const docker: Deps["docker"] = async (...a) => {
+			const line = a.join(" ");
+			if (line.includes("'/api/drain'") && !line.includes("method")) {
+				if (++gets === 2) return { code: 1, out: "HTTP 500\n" };
+			}
+			return f.deps.docker(...a);
+		};
+		expect(
+			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: the board's runners cannot be read: the hold on worker-a lapses 30 min after the last renewal",
+		);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+	}, 60_000);
+
+	test("a stuck runner the board cannot release leaves the hold to lapse", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			free: 1,
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a keeps a turn after 60 min, and the board cannot end its hold (HTTP 404): it lapses 30 min after the last renewal",
+		);
+		expect(f.calls).not.toContain(UP_SVC("server"));
+	}, 60_000);
+
+	test("the runner scripts read, hold, probe and release from the server, with its own origin", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0), st(0, 0)],
+		});
+		const scripts = new Set<string>();
+		const docker: Deps["docker"] = (...a) => {
+			if (a.at(-2) === "-e") scripts.add(a.at(-1)!);
+			return f.deps.docker(...a);
+		};
+		expect(
+			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
+		).toBe(0);
+		const byKind = (kind: (s: string) => boolean): string[] =>
+			[...scripts].filter(kind);
+		const get = byKind(
+			(s) => s.includes("'/api/drain'") && !s.includes("method"),
+		)[0]!;
+		const hold = byKind(
+			(s) => s.includes("worker-a") && s.includes("'POST'"),
+		)[0]!;
+		const free = byKind((s) => s.includes("'DELETE'"))[0]!;
+		const health = byKind((s) => s.includes("/healthz"))[0]!;
+		const seen: string[] = [];
+		const probe = await runOnBoard(health, (req) => {
+			seen.push(req.url);
+			return new Response("ok"); // the real worker answers /healthz with plain ok
+		});
+		expect(seen[0]).toEndWith("/healthz");
+		// The probe prints nothing on success; a non-ok answer prints the HTTP status.
+		expect(probe).toEqual({ code: 0, out: "" });
+		const read = await runOnBoard(
+			get,
+			() => new Response(JSON.stringify({ preparing: 0, runners: [] })),
+		);
+		expect(read).toEqual({
+			code: 0,
+			out: JSON.stringify({ preparing: 0, runners: [] }),
+		});
+		expect(
+			await runOnBoard(get, () => new Response("", { status: 404 })),
+		).toEqual({ code: 1, out: "HTTP 404" });
+		const held: string[] = [];
+		const holdRes = await runOnBoard(hold, (req) => {
+			held.push(
+				`${req.method} ${new URL(req.url).pathname} ${req.headers.get("origin")}`,
+			);
+			return Response.json({ until: 1 });
+		});
+		// The hold and free scripts print nothing on success; a non-ok answer prints
+		// the HTTP status, and the run fails closed on it.
+		expect(holdRes).toEqual({ code: 0, out: "" });
+		expect(held[0]).toMatch(/^POST \/api\/drain http:\/\/127\.0\.0\.1:\d+$/);
+		expect(hold).toContain("worker-a");
+		const freed: string[] = [];
+		const freeRes = await runOnBoard(free, (req) => {
+			const u = new URL(req.url);
+			freed.push(
+				`${req.method} ${u.pathname}${u.search} ${req.headers.get("origin")}`,
+			);
+			return Response.json({ until: null });
+		});
+		expect(freed[0]).toMatch(
+			/^DELETE \/api\/drain\?runner=worker-a http:\/\/127\.0\.0\.1:\d+$/,
+		);
+		expect(freeRes).toEqual({ code: 0, out: "" });
+	}, 60_000);
 });
 
 describe("arch-review survivor kills", () => {
@@ -1077,6 +1654,7 @@ describe("arch-review survivor kills", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			SERVER,
 			MANIFEST,
 			"compose -f c.yml images -q server",
@@ -1137,6 +1715,7 @@ describe("board seed", () => {
 			ALATE_PS,
 			ALATE_INSPECT,
 			seedRun,
+			GET,
 			...COMPARE,
 			HOLD,
 			COUNT,
@@ -1174,6 +1753,7 @@ describe("board seed", () => {
 			CFGJSON,
 			PS,
 			DATA_READ,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -1245,6 +1825,7 @@ describe("board seed", () => {
 			DATA_READ,
 			ALATE_PS,
 			DOCKER_PS,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -1352,7 +1933,16 @@ describe("board seed", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps, {})).toBe(0);
 		expect(f.seedRuns).toEqual([]);
 		expect(f.seedWrites).toEqual([]);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
 		expect(f.logs.join("\n")).toContain(
 			"no ALATE_DATA or ALATE_DATA_REPO in the environment",
 		);
@@ -1375,6 +1965,7 @@ describe("board seed", () => {
 			CFGJSON,
 			PS,
 			DATA_READ,
+			GET,
 			...COMPARE,
 			COUNT,
 			UP,
@@ -1514,6 +2105,7 @@ describe("board seed", () => {
 				BUILD,
 				CFGJSON,
 				PS,
+				GET,
 				...COMPARE,
 				COUNT,
 				UP,
@@ -1717,7 +2309,7 @@ describe("envFileValues", () => {
 });
 
 describe("helpers survivor kills", () => {
-	/** The bun -e scripts a hold that lapses after 1 h runs in the server: hold, count, free. */
+	/** The bun -e scripts a legacy run (probe, hold, count, free) runs in the server. */
 	async function boardScripts(): Promise<string[]> {
 		const { main } = checkout();
 		const f = fakes({ newImage: true, turns: "1" });
@@ -1756,8 +2348,8 @@ describe("helpers survivor kills", () => {
 
 	test("the board scripts count running turns and end the hold from the board's own origin", async () => {
 		const scripts = await boardScripts();
-		expect(scripts).toHaveLength(3);
-		const [, count, free] = scripts as [string, string, string];
+		expect(scripts).toHaveLength(4);
+		const [, , count, free] = scripts as [string, string, string, string];
 		const state = {
 			tasks: ["running", "preparing", "done", "queued"].map((state) => ({
 				state,
@@ -1811,14 +2403,32 @@ describe("helpers survivor kills", () => {
 		const { main } = checkout();
 		const f = fakes({ turns: "WARN[0000] a warning\n 0\n" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
 	}, 60_000);
 
 	test("a manifest descriptor without a digest compares the image ids", async () => {
 		const { main } = checkout();
 		const f = fakes({ manifest: { runs: "", built: "sha256:m" } });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			UP,
+			PRUNE,
+		]);
 	}, 60_000);
 
 	test("a server ps -q that fails reads no manifest and compares the image ids", async () => {
@@ -1835,6 +2445,7 @@ describe("helpers survivor kills", () => {
 			BUILD,
 			CFGJSON,
 			PS,
+			GET,
 			...COMPARE.slice(2),
 			COUNT,
 			UP,
@@ -2187,13 +2798,14 @@ describe("sidecar and seed survivor kills", () => {
 		}
 		return seen;
 	}
-	const NO_SIDECAR = [BUILD, CFGJSON, PS, ...COMPARE, COUNT, UP, PRUNE];
+	const NO_SIDECAR = [BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT, UP, PRUNE];
 	const WITH_SIDECAR = [
 		BUILD,
 		CFGJSON,
 		SIDE_BUILD,
 		...SIDE_COMPARE,
 		PS,
+		GET,
 		...COMPARE,
 		COUNT,
 		UP,
@@ -2504,6 +3116,7 @@ describe("sidecar and seed survivor kills", () => {
 						ALATE_PS,
 						DOCKER_PS,
 						seedRun,
+						GET,
 						...COMPARE,
 						HOLD,
 						COUNT,

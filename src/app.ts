@@ -373,6 +373,14 @@ interface AppDeps {
 	listProcesses?: () => ProcessInfo[];
 	/** Orphan stop seam; injectable for tests. Defaults to platform.killTree. */
 	killTree?: (pid: number) => void;
+	/** OTTR-454: every runner (worker hostnames from OTTR_WORKER_URLS, then local); absent = only local. */
+	runners?: { id: string; url: string | null }[];
+	/** OTTR-454: live runs per runner plus the preparing count, from the turn loop; absent counts zero. */
+	runnerTurns?: () => {
+		local: number;
+		workers: Record<string, number>;
+		preparing: number;
+	};
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -2123,6 +2131,9 @@ export function createApp(deps: AppDeps) {
 	let drainUntil = 0;
 	/** Sanitized commit subjects the pending update brings; valid only while drainUntil holds. */
 	let drainCommits: string[] = [];
+	/** OTTR-454 per-runner holds (worker hostname or "local") from POST /api/drain {runner};
+	 * in-memory like drainUntil, no commit subjects, never shown in the notice bar. */
+	const runnerDrains = new Map<string, number>();
 
 	function stateResponse(): StateResponse {
 		const tasks: TaskCard[] = [];
@@ -4246,11 +4257,54 @@ export function createApp(deps: AppDeps) {
 		},
 		// The update script holds new turns here while a new image waits, so the running turns
 		// finish and the restart finds the board idle (docs/WORKERS.md, "Updates").
+		// OTTR-454 adds per-runner holds on the same route: the script rolls one runner at a
+		// time and the others keep working. A per-runner hold never touches the board-wide
+		// state or the notice bar.
 		"/api/drain": {
+			GET: (req) =>
+				api(req, async () => {
+					const turns = deps.runnerTurns?.() ?? {
+						local: 0,
+						workers: {},
+						preparing: 0,
+					};
+					const now = Date.now();
+					return json({
+						drainUntil: drainUntil > now ? drainUntil : null,
+						drainCommits: drainUntil > now ? drainCommits : null,
+						preparing: turns.preparing,
+						runners: (deps.runners ?? [{ id: "local", url: null }]).map(
+							(r) => ({
+								id: r.id,
+								url: r.url,
+								until:
+									(runnerDrains.get(r.id) ?? 0) > now
+										? runnerDrains.get(r.id)!
+										: null,
+								turns:
+									r.id === "local" ? turns.local : (turns.workers[r.id] ?? 0),
+							}),
+						),
+					});
+				}),
 			POST: (req) =>
 				api(req, async () => {
 					const r = await readJson(req);
 					if ("error" in r) return r.error;
+					// A per-runner hold: validate the id and hold only that runner; the
+					// board-wide state stays untouched.
+					if (r.body.runner !== undefined) {
+						const runner = r.body.runner;
+						if (typeof runner !== "string")
+							return json({ error: "runner must be a string" }, 400);
+						const known = (deps.runners ?? [{ id: "local", url: null }]).some(
+							(x) => x.id === runner,
+						);
+						if (!known) return json({ error: `unknown runner ${runner}` }, 400);
+						const until = Date.now() + DRAIN_MS;
+						runnerDrains.set(runner, until);
+						return json({ until });
+					}
 					// The update script ships the pending commit subjects; untrusted input, so
 					// sanitize like the settings routes before anything reads them back.
 					if (r.body.commits !== undefined) {
@@ -4276,6 +4330,13 @@ export function createApp(deps: AppDeps) {
 				}),
 			DELETE: (req) =>
 				api(req, async () => {
+					// OTTR-454: ?runner=<id> clears that runner's hold only; without it,
+					// today's board-wide clear.
+					const runner = new URL(req.url).searchParams.get("runner");
+					if (runner !== null) {
+						runnerDrains.delete(runner);
+						return json({ until: null });
+					}
 					drainUntil = 0;
 					drainCommits = [];
 					return json({ drainUntil: null });
@@ -6468,6 +6529,8 @@ export function createApp(deps: AppDeps) {
 				envToken: process.env.GH_TOKEN ?? null,
 				githubHost: githubHost().host,
 			}),
+		// OTTR-454: a per-runner hold gates new turns on one runner only.
+		drainedRunner: (id: string) => Date.now() < (runnerDrains.get(id) ?? 0),
 		socketCount: () => sockets,
 		sampleStats,
 		alateProvisionTick,
