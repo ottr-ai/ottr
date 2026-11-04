@@ -422,8 +422,24 @@ export function createSupervisor(
 					.catch(() => false),
 			};
 		} else {
+			// A failed rev-list must not read as 0: classify would call the parked card done and
+			// its commits would never merge. Same fail-closed direction as hygienePass: unknown
+			// count = no proof, so leave the card parked.
+			const ahead = await ops.commitsAhead(wt, t.base).catch(() => null);
+			if (ahead === null) {
+				const key = `${e.name}/${t.id}`;
+				if (!reclassifyLogged.has(key)) {
+					reclassifyLogged.add(key);
+					ops.appendLog(
+						e.store,
+						t.id,
+						"supervisor: reclassify skipped — git rev-list failed; card left parked",
+					);
+				}
+				return;
+			}
 			facts = {
-				commitsAhead: await ops.commitsAhead(wt, t.base).catch(() => 0),
+				commitsAhead: ahead,
 				clean: await ops.isClean(wt).catch(() => false),
 				integrated: await ops.isIntegrated(wt, e.target).catch(() => false),
 			};
@@ -499,6 +515,9 @@ export function createSupervisor(
 	 * it checks worktreeLinked, statusRows and commitsAhead BEFORE moving any file — and only
 	 * then quarantines the untracked rest and removes the worktree.
 	 */
+	// Same log-once pattern as hygieneLogged: a persistent rev-list failure parks the card
+	// every tick, so the card's log names the skip once instead of every 60 s.
+	const reclassifyLogged = new Set<string>();
 	const hygieneLogged = new Set<string>();
 	async function hygienePass(e: SupervisorEntry, t: Task): Promise<void> {
 		if (

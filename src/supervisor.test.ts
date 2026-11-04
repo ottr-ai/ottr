@@ -662,6 +662,28 @@ describe("stale needs_you re-classification", () => {
 		store.close();
 	});
 
+	test("a failing commitsAhead leaves the parked answered card untouched", async () => {
+		const reason =
+			"Reported answered, but the branch has 1 commit(s) that were never integrated.";
+		const { store, t } = staleCard("re-revlist", {
+			needsReason: reason,
+			outcome: "answered",
+		});
+		const ops = fakeOps({ integratedNow: true });
+		ops.commitsAhead = async () => {
+			throw new Error("git rev-list failed: fatal: bad revision aaaabbbb");
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).not.toBe("done");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(reason);
+		expect(ops.calls.scheduled).toBe(0);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("supervisor: reclassify skipped");
+		store.close();
+	});
+
 	test("a work integrated report stays parked: only a merge turn may land", async () => {
 		const { store, t } = staleCard("re-unlinked", {
 			needsReason: "Reported integrated, but HEAD is not on main.",
