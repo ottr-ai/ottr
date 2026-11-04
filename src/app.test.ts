@@ -4462,19 +4462,28 @@ describe("project settings validation", () => {
 		expect(await errorOf(wrongType)).toBe(
 			"targetBranch must be a string or null",
 		);
-		const ok = await post("/api/projects/p1/settings", {
+		// The accepted saves run the route's resolve pre-check, so they need a real
+		// repo whose origin holds the branch (p1's folder has no git at all).
+		const dir = join(root, "target-shape-proj");
+		const add = await post("/api/projects", { name: "target-shape-proj" });
+		expect(add.status).toBe(200);
+		const pe = projects.get("target-shape-proj")!;
+		execSync("git update-ref refs/remotes/origin/develop HEAD", { cwd: dir });
+		const ok = await post("/api/projects/target-shape-proj/settings", {
 			targetBranch: "  develop  ",
 		});
 		expect(ok.status).toBe(200);
-		expect(store.getSettings().targetBranch).toBe("develop");
+		expect(pe.store.getSettings().targetBranch).toBe("develop");
 		// A patch without targetBranch leaves the stored value untouched.
-		await post("/api/projects/p1/settings", { maxImages: 3 });
-		expect(store.getSettings().targetBranch).toBe("develop");
-		const clear = await post("/api/projects/p1/settings", {
+		await post("/api/projects/target-shape-proj/settings", { maxImages: 3 });
+		expect(pe.store.getSettings().targetBranch).toBe("develop");
+		const clear = await post("/api/projects/target-shape-proj/settings", {
 			targetBranch: "",
 		});
 		expect(clear.status).toBe(200);
-		expect(store.getSettings().targetBranch).toBeNull();
+		expect(pe.store.getSettings().targetBranch).toBeNull();
+		projects.delete("target-shape-proj");
+		pe.store.close();
 	});
 
 	test("saving targetBranch moves the board target at once", async () => {
@@ -4510,6 +4519,32 @@ describe("project settings validation", () => {
 		expect(other2.status).toBe(200);
 		expect(e.target).toBe("origin/feature");
 		projects.delete("target-save-proj");
+		e.store.close();
+	});
+
+	test("saving an unresolvable targetBranch returns 409 and keeps the old target", async () => {
+		const dir = join(root, "target-bad-proj");
+		const add = await post("/api/projects", { name: "target-bad-proj" });
+		expect(add.status).toBe(200);
+		const e = projects.get("target-bad-proj")!;
+		e.target = "origin/main";
+		const res = await post("/api/projects/target-bad-proj/settings", {
+			targetBranch: "nope",
+		});
+		// The branch does not exist on origin: the save is refused whole, with the
+		// resolve error naming the typo, and nothing about the board changes.
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("cannot resolve origin/nope");
+		expect(e.store.getSettings().targetBranch).toBeNull();
+		expect(e.target).toBe("origin/main");
+		// A resolvable branch still saves normally afterwards.
+		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		const ok = await post("/api/projects/target-bad-proj/settings", {
+			targetBranch: "feature",
+		});
+		expect(ok.status).toBe(200);
+		expect(e.target).toBe("origin/feature");
+		projects.delete("target-bad-proj");
 		e.store.close();
 	});
 });

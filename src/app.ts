@@ -2938,7 +2938,8 @@ export function createApp(deps: AppDeps) {
 				)
 			).target;
 		} catch {
-			// unresolved target stays null
+			// The target is unknowable now: report none, never a stale one.
+			e.target = null;
 		}
 		e.github = await githubUrl(e.path).catch(() => null);
 		e.remote = await remoteUrl(e.path).catch(() => null);
@@ -4624,10 +4625,20 @@ export function createApp(deps: AppDeps) {
 							? (e.store.getSettings().retroSince ?? Date.now())
 							: null;
 					}
-					e.store.setSettings(patch);
 					// A new targetBranch must move e.target at once: the board, the supervisor,
 					// the diffs and the gates read it until the next turn. A save that does not
-					// touch the target leaves it alone.
+					// touch the target leaves it alone. The save proves the branch resolves
+					// before it lands: an unresolvable one is a 409 with the resolve error and
+					// nothing is applied, so the board never reports the old target under the
+					// new setting.
+					if (patch.targetBranch !== undefined) {
+						try {
+							await resolveTarget(e.path, false, null, patch.targetBranch);
+						} catch (err) {
+							return json({ error: errmsg(err) }, 409);
+						}
+					}
+					e.store.setSettings(patch);
 					if (patch.targetBranch !== undefined) await refreshRemote(e);
 					return json(projectView(e));
 				}),
