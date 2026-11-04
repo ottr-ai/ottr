@@ -5885,7 +5885,7 @@ function ProjectSub({ project }: { project: ProjectView }) {
 }
 
 /** One ask question: single-choice presets answer in one click; multi questions collect
- * checkbox picks plus typed text and answer with one comma list. */
+ * checkbox picks plus an "Other" pick or typed text and answer with one comma list. */
 export function AskBlock({
 	q,
 	name,
@@ -5908,14 +5908,27 @@ export function AskBlock({
 	onOpenDiff: (files: string[]) => void;
 	onAnswer: (text: string) => void;
 }) {
-	const [custom, setCustom] = useState("");
 	const customRef = useRef<HTMLInputElement>(null);
 	const multi = q.multi;
 	// Multi picks accumulate in the block; a saved answer (draft or sent) re-checks its
 	// presets on remount. ponytail: the join is ", ", so a label containing ", " would
 	// split wrong on reload — rename the separator if labels ever carry commas.
+	const savedParts = selected === null ? [] : selected.split(", ");
 	const [picked, setPicked] = useState<string[]>(() =>
-		selected === null ? [] : selected.split(", "),
+		savedParts.filter((l) => q.options.some((o) => o.label === l)),
+	);
+	// The "Other" checkbox is a real pick: a recorded bare "Other" part re-checks it on
+	// remount (guarded against a preset literally labeled Other), and the non-preset text
+	// re-fills the field — the input is the only place the custom answer part stays visible.
+	const [customOn, setCustomOn] = useState(
+		() =>
+			!q.options.some((o) => o.label === "Other") &&
+			savedParts.includes("Other"),
+	);
+	const [custom, setCustom] = useState(() =>
+		savedParts
+			.filter((l) => !q.options.some((o) => o.label === l) && l !== "Other")
+			.join(", "),
 	);
 	const togglePick = (label: string): void =>
 		setPicked((p) =>
@@ -5930,14 +5943,19 @@ export function AskBlock({
 		onAnswer(text);
 		if (preset) setCustom("");
 	};
-	// Multi answer = the checked presets plus typed text, sent as one comma list.
-	const multiTotal = picked.length + (custom.trim() === "" ? 0 : 1);
+	// Multi answer = the checked presets plus the "Other" row (typed text, or the bare
+	// pick when the field stays empty), sent as one comma list.
+	const customJoined = customOn || custom.trim() !== "";
+	const multiTotal = picked.length + (customJoined ? 1 : 0);
 	const submitMulti = (): void => {
 		const v = custom.trim();
-		const parts = v === "" ? picked : [...picked, v];
+		const parts = [...picked];
+		if (v !== "") parts.push(v);
+		else if (customOn) parts.push("Other");
 		if (parts.length !== 0) {
 			onAnswer(parts.join(", "));
-			setCustom("");
+			// The typed text stays in the input: that input is the only place the recorded
+			// custom answer is visible (each preset shows as a check instead).
 		}
 	};
 	return (
@@ -6032,16 +6050,25 @@ export function AskBlock({
 			>
 				{/* Single: same radio group as the presets; saving a typed answer checks it. Clicking
 				    the radio moves focus to the text field instead of checking a pick that was never
-				    saved. Multi: the checkbox just mirrors "typed text joins the answer"; clicking it
-				    also focuses the field. The ref lives on the text input, so the focus lands where
+				    saved. Multi: the checkbox is a real pick — it joins the answer as "Other" even
+				    when the field stays empty, and typed text checks it on its own. Turning it on
+				    focuses the field; the ref lives on the text input, so the focus lands where
 				    typing goes. */}
 				<input
 					type={multi ? "checkbox" : "radio"}
 					name={name}
-					checked={multi ? custom.trim() !== "" : customChosen}
+					checked={multi ? customJoined : customChosen}
 					disabled={busy}
 					aria-label="Other"
-					onChange={() => customRef.current?.focus()}
+					onChange={() => {
+						if (!multi) {
+							customRef.current?.focus();
+							return;
+						}
+						const next = !customOn;
+						setCustomOn(next);
+						if (next) customRef.current?.focus();
+					}}
 				/>
 				<input
 					ref={customRef}

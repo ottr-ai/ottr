@@ -1133,6 +1133,184 @@ describe("AskBlock", () => {
 		expect(html).toContain('type="radio"');
 		expect(html).not.toContain('type="checkbox"');
 	});
+
+	test("a saved multi answer's custom part re-fills the Other field on remount", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock {...base} q={multiQ} answered selected="A, handwritten note" />,
+		);
+		// The preset and the Other row both count; the typed part is back in the field.
+		expect(html.split('checked=""').length - 1).toBe(2);
+		expect(html).toContain('value="handwritten note"');
+		expect(html).toContain("(2)");
+	});
+
+	test("a saved bare Other pick re-checks the Other row with an empty field", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock {...base} q={multiQ} answered selected="A, Other" />,
+		);
+		expect(html.split('checked=""').length - 1).toBe(2);
+		expect(html).toContain('value=""');
+		expect(html).toContain("(2)");
+	});
+});
+
+describe("AskBlock multi answers", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// ProjectBoard search delay tests below: installed after app.tsx's import
+	// (its browser mount guard reads document at module load), removed after.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const multiQ = {
+		question: "Pick several",
+		options: [{ label: "A", description: "first" }, { label: "B" }],
+		multi: true,
+		recommended: null,
+	};
+
+	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
+	const submitEvent = (): Event =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		}) as unknown as Event;
+
+	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	/** The production onChange React rendered onto the node; happy-dom's dispatched
+	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	/** One mounted multi AskBlock; every onAnswer text lands in `answers`. */
+	async function mountAsk(): Promise<{
+		container: HTMLDivElement;
+		answers: string[];
+		form: HTMLFormElement;
+		text: HTMLInputElement;
+		other: HTMLInputElement;
+		button: HTMLButtonElement;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const answers: string[] = [];
+		function Block() {
+			return (
+				<AskBlock
+					q={multiQ}
+					name="ask-0"
+					answered={false}
+					selected={null}
+					busy={false}
+					changed={[]}
+					onOpenDiff={() => {}}
+					onAnswer={(t: string) => {
+						answers.push(t);
+					}}
+				/>
+			);
+		}
+		await act(async () => {
+			root.render(<Block />);
+		});
+		const inputs = [
+			...container.querySelectorAll("input"),
+		] as unknown as HTMLInputElement[];
+		const text = inputs.find((i) => i.type === "text");
+		const checkboxes = inputs.filter((i) => i.type === "checkbox");
+		const other = checkboxes[checkboxes.length - 1];
+		const form = container.querySelector("form") as unknown as HTMLFormElement;
+		const button = container.querySelector(
+			"button",
+		) as unknown as HTMLButtonElement;
+		if (
+			text === undefined ||
+			other === undefined ||
+			form === null ||
+			button === null
+		)
+			throw new Error("ask block did not render its controls");
+		return { container, answers, form, text, other, button };
+	}
+
+	test("clicking the Other checkbox answers even when the field stays empty", async () => {
+		const { answers, form, other, button } = await mountAsk();
+		await act(async () => {
+			onChangeOf(other)({ target: other, currentTarget: other });
+		});
+		// The bare pick counts: the answer enables with nothing typed.
+		expect(button.disabled).toBe(false);
+		expect(button.textContent).toContain("(1)");
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual(["Other"]);
+		// The pick stays visible after the submit.
+		expect(other.checked).toBe(true);
+	});
+
+	test("a typed custom answer survives its own submit", async () => {
+		const { answers, form, text, other, button } = await mountAsk();
+		await act(async () => {
+			typeInto(text, "handwritten note");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		expect(button.textContent).toContain("(1)");
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		// The answer carries the text and the field keeps showing it: that input is
+		// the only place the recorded custom part is visible.
+		expect(answers).toEqual(["handwritten note"]);
+		expect(text.value).toBe("handwritten note");
+		expect(other.checked).toBe(true);
+	});
 });
 
 describe("triageWait", () => {
