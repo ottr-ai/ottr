@@ -42,7 +42,7 @@ A **research** task answers a question instead of changing code: the agent write
 
 A **backlog** card holds a feature idea that is not thought through yet. Park a draft with **Add draft** in the backlog row of the todo lane, or press **B**; a draft runs no agent and picks no model. Open the card and pick **Plan with agent** — or **Move to todo** — and you pick the model at that moment, or leave it empty to use the project's role model: the agent asks rounds of questions, you answer with a click, and the refined task text lands in the report. When the item is ready, pick **Move to todo**; Ottr appends the grilled definition to the prompt and the card enters the normal queue.
 
-For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card when a run fails. Once an hour it turns each open Dependabot pull request into a card that runs like any task.
+For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card with the failed steps' log when a run fails. Once an hour it turns each open Dependabot pull request into a card that runs like any task.
 
 A card with **!** needs you. Reply in its drawer and the agent continues in the same session. You can also steer a running task, edit a queued steer before the agent gets it, stop its current turn, cancel any card, paste images, and start follow-ups from Done cards. The bell in the header collects everything that needs you; desktop and phone push notifications are optional. Cards can carry a **triage rank** (P0-P3, set in the drawer): the Overview triage ranks them ahead of wait time, and a close-candidate badge marks cards you plan to cancel.
 

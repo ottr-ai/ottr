@@ -41,6 +41,11 @@ interface FakeOps extends SupervisorOps {
 	removeErr: Error | null;
 	ghResult: { code: number; stdout: string; stderr: string } | Error | null;
 	ghCalls: number;
+	runViewResult:
+		| { code: number; stdout: string; stderr: string }
+		| Error
+		| null;
+	runViewCalls: number;
 	prResult: { code: number; stdout: string; stderr: string } | Error | null;
 	prCalls: number;
 	time: number;
@@ -65,6 +70,8 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		removeErr: null,
 		ghResult: null,
 		ghCalls: 0,
+		runViewResult: null,
+		runViewCalls: 0,
 		prResult: null,
 		prCalls: 0,
 		time: 1_000_000,
@@ -96,11 +103,23 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		},
 		statusRows: async () => ops.status,
 		gh: async (args) => {
-			// Dependabot polls use `gh pr ...`; the CI watch uses `gh api ...`.
+			// Dependabot polls use `gh pr ...`; the CI watch uses `gh api ...` and one
+			// `gh run view ...` per failed run when it files a follow-up.
 			if (args[0] === "pr") {
 				ops.prCalls += 1;
 				if (ops.prResult instanceof Error) throw ops.prResult;
 				return ops.prResult ?? { code: 0, stdout: "[]", stderr: "" };
+			}
+			if (args[0] === "run") {
+				ops.runViewCalls += 1;
+				if (ops.runViewResult instanceof Error) throw ops.runViewResult;
+				return (
+					ops.runViewResult ?? {
+						code: 1,
+						stdout: "",
+						stderr: "run view not stubbed",
+					}
+				);
 			}
 			ops.ghCalls += 1;
 			if (ops.ghResult instanceof Error) throw ops.ghResult;
@@ -313,7 +332,7 @@ describe("CI watch", () => {
 		store.close();
 	});
 
-	test("failure files a follow-up card and clears the parent", async () => {
+	test("failure files a follow-up card with the failed-step log and clears the parent", async () => {
 		const { store, t } = ciProject("ci-fail");
 		const ops = fakeOps({
 			ghResult: {
@@ -324,8 +343,17 @@ describe("CI watch", () => {
 						conclusion: "failure",
 						name: "build",
 						html_url: "https://run/1",
+						id: 410,
 					},
 				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: [
+					...Array.from({ length: 250 }, (_, i) => `line ${i}`),
+					"error: Process completed with exit code 1.",
+				].join("\n"),
 				stderr: "",
 			},
 		});
@@ -337,11 +365,60 @@ describe("CI watch", () => {
 		expect(child?.prompt).toContain("CI failed on the merge push");
 		expect(child?.prompt).toContain("- build: failure - https://run/1");
 		expect(child?.prompt).toContain("handoff");
+		expect(child?.prompt).toContain(
+			"log is attached at the end of the handoff file",
+		);
 		expect(ops.calls.scheduled).toBe(1);
+		expect(ops.runViewCalls).toBe(1);
+		const handoff = await Bun.file(
+			join(store.tasksDir, "handoffs", `${child!.id}.md`),
+		).text();
+		expect(handoff).toContain("## Failed-step logs");
+		expect(handoff).toContain("(51 earlier lines cut)"); // 251-line log, tail of 200 kept
+		expect(handoff).toContain("line 249");
+		expect(handoff).toContain("error: Process completed with exit code 1.");
+		expect(handoff).not.toContain("line 0\n"); // the cut head is gone
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain(
 			`CI failed for abc1234; filed follow-up ${child?.id}`,
 		);
+		store.close();
+	});
+
+	test("failed log fetch keeps the refetch line and logs the failure", async () => {
+		const { store, t } = ciProject("ci-logfail");
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 411,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: { code: 1, stdout: "", stderr: "gh: auth failed" },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)?.pushSha).toBeNull();
+		const child = store.listTasks().find((x) => x.followUpOf === t.id);
+		expect(child).toBeDefined();
+		expect(child?.prompt).toContain(
+			"Find the cause (e.g. gh run view <run-id> --log-failed --repo acme/widget)",
+		);
+		expect(child?.prompt).not.toContain(
+			"attached at the end of the handoff file",
+		);
+		const handoff = await Bun.file(
+			join(store.tasksDir, "handoffs", `${child!.id}.md`),
+		).text();
+		expect(handoff).not.toContain("## Failed-step logs");
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("ci log fetch failed for build (gh: auth failed)");
 		store.close();
 	});
 

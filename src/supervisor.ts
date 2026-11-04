@@ -68,6 +68,16 @@ const GH_FAIL_LIMIT = 10; // consecutive gh api failures before giving up
 const CLEANUP_RETRY_MS = 10 * 60 * 1000; // spacing between removal retries
 const CLEANUP_TRIES = 3; // then give up (folder stays; logged)
 const DEPENDABOT_POLL_MS = 60 * 60 * 1000; // one gh pr list per project per hour
+const CI_LOG_LINES = 200; // tail kept per failed run in a follow-up handoff; full log stays on GitHub
+
+/** One GitHub Actions workflow run from the head_sha query; `id` feeds `gh run view --log-failed`. */
+interface WorkflowRun {
+	status: string;
+	conclusion: string | null;
+	name: string;
+	html_url: string;
+	id: number;
+}
 
 interface CleanupState {
 	attempts: number;
@@ -116,6 +126,13 @@ export function failedCheckNames(prompt: string): string[] {
 		if (m) names.push(m[1]!);
 	}
 	return names;
+}
+
+/** Last `max` lines of `text` plus a cut marker; a CI log's error sits at its end. Pure. */
+function tailLines(text: string, max: number): string {
+	const lines = text.split("\n");
+	if (lines.length <= max) return text;
+	return `(${lines.length - max} earlier lines cut)\n${lines.slice(-max).join("\n")}`;
 }
 
 /** First line prefix of a Dependabot card prompt; also the dedupe key, so #1 never matches #12. Pure. */
@@ -876,6 +893,55 @@ export function createSupervisor(
 		ops.appendLog(e.store, t.id, `supervisor: filed retro ${child.id}`);
 	}
 
+	/** Failed-step logs for a CI follow-up handoff: one `gh run view --log-failed` per failed
+	 * run, best-effort. A failed fetch logs one line and yields ""; the prompt then keeps the
+	 * plain refetch instruction. */
+	async function ciLogSection(
+		e: SupervisorEntry,
+		t: Task,
+		failed: WorkflowRun[],
+		repo: string,
+	): Promise<string> {
+		const sections: string[] = [];
+		for (const r of failed) {
+			if (typeof r.id !== "number") {
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: ci log fetch skipped for ${r.name} (no run id)`,
+				);
+				continue;
+			}
+			let res: { code: number; stdout: string; stderr: string };
+			try {
+				res = await ops.gh([
+					"run",
+					"view",
+					String(r.id),
+					"--log-failed",
+					"--repo",
+					repo,
+				]);
+			} catch (err) {
+				res = { code: 1, stdout: "", stderr: errmsg(err) };
+			}
+			const out = res.stdout.trim();
+			if (res.code !== 0 || !out) {
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: ci log fetch failed for ${r.name} (${(res.stderr || "no output").slice(0, 200)})`,
+				);
+				continue;
+			}
+			sections.push(
+				`### ${r.name} — ${r.html_url}\n\n\`\`\`\`\n${tailLines(out, CI_LOG_LINES)}\n\`\`\`\``,
+			);
+		}
+		if (sections.length === 0) return "";
+		return `\n\n## Failed-step logs\n\nFetched with \`gh run view <run-id> --log-failed --repo ${repo}\`, last ${CI_LOG_LINES} lines per failed run.\n\n${sections.join("\n\n")}`;
+	}
+
 	async function ciPass(e: SupervisorEntry, t: Task): Promise<void> {
 		if (t.pushSha === null) return;
 		const key = `${e.name}/${t.id}`;
@@ -901,12 +967,7 @@ export function createSupervisor(
 		} catch (err) {
 			res = { code: 1, stdout: "", stderr: errmsg(err) };
 		}
-		let runs: {
-			status: string;
-			conclusion: string | null;
-			name: string;
-			html_url: string;
-		}[];
+		let runs: WorkflowRun[];
 		if (res.code !== 0) {
 			const fails = (ghFails.get(key) ?? 0) + 1;
 			if (fails >= GH_FAIL_LIMIT) {
@@ -946,14 +1007,15 @@ export function createSupervisor(
 			return stop(`CI passed for ${t.pushSha.slice(0, 7)}`);
 
 		const failed = runs.filter((r) => ciVerdict([r]) === "failed");
-		const text = [
+		const refetch = `gh run view <run-id> --log-failed --repo ${repo}`;
+		const fetchCause = `Find the cause (e.g. ${refetch}), fix it, and land the fix through a normal merge.`;
+		const head = [
 			`CI failed on the merge push of this card's parent task (${t.pushSha.slice(0, 7)} on ${e.target ?? "the target branch"}).`,
 			...failed.map((r) => `- ${r.name}: ${r.conclusion} - ${r.html_url}`),
-			`Find the cause (e.g. gh run view <run-id> --log-failed --repo ${repo}), fix it, and land the fix through a normal merge.`,
 		].join("\n");
 		// One fix per failing push: a restarted supervisor (crash between createTask and stop)
 		// or two cards pinned to the same merge push (capture race in turn.ts) must not file twice.
-		const first = text.split("\n", 1)[0];
+		const first = head.split("\n", 1)[0];
 		if (
 			e.store
 				.listTasks()
@@ -970,7 +1032,7 @@ export function createSupervisor(
 			);
 		// Same failing check on a different push: N cards race on one root cause, one merges the
 		// fix, the rest would stick. The open follow-up that already names this check wins.
-		const names = failedCheckNames(text);
+		const names = failedCheckNames(head);
 		// ponytail: intersection, not equality — two distinct checks failing on one push still
 		// file one card per new check only if no open card shares a name; rarer than the race it
 		// prevents.
@@ -989,19 +1051,25 @@ export function createSupervisor(
 					`CI failed for ${t.pushSha.slice(0, 7)}; follow-up already filed for the same failing check (${sibling.id})`,
 				);
 		}
+		// The log fetch comes after the dedupe: a push that files no card never calls gh again.
+		const logs = await ciLogSection(e, t, failed, repo);
+		const text = [
+			head,
+			logs
+				? `The failed steps' log is attached at the end of the handoff file; find the cause there (${refetch} refetches a missing log), fix it, and land the fix through a normal merge.`
+				: fetchCause,
+		].join("\n");
 		const child = e.store.createTask(text);
 		let prompt = text;
 		try {
 			const handoffPath = join(e.store.tasksDir, "handoffs", `${child.id}.md`);
-			writeBelow(
-				e.store.dataRoot,
-				handoffPath,
-				handoffMarkdown({
-					task: t,
-					turns: e.store.listTurns(t.id),
-					sessionsDir: e.store.sessionsDir,
-				}),
-			);
+			let handoff = handoffMarkdown({
+				task: t,
+				turns: e.store.listTurns(t.id),
+				sessionsDir: e.store.sessionsDir,
+			});
+			if (logs) handoff += logs;
+			writeBelow(e.store.dataRoot, handoffPath, handoff);
 			prompt = followUpPrompt({
 				text,
 				title: e.store.frozenTitle(t),
@@ -1009,6 +1077,8 @@ export function createSupervisor(
 			});
 		} catch {
 			/* handoff is best-effort; the plain prompt is self-contained */
+			// Without the file the prompt must not claim an attached log.
+			if (logs) prompt = `${head}\n${fetchCause}`;
 		}
 		e.store.updateTask(child.id, { prompt, followUpOf: t.id });
 		ops.schedule();
