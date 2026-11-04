@@ -723,6 +723,62 @@ describe("turn loop", () => {
 		expect(store.listTurns(task.id)[0]!.outcome).toBe("answered");
 	});
 
+	test("the turn row records the agent layer the run pinned", async () => {
+		const store = freshStore();
+		const record: Recorded = {
+			createWorktree: [],
+			removeWorktree: [],
+			runs: [],
+			publishRelease: [],
+			runReleaseCommand: [],
+			quarantine: [],
+			ignoreInMain: [],
+			publishSoon: 0,
+			notifyLog: [],
+			killed: false,
+			proposal: null,
+			recorded: [],
+		};
+
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					return {
+						pid: 4242,
+						layerId: "A",
+						done: Promise.resolve(
+							runResult({
+								outcome: {
+									status: "ready",
+									summary: "rules written",
+								} satisfies Outcome,
+							}),
+						),
+						kill: async () => {
+							record.killed = true;
+						},
+					};
+				},
+			}),
+		);
+		const task = store.createTask(
+			`${RULES_INTERVIEW_MARKER}demo`,
+			null,
+			"interview",
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		// The audit record (docs/specs/agent-layer-switch.md "Record"): the run's
+		// pinned layer id lands on the turn row; a flat-home run records null.
+		expect(store.listTurns(task.id)[0]!.layer).toBe("A");
+	});
+
 	test("backlog card runs a grill turn: no worktree, ready parks it idle in backlog", async () => {
 		const record = baseRecord();
 		const store = freshStore();
