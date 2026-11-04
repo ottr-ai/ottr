@@ -313,16 +313,31 @@ For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no
 
 A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board.
 
-1. Create the shots folder and start the demo board: `mkdir -p shots && bun run dev`.
-2. Open the UI in a browser tab and drive it to the state you want to show.
-3. Save each shot in one program step with puppeteer `page.screenshot({ path: 'shots/<name>.png' })`. Never move the image bytes through agent text.
-4. Verify each file. The first eight bytes must print `89 50 4e 47 0d 0a 1a 0a`:
+1. Create the shots folder and start the demo board from inside the shot script — never as a named background service held across tool calls (registered boards die between calls and the proof phase burns restart loops). Give every run a fresh port and its own state directory so parallel boards never collide, and wrap the board in `timeout` so the script's own child exits on its own — the standing no-kill rule stays intact:
+
+   ```sh
+   mkdir -p shots
+   port=$(( 50000 + $$ % 10000 ))   # fresh port per run; keep out of 4700-4899, e2e-steer's range
+   state=$(mktemp -d)               # own state directory per run
+   PORT=$port OTTR_STATE_DIR="$state" timeout 900 bun run dev &
+   ```
+
+2. Wait for readiness by polling the port with a bounded loop, not a fixed sleep, and fail the script when the board never comes up:
+
+   ```sh
+   for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$port/" >/dev/null && break; sleep 0.5; done
+   curl -fsS "http://127.0.0.1:$port/" || exit 1
+   ```
+
+3. Open the UI in a browser tab and drive it to the state you want to show.
+4. Save each shot in one program step with puppeteer `page.screenshot({ path: 'shots/<name>.png' })`. Never move the image bytes through agent text.
+5. Verify each file. The first eight bytes must print `89 50 4e 47 0d 0a 1a 0a`:
 
    ```sh
    for f in shots/*.png; do echo "$f: $(od -An -tx1 -N8 "$f")"; done
    ```
 
-5. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
+6. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
 
 `/shots/` and `/*.png` sit in `.gitignore`, so the shots stay out of `git status` and never enter a commit.
 
