@@ -42,6 +42,7 @@ const {
 	setupHints,
 	reportHtml,
 	Drawer,
+	LogView,
 	openCardInProject,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
@@ -2301,5 +2302,19 @@ describe("path URL card links", () => {
 		expect(html).toContain('href="/projects/proj/tasks/K-1"');
 		// Both rows name their card with its title text, not just a URL.
 		expect(html).toContain("Parent work");
+	});
+});
+
+describe("LogView log slice controls", () => {
+	const project = { name: "proj", settings: {} } as unknown as ProjectView;
+	test("an expanded turn offers its section and the full log, slice active", () => {
+		const html = renderToStaticMarkup(
+			<LogView project={project} taskId="t1" startedAt={1_000} />,
+		);
+		expect(html).toContain("Turn log");
+		expect(html).toContain("Full log");
+		// Default is the turn's own section; the full log is the opt-in.
+		expect(html).toContain('aria-pressed="true"');
+		expect(html).toContain("(no log output yet)");
 	});
 });

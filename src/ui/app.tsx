@@ -189,6 +189,7 @@ import {
 } from "./status.ts";
 import { workSteps } from "./steps.ts";
 import { age, duration, landed, stamp, turnDuration, until } from "./time.ts";
+import { turnLogStart } from "./turnlog.ts";
 import { decideReload, RELOAD_GUARD_KEY, SEEN_VERSION_KEY } from "./version.ts";
 import {
 	type WorkflowKind,
@@ -4591,14 +4592,18 @@ function useSessionContext(
 	return ctx;
 }
 
-function LogView({
+export function LogView({
 	project,
 	taskId,
+	startedAt,
 }: {
 	project: ProjectView;
 	taskId: string;
+	/** The expanded turn's startedAt: the view starts at this turn's own log section. */
+	startedAt: number;
 }) {
 	const [text, setText] = useState("");
+	const [full, setFull] = useState(false);
 	const offset = useRef(0);
 	const stick = useRef(true);
 	const pre = useRef<HTMLPreElement | null>(null);
@@ -4662,19 +4667,51 @@ function LogView({
 		if (el && stick.current) el.scrollTop = el.scrollHeight;
 	}, [text]);
 
+	// The expanded turn shows its own section: from its header on. A log without that
+	// header (file recreated after the turn) falls back to the whole text so no output hides.
+	const start = full ? 0 : (turnLogStart(text, startedAt) ?? 0);
+	const shown = text.slice(start);
 	return (
-		<pre
-			ref={pre}
-			className="log"
-			onScroll={() => {
-				const el = pre.current;
-				if (el)
-					stick.current =
-						el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
-			}}
-		>
-			{text.length > 0 ? text : "(no log output yet)"}
-		</pre>
+		<>
+			<div className="log-head">
+				<button
+					type="button"
+					className="log-mode"
+					aria-pressed={!full}
+					onClick={(e) => {
+						e.stopPropagation();
+						setFull(false);
+					}}
+					onKeyDown={(e) => e.stopPropagation()}
+				>
+					Turn log
+				</button>
+				<button
+					type="button"
+					className="log-mode"
+					aria-pressed={full}
+					onClick={(e) => {
+						e.stopPropagation();
+						setFull(true);
+					}}
+					onKeyDown={(e) => e.stopPropagation()}
+				>
+					Full log
+				</button>
+			</div>
+			<pre
+				ref={pre}
+				className="log"
+				onScroll={() => {
+					const el = pre.current;
+					if (el)
+						stick.current =
+							el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+				}}
+			>
+				{shown.length > 0 ? shown : "(no log output yet)"}
+			</pre>
+		</>
 	);
 }
 
@@ -7796,7 +7833,11 @@ export function Drawer({
 												</div>
 											)}
 											{expanded && (
-												<LogView project={project} taskId={sub ?? task.id} />
+												<LogView
+													project={project}
+													taskId={sub ?? task.id}
+													startedAt={t.startedAt}
+												/>
 											)}
 										</div>
 									</li>

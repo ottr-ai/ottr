@@ -5722,6 +5722,30 @@ button.diff-path {
 	overflow: auto;
 	word-break: break-word;
 }
+/* Which part of the card log the expanded turn shows: its own section, or everything. */
+.log-head {
+	display: flex;
+	gap: 6px;
+	margin: 0 0 4px;
+}
+button.log-mode {
+	min-height: 22px;
+	padding: 0 8px;
+	font-size: 12px;
+	color: var(--dim);
+	background: transparent;
+	border-color: transparent;
+}
+button.log-mode:hover {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
+}
+button.log-mode[aria-pressed="true"] {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
+}
 /* Markdown prose: results, research reports, release notes. */
 .md {
 	display: grid;
