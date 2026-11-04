@@ -61,7 +61,7 @@ changed line range to the Stryker config that owns the file, and runs those
 configs with those ranges. A changed-line mutant that survives or has no
 coverage fails the gate; a timed-out mutant counts as detected, as in the full
 run. No changed file is mutated by a config: the gate exits 0 without a
-Stryker run. Work turns run it over the card's base. Release reviews run it
+Stryker run. Work turns run no mutation gate. Release reviews run it
 over the last release tag; a survivor without a reason is a finding. The
 Review button and an auto-started review keep the full suite
 (`bun run test:mutation`) with its break thresholds.

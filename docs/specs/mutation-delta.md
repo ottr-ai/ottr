@@ -7,8 +7,9 @@ in `src/prompts.ts` is approved (AGENTS.md hard stop 3). No new npm dependency.
 
 Full mutation runs (5 configs, 14964 mutants in the main config alone) failed or broke in the
 last three release reviews (OTTR-213, OTTR-314, OTTR-345; each took 3 to 4.5 hours). A release
-changes about 330 of about 31400 non-test source lines. Releases and work turns run a delta
-gate over changed lines only. The Review button keeps the full run. When the board is idle and
+changes about 330 of about 31400 non-test source lines. Release reviews run a delta gate over
+changed lines only. Work turns run no mutation gate (dropped 2026-11-04, see section 2). The
+Review button keeps the full run. When the board is idle and
 a project shows Review due, the supervisor files the full review card itself.
 
 ## 1. The delta gate script
@@ -71,9 +72,11 @@ Usage: `bun run test:mutation:delta <base> [head]`.
 
 ## 2. Work turns
 
-Run `bun run test:mutation:delta <card base>`, where `<card base>` is the branch's merge-base
-with `origin/main`. A survivor gets a test that kills it, or a one-line reason in the turn
-report why it cannot change behavior. No ranges means the gate is a no-op (exit 0).
+Dropped 2026-11-04: a normal work turn runs no Stryker run at all, also not the delta gate.
+Reason: each work turn waited for the per-worker mutation lock (`scripts/stryker-load.mjs:82`)
+and loaded the machine while it held it. The release review finds the survivors in each
+card's lines. Only release reviews run the delta gate (section 3); the Review button and
+architecture work run the full run (section 4).
 
 ## 3. Release reviews
 
