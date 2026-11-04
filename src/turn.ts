@@ -14,6 +14,7 @@ import {
 	writeBelow,
 } from "./confine.ts";
 import type { pidAlive } from "./dblock.ts";
+import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import {
@@ -371,10 +372,6 @@ let notifyHook: (project: string, id: string) => void = () => {};
 export function appendLog(store: ProjectStore, id: string, line: string): void {
 	writeBelow(store.dataRoot, store.logPath(id), `${line}\n`, "append");
 	notifyHook(store.name, id);
-}
-
-export function errmsg(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
 }
 
 /** Why a review check run failed and must retry, else null: a stopped run, a non-zero exit, or

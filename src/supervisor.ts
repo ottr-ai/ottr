@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { writeBelow } from "./confine.ts";
+import { errmsg } from "./errmsg.ts";
 import { githubHost } from "./githubHost.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
 import { ownerRepo } from "./release.ts";
@@ -90,10 +91,6 @@ export function ciVerdict(
 	return passed ? "passed" : "failed";
 }
 
-function errmsg(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
-
 /**
  * A pass is about to write task columns it read from the tick's start snapshot; a reply,
  * steer, restart or cancel can have landed during the pass's awaits. Re-read the card and
@@ -110,7 +107,6 @@ function wentStale(store: ProjectStore, t: Task): boolean {
 		fresh.pendingPrompt !== null
 	);
 }
-
 /** Failing check names a CI follow-up prompt lists (lines `- Name: conclusion - URL`); [] when the prompt is not a CI follow-up. Pure. */
 export function failedCheckNames(prompt: string): string[] {
 	if (!prompt.startsWith("CI failed on the merge push")) return [];

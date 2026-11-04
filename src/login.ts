@@ -11,6 +11,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { type Subprocess, stripANSI } from "bun";
+import { errmsg } from "./errmsg.ts";
 
 interface LoginView {
 	provider: string;
@@ -123,9 +124,6 @@ interface Login {
 	/** The board origin that started the sign-in: where the provider's callback sends the browser. */
 	returnTo: string;
 }
-
-const errmsg = (err: unknown): string =>
-	err instanceof Error ? err.message : String(err);
 
 /** The loopback address the provider's page sends the browser back to, read from omp's sign-in URL. */
 export function redirectUri(output: string): URL | null {

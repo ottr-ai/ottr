@@ -25,6 +25,7 @@ import { dirname, join } from "node:path";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
+import { errmsg } from "./errmsg.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -55,7 +56,6 @@ import {
 	cancelKeptReason,
 	checkRunError,
 	createTurnLoop,
-	errmsg,
 	FORK_HOLD_REASON,
 	generateTitle,
 	getSettingsLogged,

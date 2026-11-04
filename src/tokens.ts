@@ -7,6 +7,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
+import { errmsg } from "./errmsg.ts";
 import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
 import { turnEnvValues } from "./tools.ts";
 
@@ -20,9 +21,6 @@ type Read =
 	| { kind: "token"; access: string; expires: number }
 	| { kind: "api_key" }
 	| { kind: "error"; cause: string };
-
-const errmsg = (err: unknown): string =>
-	err instanceof Error ? err.message : String(err);
 
 /** Why the provider has no active credential: never signed in, or omp disabled its row. */
 function noCredential(dbPath: string, provider: string): string {

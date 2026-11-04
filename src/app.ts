@@ -43,6 +43,7 @@ import {
 } from "./auth.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
+import { errmsg } from "./errmsg.ts";
 import {
 	createForkWatcher,
 	forkSummary,
@@ -182,7 +183,6 @@ import {
 } from "./tools.ts";
 import {
 	type CancelOutcome,
-	errmsg,
 	type FinishKeptOutcome,
 	FORK_HOLD_REASON,
 	isKeptReason,
