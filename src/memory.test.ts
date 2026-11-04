@@ -36,6 +36,12 @@ describe("memoryBackendFromEnv", () => {
 		});
 	});
 
+	test("every trailing slash is stripped, not just one", () => {
+		expect(
+			memoryBackendFromEnv({ HINDSIGHT_API_URL: "http://h:8888//" }),
+		).toEqual({ backend: "hindsight", url: "http://h:8888", token: "" });
+	});
+
 	test("an unset URL picks mnemopi (spec acceptance: unset -> mnemopi)", () => {
 		expect(memoryBackendFromEnv({})).toEqual({ backend: "mnemopi" });
 	});
