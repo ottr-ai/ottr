@@ -2123,7 +2123,7 @@ describe("Drawer approve button", () => {
 		],
 	} satisfies Partial<TaskCard>;
 
-	test("a waiting release card lists the ask's Approve action above the late commits", () => {
+	test("a waiting release card lists late commits above the Approve action", () => {
 		// lateCommits rides the drawer's TaskView, not the board row's TaskCard.
 		const task = cardFixture({
 			...releaseFields,
@@ -2146,14 +2146,38 @@ describe("Drawer approve button", () => {
 			'title="Replies &quot;Approve&quot; to the waiting session"',
 		);
 		const section = html.indexOf("Commits since the review");
-		expect(approve).toBeGreaterThanOrEqual(0);
-		expect(section).toBeGreaterThan(approve);
+		expect(section).toBeGreaterThanOrEqual(0);
+		expect(section).toBeLessThan(approve);
 	});
 
 	test("a waiting release card without late commits renders no section", () => {
 		const task = cardFixture(releaseFields);
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).not.toContain("Commits since the review");
+	});
+
+	test("the ask renders above the worktree files section", () => {
+		// The questions lead the drawer body. The changed files section renders from
+		// the fetched detail, which a static render never has; it sits right after
+		// this section in the JSX, so the ask stays ahead of both file lists.
+		const task = cardFixture({
+			...drawerFields,
+			state: "needs_you",
+			asked: [
+				{
+					question: "Which auth flow?",
+					options: [],
+					multi: false,
+					recommended: null,
+				},
+			],
+			worktreeFiles: ["mockup.html"],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		const ask = html.indexOf("Which auth flow?");
+		const wt = html.indexOf('id="drawer-wt"');
+		expect(ask).toBeGreaterThanOrEqual(0);
+		expect(wt).toBeGreaterThan(ask);
 	});
 });
 

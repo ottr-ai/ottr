@@ -7048,6 +7048,29 @@ export function Drawer({
 							</ol>
 						</DrawerSec>
 					)}
+					{/* A waiting release card reads its unreviewed commits before it approves,
+					    so this section rides above the ask and the file lists. */}
+					{task.releaseVersion !== null &&
+						task.state === "needs_you" &&
+						!cancelled &&
+						task.lateCommits !== undefined &&
+						task.lateCommits.length > 0 && (
+							<DrawerSec id="drawer-late" label="Commits since the review">
+								<ul className="late-commits">
+									{task.lateCommits.map((c) => (
+										<li key={c.sha}>
+											<code>{c.sha.slice(0, 7)}</code>
+											<span className="late-subject">{c.subject}</span>
+											<span
+												className={c.reviewed ? "late-mark" : "late-mark warn"}
+											>
+												{c.reviewed ? "review fix" : "not reviewed"}
+											</span>
+										</li>
+									))}
+								</ul>
+							</DrawerSec>
+						)}
 					{/* The ask leads the body: an outstanding question is the card's one
 					    action item, so it sits right below the lineage, before the file lists. */}
 					{task.asked !== null && task.state === "needs_you" && (
@@ -7188,27 +7211,6 @@ export function Drawer({
 							</div>
 						</DrawerSec>
 					)}
-					{task.releaseVersion !== null &&
-						task.state === "needs_you" &&
-						!cancelled &&
-						task.lateCommits !== undefined &&
-						task.lateCommits.length > 0 && (
-							<DrawerSec id="drawer-late" label="Commits since the review">
-								<ul className="late-commits">
-									{task.lateCommits.map((c) => (
-										<li key={c.sha}>
-											<code>{c.sha.slice(0, 7)}</code>
-											<span className="late-subject">{c.subject}</span>
-											<span
-												className={c.reviewed ? "late-mark" : "late-mark warn"}
-											>
-												{c.reviewed ? "review fix" : "not reviewed"}
-											</span>
-										</li>
-									))}
-								</ul>
-							</DrawerSec>
-						)}
 					{task.releaseVersion !== null &&
 						(notesEdit === null ? (
 							<DrawerSec
