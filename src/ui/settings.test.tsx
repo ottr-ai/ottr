@@ -7,10 +7,8 @@ import type { AppCheck, ProjectView, TaskCard } from "../types.ts";
 import {
 	AppCheckLines,
 	GitHostsSection,
-	GitHostsSection,
 	HindsightSection,
 	openSettingsSection,
-	ProjectSettingsForm,
 	ProjectSettingsForm,
 	ProjectsOrderSection,
 	SessionSection,

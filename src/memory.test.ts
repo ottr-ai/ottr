@@ -243,7 +243,8 @@ describe("checkMemoryHealth", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-envhome-"));
 		process.env.HOME = dir;
 		try {
-			const h = await checkMemoryHealth({ backend: "mnemopi" }, { now });
+			// No second argument at all: opts itself is undefined in production's tick.
+			const h = await checkMemoryHealth({ backend: "mnemopi" });
 			expect(h.ok).toBe(true);
 			expect(h.reason).toBe(null);
 			expect(
