@@ -51,7 +51,7 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   export default {
     ...base,
     reporters: ["clear-text", "json"],
-5:     jsonReporter: {
+    jsonReporter: {
       fileName: "<osTempDir>/ott-delta-<configName>-<randomUUID>.json",
     },
   };
