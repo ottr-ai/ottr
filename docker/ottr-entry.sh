@@ -46,17 +46,4 @@ if [ -n "$PI_CODING_AGENT_DIR" ]; then
 		echo "ottr-entry: R5-1: $PI_CODING_AGENT_DIR is not seeded; refused the shared home $HOME as its source (worker-writable). The board's omp runs without the agent layer until a trusted seed: docker compose run --rm board-seed --repo <owner/name> (docs/WORKERS.md)" >&2
 	fi
 fi
-# Fleet memory backend (D8): containers with HINDSIGHT_API_URL (compose workers and the
-# board) run omp with memory.backend: hindsight; the captured config selects mnemopi,
-# which stays the default for direct local spawns outside compose. Patches the shared
-# $HOME/.omp/agent/config.yml (workers) and the board's pinned
-# $PI_CODING_AGENT_DIR/config.yml, so a fresh seed gets the flip at the next start. Only
-# the backend line is patched — URL/token reach omp through the environment.
-if [ -n "$HINDSIGHT_API_URL" ]; then
-	for cfg in "$HOME/.omp/agent/config.yml" ${PI_CODING_AGENT_DIR:+"$PI_CODING_AGENT_DIR/config.yml"}; do
-		if [ -f "$cfg" ]; then
-			sed -i 's/^  backend: mnemopi$/  backend: hindsight/' "$cfg"
-		fi
-	done
-fi
 exec "$@"

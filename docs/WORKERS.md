@@ -300,30 +300,36 @@ to the host.
 
 ## Fleet memory (Hindsight)
 
-Compose turns run omp with `memory.backend: hindsight` against the shared Hindsight server.
-The server's address travels
-as `HINDSIGHT_API_URL`: docker-compose.yml interpolates it from the environment
-(`${HINDSIGHT_API_URL:-}`), so set it in the compose env file (the `--env-file` that
-`scripts/update-image.ts` passes) or in the shell that runs compose, for example
-`HINDSIGHT_API_URL=http://hindsight.local:8888`. **Settings -> Hindsight** can also save
-the address; a URL saved there beats the env seed at every boot, and the board switches
-the shared `config.yml`'s backend itself when a saved URL comes into effect, so Settings
-alone turns fleet memory on. An empty or unset value
-keeps omp's
-`mnemopi` default: the stack boots without fleet memory, and nothing crashes. The entry
-script switches the backend in containers that carry a non-empty `HINDSIGHT_API_URL`, and
-since server and workers share the home volume (one
-`config.yml`), the whole compose topology runs hindsight — worker turns and server-side
-merge turns alike. Mnemopi remains the default backend for direct spawns outside compose
-(the host local-spawn fallback).
+The board picks the memory backend from the deployment at every omp spawn. A non-empty
+`HINDSIGHT_API_URL` selects `hindsight`; an empty or unset value selects omp's default
+`mnemopi` (a local store in the shared home volume). docker-compose.yml interpolates the
+URL from the environment (`${HINDSIGHT_API_URL:-}`), so set it in the compose env file
+(the `--env-file` that `scripts/update-image.ts` passes) or in the shell that runs
+compose, for example `HINDSIGHT_API_URL=http://hindsight.local:8888`. **Settings ->
+Hindsight** can also save the address; a URL saved there beats the env seed at every boot,
+so Settings alone turns fleet memory on or off.
 
-The server requires its tenant API key on every request. Set it under **Settings ->
-Hindsight** (the same place holds the server address): the board saves a key only after
-the server at the effective address accepts it (`GET
+The board does not patch any `config.yml`. At every spawn it writes the choice to
+`$OTTR_DATA_DIR/omp-memory.yml` (in compose: `/data/omp-memory.yml`) and appends
+`--config <path>` to the omp command. The overlay wins per key, so a stale
+`memory: backend: hindsight` line in a seeded `config.yml` has no effect. Alate will
+strip the backend line from captured `config.yml`; until then the line is inert and
+serves only direct spawns that run without the board. Mnemopi is the default when no
+Hindsight config exists. Both server-side runs (merge, release, review turns) and worker
+turns get the overlay, so the whole compose topology runs one backend.
+
+The server checks memory health at boot and every 60 seconds. When the check fails, the
+board header and the Settings Hindsight section show the sentence
+`omp runs with no memory: <reason>` — for example an unreachable Hindsight URL or a
+mnemopi store that refuses writes.
+
+The Hindsight server requires its tenant API key on every request. Set it under
+**Settings -> Hindsight** (the same place holds the server address): the board saves a
+key only after the server at the effective address accepts it (`GET
 /v1/default/banks`), stores it in `.tasks/tracker.db` and hands it to every new turn as
-`HINDSIGHT_API_TOKEN`, which omp reads over `config.yml`. Worker turns get it through the
-env the board forwards. `HINDSIGHT_API_TOKEN` in the env file only seeds the key until
-Settings holds one. Fact extraction runs on the server and needs LLM balance there.
+`HINDSIGHT_API_TOKEN`, which omp reads over the environment. `HINDSIGHT_API_TOKEN` in the
+env file only seeds the key until Settings holds one. Fact extraction runs on the server
+and needs LLM balance there.
 
 ## Check memory
 
@@ -490,9 +496,10 @@ release review, release). The compose file pins the board's `PI_CODING_AGENT_DIR
 (config.yml, agent.db, skills, extensions, sessions) from that variable. The entry script
 creates this directory empty and logs an `ottr-entry: R5-1:` line while it is unseeded.
 The agent layer comes only from the trusted `board-seed` service, a one-off of the Alate
-image (see [Seed the board config](#seed-the-board-config)). At the next start, the entry
-script flips `memory.backend` in the seeded `config.yml`. The board's own config readers
-(`src/models.ts` model roles, the Settings hindsight flip, the sign-in store in
+image (see [Seed the board config](#seed-the-board-config)). The board decides the memory
+backend at spawn time, so the seeded `config.yml` needs no `memory:` backend line.
+The board's own config readers
+(`src/models.ts` model roles, the Settings Hindsight section, the sign-in store in
 `src/login.ts`) resolve the same variable. A worker dispatch strips the variable from the
 turn env: a worker keeps its shared home, and a turn that ran locally would otherwise hold
 the directory the board executes. The board's layer does not follow Alate provisions of
@@ -511,8 +518,8 @@ models`, `omp usage`, `omp login`, `omp token` (the token refresh), and the fork
 directory and copies nothing into it, and refuses to start when the variable points into
 the shared home. A worker dispatch removes the variable from the turn env, so a work turn
 keeps the shared home. The board's own reads of the shared home keep
-`/root`: the apt lists, the shared credential store, and the shared `config.yml` of the
-hindsight flip.
+`/root`: the apt lists, the shared credential store, and the shared `config.yml` (its
+memory backend is inert there; the spawn-time overlay decides).
 
 #### Seed the board config
 

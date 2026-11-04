@@ -7,7 +7,10 @@ import type { AppCheck, ProjectView, TaskCard } from "../types.ts";
 import {
 	AppCheckLines,
 	GitHostsSection,
+	GitHostsSection,
+	HindsightSection,
 	openSettingsSection,
+	ProjectSettingsForm,
 	ProjectSettingsForm,
 	ProjectsOrderSection,
 	SessionSection,
@@ -1455,6 +1458,39 @@ describe("ProjectsOrderSection", () => {
 	});
 });
 
+/** The HindsightView the GET on mount answers with. */
+type HindsightView = {
+	url: string | null;
+	tokenSet: boolean;
+	backend: "hindsight" | "mnemopi";
+	memoryReason: string | null;
+};
+
+/** Mounts HindsightSection against a fetch mock that answers the view load, same cleanup as mountSessions. */
+async function mountHindsight(view: HindsightView) {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async (): Promise<Response> =>
+		new Response(JSON.stringify(view))) as unknown as typeof fetch;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(<HindsightSection />);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		},
+	};
+}
+
 /** Mounts the full General settings page; the fetch stub never resolves, so the
  *  sections stay idle and the test stays deterministic. Cleanup unmounts and
  *  puts fetch back. */
@@ -1581,6 +1617,62 @@ describe("settings deep links", () => {
 		} finally {
 			await unmount();
 			window.location.hash = "";
+		}
+	});
+});
+
+describe("HindsightSection memory backend", () => {
+	test("a mnemopi board with a failing store shows the backend chip and the no-memory warning", async () => {
+		const { container, unmount } = await mountHindsight({
+			url: null,
+			tokenSet: false,
+			backend: "mnemopi",
+			memoryReason: "mnemopi store not writable: /data/home",
+		});
+		try {
+			expect(container.textContent).toContain(
+				"Memory backend: mnemopi (the default)",
+			);
+			const warning = container.querySelector('p[role="alert"].notif-line');
+			expect(warning?.textContent).toBe(
+				"omp runs with no memory: mnemopi store not writable: /data/home",
+			);
+			expect(container.textContent).toContain("never config.yml");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a healthy mnemopi board shows no warning line", async () => {
+		const { container, unmount } = await mountHindsight({
+			url: null,
+			tokenSet: false,
+			backend: "mnemopi",
+			memoryReason: null,
+		});
+		try {
+			expect(container.textContent).toContain(
+				"Memory backend: mnemopi (the default)",
+			);
+			expect(container.textContent).not.toContain("omp runs with no memory");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a hindsight board shows the backend chip, the server URL and no warning line", async () => {
+		const { container, unmount } = await mountHindsight({
+			url: "http://hindsight.local:8888",
+			tokenSet: true,
+			backend: "hindsight",
+			memoryReason: null,
+		});
+		try {
+			expect(container.textContent).toContain("Memory backend: hindsight");
+			expect(container.textContent).toContain("http://hindsight.local:8888");
+			expect(container.textContent).not.toContain("omp runs with no memory");
+		} finally {
+			await unmount();
 		}
 	});
 });

@@ -73,7 +73,8 @@ const workerOmpDir = mkdtempSync(join(tmpdir(), "ottr-worker-omp-"));
 const workerOmp = join(workerOmpDir, "fake-omp.exe");
 writeFileSync(
 	join(workerOmpDir, "fake-omp.js"),
-	`process.stdout.write(JSON.stringify({ type: "session", id: "sess-worker" }) + "\\n");
+	`process.stdout.write("ARGV " + JSON.stringify(process.argv.slice(2)) + "\\n");
+process.stdout.write(JSON.stringify({ type: "session", id: "sess-worker" }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
 process.exit(0);`,
 );
@@ -223,6 +224,35 @@ describe("buildOmpArgs", () => {
 			"--no-lsp",
 			"--config",
 			NO_DISCOVERY_CONFIG,
+		]);
+	});
+
+	test("the memory overlay rides after NO_DISCOVERY_CONFIG and before images", () => {
+		expect(
+			buildOmpArgs({
+				sessionDir: "S",
+				extensionPath: "E",
+				resumeId: null,
+				images: ["shot.png"],
+				memoryConfig: "/data/omp-memory.yml",
+			}),
+		).toEqual([
+			"-p",
+			"--mode",
+			"json",
+			"--session-dir",
+			"S",
+			"--extension",
+			"E",
+			"--config",
+			"run.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
+			"--config",
+			"/data/omp-memory.yml",
+			"@shot.png",
 		]);
 	});
 
@@ -2118,6 +2148,39 @@ describe("startRun", () => {
 		}
 	});
 
+	test("an explicit memoryConfigPath shows the overlay arg in the spawned argv", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-arg-"));
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const overlay = join(dir, "omp-memory.yml");
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+				memoryConfigPath: overlay,
+			});
+			await handle.done;
+			const i = seen[0]!.indexOf(
+				"--config",
+				seen[0]!.indexOf(NO_DISCOVERY_CONFIG),
+			);
+			expect(seen[0]!.slice(i, i + 2)).toEqual(["--config", overlay]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("splits JSON events across chunks, writes the prompt, and settles the result", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
 		try {
@@ -2293,6 +2356,31 @@ describe("startRun worker dispatch", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	}, 30_000); // The dispatch runs the real daemon and a real child; the 5 s default is tighter than that under load.
+
+	test("a worker dispatch carries the memory overlay in the run request argv", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-mem-"));
+		const server = serveWorker({ port: 0, ompPath: workerOmp });
+		try {
+			const logPath = join(dir, "run.log");
+			const overlay = join(dir, "omp-memory.yml");
+			const { done } = startRun({
+				...baseOpts(dir, logPath),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				launcher: (() => {
+					throw new Error("a worker turn must never spawn locally");
+				}) as RunLauncher,
+				memoryConfigPath: overlay,
+			});
+			const r = await done;
+			expect(r.exitCode).toBe(0);
+			// The fake omp echoes its argv: the request the worker executed had the overlay pair.
+			const log = readFileSync(logPath, "utf8");
+			expect(log).toContain(`"--config","${overlay}"`);
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	test("a connect failure with a worker pool never runs the turn locally", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));

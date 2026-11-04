@@ -46,19 +46,17 @@ x-worker: &worker
     # Server-to-worker auth, required and random: turns share this network, so a known
     # value would let them drive any worker (workers strip it from every turn's env).
     OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
-    # Fleet memory backend: workers run omp with memory.backend: hindsight
-    # against the shared Hindsight server. The URL comes from the environment: set HINDSIGHT_API_URL in the
-    # compose env file (or the host shell) to the Hindsight server address, or
-    # save it under Settings -> Hindsight (a saved URL beats this env seed at
-    # the next boot, and the board switches this shared config.yml's backend
-    # itself). The
-    # entry script switches the backend when HINDSIGHT_API_URL is non-empty, so
-    # an empty value keeps omp's mnemopi default (no fleet memory, no crash).
-    # The tenant API key is set under Settings -> Hindsight: the board
-    # hands it to every turn as HINDSIGHT_API_TOKEN. An env file value only
-    # seeds it (and serves omp run by hand in a container).
+    # Fleet memory: the board derives the backend from this env at every omp
+    # spawn and passes a --config overlay (/data/omp-memory.yml). A non-empty
+    # HINDSIGHT_API_URL picks hindsight against the shared Hindsight server
+    # (set it in the compose env file or the host shell); an empty value keeps
+    # omp's mnemopi default. A URL saved under Settings -> Hindsight beats this
+    # env seed at the next boot. The tenant API key is set under Settings ->
+    # Hindsight: the key still travels as HINDSIGHT_API_TOKEN, so the board can
+    # save it. An env file value only seeds it (and serves omp run by hand in a
+    # container).
     HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
-    HINDSIGHT_API_TOKEN:
+    HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
     # No GitHub token here: workers run turns only, and push credentials stay on the
     # server (D6). The worker daemon strips GH_TOKEN and every git host credential from
     # each turn's env, so a token set here would never reach a turn.
@@ -168,10 +166,10 @@ services:
       # the one board-seed installs into; the board's own reads of the shared home (apt
       # lists, shared store) keep /root.
       OTTR_BOARD_OMP_HOME: /etc/ottr/home
-      # One shared home volume carries one agent config: with the entry script's
-      # backend switch, the whole compose topology runs memory.backend: hindsight
-      # — server-side merge turns included. Mnemopi stays the default for
-      # direct spawns outside compose.
+      # One shared home volume carries one agent config. The server writes the
+      # memory overlay to OTTR_DATA_DIR=/data ($OTTR_DATA_DIR/omp-memory.yml);
+      # the workers resolve the same path, and the board passes it as --config
+      # at every spawn — server-side runs included.
       HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
       HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
       # Alate pairing (the `alate` profile below): these seed Settings -> Alate while it
@@ -202,7 +200,8 @@ services:
   # starting it. Usage:
   #   docker compose run --rm board-seed --repo <owner/name>
   #   docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data
-  # then `docker compose restart server` (the entry script flips the memory backend).
+  # then `docker compose restart server` (a restart re-derives the memory
+  # backend from the env).
   # --force: the data repo wins over board-local edits. Plugins install into
   # /etc/ottr/home/.omp/plugins: the server's OTTR_BOARD_OMP_HOME, the HOME that the
   # board's own omp reads plugins and user skills from.

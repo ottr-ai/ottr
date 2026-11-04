@@ -100,11 +100,14 @@ describe.skipIf(process.platform === "win32")("ottr-entry.sh", () => {
 		expect(r.stderr).toBe("");
 	});
 
-	test("existing pins are kept and both configs get the flip", () => {
+	// OTTR-453: the entry script no longer touches config.yml; the board passes
+	// the memory backend as a --config overlay at spawn time. A stale
+	// `backend: hindsight` line stays and is inert.
+	test("existing pins are kept and config.yml is never rewritten", () => {
 		const f = fixture();
 		write(f.gitconfig, CUSTOM);
 		write(join(f.agent, "config.yml"), MNEMOPI);
-		write(join(f.home, ".omp", "agent", "config.yml"), MNEMOPI);
+		write(join(f.home, ".omp", "agent", "config.yml"), HINDSIGHT);
 		write(join(f.home, ".gitconfig"), PLANT);
 		const r = run(
 			{
@@ -120,28 +123,12 @@ describe.skipIf(process.platform === "win32")("ottr-entry.sh", () => {
 		expect(r.code).toBe(0);
 		expect(r.stdout).toBe("ran\n");
 		expect(readFileSync(f.gitconfig, "utf8")).toBe(CUSTOM);
-		expect(readFileSync(join(f.agent, "config.yml"), "utf8")).toBe(HINDSIGHT);
+		expect(readFileSync(join(f.agent, "config.yml"), "utf8")).toBe(MNEMOPI);
 		expect(
 			readFileSync(join(f.home, ".omp", "agent", "config.yml"), "utf8"),
 		).toBe(HINDSIGHT);
 		expect(readdirSync(f.agent)).toEqual(["config.yml"]);
 		expect(r.stderr).not.toContain("R5-1");
-	});
-
-	test("without HINDSIGHT_API_URL neither config.yml changes", () => {
-		const f = fixture();
-		write(join(f.agent, "config.yml"), MNEMOPI);
-		write(join(f.home, ".omp", "agent", "config.yml"), MNEMOPI);
-		const r = run(
-			{ HOME: f.home, PI_CODING_AGENT_DIR: f.agent },
-			"echo",
-			"ran",
-		);
-		expect(r.code).toBe(0);
-		expect(readFileSync(join(f.agent, "config.yml"), "utf8")).toBe(MNEMOPI);
-		expect(
-			readFileSync(join(f.home, ".omp", "agent", "config.yml"), "utf8"),
-		).toBe(MNEMOPI);
 	});
 
 	test("a pin inside the shared home refuses to start before any write", () => {

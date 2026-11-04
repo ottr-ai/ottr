@@ -10,7 +10,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { cpus, freemem, homedir, totalmem } from "node:os";
+import { cpus, freemem, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
@@ -108,6 +108,11 @@ import {
 	signOutEverywhere,
 } from "./login.ts";
 import { STATS_KEEP_MS, type StatsSample, statsFrame } from "./machineStats.ts";
+import {
+	checkMemoryHealth,
+	type MemoryHealth,
+	memoryBackendFromEnv,
+} from "./memory.ts";
 import {
 	commitMessage,
 	editModelRoles,
@@ -891,51 +896,37 @@ export function createApp(deps: AppDeps) {
 		"a GitHub token is required (ghp_… or github_pat_…, with repo access)";
 	/**
 	 * Hindsight server URL and API key from Settings; stored plaintext like apiKey (same trust
-	 * level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over config.yml, and the runner
+	 * level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over the env, and the runner
 	 * forwards the board's env to workers, so saved values reach every new turn and beat the
 	 * compose env that seeds them. Without either, the board leaves the env alone: its turns keep
 	 * omp's settings.
 	 */
 	let hindsightToken: string | null = null;
 	let hindsightUrl: string | null = null;
-	/**
-	 * docker/ottr-entry.sh flips `memory.backend` once at container start, from the env seed. The
-	 * board repeats that flip whenever a Settings-saved URL comes into effect, so a stack seeded
-	 * only from Settings still runs omp with memory.backend: hindsight. Two files can be in
-	 * play (R5-1): the pinned copy the board's own omp spawns read, and the shared one in the
-	 * workers' home that every worker turn reads — patch both when they differ, the one file
-	 * when they are the same (a direct install). A missing file is fine (the entry script's
-	 * `[ -f … ]`); anything unreadable throws.
-	 */
-	function hindsightBackendFlip(): void {
-		const pinned = join(agentDir(), "config.yml");
-		const shared = join(
-			process.env.HOME ?? homedir(),
-			".omp",
-			"agent",
-			"config.yml",
-		);
-		for (const path of pinned === shared ? [pinned] : [pinned, shared]) {
-			if (!existsSync(path)) continue;
-			const cfg = readFileSync(path, "utf8");
-			// The same line the entry script's sed targets; CRLF kept for Windows installs.
-			const next = cfg.replace(
-				/^([ \t]*)backend: mnemopi([ \t]*\r?)$/m,
-				"$1backend: hindsight$2",
-			);
-			if (next !== cfg) writeFileSync(path, next);
+	/** The board derives the memory backend from the env at spawn time (src/memory.ts) and passes
+	 *  a --config overlay (src/runner.ts); config.yml no longer matters (a stale backend line is
+	 *  inert). Health of the backend in effect, refreshed on boot, on save, and on a 60 s tick. */
+	let memoryHealth: MemoryHealth | null = null;
+	async function memoryHealthTick(): Promise<void> {
+		try {
+			memoryHealth = await checkMemoryHealth(memoryBackendFromEnv(process.env));
+		} catch (err) {
+			// checkMemoryHealth reports reasons instead of throwing; a throw is a bug in the
+			// plumbing, and it must never take the board down.
+			logError("memory health check", err);
 		}
 	}
 	function applyHindsight(): void {
 		if (hindsightUrl !== null) process.env.HINDSIGHT_API_URL = hindsightUrl;
 		if (hindsightToken !== null && process.env.HINDSIGHT_API_URL)
 			process.env.HINDSIGHT_API_TOKEN = hindsightToken;
-		if (process.env.HINDSIGHT_API_URL) hindsightBackendFlip();
 	}
 	function hindsightView() {
 		return {
 			url: process.env.HINDSIGHT_API_URL || null,
 			tokenSet: Boolean(process.env.HINDSIGHT_API_TOKEN),
+			backend: memoryBackendFromEnv(process.env).backend,
+			memoryReason: memoryHealth?.reason ?? null,
 		};
 	}
 	let provisioning = false;
@@ -1699,9 +1690,11 @@ export function createApp(deps: AppDeps) {
 	try {
 		applyHindsight();
 	} catch (err) {
-		// The saved URL and key stay in effect over the env; only the config.yml flip failed.
-		logError("hindsight backend switch", err);
+		// The saved URL and key stay in effect over the env; only the seeding failed.
+		logError("hindsight env seed", err);
 	}
+	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
+	void memoryHealthTick();
 	const logins = providerLogin();
 
 	function json(v: unknown, status = 200): Response {
@@ -2151,6 +2144,9 @@ export function createApp(deps: AppDeps) {
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),
+				...(memoryHealth?.reason !== null && memoryHealth !== null
+					? [`omp runs with no memory: ${memoryHealth.reason}`]
+					: []),
 			],
 			updates: updatesView(),
 			alatePendingSince,
@@ -3771,16 +3767,10 @@ export function createApp(deps: AppDeps) {
 					if (rawUrl !== "") hindsightUrl = rawUrl.replace(/\/+$/, "");
 					if (provided) hindsightToken = token;
 					saveConfig();
-					try {
-						applyHindsight();
-					} catch (err) {
-						return json(
-							{
-								error: `saved, but omp's memory backend did not switch to hindsight: ${errmsg(err)}`,
-							},
-							502,
-						);
-					}
+					// applyHindsight only seeds the env now, so it cannot throw by a flip;
+					// the fresh check makes the returned view report the new backend at once.
+					applyHindsight();
+					await memoryHealthTick();
 					return json(hindsightView());
 				}),
 		},
@@ -6189,6 +6179,7 @@ export function createApp(deps: AppDeps) {
 		sampleStats,
 		alateProvisionTick,
 		idleReviewTick,
+		memoryHealthTick,
 		refreshUpdates,
 		tokenReminderTick,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),

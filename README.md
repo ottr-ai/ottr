@@ -217,7 +217,14 @@ The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA`
 
 The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_API_URL` for fleet memory, and provider keys pass through from the host shell. [docs/WORKERS.md](docs/WORKERS.md) has the full topology, updates and crash story.
 
-Hindsight is the preferred way to share memory between workers. Without `HINDSIGHT_API_URL`, omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only containers on the same host see it. Set the URL to a [Hindsight](https://github.com/vectorize-io/hindsight) server, and every worker on every machine reads and writes the same memory. See [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
+Hindsight is the preferred way to share memory between workers. The board picks the
+backend from the deployment: set `HINDSIGHT_API_URL` (or save the URL under
+**Settings → Hindsight**), and every worker on every machine reads and writes the same
+memory on a [Hindsight](https://github.com/vectorize-io/hindsight) server. Without it,
+omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only
+containers on the same host see it. The board checks memory at boot and every 60 seconds;
+when omp runs with no memory, it warns with the reason. See
+[docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
 
 ### Bare metal
 

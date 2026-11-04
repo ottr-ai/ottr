@@ -3300,11 +3300,16 @@ function ModelRolesSection() {
 	);
 }
 
-/** The board's Hindsight server and whether a key is in effect; the key itself is write-only. */
-type HindsightView = { url: string | null; tokenSet: boolean };
+/** The board's Hindsight server, the active memory backend and why memory is off; the key itself is write-only. */
+type HindsightView = {
+	url: string | null;
+	tokenSet: boolean;
+	backend: "hindsight" | "mnemopi";
+	memoryReason: string | null;
+};
 
 /** Settings "Hindsight" section: the server URL and the key every turn's omp sends to it. */
-function HindsightSection() {
+export function HindsightSection() {
 	const [view, setView] = useState<HindsightView | null>(null);
 	const [url, setUrl] = useState("");
 	const [urlError, setUrlError] = useState<string | null>(null);
@@ -3333,16 +3338,17 @@ function HindsightSection() {
 			status={
 				view === null
 					? undefined
-					: view.url !== null
-						? { label: "On", tone: "ok" }
-						: { label: "Off", tone: "off" }
+					: view.backend === "hindsight"
+						? { label: "Memory backend: hindsight", tone: "ok" }
+						: { label: "Memory backend: mnemopi (the default)", tone: "off" }
 			}
 			hint={
-				view === null ? undefined : view.url === null ? (
+				view === null ? undefined : view.backend === "mnemopi" ? (
 					<>
-						This board's turns use omp's own memory settings:{" "}
-						<code>HINDSIGHT_API_URL</code> is not set and no server URL is
-						saved.
+						This board's turns keep their memory with mnemopi, omp's default.
+						The backend follows the deployment: a set{" "}
+						<code>HINDSIGHT_API_URL</code> or a URL saved here switches the
+						board to the Hindsight server at the next boot — never config.yml.
 					</>
 				) : (
 					<>
@@ -3369,7 +3375,7 @@ function HindsightSection() {
 								Server URL
 								<Help
 									label="Server URL"
-									text="The Hindsight memory server that the omp of each turn uses. Empty: turns use the HINDSIGHT_API_URL environment variable."
+									text="The Hindsight memory server that the omp of each turn uses. Empty: turns use the HINDSIGHT_API_URL environment variable; when that is empty too, the board runs mnemopi (omp's default)."
 								/>
 							</b>
 							<code>
@@ -3406,6 +3412,12 @@ function HindsightSection() {
 					</div>
 				</div>
 			</form>
+			{view?.memoryReason != null && (
+				<p className="hint notif-line" role="alert">
+					<Mark kind="warn" />
+					<span>omp runs with no memory: {view.memoryReason}</span>
+				</p>
+			)}
 			{urlError !== null && (
 				<p className="auth-error" role="alert">
 					{urlError}

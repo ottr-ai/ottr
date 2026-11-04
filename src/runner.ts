@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
+import { ensureMemoryOverlay } from "./memory.ts";
 import { platform } from "./platform/index.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
@@ -117,6 +118,8 @@ export function buildOmpArgs(o: {
 	skills?: string | null;
 	/** Non-empty caps the run's duration (`--max-time`); a hung check run must not hold a board slot forever. */
 	maxTime?: string | null;
+	/** Memory backend overlay path; null/omitted omits the `--config` pair (tests pin exact argv without it). */
+	memoryConfig?: string | null;
 }): string[] {
 	return [
 		"-p",
@@ -149,6 +152,9 @@ export function buildOmpArgs(o: {
 		"--no-lsp",
 		"--config",
 		NO_DISCOVERY_CONFIG,
+		// The memory overlay rides last among the configs: later overlays win per key, so the
+		// board's backend choice beats any stale `memory:` line in the extension's run.yml.
+		...(o.memoryConfig ? ["--config", o.memoryConfig] : []),
 		...(o.images ?? []).map((p) => `@${p}`),
 	];
 }
@@ -1044,6 +1050,8 @@ export function startRun(o: {
 	/** Non-empty caps the run's duration (`--max-time`); a review check run sets it so a hung
 	 * check cannot hold a board slot forever. */
 	maxTime?: string | null;
+	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — tests only). */
+	memoryConfigPath?: string | null;
 }): RunHandle {
 	const sink = createRunSink({
 		logPath: o.logPath,
@@ -1056,7 +1064,11 @@ export function startRun(o: {
 
 	// Context a no-stderr death reports (classify folds it into the failure reason): how the
 	// run was dispatched, how much it was asked to do, where, under which pid, for how long.
-	const args = buildOmpArgs(o);
+	const memoryConfig =
+		o.memoryConfigPath !== undefined
+			? o.memoryConfigPath
+			: ensureMemoryOverlay();
+	const args = buildOmpArgs({ ...o, memoryConfig });
 	const startedAt = Date.now();
 
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
@@ -1156,7 +1168,7 @@ export function startRun(o: {
 	const workerHandle = runWorker(
 		{
 			id: crypto.randomUUID(),
-			argv: buildOmpArgs(o),
+			argv: buildOmpArgs({ ...o, memoryConfig }),
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,

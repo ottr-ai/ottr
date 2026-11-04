@@ -3859,15 +3859,14 @@ describe("hindsight settings", () => {
 			if (v === undefined) delete process.env[k];
 			else process.env[k] = v;
 	});
-	// The backend flip edits ~/.omp/agent/config.yml: point HOME at a stand-in so the
-	// tests never touch the developer's own omp config.
+	// The board no longer edits ~/.omp/agent/config.yml: point HOME at a stand-in so a
+	// regression that writes there fails these tests instead of touching the developer's own
+	// omp config. flipCfg stays absent unless the board writes it.
 	const savedHome = process.env.HOME;
 	const flipHome = mkdtempSync(join(tmpdir(), "ottr-hindsight-home"));
-	mkdirSync(join(flipHome, ".omp", "agent"), { recursive: true });
 	const flipCfg = join(flipHome, ".omp", "agent", "config.yml");
 	beforeAll(() => {
 		process.env.HOME = flipHome;
-		writeFileSync(flipCfg, "memory:\n  backend: mnemopi\n");
 	});
 	afterAll(() => {
 		if (savedHome === undefined) delete process.env.HOME;
@@ -3877,9 +3876,11 @@ describe("hindsight settings", () => {
 	// A getter: after an assignment, TypeScript narrows a direct read for good.
 	const token = (): string | undefined => process.env.HINDSIGHT_API_TOKEN;
 	const set = (t: string) => post("/api/settings/hindsight", { token: t });
-	// A restarted server: a fresh app on the same store.
-	const boot = () =>
-		createApp({
+	// A restarted server: a fresh app on the same store, with its own HTTP surface so tests
+	// can read its view and state frame (the outer get/post hit the long-lived app instead).
+	// Returns its request fn and an awaited memory health tick.
+	const boot = () => {
+		const created = createApp({
 			gstore,
 			defaultDir: root,
 			projects: new Map(),
@@ -3900,6 +3901,29 @@ describe("hindsight settings", () => {
 			},
 			serverRef: { current: undefined },
 		});
+		const srv = Bun.serve({ port: 0, ...created.serveOptions });
+		created.serverRef.current = srv;
+		mounted.push(srv);
+		const call = (path: string, body?: unknown): Promise<Response> =>
+			fetch(new URL(path, srv.url), {
+				method: body === undefined ? "GET" : "POST",
+				headers: {
+					...(body === undefined ? {} : { "content-type": "application/json" }),
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			});
+		return { call, tick: () => created.memoryHealthTick() };
+	};
+	// The config blob keeps the last saved URL and key; tests that pin the env's effect
+	// start from a store without them.
+	const clearSavedHindsight = (): void => {
+		const cfg = gstore.get<Record<string, unknown>>("config");
+		if (cfg === null || typeof cfg !== "object") return;
+		const { hindsightUrl: _url, hindsightToken: _token, ...rest } = cfg;
+		gstore.set("config", rest);
+	};
 
 	test("Settings keeps only a key Hindsight accepts, hands it to new turns and reapplies it at boot", async () => {
 		process.env.HINDSIGHT_API_URL = url;
@@ -3912,6 +3936,9 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url,
 			tokenSet: true,
+			// The save's fresh check against the stand-in answered 2xx.
+			backend: "hindsight",
+			memoryReason: null,
 		});
 		expect(await (await get("/api/state")).text()).not.toContain("key-two");
 		// A restarted server starts from the env file's seed again; the stored key wins.
@@ -3968,6 +3995,8 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url: otherUrl,
 			tokenSet: true,
+			backend: "hindsight",
+			memoryReason: null,
 		});
 		expect(envUrl()).toBe(otherUrl);
 		// A malformed URL is rejected and leaves the env alone.
@@ -3979,6 +4008,8 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url: firstUrl,
 			tokenSet: true,
+			backend: "hindsight",
+			memoryReason: null,
 		});
 		expect(token()).toBe("key-two");
 		// A restarted server starts from the env file's seed again; the stored URL wins.
@@ -3988,69 +4019,154 @@ describe("hindsight settings", () => {
 		expect(token()).toBe("key-two");
 	});
 
-	test("a saved URL alone switches omp's memory backend, like the env seed does at container start", async () => {
+	test("boot derives the backend from the env: hindsight with a URL, mnemopi without", async () => {
+		clearSavedHindsight();
 		const standIn = Bun.serve({
 			port: 0,
 			fetch: () => new Response(null, { status: 200 }),
 		});
 		const standInUrl = `http://127.0.0.1:${standIn.port}`;
 		try {
-			// A stack whose env seed is empty: only the store's saved URL is in effect.
+			process.env.HINDSIGHT_API_URL = standInUrl;
+			process.env.HINDSIGHT_API_TOKEN = "key-two";
+			let booted = boot();
+			await booted.tick();
 			expect(
-				(
-					await post("/api/settings/hindsight", {
-						url: standInUrl,
-						token: "key-nine",
-					})
-				).status,
-			).toBe(200);
-			// Reset the flip target: the save above already switched it once.
-			writeFileSync(flipCfg, "memory:\n  backend: mnemopi\n");
-			delete process.env.HINDSIGHT_API_URL;
-			boot();
-			// The saved URL beats the (deleted) env seed and flips the shared config.
-			expect(await (await get("/api/settings/hindsight")).json()).toEqual({
+				await (await booted.call("/api/settings/hindsight")).json(),
+			).toEqual({
 				url: standInUrl,
 				tokenSet: true,
+				backend: "hindsight",
+				memoryReason: null,
 			});
-			expect(readFileSync(flipCfg, "utf8")).toContain("backend: hindsight");
-			// Idempotent: a boot with the backend already switched keeps it switched.
-			boot();
-			expect(readFileSync(flipCfg, "utf8")).toContain("backend: hindsight");
+			// The boot above never touched config.yml.
+			expect(existsSync(flipCfg)).toBe(false);
+			// A stale backend line from the old flip is inert: the env decides, and the
+			// board never rewrites the file.
+			mkdirSync(dirname(flipCfg), { recursive: true });
+			writeFileSync(flipCfg, "memory:\n  backend: hindsight\n");
+			delete process.env.HINDSIGHT_API_URL;
+			booted = boot();
+			await booted.tick();
+			expect(
+				await (await booted.call("/api/settings/hindsight")).json(),
+			).toEqual({
+				url: null,
+				tokenSet: true,
+				backend: "mnemopi",
+				memoryReason: null,
+			});
+			expect(readFileSync(flipCfg, "utf8")).toBe(
+				"memory:\n  backend: hindsight\n",
+			);
 		} finally {
 			standIn.stop(true);
 		}
 	});
 
-	test("the flip reaches the board's pinned agent config too, not only the workers' shared one", async () => {
-		const standIn = Bun.serve({
+	const stateWarnings = async (
+		call: (path: string) => Promise<Response>,
+	): Promise<string[]> =>
+		((await (await call("/api/state")).json()) as { warnings: string[] })
+			.warnings;
+
+	test("an unreachable server surfaces its reason in the view and the state warnings", async () => {
+		clearSavedHindsight();
+		const dead = Bun.serve({ port: 0, fetch: () => new Response(null) });
+		const deadUrl = `http://127.0.0.1:${dead.port}`;
+		dead.stop(true);
+		process.env.HINDSIGHT_API_URL = deadUrl;
+		const booted = boot();
+		await booted.tick();
+		const v = (await (await booted.call("/api/settings/hindsight")).json()) as {
+			backend: string;
+			memoryReason: string;
+		};
+		expect(v.backend).toBe("hindsight");
+		expect(v.memoryReason).toMatch(/did not answer/);
+		expect(await stateWarnings(booted.call)).toContain(
+			`omp runs with no memory: ${v.memoryReason}`,
+		);
+	});
+
+	test("a refused key surfaces a rejected-key reason that never names the key", async () => {
+		clearSavedHindsight();
+		const rejector = Bun.serve({
+			port: 0,
+			fetch: () => new Response(null, { status: 401 }),
+		});
+		try {
+			process.env.HINDSIGHT_API_URL = `http://127.0.0.1:${rejector.port}`;
+			process.env.HINDSIGHT_API_TOKEN = "secret-token-value";
+			const booted = boot();
+			await booted.tick();
+			const v = (await (
+				await booted.call("/api/settings/hindsight")
+			).json()) as { memoryReason: string };
+			expect(v.memoryReason).toMatch(/rejected the key/);
+			expect(v.memoryReason).not.toContain("secret-token-value");
+			expect(await stateWarnings(booted.call)).toContain(
+				`omp runs with no memory: ${v.memoryReason}`,
+			);
+		} finally {
+			rejector.stop(true);
+		}
+	});
+
+	test("a healthy server means a null reason and no memory warning", async () => {
+		clearSavedHindsight();
+		const healthy = Bun.serve({
 			port: 0,
 			fetch: () => new Response(null, { status: 200 }),
 		});
-		// R5-1: compose runs the board's omp against a pinned agent dir; its config.yml is
-		// a second file, and both copies must flip (workers read the shared one).
-		const pinnedDir = mkdtempSync(join(tmpdir(), "ottr-hindsight-pinned"));
-		const pinnedCfg = join(pinnedDir, "config.yml");
-		const savedPin = process.env.PI_CODING_AGENT_DIR;
-		process.env.PI_CODING_AGENT_DIR = pinnedDir;
 		try {
-			writeFileSync(pinnedCfg, "memory:\n  backend: mnemopi\n");
-			writeFileSync(flipCfg, "memory:\n  backend: mnemopi\n");
-			expect(
-				(
-					await post("/api/settings/hindsight", {
-						url: `http://127.0.0.1:${standIn.port}`,
-						token: "key-ten",
-					})
-				).status,
-			).toBe(200);
-			expect(readFileSync(pinnedCfg, "utf8")).toContain("backend: hindsight");
-			expect(readFileSync(flipCfg, "utf8")).toContain("backend: hindsight");
+			process.env.HINDSIGHT_API_URL = `http://127.0.0.1:${healthy.port}`;
+			process.env.HINDSIGHT_API_TOKEN = "key-two";
+			const booted = boot();
+			await booted.tick();
+			const v = (await (
+				await booted.call("/api/settings/hindsight")
+			).json()) as { memoryReason: string | null };
+			expect(v.memoryReason).toBeNull();
+			expect(await stateWarnings(booted.call)).not.toContain(
+				expect.stringMatching(/^omp runs with no memory:/),
+			);
 		} finally {
-			standIn.stop(true);
-			if (savedPin === undefined) delete process.env.PI_CODING_AGENT_DIR;
-			else process.env.PI_CODING_AGENT_DIR = savedPin;
-			rmSync(pinnedDir, { recursive: true, force: true });
+			healthy.stop(true);
+		}
+	});
+
+	test("a save reports the health of the new URL immediately", async () => {
+		clearSavedHindsight();
+		const dead = Bun.serve({ port: 0, fetch: () => new Response(null) });
+		const deadEndpoint = `http://127.0.0.1:${dead.port}`;
+		dead.stop(true);
+		process.env.HINDSIGHT_API_URL = deadEndpoint;
+		process.env.HINDSIGHT_API_TOKEN = "key-two";
+		const booted = boot();
+		await booted.tick();
+		const v = (await (await booted.call("/api/settings/hindsight")).json()) as {
+			memoryReason: string;
+		};
+		expect(v.memoryReason).toMatch(/did not answer/);
+		const healthy = Bun.serve({
+			port: 0,
+			fetch: () => new Response(null, { status: 200 }),
+		});
+		try {
+			const res = await booted.call("/api/settings/hindsight", {
+				url: `http://127.0.0.1:${healthy.port}`,
+				token: "key-two",
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				url: `http://127.0.0.1:${healthy.port}`,
+				tokenSet: true,
+				backend: "hindsight",
+				memoryReason: null,
+			});
+		} finally {
+			healthy.stop(true);
 		}
 	});
 });

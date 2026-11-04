@@ -540,6 +540,9 @@ setInterval(() => void app.alateProvisionTick(), 5 * 60_000);
 // two hours files the first due project's architecture-review card by itself.
 setInterval(() => void app.idleReviewTick(), 5 * 60_000);
 
+// Memory health: boot + interval, never per turn (docs/specs/memory-backend.md).
+setInterval(() => void app.memoryHealthTick(), 60_000);
+
 // 1 s diff tick: catches file-driven changes no code path writes (omp session titles, AGENTS.md
 // appearing, main-checkout dirtiness). ponytail: replace with fs watchers if the state build ever
 // shows in profiles. Every 5th tick a bare liveness ping.
