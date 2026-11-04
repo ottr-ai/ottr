@@ -74,7 +74,11 @@ turns and work turns all get the new omp. Two parts do the work:
    only place that moves the pin. The pin sits above the omp layer, near the end of
    the file, so a bump rebuilds only the last layers.
 2. Each host that runs the stack deploys `main` with `scripts/update-image.ts`, from
-   a clean `main` checkout. It fast-forwards `main` and builds the image, then it
+   a clean `main` checkout — this rolling flow serves only that deployment. A
+   deployment that runs a published release image (`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`,
+   README quick start) updates by moving its image tag: the script never runs
+   there (`scripts/` is not copied into the image), so it needs no per-runner
+   drain and no part of this flow. It fast-forwards `main` and builds the image, then it
    rolls the stack one runner at a time. A runner is a worker (its hostname, the
    compose service name) or the server itself (`local`). It stops when the
    checkout has uncommitted changes or commits that origin lacks, when

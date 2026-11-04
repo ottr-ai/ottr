@@ -15,12 +15,31 @@ Two workers (`worker-a`, `worker-b`) and the server run turns. The server also
 runs turns itself (merge turns, retro, the board check, and the board's own omp
 runs: release review, release, and work turns when no worker is configured).
 
+The stall is not hypothetical (2026-11-04 update log): 12:13:11Z — "17 turns
+run: the board holds new turns, and the restart follows when they finish"; at
+13:11Z the hold still stood, with 7 long turns still running (Stryker runs of
+1-3 h) and 20 cards queued behind it. `main` moves almost every hour on a busy
+board, so each hourly run holds new turns for up to 60 min and the board starts
+new turns only in the gaps between holds. Earlier runs also stopped with
+"stopped: git fetch origin main failed" (10:11Z, 11:11Z), which delayed the
+deploy without lifting the stall.
+
 ## Goal
 
 One runner at a time: drain it, wait until its turns end, recreate only its
 container with the new image, wait until it is healthy and connected, undrain
 it, then the next runner. The other runners keep working. An update never
 waits for the whole board to be idle.
+
+## Scope: which deployment uses it
+
+The rolling restart serves only the compose deployment whose update script
+builds from a source checkout on the host (`scripts/update-image.ts` running
+there). `Dockerfile.worker` copies only `src` and `extension` into the image,
+so `scripts/` never ships: a deployment that runs a published release image
+(`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`) cannot run the script at all. Such a
+deployment updates by moving its image tag, and it needs no per-runner drain.
+Nothing in the board's flow depends on the script existing.
 
 ## Evidence: what a server restart does to turns
 
@@ -61,6 +80,16 @@ per-runner hold carries no commit subjects and never shows in the notice bar:
 turns keep flowing on the other runners, so the user sees no stall. Like
 `drainUntil`, it lives in memory; a server recreate or restart clears it.
 
+The board gains no machinery beyond this map: no timer, no poller, no store
+rows, no UI. The map is read only where the board picks a runner: the turn
+claim checks the dispatch path before it prepares a turn, and the dispatch
+filters drained hostnames out of the round-robin. Both reads are plain clock
+comparisons; there is no background work that consults the map. With no
+update script calling the API the board behaves exactly as before: the map
+stays empty, every check falls through, a lapsed entry is inert until the
+next POST for that runner, and the only visible trace is today's board-wide
+hold notice, which per-runner holds never touch.
+
 ### API: `/api/drain` (src/app.ts)
 
 Same route, same guards (`api(req, ...)`: loopback trust, the Origin rule on
@@ -83,6 +112,35 @@ POST). Three changes:
   Response `{ until: number }`.
 - `DELETE /api/drain?runner=<id>`: clears that runner's hold, response
   `{ until: null }`. Without `runner`: today's board-wide clear.
+
+### Security
+
+The runner branches of `/api/drain` sit behind exactly today's walls: the same
+route guard (loopback trust from the server's own container, session auth for
+everywhere else), the Origin check on POST and DELETE, and a bounded hold that
+lapses by itself after `DRAIN_MS` and only lasts longer when a caller keeps
+renewing it. Input is strict: a POST runner must be a string and a known id
+(a worker hostname from `OTTR_WORKER_URLS`, or `local`), else 400; a DELETE
+with an unknown id clears nothing and answers the same shape either way
+(idempotent, so it leaks nothing).
+
+What a caller can do is only what the board already lets the hold do, narrowed
+to one runner: stop new turns from starting on that runner for a bounded time.
+It cannot pick the runner a turn uses (the round-robin still chooses among the
+undrained workers), cannot stop or cancel a running turn, and cannot reach a
+container — the API holds no exec path, and the id only validates against the
+registry.
+
+Who can reach it, and why that is no worse than today: true loopback exists
+only inside the server's own container, where the update script's exec, the
+board check, and `docker compose exec server` already sit. A server-side turn
+(the omp run behind a merge turn or a release review) also runs there and
+could hold a runner — but the same process can already hold the whole board
+with today's board-wide `POST /api/drain`, so per-runner holds add no power.
+A worker cannot reach the route: worker-to-board traffic goes to
+`http://ottr:<port>`, where every route but the token-gated `create_task`
+answers 403, and the host-mapped port binds loopback only and wants the admin
+login.
 
 ### Turn gates (src/turn.ts)
 
