@@ -92,6 +92,7 @@ import {
 	projectLabel,
 	unwrap,
 	useBusy,
+	useDelayedState,
 	useFlash,
 	useQuota,
 	windowGone,
@@ -2450,6 +2451,10 @@ const EXPLAIN_PROJECT =
 /** Done lane page size: the cards shown before "Show more", and the step each click adds. */
 const DONE_PAGE = 20;
 
+/** Search apply delay: the lanes re-filter this long after the last keystroke, so swift
+ * typing on a big board re-renders once, not per keypress. */
+export const SEARCH_APPLY_MS = 150;
+
 /** Done order: latest landing first. doneAt stamps each entry into Done (the done clock);
  * a cancelled card orders by its cancel time. */
 const newestLanded = (a: TaskCard, b: TaskCard): number =>
@@ -2506,7 +2511,7 @@ export function cancelledTopic(
 }
 
 /** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
-function ProjectBoard({
+export function ProjectBoard({
 	project,
 	tasks,
 	deltas,
@@ -2560,7 +2565,9 @@ function ProjectBoard({
 		});
 	};
 	const [showDiagrams, setShowDiagrams] = useState(false);
-	const [query, setQuery] = useState("");
+	// The search box takes each keystroke uncontrolled; the filter lands after the
+	// pause (SEARCH_APPLY_MS), so a big board does not re-render per keypress.
+	const [applied, applySearch] = useDelayedState(SEARCH_APPLY_MS);
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
 	const [stage, setStage] = useState<Stage>("todo");
 	// Horizontal swipe on the board flips to the neighbor column; touch start point.
@@ -2594,7 +2601,7 @@ function ProjectBoard({
 			);
 			refreshState();
 		});
-	const q = query.trim().toLowerCase();
+	const q = applied.trim().toLowerCase();
 	/** One project interview endpoint call; its verdict becomes a board notice. */
 	const interview = (path: string, body: Record<string, unknown>) =>
 		act(async () => {
@@ -2605,7 +2612,7 @@ function ProjectBoard({
 			onNotice(interviewMsg(r.interview));
 		});
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
-	const { shown, counts } = laneCounts(tasks, query, seenAnswers);
+	const { shown, counts } = laneCounts(tasks, applied, seenAnswers);
 	const perStage = COLUMNS.map((c) => ({ ...c, ...counts[c.key] }));
 	// The search count matches the lanes: a retro off the board is no task to count.
 	const boardTotal = tasks.filter(onBoard).length;
@@ -2686,8 +2693,9 @@ function ProjectBoard({
 							className={q === "" ? "search" : "search filtered"}
 							placeholder="Search tasks"
 							aria-label="Search tasks"
-							value={query}
-							onChange={(e) => setQuery(e.target.value)}
+							// Uncontrolled: each keystroke stays in the DOM input, no board render.
+							defaultValue=""
+							onChange={(e) => applySearch(e.target.value)}
 						/>
 						<span
 							className="search-count"

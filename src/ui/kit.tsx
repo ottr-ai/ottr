@@ -422,6 +422,20 @@ export function useFlash(ms: number): [boolean, () => void] {
 	return [on, flash];
 }
 
+/** State that trails its setter by `ms`: each call resets the wait, the value lands
+ *  once the calls pause. Backs the board search: the box takes every keystroke, the
+ *  lanes re-filter after the pause, so swift typing on a big board renders once. */
+export function useDelayedState(ms: number): [string, (value: string) => void] {
+	const [delayed, setDelayed] = useState("");
+	const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	useEffect(() => () => clearTimeout(timer.current), []);
+	const set = (value: string): void => {
+		clearTimeout(timer.current);
+		timer.current = setTimeout(() => setDelayed(value), ms);
+	};
+	return [delayed, set];
+}
+
 /** Server-touching button: disabled with a spinner until the response arrives, error styling when it failed. */
 export function BusyButton({
 	run,

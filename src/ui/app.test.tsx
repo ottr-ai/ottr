@@ -48,6 +48,8 @@ const {
 	Drawer,
 	LogView,
 	openCardInProject,
+	ProjectBoard,
+	SEARCH_APPLY_MS,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -2906,5 +2908,181 @@ describe("LogView log slice controls", () => {
 		// Default is the turn's own section; the full log is the opt-in.
 		expect(html).toContain('aria-pressed="true"');
 		expect(html).toContain("(no log output yet)");
+	});
+});
+
+describe("ProjectBoard search delay", () => {
+	// React interaction needs browser globals; bun test has none. The same happy-dom
+	// swap as settings.test.tsx: installed after app.tsx's import (its browser mount
+	// guard reads document at module load), removed after this file's tests.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	/** The production onChange React rendered onto the node; happy-dom's dispatched
+	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	/** The board with three queued cards: "docs" matches exactly one. */
+	async function mountBoard(): Promise<{
+		container: HTMLDivElement;
+		input: HTMLInputElement;
+		unmount: () => Promise<void>;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const tasks = [
+			cardFixture({ id: "t1", title: "Fix bug", sessionTitle: "Fix bug" }),
+			cardFixture({
+				id: "t2",
+				title: "Write docs",
+				sessionTitle: "Write docs",
+			}),
+			cardFixture({ id: "t3", title: "Add icon", sessionTitle: "Add icon" }),
+		];
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		await act(async () => {
+			root.render(
+				<ProjectBoard
+					project={project}
+					tasks={tasks}
+					deltas={new Map()}
+					open={() => {}}
+					seenAnswers={new Set()}
+					compose={() => {}}
+					composeDraft={() => {}}
+					act={async () => true}
+					onNotice={() => {}}
+					draining={false}
+				/>,
+			);
+		});
+		const input = container.querySelector(
+			'input[aria-label="Search tasks"]',
+		) as HTMLInputElement | null;
+		if (input === null) throw new Error("search input missing");
+		return {
+			container,
+			input,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+			},
+		};
+	}
+
+	test("the task search re-filters only after the typing settles", async () => {
+		const { container, input, unmount } = await mountBoard();
+		try {
+			const count = (): string | null =>
+				container.querySelector(".search-count")?.textContent ?? null;
+			const cards = (): string[] =>
+				[...container.querySelectorAll("[data-task-id]")].map(
+					(el) => (el as HTMLElement).dataset.taskId ?? "",
+				);
+			expect(count()).toBe("3");
+			expect(input.value).toBe("");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			// Each phase is its own act: React defers an update from the apply timer to
+			// the act scope's exit, so the flush lands between phases, before the assert.
+			await act(async () => {
+				typeInto(input, "docs");
+				onChangeOf(input)({ target: { value: "docs" } });
+			});
+			// Inside the wait window the deadline has not passed: nothing filters.
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS - 100);
+			});
+			expect(count()).toBe("3");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			// Past the deadline, one card matches and the count box says so.
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 60);
+			});
+			expect(count()).toBe("1/3");
+			expect(cards()).toEqual(["t2"]);
+			// Clearing waits the same way, then brings every card back.
+			await act(async () => {
+				typeInto(input, "");
+				onChangeOf(input)({ target: { value: "" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS - 100);
+			});
+			expect(count()).toBe("1/3");
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 60);
+			});
+			expect(count()).toBe("3");
+			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
+			expect(
+				container
+					.querySelector(".search-group")
+					?.classList.contains("filtered"),
+			).toBe(false);
+		} finally {
+			await unmount();
+		}
 	});
 });
