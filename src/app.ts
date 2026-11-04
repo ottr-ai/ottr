@@ -5243,16 +5243,24 @@ export function createApp(deps: AppDeps) {
 					const trimmed = prompt.trim();
 					if (!trimmed || trimmed.length > 20000)
 						return json({ error: "prompt must be 1-20000 characters" }, 400);
-					// Editable only before the first work turn exists; the check and the write are sync, so the
-					// scheduler (same event loop) cannot start a turn in between.
+					// Editable only while the card still waits unclaimed: a todo card as queued, a
+					// backlog card parked idle. A preparing claim has already consumed the prompt
+					// (its turn row only appears at startRun, after the git and worktree
+					// preparation), so a rewrite there would never reach the run. The check and the
+					// write are sync, so the scheduler (same event loop) cannot start a turn in
+					// between.
 					if (
-						(task.stage !== "todo" && task.stage !== "backlog") ||
+						!(
+							(task.stage === "todo" && task.state === "queued") ||
+							(task.stage === "backlog" && task.state === "idle")
+						) ||
 						task.cancelledAt !== null ||
 						e.store.listTurns(task.id).length > 0
 					)
 						return json(
 							{
-								error: "only unstarted todo or backlog tasks can be edited",
+								error:
+									"only a queued todo task or a parked backlog task can be edited",
 							},
 							409,
 						);

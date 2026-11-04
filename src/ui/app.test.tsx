@@ -1667,7 +1667,7 @@ describe("Drawer prompt markdown", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "todo",
-			state: "idle",
+			state: "queued",
 			prompt: "fix the `align` flow",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -1693,6 +1693,19 @@ describe("Drawer prompt markdown", () => {
 		const merged = renderToStaticMarkup(<Drawer {...base} task={done} />);
 		expect(merged).toContain('class="prompt-text"');
 		expect(merged).not.toContain("Edit task");
+	});
+
+	test("a preparing card shows the prompt read-only without an edit button", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "preparing",
+			prompt: "fix the `align` flow",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('class="prompt-text"');
+		expect(html).not.toContain('class="task-prompt"');
+		expect(html).not.toContain("Edit task");
 	});
 
 	test("queued steering renders markdown in the you bubble", () => {

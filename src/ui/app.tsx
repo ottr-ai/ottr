@@ -6949,10 +6949,13 @@ export function Drawer({
 			}),
 		);
 	};
-	// Non-null while the prompt editor is open; unstarted todo and parked backlog cards get one.
+	// Non-null while the prompt editor is open; a card still waiting gets one: queued in
+	// todo, parked idle in backlog. A preparing claim already consumed the prompt, so
+	// editing it would be lost.
 	const [edit, setEdit] = useState<string | null>(null);
 	const editable =
-		(task.stage === "todo" || task.stage === "backlog") &&
+		((task.stage === "todo" && task.state === "queued") ||
+			(task.stage === "backlog" && task.state === "idle")) &&
 		task.turns.length === 0 &&
 		!cancelled;
 	const editValid =

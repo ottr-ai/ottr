@@ -920,6 +920,52 @@ describe("task routes", () => {
 		expect(unknownId.status).toBe(404);
 	});
 
+	test("a preparing or parked card cannot be edited, even with no turn row yet", async () => {
+		// A claimed card has no turn row until startRun, so the no-turns check alone
+		// would let an edit land on a prompt the preparing run already consumed.
+		const preparing = store.createTask("claimed for a run");
+		store.updateTask(preparing.id, { state: "preparing" });
+		const res = await post(`/api/projects/p1/tasks/${preparing.id}/edit`, {
+			prompt: "too late",
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"only a queued todo task or a parked backlog task can be edited",
+		);
+		expect(store.getTask(preparing.id)?.prompt).toBe("claimed for a run");
+		const parked = store.createTask("parked before the first turn");
+		store.updateTask(parked.id, {
+			state: "needs_you",
+			needsReason: "held",
+		});
+		const parkedRes = await post(`/api/projects/p1/tasks/${parked.id}/edit`, {
+			prompt: "also too late",
+		});
+		expect(parkedRes.status).toBe(409);
+		expect(store.getTask(parked.id)?.prompt).toBe(
+			"parked before the first turn",
+		);
+		// A backlog card still edits while parked idle, but not once a grill turn claimed it.
+		const backlog = store.createTask("backlog draft");
+		store.updateTask(backlog.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const backlogRes = await post(`/api/projects/p1/tasks/${backlog.id}/edit`, {
+			prompt: "edited while parked",
+		});
+		expect(backlogRes.status).toBe(200);
+		expect(store.getTask(backlog.id)?.prompt).toBe("edited while parked");
+		store.updateTask(backlog.id, { state: "preparing" });
+		const grillingRes = await post(
+			`/api/projects/p1/tasks/${backlog.id}/edit`,
+			{ prompt: "edited while grilling" },
+		);
+		expect(grillingRes.status).toBe(409);
+		expect(store.getTask(backlog.id)?.prompt).toBe("edited while parked");
+	});
+
 	test("a retro id passes the route checks; a traversal shape still fails", async () => {
 		const source = store.createTask("retro source");
 		const retro = store.createTask(
