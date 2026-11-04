@@ -6535,7 +6535,7 @@ export function OrphanNotice(props: {
 						<Icon name="info" size={16} />
 						<span>
 							pid {o.pid}
-							{o.started > 0 && <> · started {age(o.started, nowMs)} ago</>}
+							{o.started > 0 && <> · started {age(o.started, nowMs)}</>}
 							{o.kind !== null && <> · {o.kind}</>}
 							{o.project !== null && <> · {o.project}</>} ·{" "}
 							{card !== null && (
