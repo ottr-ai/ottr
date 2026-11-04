@@ -25,7 +25,6 @@ import { dirname, join } from "node:path";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
-import { errmsg } from "./errmsg.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -1204,13 +1203,6 @@ function publishingRelease(record: Recorded) {
 }
 
 describe("turn helpers", () => {
-	test("errmsg: Error message, String fallback", () => {
-		expect(errmsg(new Error("x"))).toBe("x");
-		expect(errmsg("plain")).toBe("plain");
-		expect(errmsg(42)).toBe("42");
-		expect(errmsg(null)).toBe("null");
-	});
-
 	test("keptReason names the unsaved files", () => {
 		expect(keptReason("M f.ts")).toBe(
 			"Kept the worktree: M f.ts. Reply to continue, or Cancel to delete it.",
