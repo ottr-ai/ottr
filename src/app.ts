@@ -1901,7 +1901,9 @@ export function createApp(deps: AppDeps) {
 		return res;
 	}
 
-	/** Reads a raw (non-JSON) body with the same streamed byte cap as readJson (R1-2). */
+	/** Reads a body with a streamed byte cap; readJson parses on top of it. `req.text()` would
+	 * buffer a chunked (no Content-Length) body unbounded before the size check, so an
+	 * unauthenticated client can exhaust memory (R1-2). Cancel the source at the cap. */
 	async function readBytes(
 		req: Request,
 		maxBytes: number,
@@ -1947,29 +1949,9 @@ export function createApp(deps: AppDeps) {
 			};
 		// The Origin check lives in api() (originWall): it must cover POSTs that never call
 		// readJson too (R1-2).
-		const declared = Number(req.headers.get("content-length"));
-		if (Number.isFinite(declared) && declared > maxBytes)
-			return { error: json({ error: "body too large" }, 413) };
-		// Stream the body with a byte cap: `req.text()` would buffer a chunked (no
-		// Content-Length) body unbounded before the size check, so an unauthenticated
-		// client can exhaust memory (R1-2). Cancel the source at the cap.
-		let size = 0;
-		let text = "";
-		const decoder = new TextDecoder();
-		const reader = req.body?.getReader();
-		if (reader !== undefined) {
-			for (;;) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				size += value.byteLength;
-				if (size > maxBytes) {
-					await reader.cancel();
-					return { error: json({ error: "body too large" }, 413) };
-				}
-				text += decoder.decode(value, { stream: true });
-			}
-			text += decoder.decode();
-		}
+		const read = await readBytes(req, maxBytes);
+		if ("error" in read) return read;
+		const text = new TextDecoder().decode(read.bytes);
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(text);
