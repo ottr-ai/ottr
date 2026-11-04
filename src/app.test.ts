@@ -36,6 +36,7 @@ import {
 	storedProjectPaths,
 } from "./app.ts";
 import { hashPassword, signSession } from "./auth.ts";
+import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
@@ -48,6 +49,7 @@ import {
 	BOARD_CHECK_PROMPT,
 	FORK_PROPOSED_REASON_PREFIX,
 	forkProposedReason,
+	RELEASE_SUMMARY_INSTRUCTIONS,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 	WORK_CHECK_SENDBACK_OPENING,
@@ -355,6 +357,10 @@ function mount(
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
 		schedule?: () => void;
+		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
+		releaseSummarySpawn?: Parameters<
+			typeof createApp
+		>[0]["releaseSummarySpawn"];
 	} = {},
 ) {
 	const g =
@@ -402,6 +408,7 @@ function mount(
 		sshDir: input.sshDir,
 		keyscan: input.keyscan,
 		models: input.models,
+		releaseSummarySpawn: input.releaseSummarySpawn,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -3800,6 +3807,237 @@ describe("release notes route", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(store.getTask(t.id)!.releaseNotes).toBe("new notes");
+	});
+});
+
+describe("release-summary route", () => {
+	// The route plans a real release, so the project needs a git repo; each test builds its
+	// own checkout under root and removes it afterwards (same pattern as the drawer tests).
+	const run = (dir: string, cmd: string): string =>
+		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+	const commit = (dir: string, file: string, msg: string): string => {
+		writeFileSync(join(dir, file), "x");
+		run(dir, `git add ${file} && git commit -qm '${msg}'`);
+		return run(dir, "git rev-parse HEAD");
+	};
+
+	const setup = (
+		name: string,
+		opts: { tag?: boolean } = {},
+	): {
+		dir: string;
+		store: ProjectStore;
+		projects: Map<string, Entry>;
+		cleanup: () => void;
+	} => {
+		const dir = join(root, name);
+		mkdirSync(dir, { recursive: true });
+		run(dir, "git init -q -b main");
+		run(dir, "git config user.email t@t && git config user.name t");
+		const seed = commit(dir, "seed.txt", "seed");
+		if (opts.tag !== false) run(dir, `git tag v0.1.0 ${seed}`);
+		commit(dir, "feat.txt", "feat: consolidated feature");
+		const store = ProjectStore.open(dir);
+		// One done card inside the release window, with the merge counter includedTasks reads.
+		const t = store.createTask("add the feature");
+		// Entering Done stamps done_at (updateTask), which includedTasks reads; the
+		// merge counter makes this card the one inside the release window.
+		store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			commits: 1,
+		});
+		const entry: Entry = {
+			path: dir,
+			name,
+			store,
+			target: "main",
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return {
+			dir,
+			store,
+			projects: new Map([[name, entry]]),
+			cleanup: () => rmSync(dir, { recursive: true, force: true }),
+		};
+	};
+
+	const gateway = (content: string) => {
+		const calls: string[] = [];
+		const spawn: SpawnFn = async (_argv, o) => {
+			calls.push(JSON.parse(o.stdin).body.messages[0].content);
+			return {
+				code: 0,
+				stdout: [
+					JSON.stringify({ ready: true }),
+					JSON.stringify({
+						id: 1,
+						status: 200,
+						body: { choices: [{ message: { content } }] },
+					}),
+				].join("\n"),
+				stderr: "",
+			};
+		};
+		return { calls, spawn };
+	};
+
+	test("answers the fake gateway summary with reason null", async () => {
+		const s = setup("p-relsum");
+		const gw = gateway("## Highlights\n\n- Consolidated");
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				summary: string | null;
+				reason: string | null;
+			};
+			expect(b.summary).toBe("## Highlights\n\n- Consolidated");
+			expect(b.reason).toBeNull();
+			expect(gw.calls).toHaveLength(1);
+			expect(gw.calls[0]).toBe(RELEASE_SUMMARY_INSTRUCTIONS);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("first release without a tag skips the model call", async () => {
+		const s = setup("p-relsum-first", { tag: false });
+		const gw = gateway("should never run");
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum-first/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ summary: null, reason: null });
+			expect(gw.calls).toHaveLength(0);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a failing gateway answers the fallback with 200", async () => {
+		const s = setup("p-relsum-fail");
+		const spawn: SpawnFn = async () => ({
+			code: 1,
+			stdout: "",
+			stderr: "no quota",
+		});
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				releaseSummarySpawn: spawn,
+			});
+			const res = await call("/api/projects/p-relsum-fail/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				summary: string | null;
+				reason: string | null;
+			};
+			expect(b.summary).toBeNull();
+			expect(b.reason).toMatch(/no quota/);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("rejects a bad sha with 400", async () => {
+		const s = setup("p-relsum-sha");
+		const gw = gateway("no");
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			for (const sha of ["zzz", "abc", "x".repeat(41), 5]) {
+				const res = await call("/api/projects/p-relsum-sha/release-summary", {
+					sha,
+				});
+				expect(res.status).toBe(400);
+				expect(await errorOf(res)).toBe(
+					"sha must be a 7-40 character hex string",
+				);
+			}
+			expect(gw.calls).toHaveLength(0);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("POST /release accepts notes and lands them on the release card", async () => {
+		const s = setup("p-relnotes");
+		try {
+			const { call } = mount({ projects: s.projects });
+			const res = await call("/api/projects/p-relnotes/release", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+				notes: "user edited notes",
+			});
+			expect(res.status).toBe(200);
+			const release = s.store
+				.listTasks()
+				.find((t) => t.releaseVersion !== null);
+			expect(release?.releaseNotes).toBe("user edited notes");
+			expect(release?.prompt).toContain("user edited notes");
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("POST /release without notes keeps the planned notes", async () => {
+		const s = setup("p-relnotes-plain");
+		try {
+			const { call } = mount({ projects: s.projects });
+			const res = await call("/api/projects/p-relnotes-plain/release", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const release = s.store
+				.listTasks()
+				.find((t) => t.releaseVersion !== null);
+			// No notes: the card stores plan.notes verbatim, rendered by computeRelease.
+			expect(release?.releaseNotes).toBe(
+				"## New features\n\n- Consolidated feature",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("POST /release rejects bad notes with 400", async () => {
+		const s = setup("p-relnotes-bad");
+		try {
+			const { call } = mount({ projects: s.projects });
+			for (const notes of [42, "", "   ", "x".repeat(20001)]) {
+				const res = await call("/api/projects/p-relnotes-bad/release", {
+					sha: run(s.dir, "git rev-parse HEAD"),
+					notes,
+				});
+				expect(res.status).toBe(400);
+				expect(await errorOf(res)).toBe(
+					"notes must be a string of 1-20000 characters",
+				);
+			}
+		} finally {
+			s.cleanup();
+		}
 	});
 });
 

@@ -2175,6 +2175,26 @@ button.notif-link {
 	border: 1px solid var(--line-soft);
 	border-radius: 4px;
 }
+/* The editable release-notes proposal and its full-commit-list toggle reuse the same tokens
+as the read-only notes box and the advisory's link-style action. */
+.release-notes-input {
+	width: 100%;
+	min-height: 14em;
+	padding: 10px 12px;
+	background: var(--well);
+	font-size: 12.5px;
+	line-height: 1.6;
+}
+.release-notes-toggle {
+	margin-top: 2px;
+	padding: 0;
+	color: var(--accent);
+	background: transparent;
+	border: none;
+}
+.release-notes-toggle:hover {
+	color: var(--accent-hover);
+}
 /* Late commits between a release's reviewed commit and the target head: sha, subject, and the
 mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 1.4.1). */
 .late-commits {

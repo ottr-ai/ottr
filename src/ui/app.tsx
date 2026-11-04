@@ -2342,6 +2342,11 @@ function ReleaseDialog({
 	const [loading, setLoading] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [err, setErr] = useState<string | null>(null);
+	const [notesDraft, setNotesDraft] = useState<string | null>(null);
+	const [summaryBusy, setSummaryBusy] = useState(false);
+	const [summaryReason, setSummaryReason] = useState<string | null>(null);
+	const [showCommits, setShowCommits] = useState(false);
+	const edited = useRef(false);
 	const catalog = useModels();
 	const { model, setModel, modelQuery, setModelQuery, roleModel } =
 		useReviewModel(open, catalog);
@@ -2355,19 +2360,52 @@ function ReleaseDialog({
 		setPlan(null);
 		setLoadError(null);
 		setErr(null);
+		setNotesDraft(null);
+		setSummaryBusy(false);
+		setSummaryReason(null);
+		setShowCommits(false);
+		edited.current = false;
 		setLoading(true);
+		let alive = true;
 		// unwrap: a non-JSON 200 must surface as a load error, not an empty dialog.
 		fetch(`/api/projects/${encodeURIComponent(project.name)}/release`)
 			.then((r) => unwrap<ReleasePlan>(r))
 			.then((data) => {
+				if (!alive) return;
 				setPlan(data);
 				setVersion(data.version);
+				if (data.from !== null) {
+					setSummaryBusy(true);
+					post<{ summary: string | null; reason: string | null }>(
+						`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
+						{ sha: data.sha },
+					)
+						.then((res) => {
+							if (!alive) return;
+							if (res.summary !== null) {
+								if (!edited.current) setNotesDraft(res.summary);
+							} else {
+								setSummaryReason(res.reason);
+							}
+						})
+						.catch((e) => {
+							if (alive)
+								setSummaryReason(e instanceof Error ? e.message : String(e));
+						})
+						.finally(() => {
+							if (alive) setSummaryBusy(false);
+						});
+				}
 			})
 			.catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
 			.finally(() => setLoading(false));
+		return () => {
+			alive = false;
+		};
 	}, [open, project.name]);
 	const start = (): void => {
 		if (plan === null || plan.blocked !== null || !versionOk) return;
+		const proposal = notesDraft ?? plan.notes;
 		send.start(() =>
 			act(async () => {
 				await post<TaskView>(
@@ -2376,6 +2414,7 @@ function ReleaseDialog({
 						sha: plan.sha,
 						version: version !== plan.version ? version : undefined,
 						model: model || undefined,
+						notes: proposal !== plan.notes ? proposal : undefined,
 					},
 				);
 				onClose(); // the release card arrives through polling
@@ -2436,9 +2475,47 @@ function ReleaseDialog({
 								))}
 							</ul>
 						)}
-						<div className="release-notes">
-							<Markdown text={plan.notes} />
-						</div>
+						{summaryBusy && (
+							<p className="hint" role="status">
+								<span className="spinner" aria-hidden="true" />
+								Consolidating the notes…
+							</p>
+						)}
+						{summaryReason !== null && (
+							<p className="advisory">
+								<Icon name="info" size={14} />
+								{`Consolidated notes unavailable: ${summaryReason} — showing the deterministic list.`}
+							</p>
+						)}
+						<label htmlFor="release-notes-proposal">Release notes</label>
+						<textarea
+							id="release-notes-proposal"
+							rows={10}
+							spellCheck={false}
+							className="release-notes-input"
+							value={notesDraft ?? plan.notes}
+							onChange={(e) => {
+								setNotesDraft(e.target.value);
+								edited.current = e.target.value !== plan.notes;
+							}}
+						/>
+						{plan.from !== null && (
+							<button
+								type="button"
+								className="release-notes-toggle"
+								aria-pressed={showCommits}
+								onClick={() => setShowCommits((v) => !v)}
+							>
+								{showCommits
+									? "Hide full commit list"
+									: "Show full commit list"}
+							</button>
+						)}
+						{showCommits && (
+							<div className="release-notes">
+								<Markdown text={plan.notes} />
+							</div>
+						)}
 						{plan.blocked !== null ? (
 							<p className="advisory">
 								<Icon name="info" size={14} />

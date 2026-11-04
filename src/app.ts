@@ -45,6 +45,7 @@ import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import { deepenDraft } from "./deepen.ts";
 import { errmsg } from "./errmsg.ts";
+import type { SpawnFn } from "./forkAnalysis.ts";
 import {
 	createForkWatcher,
 	forkSummary,
@@ -153,6 +154,7 @@ import {
 	releaseBlocked,
 	runGh,
 } from "./release.ts";
+import { summarizeRelease } from "./releaseSummary.ts";
 import {
 	directLoopback,
 	hostMatches,
@@ -385,6 +387,8 @@ interface AppDeps {
 	 * defaults to noRedirectFetch. Tests inject a stub.
 	 */
 	githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
+	/** Gateway spawn seam for the release-summary model call; defaults to the real spawn. Tests inject a stub. */
+	releaseSummarySpawn?: SpawnFn;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -4830,6 +4834,20 @@ export function createApp(deps: AppDeps) {
 							e.store.getSettings().releaseCommand,
 						) ?? plan.blocked;
 					if (blocked !== null) return json({ error: blocked }, 409);
+					// Optional user edit of the planned notes (the dialog's textarea).
+					const overrideNotes = r.body.notes;
+					if (
+						overrideNotes !== undefined &&
+						(typeof overrideNotes !== "string" ||
+							overrideNotes.trim().length < 1 ||
+							overrideNotes.length > 20_000)
+					)
+						return json(
+							{ error: "notes must be a string of 1-20000 characters" },
+							400,
+						);
+					const notes =
+						typeof overrideNotes === "string" ? overrideNotes : plan.notes;
 					const model = modelParam(r.body);
 					if (model instanceof Response) return model;
 					const t = e.store.createTask(
@@ -4838,7 +4856,7 @@ export function createApp(deps: AppDeps) {
 							from: plan.from,
 							sha: plan.sha,
 							commits: plan.commits,
-							notes: plan.notes,
+							notes,
 						}),
 						model,
 					);
@@ -4846,10 +4864,70 @@ export function createApp(deps: AppDeps) {
 					const updated = e.store.updateTask(t.id, {
 						base: plan.sha,
 						releaseVersion: version,
-						releaseNotes: plan.notes,
+						releaseNotes: notes,
 					});
 					deps.schedule();
 					return json({ ...updated, turns: [] });
+				}),
+		},
+		"/api/projects/:project/release-summary": {
+			POST: (req) =>
+				api(req, async () => {
+					const e = deps.projects.get(req.params.project);
+					if (e === undefined) return json({ error: "project not found" }, 404);
+					if (e.gitless)
+						return json({ error: "init a git repository first" }, 409);
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const sha = r.body.sha;
+					if (typeof sha !== "string" || /^[0-9a-f]{7,40}$/.test(sha) === false)
+						return json(
+							{ error: "sha must be a 7-40 character hex string" },
+							400,
+						);
+					let resolved: { target: string; sha: string };
+					try {
+						resolved = await resolveTarget(
+							e.path,
+							true,
+							e.store.getSettings().originUrl,
+							e.store.getSettings().targetBranch,
+						);
+					} catch (err) {
+						return json({ error: errmsg(err) }, 409);
+					}
+					const plan = await planRelease({
+						mainPath: e.path,
+						target: resolved.target,
+						sha,
+						originUrl: e.store.getSettings().originUrl,
+					}).catch((err) => json({ error: errmsg(err) }, 409));
+					if (plan instanceof Response) return plan;
+					// Before the first release there is nothing to consolidate: the dialog
+					// shows the deterministic notes and skips the model call.
+					if (plan.from === null) return json({ summary: null, reason: null });
+					// Window start: the last release tag's commit time; merges are serialized, so a
+					// task is in from..sha exactly when it finished after that commit landed.
+					const since =
+						Number(
+							(
+								await git(["log", "-1", "--format=%ct", plan.from], e.path)
+							).stdout.trim(),
+						) * 1000;
+					const all = e.store.listTasks();
+					const tasks = includedTasks(all, since);
+					const cards = tasks.map((t) => ({
+						id: t.id,
+						title: t.title,
+						details: all.find((x) => x.id === t.id)?.details ?? null,
+					}));
+					const result = await summarizeRelease({
+						notes: plan.notes,
+						cards,
+						spawn: deps.releaseSummarySpawn,
+					});
+					// The fallback is a normal outcome, not an error status.
+					return json(result);
 				}),
 		},
 		"/api/projects/:project/arch-review": {
