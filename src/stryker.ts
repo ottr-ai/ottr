@@ -71,6 +71,21 @@ export function mutateStatus(text: string): string | null {
 	return status;
 }
 
+/**
+ * The moving part of a progress text, else null: the percent and tested count of a Stryker
+ * line, the mutant count of a mutate.py line. A repeated line proves no movement — a hung
+ * Stryker run keeps ticking elapsed and remaining while its tested count freezes (ALAT-23) —
+ * and texts without numbers (a lock wait, bare "Stryker running") carry no evidence either.
+ * turn.ts records a progress movement only when this key changes.
+ */
+export function progressKey(text: string): string | null {
+	const m = [...text.matchAll(STRYKER_LINE)].at(-1);
+	if (m) return `${m[1]}/${m[4]}/${m[5]}`;
+	const mm = [...text.matchAll(MUTATE_LINE)].at(-1);
+	if (mm) return `${mm[1]}/${mm[2]}`;
+	return null;
+}
+
 function isStryker(pid: number): boolean {
 	try {
 		const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");

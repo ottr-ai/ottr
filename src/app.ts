@@ -331,8 +331,12 @@ interface AppDeps {
 		choices: unknown,
 	): Promise<FinishKeptOutcome>;
 	claimedPids(): Set<number>;
-	/** Live progress of the task's running turn (TaskCard.progress); absent in tests. */
-	progressOf?(project: string, id: string): string | null;
+	/** Live progress of the task's running turn (TaskCard.progress) and when its moving part
+	 * last changed (silentSince's activity, absent until the first numbered status); absent in tests. */
+	progressOf?(
+		project: string,
+		id: string,
+	): { text: string; at?: number } | null;
 	schedule: () => void;
 	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
 	 * Defaults to Date.now. */
@@ -2149,7 +2153,14 @@ export function createApp(deps: AppDeps) {
 						...card
 					} = t;
 					const progress = deps.progressOf?.(e.store.name, t.id);
-					const silent = silentSince(t, e.store.logPath(t.id), now);
+					const silent = silentSince(
+						t,
+						e.store.logPath(t.id),
+						now,
+						// Live progress movement counts as activity like a log write: a Stryker
+						// run whose meter moves keeps a silent log from warning (OTTR-448).
+						progress?.at,
+					);
 					cards.push({
 						...card,
 						steps: viewSteps(t),
@@ -2162,7 +2173,7 @@ export function createApp(deps: AppDeps) {
 						...(t.model === null
 							? { lastModel: e.store.lastTurnModel(t.id) }
 							: {}),
-						...(progress ? { progress } : {}),
+						...(progress ? { progress: progress.text } : {}),
 						...(silent !== null ? { silentSince: silent } : {}),
 					});
 				}

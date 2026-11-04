@@ -12,7 +12,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { platform } from "./platform/index.ts";
-import { mutateStatus, runProgress, strykerStatus } from "./stryker.ts";
+import {
+	mutateStatus,
+	progressKey,
+	runProgress,
+	strykerStatus,
+} from "./stryker.ts";
 
 const line = (
 	pct: number,
@@ -28,6 +33,27 @@ test("strykerStatus reads the newest progress line", () => {
 	expect(strykerStatus(log)).toBe(
 		"Stryker 68% · 4454/6523 · 38 survived (0.9%) · ~2h 59m elapsed · ~1h 23m left",
 	);
+});
+
+test("progressKey moves only when the numbers move (OTTR-469)", () => {
+	// Tested count and percent are the moving part; the newest line wins.
+	expect(progressKey(line(67, "~1h 30m", 4400))).toBe("67/4400/6523");
+	expect(
+		progressKey(`${line(67, "~1h 30m", 4400)}${line(68, "~1h 31m", 4454)}`),
+	).toBe("68/4454/6523");
+	// A frozen run still rewrites the line every 10 s: elapsed ticks alone are no movement.
+	expect(
+		progressKey(`${line(40, "~2h 0m", 2600)}${line(40, "~2h 1m", 2600)}`),
+	).toBe("40/2600/6523");
+	// A mutate.py line moves with its mutant count, survived tallies aside.
+	expect(progressKey(`${mline(19, 116, "KILLED", 1)}${mline(20, 116, "SURVIVED", 2)}`)).toBe(
+		"20/116",
+	);
+	// A repeated lock wait and texts without numbers carry no movement evidence.
+	expect(progressKey(waitLine(60900))).toBeNull();
+	expect(progressKey(waitLine(60901))).toBeNull();
+	expect(progressKey("Stryker running")).toBeNull();
+	expect(progressKey("INFO Initial test run succeeded.\n")).toBeNull();
 });
 
 test("strykerStatus rate rounding and omitted segments", () => {

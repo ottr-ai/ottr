@@ -12682,6 +12682,61 @@ describe("turn survivor round 5 — run setup", () => {
 		noTrackerError(store, task.id);
 	});
 
+	test("progressAt moves only when the progress numbers move (OTTR-469)", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		const task = store.createTask("work please");
+		let progress: ((text: string | null) => void) | undefined;
+		const { promise: gate, resolve: releaseDone } =
+			Promise.withResolvers<RunResult>();
+		const { promise: started, resolve: markStarted } =
+			Promise.withResolvers<void>();
+		const loop = loopFor(store, record, {
+			maxTotalRuns: () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o as never);
+				o.onSession?.("s1");
+				progress = o.onProgress;
+				markStarted();
+				return { pid: 4242, done: gate, kill: async () => {} };
+			},
+		});
+		const running = loop.runTurn(store.name, task.id);
+		await started;
+		const key = `${store.name}/${task.id}`;
+		const stryker = (pct: number, elapsed: string, tested: number): string =>
+			`Mutation testing ${pct}% (elapsed: ${elapsed}, remaining: ~1h 23m) ${tested}/6523 tested (38 survived)`;
+		// Fake clock: onProgress stamps Date.now(), so the tests pin exact stamps.
+		setSystemTime(new Date(1_800_000_000_000));
+		try {
+			// The first numbered status is a movement: the entry stamps when the meter moved.
+			progress?.(stryker(40, "~2h 0m", 2600));
+			const firstAt = loop.running.get(key)?.progressAt;
+			expect(firstAt).toBe(1_800_000_000_000);
+			expect(loop.running.get(key)?.progressKey).toBe("40/2600/6523");
+			// Elapsed ticks of a frozen run: the line repeats its numbers, the stamp stays.
+			setSystemTime(new Date(1_800_000_000_001));
+			progress?.(stryker(40, "~2h 1m", 2600));
+			expect(loop.running.get(key)?.progressAt).toBe(firstAt);
+			// The tested count moving is a movement: a fresh stamp.
+			setSystemTime(new Date(1_800_000_000_500));
+			progress?.(stryker(41, "~2h 1m", 2612));
+			expect(loop.running.get(key)?.progressAt).toBe(1_800_000_000_500);
+			// Text without numbers ends the movement; the stamp keeps the last movement.
+			progress?.(null);
+			expect(loop.running.get(key)?.progress).toBeUndefined();
+			expect(loop.running.get(key)?.progressKey).toBeUndefined();
+			expect(loop.running.get(key)?.progressAt).toBe(1_800_000_000_500);
+		} finally {
+			setSystemTime();
+		}
+		releaseDone(
+			runResult({ outcome: { status: "answered", summary: "did it" } }),
+		);
+		await running;
+		noTrackerError(store, task.id);
+	});
+
 	test("a repeated session report while running keeps the first session id", async () => {
 		const store = freshStore();
 		const record = baseRecord();

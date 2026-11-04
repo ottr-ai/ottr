@@ -617,7 +617,7 @@ function Card({
 	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
 	const silent =
 		task.silentSince !== undefined
-			? `No log output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
+			? `No output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
 			: null;
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.

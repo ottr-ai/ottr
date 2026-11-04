@@ -730,8 +730,9 @@ export type TaskCard = Omit<
 	progress?: string;
 	/** Model of the card's last run; present only when the card pins no model, so the chip can state what actually ran. */
 	lastModel?: string | null;
-	/** Epoch ms of the last log write, present only while a preparing or running card's log has been
-	 * silent past the board's limit (SILENT_LOG_MS in src/scheduler.ts): the agent may wait on a hung command. */
+	/** Epoch ms of the card's last activity (its log's last write, or the running turn's last
+	 * live-progress movement), present only while a preparing or running card has been silent past
+	 * the board's limit (SILENT_LOG_MS in src/scheduler.ts): the agent may wait on a hung command. */
 	silentSince?: number;
 	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
 	 * <version>"); present on release cards only, and only when the list is non-empty. */

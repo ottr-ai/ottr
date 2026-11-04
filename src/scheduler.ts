@@ -13,17 +13,23 @@ import type {
  * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
 export const SILENT_LOG_MS = 2 * 60 * 60_000;
 
-/** Last write of a preparing or running card's log once it has been silent past SILENT_LOG_MS;
- * null for other states, a fresher log, or no log yet. A log past the runner's 2 MiB cap keeps
+/** Last activity of a preparing or running card once it has been silent past SILENT_LOG_MS;
+ * null for other states, fresher activity, or no activity yet. Activity is the later of the
+ * log's last write and the running turn's last live-progress movement (`progressAt`, set by
+ * turn.ts when the progress numbers change — a Stryker run whose tested count no longer moves
+ * does not count, so a hung run still warns, ALAT-23). A log past the runner's 2 MiB cap keeps
  * its mtime current while output arrives (createRunSink), so the same rule covers it.
  * Floored so the 1 s state diff stays still. */
 export function silentSince(
 	t: Pick<Task, "state">,
 	logPath: string,
 	now: number,
+	progressAt?: number,
 ): number | null {
 	if (t.state !== "running" && t.state !== "preparing") return null;
-	const at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
+	let at = statSync(logPath, { throwIfNoEntry: false })?.mtimeMs;
+	if (progressAt !== undefined && (at === undefined || progressAt > at))
+		at = progressAt;
 	if (at === undefined || now - at <= SILENT_LOG_MS) return null;
 	return Math.floor(at);
 }

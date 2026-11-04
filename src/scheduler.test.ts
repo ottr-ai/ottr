@@ -70,6 +70,50 @@ describe("silentSince", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("live progress movement counts as activity beside the log mtime", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-silent-"));
+		try {
+			const log = join(dir, "card.log");
+			writeFileSync(log, "x");
+			const now = 1_800_000_000_000;
+			const setAt = (at: number): number => {
+				utimesSync(log, at / 1000, at / 1000);
+				return statSync(log).mtimeMs;
+			};
+			// Log silent past the limit, meter moved a minute ago: no warning (OTTR-448).
+			const logAt = setAt(now - SILENT_LOG_MS - 60_000);
+			expect(silentSince({ state: "running" }, log, now, now - 60_000)).toBe(
+				null,
+			);
+			// The silence dates from the later activity: here the log, the last progress
+			// movement being older.
+			const oldMove = setAt(now - SILENT_LOG_MS - 120_000);
+			expect(silentSince({ state: "running" }, log, now, logAt)).toBe(
+				Math.floor(logAt),
+			);
+			// A meter frozen past the limit (ALAT-23: elapsed ticks, tested count still)
+			// warns from its own last movement even with the log older still.
+			const frozen = setAt(now - SILENT_LOG_MS - 60_000);
+			utimesSync(log, (frozen - 120_000) / 1000, (frozen - 120_000) / 1000);
+			expect(silentSince({ state: "running" }, log, now, frozen)).toBe(
+				Math.floor(frozen),
+			);
+			// No movement recorded (no progress at all, or the demo board's static line):
+			// the log-only rule.
+			expect(silentSince({ state: "running" }, log, now)).toBe(
+				Math.floor(statSync(log).mtimeMs),
+			);
+			expect(oldMove).toBeLessThan(logAt); // the mixed case above really mixed
+			// A past movement warns with no log file yet (a preparing card).
+			const stale = now - SILENT_LOG_MS - 1000;
+			expect(
+				silentSince({ state: "running" }, join(dir, "none"), now, stale),
+			).toBe(stale);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("mergeAnywayPatch", () => {

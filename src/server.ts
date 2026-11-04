@@ -500,10 +500,17 @@ const app = createApp({
 	stopTurn: loop.stopTurn,
 	finishKept: loop.finishKept,
 	claimedPids,
-	progressOf: (project, id) =>
-		loop.running.get(`${project}/${id}`)?.progress ??
-		demoProgress?.get(`${project}/${id}`) ??
-		null,
+	progressOf: (project, id) => {
+		const entry = loop.running.get(`${project}/${id}`);
+		const text =
+			entry?.progress ?? demoProgress?.get(`${project}/${id}`) ?? null;
+		if (text === null) return null;
+		// The demo board's fabricated line never moves, so it carries no at: its card keeps
+		// the log-only warning rule (silentSince treats a missing at as no activity).
+		return entry?.progressAt !== undefined
+			? { text, at: entry.progressAt }
+			: { text };
+	},
 	schedule: loop.schedule,
 	serverVersion,
 	port: PORT,

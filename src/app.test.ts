@@ -244,6 +244,9 @@ let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
 	async () => {
 		throw new Error("deepen not stubbed");
 	};
+// Live progress the /api/state silent tests set ({ text, at }); null is the default:
+// no progress at all, the log-only warning rule.
+let fakeProgress: { text: string; at?: number } | null = null;
 const app = createApp({
 	gstore,
 	defaultDir: root,
@@ -254,6 +257,7 @@ const app = createApp({
 	projects,
 	...loopStubs(),
 	deepen: (prompt, model) => deepenImpl(prompt, model),
+	progressOf: () => fakeProgress,
 	schedule: () => {
 		calls++;
 	},
@@ -6123,6 +6127,50 @@ describe("silent live turns", () => {
 		c.sink.flush();
 		expect(statSync(store.logPath(c.id)).size).toBe(size);
 		expect(await silentSinceOf(c.id)).toBeUndefined();
+	});
+
+	test("a moving meter suppresses the warning; a frozen meter past the limit warns (OTTR-448)", async () => {
+		const now = Date.now();
+		const t = store.createTask("a metered running card");
+		store.updateTask(t.id, { stage: "in_progress", state: "running" });
+		const logPath = store.logPath(t.id);
+		mkdirSync(dirname(logPath), { recursive: true });
+		writeFileSync(logPath, "== work turn\n", { flag: "a" });
+		const wholeSecondsAgo = (ago: number): number =>
+			Math.floor((now - ago) / 1000) * 1000;
+		const logAt = wholeSecondsAgo(SILENT_LOG_MS + 120_000);
+		utimesSync(logPath, new Date(logAt), new Date(logAt));
+		const rowOf = async (): Promise<
+			{ id: string; silentSince?: number; progress?: string } | undefined
+		> => {
+			const body = (await (await get("/api/state")).json()) as {
+				tasks: Array<{
+					id: string;
+					silentSince?: number;
+					progress?: string;
+				}>;
+			};
+			return body.tasks.find((x) => x.id === t.id);
+		};
+		// The meter moved a minute ago: activity like a log write, no warning though the
+		// log has been silent for 3 h.
+		fakeProgress = {
+			text: "Stryker 40% · 2600/6523",
+			at: wholeSecondsAgo(60_000),
+		};
+		let row = await rowOf();
+		expect(row?.silentSince).toBeUndefined();
+		expect(row?.progress).toBe("Stryker 40% · 2600/6523");
+		// A meter whose numbers froze past the limit: the warning dates from its last move,
+		// not from the older log (ALAT-23).
+		const movedAt = wholeSecondsAgo(SILENT_LOG_MS + 60_000);
+		fakeProgress = { text: "Stryker 12% · 780/6523", at: movedAt };
+		row = await rowOf();
+		expect(row?.silentSince).toBe(movedAt);
+		// No progress at all: today's log-only rule.
+		fakeProgress = null;
+		row = await rowOf();
+		expect(row?.silentSince).toBe(logAt);
 	});
 });
 

@@ -85,6 +85,7 @@ import {
 	sessionModel,
 } from "./session.ts";
 import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
+import { progressKey } from "./stryker.ts";
 import type {
 	ArchReview,
 	DiffFileStat,
@@ -350,6 +351,12 @@ type RunEntry = {
 	abandoned?: boolean;
 	/** Live Stryker progress of the run (stryker.ts); the card shows it while the entry lives. */
 	progress?: string;
+	/** The moving part (stryker.ts progressKey) of the current progress text; undefined when
+	 * the text carries no numbers (a lock wait, bare "Stryker running"). */
+	progressKey?: string;
+	/** When the progress's moving part (progressKey) last changed: the live activity the
+	 * silent-log warning reads beside the log mtime. Undefined until the first numbered status. */
+	progressAt?: number;
 };
 
 export interface TurnOps {
@@ -1746,6 +1753,13 @@ export function createTurnLoop(
 				onLog: () => ops.notifyLog(name, id),
 				onProgress: (text) => {
 					if (entry === null) return;
+					// Only a movement of the numbers is live activity: a repeated line (elapsed
+					// ticks of a frozen run, a lock wait) proves nothing and must not reset the
+					// silent-log clock (ALAT-23).
+					const key = text === null ? null : progressKey(text);
+					if (key !== null && key !== entry.progressKey)
+						entry.progressAt = Date.now();
+					entry.progressKey = key ?? undefined;
 					entry.progress = text ?? undefined;
 					ops.publishSoon();
 				},
