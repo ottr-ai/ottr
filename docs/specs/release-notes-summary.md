@@ -11,8 +11,10 @@ click away, and the user edits and accepts in the dialog before a release starts
 ### Input (src/releaseSummary.ts, new)
 
 - Deterministic notes from `computeRelease` (the plan's `notes`).
-- For every card in `includedTasks` (the plan's `tasks`): id, title, and the card's latest
-  ready-report details (`Task.details` — the work prompt makes them the release notes).
+- For every card in `includedTasks` (the plan's `tasks`): id, title, and the card's ready
+  report — the latest settled turn with outcome `ready` (`store.listTurns`), whose details
+  the work prompt makes the release notes. `Task.details` is not a source: every settled
+  turn overwrites it (`turn.ts`), so it holds the merge turn's integration output.
 - Card details are trimmed to 1500 characters at a line boundary.
 - Total input is bounded to 80,000 characters. When over the bound, a first model pass
   summarizes the cards in chunks (each chunk input within half the bound, at most 10
@@ -108,9 +110,10 @@ click away, and the user edits and accepts in the dialog before a release starts
 - `src/app.test.ts`: the route answers the fake-gateway summary (200 shape, first release
   skips the call), the fallback shape on a failing gateway, and POST /release with and
   without a valid `notes` (400 on a non-string or oversized one).
-- Smoke run on the real ottr checkout over the v0.2.0..HEAD range: before (deterministic)
-  and after (consolidated) notes in the report, plus the smol-vs-default comparison the
-  model decision cites.
+- Smoke run on the real ottr checkout over the v0.2.0..HEAD range, with seeded cards whose
+  ready reports carry phrases absent from the commit messages, so the card-report path is
+  exercised live: before (deterministic) and after (consolidated) notes in the report,
+  plus the smol-vs-default comparison the model decision cites.
 - `bun run check` and `bun test` pass from the worktree root.
 - Impeccable detector on the changed UI files: no primary finding.
 

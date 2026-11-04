@@ -4916,11 +4916,21 @@ export function createApp(deps: AppDeps) {
 						) * 1000;
 					const all = e.store.listTasks();
 					const tasks = includedTasks(all, since);
-					const cards = tasks.map((t) => ({
-						id: t.id,
-						title: t.title,
-						details: all.find((x) => x.id === t.id)?.details ?? null,
-					}));
+					const cards = tasks.map((t) => {
+						// The release notes are the card's own ready report: the latest settled
+						// turn with outcome ready. Task.details is the wrong source — every
+						// settled turn overwrites it (turn.ts), so it holds the merge turn's
+						// integration output, not the notes.
+						const ready = e.store
+							.listTurns(t.id)
+							.filter((turn) => turn.outcome === "ready")
+							.at(-1);
+						return {
+							id: t.id,
+							title: t.title,
+							details: ready?.details ?? null,
+						};
+					});
 					const result = await summarizeRelease({
 						notes: plan.notes,
 						cards,

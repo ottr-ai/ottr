@@ -3847,6 +3847,22 @@ describe("release-summary route", () => {
 			state: "idle",
 			commits: 1,
 		});
+		// The card's release notes live in its ready report (the work turn's outcome
+		// details), not in Task.details: turn.ts overwrites the details with every
+		// settled turn, so the merge turn leaves the integration output there.
+		store.finishTurn(store.startTurn(t.id, "work", "work please", null).id, {
+			outcome: "ready",
+			summary: "did it",
+			details: "Release notes from the ready report: quokka counter",
+			endedAt: Date.now(),
+		});
+		store.finishTurn(store.startTurn(t.id, "merge", "merge please", null).id, {
+			outcome: "integrated",
+			summary: "merged",
+			details: "integration output: walrus stdout",
+			endedAt: Date.now(),
+		});
+		store.updateTask(t.id, { details: "integration output: walrus stdout" });
 		const entry: Entry = {
 			path: dir,
 			name,
@@ -3870,8 +3886,11 @@ describe("release-summary route", () => {
 
 	const gateway = (content: string) => {
 		const calls: string[] = [];
+		const users: string[] = [];
 		const spawn: SpawnFn = async (_argv, o) => {
-			calls.push(JSON.parse(o.stdin).body.messages[0].content);
+			const body = JSON.parse(o.stdin).body;
+			calls.push(body.messages[0].content);
+			users.push(body.messages[1].content);
 			return {
 				code: 0,
 				stdout: [
@@ -3885,7 +3904,7 @@ describe("release-summary route", () => {
 				stderr: "",
 			};
 		};
-		return { calls, spawn };
+		return { calls, users, spawn };
 	};
 
 	test("answers the fake gateway summary with reason null", async () => {
@@ -3908,6 +3927,36 @@ describe("release-summary route", () => {
 			expect(b.reason).toBeNull();
 			expect(gw.calls).toHaveLength(1);
 			expect(gw.calls[0]).toBe(RELEASE_SUMMARY_INSTRUCTIONS);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("card notes come from the ready report, not the overwritten details", async () => {
+		const s = setup("p-relsum-source");
+		const gw = gateway("## Highlights\n\n- Consolidated");
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum-source/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				summary: string | null;
+				reason: string | null;
+			};
+			expect(b.summary).toBe("## Highlights\n\n- Consolidated");
+			expect(b.reason).toBeNull();
+			// The model reads the ready report; the merge turn's integration output and
+			// the overwritten Task.details never reach it.
+			expect(gw.users[0]).toContain(
+				"Release notes from the ready report: quokka counter",
+			);
+			expect(gw.users[0]).toMatch(/- \[[A-Z0-9]+-\d+\] add the feature/);
+			expect(gw.users[0]).not.toContain("walrus");
 		} finally {
 			s.cleanup();
 		}
