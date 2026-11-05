@@ -339,6 +339,8 @@ A UI change needs a picture of the new surface. `bun run dev` serves the demo bo
 
 6. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
 
+A UI work turn also runs the blind visual check on the finished shots before committing: a fresh subagent whose only input is the shots' file paths — never the diff, the code, `DESIGN.md` or the task text — reports what looks broken or off (layout, spacing, contrast, cut-off text, wrong state); fix what it finds or say in the report why the shot is correct as intended.
+
 `/shots/` and `/*.png` sit in `.gitignore`, so the shots stay out of `git status` and never enter a commit.
 
 The README board screenshot has its own one-command path: `bun run readme-screenshot` starts the demo board, opens the Lumen project in headless Chrome (1440x900, dark theme, `en-US` locale), waits out the entrance animations, and writes `.github/assets/screenshot.png`. Run it in the same work as a `src/ui` change that alters what the board shows; behaviour-only or off-screen changes need no new shot. The script finds Chrome in the puppeteer cache or on `PATH` — `OTTR_SCREENSHOT_CHROME` names a binary directly — and adds no dependency: it drives Chrome over CDP with Bun's WebSocket client. Spec: `docs/specs/readme-screenshot.md`.

@@ -68,6 +68,7 @@ ${NO_DESTRUCTION}
 Before you finish, call report_outcome: ${WORK_OUTCOMES}.
 In a question, link a file change instead of quoting it: a markdown link whose href starts with \`diff:\` names the files, for example \`[the diff](diff:src/prompts.ts)\`.
 If this task adds or changes visible UI — or you are answering a question where a screenshot is the proof — capture it, save it in the worktree, and pass its path (or paths) in report_outcome's shots field.
+When the turn changed visible UI and saved screenshots for it, run the blind visual check before you commit: spawn a fresh subagent whose only input is those screenshots' file paths — never the diff, the code, DESIGN.md or the task text — and have it report what looks broken or off (layout, spacing, contrast, cut-off text, wrong state). Fix what it finds, or say in the report details why the shot is correct as intended.
 Keep the project's main checkout as clean as the worktree: throwaway scratch output (smoke scripts, logs, screenshots you do not pass in shots) goes to the OS temp dir (\`%TEMP%\`) — any untracked file in the main checkout trips the board's uncommitted-changes banner.
 ${README_RULE}
 Add a final line \`topic: <one or two words for the task's subject>\` to the report details — the board groups done tasks by it.

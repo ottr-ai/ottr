@@ -187,6 +187,17 @@ describe("scratch rule", () => {
 	});
 });
 
+describe("blind visual check", () => {
+	test("UI turns must run a screenshot-only critic before committing", () => {
+		const p = workPrompt({ text: "t", branch: "b", siblings: [] });
+		expect(p).toContain("run the blind visual check before you commit");
+		expect(p).toContain("only input is those screenshots' file paths");
+		// Blind means blind: no plan or code may leak into the critic's input.
+		expect(p).toContain("never the diff, the code, DESIGN.md or the task text");
+		expect(p).toContain("Fix what it finds");
+	});
+});
+
 describe("rename before report", () => {
 	test("work and merge prompts order the rename before the first report_outcome", () => {
 		const line =
