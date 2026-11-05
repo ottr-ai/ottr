@@ -1,10 +1,23 @@
-// Gate check: boot the real server on a scratch port and prove the home page bundles.
-// Catches what tsc/biome/bun test cannot: a broken index.html asset graph (500 "Build Failed").
+// Gate check: boot the real server from the file set the deployed image ships (the
+// Dockerfile.worker COPY list, node_modules linked) on a scratch port and prove the
+// home page bundles. Catches what tsc/biome/bun test cannot: an import of a file the
+// image does not ship (boot crash), and a broken index.html asset graph
+// (500 "Build Failed").
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+	chmodSync,
+	cpSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+} from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, posix, resolve } from "node:path";
 
 // ponytail: bind-0-then-close leaves a race window; fine for a dev gate, parse the
 // server's "Ottr on http://127.0.0.1:<port>" log line if a collision ever bites.
@@ -18,9 +31,97 @@ const port = await new Promise<number>((resolvePort, reject) => {
 	});
 });
 
+/** One Dockerfile.worker COPY line's context sources and their WORKDIR-relative
+ * destination, or null when the destination sits outside the app WORKDIR (the entry
+ * script: not a module path for src/server.ts). Throws on an unparsable line — the
+ * image build would fail too. `--from=` copies move files between build stages and
+ * contribute no context file, so they return null. */
+function parseCopy(
+	tokens: string[],
+	workdir: string,
+): { srcs: string[]; dest: string } | null {
+	if (tokens.some((t) => t.startsWith("--from="))) return null;
+	const args = tokens.slice(1).filter((t) => !t.startsWith("--"));
+	const dest = args.at(-1);
+	if (dest === undefined || args.length < 2)
+		throw new Error(
+			`boot-smoke: unparsable COPY in Dockerfile.worker: ${tokens.join(" ")}`,
+		);
+	const outside =
+		dest.startsWith("/") && dest !== workdir && !dest.startsWith(`${workdir}/`);
+	if (outside) return null;
+	const rel =
+		dest === workdir
+			? ""
+			: dest.startsWith("/")
+				? dest.slice(workdir.length + 1)
+				: dest;
+	return { srcs: args.slice(0, -1), dest: posix.normalize(rel) };
+}
+
+/** The build-context files Dockerfile.worker COPYs under the app WORKDIR — its COPY
+ * list, so a new COPY line ships in this smoke with no edit here. */
+function imageShippedFiles(
+	dockerfile: string,
+): { src: string; dest: string }[] {
+	const text = dockerfile.replace(/\\\r?\n/g, " "); // join line continuations
+	let workdir = "/";
+	const shipped: { src: string; dest: string }[] = [];
+	for (const line of text.split("\n")) {
+		const tokens = line.trim().split(/\s+/);
+		const instr = tokens[0]?.toUpperCase() ?? "";
+		if (instr === "WORKDIR" && tokens[1] !== undefined) {
+			workdir = tokens[1];
+			continue;
+		}
+		if (instr !== "COPY") continue;
+		const parsed = parseCopy(tokens, workdir);
+		if (parsed === null) continue;
+		for (const src of parsed.srcs) shipped.push({ src, dest: parsed.dest });
+	}
+	return shipped;
+}
+
 const roots = mkdtempSync(join(tmpdir(), "ottr-boot-"));
+const repoRoot = resolve(import.meta.dir, "..");
+
+// Boot from a copy holding only what the image ships, not the checkout: fd1c133's
+// static scripts/demo-data.ts import booted fine here (scripts/ exists in the
+// checkout) and crashed every deployed image at boot, because Dockerfile.worker
+// copies only src/, extension/ and the package files.
+const imageDir = mkdtempSync(join(tmpdir(), "ottr-boot-image-"));
+for (const { src, dest } of imageShippedFiles(
+	readFileSync(join(repoRoot, "Dockerfile.worker"), "utf8"),
+)) {
+	const from = join(repoRoot, src);
+	if (!existsSync(from))
+		throw new Error(
+			`boot-smoke: Dockerfile.worker COPY source missing in the checkout: ${src}`,
+		);
+	// Docker COPY: a directory source's contents land in dest; a file lands as dest
+	// itself, or dest/basename(src) when dest is a directory ("." or trailing "/").
+	const isDir = statSync(from).isDirectory();
+	const target =
+		isDir || dest === "." || dest.endsWith("/")
+			? isDir
+				? join(imageDir, dest)
+				: join(imageDir, dest, basename(src))
+			: join(imageDir, dest);
+	mkdirSync(dirname(target), { recursive: true });
+	cpSync(from, target, { recursive: true });
+}
+// The image installs production deps after the COPYs (bun install
+// --frozen-lockfile --production); the linked checkout node_modules stands in for it,
+// so the smoke runs no install and stays fast.
+symlinkSync(
+	join(repoRoot, "node_modules"),
+	join(imageDir, "node_modules"),
+	"junction",
+);
+
 const spawnServer = () =>
 	Bun.spawn(["bun", "src/server.ts"], {
+		cwd: imageDir,
 		env: {
 			...process.env,
 			PORT: String(port),
@@ -84,6 +185,7 @@ exec "${realGit}" "$@"
 	);
 	chmodSync(join(shimDir, "git"), 0o755);
 	const early = Bun.spawn(["bun", "src/server.ts"], {
+		cwd: imageDir,
 		env: {
 			...process.env,
 			PORT: String(port),
@@ -100,7 +202,19 @@ exec "${realGit}" "$@"
 		const deadline = Date.now() + 20_000;
 		while (!parked && Date.now() < deadline) {
 			parked = existsSync(signal);
-			if (!parked) await Bun.sleep(25);
+			if (parked) break;
+			// A child that exits before the first git spawn died at module load (e.g.
+			// an import of a file the image does not ship): fail fast, the stderr
+			// below names it.
+			if (
+				await Promise.race([
+					early.exited.then(() => true),
+					Bun.sleep(25).then(() => false),
+				])
+			)
+				throw new Error(
+					"early-signal: server exited before its first boot await",
+				);
 		}
 		if (!parked)
 			throw new Error(
@@ -155,8 +269,25 @@ exec "${realGit}" "$@"
 }
 
 const child = spawnServer();
+// One shared read of the child's stderr: a second Response over the stream throws
+// "disturbed or locked". The pipe only EOFs once the child dies, so the success path
+// never awaits it and leaves the (few) stderr lines unread — as before.
+const stderrText = new Response(child.stderr).text();
 try {
-	const boot = await settle("/api/boot");
+	// A module the image does not ship crashes the child before any port listens;
+	// race the exit so the gate fails fast with the child's stderr instead of
+	// riding settle's 20 s deadline.
+	const settled = await Promise.race([
+		settle("/api/boot").then((up) => ({ up })),
+		child.exited.then(async (code) => ({
+			exit: { code, stderr: await stderrText },
+		})),
+	]);
+	if ("exit" in settled)
+		throw new Error(
+			`server exited ${settled.exit.code ?? "?"} before /api/boot answered`,
+		);
+	const boot = settled.up;
 	if (boot?.status !== 200)
 		throw new Error(`/api/boot -> ${boot?.status ?? "no answer"}`);
 	const home = await settle("/");
@@ -200,11 +331,12 @@ try {
 	// so reading first would block until the (still-running) server exits.
 	child.kill();
 	await child.exited;
-	const stderr = await new Response(child.stderr).text();
+	const stderr = await stderrText;
 	if (stderr) console.error(stderr.slice(0, 2000));
 } finally {
 	child.kill();
 	await child.exited;
 	rmSync(roots, { recursive: true, force: true });
+	rmSync(imageDir, { recursive: true, force: true });
 }
 process.exit(failed ? 1 : 0);
