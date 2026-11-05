@@ -3005,7 +3005,9 @@ describe("turn classify wiring", () => {
 		await loop.runTurn(store.name, first.id);
 		const afterFirst = store.getTask(first.id)!;
 		expect(afterFirst.state).toBe("queued");
-		expect(afterFirst.pendingPrompt).toBe(".");
+		expect(afterFirst.pendingPrompt).toBe(
+			"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
+		);
 		expect(afterFirst.needsReason).toContain(BACKGROUND_WAIT);
 
 		// Second streak on a fresh card: the previous turn's error is already a

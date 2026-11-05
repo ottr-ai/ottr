@@ -1077,8 +1077,9 @@ describe("classify", () => {
 			stage: "in_progress",
 			state: "queued",
 			needsReason:
-				"The agent ended its turn while waiting on a background job - resuming automatically. Cancel to stop it instead.",
-			pendingPrompt: ".",
+				"The agent ended its turn while waiting on a background job - the run exited and the background job died with it; resuming automatically. Cancel to stop it instead.",
+			pendingPrompt:
+				"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
 		};
 		expect(run("work", result({ sawTerminalEnd: false }))).toEqual(resumed);
 		// A crash also ends without agent_end; only exit 0 counts as a background wait.

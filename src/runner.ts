@@ -445,8 +445,8 @@ export function classify(o: {
 	if (result.killed) return needs("Stopped by the tracker.");
 
 	// One-shot omp runs exit 0 when the agent ends its reply on a pending wait/background call
-	// (nothing is alive to deliver the result and wake it). The session survives, so a "." continue
-	// re-checks. ponytail: one automatic continue per streak; if the previous turn already ended this
+	// (nothing is alive to deliver the result and wake it). The session survives, so the corrective
+	// continue re-checks. ponytail: one automatic continue per streak; if the previous turn already ended this
 	// way, a human decides. Count streaks if agents often need a second one.
 	if (result.exitCode === 0 && !result.sawTerminalEnd)
 		return o.previousError?.startsWith(BACKGROUND_WAIT)
@@ -456,8 +456,9 @@ export function classify(o: {
 			: {
 					stage,
 					state: "queued",
-					needsReason: `${BACKGROUND_WAIT} - resuming automatically. Cancel to stop it instead.`,
-					pendingPrompt: ".",
+					needsReason: `${BACKGROUND_WAIT} - the run exited and the background job died with it; resuming automatically. Cancel to stop it instead.`,
+					pendingPrompt:
+						"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
 				};
 
 	// A lost worker is not the turn's fault: a fresh worker runs the same reply. Same
