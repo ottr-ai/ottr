@@ -210,6 +210,18 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		targetContains: async () => false,
 		serverMergePush: async () => ({ status: "skipped" as const }),
 		fetchOriginBranch: async () => null,
+		// The default cannot converge (a conflict), so a rejected push still queues the
+		// recovery steer exactly as before OTTR-510; tests on the converged path override both.
+		rebaseTargetBranch: async () => ({
+			ok: false as const,
+			conflict: true,
+			error: "CONFLICT (content): Merge conflict in src/a.ts",
+		}),
+		runMergeGates: async () => {
+			throw new Error(
+				"merge gates must not run unless the automatic rebase converged",
+			);
+		},
 		mergeHoldMismatch: async () => ({
 			mismatch: false,
 			pushDiff: null,
@@ -4708,7 +4720,11 @@ describe("turn ci watch pinning", () => {
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBeNull();
 		expect(after.pushRetries).toBe(1);
-		expect(fetches).toEqual(["main@ssh://git.example.com/a/r.git"]);
+		// OTTR-510 re-fetch: the steer's queue fetches origin again before the turn goes out.
+		expect(fetches).toEqual([
+			"main@ssh://git.example.com/a/r.git",
+			"main@ssh://git.example.com/a/r.git",
+		]);
 		expect(after.pendingPrompt).toContain(
 			"rebase the local target branch onto origin/main",
 		);
@@ -4727,6 +4743,202 @@ describe("turn ci watch pinning", () => {
 		);
 		expect(store.listTurns(task.id)[1]!.inputBy).toBe("supervisor");
 		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("origin moved while a card merges: the automatic rebase and gates converge and no steer goes out", async () => {
+		let pushes = 0;
+		const rebases: string[] = [];
+		const gates: string[] = [];
+		const { store, record, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return pushes === 1
+					? {
+							status: "rejected" as const,
+							error: "! [rejected] main -> main (non-fast-forward)",
+						}
+					: { status: "pushed" as const, output: "" };
+			},
+			fetchOriginBranch: async () => null,
+			rebaseTargetBranch: async (mainPath: string, branch: string) => {
+				rebases.push(`${mainPath}:${branch}`);
+				return { ok: true as const };
+			},
+			runMergeGates: async (mainPath: string) => {
+				gates.push(mainPath);
+				return { ok: true, output: "" };
+			},
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		// The retry push landed: the card is done, no recovery steer, no budget spent.
+		expect(after.stage).toBe("done");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.pushRetries).toBe(0);
+		expect(pushes).toBe(2);
+		expect(rebases).toEqual([`${store.path}:main`]);
+		expect(gates).toEqual([store.path]);
+		expect(logText(store, task.id)).toContain(
+			"merge gates passed on the rebased main",
+		);
+		expect(logText(store, task.id)).not.toContain(
+			"automatic rebase retry 1 of 2",
+		);
+		expect(logText(store, task.id)).not.toContain(
+			"merge turn queued to rebase",
+		);
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("a conflicting automatic rebase still queues the steer and runs no gates", async () => {
+		let pushes = 0;
+		let gateRuns = 0;
+		const { store, record, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return {
+					status: "rejected" as const,
+					error: "! [rejected] main -> main (non-fast-forward)",
+				};
+			},
+			fetchOriginBranch: async () => null,
+			rebaseTargetBranch: async () => ({
+				ok: false as const,
+				conflict: true,
+				error: "CONFLICT (content): Merge conflict in src/a.ts",
+			}),
+			runMergeGates: async () => {
+				gateRuns += 1;
+				return { ok: true, output: "" };
+			},
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.pushRetries).toBe(1);
+		expect(after.pendingPrompt).toContain("automatic rebase retry 1 of 2");
+		expect(gateRuns).toBe(0);
+		expect(pushes).toBe(1);
+		const log = logText(store, task.id);
+		expect(log).toContain("the automatic rebase of main hit a conflict");
+		expect(log).toContain(
+			"server push rejected: origin moved, merge turn queued to rebase (retry 1 of 2)",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("failed merge gates on the rebased target queue the steer before any second push", async () => {
+		let pushes = 0;
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return {
+					status: "rejected" as const,
+					error: "! [rejected] main -> main (non-fast-forward)",
+				};
+			},
+			fetchOriginBranch: async () => null,
+			rebaseTargetBranch: async () => ({ ok: true as const }),
+			runMergeGates: async () => ({
+				ok: false,
+				output: "bun run check exited 1\nerror: check failed",
+			}),
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.pushRetries).toBe(1);
+		expect(pushes).toBe(1);
+		const log = logText(store, task.id);
+		expect(log).toContain("merge gates failed on the rebased main");
+		expect(log).toContain("merge gates output");
+	});
+
+	test("a still-rejected retry push queues the steer on a fresh fetch", async () => {
+		const fetches: string[] = [];
+		let pushes = 0;
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return {
+					status: "rejected" as const,
+					error: "! [rejected] main -> main (non-fast-forward)",
+				};
+			},
+			fetchOriginBranch: async (
+				_mainPath: string,
+				branch: string,
+				originUrl: string,
+			) => {
+				fetches.push(`${branch}@${originUrl}`);
+				return null;
+			},
+			rebaseTargetBranch: async () => ({ ok: true as const }),
+			runMergeGates: async () => ({ ok: true, output: "" }),
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.pushRetries).toBe(1);
+		expect(pushes).toBe(2);
+		expect(fetches).toHaveLength(2);
+		expect(logText(store, task.id)).toContain(
+			"the retry push of origin/main rejected after the automatic rebase",
+		);
+	});
+
+	test("a failed (non-conflict) automatic rebase parks needs_you", async () => {
+		let pushes = 0;
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return {
+					status: "rejected" as const,
+					error: "! [rejected] main -> main (non-fast-forward)",
+				};
+			},
+			fetchOriginBranch: async () => null,
+			rebaseTargetBranch: async () => ({
+				ok: false as const,
+				conflict: false,
+				error: "fatal: cannot rebase: You have unstaged changes",
+			}),
+			runMergeGates: async () => ({ ok: true, output: "" }),
+		});
+		store.setSettings({
+			originUrl: "ssh://git.example.com/a/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toContain("Server push to origin failed:");
+		expect(t.needsReason).toContain(
+			"the automatic rebase failed: fatal: cannot rebase: You have unstaged changes",
+		);
+		expect(t.pendingPrompt).toBeNull();
+		expect(t.pushRetries).toBe(0);
+		expect(pushes).toBe(1);
 	});
 
 	test("the third rejected push parks the card at needs_you with git's reason", async () => {

@@ -1401,6 +1401,115 @@ export async function fetchOriginBranch(
 }
 
 /**
+ * OTTR-510: the server-side rebase behind an automatic push retry. A rejected merge push means
+ * origin moved mid-merge; the server now runs this rebase itself — and the merge gates on the
+ * result (runMergeGates) — before it retries the push, so the automatic path skips no gate and
+ * queues a recovery steer only when the retry cannot converge. A conflict aborts, so
+ * refs/heads/<branch> stays on its rejected head and the checkout never sits mid-rebase; an
+ * abort that itself fails reports a non-conflict failure (the caller then fails closed).
+ */
+export async function rebaseTargetBranch(
+	mainPath: string,
+	branch: string,
+): Promise<{ ok: true } | { ok: false; conflict: boolean; error: string }> {
+	const r = await git(
+		[
+			// The replay re-creates commits, so it needs a committer identity; pin the board's
+			// own (the same app.ts pins) so a checkout without git config cannot wedge the
+			// automatic retry.
+			"-c",
+			"user.name=Ottr",
+			"-c",
+			"user.email=ottr@localhost",
+			"rebase",
+			`refs/remotes/origin/${branch}`,
+			branch,
+		],
+		mainPath,
+	);
+	if (r.code === 0) return { ok: true };
+	const out = `${r.stdout}${r.stderr}`;
+	const mergePath = await git(
+		["rev-parse", "--git-path", "rebase-merge"],
+		mainPath,
+	);
+	const applyPath = await git(
+		["rev-parse", "--git-path", "rebase-apply"],
+		mainPath,
+	);
+	const inProgress =
+		(mergePath.code === 0 &&
+			existsSync(path.resolve(mainPath, mergePath.stdout.trim()))) ||
+		(applyPath.code === 0 &&
+			existsSync(path.resolve(mainPath, applyPath.stdout.trim())));
+	if (out.includes("CONFLICT") || inProgress) {
+		const abort = await git(["rebase", "--abort"], mainPath);
+		if (abort.code !== 0)
+			return {
+				ok: false,
+				conflict: false,
+				error: `${out.trim().split("\n").filter(Boolean).pop() ?? `git rebase exited ${r.code}`}; git rebase --abort also failed: ${abort.stderr.trim()}`,
+			};
+		return {
+			ok: false,
+			conflict: true,
+			error:
+				out.split("\n").find((line) => line.includes("CONFLICT")) ??
+				`git rebase exited ${r.code}`,
+		};
+	}
+	return {
+		ok: false,
+		conflict: false,
+		error:
+			r.stderr.split("\n").find((line) => /^(error|fatal):/i.test(line)) ??
+			r.stderr.trim().split("\n").filter(Boolean).pop() ??
+			`git rebase exited ${r.code}`,
+	};
+}
+
+/**
+ * OTTR-510: the merge gates a push retry must clear before the push goes out again. `bun run
+ * check` runs first, `bun test` only when it exited 0, both in the main checkout; the spawns
+ * name process.execPath (bun itself), so a planted PATH cannot substitute another binary. Each
+ * gate is killed after 30 minutes. Returns the failing gate's output (capped like a push's),
+ * else empty output.
+ */
+export async function runMergeGates(
+	mainPath: string,
+): Promise<{ ok: boolean; output: string }> {
+	const check = Bun.spawn([process.execPath, "run", "check"], {
+		cwd: mainPath,
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 1_800_000,
+	});
+	const checkOut = await new Response(check.stdout).text();
+	const checkErr = await new Response(check.stderr).text();
+	const checkCode = await check.exited;
+	if (checkCode !== 0)
+		return {
+			ok: false,
+			output: `bun run check exited ${checkCode}\n${cappedPushOutput(`${checkOut}${checkErr}`.trim()) ?? ""}`,
+		};
+	const test = Bun.spawn([process.execPath, "test"], {
+		cwd: mainPath,
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 1_800_000,
+	});
+	const testOut = await new Response(test.stdout).text();
+	const testErr = await new Response(test.stderr).text();
+	const testCode = await test.exited;
+	if (testCode !== 0)
+		return {
+			ok: false,
+			output: `bun test exited ${testCode}\n${cappedPushOutput(`${testOut}${testErr}`.trim()) ?? ""}`,
+		};
+	return { ok: true, output: "" };
+}
+
+/**
  * OTTR-274: whether the commits a server push would ship (refs/heads/<branch>) carry exactly the
  * approved hold's content change (base..approvedHead), plus the push-side diff for the reviewer
  * and the audited origin tip for the push's lease. A merge turn resumes the same agent session

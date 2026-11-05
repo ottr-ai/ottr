@@ -47,6 +47,7 @@ import {
 	parseNumstat,
 	planKeptFinish,
 	quarantineUntracked,
+	rebaseTargetBranch,
 	redact,
 	redactingWriter,
 	redactUrlCredentials,
@@ -54,6 +55,7 @@ import {
 	removeWorktree,
 	resetBranchTo,
 	resolveTarget,
+	runMergeGates,
 	serverMergePush,
 	setGitSecrets,
 	setNetworkGitAuth,
@@ -331,6 +333,161 @@ describe("serverMergePush", () => {
 			expect(run(f.main, "rev-parse", "refs/remotes/origin/main")).toBe(moved);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("rebaseTargetBranch rebases a clean divergence onto the moved origin tip", async () => {
+		const f = fixture();
+		try {
+			// Another writer lands a commit on origin while the merge ran; the clone's own
+			// commit rides a different file, so the rebase onto the moved tip is clean.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(twin, "move.txt"), "moved");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			writeFileSync(join(f.main, "local.txt"), "local");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "local work");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			expect(await rebaseTargetBranch(f.main, "main")).toEqual({ ok: true });
+			run(
+				f.main,
+				"merge-base",
+				"--is-ancestor",
+				"refs/remotes/origin/main",
+				"refs/heads/main",
+			);
+			const subjects = run(f.main, "log", "--format=%s", "refs/heads/main");
+			expect(subjects).toContain("local work");
+			expect(subjects).toContain("another writer");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("rebaseTargetBranch reports a conflict and restores the branch", async () => {
+		const f = fixture();
+		try {
+			// Both writers edit the same line of the same file: the rebase conflicts and must
+			// abort, leaving refs/heads/main on its rejected head and no rebase in progress.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(twin, "c.txt"), "origin line\n");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			writeFileSync(join(f.main, "c.txt"), "local line\n");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "local work");
+			const before = run(f.main, "rev-parse", "refs/heads/main");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			const r = await rebaseTargetBranch(f.main, "main");
+			if (r.ok) throw new Error("expected a conflict, got ok");
+			expect(r.conflict).toBe(true);
+			expect(r.error).toContain("CONFLICT");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(before);
+			const rebaseDir = Bun.spawnSync(
+				["git", "rev-parse", "--git-path", "rebase-merge"],
+				{ cwd: f.main, stdout: "pipe", stderr: "pipe" },
+			);
+			expect(existsSync(join(f.main, rebaseDir.stdout.toString().trim()))).toBe(
+				false,
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("rebaseTargetBranch fails closed on a dirty checkout", async () => {
+		const f = fixture();
+		try {
+			// An unstaged edit blocks any rebase; the branch ref must not move.
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(f.main, "local.txt"), "local");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "local work");
+			const before = run(f.main, "rev-parse", "refs/heads/main");
+			writeFileSync(join(f.main, "local.txt"), "dirty");
+			const r = await rebaseTargetBranch(f.main, "main");
+			if (r.ok) throw new Error("expected a failure, got ok");
+			expect(r.conflict).toBe(false);
+			expect(`${r.error} `).toMatch(/cannot rebase|unstaged/);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runMergeGates passes when check and test pass", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "exit 0" },
+				}),
+			);
+			writeFileSync(
+				join(dir, "ok.test.ts"),
+				'import { test, expect } from "bun:test";\ntest("ok", () => expect(1).toBe(1));\n',
+			);
+			expect(await runMergeGates(dir)).toEqual({ ok: true, output: "" });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runMergeGates fails on a failing check without running the tests", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "exit 1" },
+				}),
+			);
+			writeFileSync(
+				join(dir, "boom.test.ts"),
+				'import { test } from "bun:test";\ntest("boom", () => {\n\tthrow new Error("test ran");\n});\n',
+			);
+			const r = await runMergeGates(dir);
+			expect(r.ok).toBe(false);
+			expect(r.output).toContain("bun run check exited");
+			// The ordered gate stops at the failing check, so bun test never ran.
+			expect(r.output).not.toContain("test ran");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runMergeGates fails on a failing test", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "exit 0" },
+				}),
+			);
+			writeFileSync(
+				join(dir, "boom.test.ts"),
+				'import { test, expect } from "bun:test";\ntest("boom", () => expect(1).toBe(2));\n',
+			);
+			const r = await runMergeGates(dir);
+			expect(r.ok).toBe(false);
+			expect(r.output).toContain("bun test exited");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

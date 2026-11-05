@@ -123,9 +123,11 @@ import type {
 	isClean,
 	isIntegrated,
 	mergeHoldMismatch,
+	rebaseTargetBranch,
 	removeWorktree,
 	resetBranchTo,
 	resolveTarget,
+	runMergeGates,
 	serverMergePush,
 	statusFiles,
 	targetContains,
@@ -420,6 +422,12 @@ export interface TurnOps {
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
 	fetchOriginBranch: typeof fetchOriginBranch;
+	/** OTTR-510: the automatic push-race retry rebases the local target branch onto the fetched
+	 * origin tip and runs the merge gates (bun run check, bun test) in the main checkout before
+	 * the server pushes again, so the automatic path skips no gate; a rebase conflict, failed
+	 * gates, or a still-rejected retry push is what queues the recovery steer. */
+	rebaseTargetBranch: typeof rebaseTargetBranch;
+	runMergeGates: typeof runMergeGates;
 	/** OTTR-465: the credential kinds the server's git can use for a push to a URL (a card-log line, never a value); null for a non-URL pin. */
 	pushAuthKind?: (url: string) => string | null;
 	/** OTTR-465: wait before the single origin-unchanged push retry (default 30 s); tests pass 0. */
@@ -2272,6 +2280,33 @@ export function createTurnLoop(
 			// The origin tip the gate fetched and audited; the push leases against it so a
 			// merge agent cannot aim the fetch and the push at different remotes.
 			let holdTip: string | null = null;
+			// The merge push and the OTTR-510 automatic rebase retry in the pushError handling
+			// below push through the same closure. `refused` stays null for every non-merge
+			// turn: only a merge settle pays for the hold-tip read.
+			let refused: string | null = null;
+			const runPush = (): Promise<
+				| { status: "skipped" }
+				| { status: "pushed"; output: string }
+				| { status: "failed" | "rejected"; error: string; output?: string }
+			> =>
+				refused !== null
+					? Promise.resolve({
+							status: "failed" as const,
+							error: refused,
+						})
+					: ops
+							.serverMergePush(
+								e.path,
+								wt,
+								target,
+								task.branch ?? "",
+								holdTip,
+								settings.originUrl,
+							)
+							.catch((err: unknown) => ({
+								status: "failed" as const,
+								error: errmsg(err),
+							}));
 			if (kind === "merge" && !interview && !grill && !releaseCard) {
 				// An approved merge hold fixes what may ship. The merge turn resumes the same agent
 				// session and could commit beyond the approved head, so the push set
@@ -2339,39 +2374,10 @@ export function createTurnLoop(
 						}
 					}
 				}
+				// OTTR-326: a park whose branch reset could not run leaves the held patches as the
+				// local tip; no other card may push the branch while that head sits there.
+				refused = await heldMergeOnBranchTip(store, id, e.path, branch, ops);
 				if (holdMismatch === null) {
-					// OTTR-326: a park whose branch reset could not run leaves the held patches as
-					// the local tip; no other card may push the branch while that head sits there.
-					const refused = await heldMergeOnBranchTip(
-						store,
-						id,
-						e.path,
-						branch,
-						ops,
-					);
-					const runPush = (): Promise<
-						| { status: "skipped" }
-						| { status: "pushed"; output: string }
-						| { status: "failed" | "rejected"; error: string; output?: string }
-					> =>
-						refused !== null
-							? Promise.resolve({
-									status: "failed" as const,
-									error: refused,
-								})
-							: ops
-									.serverMergePush(
-										e.path,
-										wt,
-										target,
-										task.branch ?? "",
-										holdTip,
-										settings.originUrl,
-									)
-									.catch((err: unknown) => ({
-										status: "failed" as const,
-										error: errmsg(err),
-									}));
 					let p = await runPush();
 					let authLogged = false;
 					for (let attempt = 1; ; attempt++) {
@@ -2525,11 +2531,13 @@ export function createTurnLoop(
 			});
 			// A failed server push keeps the card at merging with git's reason: the worktree stays.
 			// OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
-			// server fetches origin with its own credentials, then queues its own next merge turn
-			// with the rebase prompt: only a merge turn rebases, because the gates must run on the
-			// rebased code, so the server never pushes code no gate checked. Budget: 2 automatic
-			// retries per card. Beyond the budget, any other push error, or a hold-approved push
-			// (its lease covers one exact head, OTTR-274): today's needs_you with git's reason.
+			// server fetches origin with its own credentials, then — OTTR-510 — rebases the
+			// target branch onto the fetched tip, runs the merge gates, and pushes again. The
+			// recovery merge turn goes out only when the automatic retry cannot converge: a
+			// rebase conflict, failed gates, or a still-rejected retry push. The guards are
+			// unchanged: the retry budget (2 automatic retries per card), a hold-approved push
+			// whose lease pins one exact head (OTTR-274), and the pinned origin URL all still
+			// take today's needs_you with git's reason.
 			if (pushError !== null) {
 				const branch = target.startsWith("origin/")
 					? target.slice("origin/".length)
@@ -2555,28 +2563,118 @@ export function createTurnLoop(
 							needsReason: `Server push to origin failed: ${pushError}`,
 						};
 					} else {
-						const prompt = rebaseRetryPrompt({
-							branch,
-							attempt: retries + 1,
-							max: MERGE_PUSH_RETRIES,
-						});
-						// Steering that landed mid-run rides the rebase turn, its authorship
-						// leading — the same rule a hold park follows under queued user text.
-						const steer = store.getTask(id)?.pendingPrompt ?? null;
-						store.updateTask(id, { pushRetries: retries + 1 });
-						appendLog(
-							store,
-							id,
-							`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+						log(
+							`- push rejected and origin moved: trying the automatic rebase of ${branch} onto the fetched tip first`,
 						);
-						next = {
-							stage: "merging",
-							state: "queued",
-							needsReason: null,
-							pendingPrompt: steer === null ? prompt : `${prompt}\n\n${steer}`,
-							pendingBy:
-								steer === null ? "supervisor" : (live.pendingBy ?? "user"),
+						// OTTR-510: the recovery steer is built here but sent only from the paths
+						// where the automatic retry cannot converge.
+						const queueRebaseTurn = async (): Promise<void> => {
+							// The gates can run minutes: re-fetch so the prompt's "the server has
+							// fetched origin" stays true when the recovery turn starts.
+							const refetchError =
+								settings.originUrl === null
+									? "no pinned origin URL to fetch the moved tip from"
+									: await ops
+											.fetchOriginBranch(e.path, branch, settings.originUrl)
+											.then(() => null)
+											.catch((err: unknown) => errmsg(err));
+							if (refetchError !== null) {
+								log(
+									`! origin re-fetch before the recovery turn failed: ${refetchError}`,
+								);
+								// Fail closed: no turn queued, no retry budget spent.
+								next = {
+									stage: "merging",
+									state: "needs_you",
+									needsReason: `Server push to origin failed: ${pushError}\norigin re-fetch before the recovery turn failed: ${refetchError}`,
+								};
+								return;
+							}
+							const prompt = rebaseRetryPrompt({
+								branch,
+								attempt: retries + 1,
+								max: MERGE_PUSH_RETRIES,
+							});
+							// Steering that landed mid-run rides the rebase turn, its authorship
+							// leading — the same rule a hold park follows under queued user text.
+							const steer = store.getTask(id)?.pendingPrompt ?? null;
+							store.updateTask(id, { pushRetries: retries + 1 });
+							appendLog(
+								store,
+								id,
+								`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+							);
+							next = {
+								stage: "merging",
+								state: "queued",
+								needsReason: null,
+								pendingPrompt:
+									steer === null ? prompt : `${prompt}\n\n${steer}`,
+								pendingBy:
+									steer === null ? "supervisor" : (live.pendingBy ?? "user"),
+							};
 						};
+						const rb = await ops
+							.rebaseTargetBranch(e.path, branch)
+							.catch((err: unknown) => ({
+								ok: false as const,
+								conflict: false,
+								error: errmsg(err),
+							}));
+						if (!rb.ok && rb.conflict) {
+							log(
+								`! the automatic rebase of ${branch} hit a conflict (the branch stays on its rejected head); queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+							);
+							await queueRebaseTurn();
+						} else if (!rb.ok) {
+							// Fail closed: no turn queued, no retry budget spent.
+							log(`! the automatic rebase of ${branch} failed: ${rb.error}`);
+							next = {
+								stage: "merging",
+								state: "needs_you",
+								needsReason: `Server push to origin failed: ${pushError}\nthe automatic rebase failed: ${rb.error}`,
+							};
+						} else {
+							log(
+								`- automatic rebase of ${branch} onto the fetched origin tip converged; running the merge gates (bun run check, bun test)`,
+							);
+							const gates = await ops
+								.runMergeGates(e.path)
+								.catch((err: unknown) => ({ ok: false, output: errmsg(err) }));
+							if (!gates.ok) {
+								log(
+									`! merge gates failed on the rebased ${branch}; queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+								);
+								if (gates.output !== "")
+									log(`! merge gates output:\n${gates.output}`);
+								await queueRebaseTurn();
+							} else {
+								log(
+									`- merge gates passed on the rebased ${branch}; retrying the server push`,
+								);
+								const p2 = await runPush();
+								if (p2.status === "pushed") {
+									pushError = null;
+									pushOutput = null;
+									pushRejected = false;
+									log(
+										`- pushed ${target} from the server after the automatic rebase`,
+									);
+								} else if (p2.status === "skipped") {
+									pushError = null;
+									pushOutput = null;
+									pushRejected = false;
+									log(
+										"- server push skipped after the automatic rebase (nothing to push)",
+									);
+								} else {
+									log(
+										`! the retry push of ${target} ${p2.status} after the automatic rebase: ${p2.error}`,
+									);
+									await queueRebaseTurn();
+								}
+							}
+						}
 					}
 				} else {
 					next = {
