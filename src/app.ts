@@ -174,7 +174,7 @@ import {
 	liveCard,
 	mergeAnywayPatch,
 	openWorkBlockers,
-	PROMPT_EDIT_HOLD_MS,
+	PROMPT_EDIT_HELD,
 	type ReviewTask,
 	releaseHeldMerges,
 	reviewBlocked,
@@ -5485,8 +5485,10 @@ export function createApp(deps: AppDeps) {
 		},
 		// The prompt-edit hold: while a drawer has the editor open, the card must not start —
 		// a scheduler tick would run the saved prompt and strand the unsaved draft (a started
-		// card can never be edited again). start claims the hold and doubles as the heartbeat;
-		// every editor close posts stop, and a save clears the hold in the store's editTask.
+		// card can never be edited again). start claims PROMPT_EDIT_HELD (no heartbeat: hidden
+		// tabs throttle timers); every editor close posts stop, a save clears the hold in the
+		// store's editTask, and every queue write below clears it, so a user action never
+		// stalls behind a hold whose editor died silently.
 		"/api/projects/:project/tasks/:id/edit/start": {
 			POST: (req) =>
 				api(req, async () => {
@@ -5512,7 +5514,7 @@ export function createApp(deps: AppDeps) {
 							409,
 						);
 					e.store.updateTask(task.id, {
-						holdUntil: Date.now() + PROMPT_EDIT_HOLD_MS,
+						holdUntil: PROMPT_EDIT_HELD,
 					});
 					return json({ ok: true });
 				}),
@@ -5697,6 +5699,7 @@ export function createApp(deps: AppDeps) {
 								pendingBy: "supervisor",
 								workCheckSendbacks: n,
 								state: "queued",
+								holdUntil: null,
 								queuedAt: Date.now(),
 								needsReason: null,
 								asked: null,
@@ -5740,6 +5743,7 @@ export function createApp(deps: AppDeps) {
 						e.store.updateTask(task.id, {
 							stage: "merging",
 							state: "queued",
+							holdUntil: null,
 							queuedAt: Date.now(),
 							needsReason: null,
 							asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
@@ -5759,6 +5763,7 @@ export function createApp(deps: AppDeps) {
 								: "user",
 						pendingImages: [...task.pendingImages, ...names],
 						state: "queued",
+						holdUntil: null,
 						queuedAt: Date.now(),
 						needsReason: null,
 						asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
@@ -6089,6 +6094,7 @@ export function createApp(deps: AppDeps) {
 						pendingPrompt: LOST_SESSION,
 						pendingBy: "supervisor",
 						state: "queued",
+						holdUntil: null,
 						queuedAt: Date.now(),
 						needsReason: null,
 					});
@@ -6120,6 +6126,7 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "a reply is still queued" }, 409);
 					e.store.updateTask(task.id, {
 						state: "queued",
+						holdUntil: null,
 						...(model !== null ? { model } : {}),
 						queuedAt: Date.now(),
 						needsReason: null,
@@ -6184,6 +6191,7 @@ export function createApp(deps: AppDeps) {
 							...(model !== null ? { model } : {}),
 							stage: "todo",
 							state: "queued",
+							holdUntil: null,
 							queuedAt: Date.now(),
 							needsReason: null,
 							asked: null,
@@ -6208,6 +6216,7 @@ export function createApp(deps: AppDeps) {
 						state: "idle",
 						queuedAt: null,
 						needsReason: null,
+						holdUntil: null,
 					});
 					deps.schedule();
 					return taskResponse(e, task.id);

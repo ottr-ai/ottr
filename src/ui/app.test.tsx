@@ -2520,12 +2520,18 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				onClickOf(button(container, "Edit task"))({});
 			});
 			expect(holds).toEqual(["start"]);
+			// A tab closing mid-edit cannot rely on the unmount cleanup (the page is
+			// being torn down): pagehide fires first and releases with a keepalive call.
+			await act(async () => {
+				window.dispatchEvent(new window.Event("pagehide"));
+			});
+			expect(holds).toEqual(["start", "stop"]);
 			// The drawer unmounts with the editor open (Esc, X, drawer switch): the
-			// cleanup must release the hold, or the card waits out the whole TTL.
+			// cleanup must release the hold too.
 			await act(async () => {
 				root.unmount();
 			});
-			expect(holds).toEqual(["start", "stop"]);
+			expect(holds).toEqual(["start", "stop", "stop"]);
 		} finally {
 			container.remove();
 			globalThis.fetch = realFetch;

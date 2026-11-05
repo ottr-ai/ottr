@@ -21,11 +21,7 @@ import type { ModelOption } from "../models.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
-import {
-	PROMPT_EDIT_HEARTBEAT_MS,
-	queueOrder,
-	waitingOn,
-} from "../scheduler.ts";
+import { queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
 
 import {
@@ -7086,20 +7082,33 @@ export function Drawer({
 	// once the started turn makes the card uneditable.
 	const editOpen = edit !== null;
 	const editGuardTitle = "Save or cancel the prompt edit first";
-	// And the server holds the card off too: the open editor claims a hold that stops the
-	// scheduler from starting the card over the draft (the drawer's buttons cover only the
-	// clicks this tab can see). start doubles as the heartbeat; every close path — Save,
-	// Cancel, drawer unmount — posts stop, and a save also clears the hold server-side.
+	// And the server holds the card off for exactly as long as the editor is open: the open
+	// editor claims PROMPT_EDIT_HELD and no renewal runs — hidden tabs throttle timers (a
+	// background beat can silently stop arriving mid-edit), so nothing depends on one. Every
+	// close path releases: Save clears the hold server-side, Cancel and drawer unmount post
+	// stop, and a tab closing mid-edit releases through the pagehide keepalive call, re-claim
+	// on pageshow covers the back-forward cache restoring the page with the editor open.
+	// Merely hiding the tab keeps the hold: the editor is still open when the user returns.
 	useEffect(() => {
 		if (!editOpen) return;
 		const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`;
-		const beat = (): void => {
+		void post(`${url}/start`, {}).catch(() => {});
+		const release = (): void => {
+			void fetch(`${url}/stop`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: "{}",
+				keepalive: true,
+			}).catch(() => {});
+		};
+		const reclaim = (): void => {
 			void post(`${url}/start`, {}).catch(() => {});
 		};
-		beat();
-		const timer = setInterval(beat, PROMPT_EDIT_HEARTBEAT_MS);
+		window.addEventListener("pagehide", release);
+		window.addEventListener("pageshow", reclaim);
 		return () => {
-			clearInterval(timer);
+			window.removeEventListener("pagehide", release);
+			window.removeEventListener("pageshow", reclaim);
 			void post(`${url}/stop`, {}).catch(() => {});
 		};
 	}, [editOpen, task.project, task.id]);

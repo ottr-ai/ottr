@@ -59,6 +59,7 @@ import {
 } from "./prompts.ts";
 import { createRunSink } from "./runner.ts";
 import {
+	PROMPT_EDIT_HELD,
 	type ReviewTask,
 	SILENT_LOG_MS,
 	WORK_CHECK_THIRD_BLOCK,
@@ -982,14 +983,15 @@ describe("task routes", () => {
 		const created = store.createTask("edited while queued");
 		// The drawer's editor claims the hold; pickRunnable defers a held card like any
 		// usage-limit hold, so the scheduler cannot start the card over the open draft.
+		// No heartbeat renews it: PROMPT_EDIT_HELD never arrives, so background-tab timer
+		// throttling cannot lapse the hold mid-edit.
 		const started = await post(
 			`/api/projects/p1/tasks/${created.id}/edit/start`,
 			{},
 		);
 		expect(started.status).toBe(200);
 		const held = store.getTask(created.id)!;
-		expect(held.holdUntil).not.toBeNull();
-		expect(held.holdUntil!).toBeGreaterThan(Date.now());
+		expect(held.holdUntil).toBe(PROMPT_EDIT_HELD);
 		// Saving finishes the edit: the hold clears in the same write as the prompt.
 		const saved = await post(`/api/projects/p1/tasks/${created.id}/edit`, {
 			prompt: "saved draft",
@@ -998,13 +1000,37 @@ describe("task routes", () => {
 		expect(store.getTask(created.id)?.holdUntil).toBeNull();
 		// A cancel (or any editor close) releases the hold without an edit.
 		await post(`/api/projects/p1/tasks/${created.id}/edit/start`, {});
-		expect(store.getTask(created.id)?.holdUntil).not.toBeNull();
+		expect(store.getTask(created.id)?.holdUntil).toBe(PROMPT_EDIT_HELD);
 		const stopped = await post(
 			`/api/projects/p1/tasks/${created.id}/edit/stop`,
 			{},
 		);
 		expect(stopped.status).toBe(200);
 		expect(store.getTask(created.id)?.holdUntil).toBeNull();
+		// Every route that queues the card clears the hold, so a user action never
+		// stalls behind a hold whose editor died silently.
+		const parked = store.createTask("parked idea");
+		store.updateTask(parked.id, { stage: "backlog", state: "idle" });
+		await post(`/api/projects/p1/tasks/${parked.id}/edit/start`, {});
+		expect(store.getTask(parked.id)?.holdUntil).toBe(PROMPT_EDIT_HELD);
+		const promoted = await post(`/api/projects/p1/tasks/${parked.id}/backlog`, {
+			to: "todo",
+		});
+		expect(promoted.status).toBe(200);
+		expect(store.getTask(parked.id)?.holdUntil).toBeNull();
+		expect(store.getTask(parked.id)?.state).toBe("queued");
+		const proposal = store.createTask("proposed work");
+		store.updateTask(proposal.id, {
+			state: "needs_you",
+			needsReason: "Retro proposal from t3. Accept starts it.",
+		});
+		await post(`/api/projects/p1/tasks/${proposal.id}/edit/start`, {});
+		const accepted = await post(`/api/projects/p1/tasks/${proposal.id}/reply`, {
+			text: ".",
+		});
+		expect(accepted.status).toBe(200);
+		expect(store.getTask(proposal.id)?.holdUntil).toBeNull();
+		expect(store.getTask(proposal.id)?.state).toBe("queued");
 		// Started cards keep their holds: a turn means no editable prompt, and a stray
 		// hold must never stall a started card's next queue entry.
 		const run = store.createTask("started card");

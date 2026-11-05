@@ -44,6 +44,7 @@ import {
 	isRetro,
 	isReview,
 	liveCard,
+	PROMPT_EDIT_HELD,
 	pickRunnable,
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
@@ -1642,7 +1643,9 @@ describe("turn schedule", () => {
 		const task = store.createTask("queued work");
 		// The drawer's open editor claims the hold (edit/start): a scheduler tick must
 		// defer the card, or the agent runs the saved prompt over the unsaved draft.
-		store.updateTask(task.id, { holdUntil: Date.now() + 60_000 });
+		// The claim is PROMPT_EDIT_HELD exactly because nothing renews it — a hidden
+		// tab's throttled timers must not lapse the hold mid-edit.
+		store.updateTask(task.id, { holdUntil: PROMPT_EDIT_HELD });
 		loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);

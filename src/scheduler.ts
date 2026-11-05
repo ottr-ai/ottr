@@ -13,13 +13,16 @@ import type {
  * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
 export const SILENT_LOG_MS = 2 * 60 * 60_000;
 
-/** How long an open prompt edit keeps a queued card from starting: the drawer's editor claims
- * the hold (edit/start) and renews it while it sits open, so no starter — clicked button or
- * scheduler tick — runs the saved prompt over an unsaved draft. An editor that never closes
- * (crashed tab) releases the card at most this long after its last heartbeat. */
-export const PROMPT_EDIT_HOLD_MS = 30_000;
-/** The drawer renews the hold at a third of its TTL, so three lost beats still hold. */
-export const PROMPT_EDIT_HEARTBEAT_MS = 10_000;
+/** The hold an open prompt edit claims: pickRunnable defers any card with
+ * `holdUntil > now`, and this value never arrives, so the card waits for exactly as
+ * long as some drawer has the editor open. There is no heartbeat on purpose — browsers
+ * throttle background-tab timers (Chrome runs chained timers about once a minute once
+ * a tab has been hidden for five minutes), so a renewing TTL would lapse mid-edit.
+ * Release paths are explicit instead: the save clears the hold in the same write as
+ * the prompt, every editor close posts edit/stop (a keepalive call on pagehide covers
+ * the tab closing), and every route that queues a card clears the hold, so a user
+ * action always overrides a hold whose editor died without saying goodbye. */
+export const PROMPT_EDIT_HELD = Number.MAX_SAFE_INTEGER;
 
 /** Last activity of a preparing or running card once it has been silent past SILENT_LOG_MS;
  * null for other states, fresher activity, or no activity yet. Activity is the later of the
