@@ -14,6 +14,8 @@ export default {
   // runaway from OOMing the host; the runner's own temp dirs are removed when the run ends.
   bun: { ...base.bun, timeout: 300_000, testFiles: ["src/turn.test.ts"] },
   mutate: ["src/turn.ts"],
+  // Own cache file: all five configs share the base module (stryker.config.mjs).
+  incrementalFile: "reports/stryker-incremental-turn.json",
   // The base cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
   // 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite. The CPU-derived value and
   // STRYKER_CONCURRENCY only lower it.

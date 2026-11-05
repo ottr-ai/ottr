@@ -39,7 +39,14 @@ Usage: `bun run test:mutation:delta <base> [head]`.
   ```
   <repo>/node_modules/.bin/stryker run <wrapperConfig>
     --mutate <entry>,<entry>,...
+    --force
   ```
+
+  `--force` (Stryker CLI, stryker-cli.js:113) ignores the config's incremental cache, so a
+  release review always measures its ranges fresh: the differ cannot see changes outside the
+  mutated and test files (fixtures, configs, dependencies, the Stryker version). The run
+  rewrites that config's own incremental file with the ranges' results; the next full run of
+  the config measures everything else again.
 
   `--mutate` is a single-valued CLI option with a comma `list` splitter (stryker-cli.js), so
   repeated flags overwrite each other: the entries go into one comma-joined value. The JSON

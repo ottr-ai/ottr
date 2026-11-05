@@ -513,6 +513,7 @@ describe("main", () => {
 					wrapper,
 					"--mutate",
 					"src/foo.ts:3-5,src/new.ts:1-2",
+					"--force",
 				],
 				opts: { cwd: repoRoot, stdio: "inherit" },
 			},

@@ -19,8 +19,10 @@ export default {
   concurrency: 8,
   timeoutMS: 120000,
   timeoutFactor: 3,
-  // incremental off (R8-3): an inherited untracked cache file would corrupt the main one.
-  incremental: false,
+  // Own cache file: all five configs share the base module (stryker.config.mjs), which is
+  // why incremental was off here (R8-3: an inherited untracked cache file would have
+  // corrupted the main one).
+  incrementalFile: "reports/stryker-incremental-update-image.json",
   // Sandbox outside any git repo: the test clones/inspects repos, a sandbox inside this repo
   // would nest them.
   tempDirName: base.tempDirName,

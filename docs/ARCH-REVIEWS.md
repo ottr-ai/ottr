@@ -73,6 +73,14 @@ over the last release tag; a survivor without a reason is a finding. The
 Review button and an auto-started review keep the full suite
 (`bun run test:mutation`) with its break thresholds.
 
+The gate spawns every Stryker run with `--force`
+(scripts/mutation-delta.ts): the configs run with incremental caches
+(`reports/stryker-incremental-<config>.json`, gitignored), but the differ
+cannot see changes outside the mutated and test files — fixtures, configs,
+dependencies, the Stryker version. A release must measure everything, so no
+verdict in a release review comes from a cache; only ordinary runs and the
+Review button's full suite reuse results.
+
 ## Merge hold
 
 While a review is open, only its finding cards merge. Every other card waits

@@ -57,10 +57,14 @@ export default {
   // only its covering tests up to the killer. The dry run never bails. worktree.test.ts and
   // release.test.ts drive real git repos and stay isolated into their own configs, so only the
   // matching module's mutants pay for them.
-  // No `incremental`: the five configs share one default cache path, so each run would reuse
-  // the previous config's verdicts (update-image.config.mjs already forces it off). With
-  // perTest coverage the cache would now track changed tests too (the command runner's R8-3
-  // staleness is gone), but the shared path keeps it off. Every run re-tests everything.
+  // Incremental, one cache file per config: the five configs share this base module, so the
+  // single default path would let one run reuse another config's verdicts (why incremental
+  // was off). With perTest coverage the cache tracks changed tests too (the command runner's
+  // R8-3 staleness is gone). Release reviews run --force so a release never reuses verdicts
+  // across fixture, config, dependency or Stryker-version changes the differ cannot see
+  // (docs/ARCH-REVIEWS.md "Delta gate").
+  incremental: true,
+  incrementalFile: "reports/stryker-incremental-main.json",
   // Half of the host CPUs (os.availableParallelism()), at least 1, so a run never asks for more
   // CPU than the host has; STRYKER_CONCURRENCY wins when set. Capped at the measured 24: each
   // worker runs under the 2 GB cap, the 421-mutant uniform sample kept every verdict identical

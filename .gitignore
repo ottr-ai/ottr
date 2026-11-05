@@ -19,4 +19,4 @@ seen-answers.json
 # Turn shots live in .tasks; scratch shots never belong in the tree.
 /shots/
 /*.png
-stryker*-incremental.json
+stryker-incremental-*.json

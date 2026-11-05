@@ -323,7 +323,9 @@ export async function main(
 		// The CLI's --mutate is a comma list (stryker-cli.js): a repeated flag overwrites.
 		// The JSON report path has no CLI form (commander registers no --jsonReporter
 		// flags), so each run extends the real config with the json reporter through a
-		// wrapper config next to it, removed again after the run.
+		// wrapper config next to it, removed again after the run. --force keeps a release
+		// review honest: the incremental differ cannot see fixture, config, dependency or
+		// Stryker-version changes, so a release never reuses a cached verdict.
 		const wrapper = writeWrapperConfig(repoRoot, config, reportPath);
 		let run: SpawnResult;
 		try {
@@ -334,6 +336,7 @@ export async function main(
 					wrapper,
 					"--mutate",
 					ranges.map((r) => `${r.file}:${r.start}-${r.end}`).join(","),
+					"--force",
 				],
 				{ cwd: repoRoot, stdio: "inherit" },
 			);

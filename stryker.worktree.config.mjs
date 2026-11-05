@@ -16,6 +16,8 @@ export default {
     bunArgs: ["--timeout=60000"],
   },
   mutate: ["src/worktree.ts"],
+  // Own cache file: all five configs share the base module (stryker.config.mjs).
+  incrementalFile: "reports/stryker-incremental-worktree.json",
   // 8, not the base cap: this git-spawn-heavy suite timed out at 16-way on the loaded machine
   // (2026-09-30, 32/38 in the first minutes); 8 keeps runs inside the budget below. The
   // CPU-derived value and STRYKER_CONCURRENCY only lower it.

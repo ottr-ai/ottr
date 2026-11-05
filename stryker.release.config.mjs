@@ -13,6 +13,8 @@ export default {
   // when the run ends.
   bun: { ...base.bun, timeout: 600_000, testFiles: ["src/release.test.ts"] },
   mutate: ["src/release.ts"],
+  // Own cache file: all five configs share the base module (stryker.config.mjs).
+  incrementalFile: "reports/stryker-incremental-release.json",
   // 8, not the base cap: this git-spawn-heavy suite inflated every run past any timeout
   // budget at higher concurrency (80/80 timed out at 16-way, 2026-09-30); 8 keeps runs within the
   // budget below. The CPU-derived value and STRYKER_CONCURRENCY only lower it.
