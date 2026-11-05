@@ -54,6 +54,7 @@ export function workPrompt(o: {
 
 ---
 orchestrate this task following AGENTS.md: plan, implement, verify, and commit on branch ${o.branch}.
+A task that writes a spec or implements code is not architecture work, even when it restructures core dispatch. Only the Review flow, release reviews, and architecture reviews run the mutation gates.
 In a fresh worktree, run the project's dependency install in locked/frozen mode before the gates (bun: \`bun install --frozen-lockfile\`).
 When a commit replaces an earlier commit's change instead of fixing it, reference the earlier commit with a \`Supersedes: <sha>\` body line. The release notes drop the named commit's bullet.
 Do not merge, push, tag or release: the tracker runs integration as a separate turn when this project's merge slot is free.
