@@ -79,6 +79,11 @@ export function serveWorker(opts: {
 	sweepRoots?: readonly string[];
 	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
 	sweepGraceMs?: number;
+	/** Only for tests: the /proc tree /sweep scans instead of the real one. */
+	sweepProcRoot?: string;
+	/** Only for tests: the signal call /sweep uses instead of process.kill, so a
+	 * test can never signal a process it did not create. */
+	sweepKill?: typeof process.kill;
 	/** Only for tests: the expiry of /detached entries instead of 24 h. */
 	detachedTtlMs?: number;
 }): Bun.Server<never> {
@@ -115,6 +120,8 @@ export function serveWorker(opts: {
 						roots: opts.sweepRoots,
 						graceMs: opts.sweepGraceMs,
 						keepPids: runChildren,
+						procRoot: opts.sweepProcRoot,
+						kill: opts.sweepKill,
 					});
 					return Response.json(stopped);
 				} catch (err) {
@@ -590,18 +597,26 @@ async function sweepLeftovers(opts?: {
 	roots?: readonly string[];
 	graceMs?: number;
 	keepPids?: Iterable<number>;
+	/** Only for tests: the /proc tree to scan instead of the real one. */
+	procRoot?: string;
+	/** Only for tests: the signal call instead of process.kill. A test must never
+	 * let a sweep signal a process it did not create: a mutant that widens the
+	 * target set would otherwise kill the worker daemon, Stryker, and the shell. */
+	kill?: typeof process.kill;
 }): Promise<SweptProcess[]> {
 	const roots = opts?.roots ?? ["/workspace"];
 	const graceMs = opts?.graceMs ?? 1000;
+	const procRoot = opts?.procRoot ?? "/proc";
+	const kill = opts?.kill ?? process.kill;
 	// One /proc snapshot of the parent links; the kept set is the keep roots plus
 	// every descendant (BFS over ppid). A process that forks after the snapshot is
 	// swept at the next tick, same known gap killTree has.
 	const ppid = new Map<number, number>();
-	for (const name of readdirSync("/proc")) {
+	for (const name of readdirSync(procRoot)) {
 		const pid = Number(name);
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		try {
-			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
 			// comm can hold spaces and parens: fields start after the last ")".
 			const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
 			const parent = Number(after[1]);
@@ -620,13 +635,13 @@ async function sweepLeftovers(opts?: {
 			if (parent === pid && !keep.has(child)) queue.push(child);
 	}
 	const targets: SweptProcess[] = [];
-	for (const name of readdirSync("/proc")) {
+	for (const name of readdirSync(procRoot)) {
 		const pid = Number(name);
 		if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
 		if (keep.has(pid)) continue; // a live /run child (or its tree) is not a leftover
 		let cwdLink: string;
 		try {
-			cwdLink = readlinkSync(`/proc/${pid}/cwd`);
+			cwdLink = readlinkSync(`${procRoot}/${pid}/cwd`);
 		} catch {
 			continue; // exited, zombie, or permission denied
 		}
@@ -634,7 +649,7 @@ async function sweepLeftovers(opts?: {
 		if (!match) continue;
 		let command = "";
 		try {
-			command = readFileSync(`/proc/${pid}/cmdline`, "utf8")
+			command = readFileSync(`${procRoot}/${pid}/cmdline`, "utf8")
 				.split("\0")
 				.filter((seg) => seg !== "")
 				.join(" ");
@@ -644,7 +659,7 @@ async function sweepLeftovers(opts?: {
 	const stopped: SweptProcess[] = [];
 	for (const target of targets) {
 		try {
-			process.kill(target.pid, "SIGTERM");
+			kill(target.pid, "SIGTERM");
 		} catch {
 			continue; // ESRCH: already gone
 		}
@@ -654,8 +669,8 @@ async function sweepLeftovers(opts?: {
 	for (const target of stopped) {
 		try {
 			// Signal 0: existence probe. ESRCH here means the process took the TERM.
-			process.kill(target.pid, 0);
-			process.kill(target.pid, "SIGKILL");
+			kill(target.pid, 0);
+			kill(target.pid, "SIGKILL");
 		} catch {
 			// already exited between the check and the kill
 		}

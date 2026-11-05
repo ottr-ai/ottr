@@ -1,12 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { type ChildProcess, spawn } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
-	readlinkSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -119,6 +118,49 @@ function fakeSink(): RunSink & { lines: string[] } {
 			base.stderrLine(line);
 		},
 	};
+}
+
+// Helpers shared by the sweep and detach describes: every sweep a test runs
+// scans a fake proc tree through a recording kill, so no test can ever signal a
+// pid it did not create — not even under a Stryker mutant that widens the target
+// set (dropping the match guard would otherwise make every process in the
+// container a target and kill the worker itself).
+
+// Pure recording kill for fake proc scans: no signal ever leaves the test.
+function recordingKill() {
+	const calls: { pid: number; signal: string | number }[] = [];
+	const kill = (pid: number, signal?: number | string): true => {
+		calls.push({ pid, signal: signal ?? 0 });
+		return true;
+	};
+	return { calls, kill };
+}
+
+// Fake proc tree: exactly the files sweepLeftovers reads — stat (the ppid field
+// after the last ")"), cwd (the readlink target, which may dangle and may carry
+// the kernel's " (deleted)" marker), cmdline (NUL-separated argv).
+let fakeProcN = 0;
+type FakeProcEntry = {
+	pid: number;
+	ppid?: number;
+	cwd?: string;
+	cmd?: string[];
+};
+function fakeProcEntry(procRoot: string, e: FakeProcEntry): void {
+	const p = join(procRoot, String(e.pid));
+	mkdirSync(p, { recursive: true });
+	writeFileSync(join(p, "stat"), `${e.pid} (bun) S ${e.ppid ?? 1} 0 0\n`);
+	if (e.cwd) symlinkSync(e.cwd, join(p, "cwd"));
+	writeFileSync(
+		join(p, "cmdline"),
+		(e.cmd ?? ["bun", "run", "dev"]).map((seg) => `${seg}\0`).join(""),
+	);
+}
+
+function makeFakeProc(entries: FakeProcEntry[]): string {
+	const procRoot = join(dir, `fake-proc-${fakeProcN++}`);
+	for (const e of entries) fakeProcEntry(procRoot, e);
+	return procRoot;
 }
 
 async function readLines(res: Response): Promise<string[]> {
@@ -604,21 +646,12 @@ describe("serveWorker", () => {
 			});
 			await res.body?.getReader().read();
 			controller.abort();
-			const pid = Number(readFileSync(pidFile, "utf8"));
-			const alive = () => {
-				try {
-					process.kill(pid, 0);
-					return true;
-				} catch {
-					return false;
-				}
-			};
-			// Real wall-clock: neither the kill nor the drained pipe has an event the test can
-			// await; the loop exits on the condition, then the last buffered lines get a moment.
-			for (const end = Date.now() + 10_000; alive() && Date.now() < end; )
-				await Bun.sleep(10);
+			// The daemon killTree's the child with SIGKILL, which no test can observe
+			// without a real proc liveness probe or a signal call — both banned in
+			// this file so a widening sweep mutant can never find a real target here.
+			// The buffered lines still drain for a moment after the abort; the
+			// platform tests cover killTree's signals themselves.
 			await Bun.sleep(200);
-			expect(alive()).toBe(false);
 			expect(errors).toEqual([]);
 		} finally {
 			process.off("uncaughtException", onError);
@@ -867,132 +900,74 @@ runWorker({ id: "idle", argv: [], cwd: ${JSON.stringify(dir)}, stdin: "", env: {
 });
 
 describe("sweepLeftovers", () => {
-	// Detached child with its cwd in a (later deleted) fake worktree: the leftover dev
-	// server shape the sweep exists to kill. Boot is a real spawn, so the same 30 s
-	// budget as the other real-child tests applies.
-	async function startSweepChild(
-		root: string,
-		project: string,
-		cardId: string,
-	) {
-		const cwd = join(root, project, ".worktrees", cardId);
-		mkdirSync(cwd, { recursive: true });
-		const child = spawn(
-			process.execPath,
-			[
-				"-e",
-				"setInterval(() => {}, 1000); setTimeout(() => process.exit(0), 60000);",
-			],
-			{ cwd, detached: true, stdio: "ignore" },
-		);
-		child.unref();
-		// The child's /proc/<pid>/cwd entry appears only once it has execed; under
-		// machine load that can take seconds.
-		const deadline = Date.now() + 20_000;
-		for (;;) {
-			try {
-				readlinkSync(`/proc/${child.pid}/cwd`);
-				return child;
-			} catch {
-				if (Date.now() > deadline)
-					throw new Error(`child ${child.pid} never showed a cwd`);
-				await Bun.sleep(100);
-			}
-		}
-	}
-
-	async function awaitExit(child: ChildProcess): Promise<void> {
-		await Promise.race([
-			new Promise<void>((resolve) => child.once("exit", () => resolve())),
-			Bun.sleep(10_000),
+	// Safety contract for every test in this block: the sweep under test scans a
+	// fake proc tree (helpers above) and "signals" through a recording kill, so
+	// no test can ever signal a pid it did not create — not even under a Stryker
+	// mutant that widens the target set (e.g. dropping the match guard would
+	// otherwise make every process in the container a target and kill the worker
+	// itself). The fake tree below holds non-matching pids on purpose: the exact
+	// kill log fails the test if the sweep ever names one.
+	test("sweeps exactly the deleted-worktree process in a fake /proc", async () => {
+		const root = join(dir, "ottr-sweep-fake");
+		const procRoot = makeFakeProc([
+			{ pid: 4111, ppid: 1, cwd: `${root}/proj/.worktrees/T1 (deleted)` },
+			// Live worktree: not a leftover.
+			{ pid: 4112, ppid: 1, cwd: `${root}/proj/.worktrees/T2` },
+			// Deleted, but outside every sweep root.
+			{ pid: 4113, ppid: 1, cwd: "/elsewhere/proj/.worktrees/T3 (deleted)" },
+			// Exited between readdir and the cwd readlink: no cwd link.
+			{ pid: 4114, ppid: 1 },
 		]);
-	}
+		const { calls, kill } = recordingKill();
+		const url = start({
+			token: "t",
+			sweepRoots: [root],
+			sweepGraceMs: 50,
+			sweepProcRoot: procRoot,
+			sweepKill: kill,
+		});
+		const res = await fetch(`${url}/sweep`, {
+			method: "POST",
+			headers: { "x-otwr-token": "t" },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual([
+			{ pid: 4111, project: "proj", cardId: "T1", command: "bun run dev" },
+		]);
+		// TERM, the liveness probe, and the escalation: the exact sequence and
+		// nothing else. A foreign pid here is a test failure, not a signal.
+		expect(calls).toEqual([
+			{ pid: 4111, signal: "SIGTERM" },
+			{ pid: 4111, signal: 0 },
+			{ pid: 4111, signal: "SIGKILL" },
+		]);
+	});
 
-	test("sweeps a process whose worktree was deleted", async () => {
-		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-"));
-		let child: ChildProcess | undefined;
-		try {
-			child = await startSweepChild(root, "proj", "T1");
-			rmSync(root, { recursive: true, force: true });
-			// The kernel only marks the link "(deleted)" once the dir is gone; the unlink
-			// is async, so poll instead of asserting immediately.
-			const deadline = Date.now() + 20_000;
-			for (;;) {
-				const link = readlinkSync(`/proc/${child.pid}/cwd`);
-				if (link.endsWith(" (deleted)")) break;
-				if (Date.now() > deadline)
-					throw new Error(`cwd never turned deleted: ${link}`);
-				await Bun.sleep(100);
-			}
-			const server = start({
-				token: "t",
-				sweepRoots: [root],
-				sweepGraceMs: 100,
-			});
-			const res = await fetch(`${server}/sweep`, {
-				method: "POST",
-				headers: { "x-otwr-token": "t" },
-			});
-			expect(res.status).toBe(200);
-			const stopped = (await res.json()) as {
-				pid: number;
-				project: string;
-				cardId: string;
-				command: string;
-			}[];
-			expect(stopped).toEqual([
-				{
-					pid: child.pid!,
-					project: "proj",
-					cardId: "T1",
-					command: expect.stringContaining("bun"),
-				},
-			]);
-			await awaitExit(child);
-		} finally {
-			if (child && child.exitCode === null && child.signalCode === null)
-				child.kill();
-			rmSync(root, { recursive: true, force: true });
-		}
-	}, 30_000);
-
-	test("leaves a process with a live worktree alone", async () => {
-		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-live-"));
-		let child: ChildProcess | undefined;
-		try {
-			child = await startSweepChild(root, "proj", "T2");
-			const server = start({
-				token: "t",
-				sweepRoots: [root],
-				sweepGraceMs: 100,
-			});
-			const res = await fetch(`${server}/sweep`, {
-				method: "POST",
-				headers: { "x-otwr-token": "t" },
-			});
-			expect(res.status).toBe(200);
-			expect(await res.json()).toEqual([]);
-			// Still alive: a live worktree must never be swept.
-			process.kill(child.pid!, 0);
-		} finally {
-			if (child && child.exitCode === null && child.signalCode === null)
-				child.kill();
-			rmSync(root, { recursive: true, force: true });
-		}
-	}, 30_000);
-
-	// Real child and real /proc state: fake timers cannot drive a separate process or
-	// the kernel's "(deleted)" cwd marker, so the polls use the platform clock.
+	// Real run child, fake scan: the sweep never reads the kernel's /proc and the
+	// kill is a recording spy, so a widened target set can only ever "signal" the
+	// fake neighbor; the pid-file poll uses the platform clock because no event
+	// fires when a separate process writes a file.
 	test("a live /run child with a deleted worktree survives the sweep", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-sweep-run-"));
 		const wt = join(root, "proj", ".worktrees", "T3");
 		mkdirSync(wt, { recursive: true });
 		const pidFile = join(root, "pid");
+		const procRoot = makeFakeProc([
+			// A leftover neighbor: the only process the sweep may "signal".
+			{
+				pid: 4301,
+				ppid: 1,
+				cwd: `${root}/other/.worktrees/T9 (deleted)`,
+			},
+		]);
+		const { calls, kill } = recordingKill();
 		const url = start({
 			token: "t",
 			ompPath: process.execPath,
 			sweepRoots: [root],
 			sweepGraceMs: 100,
+			sweepProcRoot: procRoot,
+			sweepKill: kill,
 		});
 		const handle = runWorker(
 			{
@@ -1020,24 +995,28 @@ describe("sweepLeftovers", () => {
 				}
 			}
 			rmSync(root, { recursive: true, force: true });
-			// The merge-turn shape: the agent removed its own worktree mid-run, so the
-			// live omp cwd link ends in " (deleted)" while the turn still runs.
-			const gone = Date.now() + 20_000;
-			for (;;) {
-				const link = readlinkSync(`/proc/${ompPid}/cwd`);
-				if (link.endsWith(" (deleted)")) break;
-				if (Date.now() > gone)
-					throw new Error(`cwd never turned deleted: ${link}`);
-				await Bun.sleep(100);
-			}
+			// The merge-turn shape: the agent removed its own worktree mid-run, so a
+			// live turn's cwd link ends in " (deleted)". Mirror that shape into the
+			// fake /proc tree; runChildren must keep the live run out of the sweep.
+			fakeProcEntry(procRoot, {
+				pid: ompPid!,
+				ppid: 1,
+				cwd: `${wt} (deleted)`,
+			});
 			const res = await fetch(`${url}/sweep`, {
 				method: "POST",
 				headers: { "x-otwr-token": "t" },
 			});
 			expect(res.status).toBe(200);
-			expect(await res.json()).toEqual([]);
-			// Still alive: a live run (or its tree) is never a leftover.
-			process.kill(ompPid!, 0);
+			expect(await res.json()).toEqual([
+				{ pid: 4301, project: "other", cardId: "T9", command: "bun run dev" },
+			]);
+			// Exact kill log: the live run child was never signaled.
+			expect(calls).toEqual([
+				{ pid: 4301, signal: "SIGTERM" },
+				{ pid: 4301, signal: 0 },
+				{ pid: 4301, signal: "SIGKILL" },
+			]);
 		} finally {
 			handle.kill();
 			rmSync(root, { recursive: true, force: true });
@@ -1110,14 +1089,10 @@ describe("detach protocol", () => {
 		}
 	}
 
-	const alive = (pid: number): boolean => {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch {
-			return false;
-		}
-	};
+	// Kill landing is observed through the server-side entry state: real pid
+	// liveness probes and signal calls are banned in this file so a widening
+	// sweep mutant can never find a real target here. killTree's signals are
+	// covered by the platform tests.
 
 	async function run(
 		url: string,
@@ -1211,8 +1186,6 @@ describe("detach protocol", () => {
 			return entry !== undefined;
 		}, "entry");
 		expect(entry?.running).toBe(true);
-		const pid = entry!.pid;
-		expect(alive(pid)).toBe(true);
 		const miss = await fetch(`${url}/detach/kill`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -1226,8 +1199,10 @@ describe("detach protocol", () => {
 		});
 		expect(kill.status).toBe(200);
 		expect(await kill.json()).toEqual({ killed: true });
-		await pollUntil(() => !alive(pid), "kill landing");
-		expect((await detachedList(url))[0]?.killed).toBe(true);
+		await pollUntil(
+			async () => (await detachedList(url))[0]?.killed === true,
+			"kill landing",
+		);
 	}, 30_000);
 
 	test("/sweep does not stop a detached child", async () => {
@@ -1235,18 +1210,29 @@ describe("detach protocol", () => {
 		const cwd = join(root, "proj", ".worktrees", "T9");
 		mkdirSync(cwd, { recursive: true });
 		const pidFile = join(dir, "detach-sweep.pid");
+		// Fake scan + recording kill: the sweep can never signal a real process.
+		const procRoot = makeFakeProc([
+			{
+				pid: 4401,
+				ppid: 1,
+				cwd: `${root}/other/.worktrees/T8 (deleted)`,
+			},
+		]);
+		const { calls, kill } = recordingKill();
 		const url = start({
 			ompPath: process.execPath,
 			sweepRoots: [root],
 			sweepGraceMs: 100,
+			sweepProcRoot: procRoot,
+			sweepKill: kill,
 		});
+		let ompPid = 0;
 		try {
 			// The child writes no stdout, so Bun's client only resolves the /run
 			// response when the stream closes: start it un-awaited and let the pid
 			// file prove the spawn instead. The cwd is the worktree the sweep roots
 			// watch: its death mid-run is the merge-turn shape this test builds.
 			const resP = run(url, undefined, "d3", [sweepSleepPath, pidFile], cwd);
-			let ompPid = 0;
 			await pollUntil(() => {
 				try {
 					ompPid = Number(readFileSync(pidFile, "utf8"));
@@ -1256,14 +1242,14 @@ describe("detach protocol", () => {
 				}
 			}, "child pid file");
 			rmSync(root, { recursive: true, force: true });
-			// The merge-turn shape: the worktree is gone while the child still runs.
-			await pollUntil(() => {
-				try {
-					return readlinkSync(`/proc/${ompPid}/cwd`).endsWith(" (deleted)");
-				} catch {
-					return false;
-				}
-			}, "deleted cwd link");
+			// The merge-turn shape: the worktree is gone while the child still runs,
+			// so its cwd link ends in " (deleted)". Mirror it into the fake /proc
+			// tree; the detached entry must keep the child out of the sweep.
+			fakeProcEntry(procRoot, {
+				pid: ompPid,
+				ppid: 1,
+				cwd: `${cwd} (deleted)`,
+			});
 			expect(
 				await (await fetch(`${url}/detach`, { method: "POST" })).json(),
 			).toEqual({ detached: 1 });
@@ -1273,20 +1259,30 @@ describe("detach protocol", () => {
 			const res = await resP;
 			expect(res.status).toBe(200);
 			expect((await res.text()).length).toBe(0);
-			// The keep-set must cover a detached run: no leftover sweep, ever.
+			// The keep-set must cover a detached run: only the fake neighbor is
+			// listed and signaled, and the exact kill log holds no real pid.
 			const sweep = await fetch(`${url}/sweep`, {
 				method: "POST",
 			});
 			expect(sweep.status).toBe(200);
-			expect(await sweep.json()).toEqual([]);
-			expect(alive(ompPid)).toBe(true);
-			// Clean up the 60 s sleeper.
+			expect(await sweep.json()).toEqual([
+				{ pid: 4401, project: "other", cardId: "T8", command: "bun run dev" },
+			]);
+			expect(calls).toEqual([
+				{ pid: 4401, signal: "SIGTERM" },
+				{ pid: 4401, signal: 0 },
+				{ pid: 4401, signal: "SIGKILL" },
+			]);
+			// Clean up the 60 s sleeper; the entry records the landing.
 			await fetch(`${url}/detach/kill`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ id: "d3" }),
 			});
-			await pollUntil(() => !alive(ompPid), "kill landing");
+			await pollUntil(
+				async () => (await detachedList(url))[0]?.killed === true,
+				"kill landing",
+			);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
