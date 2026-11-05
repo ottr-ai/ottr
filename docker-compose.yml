@@ -275,6 +275,8 @@ services:
     environment:
       # The key alate itself requires on every request.
       ALATE_API_KEY: ${ALATE_API_KEY:-}
+      # Layer mode on (docs/specs/agent-layer-switch.md): layers with an atomic switch, not the flat home.
+      ALATE_LAYER: "1"
     ports:
       - "127.0.0.1:4570:4570"
 

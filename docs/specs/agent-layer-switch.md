@@ -183,7 +183,11 @@ layers. `agentDir()` (the credential store path) stays flat by definition.
    install-into-layer and switch) as a pair.
 2. Deploy in either order: the board image (compose) and the alate code (data
    repo provisioning on the host). Between the two, the board sees no
-   `layers: true` and keeps the old idle gate, so nothing breaks.
+   `layers: true` and keeps the old idle gate, so nothing breaks. The board
+   image deploy turns on layer mode in the bundled alate service: set
+   `ALATE_LAYER=1` in the `alate` service environment in `docker-compose.yml`
+   (the alate activation flag, ALAT-63). Without it, the bundled alate keeps
+   provisioning the flat home.
 3. After the first layered provision, `current` exists and new turns pin. The
    flat agent-layer files stay in place, unused; alate may prune them later.
    The flat shared state (agent.db, oauth, sessions, caches, git and gh
