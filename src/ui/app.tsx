@@ -540,6 +540,9 @@ type CardDrag = {
 	onDragEnd: () => void;
 };
 
+/** A model selector without its provider ("zai/glm-5.3-flash:max" -> "glm-5.3-flash:max"). */
+const shortModel = (m: string): string => m.slice(m.indexOf("/") + 1);
+
 /** Rank and close-candidate chips, shared by the board card and the overview triage row.
  * Text labels, never color alone; the close badge's tooltip carries the reason. */
 function RankBadges({
@@ -617,6 +620,11 @@ function Card({
 	const release = releaseOf(task);
 	const commits = task.stage === "done" ? task.commits : null;
 	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
+	// The card shows only the percent and the time left; the full line stays in the tooltip.
+	const spLeft =
+		sp === null
+			? null
+			: (strykerStats(sp.rest).find((x) => x.label === "Left")?.value ?? null);
 	const silent =
 		task.silentSince !== undefined
 			? `No output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
@@ -691,6 +699,15 @@ function Card({
 						</span>
 					)}
 					<RankBadges task={task} />
+					{/* Pinned to the head's top right without the provider; the tooltip keeps the full id. */}
+					{task.stage !== "done" && (
+						<span
+							className="model"
+							title={`Main loop model: ${task.model ?? task.lastModel ?? "default"}${task.model === null && task.lastModel ? " (last run)" : ""}`}
+						>
+							{shortModel(task.model ?? task.lastModel ?? "default")}
+						</span>
+					)}
 				</span>
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
 				{/* Needs attention: the error takes the prompt line until the state clears; the
@@ -737,14 +754,6 @@ function Card({
 							? landed(task.doneAt)
 							: age(task.createdAt)}{" "}
 					{sp === null && <>· {statusLine(task, hasRules, hold, drain)}</>}
-					{task.stage !== "done" && (
-						<span
-							className="model"
-							title={`Main loop model: ${task.model ?? task.lastModel ?? "default"}${task.model === null && task.lastModel ? " (last run)" : ""}`}
-						>
-							{task.model ?? task.lastModel ?? "default"}
-						</span>
-					)}
 					{commits !== null && (
 						<span
 							className="commits"
@@ -769,13 +778,12 @@ function Card({
 				)}
 				{sp !== null && (
 					<span className="card-mutation" title={task.progress ?? undefined}>
-						<Meter
-							label="Mutation testing"
-							pct={sp.pct}
-							value={`${sp.tested}/${sp.total}`}
-							band={false}
-						/>
-						<span className="mutation-stats">{sp.rest}</span>
+						Mutation {sp.pct}%{spLeft !== null && ` · ${spLeft} left`}
+						<span className="mutation-track" aria-hidden="true">
+							<i
+								style={{ transform: `scaleX(${clamp(sp.pct, 0, 100) / 100})` }}
+							/>
+						</span>
 					</span>
 				)}
 			</a>
@@ -7397,32 +7405,32 @@ export function Drawer({
 						</p>
 					</header>
 					{mut !== null && (
-						<DrawerSec
-							id="drawer-mut"
-							label="Mutation run"
-							className="drawer-mut"
-						>
-							<Meter
-								label="Mutation testing"
-								pct={mut.pct}
-								value={`${Math.round(mut.pct)}%`}
-								band={false}
-							/>
-							<dl className="readout">
-								<div>
-									<dt>Tested</dt>
-									<dd>
-										{mut.tested} / {mut.total}
-									</dd>
-								</div>
-								{/* The tail's parts are known words (survived, elapsed, left, timed out); a part the format grows later keeps its raw text. */}
-								{strykerStats(mut.rest).map((s) => (
-									<div key={s.label === "" ? s.value : s.label}>
-										<dt>{s.label}</dt>
-										<dd>{s.value}</dd>
+						<DrawerSec id="drawer-mut" label="Mutation run">
+							<div className="mut-run">
+								<span className="mut-pct">{Math.round(mut.pct)}%</span>
+								<span className="mut-bar" aria-hidden="true">
+									<i
+										style={{
+											transform: `scaleX(${clamp(mut.pct, 0, 100) / 100})`,
+										}}
+									/>
+								</span>
+								<dl className="mut-figs">
+									<div>
+										<dt>Tested</dt>
+										<dd>
+											{mut.tested} / {mut.total}
+										</dd>
 									</div>
-								))}
-							</dl>
+									{/* The tail's parts are known words (survived, elapsed, left, timed out); a part the format grows later keeps its raw text. */}
+									{strykerStats(mut.rest).map((s) => (
+										<div key={s.label === "" ? s.value : s.label}>
+											<dt>{s.label}</dt>
+											<dd>{s.value}</dd>
+										</div>
+									))}
+								</dl>
+							</div>
 						</DrawerSec>
 					)}
 					{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
@@ -7873,7 +7881,7 @@ export function Drawer({
 											{" · "}
 											{run.model === null
 												? "default model"
-												: run.model.slice(run.model.indexOf("/") + 1)}
+												: shortModel(run.model)}
 											{" · "}
 											{stamp(run.at)} · {duration(run.durationMs)}
 										</p>
@@ -8123,7 +8131,7 @@ export function Drawer({
 												<span className="turn-model" title="model">
 													{run.model === null
 														? "default model"
-														: run.model.slice(run.model.indexOf("/") + 1)}
+														: shortModel(run.model)}
 												</span>
 												<span className="turn-time">
 													{new Date(run.at).toLocaleTimeString()}

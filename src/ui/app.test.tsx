@@ -442,7 +442,8 @@ describe("LaneCol backlog divider", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="todo" tasks={[ran]} />,
 		);
-		expect(html).toContain(">zai/glm-5.3-flash</span>");
+		// The chip drops the provider; its tooltip keeps the full id.
+		expect(html).toContain(">glm-5.3-flash</span>");
 		expect(html).toContain("Main loop model: zai/glm-5.3-flash (last run)");
 		// No run recorded a model yet: the chip stays on the literal default.
 		const fresh = cardFixture({
@@ -466,7 +467,7 @@ describe("LaneCol backlog divider", () => {
 		const pin = renderToStaticMarkup(
 			<LaneCol {...base} stage="todo" tasks={[pinned]} />,
 		);
-		expect(pin).toContain(">a/big</span>");
+		expect(pin).toContain(">big</span>");
 		expect(pin).toContain('title="Main loop model: a/big"');
 	});
 
@@ -611,7 +612,7 @@ describe("LaneCol backlog divider", () => {
 		expect(g!.hidden).toBe(5);
 	});
 
-	test("a running card's mutation meter reads the tool-neutral label", () => {
+	test("a running card's mutation line shows the percent and the time left only", () => {
 		const run = cardFixture({
 			id: "m1",
 			stage: "in_progress",
@@ -621,15 +622,14 @@ describe("LaneCol backlog divider", () => {
 		});
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
-		);
-		expect(html).toContain("Mutation testing");
-		expect(html).toContain("card-mutation");
-		expect(html).toContain("mutation-stats");
-		// The stats tail keeps the tool's own words; the raw line stays on the row's title.
-		expect(html).toContain("38 survived (0.9%)");
-		expect(html).toContain('title="Stryker 68%');
+		).replaceAll("<!-- -->", "");
+		expect(html).toContain(">Mutation 68% · ~1h 23m left<");
+		expect(html).toContain('class="mutation-track"');
+		// Counts, survivors and elapsed time stay on the row's title, off the card face.
+		expect(html).toContain('title="Stryker 68% · 4454/6523 · 38 survived');
+		expect(html).not.toContain(">4454/6523<");
+		expect(html).not.toContain("elapsed<");
 		expect(html).not.toContain(">Stryker<");
-		expect(html).not.toContain("card-stryker");
 	});
 });
 

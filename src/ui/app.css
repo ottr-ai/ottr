@@ -1269,19 +1269,13 @@ textarea {
 	color: inherit;
 }
 /* No mark on the bell: the bell itself carries the level. While something needs you it fills in
-   the level colour (the count too); new notices fill the whole button and the bell turns ink. */
+   the level colour and the count stays white; new notices fill the whole button and the bell turns ink. */
 .inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
 		.lit
 	)
 	> .icon-svg {
 	color: var(--lit);
 	fill: var(--lit);
-}
-.inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
-		.lit
-	)
-	.inbox-n {
-	color: var(--lit);
 }
 .inbox.lit > .icon-svg {
 	fill: currentColor;
@@ -1808,9 +1802,11 @@ button.notif-link {
 	border: 0;
 }
 /* One account menu for every width. Desktop opens it from the rail chip and keeps theme in
-   the bar; phones have no rail, so a bar chip opens it and the menu carries the theme rows. */
+   the bar; phones have no rail, so a bar chip opens it and the menu carries the theme rows.
+   The "Signed in as" line shows only on phones: on desktop the rail chip already names the user. */
 @media (min-width: 721px) {
 	.bar-user,
+	.menu-who,
 	.menu-theme {
 		display: none;
 	}
@@ -1845,7 +1841,7 @@ button.notif-link {
 .project {
 	display: flex;
 	flex-direction: column;
-	gap: 12px;
+	gap: 20px; /* the board sits as far below the header as the header sits from the main edges */
 	/* Definite height, so .flow's flex-basis resolves and the columns scroll instead of stretching the page. */
 	height: 100%;
 }
@@ -2365,7 +2361,9 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	overflow-y: auto;
 	display: flex;
 	flex-direction: column;
-	gap: 10px;
+	/* The same 16px between cards as from the column lines; the drop placeholder reads it too. */
+	--card-gap: 16px;
+	gap: var(--card-gap);
 	/* 16px from every column line, so cards sit clear of the dividers. */
 	padding: 8px 16px 16px;
 }
@@ -2412,7 +2410,7 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 /* Drop targets preview the slot the dragged card will take: a dashed steel placeholder of its height,
    above the target card or at the end of the column. The target card moves down to make room. */
 .card.drop-before {
-	margin-top: calc(var(--drag-h, 36px) + 6px);
+	margin-top: calc(var(--drag-h, 36px) + var(--card-gap));
 }
 .card.drop-before::before,
 .stage-cards.drop-end::after {
@@ -2426,10 +2424,8 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .card.drop-before::before {
 	position: absolute;
 	right: -1px;
-	bottom: calc(
-		100% +
-		7px
-	); /* the 6px list gap, measured from outside the card's 1px border */
+	/* one list gap above the card, measured from outside the card's 1px border */
+	bottom: calc(100% + var(--card-gap) + 1px);
 	left: -1px;
 }
 .stage-cards.drop-end::after {
@@ -2570,20 +2566,50 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	font-size: 12.5px;
 	color: var(--dim);
 }
-.card-meta .commits,
-.card-meta .model {
+.card-meta .commits {
 	margin-left: auto;
 }
-/* Mutation testing meter row: a running card's live progress under the meta line.
-   Stacked, so the stats tail keeps whole words on the narrow board card. */
-.card-mutation {
-	display: grid;
-	gap: 2px;
-	font-size: 12px;
-	color: var(--dim);
-}
-.mutation-stats {
+/* The model chip is pinned to the head's top right: it takes the auto margin unless an
+   earlier right-hand chip (research, rank, close) already took it, and order keeps it
+   after "next". A long id ellipsizes instead of pushing the task key. */
+.card-head .model {
+	order: 2;
+	min-width: 0;
+	margin-left: auto;
 	overflow: hidden;
+	line-height: 18px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.card-head :is(.research, .cancelled, .rank-badges:not(:empty)) ~ .model {
+	margin-left: 0;
+}
+/* Mutation testing on a running card: one dim line (percent and time left), and the
+   progress as a 2px line along the card's bottom edge. Counts, survivors and elapsed time
+   stay in the tooltip and the drawer. */
+.card-mutation {
+	overflow: hidden;
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	color: var(--dim);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.mutation-track {
+	position: absolute;
+	right: 0;
+	bottom: 0;
+	left: 0;
+	height: 2px;
+	overflow: hidden;
+	border-radius: 0 0 3px 3px;
+}
+.mutation-track > i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
 }
 /* Arrival: when a card lands in a column its status mark traces itself once and the meta line follows;
    nothing loops. Cards cascade by position up to the eighth. Reduced motion skips it entirely. */
@@ -2611,28 +2637,37 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 		opacity: 0;
 	}
 }
-/* The head of the Todo queue says "next" at the end of its head line; the rest of the queue stays unnumbered.
+/* The head of the Todo queue says "next" at the right end of its head line, just left of
+   the model chip; the rest of the queue stays unnumbered.
    A card held by unfinished dependencies is never next: the label goes to the first unheld card.
    ponytail: marks the Todo lane's head; a queued reply in In progress can still run first. Pass the
    scheduler's head as a data attribute if that ever matters. */
 .card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
 		.card[data-state="queued"]:not([data-held]) ~ .card
 	)
-	.card-head {
-	padding-right: 40px;
-}
-.card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
-	.card[data-state="queued"]:not([data-held]) ~ .card
-)::after {
+	.card-head::after {
 	content: "next";
-	position: absolute;
-	top: 12px;
-	right: 10px;
+	order: 1;
+	flex: none;
+	margin-left: auto;
 	font-size: 12px;
 	font-weight: 600;
-	line-height: 1;
+	line-height: 18px;
 	color: var(--text);
-	pointer-events: none;
+}
+/* Only one item takes the auto margin: an earlier chip, else "next", else the model. */
+.card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
+		.card[data-state="queued"]:not([data-held]) ~ .card
+	)
+	.card-head:has(.research, .rank-badges:not(:empty))::after {
+	margin-left: 0;
+}
+.card[data-stage="todo"][data-state="queued"]:not([data-held]):not(
+		.card[data-state="queued"]:not([data-held]) ~ .card
+	)
+	.card-head
+	.model {
+	margin-left: 0;
 }
 .card-tags {
 	position: relative;
@@ -2712,7 +2747,7 @@ a.release:hover {
 }
 
 /* Research chip: same shape as the .model chip, muted to read as metadata. Right-aligned
-   on the head line, the way .model right-aligns the meta line. */
+   on the head line, just left of the pinned model chip. */
 .card .research {
 	flex-shrink: 0;
 	margin-left: auto;
@@ -2950,7 +2985,7 @@ a.release:hover {
 	min-height: 0;
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
+	gap: var(--card-gap);
 	padding: 6px 0 2px;
 	/* No padding transition: animating padding thrashes layout, and the 6px snap
 	   is invisible inside the 160ms grid-template-rows collapse above. */
@@ -5137,13 +5172,59 @@ dialog.drawer[open]::backdrop {
 .drawer-sub .sub-dim {
 	color: var(--dim);
 }
-/* Live mutation run: a running card's mutation-tool progress as a drawer section —
-   the same data the board card's meter row shows, with room for the full readout. */
-.drawer-mut .meter-track {
-	width: 200px;
+/* Live mutation run in the drawer: a large percent (Values-Read-First), a full-width bar,
+   then the readout as label-over-value figures in one row (two rows of two on phones). */
+.mut-run {
+	display: grid;
+	gap: 10px;
 }
-.drawer-mut .readout {
-	margin: 12px 0 0;
+.mut-pct {
+	font-size: 22px;
+	font-weight: 600;
+	line-height: 1;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+}
+.mut-bar {
+	position: relative;
+	display: block;
+	height: 4px;
+	overflow: hidden;
+	background: var(--well);
+	border-radius: 2px;
+}
+.mut-bar > i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
+.mut-figs {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 8px;
+	margin: 0;
+}
+.mut-figs div {
+	display: grid;
+	gap: 2px;
+}
+.mut-figs dt {
+	font-size: 12px;
+	color: var(--dim);
+}
+.mut-figs dd {
+	margin: 0;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+@media (max-width: 480px) {
+	.mut-figs {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		row-gap: 10px;
+	}
 }
 /* Inline id chip: strips the chrome-button shell; click copies the id. */
 .task-id {
@@ -6410,6 +6491,10 @@ button.log-mode[aria-pressed="true"] {
 	}
 	.main {
 		padding: 14px 12px;
+	}
+	/* Phones: the board sits as far below the header as the header sits from the top. */
+	.project {
+		gap: 16px;
 	}
 	/* The FAB floats over the list: no reserved band below the board. The clearance
 	   lives in the lane scroller, so the last card can scroll above the button. */
