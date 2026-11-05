@@ -6722,6 +6722,26 @@ describe("prepareTurn", () => {
 		);
 	});
 
+	test("a busy board store stops the turn with a retry reason, not a sign-in prompt", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async () => ({
+				env: {},
+				missing: [],
+				credentialError:
+					"the board store /agent/agent.db is busy (a write did not end within 5 s)",
+				busy: true,
+			}),
+		});
+		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)!.needsReason).toBe(
+			"Sign-in: the board store /agent/agent.db is busy (a write did not end within 5 s). The turn did not start. Reply to retry; do not sign in again.",
+		);
+	});
+
 	test("a worker-dispatched turn never calls prepareTurn", async () => {
 		let called = false;
 		const { store, loop } = setup({

@@ -56,6 +56,39 @@ console.log("access-new");
 `,
 );
 
+// A lock holder: opens the store, takes SQLite's exclusive lock, prints "locked" once the lock
+// is held, and commits after `hold` ms. Real timers on purpose: the busy wait runs inside
+// SQLite's native busy handler, and the holder is another process — fake timers cannot drive
+// either, so the test pays the real hold of about 300 ms.
+const lockHolder = join(dir, "lock-holder.ts");
+writeFileSync(
+	lockHolder,
+	`import { Database } from "bun:sqlite";
+const [path, hold] = process.argv.slice(2);
+const db = new Database(path);
+db.exec("BEGIN EXCLUSIVE");
+console.log("locked");
+setTimeout(() => {
+	db.exec("COMMIT");
+	db.close();
+}, Number(hold));
+`,
+);
+
+/** Resolves with the lock holder's first stdout line: its exclusive lock is held from then on. */
+async function waitLocked(stdout: ReadableStream<Uint8Array>): Promise<string> {
+	const reader = stdout.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) throw new Error("the lock holder exited before it locked");
+		text += decoder.decode(value, { stream: true });
+		const nl = text.indexOf("\n");
+		if (nl !== -1) return text.slice(0, nl);
+	}
+}
+
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const command = [process.execPath, fake];
@@ -129,6 +162,55 @@ describe("lentProviderEnv", () => {
 			error: null,
 		});
 		expect(runs(path)).toEqual([]);
+	});
+
+	test("a store locked for a short write waits for it and still lends", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		const holder = Bun.spawn([process.execPath, lockHolder, path, "300"], {
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+			windowsHide: true,
+		});
+		await waitLocked(holder.stdout);
+		expect(await lend("anthropic/claude-opus-5-5", path)).toEqual({
+			env: { ANTHROPIC_OAUTH_TOKEN: "access-1" },
+			error: null,
+		});
+		expect(await holder.exited).toBe(0);
+	});
+
+	test("a store still locked after the busy timeout reports busy, not a broken sign-in", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		const holder = Bun.spawn([process.execPath, lockHolder, path, "600"], {
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+			windowsHide: true,
+		});
+		await waitLocked(holder.stdout);
+		const env = await lentProviderEnv("anthropic/claude-opus-5-5", {
+			dbPath: path,
+			now: NOW,
+			command,
+			busyTimeoutMs: 100,
+		});
+		expect(env.env).toEqual({});
+		expect(env.busy).toBe(true);
+		expect(env.error).toBe(
+			`the board store ${path} is busy (a write did not end within 0.1 s)`,
+		);
+		expect(await holder.exited).toBe(0);
 	});
 
 	test("a token near its expiry makes omp refresh it in the board store, then lends the new one", async () => {

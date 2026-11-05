@@ -3,12 +3,18 @@
 // refresh token. Ottr has no OAuth refresh code: when the token runs low, omp refreshes it
 // (docs/specs/provider-credentials.md, "Token lending"). Lending fails closed: for a provider
 // the board lends, anything short of a usable token is an error that stops the worker turn.
-import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stripANSI } from "bun";
 import { errmsg } from "./errmsg.ts";
-import { agentDir, boardOmpEnv, currentCredential, LENT_ENV } from "./login.ts";
+import {
+	agentDir,
+	boardOmpEnv,
+	currentCredential,
+	LENT_ENV,
+	openStoreReadOnly,
+	STORE_BUSY_TIMEOUT_MS,
+} from "./login.ts";
 import { turnEnvValues } from "./tools.ts";
 
 const TOKEN_REFRESH_MARGIN_MS = 30 * 60_000;
@@ -20,11 +26,16 @@ const ZAI_NO_EXPIRY = 8_640_000_000_000_000;
 type Read =
 	| { kind: "token"; access: string; expires: number }
 	| { kind: "api_key" }
-	| { kind: "error"; cause: string };
+	/** `busy`: the store was still locked after the busy timeout (a concurrent omp write). */
+	| { kind: "error"; cause: string; busy?: true };
 
 /** Why the provider has no active credential: never signed in, or omp disabled its row. */
-function noCredential(dbPath: string, provider: string): string {
-	const db = new Database(dbPath, { readonly: true });
+function noCredential(
+	dbPath: string,
+	provider: string,
+	timeoutMs = STORE_BUSY_TIMEOUT_MS,
+): string {
+	const db = openStoreReadOnly(dbPath, timeoutMs);
 	try {
 		const row = db
 			.query(
@@ -45,18 +56,32 @@ function noCredential(dbPath: string, provider: string): string {
  * API key is reported as such: the board never lends one. Everything else is an error with its
  * cause: a missing or unreadable store, no sign-in, a disabled sign-in, or a damaged row.
  */
-function readToken(dbPath: string, provider: string): Read {
+function readToken(
+	dbPath: string,
+	provider: string,
+	timeoutMs = STORE_BUSY_TIMEOUT_MS,
+): Read {
 	// A readonly open of a missing path fails with a message that names no file (login.ts).
 	if (!existsSync(dbPath))
 		return { kind: "error", cause: `the board store ${dbPath} does not exist` };
 	let data: string;
 	try {
-		const row = currentCredential(dbPath, provider);
+		const row = currentCredential(dbPath, provider, timeoutMs);
 		if (row === null)
-			return { kind: "error", cause: noCredential(dbPath, provider) };
+			return {
+				kind: "error",
+				cause: noCredential(dbPath, provider, timeoutMs),
+			};
 		if (row.credential_type !== "oauth") return { kind: "api_key" };
 		data = row.data;
 	} catch (err) {
+		// Still locked after the busy timeout: omp held the store (a token refresh).
+		if (errmsg(err).includes("database is locked"))
+			return {
+				kind: "error",
+				busy: true,
+				cause: `the board store ${dbPath} is busy (a write did not end within ${timeoutMs / 1000} s)`,
+			};
 		return {
 			kind: "error",
 			cause: `cannot read the board store ${dbPath}: ${errmsg(err)}`,
@@ -152,6 +177,8 @@ function sharedRefresh(
 interface Lent {
 	env: Record<string, string>;
 	error: string | null;
+	/** The error was a busy store: a reply retries, a new sign-in does not help. */
+	busy?: boolean;
 }
 
 /** The lent env for the model's provider; a null model (a local run) lends nothing. */
@@ -162,6 +189,8 @@ export async function lentProviderEnv(
 		now?: number;
 		/** Only for tests: the command that gets `<provider> --force-refresh` appended. */
 		command?: string[];
+		/** Only for tests: how long a store read waits out a concurrent write. */
+		busyTimeoutMs?: number;
 	} = {},
 ): Promise<Lent> {
 	if (model === null || model === undefined || model.trim() === "")
@@ -180,9 +209,10 @@ export async function lentProviderEnv(
 	const now = opts.now ?? Date.now();
 	const dbPath = opts.dbPath ?? join(agentDir(), "agent.db");
 
-	const before = readToken(dbPath, provider);
+	const before = readToken(dbPath, provider, opts.busyTimeoutMs);
 	if (before.kind === "api_key") return { env: {}, error: null };
-	if (before.kind === "error") return { env: {}, error: before.cause };
+	if (before.kind === "error")
+		return { env: {}, error: before.cause, busy: before.busy };
 	if (before.expires - now > TOKEN_REFRESH_MARGIN_MS)
 		return { env: { [name]: before.access }, error: null };
 
@@ -191,7 +221,7 @@ export async function lentProviderEnv(
 		dirname(dbPath),
 		opts.command ?? ["omp", "token"],
 	);
-	const after = readToken(dbPath, provider);
+	const after = readToken(dbPath, provider, opts.busyTimeoutMs);
 	// A login during the refresh made an API key current: as before the refresh, lend nothing.
 	if (after.kind === "api_key") return { env: {}, error: null };
 	if (after.kind === "token" && after.expires - now > TOKEN_REFRESH_MARGIN_MS)
@@ -204,6 +234,7 @@ export async function lentProviderEnv(
 	return {
 		env: {},
 		error: `omp did not refresh the board's ${provider} sign-in: ${why}`,
+		busy: cause === null && after.kind === "error" ? after.busy : undefined,
 	};
 }
 
@@ -221,6 +252,8 @@ export async function turnEnv(
 	env: Record<string, string>;
 	missing: string[];
 	credentialError: string | null;
+	/** The error was a busy board store: a reply retries, no new sign-in. */
+	busy?: boolean;
 	secrets: string[];
 }> {
 	const base = turnEnvValues(project, envValues, opts.home);
@@ -229,6 +262,7 @@ export async function turnEnv(
 		env: { ...base.env, ...lent.env },
 		missing: base.missing,
 		credentialError: lent.error,
+		busy: lent.busy,
 		secrets: Object.values(lent.env),
 	};
 }

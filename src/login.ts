@@ -447,9 +447,22 @@ export interface SignIn {
 // The causes omp itself hides (pi-coding-agent usage-cli): a logout or a newer login of the account.
 const GONE = /^(replaced by|deleted by user)/i;
 
+/** How long a store read waits for a concurrent omp write (a token refresh) to end before it fails busy. */
+export const STORE_BUSY_TIMEOUT_MS = 5000;
+
+/** Opens the board store read-only; a concurrent write holds the first read up to `timeoutMs`. */
+export function openStoreReadOnly(
+	dbPath: string,
+	timeoutMs = STORE_BUSY_TIMEOUT_MS,
+): Database {
+	const db = new Database(dbPath, { readonly: true });
+	db.exec(`PRAGMA busy_timeout = ${timeoutMs}`);
+	return db;
+}
+
 /** omp's stored sign-ins, one per provider: its current credential (see currentCredential); a failed one only when none is active. One connection per call. */
 export function signIns(dbPath = agentDb()): SignIn[] {
-	const db = new Database(dbPath, { readonly: true });
+	const db = openStoreReadOnly(dbPath);
 	const by = new Map<string, SignIn>();
 	let current: Map<string, ActiveCredential>;
 	try {
@@ -520,10 +533,13 @@ interface ActiveCredential {
 }
 
 /** The store's active rows with their login moments; empty when the store or its table is missing. */
-function activeCredentials(dbPath: string): ActiveCredential[] {
+function activeCredentials(
+	dbPath: string,
+	timeoutMs = STORE_BUSY_TIMEOUT_MS,
+): ActiveCredential[] {
 	// A readonly open of a missing path fails with a message that names no file.
 	if (!existsSync(dbPath)) return [];
-	const db = new Database(dbPath, { readonly: true });
+	const db = openStoreReadOnly(dbPath, timeoutMs);
 	try {
 		return readActive(db);
 	} finally {
@@ -595,8 +611,9 @@ function newestPerProvider(
 export const currentCredential = (
 	dbPath: string,
 	provider: string,
+	timeoutMs = STORE_BUSY_TIMEOUT_MS,
 ): ActiveCredential | null =>
-	newestPerProvider(activeCredentials(dbPath)).get(provider) ?? null;
+	newestPerProvider(activeCredentials(dbPath, timeoutMs)).get(provider) ?? null;
 
 /** The board lends this credential to worker turns: OAuth, of a LENT_ENV provider. */
 const lendable = (r: ActiveCredential): boolean =>
@@ -643,7 +660,7 @@ export function signOut(
 ): number {
 	const db = new Database(dbPath);
 	try {
-		db.exec("PRAGMA busy_timeout = 5000");
+		db.exec(`PRAGMA busy_timeout = ${STORE_BUSY_TIMEOUT_MS}`);
 		return db
 			.query(
 				`UPDATE auth_credentials SET disabled_cause = ?,

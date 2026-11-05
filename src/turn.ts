@@ -470,6 +470,8 @@ export interface TurnOps {
 		env: Record<string, string>;
 		missing: string[];
 		credentialError?: string | null;
+		/** The credential error was a busy board store: a reply retries, no new sign-in. */
+		busy?: boolean;
 		/** Values the run redacts from its log (the lent provider token). */
 		secrets?: string[];
 	}>;
@@ -489,6 +491,20 @@ export interface TurnOps {
 	): Promise<ArchReviewDelta | null>;
 	/** Provider usage limits (`omp usage`), so a check that hit a limit waits for its reset; absent = unknown. */
 	quota?: () => Promise<QuotaState>;
+}
+
+/**
+ * The card's reason for a credential-stopped turn: a busy store names the retry (the sign-in is
+ * not the cause), any other credential fault says to sign in again.
+ */
+function signInNeedsReason(
+	credentialError: string | null | undefined,
+	busy: boolean,
+): string {
+	const cause = credentialError || "the board cannot lend a credential";
+	return busy
+		? `Sign-in: ${cause}. The turn did not start. Reply to retry; do not sign in again.`
+		: `Sign-in: ${cause}. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.`;
 }
 
 // ponytail: module-level notify hook so exported appendLog keeps its 3-arg
@@ -1884,7 +1900,7 @@ export function createTurnLoop(
 				turnEnv.credentialError !== null
 			) {
 				stopBeforeRun(
-					`Sign-in: ${turnEnv.credentialError || "the board cannot lend a credential"}. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.`,
+					signInNeedsReason(turnEnv.credentialError, turnEnv.busy === true),
 				);
 				return;
 			}
