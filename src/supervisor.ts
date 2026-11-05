@@ -49,6 +49,7 @@ export interface SupervisorOps {
 	}): Promise<void>;
 	unsavedWork(worktreePath: string, target: string): Promise<string | null>;
 	statusRows(worktreePath: string): Promise<string[]>;
+	statusFiles(worktreePath: string): Promise<string[]>;
 	gh(args: string[]): Promise<{ code: number; stdout: string; stderr: string }>;
 	commitsAhead: typeof commitsAhead;
 	isClean: typeof isClean;
@@ -538,7 +539,14 @@ export function createSupervisor(
 			ops.schedule();
 		} else if (next.stage === "done") {
 			const commits = await ops.targetCommits(e.path, e.target);
-			// Re-checked past the targetCommits await: a reply landing there must not lose
+			// The tracked changes that kept this card parked stay in the worktree (only
+			// untracked scratch was quarantined above): capture them for the done drawer
+			// before cleanupPass can remove the tree, like the turn settle does.
+			const uncommitted =
+				t.worktree !== null && existsSync(t.worktree)
+					? await ops.statusFiles(t.worktree)
+					: [];
+			// Re-checked past the git awaits: a reply landing there must not lose
 			// its queued prompt to this write.
 			if (wentStale(e.store, t)) return;
 			// ponytail: a tick-done card skips the finish path's kept-files UI; quarantine already
@@ -548,6 +556,7 @@ export function createSupervisor(
 				state: "idle",
 				needsReason: null,
 				commits,
+				uncommittedFiles: uncommitted,
 			});
 			ops.appendLog(
 				e.store,

@@ -566,6 +566,7 @@ const supervisor = createSupervisor(
 		removeWorktree,
 		unsavedWork,
 		statusRows,
+		statusFiles,
 		gh: runGh,
 		commitsAhead,
 		isClean,

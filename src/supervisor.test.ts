@@ -102,6 +102,7 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			return ops.unsaved;
 		},
 		statusRows: async () => ops.status,
+		statusFiles: async () => [],
 		gh: async (args) => {
 			// Dependabot polls use `gh pr ...`; the CI watch uses `gh api ...` and one
 			// `gh run view ...` per failed run when it files a follow-up.
@@ -624,6 +625,10 @@ describe("stale needs_you re-classification", () => {
 			outcome: "ready",
 		});
 		const ops = fakeOps({ cleanNow: false, integratedNow: true });
+		// The tracked changes that kept the card parked live in the worktree: the
+		// done card must keep naming them.
+		mkdirSync(join(root, "re-done", ".wt"), { recursive: true });
+		ops.statusFiles = async () => ["radio.conf"];
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect(ops.calls.quarantine).toEqual([
 			{
@@ -636,6 +641,7 @@ describe("stale needs_you re-classification", () => {
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 		expect(after.commits).toBe(3);
+		expect(after.uncommittedFiles).toEqual(["radio.conf"]);
 		expect(ops.calls.scheduled).toBe(0);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("git now proves the work integrated; card resolved");

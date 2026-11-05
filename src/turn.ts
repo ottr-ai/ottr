@@ -1363,11 +1363,18 @@ export function createTurnLoop(
 						const mergeHead = await ops
 							.targetSha(e.path, target)
 							.catch(() => null);
+						// The review's worktree holds its generated report files; capture them
+						// before cleanupPass removes the tree, like the turn settle does.
+						const uncommitted =
+							t.worktree !== null && existsSync(t.worktree)
+								? await ops.statusFiles(t.worktree)
+								: [];
 						if (cancelled()) continue;
 						e.store.updateTask(t.id, {
 							stage: "done",
 							state: "idle",
 							needsReason: null,
+							uncommittedFiles: uncommitted,
 							commits,
 							mergeHead,
 						});
@@ -1395,12 +1402,18 @@ export function createTurnLoop(
 					const mergeHead = await ops
 						.targetSha(e.path, target)
 						.catch(() => null);
+					// Same capture rule as the plain review done above.
+					const uncommitted =
+						t.worktree !== null && existsSync(t.worktree)
+							? await ops.statusFiles(t.worktree)
+							: [];
 					if (cancelled()) continue;
 					e.store.updateTask(t.id, {
 						stage: "done",
 						state: "idle",
 						needsReason: null,
 						summary: `Released ${t.releaseVersion}`,
+						uncommittedFiles: uncommitted,
 						commits,
 						mergeHead,
 					});
@@ -3976,6 +3989,9 @@ export function createTurnLoop(
 			stage: "done",
 			state: "idle",
 			needsReason: null,
+			// The kept list is this run's uncommitted files: the done drawer keeps
+			// naming them now that the worktree they lived in is gone.
+			uncommittedFiles: task.keptFiles,
 			keptFiles: [],
 			commits: await ops.targetCommits(e.path, target),
 			mergeHead: await ops.targetSha(e.path, target).catch(() => null),

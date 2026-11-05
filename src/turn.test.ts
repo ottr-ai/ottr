@@ -3763,19 +3763,23 @@ describe("turn settleReviews", () => {
 	});
 
 	test("a parked Review-button review is done, without a publish, once its findings are done", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = setup({
+			statusFiles: async () => ["stryker-report.md"],
+		});
 		for (const p of projects.values()) p.target = "origin/main";
 		const review = store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
+		const wt = join(store.worktreesDir, review.id);
+		mkdirSync(wt, { recursive: true });
 		store.updateTask(review.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: "waiting for the review's findings to be implemented",
 			base: "b",
-			worktree: "wt",
+			worktree: wt,
 		});
 		const finding = store.createTask("review finding");
 		store.updateTask(finding.id, {
@@ -3793,6 +3797,8 @@ describe("turn settleReviews", () => {
 		expect(after?.stage).toBe("done");
 		expect(after?.needsReason).toBeNull();
 		expect(after?.commits).toBe(3);
+		// The review's generated report files survive on the done drawer.
+		expect(after?.uncommittedFiles).toEqual(["stryker-report.md"]);
 		expect(record.publishRelease).toHaveLength(0);
 		expect(record.runReleaseCommand).toHaveLength(0);
 	});
@@ -8568,6 +8574,34 @@ describe("arch-review survivor kills", () => {
 
 		expect(store.getTask(task.id)!.stage).toBe("done");
 		expect(store.getTask(task.id)!.keptFiles).toEqual(["history.txt"]);
+	});
+
+	test("finishing a kept worktree keeps the run's uncommitted files on the done card", async () => {
+		const { store, loop, record } = setup();
+		const task = store.createTask("kept work");
+		const wt = join(store.worktreesDir, task.id);
+		store.updateTask(task.id, {
+			state: "needs_you",
+			stage: "in_progress",
+			needsReason: keptReason("M a.txt"),
+			keptFiles: ["a.txt"],
+			worktree: wt,
+			branch: `ott/${task.id}`,
+			base: "abc",
+		});
+		mkdirSync(wt, { recursive: true });
+		writeFileSync(join(wt, "a.txt"), "moved");
+		const e = fakeProject(store);
+
+		await loop.finishKept(e, task.id, {});
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		// The kept list is this run's uncommitted files: the done drawer keeps the
+		// names now that the worktree they lived in is gone.
+		expect(after.uncommittedFiles).toEqual(["a.txt"]);
+		expect(after.keptFiles).toEqual([]);
+		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	// ---- cancel ----------------------------------------------------------------------
