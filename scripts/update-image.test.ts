@@ -2293,9 +2293,11 @@ describe("rolling restart", () => {
 	test("a busy local logs its note once, and the restart follows on the next poll", async () => {
 		const { main } = checkout();
 		const data = checkout();
+		// local stays busy across one renewal, then drains: the note prints once,
+		// and the renewal names local again.
 		const f = fakes({
 			running: RUNNING3,
-			gets: [st(0, 0), stl(0, 0, 1), stl(0, 0, 0)],
+			gets: [st(0, 0), stl(0, 0, 1), stl(0, 0, 1), stl(0, 0, 0)],
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
@@ -2308,7 +2310,11 @@ describe("rolling restart", () => {
 		expect(f.logs.filter((l) => l.includes("still runs its turns"))).toEqual([
 			"local still runs its turns: the server restart follows when they finish",
 		]);
-		expect(f.waits).toEqual([30_000]);
+		expect(f.waits).toEqual([30_000, 30_000]);
+		// Posts: the local hold, its renewal, then one hold per worker. The local
+		// runner never takes a worker hold or a detach: it is the server's own child.
+		expect(postBody(f, 1)).toEqual({ runner: "local" });
+		expect(f.calls).not.toContain(DETACH_SVC("local"));
 		expect(f.calls).toContain(RESTART);
 	}, 60_000);
 

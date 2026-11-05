@@ -1140,6 +1140,8 @@ async function rollServer(
 	}
 	board.preparing = fresh.preparing;
 	board.runners = fresh.runners;
+	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
+	// exclusive to the first pass, so Stryker's i-- mutant prints the same note.
 	for (let i = 0; ; i++) {
 		const local = board.runners.find((r) => r.id === "local");
 		if (local === undefined || local.turns === 0) break;
