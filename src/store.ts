@@ -261,6 +261,7 @@ interface TaskRow {
 	hold_head: string | null;
 	diff_files: string | null;
 	diff_text: string | null;
+	uncommitted_files: string;
 	work_check_log: string;
 	work_check_sendbacks: number;
 	work_check_head: string | null;
@@ -404,6 +405,7 @@ function toTask(project: string, r: TaskRow): Task {
 		holdHead: r.hold_head,
 		diffFiles: parseDiffFiles(r.diff_files),
 		diffText: r.diff_text,
+		uncommittedFiles: parseStringList(r.uncommitted_files),
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
 		workCheckSendbacks: r.work_check_sendbacks,
 		workCheckHead: r.work_check_head,
@@ -597,6 +599,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdHead: "hold_head",
 	diffFiles: "diff_files",
 	diffText: "diff_text",
+	uncommittedFiles: "uncommitted_files",
 	workCheckLog: "work_check_log",
 	workCheckSendbacks: "work_check_sendbacks",
 	workCheckHead: "work_check_head",
@@ -1303,6 +1306,13 @@ export class ProjectStore {
 		} catch {
 			/* backfill is best-effort; the next open retries */
 		}
+		// uncommitted_files: the worktree's uncommitted files captured when a card settles
+		// done, so the done drawer still names them after removeWorktree deletes the tree.
+		// ALTER-only after every rebuild, like the columns above.
+		if (!cols.includes("uncommitted_files"))
+			db.exec(
+				"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
+			);
 		// Proposal reasons written before the 2026-11 wording fix double the kind label
 		// ("the retro of Retro of …", "the fork research Fork research: …") and describe
 		// the actions without naming the drawer buttons. replace() with the exact

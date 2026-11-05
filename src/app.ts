@@ -5307,8 +5307,14 @@ export function createApp(deps: AppDeps) {
 					if (found instanceof Response) return found;
 					const { e, task } = found;
 					const view = taskView(e, task);
+					// Done cards serve the list captured at settle (the worktree is gone, so the
+					// live read would always be []); open cards read the worktree live.
 					view.worktreeFiles =
-						task.worktree === null ? [] : await statusFiles(task.worktree);
+						task.stage === "done"
+							? task.uncommittedFiles
+							: task.worktree === null
+								? []
+								: await statusFiles(task.worktree);
 					// Finished cards read the stat captured at merge start (the worktree and branch are
 					// gone); open cards read the branch live, uncommitted edits included. A merge-hold
 					// mismatch park also serves the stored stat: it is the push-side numstat the gate

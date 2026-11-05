@@ -3706,6 +3706,10 @@ export function createTurnLoop(
 				}
 				// An interview or grill card runs in the main checkout: its wt must never be removed.
 				if (!interview && !grill) {
+					// The done drawer keeps naming what the run left uncommitted after the
+					// worktree is gone: capture the list before removeWorktree deletes it.
+					// statusFiles never rejects (an unreadable tree reads as []).
+					store.updateTask(id, { uncommittedFiles: await ops.statusFiles(wt) });
 					try {
 						await ops.removeWorktree({
 							mainPath: e.path,

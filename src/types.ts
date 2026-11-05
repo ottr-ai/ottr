@@ -346,6 +346,8 @@ export interface Task {
 	diffFiles: DiffFileStat[] | null;
 	/** The unified diff captured with diffFiles, capped; null when never captured. */
 	diffText: string | null;
+	/** Uncommitted worktree files captured when the card settled done (the worktree is removed right after); [] while open and for rows settled before the capture existed. */
+	uncommittedFiles: string[];
 	/** Second-model checks of this work card, oldest first, capped at the newest 20 runs. */
 	workCheckLog: WorkCheckRun[];
 	/** Work-check send-backs to the work agent so far; the third failing check parks the card on needs_you. */

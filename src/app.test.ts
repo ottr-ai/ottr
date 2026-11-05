@@ -572,18 +572,19 @@ describe("task routes", () => {
 		).toBe(404);
 	});
 
-	test("drawer detail of a card whose worktree is gone lists no files", async () => {
+	test("drawer detail serves the captured uncommitted files for done cards", async () => {
 		// A merged card keeps its worktree path after the merge turn removed the directory.
 		const t = store.createTask("merged earlier");
 		store.updateTask(t.id, {
 			stage: "done",
 			state: "idle",
 			worktree: join(root, "removed-after-merge"),
+			uncommittedFiles: ["report.md"],
 		});
 		const detail = await get(`/api/projects/p1/tasks/${t.id}`);
 		expect(detail.status).toBe(200);
 		const b = (await detail.json()) as { worktreeFiles?: string[] };
-		expect(b.worktreeFiles).toEqual([]);
+		expect(b.worktreeFiles).toEqual(["report.md"]);
 	});
 
 	test("diff endpoint serves the captured stat and text for finished cards", async () => {

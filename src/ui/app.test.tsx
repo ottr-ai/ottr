@@ -2773,6 +2773,24 @@ describe("Drawer approve button", () => {
 		expect(ask).toBeGreaterThanOrEqual(0);
 		expect(wt).toBeGreaterThan(ask);
 	});
+
+	test("a done card keeps worktree files as names, not links", () => {
+		// The worktree is removed once the card settles done, so the captured
+		// names render as plain paths and the hint explains the capture.
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md", "scratch.txt"],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		const wt = html.indexOf('id="drawer-wt"');
+		expect(wt).toBeGreaterThanOrEqual(0);
+		expect(html).toContain("research-report.md");
+		expect(html).toContain("scratch.txt");
+		expect(html).toContain("captured when it finished");
+		expect(html).not.toContain("/files?path=");
+	});
 });
 
 describe("cancelled cards on the board", () => {

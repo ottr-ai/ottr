@@ -5951,6 +5951,7 @@ describe("turn research cards", () => {
 					writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "rep");
 					writeFileSync(join(o.worktreePath, "scratch.txt"), "uncommitted");
 				},
+				statusFiles: async () => ["research-report.md", "scratch.txt"],
 			}),
 		);
 		const task = researchTask(store);
@@ -5960,6 +5961,10 @@ describe("turn research cards", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
+		expect(after.uncommittedFiles).toEqual([
+			"research-report.md",
+			"scratch.txt",
+		]);
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
@@ -8526,7 +8531,10 @@ describe("arch-review survivor kills", () => {
 	// ---- keptFiles at settle ---------------------------------------------------------
 
 	test("a done work turn clears stale keptFiles", async () => {
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			statusFiles: async () => ["leftover.txt"],
+		});
 		const task = store.createTask("work please");
 		store.updateTask(task.id, { keptFiles: ["stale.txt"] });
 
@@ -8534,6 +8542,7 @@ describe("arch-review survivor kills", () => {
 
 		expect(store.getTask(task.id)!.stage).toBe("done");
 		expect(store.getTask(task.id)!.keptFiles).toEqual([]);
+		expect(store.getTask(task.id)!.uncommittedFiles).toEqual(["leftover.txt"]);
 	});
 
 	test("a done release card leaves keptFiles untouched", async () => {

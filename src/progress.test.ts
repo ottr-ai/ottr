@@ -52,6 +52,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		holdHead: null,
 		diffFiles: null,
 		diffText: null,
+		uncommittedFiles: [],
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,

@@ -7612,20 +7612,27 @@ export function Drawer({
 						<DrawerSec id="drawer-wt" label="Worktree files">
 							<div className="wt-files">
 								<p className="hint">
-									Uncommitted files this task produced. Open them before the
-									worktree is removed.
+									{task.stage === "done"
+										? "Uncommitted files this task produced, captured when it finished. The worktree is gone, so only the names remain."
+										: "Uncommitted files this task produced. Open them before the worktree is removed."}
 								</p>
-								{task.worktreeFiles!.slice(0, 50).map((f) => (
-									<a
-										key={f}
-										className="wt-file"
-										href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
-										target="_blank"
-										rel="noreferrer"
-									>
-										{f}
-									</a>
-								))}
+								{task.worktreeFiles!.slice(0, 50).map((f) =>
+									task.stage === "done" ? (
+										<code key={f} className="kept-path">
+											{f}
+										</code>
+									) : (
+										<a
+											key={f}
+											className="wt-file"
+											href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
+											target="_blank"
+											rel="noreferrer"
+										>
+											{f}
+										</a>
+									),
+								)}
 								{task.worktreeFiles!.length > 50 && (
 									<p className="hint">
 										…and {task.worktreeFiles!.length - 50} more

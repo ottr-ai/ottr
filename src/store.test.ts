@@ -881,6 +881,46 @@ describe("keptFiles", () => {
 	});
 });
 
+describe("uncommittedFiles", () => {
+	test("updateTask stores and clears the list; fresh stores default to empty", () => {
+		const store = open(join(root, "uncommitted"));
+		const task = store.createTask("capture me");
+		expect(task.uncommittedFiles).toEqual([]);
+		const withFiles = store.updateTask(task.id, {
+			uncommittedFiles: ["research-report.md", "scratch.txt"],
+		});
+		expect(withFiles.uncommittedFiles).toEqual([
+			"research-report.md",
+			"scratch.txt",
+		]);
+		expect(store.getTask(task.id)?.uncommittedFiles).toEqual([
+			"research-report.md",
+			"scratch.txt",
+		]);
+		expect(
+			store.updateTask(task.id, { uncommittedFiles: [] }).uncommittedFiles,
+		).toEqual([]);
+		store.close();
+	});
+
+	test("opening a pre-uncommitted_files database backfills the column", () => {
+		const dir = join(root, "uncommitted-legacy");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		// Schema as it was before uncommitted_files existed.
+		db.exec(
+			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]', release_version TEXT, release_notes TEXT, session_title TEXT, asked TEXT, model TEXT, kept_files TEXT NOT NULL DEFAULT '[]')",
+		);
+		db.run(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('wt1', 't', 'p', 'done', 'idle', 1, 1)",
+		);
+		db.close();
+		const store = open(dir);
+		expect(store.getTask("wt1")?.uncommittedFiles).toEqual([]);
+		store.close();
+	});
+});
+
 describe("events", () => {
 	test("createTask records a create event and the initial queued state", () => {
 		const store = open(join(root, "stats-create"));

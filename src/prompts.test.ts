@@ -701,6 +701,7 @@ describe("handoffMarkdown research report", () => {
 		holdHead: null,
 		diffFiles: null,
 		diffText: null,
+		uncommittedFiles: [],
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
