@@ -1726,6 +1726,7 @@ describe("Drawer meta ran-on row", () => {
 				onFollowed={() => {}}
 				read={false}
 				onMarkUnread={() => {}}
+				onMarkSeen={() => {}}
 				onOpenTask={() => {}}
 				draining={false}
 				usedTotal={0}
