@@ -175,10 +175,10 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
   - **Ellipsis:** only when the button asks for more input before it acts ("Add image…"). A progress label also ends in one ("Provisioning…").
   - **Destructive confirm:** the confirm button repeats the action's label ("Cancel task", "Remove project"), never "OK" or "Confirm".
 - **Icons on buttons** — sources: [NN/g, Icon Usability](https://www.nngroup.com/articles/icon-usability/), [Apple HIG Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons), [Red Hat Button](https://ux.redhat.com/elements/button/guidelines/).
-  - **A visible text label by default.** Few icons are universal: close (x), search, plus for add, and the help "?". Every other icon-only button needs `aria-label` and a `title` tooltip. A tooltip does not replace a label on touch screens, because they have no hover.
+  - **A visible text label by default.** Few icons are universal: close (x), search, plus for add, the help "?", and the horizontal ellipsis "⋯" for a menu of further actions. Every other icon-only button needs `aria-label` and a `title` tooltip. A tooltip does not replace a label on touch screens, because they have no hover.
   - **One icon, one meaning.** An icon that already means one action never stands for a second action. Pick a different glyph, or show the text label.
   - **Familiar actions, familiar glyphs:** x closes, plus adds, a pencil edits, a trash can deletes, a down arrow downloads, a send arrow sends.
-  - **Icon-only only where space forces it**, for example the bar's sidebar toggle or the narrow-board segment buttons. The `aria-label` and the tooltip then carry the same words as the full label.
+  - **Icon-only only where space forces it or the glyph is universal**, for example the bar's sidebar toggle or the project header's "⋯" menu. The `aria-label` and the tooltip then carry the same words as the full label. The items inside a "⋯" menu keep their text labels.
   - **No typed symbols as icons** ("+", "×", "→" as text); use the `Icon` set in `kit.tsx`.
   - **Five-second test:** if a new glyph needs more than five seconds of thought to match its action, use text.
 

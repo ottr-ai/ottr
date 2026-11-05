@@ -1851,7 +1851,7 @@ button.notif-link {
 }
 .project-head {
 	display: flex;
-	align-items: flex-start;
+	align-items: center; /* the actions sit on the name block's middle line */
 	flex-wrap: wrap; /* a narrow board puts the actions under the name, never crushes it */
 	justify-content: space-between;
 	gap: 16px;
@@ -2063,51 +2063,57 @@ button.notif-link {
 	color: var(--dim);
 	font-weight: 600;
 }
-/* Header actions join into one bordered toolbar unit: inner 1px dividers share the
-   edge, so the related controls read as one control. The primary New task stays
-   outside it. An empty group (gitless, no rules, no review due) disappears. */
-.project-actions .seg {
-	display: inline-flex;
-	align-items: stretch;
-	border: 1px solid var(--line);
-	border-radius: 4px;
-}
-.seg:empty {
-	display: none;
-}
-.seg button {
-	border: 0;
-	border-left: 1px solid var(--line-soft);
-	border-radius: 0;
-}
-.seg button:first-child {
-	border-left: 0;
-}
-/* The review action keeps its alarm ink inside the group; the status span in the
-   meta line next to the name carries the words. */
-.seg .arch-start {
+/* Header actions: one square "more" button opens a menu of the project's actions, so
+   the bar holds only the search, the menu and New task. An overdue review stays out
+   as the one alarm nudge; the status span next to the name carries the words. */
+.project-actions .arch-start {
 	color: var(--alarm);
 }
-.seg .arch-start:hover {
+.project-actions .arch-start:hover {
 	color: var(--alarm);
 	background: var(--alarm-bg);
 }
-/* Below the due cap the same action is an offer, not an alarm: quiet ink. */
-.seg .arch-start.quiet {
-	color: var(--text);
+.project-more {
+	anchor-name: --project-more;
+	aspect-ratio: 1;
+	justify-content: center;
+	padding: 0;
 }
-.seg .arch-start.quiet:hover {
-	color: var(--text-strong);
+.project-menu {
+	position-anchor: --project-more;
+	position-area: bottom span-left;
+	position-try-fallbacks: flip-block;
+	inset: auto;
+	width: max-content;
+	margin: 6px 0 0;
+	padding: 4px;
+	color: var(--text);
+	background: var(--field);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	box-shadow: var(--shadow-overlay);
+}
+.project-menu:popover-open {
+	display: grid;
+	gap: 2px;
+}
+.project-menu button {
+	justify-content: flex-start;
+	background: transparent;
+	border-color: transparent;
+}
+.project-menu button:hover:not(:disabled) {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
 }
 .project-actions {
 	display: flex;
 	flex-shrink: 0;
-	align-items: stretch; /* search, segment group and New task share one height and top */
+	align-items: stretch; /* search, menu and New task share one height and top */
 	gap: 8px;
 }
-/* Narrow board: the search and New task share the first line, and the four actions take
-   a 2x2 grid under them. Every action keeps its label (the Verb-Label Rule): each icon is
-   unique, but it only supports the words. */
+/* Narrow board: the actions take the full line under the name, the search takes the
+   free width. */
 @container (max-width: 960px) {
 	.project-actions {
 		flex: 1 1 100%;
@@ -2117,18 +2123,6 @@ button.notif-link {
 		flex: 1 1 auto;
 		width: auto;
 		min-width: 0;
-	}
-	.project-actions .seg {
-		order: 1;
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		flex: 1 1 100%;
-	}
-	.project-actions .seg button:nth-child(3) {
-		border-left: 0;
-	}
-	.project-actions .seg button:nth-child(n + 3) {
-		border-top: 1px solid var(--line-soft);
 	}
 	.project-actions .primary {
 		flex: none;
@@ -2333,7 +2327,9 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
-	padding: 14px 16px 6px;
+	/* 9px, not 16px: the 21px line box adds ~5px above the glyphs, so the title's
+	   top sits 16px from the column edge, the same as the count's right gap. */
+	padding: 9px 16px 6px;
 	font-size: 14px;
 	font-weight: 600;
 	color: var(--text-strong);
@@ -6419,28 +6415,6 @@ button.log-mode[aria-pressed="true"] {
 	   lives in the lane scroller, so the last card can scroll above the button. */
 	.stage-cards {
 		padding-bottom: 72px; /* FAB 56px + 16px bottom offset */
-	}
-	/* The segments take the full line under the search. */
-	.project-actions {
-		flex-wrap: wrap;
-	}
-	/* Labelled segments as separate buttons in a 2x2 grid (a lone one spans the row);
-	   min-height 40px comes from the tier's button rule. */
-	.project-actions .seg {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 8px;
-		border: 0; /* separate bordered buttons on touch, no group edge around them */
-		width: 100%;
-	}
-	.project-actions .seg button:only-child {
-		grid-column: 1 / -1;
-	}
-	/* :nth-child(n) outranks the joined group's inner-edge rules from the narrow tier. */
-	.project-actions .seg button:nth-child(n) {
-		flex: 1;
-		border: 1px solid var(--line);
-		border-radius: 4px;
 	}
 	/* No hardware keyboard on touch: the shortcut badge is noise and costs width. */
 	.project-actions kbd {

@@ -246,6 +246,14 @@ const ICON_PATHS = {
 			<rect x="13" y="13" width="8" height="8" rx="2" />
 		</>
 	),
+	// lucide ellipsis (ISC): the project header's menu of actions
+	more: (
+		<>
+			<circle cx="12" cy="12" r="1" />
+			<circle cx="19" cy="12" r="1" />
+			<circle cx="5" cy="12" r="1" />
+		</>
+	),
 	// lucide list-checks (ISC): Open setup, a wizard of steps
 	"list-checks": (
 		<>

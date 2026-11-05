@@ -2951,86 +2951,102 @@ export function ProjectBoard({
 							{q === "" ? boardTotal : `${shown.length}/${boardTotal}`}
 						</span>
 					</span>
-					<div className="seg">
-						{project.hasRules && (
+					{/* Only an overdue review stays out, as the alarm nudge; every other action waits in the menu. */}
+					{project.archReview?.due && !project.archReview.running && (
+						<button
+							type="button"
+							className="arch-start"
+							title="Pick a model and create a task that reviews the whole repo, the same review a release runs"
+							onClick={() => setShowReview(true)}
+						>
+							<Icon name="shield-check" size={13} />
+							Start review
+						</button>
+					)}
+					{(project.hasRules || !project.gitless) && (
+						<>
 							<button
 								type="button"
-								className="ghost"
-								aria-label="Align rules"
-								onClick={async () =>
-									(await confirmDialog(
-										"Align rules? This creates a task that fixes AGENTS.md rules that contradict the tracker's pipeline.",
-										{ ok: "Create task" },
-									)) && interview("/interview", { fix: true })
-								}
-								title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
+								className="project-more"
+								popoverTarget="project-more"
+								aria-label="More project actions"
+								title="More project actions"
 							>
-								<Icon name="scale" />
-								<span className="seg-label">Align rules</span>
+								<Icon name="more" />
 							</button>
-						)}
-						{project.archReview?.due || project.archReview?.running ? (
-							<button
-								type="button"
-								className="arch-start"
-								aria-label="Start review"
-								disabled={project.archReview.running}
-								title={
-									project.archReview.running
-										? "A review is still open: one review at a time"
-										: "Pick a model and create a task that reviews the whole repo, the same review a release runs"
-								}
-								onClick={() => setShowReview(true)}
+							{/* biome-ignore lint/a11y/useKeyWithClickEvents lint/a11y/noStaticElementInteractions: the items are buttons; a click on one runs it, then this closes the menu */}
+							<div
+								id="project-more"
+								popover="auto"
+								className="project-menu"
+								onClick={(e) => e.currentTarget.hidePopover()}
 							>
-								<Icon name="shield-check" size={13} />
-								<span className="seg-label">Start review</span>
-							</button>
-						) : (
-							project.archReview !== null &&
-							project.archReview.delta > 0 && (
-								<button
-									type="button"
-									className="arch-start quiet"
-									aria-label="Start review"
-									title={`${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`}
-									onClick={() => setShowReview(true)}
-								>
-									<Icon name="shield-check" size={13} />
-									<span className="seg-label">Start review</span>
-								</button>
-							)
-						)}
-						{!project.gitless && (
-							<button
-								type="button"
-								className="ghost"
-								aria-label="Create release"
-								// Same guard as Review: a release runs that review (releaseBlocked).
-								disabled={project.archReview?.running}
-								onClick={() => setShowRelease(true)}
-								title={
-									project.archReview?.running
-										? "A release or review is still open: one at a time"
-										: "Release all new commits"
-								}
-							>
-								<Icon name="package" />
-								<span className="seg-label">Create release</span>
-							</button>
-						)}
-						{!project.gitless && (
-							<button
-								type="button"
-								className="ghost"
-								aria-label="Show diagrams"
-								onClick={() => setShowDiagrams(true)}
-								title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
-							>
-								<Icon name="workflow" />
-								<span className="seg-label">Show diagrams</span>
-							</button>
-						)}
-					</div>
+								{project.hasRules && (
+									<button
+										type="button"
+										className="ghost"
+										onClick={async () =>
+											(await confirmDialog(
+												"Align rules? This creates a task that fixes AGENTS.md rules that contradict the tracker's pipeline.",
+												{ ok: "Create task" },
+											)) && interview("/interview", { fix: true })
+										}
+										title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
+									>
+										<Icon name="scale" />
+										Align rules
+									</button>
+								)}
+								{project.archReview !== null &&
+									!(project.archReview.due && !project.archReview.running) &&
+									(project.archReview.running ||
+										project.archReview.delta > 0) && (
+										<button
+											type="button"
+											className="ghost"
+											disabled={project.archReview.running}
+											title={
+												project.archReview.running
+													? "A review is still open: one review at a time"
+													: `${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`
+											}
+											onClick={() => setShowReview(true)}
+										>
+											<Icon name="shield-check" size={13} />
+											Start review
+										</button>
+									)}
+								{!project.gitless && (
+									<button
+										type="button"
+										className="ghost"
+										// Same guard as Review: a release runs that review (releaseBlocked).
+										disabled={project.archReview?.running}
+										onClick={() => setShowRelease(true)}
+										title={
+											project.archReview?.running
+												? "A release or review is still open: one at a time"
+												: "Release all new commits"
+										}
+									>
+										<Icon name="package" />
+										Create release
+									</button>
+								)}
+								{!project.gitless && (
+									<button
+										type="button"
+										className="ghost"
+										onClick={() => setShowDiagrams(true)}
+										title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
+									>
+										<Icon name="workflow" />
+										Show diagrams
+									</button>
+								)}
+							</div>
+						</>
+					)}
 					{!project.gitless && (
 						<button
 							type="button"
