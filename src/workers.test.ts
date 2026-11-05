@@ -38,12 +38,17 @@ writeFileSync(
 	`process.stdout.write(JSON.stringify(process.env) + "\\n");`,
 );
 
-// Sleeper omp: emits a JSON event, then stays alive until killed.
+// Sleeper omp: emits a JSON event, then stays alive until killed. With a beat
+// path argument it also rewrites that file every 50 ms, so a test can observe
+// liveness and death (the beat stalls) without a pid liveness probe.
 const sleepPath = join(dir, "sleep-omp.js");
 writeFileSync(
 	sleepPath,
 	`process.stdout.write('{"type":"tick"}\\n');
-setTimeout(() => {}, 60000);`,
+const fs = require("node:fs");
+let beat = 0;
+if (process.argv[2]) setInterval(() => fs.writeFileSync(process.argv[2], String(++beat)), 50);
+setTimeout(() => process.exit(0), 60000);`,
 );
 
 // Flooding omp: records its pid, then writes 4096 JSON events every millisecond until killed, so
@@ -57,11 +62,15 @@ setInterval(() => process.stdout.write(burst), 1);`,
 );
 
 // Pid-writing sleeper omp: drops its pid, then stays alive until killed. The sweep test
-// uses it as the live run child whose worktree disappears mid-run.
+// uses it as the live run child whose worktree disappears mid-run. Optional beat
+// file as argv[3], same 50 ms heartbeat.
 const sweepSleepPath = join(dir, "sweep-sleep-omp.js");
 writeFileSync(
 	sweepSleepPath,
 	`require("node:fs").writeFileSync(process.argv[2], String(process.pid));
+const fs = require("node:fs");
+let beat = 0;
+if (process.argv[3]) setInterval(() => fs.writeFileSync(process.argv[3], String(++beat)), 50);
 setInterval(() => {}, 1000);
 setTimeout(() => process.exit(0), 60000);`,
 );
@@ -161,6 +170,51 @@ function makeFakeProc(entries: FakeProcEntry[]): string {
 	const procRoot = join(dir, `fake-proc-${fakeProcN++}`);
 	for (const e of entries) fakeProcEntry(procRoot, e);
 	return procRoot;
+}
+
+// Child liveness and death, observable without a pid liveness probe (no signal
+// call, no proc read — banned in this file so a widening sweep mutant can never
+// find a real target): the fake omp children rewrite a beat file every 50 ms,
+// and SIGKILL cannot be caught or reported, so the only test-side proof that a
+// kill landed is the beat stalling.
+function readBeat(hbPath: string): string {
+	try {
+		return readFileSync(hbPath, "utf8");
+	} catch {
+		return "";
+	}
+}
+
+async function awaitBeatAdvance(
+	hbPath: string,
+	prev: string,
+	what: string,
+): Promise<void> {
+	const deadline = Date.now() + 20_000;
+	for (;;) {
+		const beat = readBeat(hbPath);
+		if (beat !== prev && beat !== "") return;
+		if (Date.now() > deadline) throw new Error(`${what}: never happened`);
+		await Bun.sleep(20);
+	}
+}
+
+async function awaitBeatStall(hbPath: string, what: string): Promise<void> {
+	const deadline = Date.now() + 20_000;
+	let prev: string | undefined;
+	let prevAt = 0;
+	for (;;) {
+		const beat = readBeat(hbPath);
+		const now = Date.now();
+		if (beat !== prev) {
+			prev = beat;
+			prevAt = now;
+		} else if (prev !== "" && prev !== undefined && now - prevAt > 1500)
+			// Frozen for many beat intervals (50 ms each): the child is gone.
+			return;
+		if (Date.now() > deadline) throw new Error(`${what}: never happened`);
+		await Bun.sleep(20);
+	}
 }
 
 async function readLines(res: Response): Promise<string[]> {
@@ -647,10 +701,12 @@ describe("serveWorker", () => {
 			await res.body?.getReader().read();
 			controller.abort();
 			// The daemon killTree's the child with SIGKILL, which no test can observe
-			// without a real proc liveness probe or a signal call — both banned in
-			// this file so a widening sweep mutant can never find a real target here.
-			// The buffered lines still drain for a moment after the abort; the
-			// platform tests cover killTree's signals themselves.
+			// with a pid liveness probe (signal calls and proc reads are banned in
+			// this file so a widening sweep mutant can never find a real target), and
+			// this child's own 1 ms stdout bursts block its event loop, so a
+			// heartbeat cannot advance either. The buffered lines drain for a moment
+			// after the abort; the platform tests cover killTree's signals and the
+			// /detach/kill route proves the kill lands via its sleeper child.
 			await Bun.sleep(200);
 			expect(errors).toEqual([]);
 		} finally {
@@ -961,6 +1017,7 @@ describe("sweepLeftovers", () => {
 			},
 		]);
 		const { calls, kill } = recordingKill();
+		const beatPath = join(dir, "sweep-live-beat");
 		const url = start({
 			token: "t",
 			ompPath: process.execPath,
@@ -972,7 +1029,7 @@ describe("sweepLeftovers", () => {
 		const handle = runWorker(
 			{
 				id: "sweep-live",
-				argv: [sweepSleepPath, pidFile],
+				argv: [sweepSleepPath, pidFile, beatPath],
 				cwd: wt,
 				stdin: "",
 				env: {},
@@ -1017,6 +1074,13 @@ describe("sweepLeftovers", () => {
 				{ pid: 4301, signal: 0 },
 				{ pid: 4301, signal: "SIGKILL" },
 			]);
+			// Still alive: the heartbeat keeps advancing, the observable stand-in
+			// for the old pid liveness probe.
+			await awaitBeatAdvance(
+				beatPath,
+				readBeat(beatPath),
+				"heartbeat after sweep",
+			);
 		} finally {
 			handle.kill();
 			rmSync(root, { recursive: true, force: true });
@@ -1089,10 +1153,11 @@ describe("detach protocol", () => {
 		}
 	}
 
-	// Kill landing is observed through the server-side entry state: real pid
-	// liveness probes and signal calls are banned in this file so a widening
-	// sweep mutant can never find a real target here. killTree's signals are
-	// covered by the platform tests.
+	// Kill landing is observed through the child's heartbeat stalling (the beat
+	// file the fake omp rewrites every 50 ms): real pid liveness probes and
+	// signal calls are banned in this file so a widening sweep mutant can never
+	// find a real target here. killTree's signals are covered by the platform
+	// tests.
 
 	async function run(
 		url: string,
@@ -1167,7 +1232,8 @@ describe("detach protocol", () => {
 
 	test("POST /detach/kill kills the child and marks the entry; unknown id is 404", async () => {
 		const url = start({ ompPath: process.execPath });
-		const res = await run(url, undefined, "d2", [sleepPath]);
+		const beatPath = join(dir, "d2-beat");
+		const res = await run(url, undefined, "d2", [sleepPath, beatPath]);
 		expect(res.status).toBe(200);
 		// No cancel before detach: a client abort would kill the child. The detach
 		// below closes the stream; drain it afterwards.
@@ -1186,6 +1252,8 @@ describe("detach protocol", () => {
 			return entry !== undefined;
 		}, "entry");
 		expect(entry?.running).toBe(true);
+		// Alive before the kill: the child's heartbeat keeps advancing.
+		await awaitBeatAdvance(beatPath, readBeat(beatPath), "heartbeat");
 		const miss = await fetch(`${url}/detach/kill`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -1199,10 +1267,10 @@ describe("detach protocol", () => {
 		});
 		expect(kill.status).toBe(200);
 		expect(await kill.json()).toEqual({ killed: true });
-		await pollUntil(
-			async () => (await detachedList(url))[0]?.killed === true,
-			"kill landing",
-		);
+		// The killed flag is set synchronously with the fire-and-forget killTree,
+		// so it proves nothing about the child; the beat stalling does.
+		await awaitBeatStall(beatPath, "kill landing");
+		expect((await detachedList(url))[0]?.killed).toBe(true);
 	}, 30_000);
 
 	test("/sweep does not stop a detached child", async () => {
@@ -1219,6 +1287,7 @@ describe("detach protocol", () => {
 			},
 		]);
 		const { calls, kill } = recordingKill();
+		const beatPath = join(dir, "d3-beat");
 		const url = start({
 			ompPath: process.execPath,
 			sweepRoots: [root],
@@ -1232,7 +1301,13 @@ describe("detach protocol", () => {
 			// response when the stream closes: start it un-awaited and let the pid
 			// file prove the spawn instead. The cwd is the worktree the sweep roots
 			// watch: its death mid-run is the merge-turn shape this test builds.
-			const resP = run(url, undefined, "d3", [sweepSleepPath, pidFile], cwd);
+			const resP = run(
+				url,
+				undefined,
+				"d3",
+				[sweepSleepPath, pidFile, beatPath],
+				cwd,
+			);
 			await pollUntil(() => {
 				try {
 					ompPid = Number(readFileSync(pidFile, "utf8"));
@@ -1273,16 +1348,21 @@ describe("detach protocol", () => {
 				{ pid: 4401, signal: 0 },
 				{ pid: 4401, signal: "SIGKILL" },
 			]);
-			// Clean up the 60 s sleeper; the entry records the landing.
+			// Alive after the sweep: the child's heartbeat keeps advancing, the
+			// observable stand-in for the old pid liveness probe.
+			await awaitBeatAdvance(
+				beatPath,
+				readBeat(beatPath),
+				"heartbeat after sweep",
+			);
+			// Clean up the 60 s sleeper; the beat stalling proves the SIGKILL landed
+			// (the killed flag is set synchronously with the fire-and-forget killTree).
 			await fetch(`${url}/detach/kill`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ id: "d3" }),
 			});
-			await pollUntil(
-				async () => (await detachedList(url))[0]?.killed === true,
-				"kill landing",
-			);
+			await awaitBeatStall(beatPath, "kill landing");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
