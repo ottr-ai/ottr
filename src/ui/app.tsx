@@ -83,6 +83,7 @@ import {
 	copyText,
 	Help,
 	Icon,
+	type IconName,
 	interviewMsg,
 	LOGOUT_KEY,
 	loadLevel,
@@ -104,6 +105,7 @@ import {
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
 import {
+	displayModel,
 	type ModelCatalog,
 	modelMatches,
 	modelRows,
@@ -374,8 +376,11 @@ function ImageThumbs({
 /** Hidden-file-input picker behind the Add image button; the ref survives re-picking the same file. */
 function ImageBrowseButton({
 	onAdd,
+	icon = "image",
 }: {
 	onAdd: (files: Iterable<File>) => void;
+	/** The steer composer's icon-only button shows a plus (the chat-app "add" glyph). */
+	icon?: IconName;
 }) {
 	const input = useRef<HTMLInputElement>(null);
 	return (
@@ -386,7 +391,7 @@ function ImageBrowseButton({
 				title="Attach images from disk"
 				onClick={() => input.current?.click()}
 			>
-				<Icon name="image" />
+				<Icon name={icon} />
 				Add image…
 			</button>
 			<input
@@ -419,6 +424,7 @@ function ComposerActions({
 	setModelQuery,
 	secondary,
 	primary,
+	attachIcon,
 }: {
 	onAddImages: (files: Iterable<File>) => void;
 	catalog: ModelCatalog | null;
@@ -428,6 +434,8 @@ function ComposerActions({
 	setModelQuery: (q: string) => void;
 	secondary?: ReactNode;
 	primary: ReactNode;
+	/** Glyph of the Add image button (the steer composer uses "plus"). */
+	attachIcon?: IconName;
 }) {
 	return (
 		<div className="composer-actions">
@@ -439,7 +447,7 @@ function ComposerActions({
 				setModelQuery={setModelQuery}
 			/>
 			<div className="composer-bar">
-				<ImageBrowseButton onAdd={onAddImages} />
+				<ImageBrowseButton onAdd={onAddImages} icon={attachIcon} />
 				{secondary}
 				{primary}
 			</div>
@@ -541,9 +549,6 @@ type CardDrag = {
 	onDragEnd: () => void;
 };
 
-/** A model selector without its provider ("zai/glm-5.3-flash:max" -> "glm-5.3-flash:max"). */
-const shortModel = (m: string): string => m.slice(m.indexOf("/") + 1);
-
 /** Rank and close-candidate chips, shared by the board card and the overview triage row.
  * Text labels, never color alone; the close badge's tooltip carries the reason. */
 function RankBadges({
@@ -618,6 +623,8 @@ function Card({
 	/** Cancels the release card and opens Create release; set only while reRelease is non-null. */
 	onRerelease?: () => void;
 }) {
+	// The model chip names the model as omp does (display name); one cached catalog serves every card.
+	const catalog = useModels();
 	const release = releaseOf(task);
 	const commits = task.stage === "done" ? task.commits : null;
 	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
@@ -706,7 +713,10 @@ function Card({
 							className="model"
 							title={`Main loop model: ${task.model ?? task.lastModel ?? "default"}${task.model === null && task.lastModel ? " (last run)" : ""}`}
 						>
-							{shortModel(task.model ?? task.lastModel ?? "default")}
+							{displayModel(
+								catalog?.models ?? [],
+								task.model ?? task.lastModel ?? "default",
+							)}
 						</span>
 					)}
 				</span>
@@ -780,10 +790,9 @@ function Card({
 				{sp !== null && (
 					<span className="card-mutation" title={task.progress ?? undefined}>
 						Mutation {sp.pct}%{spLeft !== null && ` · ${spLeft} left`}
-						<span className="mutation-track" aria-hidden="true">
-							<i
-								style={{ transform: `scaleX(${clamp(sp.pct, 0, 100) / 100})` }}
-							/>
+						{/* The card's left edge is the progress: a dotted rail, filled bottom-up with the percent. */}
+						<span className="mutation-rail" aria-hidden="true">
+							<i style={{ height: `${clamp(sp.pct, 0, 100)}%` }} />
 						</span>
 					</span>
 				)}
@@ -950,26 +959,7 @@ function SystemBar({
 					}
 				>
 					<span className="sb-lbl sb-hide-phone">Quota</span>
-					{quotaPct !== null && (
-						<span
-							className="sb-twin"
-							data-level={quotaLevel}
-							aria-hidden="true"
-						>
-							{quotaGone !== null && (
-								<span className="t">
-									<i style={{ width: `${quotaGone}%` }} />
-								</span>
-							)}
-							<span className="q">
-								<i
-									style={{
-										transform: `scaleX(${clamp(quotaPct, 0, 100) / 100})`,
-									}}
-								/>
-							</span>
-						</span>
-					)}
+					{tightest !== null && <QuotaTwin limit={tightest} />}
 					<span className="sb-val" data-level={quotaLevel}>
 						{quotaLevel === "high" && <Mark kind="needs" />}
 						{quotaLevel === "crit" && <Mark kind="crit" />}
@@ -1560,6 +1550,40 @@ function useReviewModel(
 	};
 }
 
+/** The quota tooltip: every window's used percent and its reset, one clause each. */
+function quotaTitle(limits: QuotaState["limits"]): string {
+	return limits
+		.map(
+			(l) =>
+				`${l.label}: ${l.usedPct}% used${l.resetsAt === null ? "" : `, resets in ${until(l.resetsAt)}`}`,
+		)
+		.join("; ");
+}
+
+/** One window as the twin bar: a thin line for the time gone in the window over the quota used
+    (the top bar's Quota group uses the same bar). Decorative; the percent beside it carries the value. */
+function QuotaTwin({ limit }: { limit: QuotaState["limits"][number] }) {
+	const gone = windowGone(limit, Date.now());
+	return (
+		<span
+			className="sb-twin"
+			data-level={loadLevel(limit.usedPct)}
+			aria-hidden="true"
+		>
+			{gone !== null && (
+				<span className="t">
+					<i style={{ width: `${gone}%` }} />
+				</span>
+			)}
+			<span className="q">
+				<i
+					style={{ transform: `scaleX(${clamp(limit.usedPct, 0, 100) / 100})` }}
+				/>
+			</span>
+		</span>
+	);
+}
+
 /** The shared model picker behind New task and Follow up: a trigger button opening a searchable popover. */
 function ModelField({
 	catalog,
@@ -1576,6 +1600,8 @@ function ModelField({
 }) {
 	// One picker per dialog instance; several New task dialogs (one per project) stay mounted at once.
 	const popId = useId();
+	// The thinking level opens as a nested menu beside the model menu (like Claude's effort row).
+	const levelPopId = useId();
 	const allModels = catalog?.models ?? [];
 	// model is a joined omp selector "provider/model:level"; "" level means omp default.
 	const [base, level] = splitLevel(model);
@@ -1593,7 +1619,12 @@ function ModelField({
 		const pop = document.getElementById(popId);
 		if (pop === null) return;
 		const onDown = (e: PointerEvent): void => {
-			if (!(e.target instanceof Element) || pop.contains(e.target)) return;
+			if (
+				!(e.target instanceof Element) ||
+				pop.contains(e.target) ||
+				document.getElementById(levelPopId)?.contains(e.target)
+			)
+				return;
 			// The invoker's click is native toggle coordination; hiding here would make it reopen.
 			const invoker = e.target.closest("button");
 			if (invoker !== null && invoker.getAttribute("popovertarget") === popId)
@@ -1602,14 +1633,17 @@ function ModelField({
 		};
 		document.addEventListener("pointerdown", onDown);
 		return () => document.removeEventListener("pointerdown", onDown);
-	}, [modelOpen, popId]);
-	const selectedModel = allModels.find((m) => m.selector === base);
-	const modelLabel =
+	}, [modelOpen, popId, levelPopId]);
+	// Trigger: the model without its provider, then ":level" (the default model's own level when
+	// nothing is picked). The full selector stays in the tooltip and the accessible name.
+	const runModel = base === "" ? (catalog?.defaultModel ?? "") : model;
+	const [runBase, runLevel] = splitLevel(runModel);
+	const fullLabel =
 		base === ""
-			? `Default${catalog?.defaultModel ? ` (${catalog.defaultModel})` : ""}`
-			: selectedModel !== undefined
-				? `${selectedModel.name} (${selectedModel.id})`
-				: base;
+			? runModel === ""
+				? "Default model"
+				: `Default model: ${runModel}`
+			: `Model: ${model}`;
 	const quota = useQuota();
 	// The budget of the model that would actually run: the pick, else the catalog default.
 	const limits = forModel(
@@ -1621,6 +1655,16 @@ function ModelField({
 	const pickModel = (selector: string): void => {
 		setModel(selector);
 		document.getElementById(popId)?.hidePopover();
+	};
+	// On the default model a level needs an explicit anchor, so it pins the default's base
+	// ("Default" level keeps following the omp default).
+	const levelBase =
+		base !== "" ? base : splitLevel(catalog?.defaultModel ?? "")[0];
+	const pickLevel = (l: string): void => {
+		setModel(base === "" && l === "" ? "" : joinLevel(levelBase, l));
+		document.getElementById(levelPopId)?.hidePopover();
+		document.getElementById(popId)?.hidePopover();
+		trigger.current?.focus();
 	};
 	// Arrow keys walk the role/catalog rows from wherever the focus sits inside the open
 	// popover; Escape closes and hands the focus back to the trigger.
@@ -1634,10 +1678,11 @@ function ModelField({
 			return;
 		}
 		if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+		const menu =
+			e.currentTarget.closest<HTMLElement>("[popover]") ??
+			document.getElementById(popId);
 		const opts = [
-			...(document
-				.getElementById(popId)
-				?.querySelectorAll<HTMLElement>(".model-option") ?? []),
+			...(menu?.querySelectorAll<HTMLElement>(".model-option") ?? []),
 		];
 		const idx = stepIndex(
 			opts.length,
@@ -1654,29 +1699,21 @@ function ModelField({
 				<label className="field">
 					<span className="field-head">
 						Model
-						{/* Each window paints itself: only the one under the threshold turns amber. */}
+						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
+						    percent; only a window past the band turns amber, a critical one red. */}
 						{worst !== null && (
-							<span
-								className="model-quota"
-								aria-hidden="true"
-								title={limits
-									.map(
-										(l) =>
-											`${l.label}: ${l.usedPct}% used${
-												l.resetsAt === null
-													? ""
-													: `, resets in ${until(l.resetsAt)}`
-											}`,
-									)
-									.join("; ")}
-							>
-								{limits.map((l, i) => (
-									<Fragment key={l.window ?? l.label}>
-										{i > 0 && " · "}
-										<span data-level={loadLevel(l.usedPct)}>
-											{`${l.window ?? l.label} ${Math.max(0, Math.round(100 - l.usedPct))}% left`}
+							<span className="model-quota" title={quotaTitle(limits)}>
+								{limits.map((l) => (
+									<span key={l.window ?? l.label} className="quota-win">
+										<span className="quota-name">{l.window ?? l.label}</span>
+										<QuotaTwin limit={l} />
+										<span
+											className="quota-pct"
+											data-level={loadLevel(l.usedPct)}
+										>
+											{Math.round(l.usedPct)}%
 										</span>
-									</Fragment>
+									</span>
 								))}
 							</span>
 						)}
@@ -1686,6 +1723,8 @@ function ModelField({
 						className="model-trigger"
 						popoverTarget={popId}
 						ref={trigger}
+						title={fullLabel}
+						aria-label={fullLabel}
 						onKeyDown={(e) => {
 							if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
 							if (modelOpen) return;
@@ -1693,27 +1732,14 @@ function ModelField({
 							document.getElementById(popId)?.showPopover();
 						}}
 					>
-						<span>{modelLabel}</span>
+						<span className="model-name">
+							{runBase === "" ? "Default" : displayModel(allModels, runBase)}
+							{runLevel !== "" && (
+								<span className="model-level"> {runLevel}</span>
+							)}
+						</span>
 						<Icon name="chevron-right" size={14} />
 					</button>
-				</label>
-				<label className="field">
-					<span className="field-head">Thinking</span>
-					{/* Empty base = run on the omp default model; a manual level needs an explicit model anchor. */}
-					<select
-						aria-label="Thinking level"
-						value={level}
-						disabled={base === ""}
-						title={base === "" ? "Pick a model first" : undefined}
-						onChange={(e) => setModel(joinLevel(base, e.target.value))}
-					>
-						<option value="">Default</option>
-						{THINKING_LEVELS.map((l) => (
-							<option key={l} value={l}>
-								{l}
-							</option>
-						))}
-					</select>
 				</label>
 			</div>
 			{/* Sibling, not child: label click-forwarding must not fight the popover's focus. */}
@@ -1780,6 +1806,67 @@ function ModelField({
 							</Fragment>
 						),
 					)}
+				</div>
+				<hr className="model-divider" />
+				<button
+					type="button"
+					className="model-option level-row"
+					popoverTarget={levelPopId}
+					disabled={levelBase === ""}
+					title={levelBase === "" ? "Pick a model first" : undefined}
+					onKeyDown={(e) => {
+						if (e.key === "ArrowRight" || e.key === "Enter" || e.key === " ") {
+							e.preventDefault();
+							document.getElementById(levelPopId)?.showPopover();
+							document
+								.getElementById(levelPopId)
+								?.querySelector<HTMLElement>(".model-option")
+								?.focus();
+							return;
+						}
+						popKeys(e);
+					}}
+				>
+					<span>Thinking</span>
+					<span className="level-value">
+						{level === "" ? "Default" : level}
+						<Icon name="chevron-right" size={14} />
+					</span>
+				</button>
+				<div id={levelPopId} popover="auto" className="popover level-pop">
+					<p className="level-hint">
+						More thinking gives deeper answers, but turns take longer and use
+						more quota.
+					</p>
+					{["", ...THINKING_LEVELS].map((l) => (
+						<button
+							key={l || "default"}
+							type="button"
+							className="model-option"
+							aria-pressed={level === l}
+							onClick={() => pickLevel(l)}
+							onKeyDown={(e) => {
+								// ArrowLeft steps back to the Thinking row of the model menu.
+								if (e.key !== "ArrowLeft") return popKeys(e);
+								e.preventDefault();
+								document.getElementById(levelPopId)?.hidePopover();
+								document
+									.getElementById(popId)
+									?.querySelector<HTMLElement>(".level-row")
+									?.focus();
+							}}
+						>
+							{/* On the default model, "Default" names the level it brings (e.g. max). */}
+							<span>
+								{l !== ""
+									? l
+									: base === "" && runLevel !== ""
+										? `Default (${runLevel})`
+										: "Default"}
+							</span>
+							{level === l && <Icon name="check" size={14} />}
+						</button>
+					))}
 				</div>
 			</div>
 		</>
@@ -2008,22 +2095,43 @@ export function ComposeDialog({
 						</h2>
 						<CloseButton />
 					</div>
-					<PromptInput
-						label={inputLabel}
-						labelExtra={
-							deepen !== undefined ? (
-								<Help label="Deepen" text={DEEPEN_HELP} />
-							) : undefined
-						}
-						value={text}
-						rows={4}
-						autoFocus
-						placeholder={placeholder}
-						onChange={editText}
-						onEnter={submit}
-						images={images}
-						onView={(i) => setViewing(images.images[i]?.url ?? null)}
-					/>
+					<div className="prompt-card">
+						<PromptInput
+							label={inputLabel}
+							value={text}
+							rows={4}
+							autoFocus
+							placeholder={placeholder}
+							onChange={editText}
+							onEnter={submit}
+							images={images}
+							onView={(i) => setViewing(images.images[i]?.url ?? null)}
+						/>
+						<ImageBrowseButton onAdd={images.addFiles} icon="plus" />
+						{showModel !== false && (
+							<ModelField
+								catalog={catalog}
+								model={model}
+								setModel={editModel}
+								modelQuery={modelQuery}
+								setModelQuery={setModelQuery}
+							/>
+						)}
+						<button
+							type="submit"
+							className={"primary" + (sendState.failed ? " failed" : "")}
+							disabled={sendState.busy || text.trim().length === 0}
+							aria-busy={sendState.busy || undefined}
+							title={`${submitLabel} (Enter)`}
+						>
+							{sendState.busy ? (
+								<span className="spinner" aria-hidden="true" />
+							) : (
+								<Icon name={icon} />
+							)}
+							{submitLabel}
+						</button>
+					</div>
 					{deepen !== undefined && (
 						<div className="deepen-row">
 							<button
@@ -2039,6 +2147,7 @@ export function ComposeDialog({
 								<Icon name="edit" size={14} />
 								Deepen
 							</button>
+							<Help label="Deepen" text={DEEPEN_HELP} />
 							<span className="deepen-hint">
 								Ask a model to rewrite the draft as a diff; nothing changes
 								until you accept it.
@@ -2058,42 +2167,12 @@ export function ComposeDialog({
 							Deepen failed: {deepenErr} The draft is unchanged — try again.
 						</p>
 					)}
-					{showModel !== false && (
-						<ModelField
-							catalog={catalog}
-							model={model}
-							setModel={editModel}
-							modelQuery={modelQuery}
-							setModelQuery={setModelQuery}
-						/>
-					)}
 					<p className="hint">{hint}</p>
 					{err !== null && (
 						<p className="auth-error" role="alert">
 							{err}
 						</p>
 					)}
-					<div className="dialog-actions">
-						<ImageBrowseButton onAdd={images.addFiles} />
-						<button
-							type="button"
-							onClick={(e) => e.currentTarget.closest("dialog")?.close()}
-						>
-							Cancel
-						</button>
-						<button
-							type="submit"
-							className={"primary" + (sendState.failed ? " failed" : "")}
-							disabled={sendState.busy || text.trim().length === 0}
-							aria-busy={sendState.busy || undefined}
-						>
-							{sendState.busy && (
-								<span className="spinner" aria-hidden="true" />
-							)}
-							<Icon name={icon} />
-							{submitLabel}
-						</button>
-					</div>
 				</form>
 			</Modal>
 			{/* Sibling, not child: a nested dialog's close event would propagate to the compose dialog and close both. */}
@@ -2136,7 +2215,7 @@ function NewTaskDialog({
 			inputLabel="What should the agent do?"
 			placeholder="Describe the task in plain language"
 			hint="Enter adds the task. Shift+Enter starts a new line. Images: paste, drop or browse."
-			icon="plus"
+			icon="send"
 			submitLabel="Add task"
 			deepen={async (text, model) =>
 				post<{ deepened: string }>(
@@ -2181,7 +2260,7 @@ function BacklogDialog({
 			inputLabel="What is the idea?"
 			placeholder="Describe the idea in plain language"
 			hint="Enter parks the draft in the backlog. Shift+Enter starts a new line. Images: paste, drop or browse. No model pick: a draft runs no agent."
-			icon="plus"
+			icon="send"
 			submitLabel="Add draft"
 			send={async ({ text, images }) => {
 				await post(`/api/projects/${encodeURIComponent(project.name)}/tasks`, {
@@ -3539,8 +3618,11 @@ function Triage({
 	);
 }
 
-/** Every project in one table (the plant overview); clicking a row opens that project.
- * Option A order: triage, fleet KPIs, live table, per-project table. */
+const OVERVIEW_TABS = ["now", "perf", "setup"] as const;
+type OverviewTab = (typeof OVERVIEW_TABS)[number];
+
+/** The plant overview in three tabs: Now (Your turn and the projects table; clicking a row
+ * opens that project), Performance (fleet KPIs, per-project table) and Setup (provisioning). */
 export function Overview({
 	projects,
 	tasks,
@@ -3560,6 +3642,8 @@ export function Overview({
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
 	const prov = useProvisioning();
+	// Tabs: Now (what waits on you, the live projects), Performance and Setup.
+	const [tab, setTab] = useState<OverviewTab>("now");
 	if (projects.length === 0) {
 		return (
 			<section className="empty">
@@ -3612,7 +3696,8 @@ export function Overview({
 	const performance = (
 		<section aria-labelledby="perf-title" className="perf">
 			<div className="ov-head">
-				<h2 className="ov-sec" id="perf-title">
+				{/* The Performance tab names the section; the heading stays for screen readers. */}
+				<h2 className="ov-sec sr" id="perf-title">
 					Performance
 				</h2>
 				{rangeButtons}
@@ -3764,29 +3849,70 @@ export function Overview({
 			</div>
 		</>
 	);
-	// Order by urgency: what waits on the user, the live projects, the numbers, and setup last.
+	const setup = setupHints(prov.data, prov.err);
+	const { needs, asks } = splitAlarms(tasks);
+	const turn = needs.length + asks.length;
+	const tabProps = (key: OverviewTab) => ({
+		type: "button" as const,
+		role: "tab",
+		id: `ov-tab-${key}`,
+		"aria-controls": `ov-panel-${key}`,
+		"aria-selected": tab === key,
+		tabIndex: tab === key ? 0 : -1,
+		"data-tab": key,
+		onClick: () => setTab(key),
+		onKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) =>
+			switchTab(e, OVERVIEW_TABS, setTab),
+	});
+	const panelProps = (key: OverviewTab) => ({
+		role: "tabpanel",
+		id: `ov-panel-${key}`,
+		"aria-labelledby": `ov-tab-${key}`,
+		className: "ov-panel",
+		hidden: tab !== key,
+	});
 	return (
 		<section className="overview" aria-labelledby="overview-title">
 			<h1 id="overview-title">Overview</h1>
-			<Triage
-				projects={projects}
-				tasks={tasks}
-				openTask={openTask}
-				navigate={navigate}
-				setup={setupHints(prov.data, prov.err)}
-			/>
-			{projectsNow}
-			{performance}
-			<details className="ov-setup">
-				<summary>
-					<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-						<path d="M2 3l2 2 2-2" />
-					</svg>
+			<div
+				className="add-tabs ov-tabs"
+				role="tablist"
+				aria-label="Overview sections"
+			>
+				<button {...tabProps("now")}>
+					Now
+					{turn > 0 && <span className="ov-tab-n">{turn}</span>}
+				</button>
+				<button {...tabProps("perf")}>Performance</button>
+				{/* No agent server blocks every worker's provisioning: the tab says so in amber,
+				    like the Setup panel's callout; other setup hints keep the grey mark. */}
+				<button
+					{...tabProps("setup")}
+					data-alarm={prov.data?.server === null ? "" : undefined}
+				>
 					Setup
-					<small>Provisioning of the workers</small>
-				</summary>
+					{setup.length > 0 && (
+						<>
+							<Mark kind={prov.data?.server === null ? "needs" : "warn"} />
+							<span className="sr"> needs attention</span>
+						</>
+					)}
+				</button>
+			</div>
+			<div {...panelProps("now")}>
+				<Triage
+					projects={projects}
+					tasks={tasks}
+					openTask={openTask}
+					navigate={navigate}
+					setup={setup}
+				/>
+				{projectsNow}
+			</div>
+			<div {...panelProps("perf")}>{performance}</div>
+			<div {...panelProps("setup")}>
 				<Provisioning data={prov.data} err={prov.err} />
-			</details>
+			</div>
 		</section>
 	);
 }
@@ -3883,21 +4009,29 @@ function Provisioning({
 				<h2 className="ov-sec" id="prov-title">
 					Provisioning
 				</h2>
-				{data !== null && (
-					<p className="prov-server">
-						{data.server === null ? (
-							<>
-								<Mark kind="warn" />
-								Agent server not configured.{" "}
-								<button
-									type="button"
-									onClick={() => openSettingsSection("alate-section")}
-								>
-									Open setup
-								</button>
-							</>
-						) : (
-							(() => {
+				{data !== null &&
+					(data.server === null ? (
+						// No agent server stops provisioning for every worker: it waits on the
+						// user like a needs-action card, so it takes the amber callout.
+						<div className="prov-callout" role="status">
+							<Mark kind="needs" />
+							<span className="prov-callout-text">
+								<b>Agent server not configured</b>
+								<small>
+									Workers get no omp rules, settings, skills or plugins until an
+									Alate server is set.
+								</small>
+							</span>
+							<button
+								type="button"
+								onClick={() => openSettingsSection("alate-section")}
+							>
+								Open setup
+							</button>
+						</div>
+					) : (
+						<p className="prov-server">
+							{(() => {
 								const line = serverLine(data.server);
 								return (
 									<>
@@ -3907,10 +4041,9 @@ function Provisioning({
 										{line.text}
 									</>
 								);
-							})()
-						)}
-					</p>
-				)}
+							})()}
+						</p>
+					))}
 			</div>
 			{err !== null && (
 				<p className="prov-error" role="alert">
@@ -8162,7 +8295,7 @@ export function Drawer({
 											{" · "}
 											{run.model === null
 												? "default model"
-												: shortModel(run.model)}
+												: displayModel(catalog?.models ?? [], run.model)}
 											{" · "}
 											{stamp(run.at)} · {duration(run.durationMs)}
 										</p>
@@ -8412,7 +8545,7 @@ export function Drawer({
 												<span className="turn-model" title="model">
 													{run.model === null
 														? "default model"
-														: shortModel(run.model)}
+														: displayModel(catalog?.models ?? [], run.model)}
 												</span>
 												<span className="turn-time">
 													{new Date(run.at).toLocaleTimeString()}
@@ -9053,7 +9186,7 @@ export function Drawer({
 
 					{(task.state === "running" || task.state === "queued") && (
 						<form
-							className="reply-form"
+							className="reply-form steer-form prompt-card"
 							onSubmit={(e) => {
 								e.preventDefault();
 								steerSend.start(() => sendSteer(steer));
@@ -9072,6 +9205,7 @@ export function Drawer({
 								}}
 							/>
 							<ComposerActions
+								attachIcon="plus"
 								onAddImages={steerImages.addFiles}
 								catalog={catalog}
 								model={task.model ?? ""}
@@ -9124,13 +9258,19 @@ export function Drawer({
 									<button
 										type="submit"
 										className={"primary" + (steerSend.failed ? " failed" : "")}
-										disabled={steerSend.busy}
+										// Nothing to send while the field and the images are empty.
+										disabled={
+											steerSend.busy ||
+											(steer.trim() === "" && steerImages.images.length === 0)
+										}
 										aria-busy={steerSend.busy || undefined}
+										title="Steer (Enter)"
 									>
-										{steerSend.busy && (
+										{steerSend.busy ? (
 											<span className="spinner" aria-hidden="true" />
+										) : (
+											<Icon name="helm" />
 										)}
-										<Icon name="helm" />
 										Steer
 									</button>
 								}

@@ -754,7 +754,7 @@ textarea {
 .theme-choice[aria-pressed="true"] > .icon-svg:last-child {
 	color: var(--accent);
 }
-/* Model + Thinking fields sit side by side in dialogs. */
+/* The model field: caption with the quota above the one picker that sets model and thinking. */
 .model-fields {
 	display: flex;
 	gap: 10px;
@@ -762,10 +762,6 @@ textarea {
 .model-fields .field {
 	flex: 1;
 	min-width: 0;
-}
-/* The select fills its column, so its box ends level with the taller model trigger. */
-.model-fields select {
-	flex: 1;
 }
 /* Model picker: the trigger looks like the select it replaced and opens the popover
    holding the search bar and the roles/catalog list. */
@@ -776,7 +772,12 @@ textarea {
 	justify-content: space-between;
 	gap: 8px;
 }
+/* The quota beside "Model": every window as name, twin bar (time gone over quota used) and used
+   percent, in the top bar's grammar; the bright percent reads first (Values-Read-First). */
 .model-quota {
+	display: inline-flex;
+	align-items: center;
+	gap: 12px;
 	font-size: 12px;
 	/* Match the dialog chip inside uppercase form labels (steer, reply): the numbers
 	   read better in normal case, the label text keeps the caption style. */
@@ -789,12 +790,22 @@ textarea {
 	min-width: 0;
 	overflow: hidden;
 	white-space: nowrap;
-	text-overflow: ellipsis;
 }
-.model-quota [data-level="high"] {
+.quota-win {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+.model-quota .sb-twin {
+	width: 40px;
+}
+.quota-pct {
+	color: var(--text-strong);
+}
+.quota-pct[data-level="high"] {
 	color: var(--alarm);
 }
-.model-quota [data-level="crit"] {
+.quota-pct[data-level="crit"] {
 	color: var(--crit-text);
 }
 .model-trigger {
@@ -852,8 +863,11 @@ textarea {
 	min-height: 0;
 	overflow-y: auto;
 }
+/* flex: none: in the scrolling list a row never shrinks below its content, so a wrapped
+   two-line row keeps its height instead of overlapping the next one. */
 .model-option {
 	display: flex;
+	flex: none;
 	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
@@ -876,20 +890,99 @@ textarea {
 .model-option[aria-pressed="true"] > .icon-svg {
 	color: var(--accent);
 }
-/* Divider between the omp role rows and the alphabetical catalog. */
+/* Divider between the omp role rows and the alphabetical catalog, and above the Thinking row. */
 .model-divider {
 	margin: 6px 0;
 	border: 0;
 	border-top: 1px solid var(--line);
 }
+/* Trigger: "model level" (Gemini's "Argon Mittel"): the model in the bright tone, the level
+   after a space in the dim tone, so the model name reads first. */
+.model-name {
+	min-width: 0;
+	color: var(--text-strong);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.model-level {
+	color: var(--dim);
+}
+/* The menu's last row: "Thinking" left, the current level and a chevron right; it opens the
+   level menu beside the model menu. It sits outside the scrolling list, so it never scrolls away. */
+.level-row {
+	flex: none;
+}
+.level-value {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--dim);
+}
+.level-row:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+.level-pop {
+	top: auto;
+	left: auto;
+	width: min(260px, calc(100vw - 24px));
+	padding: 8px;
+}
+.level-pop:popover-open {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.level-hint {
+	margin: 2px 6px 6px;
+	font-size: 12.5px;
+	line-height: 1.45;
+	color: var(--dim);
+}
 @supports (position-anchor: --a) {
 	.model-trigger {
 		anchor-name: --model-trigger;
 	}
+	/* Below the trigger by default; near the bottom edge (the docked drawer composer) it flips
+	   above, so the menu never runs out of the viewport. */
 	.model-pop {
 		position-anchor: --model-trigger;
-		top: calc(anchor(bottom) + 4px);
-		left: anchor(left);
+		position-area: bottom span-right;
+		position-try-fallbacks:
+			flip-block,
+			flip-inline,
+			flip-block flip-inline;
+		margin: 4px 0;
+	}
+	.level-row {
+		anchor-name: --level-row;
+	}
+	/* Beside the Thinking row, its top level with the row (Claude's effort submenu); without room
+	   at either side (phones) it opens above the row, over the model list. */
+	.level-pop {
+		position-anchor: --level-row;
+		position-area: right span-bottom;
+		position-try-fallbacks:
+			right span-top,
+			left span-bottom,
+			left span-top,
+			top,
+			bottom;
+		margin: 0 4px;
+	}
+	/* Phones: a side area is too narrow for the menu, so both menus take the screen width over
+	   or under their trigger (the level menu covers the model list it came from). */
+	@media (max-width: 560px) {
+		.model-pop {
+			position-area: bottom span-all;
+			position-try-fallbacks: top span-all;
+		}
+		.level-pop {
+			position-area: top span-all;
+			position-try-fallbacks: bottom span-all;
+			margin: 4px 0;
+		}
 	}
 }
 .popover section + section {
@@ -2589,9 +2682,11 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .card-head :is(.research, .cancelled, .rank-badges:not(:empty)) ~ .model {
 	margin-left: 0;
 }
-/* Mutation testing on a running card: one dim line (percent and time left), and the
-   progress as a 2px line along the card's bottom edge. Counts, survivors and elapsed time
-   stay in the tooltip and the drawer. */
+/* Mutation testing on a running card: one dim line (percent and time left). The card's
+   left edge is the progress, drawn like the quota twin bar's time line on its side: the
+   remaining part as a thin 1px white line, the done part as a 3px white fill from the
+   bottom, and a round head at the fill's top. Width, not colour, tells done from remaining.
+   Counts, survivors and elapsed time stay in the tooltip and the drawer. */
 .card-mutation {
 	overflow: hidden;
 	font-size: 12px;
@@ -2600,21 +2695,41 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
-.mutation-track {
+/* The rail takes the live edge's place: no solid inset edge under it (this selector
+   outranks the later live-edge rule). */
+.card:is([data-state="running"], [data-state="preparing"]):has(.mutation-rail) {
+	box-shadow: none;
+}
+.mutation-rail {
 	position: absolute;
-	right: 0;
+	top: 0;
 	bottom: 0;
 	left: 0;
-	height: 2px;
-	overflow: hidden;
-	border-radius: 0 0 3px 3px;
+	width: 3px;
+	background:
+		linear-gradient(var(--text-strong), var(--text-strong)) 1px 0 / 1px 100%
+		no-repeat;
+	pointer-events: none;
 }
-.mutation-track > i {
+.mutation-rail > i {
 	position: absolute;
-	inset: 0;
-	background: var(--normal-fill);
-	transform-origin: left;
-	transition: transform 0.4s var(--ease);
+	bottom: 0;
+	left: 0;
+	width: 3px;
+	background: var(--text-strong);
+	border-bottom-left-radius: 3px;
+	transition: height 0.4s var(--ease);
+}
+/* The head: the twin bar's 6px end dot, centred on the 3px fill. */
+.mutation-rail > i::before {
+	content: "";
+	position: absolute;
+	top: -3px;
+	left: -1.5px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--text-strong);
 }
 /* Arrival: when a card lands in a column its status mark traces itself once and the meta line follows;
    nothing loops. Cards cascade by position up to the eighth. Reduced motion skips it entirely. */
@@ -2769,6 +2884,16 @@ a.release:hover {
 
 .card[data-state="needs_you"] {
 	border-color: var(--alarm);
+}
+/* A live card (running or preparing) carries a bright 3px left edge and the strong border,
+   so it stands out in a long column without a new hue (Grey-Is-Normal). The edge is the
+   signal, so the card's dot stays steady instead of breathing. */
+.card:is([data-state="running"], [data-state="preparing"]) {
+	border-color: var(--line);
+	box-shadow: inset 3px 0 0 var(--text-strong);
+}
+.card-head :is(.mark-running, .mark-preparing) {
+	animation: none;
 }
 
 /* Research chip: same shape as the .model chip, muted to read as metadata. Right-aligned
@@ -3243,45 +3368,42 @@ a.release:hover {
 .perf .ov thead th:first-child {
 	color: var(--text);
 }
-/* Setup (provisioning) folds at the end of the Overview: it rarely needs a look. */
-.ov-setup {
-	background: var(--panel);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+/* Overview tabs: the board's steel-underline strip (.add-tabs). Now carries the count of
+   cards waiting on you; Setup carries the warning mark while provisioning needs a look. */
+.ov-tabs {
+	margin-top: 4px;
 }
-.ov-setup > summary {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	padding: 10px 14px;
-	font-size: 13px;
-	color: var(--text);
-	list-style: none;
-	cursor: pointer;
+.ov-tabs button {
+	gap: 6px;
 }
-.ov-setup > summary::-webkit-details-marker {
-	display: none;
-}
-.ov-setup > summary .chev {
+.ov-tabs .mark {
 	width: 12px;
 	height: 12px;
-	fill: none;
-	stroke: currentColor;
-	stroke-width: 1.4;
-	transform: rotate(-90deg);
-	transition: transform 0.16s var(--ease);
 }
-.ov-setup[open] > summary .chev {
-	transform: none;
-}
-.ov-setup > summary small {
-	margin-left: auto;
+.ov-tab-n {
 	font-size: 12px;
+	font-weight: 600;
 	color: var(--dim);
+	font-variant-numeric: tabular-nums;
 }
-.ov-setup > .prov {
+.ov-tabs button[aria-selected="true"] .ov-tab-n {
+	color: var(--text-strong);
+}
+.ov-panel {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+.ov-panel[hidden] {
+	display: none;
+}
+/* The Performance heading is screen-reader only, so the range buttons sit at the right. */
+.perf > .ov-head {
+	justify-content: flex-end;
+}
+/* Setup (provisioning) sits bare in its tab: its own table is already the card. */
+.ov-panel > .prov {
 	margin: 0;
-	padding: 0 14px 14px;
 }
 .perf-error {
 	display: flex;
@@ -3317,18 +3439,46 @@ a.release:hover {
 	font-size: 12.5px;
 	color: var(--dim);
 }
-.prov-server button {
-	padding: 0;
-	border: 0;
-	background: none;
-	font: inherit;
-	color: var(--accent);
-	text-decoration: underline;
-	text-underline-offset: 3px;
-	cursor: pointer;
+/* No agent server: a full-width amber callout under the heading. It waits on the user like a
+   needs-action card (amber triangle, alarm tint); the second line says what stops. */
+.prov-callout {
+	flex-basis: 100%;
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 4px 0 0;
+	padding: 10px 12px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
 }
-.prov-server button:hover {
-	color: var(--accent-hover);
+.prov-callout .mark {
+	flex: none;
+	width: 16px;
+	height: 16px;
+}
+.prov-callout-text {
+	display: grid;
+	flex: 1;
+	gap: 2px;
+	min-width: 0;
+}
+.prov-callout b {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.prov-callout small {
+	font-size: 12.5px;
+	color: var(--text);
+}
+.prov-callout button {
+	flex: none;
+}
+/* The Setup tab carries the same amber while no agent server is set, selected or not
+   (the second selector outranks the later .add-tabs selected rule). */
+.ov-tabs button[data-alarm],
+.ov-tabs button[data-alarm][aria-selected="true"] {
+	color: var(--alarm);
 }
 /* The provisioning rows open nothing: no pointer, no hover. */
 .prov-matrix tbody tr {
@@ -5064,7 +5214,13 @@ dialog.drawer[open]::backdrop {
 		transform: none; /* the fade stays, the slide goes */
 	}
 }
+/* A flex column at least the drawer's height, so the composer docks at the bottom edge
+   even when the sections above are short (see .drawer-body > .reply-form). */
 .drawer-body {
+	display: flex;
+	flex-direction: column;
+	box-sizing: border-box;
+	min-height: 100%;
 	padding: 18px 22px 26px;
 }
 /* The drawer's header band: title, actions and the meta line stay at the top of the
@@ -5079,11 +5235,9 @@ dialog.drawer[open]::backdrop {
 	background: var(--panel);
 	border-bottom: 1px solid var(--line-soft);
 }
-/* The band's edge is the first section's top rule: no second rule and no margin above
-   it, so edge-to-label is the same 14px as every rule-to-label below. */
+/* The band's edge closes the header: the first section keeps one 14px step below it. */
 .drawer-body > .drawer-top + .dsec {
-	margin-top: 0;
-	border-top: 0;
+	margin-top: 14px;
 }
 .drawer-head {
 	display: flex;
@@ -5549,14 +5703,12 @@ a.lineage-row:hover .lineage-title {
 	text-transform: uppercase;
 	color: var(--dim);
 }
-/* Every drawer section is a .dsec wrapper: one hairline boundary between neighbours,
-   one spacing step on both sides. Collapsible heads (fu-head) toggle the body below. */
+/* Every drawer section is a .dsec wrapper. Sections are read-only, so space alone
+   separates them: no rules. Collapsible heads (fu-head) toggle the body below. */
 .drawer-body > .dsec {
-	margin-top: 18px;
-	padding-top: 14px;
-	border-top: 1px solid var(--line-soft);
+	margin-top: 22px;
 }
-/* Inside a section the boundary rule owns the top spacing; the head keeps only its
+/* Inside a section the section's top margin owns the spacing; the head keeps only its
    label-to-content gap. */
 .dsec > h3,
 .dsec > .section-head {
@@ -6305,6 +6457,172 @@ button.log-mode[aria-pressed="true"] {
 	padding-top: 14px;
 	border-top: 1px solid var(--line-soft);
 }
+/* In the drawer the composer docks at the bottom edge as one control band (field,
+   model and the turn buttons together), and the read-only sections scroll above it.
+   The <dialog> is the scroll container, so the pin offset is 0 against its edge; the
+   band bleeds past the body's side and bottom padding, so its top rule spans the drawer. */
+.drawer-body > .reply-form {
+	order: 3;
+	position: sticky;
+	bottom: 0;
+	/* A short drawer pushes the band to the bottom edge (auto top margin); the 10px
+	   step above it comes from the meta and actions blocks' bottom margins. */
+	margin: auto -22px -26px;
+	padding: 12px 22px 18px;
+	background: var(--panel);
+}
+.drawer-body > .reply-form .hint {
+	display: none;
+}
+/* Prompt card (Claude style), shared by the steer composer and the compose dialogs (New task,
+   Add draft, Follow up): the field and one tool row share a recessed box, with + at the left and
+   the model picker next to the icon-only submit at the right, all 8px from the box walls; the
+   quota sits under the box at the right. The wrappers drop out of layout so every control lands
+   on the card's grid; the box is the ::before behind the first three rows, the field goes bare,
+   and focus in it lights the box edge (One-Edge Rule). */
+.prompt-card {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) minmax(0, auto) auto;
+	grid-template-areas:
+		"field field field field"
+		"att att att att"
+		"plus . model send"
+		". quota quota quota";
+	gap: 0 8px;
+}
+.prompt-card::before {
+	content: "";
+	grid-area: 1 / 1 / 4 / -1;
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	pointer-events: none;
+}
+.prompt-card:has(textarea:focus-visible)::before {
+	border-color: var(--accent);
+}
+.prompt-card .prompt-field,
+.prompt-card .model-fields,
+.prompt-card .model-fields .field {
+	display: contents;
+}
+/* The field's caption leaves the screen, not the accessibility tree: it still names the field. */
+.prompt-card .prompt-field > label {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+.prompt-card .prompt-field > textarea {
+	grid-area: field;
+	z-index: 1;
+	padding: 12px 12px 4px;
+	background: transparent;
+	border: 0;
+	outline: none;
+	box-shadow: none;
+	resize: none;
+}
+.prompt-card .prompt-field > :not(label):not(textarea) {
+	grid-area: att;
+	z-index: 1;
+	padding: 0 10px 6px;
+}
+/* The model caption hides (font-size 0); its quota stays, right-aligned under the box. */
+.prompt-card .model-fields .field-head {
+	grid-area: quota;
+	justify-self: end;
+	align-self: center;
+	margin-top: 8px;
+	font-size: 0;
+}
+/* Tool row: each control keeps its own height, centred on the row, 8px from the box walls. */
+.prompt-card .model-fields .field > :not(.field-head) {
+	grid-area: model;
+	justify-self: end;
+	align-self: center;
+	margin-bottom: 8px;
+}
+.prompt-card .model-trigger,
+.prompt-card .browse {
+	z-index: 1;
+	min-width: 0;
+	width: auto;
+	max-width: 100%;
+	color: var(--text);
+	background: transparent;
+	border-color: transparent;
+}
+.prompt-card .model-trigger:hover,
+.prompt-card .browse:hover {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+/* Icon-only + and submit (the chat-app send): the word leaves the screen and still names the
+   button; two 32px squares (40px on touch). The submit stays off while there is nothing to send. */
+.prompt-card :is(.browse, .primary) {
+	z-index: 1;
+	align-self: center;
+	justify-content: center;
+	width: 32px;
+	min-width: 32px;
+	padding: 0;
+	gap: 0;
+	font-size: 0;
+}
+@media (pointer: coarse) {
+	.prompt-card .primary {
+		width: 40px;
+		min-width: 40px;
+	}
+}
+.prompt-card .browse {
+	grid-area: plus;
+	margin: 0 0 8px 8px;
+}
+.prompt-card .primary {
+	grid-area: send;
+	justify-self: end;
+	margin: 0 8px 8px 0;
+}
+/* Steer composer: the card docks in the drawer (see .drawer-body > .reply-form); Stop turn
+   (outlined) takes the left of the line under the box. .drawer-body lifts these above the
+   composer's own grid rules (.composer-actions ...). */
+.drawer-body > .steer-form {
+	grid-template-areas:
+		"field field field field"
+		"att att att att"
+		"plus . model send"
+		"stop quota quota quota";
+}
+.drawer-body > .steer-form .composer-actions,
+.drawer-body > .steer-form .composer-bar,
+.drawer-body > .steer-form .model-fields {
+	display: contents;
+}
+.drawer-body > .steer-form .model-trigger {
+	width: auto;
+}
+.drawer-body > .steer-form .composer-bar > button:not(.primary):not(.browse) {
+	grid-area: stop;
+	justify-self: start;
+	align-self: center;
+	margin: 8px 0 0;
+	white-space: nowrap;
+	color: var(--text);
+	background: var(--card);
+	border-color: var(--line);
+}
+.drawer-body
+	> .steer-form
+	.composer-bar
+	> button:not(.primary):not(.browse):hover {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
 .followup-cta {
 	display: flex;
 	align-items: center;
@@ -6347,7 +6665,7 @@ button.log-mode[aria-pressed="true"] {
 }
 .composer-actions .model-fields {
 	display: grid;
-	grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+	grid-template-columns: minmax(0, 1fr);
 	gap: 10px;
 }
 .composer-actions .field {
@@ -6425,8 +6743,10 @@ button.log-mode[aria-pressed="true"] {
 	border: 1px solid var(--line);
 	border-radius: 3px;
 }
+/* Meta and the card actions sit above the docked composer. */
 .meta-block {
-	margin-top: 14px;
+	order: 1;
+	margin: 14px 0 10px;
 }
 .meta-block > summary {
 	cursor: pointer;
@@ -6442,9 +6762,9 @@ button.log-mode[aria-pressed="true"] {
 	flex-wrap: wrap;
 	justify-content: flex-end;
 	gap: 8px;
-	margin-top: 20px;
-	padding-top: 14px;
-	border-top: 1px solid var(--line-soft);
+	order: 2;
+	/* Flex margins add up: 8px here plus Meta's 10px keep the old 18px step. */
+	margin: 8px 0 10px;
 }
 .meta {
 	display: flex;

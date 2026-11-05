@@ -5,6 +5,7 @@ import fc from "../test/properties.ts";
 import {
 	addRoleError,
 	classifyRolesSave,
+	displayModel,
 	fetchCatalog,
 	loadCatalog,
 	modelMatches,
@@ -231,10 +232,10 @@ test("modelMatches is case-insensitive over selector and name", () => {
 const models = [m("z/fast", "Fast"), m("a/smol", "Smol")];
 const roles = { default: "a/smol", slow: "z/slow", plan: "a/plan" };
 
-test("modelRows puts Default first with roles.default in the label", () => {
+test("modelRows puts the default model first, model first with its role in braces", () => {
 	expect(modelRows([], roles, "", "")[0]).toEqual({
 		key: "role-default",
-		label: "Default (a/smol)",
+		label: "a/smol (default)",
 		selector: "",
 		pressed: true,
 	});
@@ -243,21 +244,67 @@ test("modelRows puts Default first with roles.default in the label", () => {
 test("modelRows Default label is bare without roles.default", () => {
 	expect(modelRows([], { slow: "s" }, "s", "")).toEqual([
 		{ key: "role-default", label: "Default", selector: "", pressed: false },
-		{ key: "role-slow", label: "Slow (s)", selector: "s", pressed: true },
+		{ key: "role-s", label: "s (slow)", selector: "s", pressed: true },
 	]);
 });
 
-test("modelRows excludes default from role rows and sorts by role name", () => {
+test("modelRows lists each role model once after the default row, sorted by model", () => {
 	const rows = modelRows([], roles, "", "");
 	expect(rows.map((r) => r.key)).toEqual([
 		"role-default",
-		"role-plan",
-		"role-slow",
+		"role-a/plan",
+		"role-z/slow",
 	]);
 	expect(rows.map((r) => r.label)).toEqual([
-		"Default (a/smol)",
-		"Plan (a/plan)",
-		"Slow (z/slow)",
+		"a/smol (default)",
+		"a/plan (plan)",
+		"z/slow (slow)",
+	]);
+});
+
+test("displayModel shows the display name and level, else the selector without its provider", () => {
+	const ms = [m("anthropic/claude-opus-5-5", "Claude Opus 5.5")];
+	expect(displayModel(ms, "anthropic/claude-opus-5-5:medium")).toBe(
+		"Claude Opus 5.5 medium",
+	);
+	expect(displayModel(ms, "anthropic/claude-opus-5-5")).toBe("Claude Opus 5.5");
+	expect(displayModel(ms, "zai/glm-5.3-flash:max")).toBe("glm-5.3-flash:max");
+	expect(displayModel(ms, "default")).toBe("default");
+});
+
+test("modelRows names role models by omp's display name, level kept, selector as fallback", () => {
+	const rows = modelRows(
+		[m("anthropic/opus", "Opus 5.5")],
+		{
+			default: "anthropic/opus:medium",
+			plan: "anthropic/opus:medium",
+			task: "x/unlisted",
+		},
+		"",
+		"",
+	);
+	expect(rows.map((r) => r.label)).toEqual([
+		"Opus 5.5 medium (default, plan)",
+		"x/unlisted (task)",
+		"Opus 5.5 (anthropic/opus)",
+	]);
+});
+
+test("modelRows merges roles that share a model into one row", () => {
+	const rows = modelRows(
+		[],
+		{ task: "b", default: "a", smol: "a", plan: "b" },
+		"b",
+		"",
+	);
+	expect(rows).toEqual([
+		{
+			key: "role-default",
+			label: "a (default, smol)",
+			selector: "",
+			pressed: false,
+		},
+		{ key: "role-b", label: "b (plan, task)", selector: "b", pressed: true },
 	]);
 });
 
@@ -268,7 +315,7 @@ test("modelRows marks pressed via shared selector across role and catalog rows",
 		"z/slow",
 		"",
 	);
-	expect(rows.find((r) => r.key === "role-slow")?.pressed).toBe(true);
+	expect(rows.find((r) => r.key === "role-z/slow")?.pressed).toBe(true);
 	expect(rows.find((r) => r.key === "z/slow")?.pressed).toBe(true);
 	expect(rows.find((r) => r.key === "role-default")?.pressed).toBe(false);
 });
@@ -305,7 +352,7 @@ test("modelRows query filters role rows case-insensitively but not catalog rows"
 	const rows = modelRows(models, { slow: "Z/SLOW" }, "", "slow");
 	expect(rows.map((r) => r.key)).toEqual([
 		"role-default",
-		"role-slow",
+		"role-Z/SLOW",
 		"z/fast",
 		"a/smol",
 	]);
@@ -338,8 +385,8 @@ test("modelRows pressed ignores the level suffix while role labels keep it", () 
 		"z/slow:high",
 		"",
 	);
-	const role = rows.find((r) => r.key === "role-slow");
-	expect(role?.label).toBe("Slow (z/slow:low)");
+	const role = rows.find((r) => r.key === "role-z/slow:low");
+	expect(role?.label).toBe("Slow low (slow)");
 	expect(role?.pressed).toBe(true);
 	expect(rows.find((r) => r.key === "z/slow")?.pressed).toBe(true);
 	expect(rows.find((r) => r.key === "role-default")?.pressed).toBe(false);

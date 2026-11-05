@@ -101,7 +101,7 @@ The palette is four neutral greys plus a recessed well, one steel interaction ac
 
 **Neutral — Field Grey** (`#c9ced4`): body text. Surfaces step darker-to-lighter: field `#2b2e32`, chrome `#24272b`, panel `#303338`, card `#3a3f45`, hover `#41464d`, recessed well `#1f2225`. Lines `#4a5057` (strong) and `#3d4248` (soft). Values read brighter at `#eceef1`; secondary text `#a8b0b9` holds at least 4.5:1 on cards. Indicator fill inside the normal band is `#8f979f` — visible, but grey.
 
-**The Grey-Is-Normal Rule.** Colour is an alarm channel. If a state is fine, it renders in grey; amber and red are reserved for needs-you and critical, respectively.
+**The Grey-Is-Normal Rule.** Colour is an alarm channel. If a state is fine, it renders in grey; amber and red are reserved for needs-you and critical, respectively. A setup problem that stops every worker counts as needs-you: a missing agent server shows an amber callout on the Overview's Setup tab, and the tab label turns amber. Other setup hints keep the grey warning mark.
 
 **The Redundant-Coding Rule.** No alarm state is carried by hue alone. Needs-you is an amber triangle "!", critical is a red square "!", normal-band exceedance is a tick on the indicator plus the amber fill. Shape and text carry the meaning first.
 

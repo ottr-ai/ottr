@@ -625,7 +625,8 @@ describe("LaneCol backlog divider", () => {
 			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
 		).replaceAll("<!-- -->", "");
 		expect(html).toContain(">Mutation 68% · ~1h 23m left<");
-		expect(html).toContain('class="mutation-track"');
+		// The left-edge rail fills to the run's percent.
+		expect(html).toMatch(/class="mutation-rail"[^>]*><i style="height:68%"/);
 		// Counts, survivors and elapsed time stay on the row's title, off the card face.
 		expect(html).toContain('title="Stryker 68% · 4454/6523 · 38 survived');
 		expect(html).not.toContain(">4454/6523<");

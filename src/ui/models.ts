@@ -168,6 +168,39 @@ export function modelMatches(m: ModelOption, query: string): boolean {
 	return q === "" || `${m.selector} ${m.name}`.toLowerCase().includes(q);
 }
 
+/** omp's display name of a selector's model (e.g. "Opus 5.5" for "anthropic/claude-opus-5-5"),
+    or null when the catalog does not list it. The thinking level is ignored. */
+export function modelName(
+	models: readonly ModelOption[],
+	selector: string,
+): string | null {
+	const [base] = splitLevel(selector);
+	return models.find((m) => m.selector === base)?.name ?? null;
+}
+
+/** A selector as people read it: omp's display name plus the level ("Claude Opus 5.5 medium");
+    a model the catalog does not list keeps its selector without the provider ("glm-5.3-flash:max"). */
+export function displayModel(
+	models: readonly ModelOption[],
+	selector: string,
+): string {
+	const name = modelName(models, selector);
+	if (name === null) return selector.slice(selector.indexOf("/") + 1);
+	const [, level] = splitLevel(selector);
+	return level === "" ? name : `${name} ${level}`;
+}
+
+/** A role row's model: the display name plus the level ("Opus 5.5 medium"), else the selector. */
+function roleModelLabel(
+	models: readonly ModelOption[],
+	selector: string,
+): string {
+	const name = modelName(models, selector);
+	if (name === null) return selector;
+	const [, level] = splitLevel(selector);
+	return level === "" ? name : `${name} ${level}`;
+}
+
 export type ModelRow = {
 	key: string;
 	label: string;
@@ -176,9 +209,12 @@ export type ModelRow = {
 	divider?: boolean;
 };
 
-/** Picker list data: omp roles first (their model as info, e.g. "Smol (zai/glm-5.3-flash)"), a divider,
-    then the whole catalog alphabetically. "Default" (no explicit model) is the default role row.
-    Catalog rows are NOT query-filtered here — the caller pre-filters with modelMatches. */
+/** Picker list data: the models omp roles use first, model first with its roles in braces
+    (e.g. "zai/glm-5.3-flash (plan, smol)"), one row per model even when several roles share it;
+    a divider; then the whole catalog alphabetically. The first row runs on omp's default model
+    (empty selector, so the task follows a later default change); roles that share the default
+    model join that row. Catalog rows are NOT query-filtered here — the caller pre-filters with
+    modelMatches. */
 export function modelRows(
 	models: readonly ModelOption[],
 	roles: Record<string, string> | null,
@@ -187,23 +223,36 @@ export function modelRows(
 ): ModelRow[] {
 	const q = query.trim().toLowerCase();
 	const [selBase] = splitLevel(selected);
-	const roleRows = Object.entries(roles ?? {})
+	const bySelector = new Map<string, string[]>();
+	for (const [r, s] of Object.entries(roles ?? {}).sort(([a], [b]) =>
+		a.localeCompare(b),
+	))
+		bySelector.set(s, [...(bySelector.get(s) ?? []), r]);
+	const def = roles?.default;
+	const defRoles =
+		def === undefined
+			? []
+			: [
+					"default",
+					...(bySelector.get(def) ?? []).filter((r) => r !== "default"),
+				];
+	const roleRows = [...bySelector]
 		.filter(
-			([r, s]) =>
-				r !== "default" && (q === "" || `${r} ${s}`.toLowerCase().includes(q)),
+			([s, rs]) =>
+				s !== def &&
+				(q === "" || `${s} ${rs.join(" ")}`.toLowerCase().includes(q)),
 		)
 		.sort(([a], [b]) => a.localeCompare(b))
-		.map(([r, s]): ModelRow => {
-			const label = `${r.charAt(0).toUpperCase()}${r.slice(1)} (${s})`;
-			// Suffix-insensitive: a task model "z/slow:high" marks both the "z/slow:low" role
-			// row and the "z/slow" catalog row, so both rewrite the same base.
-			return {
-				key: `role-${r}`,
-				label,
+		.map(
+			([s, rs]): ModelRow => ({
+				key: `role-${s}`,
+				label: `${roleModelLabel(models, s)} (${rs.join(", ")})`,
 				selector: s,
+				// Suffix-insensitive: a task model "z/slow:high" marks both the "z/slow:low" role
+				// row and the "z/slow" catalog row, so both rewrite the same base.
 				pressed: splitLevel(s)[0] === selBase,
-			};
-		});
+			}),
+		);
 	const catalog = [...models]
 		.sort((a, b) => a.name.localeCompare(b.name))
 		.map(
@@ -218,7 +267,10 @@ export function modelRows(
 	return [
 		{
 			key: "role-default",
-			label: `Default${roles?.default ? ` (${roles.default})` : ""}`,
+			label:
+				def === undefined
+					? "Default"
+					: `${roleModelLabel(models, def)} (${defRoles.join(", ")})`,
 			selector: "",
 			pressed: selected === "",
 		},
