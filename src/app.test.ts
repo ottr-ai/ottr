@@ -987,6 +987,53 @@ describe("task routes", () => {
 		expect(store.getTask(backlog.id)?.prompt).toBe("edited while parked");
 	});
 
+	test("a held proposal card edits via /edit and /edit/start; a plain needs_you card does not", async () => {
+		// A retro proposal parks needs_you with zero turns: the drawer edits its
+		// prompt before the user accepts, so the edit gates take that one shape too.
+		const proposal = store.createTask("proposal draft");
+		store.updateTask(proposal.id, {
+			state: "needs_you",
+			needsReason:
+				"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		});
+		const editRes = await post(`/api/projects/p1/tasks/${proposal.id}/edit`, {
+			prompt: "Refactor the retry loop in src/push.ts instead",
+		});
+		expect(editRes.status).toBe(200);
+		expect(store.getTask(proposal.id)?.prompt).toBe(
+			"Refactor the retry loop in src/push.ts instead",
+		);
+		// editTask re-derives the title from the new prompt.
+		expect(store.getTask(proposal.id)?.title).toBe(
+			"Refactor the retry loop in src/push.ts instead",
+		);
+		const startRes = await post(
+			`/api/projects/p1/tasks/${proposal.id}/edit/start`,
+			{},
+		);
+		expect(startRes.status).toBe(200);
+		expect(store.getTask(proposal.id)?.holdUntil).toBe(PROMPT_EDIT_HELD);
+		await post(`/api/projects/p1/tasks/${proposal.id}/edit/stop`, {});
+
+		// Any other needs_you card (a user park, a question) still gets 409.
+		const parked = store.createTask("parked with a question");
+		store.updateTask(parked.id, {
+			state: "needs_you",
+			needsReason: "asked a question",
+		});
+		const parkedEdit = await post(`/api/projects/p1/tasks/${parked.id}/edit`, {
+			prompt: "nope",
+		});
+		expect(parkedEdit.status).toBe(409);
+		expect(store.getTask(parked.id)?.prompt).toBe("parked with a question");
+		const parkedStart = await post(
+			`/api/projects/p1/tasks/${parked.id}/edit/start`,
+			{},
+		);
+		expect(parkedStart.status).toBe(409);
+		expect(store.getTask(parked.id)?.holdUntil).toBeNull();
+	});
+
 	test("an open prompt edit holds the card and every close path releases it", async () => {
 		const created = store.createTask("edited while queued");
 		// The drawer's editor claims the hold; pickRunnable defers a held card like any

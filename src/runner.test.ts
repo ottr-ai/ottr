@@ -1647,6 +1647,7 @@ describe("applyEvent", () => {
 		expect(s.proposed).toEqual({
 			prompt: "Add tests for X",
 			model: "zai/glm",
+			summary: null,
 		});
 		feed(s, {
 			type: "tool_execution_start",
@@ -1672,7 +1673,7 @@ describe("applyEvent", () => {
 			toolCallId: "p2",
 			args: { prompt: "Good" },
 		});
-		expect(s.proposed).toEqual({ prompt: "Good", model: null });
+		expect(s.proposed).toEqual({ prompt: "Good", model: null, summary: null });
 	});
 
 	test("a model-less or non-string model propose becomes null", () => {
@@ -1683,7 +1684,136 @@ describe("applyEvent", () => {
 			toolCallId: "p1",
 			args: { prompt: "P", model: 42 },
 		});
-		expect(s.proposed).toEqual({ prompt: "P", model: null });
+		expect(s.proposed).toEqual({ prompt: "P", model: null, summary: null });
+	});
+
+	test("all five summary fields are captured, trimmed", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: {
+				prompt: "P",
+				whatChanges: "  edit src/prompts.ts  ",
+				why: " OTTR-1 duplicated text ",
+				gain: " 200 characters per card ",
+				risk: " none found ",
+				check: " bun test ",
+			},
+		});
+		expect(s.proposed?.summary).toEqual({
+			whatChanges: "edit src/prompts.ts",
+			why: "OTTR-1 duplicated text",
+			gain: "200 characters per card",
+			risk: "none found",
+			check: "bun test",
+		});
+	});
+
+	test("an absent or non-string risk defaults to none found", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: {
+				prompt: "P",
+				whatChanges: "w",
+				why: "y",
+				gain: "g",
+				check: "c",
+				risk: 42,
+			},
+		});
+		expect(s.proposed?.summary).toEqual({
+			whatChanges: "w",
+			why: "y",
+			gain: "g",
+			risk: "none found",
+			check: "c",
+		});
+	});
+
+	test("a missing or empty required summary field yields summary null", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: { prompt: "P", whatChanges: "w", why: "y", gain: "g" },
+		});
+		expect(s.proposed?.summary).toBeNull();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p2",
+			args: {
+				prompt: "Q",
+				whatChanges: "w",
+				why: "  ",
+				gain: "g",
+				check: "c",
+			},
+		});
+		// The first valid call stays the proposal; its summary stays null.
+		expect(s.proposed?.summary).toBeNull();
+	});
+
+	test("a summary field over 400 characters is capped at 399 plus an ellipsis", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: {
+				prompt: "P",
+				whatChanges: "w",
+				why: "y",
+				gain: "g".repeat(500),
+				check: "c",
+			},
+		});
+		expect(s.proposed?.summary?.gain).toBe("g".repeat(399) + "…");
+		expect(s.proposed?.summary?.gain).toHaveLength(400);
+	});
+
+	test("a non-string required summary field counts as absent", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: {
+				prompt: "P",
+				whatChanges: "w",
+				why: { note: "y" },
+				gain: "g",
+				check: "c",
+			},
+		});
+		expect(s.proposed?.summary).toBeNull();
+	});
+
+	test("review-mode recorded findings carry no summary", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: {
+				prompt: "F",
+				rank: 1,
+				whatChanges: "w",
+				why: "y",
+				gain: "g",
+				risk: "r",
+				check: "c",
+			},
+		});
+		expect(s.recorded).toEqual([
+			{ prompt: "F", model: null, rank: 1, security: null },
+		]);
 	});
 
 	test("a review's propose_task calls all land in recorded, with rank and security", () => {
@@ -1705,7 +1835,7 @@ describe("applyEvent", () => {
 			{ prompt: "Second", model: null, rank: 2, security: null },
 		]);
 		// Retro semantics keep the first valid call as the proposal.
-		expect(s.proposed).toEqual({ prompt: "First", model: null });
+		expect(s.proposed).toEqual({ prompt: "First", model: null, summary: null });
 	});
 
 	test("a bad rank, a fractional rank, and an unknown security fall back to null", () => {

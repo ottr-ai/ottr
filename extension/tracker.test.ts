@@ -467,11 +467,16 @@ describe("propose_task tool", () => {
 		expect(tool?.loadMode).toBe("essential");
 	});
 
-	test("declares exactly prompt and model", () => {
+	test("declares exactly prompt, model and the five summary fields", () => {
 		process.env.OTTR_RETRO = "1";
 		expect(Object.keys(fakePi().propose_task?.parameters ?? {})).toEqual([
 			"prompt",
 			"model",
+			"whatChanges",
+			"why",
+			"gain",
+			"risk",
+			"check",
 		]);
 	});
 
@@ -490,7 +495,26 @@ describe("propose_task tool", () => {
 		}
 	});
 
-	test("resolves locally once, then refuses the second call; create_task untouched", async () => {
+	test("rejects non-string, blank and over-400 summary fields", async () => {
+		process.env.OTTR_RETRO = "1";
+		const tools = fakePi();
+		const bad: Record<string, unknown>[] = [
+			{ prompt: "p", whatChanges: 7 },
+			{ prompt: "p", whatChanges: "   " },
+			{ prompt: "p", why: "x".repeat(401) },
+			{ prompt: "p", gain: "" },
+			{ prompt: "p", risk: {} },
+			{ prompt: "p", check: "x".repeat(401) },
+		];
+		for (const params of bad) {
+			const out = await tools.propose_task!.execute("t1", params);
+			expect(text(out)).toMatch(
+				/^Error: (whatChanges|why|gain|risk|check) must be a string of 1-400 characters \(trimmed\) when given\.$/,
+			);
+		}
+	});
+
+	test("accepts all five summary fields and resolves locally once, then refuses the second call; create_task untouched", async () => {
 		process.env.OTTR_RETRO = "1";
 		let fetched = false;
 		globalThis.fetch = (async () => {
@@ -500,6 +524,11 @@ describe("propose_task tool", () => {
 		const tools = fakePi();
 		const out = await tools.propose_task!.execute("t1", {
 			prompt: "  improve the thing  ",
+			whatChanges: "edit prompts.ts",
+			why: "OTTR-1 duplicated text",
+			gain: "200 characters per card",
+			risk: "none found",
+			check: "bun test",
 		});
 		expect(text(out)).toBe(
 			"Recorded. Ottr files it as a held card when this retro ends.",

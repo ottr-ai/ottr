@@ -36,6 +36,22 @@ interface AskOption {
 	description?: string;
 }
 
+/** The five decision facts a retro proposal carries next to its prompt; the drawer's
+ * decision panel renders them as fixed labels. Absent on proposals filed before the
+ * panel existed (the drawer falls back to the prompt's first paragraph). */
+export interface ProposalSummary {
+	/** The file or setting and the edit, in one sentence. */
+	whatChanges: string;
+	/** The cause and the evidence, with the card ids. */
+	why: string;
+	/** The measured or estimated time or cost the change saves. */
+	gain: string;
+	/** What can break, or "none found". */
+	risk: string;
+	/** How the result is verified. */
+	check: string;
+}
+
 /** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer buttons. */
 export interface AskQuestion {
 	question: string;
@@ -271,6 +287,9 @@ export interface Task {
 	state: RunState;
 	/** Why the task needs you (shown with the "!" badge). */
 	needsReason: string | null;
+	/** Retro proposals only: the five decision facts the propose_task call carried; null on
+	 * older proposals (the drawer falls back to the prompt's first paragraph). */
+	proposalSummary: ProposalSummary | null;
 	/** Reply text waiting to be sent with the next turn. */
 	pendingPrompt: string | null;
 	/** Who authored pendingPrompt: "user" (steer/reply routes) or "supervisor" (tracker-parked:
@@ -453,8 +472,13 @@ export interface RunResult {
 	outcome: Outcome | null;
 	/** The agent's outstanding `ask` call (last one seen), or null. */
 	asked: AskQuestion[] | null;
-	/** A retro run's first valid `propose_task` call (proposal held for approval), or null. */
-	proposed: { prompt: string; model: string | null } | null;
+	/** A retro run's first valid `propose_task` call (proposal held for approval), or null.
+	 * summary holds the five decision fields the call carried, or null when it sent none. */
+	proposed: {
+		prompt: string;
+		model: string | null;
+		summary: ProposalSummary | null;
+	} | null;
 	/** Every valid `propose_task` call of the run, in order: a retro records at most one (the
 	 * extension refuses a second), a review records one per finding. */
 	recorded: RecordedFinding[];

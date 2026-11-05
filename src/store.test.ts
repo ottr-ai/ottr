@@ -691,6 +691,80 @@ describe("diff capture columns", () => {
 	});
 });
 
+describe("proposal summary column", () => {
+	test("stores the five fields and survives a reopen; fresh rows default null", () => {
+		const store = open(join(root, "proposal-summary"));
+		const task = store.createTask("held proposal");
+		expect(task.proposalSummary).toBeNull();
+		store.updateTask(task.id, {
+			proposalSummary: {
+				whatChanges: "Add a benchmark script for the merge path.",
+				why: "Merge turns re-run the same slow path on every retro.",
+				gain: "About 30 seconds per retro run.",
+				risk: "none found",
+				check: "bun test src/merge-bench.test.ts passes.",
+			},
+		});
+		const stored = store.getTask(task.id);
+		expect(stored?.proposalSummary).toEqual({
+			whatChanges: "Add a benchmark script for the merge path.",
+			why: "Merge turns re-run the same slow path on every retro.",
+			gain: "About 30 seconds per retro run.",
+			risk: "none found",
+			check: "bun test src/merge-bench.test.ts passes.",
+		});
+		store.close();
+		const reopened = open(join(root, "proposal-summary"));
+		expect(reopened.getTask(task.id)?.proposalSummary?.gain).toBe(
+			"About 30 seconds per retro run.",
+		);
+		reopened.close();
+	});
+
+	test("invalid or wrong-shaped proposal_summary JSON reads as null", () => {
+		const store = open(join(root, "proposal-summary-corrupt"));
+		const task = store.createTask("corrupt summary");
+		// Not JSON.
+		store.updateTask(task.id, { proposalSummary: "not json" as never });
+		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
+		// JSON but a wrong shape: a missing field drops the whole summary.
+		store.updateTask(task.id, {
+			proposalSummary: { whatChanges: "x", why: "y", gain: "z" } as never,
+		});
+		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
+		// An empty string field also drops the whole summary.
+		store.updateTask(task.id, {
+			proposalSummary: {
+				whatChanges: "x",
+				why: "y",
+				gain: "",
+				risk: "none found",
+				check: "c",
+			} as never,
+		});
+		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
+		store.close();
+	});
+
+	test("a legacy database without the column converges on open and reads null", () => {
+		const dir = join(root, "proposal-summary-legacy");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		// Schema as it was before the proposal summary existed (pre-feature done card).
+		db.exec(
+			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]', shots TEXT NOT NULL DEFAULT '[]', release_version TEXT, release_notes TEXT, session_title TEXT, asked TEXT, model TEXT, kept_files TEXT NOT NULL DEFAULT '[]', follow_up_of TEXT, commits INTEGER, done_at INTEGER, push_sha TEXT, report TEXT, research INTEGER NOT NULL DEFAULT 0, update_ids TEXT NOT NULL DEFAULT '[]', update_merge_approved INTEGER NOT NULL DEFAULT 0, topic TEXT, depends_on TEXT NOT NULL DEFAULT '[]')",
+		);
+		db.exec(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('abc12345', 'old', 'p', 'done', 'idle', 1, 1)",
+		);
+		db.close();
+		const store = open(dir);
+		const task = store.getTask("abc12345");
+		expect(task?.proposalSummary).toBeNull();
+		store.close();
+	});
+});
+
 describe("speaker attribution", () => {
 	test("pendingBy and turn inputBy persist across a reopen; legacy rows read as null", () => {
 		const dir = join(root, "pending-by");

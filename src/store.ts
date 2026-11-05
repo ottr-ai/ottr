@@ -41,6 +41,7 @@ import type {
 	ForkBranchState,
 	OutcomeStatus,
 	ProjectSettings,
+	ProposalSummary,
 	PrReviewRow,
 	PrState,
 	RunState,
@@ -268,6 +269,7 @@ interface TaskRow {
 	priority: string | null;
 	close_candidate: string | null;
 	hold_until: number | null;
+	proposal_summary: string | null;
 	kind: string;
 }
 
@@ -413,6 +415,7 @@ function toTask(project: string, r: TaskRow): Task {
 		closeCandidate: r.close_candidate,
 		kind: r.kind as TaskKind,
 		holdUntil: r.hold_until,
+		proposalSummary: parseProposalSummary(r.proposal_summary),
 	};
 }
 
@@ -437,6 +440,36 @@ function parseDiffFiles(raw: string | null): DiffFileStat[] | null {
 			});
 		}
 		return files;
+	} catch {
+		return null;
+	}
+}
+
+/** Parses the stored proposal-summary JSON; null when absent. A wrong-shaped entry drops the
+ * whole summary: the drawer's decision panel needs all five fields to render. Never throws. */
+function parseProposalSummary(raw: string | null): ProposalSummary | null {
+	if (raw === null) return null;
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (typeof value !== "object" || value === null) return null;
+		const { whatChanges, why, gain, risk, check } = value as Record<
+			string,
+			unknown
+		>;
+		if (
+			typeof whatChanges !== "string" ||
+			!whatChanges ||
+			typeof why !== "string" ||
+			!why ||
+			typeof gain !== "string" ||
+			!gain ||
+			typeof risk !== "string" ||
+			!risk ||
+			typeof check !== "string" ||
+			!check
+		)
+			return null;
+		return { whatChanges, why, gain, risk, check };
 	} catch {
 		return null;
 	}
@@ -606,6 +639,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	priority: "priority",
 	closeCandidate: "close_candidate",
 	holdUntil: "hold_until",
+	proposalSummary: "proposal_summary",
 };
 
 const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
@@ -1313,6 +1347,10 @@ export class ProjectStore {
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
 			);
+		// OTTR-528: the decision panel's five fields, nullable JSON, ALTER-only after the
+		// rebuilds like the columns above.
+		if (!cols.includes("proposal_summary"))
+			db.exec("ALTER TABLE tasks ADD COLUMN proposal_summary TEXT");
 		// Proposal reasons written before the 2026-11 wording fix double the kind label
 		// ("the retro of Retro of …", "the fork research Fork research: …") and describe
 		// the actions without naming the drawer buttons. replace() with the exact
@@ -2022,6 +2060,7 @@ export class ProjectStore {
 			if (value !== undefined) {
 				sets.push(`${TASK_COLUMNS[key]} = ?`);
 				// ponytail: Array.isArray covers exactly the JSON array columns (images, pendingImages, shots, asked, keptFiles); more need a column->serializer map
+				// A plain object (proposalSummary) serializes too; null and the scalars pass through.
 				values.push(
 					Array.isArray(value)
 						? JSON.stringify(value)
@@ -2029,7 +2068,9 @@ export class ProjectStore {
 							? value
 								? 1
 								: 0
-							: (value as string | number | null),
+							: value !== null && typeof value === "object"
+								? JSON.stringify(value)
+								: (value as string | number | null),
 				);
 			}
 		}

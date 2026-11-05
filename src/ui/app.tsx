@@ -76,6 +76,7 @@ import {
 	type Act,
 	BAND_LIMIT,
 	BusyButton,
+	type BusyState,
 	CloseButton,
 	clamp,
 	confirmDialog,
@@ -840,6 +841,26 @@ function Card({
 						))}
 				</span>
 			)}
+			{/* A proposal card gets a Decide chip beside the card tags: it opens the drawer,
+			    where the decision panel sits on top. Same click rules as the hold-link chips. */}
+			{task.state === "needs_you" &&
+				task.cancelledAt === null &&
+				isProposalReason(task.needsReason) && (
+					<span className="card-tags">
+						<button
+							type="button"
+							className="decide-link"
+							title="Accept, edit or cancel this proposal"
+							onClick={(e) => {
+								// The card body is a stretched open link: keep the click off it.
+								e.stopPropagation();
+								onOpen();
+							}}
+						>
+							Decide
+						</button>
+					</span>
+				)}
 		</div>
 	);
 }
@@ -6805,6 +6826,231 @@ function ProposalReasonLink({
 	);
 }
 
+/** Card ids inside a proposal's Why line render as card links, same-project first, else any
+ * project; an id the board no longer lists stays plain text — mirror ProposalReasonLink. */
+function CardIdLinks({
+	text,
+	selfProject,
+	tasks,
+	onOpenTask,
+}: {
+	text: string;
+	selfProject: string;
+	tasks: TaskCard[];
+	onOpenTask: (id: string) => void;
+}) {
+	const parts: ReactNode[] = [];
+	const re = /\b[A-Z]{1,4}-\d+\b/g;
+	let last = 0;
+	for (const m of text.matchAll(re)) {
+		if (m.index > last) parts.push(text.slice(last, m.index));
+		const id = m[0];
+		const linked =
+			tasks.find((t) => t.id === id && t.project === selfProject) ??
+			tasks.find((t) => t.id === id) ??
+			null;
+		parts.push(
+			linked === null ? (
+				id
+			) : (
+				<a
+					key={`${id}-${m.index}`}
+					className="reason-card-link"
+					href={taskPath(linked.project, linked.id)}
+					title={linked.sessionTitle ?? linked.title}
+					onClick={(e) => navClick(e, () => onOpenTask(linked.id))}
+				>
+					{id}
+				</a>
+			),
+		);
+		last = m.index + id.length;
+	}
+	parts.push(text.slice(last));
+	return <>{parts}</>;
+}
+
+/** The prompt editor form, shared by the panel on a proposal card and the Prompt section on
+ * an ordinary unstarted card: same ids and handlers either way, and never both at once. */
+function PromptEditForm({
+	edit,
+	onEdit,
+	editValid,
+	editSave,
+	onSave,
+}: {
+	edit: string;
+	onEdit: (value: string | null) => void;
+	editValid: boolean;
+	editSave: BusyState;
+	onSave: () => void;
+}) {
+	return (
+		<form
+			className="reply-form"
+			onSubmit={(e) => {
+				e.preventDefault();
+				onSave();
+			}}
+		>
+			<label htmlFor="edit-text">Task</label>
+			<textarea
+				id="edit-text"
+				rows={6}
+				value={edit}
+				onChange={(e) => onEdit(e.target.value)}
+				placeholder="What should the agent do?"
+			/>
+			<div className="reply-actions">
+				<button type="button" onClick={() => onEdit(null)}>
+					Cancel
+				</button>
+				<button
+					type="submit"
+					className={"primary" + (editSave.failed ? " failed" : "")}
+					disabled={!editValid || editSave.busy}
+					aria-busy={editSave.busy || undefined}
+				>
+					{editSave.busy && <span className="spinner" aria-hidden="true" />}
+					<Icon name="send" />
+					Save
+				</button>
+			</div>
+		</form>
+	);
+}
+
+/** The decision panel of a proposal card: the reason line, the stored five-line summary
+ * (or the prompt's first paragraph for older and fork proposals), the three decision
+ * buttons and the collapsed full prompt. The panel replaces the needs-reason box and the
+ * Prompt section, which stay hidden on proposal cards. */
+function ProposalPanel({
+	task,
+	selfProject,
+	tasks,
+	onOpenTask,
+	editOpen,
+	editGuardTitle,
+	edit,
+	onAccept,
+	onEdit,
+	onCancel,
+	onEditChange,
+	editValid,
+	editSave,
+	onSaveEdit,
+}: {
+	task: TaskView;
+	selfProject: string;
+	tasks: TaskCard[];
+	onOpenTask: (id: string) => void;
+	editOpen: boolean;
+	editGuardTitle: string;
+	edit: string | null;
+	onAccept: () => Promise<boolean>;
+	onEdit: () => void;
+	onCancel: () => Promise<boolean>;
+	onEditChange: (value: string | null) => void;
+	editValid: boolean;
+	editSave: BusyState;
+	onSaveEdit: () => void;
+}) {
+	// Older proposals and partial fixtures carry no summary: undefined reads as the fallback.
+	const s = task.proposalSummary ?? null;
+	return (
+		<>
+			<div className="decide-reason">
+				<ProposalReasonLink
+					reason={task.needsReason ?? ""}
+					selfProject={selfProject}
+					tasks={tasks}
+					onOpenTask={onOpenTask}
+				/>
+			</div>
+			{s !== null ? (
+				<dl className="decide-facts">
+					<div>
+						<dt>What changes</dt>
+						<dd>{s.whatChanges}</dd>
+					</div>
+					<div>
+						<dt>Why</dt>
+						<dd>
+							<CardIdLinks
+								text={s.why}
+								selfProject={selfProject}
+								tasks={tasks}
+								onOpenTask={onOpenTask}
+							/>
+						</dd>
+					</div>
+					<div>
+						<dt>Gain</dt>
+						<dd>{s.gain}</dd>
+					</div>
+					<div>
+						<dt>Risk</dt>
+						<dd>{s.risk}</dd>
+					</div>
+					<div>
+						<dt>Check</dt>
+						<dd>{s.check}</dd>
+					</div>
+				</dl>
+			) : (
+				// First paragraph of the prompt, one line per row: the prompt's single-newline
+				// sections (Why:, Change:, …) keep their run-in labels readable.
+				<div className="decide-fallback">
+					{(task.prompt.split(/\n{2}/)[0] ?? "").split("\n").map((line) => (
+						<div key={line}>{line}</div>
+					))}
+				</div>
+			)}
+			<div className="decide-actions">
+				<BusyButton
+					className="primary"
+					title={editOpen ? editGuardTitle : "Start the proposed task"}
+					disabled={editOpen}
+					run={onAccept}
+				>
+					Accept
+				</BusyButton>
+				<button
+					type="button"
+					title={editOpen ? editGuardTitle : "Edit the task text"}
+					disabled={editOpen}
+					onClick={onEdit}
+				>
+					Edit
+				</button>
+				<BusyButton
+					className="danger"
+					title="Decline this proposal"
+					run={onCancel}
+				>
+					Cancel
+				</BusyButton>
+			</div>
+			{edit !== null ? (
+				<PromptEditForm
+					edit={edit}
+					onEdit={onEditChange}
+					editValid={editValid}
+					editSave={editSave}
+					onSave={onSaveEdit}
+				/>
+			) : (
+				<details className="decide-prompt">
+					<summary>Full prompt</summary>
+					<div className="prompt-text">
+						<Markdown text={task.prompt} />
+					</div>
+				</details>
+			)}
+		</>
+	);
+}
+
 /** Where the card ran, for the Meta row: the newest work turn that recorded it, else the newest
  * turn of any kind (a merge-only history), else null — the row shows "-". The string names the
  * worker or the board plus the docker container hostname the run executed in. */
@@ -7106,6 +7352,18 @@ export function Drawer({
 	// once the started turn makes the card uneditable.
 	const editOpen = edit !== null;
 	const editGuardTitle = "Save or cancel the prompt edit first";
+	const editSubmit = (): void => {
+		if (edit === null || !editValid) return;
+		editSave.start(() =>
+			act(async () => {
+				await post(
+					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`,
+					{ prompt: edit },
+				);
+				setEdit(null);
+			}),
+		);
+	};
 	// And the server holds the card off for exactly as long as the editor is open: the open
 	// editor claims PROMPT_EDIT_HELD and no renewal runs — hidden tabs throttle timers (a
 	// background beat can silently stop arriving mid-edit), so nothing depends on one. Every
@@ -7404,6 +7662,28 @@ export function Drawer({
 							)}
 						</p>
 					</header>
+					{/* The decision panel leads the drawer body on a proposal card; the needs-reason
+					    box and the Prompt section below stay hidden because the panel carries both. */}
+					{proposal && task.state === "needs_you" && !cancelled && (
+						<DrawerSec id="drawer-decide" label="Decide">
+							<ProposalPanel
+								task={task}
+								selfProject={row.project}
+								tasks={tasks}
+								onOpenTask={onOpenTask}
+								editOpen={editOpen}
+								editGuardTitle={editGuardTitle}
+								edit={edit}
+								onAccept={() => sendReply(".")}
+								onEdit={() => setEdit(task.prompt)}
+								onCancel={runCancel}
+								onEditChange={setEdit}
+								editValid={editValid}
+								editSave={editSave}
+								onSaveEdit={editSubmit}
+							/>
+						</DrawerSec>
+					)}
 					{mut !== null && (
 						<DrawerSec id="drawer-mut" label="Mutation run">
 							<div className="mut-run">
@@ -7564,7 +7844,7 @@ export function Drawer({
 					)}
 					{/* A live ask round hides its reason: the runner echoes the first question into
 					    it, and the ask panel above already carries the full questions. */}
-					{task.needsReason !== null && !askedNow && (
+					{task.needsReason !== null && !askedNow && !proposal && (
 						<div className="needs-reason">
 							<ProposalReasonLink
 								reason={task.needsReason}
@@ -7762,14 +8042,14 @@ export function Drawer({
 								</form>
 							</section>
 						))}
-					{!editable && (
+					{!editable && !proposal && (
 						<DrawerSec id="drawer-prompt" label="Prompt">
 							<div className="prompt-text">
 								<Markdown text={task.prompt} />
 							</div>
 						</DrawerSec>
 					)}
-					{editable && edit === null && (
+					{!proposal && editable && edit === null && (
 						<DrawerSec id="drawer-prompt" label="Prompt">
 							<div className="task-prompt">
 								<Markdown text={task.prompt} />
@@ -7780,49 +8060,14 @@ export function Drawer({
 							</div>
 						</DrawerSec>
 					)}
-					{editable && edit !== null && (
-						<form
-							className="reply-form"
-							onSubmit={(e) => {
-								e.preventDefault();
-								if (edit === null || !editValid) return;
-								editSave.start(() =>
-									act(async () => {
-										await post(
-											`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`,
-											{ prompt: edit },
-										);
-										setEdit(null);
-									}),
-								);
-							}}
-						>
-							<label htmlFor="edit-text">Task</label>
-							<textarea
-								id="edit-text"
-								rows={6}
-								value={edit}
-								onChange={(e) => setEdit(e.target.value)}
-								placeholder="What should the agent do?"
-							/>
-							<div className="reply-actions">
-								<button type="button" onClick={() => setEdit(null)}>
-									Cancel
-								</button>
-								<button
-									type="submit"
-									className={"primary" + (editSave.failed ? " failed" : "")}
-									disabled={!editValid || editSave.busy}
-									aria-busy={editSave.busy || undefined}
-								>
-									{editSave.busy && (
-										<span className="spinner" aria-hidden="true" />
-									)}
-									<Icon name="send" />
-									Save
-								</button>
-							</div>
-						</form>
+					{!proposal && editable && edit !== null && (
+						<PromptEditForm
+							edit={edit}
+							onEdit={setEdit}
+							editValid={editValid}
+							editSave={editSave}
+							onSave={editSubmit}
+						/>
 					)}
 					{(task.images.length > 0 || task.pendingImages.length > 0) && (
 						<div className="thumbs">

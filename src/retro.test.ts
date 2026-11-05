@@ -40,6 +40,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 	seq += 1;
 	return {
 		id: `t${seq}`,
+		proposalSummary: null,
 		kind: p.kind ?? "work",
 		project: "proj",
 		title: `task ${seq}`,

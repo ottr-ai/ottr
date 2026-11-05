@@ -42,6 +42,11 @@ interface CreateTaskParams {
 	project?: unknown;
 	rank?: unknown;
 	security?: unknown;
+	whatChanges?: unknown;
+	why?: unknown;
+	gain?: unknown;
+	risk?: unknown;
+	check?: unknown;
 }
 interface Pi {
 	zod: ZodBuilder;
@@ -139,6 +144,20 @@ function proposeValidationError(
 	const model = typeof params.model === "string" ? params.model.trim() : "";
 	if (params.model !== undefined && model === "") {
 		return "Error: model must be a non-empty string when given.";
+	}
+	const summaryFields = [
+		"whatChanges",
+		"why",
+		"gain",
+		"risk",
+		"check",
+	] as const;
+	for (const field of summaryFields) {
+		if (params[field] === undefined) continue;
+		const value = typeof params[field] === "string" ? params[field].trim() : "";
+		if (value === "" || value.length > 400) {
+			return `Error: ${field} must be a string of 1-400 characters (trimmed) when given.`;
+		}
 	}
 	if (
 		reviewMode &&
@@ -568,7 +587,7 @@ export default function (pi: Pi) {
 			name: "propose_task",
 			label: "Propose task",
 			description: retroMode
-				? "Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task."
+				? "Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified."
 				: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out.',
 			parameters: z.object(
 				retroMode
@@ -582,6 +601,30 @@ export default function (pi: Pi) {
 								.string()
 								.optional()
 								.describe("Model override for the task (provider/model)"),
+							whatChanges: z
+								.string()
+								.optional()
+								.describe(
+									"The file or setting and the edit, in one sentence (1-400 characters)",
+								),
+							why: z
+								.string()
+								.optional()
+								.describe(
+									"The cause and the evidence, with the card ids (1-400 characters)",
+								),
+							gain: z
+								.string()
+								.optional()
+								.describe("The saving in concrete units (1-400 characters)"),
+							risk: z
+								.string()
+								.optional()
+								.describe('What can break, or "none found" (1-400 characters)'),
+							check: z
+								.string()
+								.optional()
+								.describe("How the result is verified (1-400 characters)"),
 						}
 					: {
 							prompt: z

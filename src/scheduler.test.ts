@@ -159,6 +159,7 @@ function task(p: Partial<Task> = {}): Task {
 		project: "proj",
 		title: `task ${seq}`,
 		prompt: `prompt ${seq}`,
+		proposalSummary: null,
 		stage: "todo",
 		state: "queued",
 		needsReason: null,

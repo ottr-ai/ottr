@@ -2721,6 +2721,26 @@ a.release:hover {
 	color: var(--accent);
 	border-color: var(--accent);
 }
+/* Decide chip on a proposal card: the same chip voice as hold-link, but steel text so it
+   reads as the card's one interactive edge; the click opens the drawer's decision panel. */
+.card-tags .decide-link {
+	pointer-events: auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--accent);
+	background: none;
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	cursor: pointer;
+}
+.card-tags .decide-link:hover {
+	color: var(--accent-hover);
+	border-color: var(--accent);
+}
 /* Inbox badge: a done card with something to read whose drawer never opened; opening clears it (a steps report only its drawer buttons clear). */
 .card .unread {
 	flex-shrink: 0;
@@ -5800,7 +5820,8 @@ button.diff-path {
 .kept-actions {
 	margin-top: 10px;
 }
-.needs-reason {
+.needs-reason,
+.decide-reason {
 	display: flex;
 	gap: 8px;
 	margin: 8px 0;
@@ -5811,7 +5832,8 @@ button.diff-path {
 	border-radius: 4px;
 	overflow-wrap: anywhere;
 }
-.needs-reason::before {
+.needs-reason::before,
+.decide-reason::before {
 	content: "";
 	flex: none;
 	width: 13px;
@@ -5822,14 +5844,76 @@ button.diff-path {
 }
 /* The source card id inside a proposal reason: a real link, underlined so it reads
    as one; the accent carries the hover and focus states. */
-.needs-reason a {
+.needs-reason a,
+.decide-reason a {
 	color: var(--accent);
 	text-decoration: underline;
 	text-underline-offset: 2px;
 }
 .needs-reason a:hover,
-.needs-reason a:focus-visible {
+.needs-reason a:focus-visible,
+.decide-reason a:hover,
+.decide-reason a:focus-visible {
 	color: var(--accent-hover);
+}
+/* The proposal card's decision panel: .decide-reason shares the amber box above; the five
+   summary rows sit in a compact two-column grid (labels dim, values bright, per the
+   values-read-first rule), stacking to one column under 720px so the panel fits without
+   scrolling at phone widths. */
+.decide-facts {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: 2px 14px;
+	margin: 10px 0 0;
+}
+.decide-facts > div {
+	display: contents;
+}
+.decide-facts dt {
+	color: var(--dim);
+}
+.decide-facts dd {
+	margin: 0;
+	min-width: 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.decide-fallback {
+	margin: 10px 0 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.decide-fallback > div + div {
+	margin-top: 3px;
+}
+.decide-actions {
+	display: flex;
+	gap: 8px;
+	margin: 10px 0 0;
+}
+.decide-prompt {
+	margin: 10px 0 0;
+}
+.decide-prompt summary {
+	color: var(--dim);
+	cursor: pointer;
+}
+.decide-prompt summary:hover {
+	color: var(--text-strong);
+}
+.decide-prompt .prompt-text {
+	margin: 6px 0 0;
+}
+@media (max-width: 720px) {
+	.decide-facts {
+		grid-template-columns: 1fr;
+	}
+	.decide-facts dt {
+		margin-top: 4px;
+	}
+	.decide-actions {
+		flex-wrap: wrap;
+	}
 }
 /* An ask echo is a question, not a stall: the ask panel's hairline box and the steel
    question mark in markup replace the amber fill and triangle (::before). */

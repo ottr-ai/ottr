@@ -138,6 +138,7 @@ import {
 	BOARD_CHECK_PROMPT,
 	followUpPrompt,
 	handoffMarkdown,
+	isProposalReason,
 	LOST_SESSION,
 	releasePrompt,
 	reviewPrompt,
@@ -5480,15 +5481,19 @@ export function createApp(deps: AppDeps) {
 					if (!trimmed || trimmed.length > 20000)
 						return json({ error: "prompt must be 1-20000 characters" }, 400);
 					// Editable only while the card still waits unclaimed: a todo card as queued, a
-					// backlog card parked idle. A preparing claim has already consumed the prompt
-					// (its turn row only appears at startRun, after the git and worktree
-					// preparation), so a rewrite there would never reach the run. The check and the
-					// write are sync, so the scheduler (same event loop) cannot start a turn in
-					// between.
+					// backlog card parked idle, or a held proposal parked needs_you (its drawer
+					// edits the prompt before the user accepts). A preparing claim has already
+					// consumed the prompt (its turn row only appears at startRun, after the git and
+					// worktree preparation), so a rewrite there would never reach the run. The check
+					// and the write are sync, so the scheduler (same event loop) cannot start a turn
+					// in between.
 					if (
 						!(
 							(task.stage === "todo" && task.state === "queued") ||
-							(task.stage === "backlog" && task.state === "idle")
+							(task.stage === "backlog" && task.state === "idle") ||
+							(task.stage === "todo" &&
+								task.state === "needs_you" &&
+								isProposalReason(task.needsReason))
 						) ||
 						task.cancelledAt !== null ||
 						e.store.listTurns(task.id).length > 0
@@ -5516,13 +5521,16 @@ export function createApp(deps: AppDeps) {
 					const found = resolveTask(req.params.project, req.params.id);
 					if (found instanceof Response) return found;
 					const { e, task } = found;
-					// Same rule as /edit: only a queued todo card or a parked backlog card has a
-					// prompt worth guarding — and a hold on a started card could stall a later
-					// reply turn.
+					// Same rule as /edit: only a queued todo card, a parked backlog card, or a held
+					// proposal parked needs_you has a prompt worth guarding — and a hold on a started
+					// card could stall a later reply turn.
 					if (
 						!(
 							(task.stage === "todo" && task.state === "queued") ||
-							(task.stage === "backlog" && task.state === "idle")
+							(task.stage === "backlog" && task.state === "idle") ||
+							(task.stage === "todo" &&
+								task.state === "needs_you" &&
+								isProposalReason(task.needsReason))
 						) ||
 						task.cancelledAt !== null ||
 						e.store.listTurns(task.id).length > 0

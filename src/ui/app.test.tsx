@@ -7,6 +7,7 @@ import type {
 	PerfMetrics,
 	PerfStat,
 	ProjectView,
+	ProposalSummary,
 	Task,
 	TaskCard,
 	TaskView,
@@ -4187,6 +4188,329 @@ describe("OrphanNotice actions", () => {
 				unmount();
 			});
 			container.remove();
+		}
+	});
+});
+
+describe("Drawer proposal decision panel", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	const reason =
+		"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
+	const summary: ProposalSummary = {
+		whatChanges: "Rework the proposal reason wording",
+		why: "Duplicated text on OTTR-404, and ZZZ-9 never existed",
+		gain: "One line less on every proposal card",
+		risk: "none found",
+		check: "bun test passes",
+	};
+
+	test("a summary proposal renders the five labeled lines and links the known Why card id", () => {
+		const source = cardFixture({
+			id: "OTTR-404",
+			title: "Add the summary fields",
+			sessionTitle: "Add the summary fields",
+			stage: "done",
+			state: "idle",
+		});
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "Rework the wording\n\nsecond paragraph",
+			proposalSummary: summary,
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={task} tasks={[source]} />,
+		);
+		expect(html).toContain('id="drawer-decide"');
+		expect(html).toContain("<dt>What changes</dt>");
+		expect(html).toContain("<dt>Why</dt>");
+		expect(html).toContain("<dt>Gain</dt>");
+		expect(html).toContain("<dt>Risk</dt>");
+		expect(html).toContain("<dt>Check</dt>");
+		expect(html).toContain("Rework the proposal reason wording");
+		expect(html).toContain("One line less on every proposal card");
+		// The known id renders as a link to its card; the unknown one stays text.
+		expect(html).toContain('href="/projects/proj/tasks/OTTR-404"');
+		expect(html).not.toContain("tasks/ZZZ-9");
+		expect(html).toContain("ZZZ-9 never existed");
+	});
+
+	test("a proposal without a summary shows the prompt's first paragraph, no five labels", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "First paragraph only\n\nSecond paragraph",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-decide"');
+		expect(html).toContain("First paragraph only");
+		expect(html).toContain('class="decide-fallback"');
+		expect(html).not.toContain("<dt>What changes</dt>");
+		expect(html).not.toContain("<dt>Why</dt>");
+		expect(html).not.toContain("<dt>Gain</dt>");
+		expect(html).not.toContain("<dt>Risk</dt>");
+		expect(html).not.toContain("<dt>Check</dt>");
+		// The full prompt stays available under the collapsed section.
+		expect(html).toContain("Second paragraph");
+	});
+
+	test("the panel carries Accept, Edit, Cancel and the collapsed full prompt", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "Rework the wording",
+			proposalSummary: summary,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		// Accept is the primary action; Edit and Cancel render beside it.
+		expect(html).toContain('class="primary"');
+		expect(html).toContain('title="Start the proposed task"');
+		expect(html).toContain('title="Edit the task text"');
+		expect(html).toContain('title="Decline this proposal"');
+		// The full prompt sits collapsed under a visible summary.
+		expect(html).toContain("<summary>Full prompt</summary>");
+		// The panel replaces the standalone prompt section and the needs-reason box.
+		expect(html).not.toContain('id="drawer-prompt"');
+		expect(html).not.toContain('class="needs-reason"');
+		// Real buttons, Tab reachable, visible text as the accessible name.
+		expect(html).toContain(">Accept</button>");
+		expect(html).toContain(">Edit</button>");
+		expect(html).toContain(">Cancel</button>");
+		// The three panel buttons carry no tabindex: keyboard order follows document order.
+		// The drawer dialog itself sets tabindex="-1" as its focus target, so scope to the
+		// buttons' own tags.
+		for (const title of [
+			"Start the proposed task",
+			"Edit the task text",
+			"Decline this proposal",
+		]) {
+			const tag = new RegExp(`<button[^>]*title="${title}"[^>]*>`).exec(
+				html,
+			)?.[0];
+			expect(tag).toBeDefined();
+			expect(tag).not.toContain("tabindex");
+		}
+	});
+
+	test("a plain needs_you card keeps the needs-reason box and the prompt section, no panel", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain('id="drawer-decide"');
+		expect(html).not.toContain(">Decide</button>");
+		expect(html).toContain('class="needs-reason"');
+		expect(html).toContain('id="drawer-prompt"');
+	});
+
+	test("a proposal card on the board shows the Decide chip; an ordinary needs_you card does not", () => {
+		const laneBase = {
+			projectTasks: [] as TaskCard[],
+			groups: null,
+			collapsed: {},
+			onToggle: () => {},
+			hasRules: true,
+			github: null,
+			deltas: new Map<string, number>(),
+			open: () => {},
+			unread: () => false,
+			onReorder: async () => {},
+			filtering: false,
+			draining: false,
+		} as const;
+		const proposal = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+		});
+		const plain = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+		});
+		const withProposal = renderToStaticMarkup(
+			<LaneCol {...laneBase} stage="todo" tasks={[proposal]} />,
+		);
+		expect(withProposal).toContain('class="decide-link"');
+		expect(withProposal).toContain(">Decide</button>");
+		expect(withProposal).toContain(
+			'title="Accept, edit or cancel this proposal"',
+		);
+		const withPlain = renderToStaticMarkup(
+			<LaneCol {...laneBase} stage="todo" tasks={[plain]} />,
+		);
+		expect(withPlain).not.toContain("decide-link");
+	});
+});
+
+describe("Drawer proposal panel editing (client)", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of Object.entries(originals)) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	// happy-dom's dispatched clicks never reach React's event plugin: call the
+	// production onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	test("the panel's Edit opens exactly one prompt editor for the proposal", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const reason =
+			"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
+		const task = cardFixture({
+			kind: "work",
+			research: false,
+			report: null,
+			details: null,
+			branch: null,
+			model: null,
+			worktree: null,
+			sessionId: null,
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			workCheckLog: [],
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "Rework the wording",
+		} as unknown as Partial<TaskCard> & Partial<Pick<Task, "report">>);
+		const panelEdit = (): Element => {
+			const node = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent?.trim() === "Edit",
+			);
+			if (node === undefined) throw new Error("no panel Edit button");
+			return node;
+		};
+		try {
+			const base = {
+				project: {
+					name: "proj",
+					github: null,
+					hasRules: true,
+					sessionsDir: "/tmp/proj/.tasks/sessions",
+					settings: {},
+				} as unknown as ProjectView,
+				act: async () => true,
+				onClose: () => {},
+				onFollowed: () => {},
+				read: true,
+				onMarkUnread: () => {},
+				onMarkSeen: () => {},
+				tasks: [],
+				onOpenTask: () => {},
+				draining: false,
+				usedTotal: 0,
+				maxTotal: null,
+			};
+			await act(async () => {
+				root.render(<Drawer {...base} task={task} />);
+			});
+			await act(async () => {
+				onClickOf(panelEdit())({});
+			});
+			// One editor with the proposal's prompt, and no duplicate edit-text id.
+			const editors = container.querySelectorAll("#edit-text");
+			expect(editors.length).toBe(1);
+			expect((editors[0] as unknown as HTMLTextAreaElement).value).toBe(
+				"Rework the wording",
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
 		}
 	});
 });

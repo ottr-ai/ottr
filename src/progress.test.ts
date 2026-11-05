@@ -8,6 +8,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		project,
 		title: "",
 		prompt: "",
+		proposalSummary: null,
 		kind: "work",
 		stage: "done",
 		state: "idle",

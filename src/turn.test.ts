@@ -73,6 +73,7 @@ import {
 } from "./turn.ts";
 import type {
 	Outcome,
+	ProposalSummary,
 	RecordedFinding,
 	RunResult,
 	WorkCheckRun,
@@ -124,7 +125,11 @@ interface Recorded {
 	notifyLog: [string, string][];
 	killed: boolean;
 	/** The fake run resolves `done` with this proposal (a retro run's propose_task). */
-	proposal: { prompt: string; model: string | null } | null;
+	proposal: {
+		prompt: string;
+		model: string | null;
+		summary: ProposalSummary | null;
+	} | null;
 	/** The fake run resolves `done` with these findings (a review run's propose_task calls). */
 	recorded: RecordedFinding[];
 }
@@ -496,6 +501,13 @@ describe("turn loop", () => {
 		record.proposal = {
 			prompt: "Add a benchmark for the merge path",
 			model: "zai/glm",
+			summary: {
+				whatChanges: "Add a benchmark script for the merge path.",
+				why: "Merge turns re-run the same slow path on every retro.",
+				gain: "About 30 seconds per retro run.",
+				risk: "none found",
+				check: "bun test src/merge-bench.test.ts passes.",
+			},
 		};
 		const task = store.createTask(
 			`${RETRO_MARKER}the weekly retro`,
@@ -525,6 +537,14 @@ describe("turn loop", () => {
 		expect(kid.needsReason).toContain(task.id);
 		expect(kid.needsReason).not.toContain("the weekly retro");
 		expect(kid.model).toBe("zai/glm");
+		// The five decision fields ride to the child card for the drawer's panel.
+		expect(kid.proposalSummary).toEqual({
+			whatChanges: "Add a benchmark script for the merge path.",
+			why: "Merge turns re-run the same slow path on every retro.",
+			gain: "About 30 seconds per retro run.",
+			risk: "none found",
+			check: "bun test src/merge-bench.test.ts passes.",
+		});
 		expect(kid.prompt).toContain("handoffs");
 		expect(kid.prompt).toContain("Add a benchmark for the merge path");
 		// The handoff file exists and describes the finished retro.
@@ -554,6 +574,7 @@ describe("turn loop", () => {
 		record.proposal = {
 			prompt: "Add a benchmark for the merge path",
 			model: null,
+			summary: null,
 		};
 
 		await loop.runTurn(store.name, retro.id);
@@ -570,6 +591,9 @@ describe("turn loop", () => {
 		expect(reason).not.toContain(source.title);
 		expect(/retro of retro of/i.test(reason)).toBe(false);
 		expect(reason).not.toContain(retro.id);
+		// A proposal without a summary keeps the field null; the drawer falls back
+		// to the prompt's first paragraph.
+		expect(kid!.proposalSummary).toBeNull();
 	});
 
 	test("retro proposal filing is capped at 3 open proposals", async () => {
@@ -587,7 +611,7 @@ describe("turn loop", () => {
 						: `${PROPOSED_REASON_PREFIX}an older retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 			});
 		}
-		record.proposal = { prompt: "one too many", model: null };
+		record.proposal = { prompt: "one too many", model: null, summary: null };
 
 		await loop.runTurn(store.name, retro.id);
 
@@ -610,7 +634,11 @@ describe("turn loop", () => {
 				...(i === 0 ? { cancelledAt: Date.now() } : {}),
 			});
 		}
-		record.proposal = { prompt: "fits under the cap", model: null };
+		record.proposal = {
+			prompt: "fits under the cap",
+			model: null,
+			summary: null,
+		};
 
 		await loop.runTurn(store.name, retro.id);
 
@@ -9968,7 +9996,7 @@ describe("turn fork-born merge hold", () => {
 
 	test("a retro filed below fork-born work settles done and files its proposal", async () => {
 		const { store, record, loop, task } = forkCase();
-		record.proposal = { prompt: "Add a benchmark", model: null };
+		record.proposal = { prompt: "Add a benchmark", model: null, summary: null };
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 		store.updateTask(retro.id, { followUpOf: task.id });
 		await loop.runTurn(store.name, retro.id);
@@ -14704,7 +14732,11 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("a plain work card's proposal is never filed as a card", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		record.proposal = { prompt: "not a retro idea", model: null };
+		record.proposal = {
+			prompt: "not a retro idea",
+			model: null,
+			summary: null,
+		};
 		const task = store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
@@ -14732,7 +14764,7 @@ describe("turn survivor round 5 — run finish", () => {
 			commitsAhead: async () => 0,
 			startRun: runReturning(record, {
 				...askOutcome("which week?"),
-				proposed: { prompt: "premature idea", model: null },
+				proposed: { prompt: "premature idea", model: null, summary: null },
 			}),
 		});
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
@@ -14755,7 +14787,11 @@ describe("turn survivor round 5 — run finish", () => {
 				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
 			});
 		}
-		record.proposal = { prompt: "fits under the cap", model: null };
+		record.proposal = {
+			prompt: "fits under the cap",
+			model: null,
+			summary: null,
+		};
 
 		await loop.runTurn(store.name, retro.id);
 
@@ -14776,7 +14812,11 @@ describe("turn survivor round 5 — run finish", () => {
 			const t = store.startTurn(p.id, "work", "p", null);
 			store.finishTurn(t.id, { endedAt: Date.now() });
 		}
-		record.proposal = { prompt: "fits under the cap", model: null };
+		record.proposal = {
+			prompt: "fits under the cap",
+			model: null,
+			summary: null,
+		};
 
 		await loop.runTurn(store.name, retro.id);
 
@@ -14788,7 +14828,7 @@ describe("turn survivor round 5 — run finish", () => {
 	test("a proposal filed when the handoffs folder already exists still gets its handoff", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
 		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
-		record.proposal = { prompt: "second idea", model: null };
+		record.proposal = { prompt: "second idea", model: null, summary: null };
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);
@@ -14801,7 +14841,7 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("the proposal handoff describes the settled retro: its summary and session", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		record.proposal = { prompt: "an idea", model: null };
+		record.proposal = { prompt: "an idea", model: null, summary: null };
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);
@@ -14820,7 +14860,7 @@ describe("turn survivor round 5 — run finish", () => {
 		mkdirSync(store.tasksDir, { recursive: true });
 		// A plain file where the handoffs folder belongs: mkdir fails.
 		writeFileSync(join(store.tasksDir, "handoffs"), "not a folder");
-		record.proposal = { prompt: "bare idea", model: null };
+		record.proposal = { prompt: "bare idea", model: null, summary: null };
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);

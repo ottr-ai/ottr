@@ -607,6 +607,10 @@ describe("retro prompts", () => {
 		for (const part of ["Why:", "Change:", "Check:", "Gain:"]) {
 			expect(PROPOSE_TOOL_DESCRIPTION).toContain(part);
 		}
+		expect(PROPOSE_TOOL_DESCRIPTION).toContain("summary:");
+		for (const field of ["whatChanges:", "why:", "gain:", "risk:", "check:"]) {
+			expect(PROPOSE_TOOL_DESCRIPTION).toContain(field);
+		}
 	});
 
 	test("proposal detection matches the legacy wording stored on old cards", () => {
@@ -642,7 +646,7 @@ describe("retro prompts", () => {
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(PROPOSE_TOOL_DESCRIPTION).toBe(
-			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task.",
+			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified.",
 		);
 	});
 
@@ -659,6 +663,7 @@ describe("handoffMarkdown research report", () => {
 		project: "proj",
 		title: "Research question",
 		prompt: "ask it",
+		proposalSummary: null,
 		stage: "done" as const,
 		state: "idle" as const,
 		needsReason: null,

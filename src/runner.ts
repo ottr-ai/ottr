@@ -661,7 +661,17 @@ export interface EventState {
 	/** The agent's last ask call, normalized; null while none. */
 	asked: AskQuestion[] | null;
 	/** First valid `propose_task` call of a retro run; null while none (the extension refuses a second). */
-	proposed: { prompt: string; model: string | null } | null;
+	proposed: {
+		prompt: string;
+		model: string | null;
+		summary: {
+			whatChanges: string;
+			why: string;
+			gain: string;
+			risk: string;
+			check: string;
+		} | null;
+	} | null;
 	/** Every valid `propose_task` call, in order: a retro records at most one, a review one per finding. */
 	recorded: RecordedFinding[];
 }
@@ -759,8 +769,29 @@ export function applyEvent(
 			};
 			state.recorded.push(call);
 			// Retro semantics: the first valid call is the proposal (the extension refuses a second).
-			if (state.proposed === null)
-				state.proposed = { prompt: call.prompt, model: call.model };
+			// Summary policy: whatChanges/why/gain/check are required, risk optional and defaults
+			// to "none found"; each field is capped at 400 characters (slice to 399 + "…").
+			if (state.proposed === null) {
+				const part = (key: string): string | null => {
+					if (typeof args[key] !== "string") return null;
+					const value = (args[key] as string).trim();
+					if (value === "") return null;
+					return value.length > 400 ? value.slice(0, 399) + "…" : value;
+				};
+				const whatChanges = part("whatChanges");
+				const why = part("why");
+				const gain = part("gain");
+				const check = part("check");
+				const risk = part("risk") ?? "none found";
+				const summary =
+					whatChanges !== null &&
+					why !== null &&
+					gain !== null &&
+					check !== null
+						? { whatChanges, why, gain, risk, check }
+						: null;
+				state.proposed = { prompt: call.prompt, model: call.model, summary };
+			}
 		}
 		return {};
 	}

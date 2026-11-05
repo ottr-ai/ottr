@@ -404,11 +404,13 @@ export async function logOut(): Promise<void> {
 }
 
 /** Busy + failed state for one server-triggering control; `start` runs the action and tracks it. */
-export function useBusy(): {
+export interface BusyState {
 	busy: boolean;
 	failed: boolean;
 	start: (run: () => Promise<boolean>) => void;
-} {
+}
+
+export function useBusy(): BusyState {
 	const [busy, setBusy] = useState(false);
 	const [failed, setFailed] = useState(false);
 	useEffect(() => {

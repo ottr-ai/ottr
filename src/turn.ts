@@ -3222,6 +3222,8 @@ export function createTurnLoop(
 								? store.getTask(task.followUpOf)
 								: null) ?? { id: task.id },
 						),
+						// The drawer's decision panel reads it; older proposals keep null.
+						proposalSummary: result.proposed.summary,
 					});
 					log(`- filed proposal ${child.id} (held for approval)`);
 				}
