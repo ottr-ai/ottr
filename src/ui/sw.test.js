@@ -36,7 +36,11 @@ globalThis.self = {
 	},
 };
 
-await import("./sw.js");
+// The ?ottr-test query gives this import its own module instance: sw.js registers its
+// handlers on `self` at module scope, and Stryker's bun runner eagerly imports every
+// mutated file first, so a plain import here would return the already-evaluated module
+// whose handlers went to the real test-process self instead of this fake.
+await import("./sw.js?ottr-test");
 
 beforeEach(() => {
 	calls.notifications.length = 0;

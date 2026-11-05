@@ -1,9 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
 import { resolve } from "node:path";
 
-// dev.ts is all top-level effects: it seeds the scratch root, points the tracker
-// env at it, then imports the server. Mock the seed and the server so the import
-// stays a pure bootstrap we can assert on.
+// dev.ts is entry-only side effects behind an exported bootstrap(): it seeds the scratch
+// root, points the tracker env at it, then imports the server. Mock the seed and the
+// server so the bootstrap stays pure enough to assert on.
 describe("dev board bootstrap", () => {
 	test("seeds the .dev root, points the env at it, and loads the server", async () => {
 		const seeded: string[] = [];
@@ -20,10 +20,12 @@ describe("dev board bootstrap", () => {
 
 		const prev: Record<string, string | undefined> = { ...process.env };
 		try {
-			// Dynamic import is the point: dev.ts is all top-level effects, so the
-			// mocks must be registered before it executes — a static import would
-			// run it (and start the real server) before this test can intercept.
-			await import("./dev.ts");
+			// Dynamic import is the point: the module itself is import-safe (its entry
+			// behavior lives in bootstrap(), called below), and the mocks must be
+			// registered before bootstrap runs — an unmocked import would start the
+			// real server before this test can intercept.
+			const { bootstrap } = await import("./dev.ts");
+			await bootstrap();
 			const root = resolve(import.meta.dir, "..", ".dev");
 			expect(seeded).toEqual([root]);
 			expect(process.env.OMP_TRACKER_ROOTS).toBe(root);
