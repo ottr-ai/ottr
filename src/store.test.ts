@@ -321,6 +321,7 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
+			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		store.setSettings({ displayName: null, releaseCommand: null });
@@ -344,6 +345,7 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
+			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		store.close();

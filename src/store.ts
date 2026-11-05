@@ -75,6 +75,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
+	pushSyncCommits: false,
 	taskIdPrefix: null,
 };
 
@@ -876,6 +877,7 @@ const SETTINGS_SHAPES = {
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
+	pushSyncCommits: "boolean",
 	taskIdPrefix: "string|null",
 } as const satisfies Record<keyof ProjectSettings, string>;
 

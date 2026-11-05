@@ -263,6 +263,7 @@ import {
 	originRemoteUrl,
 	remoteUrl,
 	resolveTarget,
+	serverMergePush,
 	setNetworkGitAuth,
 	statusFiles,
 	validateCopyPath,
@@ -2086,6 +2087,8 @@ export function createApp(deps: AppDeps) {
 			target: e.target,
 			gitless: e.gitless,
 			dirty: e.dirty,
+			mainBranch: e.mainBranch,
+			mainUnpushed: e.mainUnpushed,
 			github: e.github,
 			remote: e.remote,
 			latestRelease: e.latestRelease,
@@ -2560,6 +2563,12 @@ export function createApp(deps: AppDeps) {
 				return json({ error: "prReviews must be a boolean" }, 400);
 			patch.prReviews = pr;
 		}
+		const psc = body.pushSyncCommits;
+		if (psc !== undefined) {
+			if (typeof psc !== "boolean")
+				return json({ error: "pushSyncCommits must be a boolean" }, 400);
+			patch.pushSyncCommits = psc;
+		}
 		const sc = body.setupChecklist;
 		if (sc !== undefined) {
 			if (typeof sc !== "boolean")
@@ -2988,6 +2997,7 @@ export function createApp(deps: AppDeps) {
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
+			mainBranch: null,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,
@@ -4844,6 +4854,30 @@ export function createApp(deps: AppDeps) {
 					e.store.setSettings(patch);
 					if (patch.targetBranch !== undefined) await refreshRemote(e);
 					return json(projectView(e));
+				}),
+		},
+		// Board "Push to origin" (OTTR-531): the standing-approval push, the exact
+		// authenticated path the merge flow uses. Moves refs/heads/<target> on origin only;
+		// never depends on the checked-out branch, never forces.
+		"/api/projects/:project/push-main": {
+			POST: (req) =>
+				api(req, async () => {
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					if (e.gitless)
+						return json({ error: "init a git repository first" }, 409);
+					if (e.target === null || !e.target.startsWith("origin/"))
+						return json({ error: "no resolved target" }, 409);
+					const result = await serverMergePush(
+						e.path,
+						e.path,
+						e.target,
+						"",
+						null,
+						e.store.getSettings().originUrl,
+					).catch((err) => ({ status: "failed" as const, error: errmsg(err) }));
+					if (result.status === "pushed") e.mainUnpushed = false;
+					return json(result);
 				}),
 		},
 		// The board's Diagrams button: docs/how-it-works.md as committed on the target branch.

@@ -2875,6 +2875,18 @@ export function ProjectBoard({
 			refreshState();
 		});
 	const q = applied.trim().toLowerCase();
+	// The target branch name without the origin/ prefix; the project's default branch.
+	const short = project.target?.startsWith("origin/")
+		? project.target.slice(7)
+		: null;
+	/** One push-main endpoint call; the run verdict drives BusyButton's styling. */
+	const pushMain = () =>
+		act(async () => {
+			await post(
+				`/api/projects/${encodeURIComponent(project.name)}/push-main`,
+				{},
+			);
+		});
 	/** One project interview endpoint call; its verdict becomes a board notice. */
 	const interview = (path: string, body: Record<string, unknown>) =>
 		act(async () => {
@@ -3115,6 +3127,23 @@ export function ProjectBoard({
 					<Icon name="info" size={14} />
 					The main checkout has uncommitted changes. Your own pull or stash can
 					collide with commits from tasks.
+				</p>
+			)}
+			{project.mainBranch !== null &&
+				short !== null &&
+				project.mainBranch !== short && (
+					<p className="advisory">
+						<Icon name="info" size={14} />
+						The main checkout is on branch <code>{project.mainBranch}</code>,
+						not {short}. Commit to {short}, never to a task branch.
+					</p>
+				)}
+			{short !== null && project.mainUnpushed && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					Local {short} has commits origin lacks. Merges wait until it reaches
+					origin.
+					<BusyButton run={pushMain}>Push to origin</BusyButton>
 				</p>
 			)}
 			{!project.hasRules && (

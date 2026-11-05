@@ -187,6 +187,12 @@ export interface ProjectSettings {
 	 * closed at the next push until the server pins again.
 	 */
 	originUrl: string | null;
+	/**
+	 * Standing approval for the board to push the main checkout's target branch to the pinned
+	 * origin when the tick finds local commits origin lacks (OTTR-531 sync commits); false
+	 * needs the one click on the board's push button instead. Without it nothing pushes.
+	 */
+	pushSyncCommits: boolean;
 	/** Task id handle like OTTR; null = derived from the folder name. Uppercase letters and digits, at most 8. */
 	taskIdPrefix: string | null;
 }
@@ -681,6 +687,10 @@ export interface ProjectView {
 	gitless: boolean;
 	/** Main checkout has uncommitted changes: your own pull/stash will collide with task-made commits. */
 	dirty: boolean;
+	/** Branch the main checkout has checked out; null when detached, gitless, or git failed (OTTR-531). */
+	mainBranch: string | null;
+	/** OTTR-531: true while the local target branch has commits origin lacks — the merge hold's git fact. */
+	mainUnpushed: boolean;
 	/** HTTPS URL of the project's GitHub remote (origin preferred); null when it has none. */
 	github: string | null;
 	/** Highest vX.Y.Z tag merged into the target; null until the first scan or with no tags. */

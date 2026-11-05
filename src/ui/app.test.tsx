@@ -4514,3 +4514,60 @@ describe("Drawer proposal panel editing (client)", () => {
 		}
 	});
 });
+
+describe("ProjectBoard sync-commit advisories", () => {
+	const projectWith = (over: Record<string, unknown>): ProjectView =>
+		({
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			mainBranch: null,
+			mainUnpushed: false,
+			target: "origin/main",
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+			...over,
+		}) as unknown as ProjectView;
+
+	const renderBoard = (project: ProjectView): string => {
+		const tasks = [cardFixture({ id: "t1", title: "Fix bug" })];
+		return renderToStaticMarkup(
+			<ProjectBoard
+				project={project}
+				tasks={tasks}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async () => true}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
+	};
+
+	test("a checkout left on a foreign branch names it in the advisory", () => {
+		const html = renderBoard(projectWith({ mainBranch: "ott/ottr-516-mean" }));
+		expect(html).toContain("ott/ottr-516-mean");
+		expect(html).toContain("never to a task branch.");
+	});
+
+	test("an unpushed local main offers the Push to origin button", () => {
+		const html = renderBoard(projectWith({ mainUnpushed: true }));
+		expect(html).toContain("Push to origin");
+		expect(html).toContain("has commits origin lacks");
+	});
+
+	test("a clean project renders neither advisory", () => {
+		const html = renderBoard(projectWith({}));
+		expect(html).not.toContain("Push to origin");
+		expect(html).not.toContain("never to a task branch.");
+		expect(html).not.toContain("has commits origin lacks");
+	});
+});

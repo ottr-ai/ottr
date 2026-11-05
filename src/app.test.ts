@@ -281,6 +281,7 @@ projects.set("p1", {
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
+	mainBranch: null,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -298,6 +299,7 @@ projects.set("p2", {
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
+	mainBranch: null,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -314,6 +316,7 @@ projects.set("p3", {
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
+	mainBranch: null,
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
@@ -704,6 +707,7 @@ describe("task routes", () => {
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,
+				mainBranch: null,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,
@@ -718,6 +722,7 @@ describe("task routes", () => {
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,
+				mainBranch: null,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,
@@ -2894,6 +2899,7 @@ describe("alate provision trigger (U9)", () => {
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
+		mainBranch: null,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -3163,6 +3169,7 @@ describe("agent layer boot reconcile", () => {
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
+			mainBranch: null,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,
@@ -4194,6 +4201,7 @@ describe("release-summary route", () => {
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
+			mainBranch: null,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,
@@ -5450,6 +5458,129 @@ describe("project settings validation", () => {
 	});
 });
 
+describe("push-main route (OTTR-531)", () => {
+	// Real repos: a bare origin plus a clone whose main is one commit ahead. execSync
+	// fixtures only, like the release-summary and behindMain describes.
+	const run = (dir: string, cmd: string): string =>
+		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+
+	const setup = (
+		name: string,
+	): {
+		origin: string;
+		dir: string;
+		store: ProjectStore;
+		entry: Entry;
+		projects: Map<string, Entry>;
+		cleanup: () => void;
+	} => {
+		const origin = join(root, `${name}-origin`);
+		const dir = join(root, name);
+		run(root, `git init -q --bare -b main ${origin}`);
+		run(root, `git clone -q ${origin} ${dir}`);
+		run(dir, "git config user.email t@t && git config user.name t");
+		writeFileSync(join(dir, "seed.txt"), "x");
+		run(dir, "git add seed.txt && git commit -qm seed");
+		run(dir, "git push -q origin main");
+		// The clone's main is ahead of origin: exactly what the endpoint is allowed to push.
+		writeFileSync(join(dir, "ahead.txt"), "x");
+		run(dir, "git add ahead.txt && git commit -qm ahead");
+		const store = ProjectStore.open(dir);
+		store.setSettings({ originUrl: origin });
+		const entry: Entry = {
+			path: dir,
+			name,
+			store,
+			target: "origin/main",
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			mainUnpushed: true,
+			mainBranch: "main",
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return {
+			origin,
+			dir,
+			store,
+			entry,
+			projects: new Map([[name, entry]]),
+			cleanup: () => {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(origin, { recursive: true, force: true });
+			},
+		};
+	};
+
+	test("an approved push moves origin to the local main and clears the flag", async () => {
+		const s = setup("p-pushmain");
+		try {
+			const m = mount({ projects: s.projects });
+			const res = await m.call("/api/projects/p-pushmain/push-main", {});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { status: string };
+			expect(b.status).toBe("pushed");
+			// The bare origin's main ref now equals the clone's local main tip.
+			expect(run(s.origin, "git rev-parse main")).toBe(
+				run(s.dir, "git rev-parse refs/heads/main"),
+			);
+			// The hold lifts at once, without waiting for the scheduler tick.
+			expect(s.entry.mainUnpushed).toBe(false);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("unknown project is 404 and a null target is 409; nothing pushes", async () => {
+		const s = setup("p-pushnull");
+		try {
+			// Null target: the route must refuse before any git call.
+			s.entry.target = null;
+			const m = mount({ projects: s.projects });
+			const none = await m.call("/api/projects/nope/push-main", {});
+			expect(none.status).toBe(404);
+			expect(await errorOf(none)).toBe("unknown project");
+			const res = await m.call("/api/projects/p-pushnull/push-main", {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("no resolved target");
+			// Nothing pushed: the bare origin still sits at the seed commit.
+			expect(run(s.origin, "git rev-parse main")).toBe(
+				run(s.dir, "git rev-parse HEAD~1"),
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+});
+
+describe("pushSyncCommits setting and ProjectView fields", () => {
+	test("the settings route accepts the boolean and the view carries mainBranch/mainUnpushed", async () => {
+		const res = await post("/api/projects/p1/settings", {
+			pushSyncCommits: true,
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			settings: { pushSyncCommits: boolean };
+			mainBranch: string | null;
+			mainUnpushed: boolean;
+		};
+		expect(b.settings.pushSyncCommits).toBe(true);
+		expect(b.mainBranch).toBeNull();
+		expect(b.mainUnpushed).toBe(false);
+	});
+
+	test("a non-boolean pushSyncCommits is 400", async () => {
+		const res = await post("/api/projects/p1/settings", {
+			pushSyncCommits: "yes",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("pushSyncCommits must be a boolean");
+	});
+});
+
 describe("project icon", () => {
 	// 1x1 transparent PNG, base64.
 	const png = new Uint8Array(
@@ -6650,6 +6781,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
+		mainBranch: null,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -7483,6 +7615,7 @@ describe("PR review routes", () => {
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
+		mainBranch: null,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -9581,6 +9714,7 @@ describe("project order route", () => {
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,
+				mainBranch: null,
 				latestRelease: null,
 				latestImage: null,
 				archReview: null,

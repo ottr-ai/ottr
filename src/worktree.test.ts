@@ -26,6 +26,7 @@ import {
 	branchMergedOrGone,
 	branchUnpushed,
 	changedFiles,
+	checkedOutBranch,
 	createWorktree,
 	describeVersion,
 	diffStat,
@@ -1369,6 +1370,43 @@ describe("branchUnpushed", () => {
 			expect(await branchUnpushed(clone, "main")).toBe(true);
 			// A branch without refs on either side counts as pushed.
 			expect(await branchUnpushed(f.main, "ghost")).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("checkedOutBranch (OTTR-531)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-cob-"));
+		const main = join(dir, "main");
+		run(dir, "init", "-q", "-b", "main", main);
+		writeFileSync(join(main, "a.txt"), "a");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		return { dir, main };
+	};
+
+	test("on a branch, detached HEAD, and outside a repo", async () => {
+		const f = fixture();
+		try {
+			expect(await checkedOutBranch(f.main)).toBe("main");
+			// Detached HEAD carries no branch name: null, not the short sha.
+			run(f.main, "checkout", "-q", "--detach", "HEAD");
+			expect(await checkedOutBranch(f.main)).toBe(null);
+			// Not a git repo: null, never a throw.
+			expect(await checkedOutBranch(f.dir)).toBe(null);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}

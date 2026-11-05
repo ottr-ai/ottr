@@ -217,6 +217,8 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		fetchOriginBranch: async () => null,
 		// No rejected push in the default fixtures: the merge hold's git fact stays false.
 		branchUnpushed: async () => false,
+		// The default main checkout sits on main, so no off-default finding fires.
+		checkedOutBranch: async () => null,
 		// The default cannot converge (a conflict), so a rejected push still queues the
 		// recovery steer exactly as before OTTR-510; tests on the converged path override both.
 		rebaseTargetBranch: async () => ({
@@ -298,6 +300,7 @@ function fakeProject(store: ProjectStore): TurnProject {
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
+		mainBranch: null,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -17371,5 +17374,87 @@ describe("detached re-bind survivor pins", () => {
 		expect(store.getTask(task.id)!.state).toBe("idle");
 		// No detach-path error was logged: the task's log file was never even created.
 		expect(existsSync(store.logPath(task.id))).toBe(false);
+	});
+});
+
+describe("sync-commit hygiene (OTTR-531)", () => {
+	/** A settled work turn with target origin/main on the project entry. */
+	function targetedSetup(overrides: Partial<TurnOps> = {}) {
+		const s = setup(overrides);
+		s.projects.get(s.store.name)!.target = "origin/main";
+		return s;
+	}
+
+	test("a settled outcome names a main checkout left on a foreign branch", async () => {
+		const { store, loop } = targetedSetup({
+			checkedOutBranch: async () => "ott/ottr-516-mean",
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.details).toContain(
+			`Board: ${store.name}'s main checkout is on branch ott/ottr-516-mean, not main.`,
+		);
+	});
+
+	test("a settled outcome names a local main that origin lacks", async () => {
+		const { store, loop } = targetedSetup({
+			branchUnpushed: async () => true,
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.details).toContain(
+			`Board: ${store.name}'s local main has commits origin lacks.`,
+		);
+	});
+
+	test("a clean main checkout adds no Board: line", async () => {
+		const { store, loop } = targetedSetup();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.details ?? "").not.toContain("Board:");
+	});
+
+	test("pushSyncCommits on: the tick pushes once on the unpushed edge and lifts the hold", async () => {
+		const calls: unknown[][] = [];
+		const { store, projects, loop } = targetedSetup({
+			branchUnpushed: async () => true,
+			serverMergePush: async (...args: unknown[]) => {
+				calls.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		store.setSettings({ pushSyncCommits: true });
+		const e = projects.get(store.name)!;
+		loop.schedule();
+		await flushPromises();
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toEqual([
+			e.path,
+			e.path,
+			"origin/main",
+			"",
+			null,
+			store.getSettings().originUrl,
+		]);
+		expect(e.mainUnpushed).toBe(false);
+	});
+
+	test("pushSyncCommits off: the tick never pushes", async () => {
+		const calls: unknown[][] = [];
+		const { loop } = setup({
+			branchUnpushed: async () => true,
+			serverMergePush: async (...args: unknown[]) => {
+				calls.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		loop.schedule();
+		await flushPromises();
+
+		expect(calls).toHaveLength(0);
 	});
 });

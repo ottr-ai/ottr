@@ -114,6 +114,7 @@ import type {
 	branchMergedOrGone,
 	branchUnpushed,
 	changedFiles,
+	checkedOutBranch,
 	commitsAhead,
 	createWorktree,
 	diffStat,
@@ -343,6 +344,10 @@ export interface TurnProject {
 	 * check like dirty, and set eagerly by the turn that saw the rejection or landed the
 	 * repairing push, so the merge hold gates the very next tick. Read-only elsewhere. */
 	mainUnpushed: boolean;
+	/** OTTR-531: the main checkout's checked-out branch; null when detached, gitless, or git
+	 * failed. Refreshed by the scheduler tick like dirty and mainUnpushed (a failed check
+	 * keeps the last value); the off-default banner and turn finding read it. */
+	mainBranch: string | null;
 	/** Highest vX.Y.Z tag merged into the target; refreshed by the scheduler tick, read-only elsewhere. */
 	latestRelease: string | null;
 	/** Public ghcr.io image of the repo; probed on a TTL by the scheduler tick, read-only elsewhere. */
@@ -426,6 +431,8 @@ export interface TurnOps {
 	targetContains: typeof targetContains;
 	/** OTTR-506: true while the local target branch has commits origin lacks (the merge hold's git fact). */
 	branchUnpushed: typeof branchUnpushed;
+	/** OTTR-531: the main checkout's checked-out branch; null on detached HEAD or git failure. */
+	checkedOutBranch: typeof checkedOutBranch;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
 	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
@@ -1156,6 +1163,28 @@ export function createTurnLoop(
 		}
 	}
 
+	/** OTTR-531: one line per sync-commit hygiene finding, appended to a settled turn's
+	 * outcome details. Git failures add no line (the tick refreshes the flags instead). */
+	async function syncCommitFindings(): Promise<string[]> {
+		const lines: string[] = [];
+		for (const e of projects.values()) {
+			if (e.gitless) continue;
+			const target = e.target;
+			if (target === null || !target.startsWith("origin/")) continue;
+			const short = target.slice("origin/".length);
+			const branch = await ops.checkedOutBranch(e.path).catch(() => null);
+			if (branch !== null && branch !== short)
+				lines.push(
+					`Board: ${e.name}'s main checkout is on branch ${branch}, not ${short}.`,
+				);
+			if (await ops.branchUnpushed(e.path, short))
+				lines.push(
+					`Board: ${e.name}'s local ${short} has commits origin lacks.`,
+				);
+		}
+		return lines;
+	}
+
 	function schedule(): void {
 		ops.publishSoon(); // board diffs from dirty/release flags and new turns ship without polling
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
@@ -1180,11 +1209,58 @@ export function createTurnLoop(
 				void ops
 					.branchUnpushed(e.path, branch)
 					.then((unpushed) => {
+						// OTTR-531: on the false→true edge of an unpushed main, a standing
+						// pushSyncCommits approval pushes the local target ref once — no edge
+						// (a failed push leaves the flag true) means no retry storm.
+						const edge = !e.mainUnpushed && unpushed;
 						e.mainUnpushed = unpushed;
+						if (!edge || !e.store.getSettings().pushSyncCommits) return;
+						const settings = e.store.getSettings();
+						void ops
+							.serverMergePush(
+								e.path,
+								e.path,
+								`origin/${branch}`,
+								"",
+								null,
+								settings.originUrl,
+							)
+							.then((p) => {
+								if (p.status === "pushed") {
+									// The hold lifts at once instead of waiting for the next tick.
+									e.mainUnpushed = false;
+									console.log(
+										`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
+									);
+								} else if (p.status === "skipped") {
+									console.log(
+										`${e.store.name}: ! sync-commit push of ${branch} skipped`,
+									);
+								} else {
+									console.log(
+										`${e.store.name}: ! sync-commit push of ${branch} failed: ${p.error}`,
+									);
+								}
+							})
+							.catch((err: unknown) => {
+								console.log(
+									`${e.store.name}: ! sync-commit push of ${branch} failed: ${errmsg(err)}`,
+								);
+							});
 					})
 					.catch(() => {
 						// git failed: keep the last mainUnpushed flag; the next tick retries.
 					});
+			// OTTR-531: the off-default finding's git fact, refreshed like the dirty flag —
+			// a failed check keeps the last value and the next tick retries.
+			void ops
+				.checkedOutBranch(e.path)
+				.then((b) => {
+					e.mainBranch = b;
+				})
+				.catch(() => {
+					// git failed: keep the last mainBranch; the next tick retries.
+				});
 			void ops.refreshRelease(e);
 			void ops.refreshArchReview(e);
 		}
@@ -3060,6 +3136,20 @@ export function createTurnLoop(
 				};
 				holdHead = head;
 				commits = undefined; // not done: the approving settle re-measures
+			}
+			// OTTR-531: sync-commit hygiene findings land on the card before any settle write.
+			if (result.outcome) {
+				const lines = await syncCommitFindings();
+				if (lines.length > 0) {
+					const o = result.outcome;
+					result = {
+						...result,
+						outcome: {
+							...o,
+							details: `${o.details ?? ""}${o.details ? "\n\n" : ""}${lines.join("\n")}`,
+						},
+					};
+				}
 			}
 			const settled = store.getTask(id);
 			if (

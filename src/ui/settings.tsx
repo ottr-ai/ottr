@@ -5184,6 +5184,13 @@ export function ProjectSettingsForm({
 							save={(v) => send({ prReviews: v })}
 							act={act}
 						/>
+						<CheckRow
+							name="Push sync commits"
+							desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
+							checked={st.pushSyncCommits}
+							save={(v) => send({ pushSyncCommits: v })}
+							act={act}
+						/>
 					</div>
 				</SettingsCard>
 			</section>

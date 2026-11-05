@@ -470,6 +470,7 @@ describe("ProjectSettingsForm target branch", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -621,6 +622,57 @@ describe("ProjectSettingsForm target branch", () => {
 			});
 			expect(postBody).not.toBeUndefined();
 			expect(postBody?.taskIdPrefix).toBe("chs");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the Updates card shows the push sync commits checkbox and toggling posts it", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return ok(project);
+			}
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountForm(fetchMock);
+		try {
+			const card = container.querySelector("#project-updates-section");
+			expect(card).not.toBeNull();
+			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
+				l.textContent?.includes("Push sync commits"),
+			);
+			if (label === undefined) throw new Error("push sync commits row missing");
+			const input = card?.querySelector<HTMLInputElement>(
+				`input[id="${label.htmlFor}"]`,
+			);
+			if (input === null || input === undefined)
+				throw new Error("push sync commits checkbox did not render");
+			expect(input.checked).toBe(false);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.pushSyncCommits).toBe(true);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
+			});
+			expect(postBody?.pushSyncCommits).toBe(false);
 		} finally {
 			await unmount();
 		}

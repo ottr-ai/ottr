@@ -57,6 +57,7 @@ import {
 	branchMergedOrGone,
 	branchUnpushed,
 	changedFiles,
+	checkedOutBranch,
 	commitsAhead,
 	createWorktree,
 	describeVersion,
@@ -319,6 +320,7 @@ for (const p of discoverProjects(
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
+		mainBranch: null,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -443,6 +445,7 @@ const loop = createTurnLoop(projects, {
 	targetSha,
 	targetContains,
 	branchUnpushed,
+	checkedOutBranch,
 	serverMergePush,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),

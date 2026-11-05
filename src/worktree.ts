@@ -1731,6 +1731,22 @@ export async function branchUnpushed(
 	return r === null || r.code !== 0;
 }
 
+/** OTTR-531: the branch the main checkout has checked out (HEAD minus its refs/heads
+ * prefix), or null on a detached HEAD or any git failure — the off-default banner and the
+ * turn-outcome finding read it to name a checkout left on a foreign branch. */
+export async function checkedOutBranch(
+	mainPath: string,
+): Promise<string | null> {
+	const head = await git(["symbolic-ref", "--quiet", "HEAD"], mainPath).catch(
+		() => null,
+	);
+	if (head === null || head.code !== 0) return null;
+	const branch = head.stdout.trim();
+	return branch.startsWith("refs/heads/")
+		? branch.slice("refs/heads/".length)
+		: null;
+}
+
 /** True when the main checkout's target already contains sha (AGEN-24: the approving turn
  * merged by itself and removed the worktree; the settle then finishes instead of parking again). */
 export async function targetContains(

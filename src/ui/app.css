@@ -2229,6 +2229,11 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	border: 1px solid var(--line-soft);
 	border-radius: 4px;
 }
+/* Stacked advisories (dirty, off-default branch, unpushed main) keep one banner's gap
+   between their borders instead of doubling into a shared edge. */
+.advisory + .advisory {
+	margin-top: 8px;
+}
 .advisory > .icon-svg {
 	color: var(--dim);
 }
