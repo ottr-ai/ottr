@@ -95,6 +95,14 @@ const probeRunner = (url: string): string =>
 const DETACH_WORKER =
 	"const r = await fetch('http://127.0.0.1:' + (process.env.WORKER_PORT || 8787) + '/detach', { method: 'POST', headers: { 'x-otwr-token': process.env.OTTR_WORKER_TOKEN } });" +
 	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }";
+// Reads a worker's detached runs (GET /detached, token-gated like /run): a run the
+// server step detached in an earlier run re-binds on the new server, and the board's
+// runner count cannot see it. An old worker without the route answers 404: no runs.
+const DETACHED_LIST =
+	'const r = await fetch("http://127.0.0.1:" + (process.env.WORKER_PORT || 8787) + "/detached", { headers: { "x-otwr-token": process.env.OTTR_WORKER_TOKEN } });' +
+	'if (r.status === 404) console.log("[]");' +
+	'else if (!r.ok) { console.log("HTTP " + r.status); process.exit(1); }' +
+	"else console.log(await r.text());";
 // The runner poll repeats every 30 s while a hold waits its turns out. The scheduled task
 // starts no second run meanwhile (IgnoreNew), so the run that built the image restarts the stack.
 const POLL_MS = 30_000;
@@ -1006,8 +1014,50 @@ async function rollRunner(
 	for (let i = 0; ; i++) {
 		const r = board.runners.find((x) => x.id === service);
 		if (r !== undefined && r.turns === 0 && board.preparing === 0) {
-			busy = false;
-			break;
+			// The board count cannot see a run the server step detached in an
+			// earlier run: the new server re-binds its row, and the count reads a
+			// map the restart emptied. The worker itself answers for them, and an
+			// old worker without the route answers []. A failed read is a real
+			// worker error: like an unreadable runner state, the roll stops, for
+			// recreating now would kill the run nobody can see. The probe execs in
+			// the worker's own container, not the server.
+			const listed = await d.docker(
+				"compose",
+				...compose,
+				"exec",
+				"-T",
+				service,
+				"bun",
+				"-e",
+				DETACHED_LIST,
+			);
+			// ponytail: a failed exec prints only HTTP text, so JSON.parse would throw
+			// on it anyway and the catch below stops with the same words — this check
+			// fails fast, and its false-mutant cannot change the outcome.
+			if (listed.code !== 0)
+				return {
+					kind: "stop",
+					early: stop(
+						`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
+					),
+				};
+			let detached: { running?: boolean }[];
+			try {
+				detached = JSON.parse(listed.out) as { running?: boolean }[];
+			} catch {
+				return {
+					kind: "stop",
+					early: stop(
+						`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
+					),
+				};
+			}
+			// ponytail: the fall-through keeps the wait running when a detached
+			// entry still runs, so the next poll's probe sees it finished.
+			if (!detached.some((x) => x.running === true)) {
+				busy = false;
+				break;
+			}
 		}
 		// The next poll would end past the limit.
 		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) break;

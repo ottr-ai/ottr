@@ -98,7 +98,9 @@ turns and work turns all get the new omp. Two parts do the work:
      preparing. A hold lasts at most 1 hour. If the worker still runs a turn then,
      the script ends its hold (`DELETE /api/drain?runner=`), the worker stays on
      the old image, and a later run tries again. The roll goes on with the next
-     worker, and the run exits 0.
+     worker, and the run exits 0. The roll also waits for detached runs a
+     previous server restart left on that worker (the board cannot see them); a
+     worker that answers no `/detached` route reads as having none.
    - When the worker is idle, the script recreates only its container
      (`up -d --no-deps --wait <service>`). The worker's compose healthcheck probes
      its own `GET /healthz`, so the `--wait` fails when the new container never

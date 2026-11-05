@@ -129,6 +129,10 @@ function fakes(
 		health?: number | number[];
 		/** Exit codes of the worker /detach execs in call order, the last one repeating. */
 		detach?: number | number[];
+		/** The worker's GET /detached answers, in order; the last one repeats. Without
+		 *  them the worker answers [] (an old worker without the route). A body of
+		 *  "!fail" makes the exec exit 1; "!bad" prints a body that is no JSON. */
+		detachedList?: string[];
 		/** Runs after each poll wait: work that lands in the checkout mid-hold. */
 		onWait?: () => void;
 	} = {},
@@ -147,6 +151,7 @@ function fakes(
 	const frees = typeof o.free === "number" ? [o.free] : (o.free ?? [0]);
 	const detaches =
 		typeof o.detach === "number" ? [o.detach] : (o.detach ?? [0]);
+	const dlists = o.detachedList;
 	const gets = o.gets;
 	let counted = 0;
 	let holdCalls = 0;
@@ -154,6 +159,7 @@ function fakes(
 	let healthCalls = 0;
 	let freeCalls = 0;
 	let detachCalls = 0;
+	let dlistCalls = 0;
 	// A real epoch, not 0: the hold limit must measure the time since the hold, not the clock.
 	let clock = Date.UTC(2026, 9, 16);
 	const deps: Deps = {
@@ -167,6 +173,8 @@ function fakes(
 			const get = drain && !free && !line.includes("'POST'");
 			const health = line.includes("/healthz");
 			const detach = !drain && !health && line.includes("'/detach'");
+			const dlist =
+				!drain && !health && !detach && line.includes('"/detached"');
 			if (drain) drains.push(line);
 			if (args.includes("board-seed")) {
 				seedRuns.push(line);
@@ -208,7 +216,9 @@ function fakes(
 									? " -e <health>"
 									: detach
 										? " -e <detach>"
-										: " -e <count>",
+										: dlist
+											? " -e <detached>"
+											: " -e <count>",
 				),
 			);
 			if (args.includes("build")) {
@@ -327,6 +337,13 @@ function fakes(
 				// A failed detach prints the worker's HTTP status, like the other scripts.
 				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
 			}
+			if (dlist) {
+				const b = dlists?.[Math.min(dlistCalls++, dlists.length - 1)] ?? "[]";
+				// A failed read prints the worker's HTTP status and exits 1, like
+				// the other scripts; "!bad" is an answer no JSON parser takes.
+				if (b === "!fail") return { code: 1, out: "HTTP 500\n" };
+				return { code: 0, out: `${b}\n` };
+			}
 			if (args.includes("restart"))
 				return o.restart
 					? { code: o.restart, out: o.restartOut ?? "" }
@@ -418,6 +435,8 @@ const UP_SVC = (s: string) => `compose -f c.yml up -d --no-deps --wait ${s}`;
 const RESTART = "compose -f c.yml restart server";
 const DETACH_SVC = (s: string) =>
 	`compose -f c.yml exec -T ${s} bun -e <detach>`;
+const DETACHED_SVC = (s: string) =>
+	`compose -f c.yml exec -T ${s} bun -e <detached>`;
 /** A GET /api/drain answer like st(), but with a `local` turn count. */
 const stl = (a: number, b: number, local: number) =>
 	JSON.stringify({
@@ -1229,6 +1248,7 @@ describe("rolling restart", () => {
 					...process.env,
 					PORT: String(server.port),
 					WORKER_PORT: String(server.port),
+					OTTR_WORKER_TOKEN: "t",
 				},
 				stdout: "pipe",
 				stderr: "pipe",
@@ -1264,11 +1284,14 @@ describe("rolling restart", () => {
 			// The wait renews the runner hold: one POST holds 30 min, the wait may
 			// reach 1 h, and a lapsed hold would take turns again before the recreate.
 			HOLD,
+			// The idle check asks the worker for detached runs before the recreate.
+			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
 			FREE,
 			...COMPARE_SVC("worker-b"),
 			HOLD,
+			DETACHED_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			HEALTH,
 			FREE,
@@ -1297,6 +1320,162 @@ describe("rolling restart", () => {
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
 		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+	}, 60_000);
+
+	test("a detached run the board cannot see holds the roll until the worker reports it finished", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// worker-a's board count reaches 0 after one poll, but its /detached still
+		// lists a running entry: an earlier server step detached the run, and the
+		// new server re-binds its row, so the board cannot count it.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0), st(0, 0), st(0, 0), st(0, 0)],
+			detachedList: [
+				'[{"id":"r1","running":true}]',
+				'[{"id":"r1","running":false}]',
+			],
+		});
+		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			GET,
+			HOLD,
+			// The idle board is not enough: the probe finds the run still running,
+			// and the wait goes on (each poll renews the hold) until the probe
+			// reads it finished. The recreate happens only after that read.
+			DETACHED_SVC("worker-a"),
+			GET,
+			HOLD,
+			DETACHED_SVC("worker-a"),
+			UP_SVC("worker-a"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("worker-b"),
+			HOLD,
+			DETACHED_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("server"),
+			HOLD,
+			GET,
+			HOLD,
+			HOLD,
+			UP_SVC("server"),
+			UP,
+			PRUNE,
+		]);
+		// The probe skips the busy polls: the exec runs only when the board says idle.
+		expect(f.calls.indexOf(DETACHED_SVC("worker-a"))).toBeGreaterThan(
+			f.calls.indexOf(GET, f.calls.indexOf(GET) + 1),
+		);
+		expect(
+			f.logs.filter((l) => l.includes("still runs its turns")),
+		).toHaveLength(1);
+	}, 60_000);
+
+	test("a detached run that outlasts the hold leaves the runner stuck, and nothing recreates", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const unrecorded = "0".repeat(40);
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			// The probe answers "running" at every poll, for both workers.
+			detachedList: ['[{"id":"r1","running":true}]'],
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// 120 polls of 30 s fill each worker's hour while its detached run keeps going.
+		expect(f.waits).toHaveLength(240);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.calls).not.toContain(UP_SVC("worker-b"));
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
+		expect(f.calls.slice(-2)).toEqual([FREE, PRUNE]);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+		expect(f.logs.join("\n")).toContain(
+			"worker-b keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+		expect(f.logs.join("\n")).toContain(
+			"the server restart waits for a later run",
+		);
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a failed detached-list read stops the roll", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			detachedList: ["!fail"],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		// Fail closed: the roll ends at once, and no container recreates.
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE_SVC("worker-a"),
+			HOLD,
+			DETACHED_SVC("worker-a"),
+		]);
+		expect(f.logs.join("\n")).toContain(
+			"stopped: worker-a cannot read its detached runs: HTTP 500",
+		);
+	}, 60_000);
+
+	test("a detached-list answer that is no JSON stops the roll", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			detachedList: ["!bad"],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.logs.join("\n")).toContain(
+			"stopped: worker-a cannot read its detached runs: !bad",
+		);
+	}, 60_000);
+
+	test("an old worker without the detached route reads as idle and recreates at once", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// The snippet prints [] on the route's 404: the fake answers [] like the
+		// snippet does, and the roll recreates without a single poll wait.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			detachedList: ["[]"],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.waits).toHaveLength(0);
+		expect(f.calls).toContain(UP_SVC("worker-a"));
+		expect(f.calls).toContain(UP_SVC("worker-b"));
+		expect(f.calls).toContain(UP_SVC("server"));
 	}, 60_000);
 
 	test("a stuck runner is released, the roll goes on, and the server step waits for a later run", async () => {
@@ -1373,6 +1552,7 @@ describe("rolling restart", () => {
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
+			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -1450,6 +1630,7 @@ describe("rolling restart", () => {
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
+			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
 			FREE,
@@ -1622,11 +1803,13 @@ describe("rolling restart", () => {
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
+			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
 			FREE,
 			...COMPARE_SVC("worker-b"),
 			HOLD,
+			DETACHED_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			HEALTH,
 			FREE,
@@ -1707,6 +1890,7 @@ describe("rolling restart", () => {
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
+			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
 			FREE,
@@ -1798,6 +1982,7 @@ describe("rolling restart", () => {
 		)[0]!;
 		const free = byKind((s) => s.includes("'DELETE'"))[0]!;
 		const health = byKind((s) => s.includes("/healthz"))[0]!;
+		const detached = byKind((s) => s.includes('"/detached"'))[0]!;
 		const seen: string[] = [];
 		const probe = await runOnBoard(health, (req) => {
 			seen.push(req.url);
@@ -1851,6 +2036,26 @@ describe("rolling restart", () => {
 		).toEqual({ code: 1, out: "HTTP 404" });
 		expect(
 			await runOnBoard(health, () => new Response("", { status: 500 })),
+		).toEqual({ code: 1, out: "HTTP 500" });
+		// The detached-list script names the worker's own /detached with its token,
+		// prints the JSON body, and an old worker's 404 reads as no detached runs.
+		const seenDet: string[] = [];
+		const detRes = await runOnBoard(detached, (req) => {
+			seenDet.push(
+				`${req.method} ${new URL(req.url).pathname} ${req.headers.get("x-otwr-token")}`,
+			);
+			return Response.json([{ id: "r1", running: true }]);
+		});
+		expect(seenDet[0]).toMatch(/^GET \/detached t$/);
+		expect(detRes).toEqual({
+			code: 0,
+			out: JSON.stringify([{ id: "r1", running: true }]),
+		});
+		expect(
+			await runOnBoard(detached, () => new Response("", { status: 404 })),
+		).toEqual({ code: 0, out: "[]" });
+		expect(
+			await runOnBoard(detached, () => new Response("", { status: 500 })),
 		).toEqual({ code: 1, out: "HTTP 500" });
 	}, 60_000);
 

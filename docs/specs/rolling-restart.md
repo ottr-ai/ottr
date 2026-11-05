@@ -194,6 +194,15 @@ block becomes:
    - Still busy after `HOLD_LIMIT_MS` (1 h): `DELETE ?runner`, log that the
      runner keeps a turn and its restart waits for a later run, mark it stuck,
      and go on with the next runner.
+   - Idle check, every poll: the board count alone is not enough. A turn that the
+     server step detached in an earlier run re-binds to an open row on the new
+     server, and the row is invisible to the runner count (the runner count reads
+     the live-run map, which a restart empties). So when the board says idle, the
+     roll also asks the worker itself for open detached runs (`GET /detached`
+     through a worker exec, as `[]` from an old worker without the route). The
+     worker counts as idle only when the board says idle and no detached entry
+     still runs. A detached-list exec that fails stops the roll (fails closed),
+     like an unreadable runner state.
    - Idle: `docker compose up -d --no-deps --wait <service>`. A non-zero exit
      stops the roll at once (exit 1): no further runner rolls, the server does
      not restart, the not-yet-rolled containers stay on the old image.
