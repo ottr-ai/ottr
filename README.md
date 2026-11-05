@@ -348,6 +348,7 @@ The README board screenshot has its own one-command path: `bun run readme-screen
 - [docs/how-it-works.md](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
 - [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md): the **Review due** feature.
+- [docs/adr/](docs/adr/README.md): the decision log — why the system has its shape; an ADR records a decision that is hard to reverse, surprising to a new reader, and a real trade-off.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
 
 ## Built with Ottr badge
