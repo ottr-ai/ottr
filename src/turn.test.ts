@@ -210,6 +210,8 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		targetContains: async () => false,
 		serverMergePush: async () => ({ status: "skipped" as const }),
 		fetchOriginBranch: async () => null,
+		// No rejected push in the default fixtures: the merge hold's git fact stays false.
+		branchUnpushed: async () => false,
 		// The default cannot converge (a conflict), so a rejected push still queues the
 		// recovery steer exactly as before OTTR-510; tests on the converged path override both.
 		rebaseTargetBranch: async () => ({
@@ -5012,13 +5014,20 @@ describe("turn ci watch pinning", () => {
 		// queues the card again (app.ts sets pendingBy "user") — the hold must let exactly
 		// that card run, or it would lock out the only merge that can push main (ALAT-60).
 		let pushes = 0;
-		const { store, record, loop, projects, task: a } = mergeDoneSetup({
+		const {
+			store,
+			record,
+			loop,
+			projects,
+			task: a,
+		} = mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
 					? {
 							status: "failed" as const,
-							error: "fatal: unable to access 'https://github.com/a/r.git': Could not resolve host",
+							error:
+								"fatal: unable to access 'https://github.com/a/r.git': Could not resolve host",
 						}
 					: { status: "pushed" as const, output: "" };
 			},

@@ -3114,6 +3114,7 @@ describe("agent layer boot reconcile", () => {
 			github: null,
 			remote: null,
 			dirty: false,
+			mainUnpushed: false,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,
@@ -4144,6 +4145,7 @@ describe("release-summary route", () => {
 			github: null,
 			remote: null,
 			dirty: false,
+			mainUnpushed: false,
 			latestRelease: null,
 			latestImage: null,
 			archReview: null,
@@ -6599,6 +6601,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 		github: null,
 		remote: null,
 		dirty: false,
+		mainUnpushed: false,
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
@@ -8965,10 +8968,16 @@ describe("board warnings", () => {
 			const card = (
 				over: Partial<
 					ReviewTask &
-						Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy">
+						Pick<
+							Task,
+							"state" | "project" | "stage" | "pushRetries" | "pendingBy"
+						>
 				>,
 			): ReviewTask &
-				Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy"> => ({
+				Pick<
+					Task,
+					"state" | "project" | "stage" | "pushRetries" | "pendingBy"
+				> => ({
 				id: "x",
 				kind: "work",
 				releaseVersion: null,

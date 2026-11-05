@@ -127,7 +127,10 @@ export function cardMark(
  * local main has commits origin lacks; the browser gets no git), then any stage on its
  * unfinished dependencies (one missing from `tasks` counts as done); a done card is never held. */
 export function holdFor(
-	t: Pick<Task, "id" | "stage" | "state" | "dependsOn" | "pushRetries" | "pendingBy"> & {
+	t: Pick<
+		Task,
+		"id" | "stage" | "state" | "dependsOn" | "pushRetries" | "pendingBy"
+	> & {
 		pushHold?: boolean;
 	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
