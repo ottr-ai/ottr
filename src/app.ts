@@ -10,7 +10,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { cpus, freemem, totalmem } from "node:os";
+import { cpus, freemem, homedir, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
@@ -4372,9 +4372,7 @@ export function createApp(deps: AppDeps) {
 							name,
 							apt: existsSync(aptListPath(name, workersHome)),
 							tools: existsSync(toolsListPath(name, workersHome)),
-							requirements: existsSync(
-								requirementsListPath(name, workersHome),
-							),
+							requirements: existsSync(requirementsListPath(name, workersHome)),
 							env: existsSync(envListPath(name, workersHome)),
 						}),
 					);

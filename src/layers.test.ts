@@ -443,3 +443,46 @@ describe("registry write failures are best-effort", () => {
 		expect(readLayerUse(home)).toEqual([]);
 	});
 });
+
+describe("layer containment and registry hardening", () => {
+	test("a current link pointing outside .alate/layers resolves to nothing", () => {
+		const home = tempHome();
+		const foreign = mkdtempSync(join(tmpdir(), "ottr-layer-foreign-"));
+		mkdirSync(join(home, ".alate"), { recursive: true });
+		symlinkSync(foreign, join(home, ".alate", "current"));
+		// The home is worker-writable (R5-1), so a planted `current` must not redirect
+		// the pin (or the layer-following list reads) into paths outside the layers tree.
+		expect(resolveAgentLayer(home)).toBeNull();
+		expect(pinnedAgentLayer(home)).toEqual({ ok: false, reason: "broken" });
+		rmSync(foreign, { recursive: true, force: true, maxRetries: 5 });
+	});
+
+	test("a planted in-use.json symlink is replaced, its victim stays intact", () => {
+		const home = tempHome();
+		const victim = join(home, "victim-server-only.db");
+		const victimBytes = "SQLite format 3\x00do not touch";
+		writeFileSync(victim, victimBytes);
+		mkdirSync(join(home, ".alate"), { recursive: true });
+		symlinkSync(victim, join(home, ".alate", "in-use.json"));
+		addLayerUse(home, "a");
+		// The rename replaced the symlink instead of truncating the server-only target.
+		expect(readFileSync(victim, "utf8")).toBe(victimBytes);
+		expect(readLayerUse(home).map((e) => e.id)).toEqual(["a"]);
+	});
+
+	test("planted tmp symlinks never take the registry write", () => {
+		const home = tempHome();
+		const victims = ["a.db", "b.cfg"].map((n) => {
+			const p = join(home, n);
+			writeFileSync(p, n);
+			return p;
+		});
+		mkdirSync(join(home, ".alate"), { recursive: true });
+		for (const [i, victim] of victims.entries())
+			symlinkSync(victim, join(home, ".alate", `in-use.json.${i}.tmp`));
+		addLayerUse(home, "a");
+		for (const [i, victim] of victims.entries())
+			expect(readFileSync(victim, "utf8")).toBe(["a.db", "b.cfg"][i]);
+		expect(readLayerUse(home).map((e) => e.id)).toEqual(["a"]);
+	});
+});

@@ -1,17 +1,18 @@
+import { randomBytes } from "node:crypto";
 import {
-	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
-	openSync,
-	readFileSync,
 	realpathSync,
-	renameSync,
 	symlinkSync,
-	unlinkSync,
-	writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import {
+	readRegular,
+	renameBelow,
+	unlinkBelow,
+	writeBelow,
+} from "./confine.ts";
 
 /** One installed agent layer under `<home>/.alate/layers/<id>` (OTTR-451). */
 export type AgentLayer = { id: string; dir: string };
@@ -44,21 +45,29 @@ const LINK_IF_SOURCE_EXISTS = [
 ];
 
 /**
- * The layer `<home>/.alate/current` resolves to, or null (no link, or a link that does not
- * resolve — alate repairs the switch on its next provision).
+ * The layer `<home>/.alate/current` resolves to, or null (no link, a link that does not
+ * resolve, or a link pointing outside `<home>/.alate/layers` — alate never installs
+ * there, so anything else is a plant; the callers fall back to the flat home).
  */
 export function resolveAgentLayer(home: string): AgentLayer | null {
 	const pin = pinTarget(home);
 	return pin ? { id: basename(pin), dir: pin } : null;
 }
 
-/** Realpath of the current link, or null when it does not resolve. */
+/** Realpath of the current link, or null when it does not resolve or escapes the layers tree. */
 function pinTarget(home: string): string | null {
+	let dir: string;
 	try {
-		return realpathSync(currentLink(home));
+		dir = realpathSync(currentLink(home));
 	} catch {
 		return null;
 	}
+	// The home is worker-writable (R5-1), so `current` itself can be planted: refuse any
+	// target that is not `<home>/.alate/layers/<one segment>` — the only shape alate
+	// creates. basename() is the layer id; a deeper or sibling path is a plant.
+	const layersRoot = join(home, ".alate", "layers");
+	if (dirname(dir) !== layersRoot) return null;
+	return dir;
 }
 
 /**
@@ -122,7 +131,12 @@ const inUsePath = (home: string): string => join(home, ".alate", "in-use.json");
 
 function readRegistry(home: string): UseEntry[] {
 	try {
-		const parsed: unknown = JSON.parse(readFileSync(inUsePath(home), "utf8"));
+		// readRegular refuses a planted symlink/FIFO at the registry: its content never
+		// matters enough to follow a link into server-only paths, and the [] fallback
+		// keeps clean-up conservative (it only over-retains layers).
+		const parsed: unknown = JSON.parse(
+			readRegular(inUsePath(home)).toString("utf8"),
+		);
 		if (typeof parsed !== "object" || parsed === null || !("layers" in parsed))
 			return [];
 		const layers = parsed.layers;
@@ -147,22 +161,28 @@ function readRegistry(home: string): UseEntry[] {
 }
 
 function writeRegistry(home: string, entries: UseEntry[]): void {
-	const path = inUsePath(home);
-	const tmp = `${path}.${process.pid}.tmp`;
+	// Worker-writable home (R5-1): every path below it is plantable, so the write goes
+	// through the confine helpers — a symlink at `.alate`, at the tmp file, or at the
+	// registry fails the write ("refusing"), it is never followed. A random tmp suffix
+	// keeps a planted tmp name from predicting the write; the rename replaces a planted
+	// `in-use.json` symlink instead of following it.
+	const tmp = `in-use.json.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
 	try {
-		mkdirSync(dirname(path), { recursive: true });
-		const fd = openSync(tmp, "w");
-		try {
-			writeSync(fd, JSON.stringify({ layers: entries }));
-		} finally {
-			closeSync(fd);
-		}
-		renameSync(tmp, path);
+		writeBelow(
+			home,
+			join(home, ".alate", tmp),
+			JSON.stringify({ layers: entries }),
+		);
+		renameBelow(
+			home,
+			join(home, ".alate", tmp),
+			join(home, ".alate", "in-use.json"),
+		);
 	} catch (err) {
 		try {
-			unlinkSync(tmp);
+			unlinkBelow(home, join(home, ".alate", tmp));
 		} catch {
-			/* nothing to clean */
+			/* the write failure is the one that matters */
 		}
 		console.warn(`! agent layer registry write failed: ${String(err)}`);
 	}

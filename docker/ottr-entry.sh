@@ -42,7 +42,10 @@ if [ -n "$OTTR_BOARD_OMP_HOME" ]; then
 fi
 if [ -n "$PI_CODING_AGENT_DIR" ]; then
 	mkdir -p "$PI_CODING_AGENT_DIR"
-	if [ ! -e "$PI_CODING_AGENT_DIR/config.yml" ]; then
+	# A seeded agent layer counts as seeded: the board home carries .alate/current
+	# (docs/specs/agent-layer-switch.md). -e follows the link, so a broken link
+	# still warns.
+	if [ ! -e "$PI_CODING_AGENT_DIR/config.yml" ] && [ ! -e "$OTTR_BOARD_OMP_HOME/.alate/current" ]; then
 		echo "ottr-entry: R5-1: $PI_CODING_AGENT_DIR is not seeded; refused the shared home $HOME as its source (worker-writable). The board's omp runs without the agent layer until a trusted seed: docker compose run --rm board-seed --repo <owner/name> (docs/WORKERS.md)" >&2
 	fi
 fi
