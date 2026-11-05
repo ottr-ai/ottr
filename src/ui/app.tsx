@@ -1929,15 +1929,16 @@ export function DeepenReview({
 /** The Help pop-over text next to the composer label: what makes a good prompt, and what Deepen does. */
 const DEEPEN_HELP = (
 	<>
-		<p>
-			A good prompt states the goal behind the task, what the work must not
-			touch, and how to check the result.
-		</p>
-		<p>
-			Deepen asks a model to rewrite the draft with four questions: the expert
-			method, the raw material, the tools, and an outside check. The rewrite
-			opens as a diff; nothing changes until you accept it.
-		</p>
+		<b className="help-title">Cover in a prompt</b>
+		<ul className="help-list">
+			<li>Goal: why the task matters</li>
+			<li>Limits: what must not change</li>
+			<li>Check: how to prove it works</li>
+			<li>Method: how an expert would do it</li>
+			<li>Material: files, data, examples</li>
+			<li>Tools: commands and services to use</li>
+		</ul>
+		<p className="help-note">Deepen fills the gaps as a diff you accept.</p>
 	</>
 );
 
@@ -2131,29 +2132,33 @@ export function ComposeDialog({
 							)}
 							{submitLabel}
 						</button>
-					</div>
-					{deepen !== undefined && (
-						<div className="deepen-row">
-							<button
-								type="button"
-								className="deepen-btn"
-								disabled={text.trim().length === 0 || deepenState.busy}
-								aria-busy={deepenState.busy || undefined}
-								onClick={runDeepen}
-							>
-								{deepenState.busy && (
-									<span className="spinner" aria-hidden="true" />
-								)}
-								<Icon name="edit" size={14} />
-								Deepen
-							</button>
-							<Help label="Deepen" text={DEEPEN_HELP} />
-							<span className="deepen-hint">
-								Ask a model to rewrite the draft as a diff; nothing changes
-								until you accept it.
+						{deepen !== undefined && (
+							<span className="compose-deepen">
+								<button
+									type="button"
+									className="ghost deepen-btn"
+									disabled={text.trim().length === 0 || deepenState.busy}
+									aria-busy={deepenState.busy || undefined}
+									onClick={runDeepen}
+								>
+									{deepenState.busy ? (
+										<span className="spinner" aria-hidden="true" />
+									) : (
+										<Icon name="edit" size={14} />
+									)}
+									Deepen
+								</button>
+								<Help label="Deepen" text={DEEPEN_HELP} />
 							</span>
-						</div>
-					)}
+						)}
+					</div>
+					{/* The keys under the card as chips; the full hint stays in the tooltip and for screen readers. */}
+					<p className="compose-keys" title={hint}>
+						<kbd>Enter</kbd> {submitLabel.toLowerCase()}
+						<span aria-hidden="true">·</span>
+						<kbd>Shift</kbd>+<kbd>Enter</kbd> new line
+						<span className="sr"> {hint}</span>
+					</p>
 					{deepen !== undefined && review !== null && (
 						<DeepenReview
 							original={review.original}
@@ -2167,7 +2172,6 @@ export function ComposeDialog({
 							Deepen failed: {deepenErr} The draft is unchanged — try again.
 						</p>
 					)}
-					<p className="hint">{hint}</p>
 					{err !== null && (
 						<p className="auth-error" role="alert">
 							{err}

@@ -3870,10 +3870,9 @@ describe("ComposeDialog deepen", () => {
 		);
 		expect(html).toContain('aria-label="About Deepen"');
 		expect(html).toContain("Deepen");
-		expect(html).toContain("deepen-row");
-		expect(html).toContain("deepen-hint");
+		expect(html).toContain("compose-keys");
 		// Empty draft: Deepen and the submit button are both disabled in the markup.
-		expect(html).toContain('class="deepen-btn" disabled=""');
+		expect(html).toContain('class="ghost deepen-btn" disabled=""');
 		expect(html).toContain('type="submit" class="primary" disabled=""');
 		expect(html).not.toContain("Use rewrite");
 	});
