@@ -4416,7 +4416,7 @@ describe("Drawer proposal panel editing (client)", () => {
 	});
 	afterAll(() => {
 		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of Object.entries(originals)) {
+		for (const [key, value] of originals) {
 			if (value === undefined) delete host[key];
 			else host[key] = value;
 		}
