@@ -1,5 +1,6 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	existsSync,
@@ -10,6 +11,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -69,29 +71,73 @@ const outcome = (over: Partial<Outcome> = {}): Outcome => ({
 	...over,
 });
 
+/**
+ * Builds a compiled fake omp once per source content, at a fixed hash-keyed temp path,
+ * and reuses the exe when it exists. Compiling per load leaked ~100 MB folders into the
+ * temp dir on every bun test and every Stryker mutant run (OTTR-524); killed mutant
+ * runs never reach afterAll, so deletion cannot be relied on — reuse can. The js and
+ * the exe stage under pid-suffixed temp names and rename into place, so parallel
+ * test-file loads never race on a half-written build. The folder keeps an ottr- prefix,
+ * so worker.ts's hourly sweepTmpDirs ages it out like any other test litter once the
+ * source changes and the hash moves on.
+ */
+const compiledFakeOmp = (
+	prefix: string,
+	exeName: string,
+	source: string,
+): string => {
+	const dir = join(
+		tmpdir(),
+		`${prefix}${createHash("sha256").update(source).digest("hex").slice(0, 16)}`,
+	);
+	const exe = join(dir, exeName);
+	if (existsSync(exe)) return exe;
+	mkdirSync(dir, { recursive: true });
+	const js = join(dir, `${exeName}.js`);
+	const jsTmp = `${js}.${process.pid}.tmp`;
+	writeFileSync(jsTmp, source);
+	renameSync(jsTmp, js);
+	const exeTmp = `${exe}.${process.pid}.tmp`;
+	Bun.spawnSync([
+		process.execPath,
+		"build",
+		"--compile",
+		js,
+		"--outfile",
+		exeTmp,
+	]);
+	renameSync(exeTmp, exe);
+	return exe;
+};
+
 // A compiled stand-in for worker-dispatched omp. `bun build --compile` alone can take
 // seconds under concurrent machine load, so it runs once here, outside every test's
 // timeout budget; a compiled exe also boots without bun's per-spawn transpile cost.
-const workerOmpDir = mkdtempSync(join(tmpdir(), "ottr-worker-omp-"));
-const workerOmp = join(workerOmpDir, "fake-omp.exe");
-writeFileSync(
-	join(workerOmpDir, "fake-omp.js"),
-	`process.stdout.write("ARGV " + JSON.stringify(process.argv.slice(2)) + "\\n");
+const workerOmpSource = `process.stdout.write("ARGV " + JSON.stringify(process.argv.slice(2)) + "\\n");
 process.stdout.write(JSON.stringify({ type: "session", id: "sess-worker" }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
-process.exit(0);`,
+process.exit(0);`;
+const workerOmp = compiledFakeOmp(
+	"ottr-worker-omp-",
+	"fake-omp.exe",
+	workerOmpSource,
 );
-Bun.spawnSync([
-	process.execPath,
-	"build",
-	"--compile",
-	join(workerOmpDir, "fake-omp.js"),
-	"--outfile",
-	workerOmp,
-]);
-afterAll(() =>
-	rmSync(workerOmpDir, { recursive: true, force: true, maxRetries: 5 }),
-);
+
+describe("compiledFakeOmp", () => {
+	test("a second load of the same source reuses the compiled exe without recompiling", () => {
+		const before = statSync(workerOmp);
+		const again = compiledFakeOmp(
+			"ottr-worker-omp-",
+			"fake-omp.exe",
+			workerOmpSource,
+		);
+		expect(again).toBe(workerOmp);
+		// A rebuild would rename a fresh exe over this one: a new inode with a new mtime.
+		const after = statSync(again);
+		expect(after.ino).toBe(before.ino);
+		expect(after.mtimeMs).toBe(before.mtimeMs);
+	});
+});
 
 describe("childEnv", () => {
 	test("carries board coordinates and token; an operator-set OTTR_BOARD_URL wins, an inherited token never does", () => {
@@ -3005,29 +3051,18 @@ mock.module("node:os", () => ({
 
 // A compiled worker omp stand-in that reports its env and holds the run open until a
 // release file appears, so the test can switch the layer under a live run.
-const layerOmpDir = mkdtempSync(join(tmpdir(), "ottr-layer-omp-"));
-const layerOmp = join(layerOmpDir, "layer-omp.exe");
-writeFileSync(
-	join(layerOmpDir, "layer-omp.js"),
-	`import { writeFileSync, existsSync } from "node:fs";
+const layerOmpSource = `import { writeFileSync, existsSync } from "node:fs";
 writeFileSync(process.env.LAYER_ENV_OUT, JSON.stringify(process.env));
 const release = process.env.LAYER_RELEASE;
 const t0 = Date.now();
 while (!existsSync(release) && Date.now() - t0 < 20000) {}
 process.stdout.write(JSON.stringify({ type: "session", id: "sess-layer" }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
-`,
-);
-Bun.spawnSync([
-	process.execPath,
-	"build",
-	"--compile",
-	join(layerOmpDir, "layer-omp.js"),
-	"--outfile",
-	layerOmp,
-]);
-afterAll(() =>
-	rmSync(layerOmpDir, { recursive: true, force: true, maxRetries: 5 }),
+`;
+const layerOmp = compiledFakeOmp(
+	"ottr-layer-omp-",
+	"layer-omp.exe",
+	layerOmpSource,
 );
 
 /** A minimal installed layer with its mnemopi config, the shape alate ships. */
