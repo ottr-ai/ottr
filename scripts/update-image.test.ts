@@ -2311,9 +2311,11 @@ describe("rolling restart", () => {
 			"local still runs its turns: the server restart follows when they finish",
 		]);
 		expect(f.waits).toEqual([30_000, 30_000]);
-		// Posts: the local hold, its renewal, then one hold per worker. The local
-		// runner never takes a worker hold or a detach: it is the server's own child.
+		// Posts: the local hold, its two renewals, then one hold per worker. The
+		// local runner never takes a worker hold or a detach: it is the server's
+		// own child.
 		expect(postBody(f, 1)).toEqual({ runner: "local" });
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(5);
 		expect(f.calls).not.toContain(DETACH_SVC("local"));
 		expect(f.calls).toContain(RESTART);
 	}, 60_000);

@@ -1104,7 +1104,9 @@ async function rollServer(
 	// Nothing changed and no seed waits: the done path and the fallen-through
 	// path both no-op (a final up with unchanged images, recordSeed with seeded
 	// false), and the caller treats any non-early/non-deferred kind as done.
-	// ponytail: mutants of the done literal are behavior-preserving.
+	// ponytail: mutants of the done literal are behavior-preserving — here and at
+	// the recreate/restart returns below, a mislabeled done still reaches the same
+	// no-work path the caller already treats as done.
 	if (!changed && !seeded) return { kind: "done" };
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
@@ -1141,7 +1143,8 @@ async function rollServer(
 	board.preparing = fresh.preparing;
 	board.runners = fresh.runners;
 	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
-	// exclusive to the first pass, so Stryker's i-- mutant prints the same note.
+	// exclusive to the first pass, so Stryker's i-- mutant prints the same note;
+	// its i !== 0 mutant only moves the note one poll later, same count.
 	for (let i = 0; ; i++) {
 		const local = board.runners.find((r) => r.id === "local");
 		if (local === undefined || local.turns === 0) break;
@@ -1177,7 +1180,8 @@ async function rollServer(
 		}
 	}
 	// Worker holds stop new dispatches for the seconds of the restart window; the
-	// cards stay queued, and no board-wide notice shows.
+	// cards stay queued, and no board-wide notice shows. Local skips: its hold is
+	// already on, and a second hold for it would name an empty runner.
 	for (const r of board.runners) {
 		if (r.id === "local") continue;
 		const h = await exec(holdRunner(r.id));
@@ -1215,6 +1219,8 @@ async function rollServer(
 			: { kind: "done" };
 	}
 	const rs = await d.docker("compose", ...compose, "restart", "server");
+	// ponytail: rs.out is always a defined string, so the trim's optional-chain
+	// mutant cannot change the message.
 	return rs.code === 0
 		? { kind: "done" }
 		: {
