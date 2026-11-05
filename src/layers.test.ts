@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
 	addLayerUse,
 	pinnedAgentLayer,
@@ -481,8 +481,8 @@ describe("layer containment and registry hardening", () => {
 		for (const [i, victim] of victims.entries())
 			symlinkSync(victim, join(home, ".alate", `in-use.json.${i}.tmp`));
 		addLayerUse(home, "a");
-		for (const [i, victim] of victims.entries())
-			expect(readFileSync(victim, "utf8")).toBe(["a.db", "b.cfg"][i]);
+		for (const victim of victims)
+			expect(readFileSync(victim, "utf8")).toBe(basename(victim));
 		expect(readLayerUse(home).map((e) => e.id)).toEqual(["a"]);
 	});
 });
