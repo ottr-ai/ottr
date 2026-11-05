@@ -11,6 +11,10 @@ const STAGE_LABEL: Record<Stage, string> = {
 const ONE_SHOT =
 	"This run is one-shot: nothing wakes you after your turn ends. Never finish with a pending wait or background job; if a slow gate is force-backgrounded, block on it in the foreground, or call report_outcome needs_you instead of ending the turn.";
 
+/** A vague card must not run on a guess: the work agent grills the user first, like the backlog grill session. */
+const VAGUE_RULE =
+	'If the task text is too vague to build without guessing the user\'s intent — for example "add a password-forgotten feature" with no flow, channel, limits or acceptance check — do not guess and do not change any file: grill the user with the ask tool (1-5 questions, each with 2 to 5 concrete options) on the scope, the flows, the edge cases, the acceptance checks and the non-goals, then end the turn with needs_you; build only once the answers settle the intent. A task text that already says what to build and how to check it runs without questions.';
+
 /** The card shows `details`, not the chat, so an answer has to go there. */
 const WORK_OUTCOMES =
 	"ready (committed, needs integration; summary is one line; details are the release notes: only bug fixes, changes and new features — no verification output), answered (question only, nothing to merge; put your complete answer in details) or needs_you (with the exact question — call ask with it and its options first, then end; the tracker then surfaces the question with clickable choices). If the task exists to get your input — questions, grilling, decisions — end with the ask tool's questions outstanding or needs_you, never answered";
@@ -54,6 +58,7 @@ export function workPrompt(o: {
 
 ---
 orchestrate this task following AGENTS.md: plan, implement, verify, and commit on branch ${o.branch}.
+${VAGUE_RULE}
 A task that writes a spec or implements code is not architecture work, even when it restructures core dispatch. Only the Review flow, release reviews, and architecture reviews run the mutation gates.
 In a fresh worktree, run the project's dependency install in locked/frozen mode before the gates (bun: \`bun install --frozen-lockfile\`).
 When a commit replaces an earlier commit's change instead of fixing it, reference the earlier commit with a \`Supersedes: <sha>\` body line. The release notes drop the named commit's bullet.
