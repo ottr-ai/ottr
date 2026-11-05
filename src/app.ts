@@ -577,7 +577,7 @@ export function boardWarnings(
 	env: Record<string, string | undefined> = process.env,
 	expiry: TokenExpiryView = tokenExpiryView(env),
 	tasks: readonly (ReviewTask &
-		Pick<Task, "state" | "project" | "stage" | "pushRetries">)[] = [],
+		Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy">)[] = [],
 	now: number = Date.now(),
 ): string[] {
 	if (!existsSync(join(agentDir(), "config.yml")))
@@ -612,7 +612,10 @@ export function boardWarnings(
 	// flat cross-project list.
 	const byProject = new Map<
 		string,
-		(ReviewTask & Pick<Task, "state" | "project" | "stage" | "pushRetries">)[]
+		(
+			ReviewTask &
+				Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy">
+		)[]
 	>();
 	for (const t of tasks) {
 		const group = byProject.get(t.project);

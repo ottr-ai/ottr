@@ -140,18 +140,23 @@ function findingsOpen(
 /** OTTR-506: why the push hold parks a queued merge while the project's local target branch
  * has commits origin lacks (a rejected server push left it ahead), else null. The rejected
  * card's own rebase retry (pushRetries > 0, queued at merging) stays runnable: it rebases
- * main onto origin, re-runs the gates, and its server push ends the hold. Every other queued
- * merge waits, so one rejection cannot pile merges onto an unpushed main. Pure: `mainUnpushed`
- * is the git fact (worktree.ts branchUnpushed), passed in because the scheduler stays git-free. */
+ * main onto origin, re-runs the gates, and its server push ends the hold. So does a card the
+ * user replied to (pendingBy "user"): a push that failed without being rejected (auth,
+ * network), a rejected push whose origin re-check failed, and a rejected hold-approved push
+ * all park needs_you with pushRetries still 0 — if the user's reply could not run, the hold
+ * would lock out the only card that can push main (ALAT-60 recovered exactly this way).
+ * Every other automatically scheduled merge waits, so one rejection cannot pile merges onto
+ * an unpushed main. Pure: `mainUnpushed` is the git fact (worktree.ts branchUnpushed),
+ * passed in because the scheduler stays git-free. */
 export const PUSH_HOLD = "waiting for main to reach origin/main";
 
 export function pushHold(
 	mainUnpushed: boolean,
-	t: Pick<Task, "stage" | "state" | "pushRetries">,
+	t: Pick<Task, "stage" | "state" | "pushRetries" | "pendingBy">,
 ): string | null {
 	if (!mainUnpushed || t.stage !== "merging" || t.state !== "queued")
 		return null;
-	return t.pushRetries > 0 ? null : PUSH_HOLD;
+	return t.pushRetries > 0 || t.pendingBy === "user" ? null : PUSH_HOLD;
 }
 
 /** Why the tracker holds a queued merge, else null. While a review runs, and until its findings are
@@ -162,7 +167,7 @@ export function pushHold(
  * queued merge but the rejected card's rebase retry waits too (pushHold). */
 export function mergeHold(
 	tasks: readonly ReviewTask[],
-	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries">,
+	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries" | "pendingBy">,
 	o: { mainUnpushed?: boolean } = {},
 ): string | null {
 	for (const r of tasks) {
@@ -204,7 +209,8 @@ export function findingsHold(
  * <version>"): the cards its hold names, its own findings excluded (they merge while it runs).
  * A done or cancelled review, and the Review button's card (no releaseVersion), holds nothing. */
 export function releaseHeldMerges<
-	T extends ReviewTask & Pick<Task, "state" | "stage" | "pushRetries">,
+	T extends ReviewTask &
+		Pick<Task, "state" | "stage" | "pushRetries" | "pendingBy">,
 >(tasks: readonly T[], review: ReviewTask & Pick<Task, "state">): T[] {
 	if (
 		review.cancelledAt !== null ||

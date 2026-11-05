@@ -8964,10 +8964,11 @@ describe("board warnings", () => {
 			const now = 1_762_000_000_000;
 			const card = (
 				over: Partial<
-					ReviewTask & Pick<Task, "state" | "project" | "stage" | "pushRetries">
+					ReviewTask &
+						Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy">
 				>,
 			): ReviewTask &
-				Pick<Task, "state" | "project" | "stage" | "pushRetries"> => ({
+				Pick<Task, "state" | "project" | "stage" | "pushRetries" | "pendingBy"> => ({
 				id: "x",
 				kind: "work",
 				releaseVersion: null,
@@ -8975,6 +8976,7 @@ describe("board warnings", () => {
 				stage: "todo",
 				state: "queued",
 				pushRetries: 0,
+				pendingBy: null,
 				project: "p",
 				createdAt: now - 10_000,
 				doneAt: null,
@@ -9064,7 +9066,10 @@ describe("board warnings", () => {
 			const twin = (
 				project: string,
 			): (ReviewTask &
-				Pick<Task, "state" | "project" | "stage" | "pushRetries">)[] => [
+				Pick<
+					Task,
+					"state" | "project" | "stage" | "pushRetries" | "pendingBy"
+				>)[] => [
 				card({
 					id: `${project}-release`,
 					project,

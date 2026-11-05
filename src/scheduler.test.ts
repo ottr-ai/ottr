@@ -288,6 +288,12 @@ describe("push hold (OTTR-506)", () => {
 		expect(
 			pickRunnable([heldA, heldB, todo], { ...opts, mainUnpushed: true }),
 		).toEqual([todo]);
+		// A card the user replied to still runs: a push failure parked it needs_you with
+		// pushRetries 0, and the reply is the only way its merge turn can push main.
+		const replied = task({ stage: "merging", queuedAt: 50, pendingBy: "user" });
+		expect(
+			pickRunnable([replied, heldA, todo], { ...opts, mainUnpushed: true }),
+		).toEqual([replied, todo]);
 	});
 
 	test("pushHold: queued merges wait, the retry card and every other stage run", () => {
@@ -295,13 +301,25 @@ describe("push hold (OTTR-506)", () => {
 			stage: "merging",
 			state: "queued",
 			pushRetries: 0,
+			pendingBy: null,
 		} as const;
 		expect(pushHold(true, merging)).toBe(PUSH_HOLD);
 		expect(pushHold(true, { ...merging, pushRetries: 2 })).toBeNull();
+		// A user reply on a card parked needs_you (pushRetries 0) must still run — see
+		// the doc comment: without this the hold deadlocks the repair.
+		expect(pushHold(true, { ...merging, pendingBy: "user" })).toBeNull();
+		expect(pushHold(true, { ...merging, pendingBy: "supervisor" })).toBe(
+			PUSH_HOLD,
+		);
 		expect(pushHold(true, { ...merging, state: "needs_you" })).toBeNull();
 		expect(pushHold(true, { ...merging, state: "idle" })).toBeNull();
 		expect(
-			pushHold(true, { stage: "todo", state: "queued", pushRetries: 0 }),
+			pushHold(true, {
+				stage: "todo",
+				state: "queued",
+				pushRetries: 0,
+				pendingBy: null,
+			}),
 		).toBeNull();
 		expect(pushHold(false, merging)).toBeNull();
 	});

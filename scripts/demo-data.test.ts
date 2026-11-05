@@ -61,6 +61,7 @@ const toReview = (t: Row) => ({
 	stage: t.stage,
 	state: t.state,
 	pushRetries: t.push_retries,
+	pendingBy: t.pending_by,
 	createdAt: t.created_at,
 	doneAt: t.done_at,
 	dependsOn: t.depends_on,

@@ -5006,6 +5006,77 @@ describe("turn ci watch pinning", () => {
 		expect(record.removeWorktree).toHaveLength(2);
 	});
 
+	test("a push failure that parks needs_you still recovers when the user replies", async () => {
+		// A non-rejection push failure (auth, network) parks needs_you with pushRetries 0;
+		// local main holds the merged commits, so the push hold engages. The user's reply
+		// queues the card again (app.ts sets pendingBy "user") — the hold must let exactly
+		// that card run, or it would lock out the only merge that can push main (ALAT-60).
+		let pushes = 0;
+		const { store, record, loop, projects, task: a } = mergeDoneSetup({
+			serverMergePush: async () => {
+				pushes += 1;
+				return pushes === 1
+					? {
+							status: "failed" as const,
+							error: "fatal: unable to access 'https://github.com/a/r.git': Could not resolve host",
+						}
+					: { status: "pushed" as const, output: "" };
+			},
+			// The tick's refresh reads the same git fact the production failure leaves:
+			// unpushed between the failed push and the repairing one, pushed after it.
+			branchUnpushed: async () => pushes === 1,
+		});
+		// No pinned origin URL: the in-turn re-check cannot run, so the card parks.
+		store.setSettings({ originUrl: null, maxParallel: 0 });
+		await loop.runTurn(store.name, a.id);
+		const parked = store.getTask(a.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.pushRetries).toBe(0);
+		// The failure left main unpushed: the hold engages for every queued merge.
+		expect(projects.get(store.name)!.mainUnpushed).toBe(true);
+		const b = store.createTask("merge b please");
+		store.updateTask(b.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/b",
+		});
+		const gate = () =>
+			pickRunnable(store.listTasks(), {
+				maxParallel: null,
+				hasRules: true,
+				mainUnpushed: true,
+			}).map((t) => t.id);
+		// A supervisor queue of the parked card stays held: no user directed it, and the
+		// normal queued merge b is held too — only a user reply (or a rebase retry) runs.
+		store.updateTask(a.id, {
+			state: "queued",
+			needsReason: null,
+			pendingPrompt: "retry",
+			pendingBy: "supervisor",
+			queuedAt: Date.now(),
+		});
+		expect(gate()).toEqual([]);
+		store.updateTask(a.id, { state: "needs_you", pendingPrompt: null });
+		// The user replies: the reply route queues the card with pendingBy "user".
+		store.updateTask(a.id, {
+			state: "queued",
+			needsReason: null,
+			pendingPrompt: "retry the push",
+			pendingBy: "user",
+			queuedAt: Date.now(),
+		});
+		expect(gate()).toEqual([a.id]);
+		// The recovered turn pushes and lands, and the hold lifts for the other card.
+		await loop.runTurn(store.name, a.id);
+		expect(store.getTask(a.id)!.stage).toBe("done");
+		expect(projects.get(store.name)!.mainUnpushed).toBe(false);
+		expect(pushes).toBe(2);
+		await loop.runTurn(store.name, b.id);
+		expect(store.getTask(b.id)!.stage).toBe("done");
+		expect(pushes).toBe(3);
+		expect(record.removeWorktree).toHaveLength(2);
+	});
+
 	test("the third rejected push parks the card at needs_you with git's reason", async () => {
 		const { store, loop, task } = mergeDoneSetup({
 			serverMergePush: async () => ({
