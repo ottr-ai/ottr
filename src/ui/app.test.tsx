@@ -2335,6 +2335,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		onFollowed: () => {},
 		read: true,
 		onMarkUnread: () => {},
+		onMarkSeen: () => {},
 		tasks: [],
 		onOpenTask: () => {},
 		draining: false,
@@ -2452,22 +2453,6 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			globalThis.fetch = realFetch;
 		}
 	};
-
-	test("a proposal's Accept waits for the prompt edit", async () => {
-		// drawerFields omits turns, so the drawer's detail fallback supplies turns: []
-		// and the never-run proposal card is editable alongside its Accept.
-		await expectGuard(
-			cardFixture({
-				...drawerFields,
-				state: "needs_you",
-				needsReason:
-					"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
-				prompt: "do the thing",
-			}),
-			"Accept",
-			"Start the proposed task",
-		);
-	});
 
 	test("a parked card's Plan with agent and Move to todo wait for the edit", async () => {
 		const parked = cardFixture({

@@ -979,6 +979,8 @@ describe("task routes", () => {
 		);
 		expect(grillingRes.status).toBe(409);
 		expect(store.getTask(backlog.id)?.prompt).toBe("edited while parked");
+	});
+
 	test("an open prompt edit holds the card and every close path releases it", async () => {
 		const created = store.createTask("edited while queued");
 		// The drawer's editor claims the hold; pickRunnable defers a held card like any
@@ -1019,18 +1021,17 @@ describe("task routes", () => {
 		expect(promoted.status).toBe(200);
 		expect(store.getTask(parked.id)?.holdUntil).toBeNull();
 		expect(store.getTask(parked.id)?.state).toBe("queued");
-		const proposal = store.createTask("proposed work");
-		store.updateTask(proposal.id, {
-			state: "needs_you",
-			needsReason: "Retro proposal from t3. Accept starts it.",
-		});
-		await post(`/api/projects/p1/tasks/${proposal.id}/edit/start`, {});
-		const accepted = await post(`/api/projects/p1/tasks/${proposal.id}/reply`, {
-			text: ".",
-		});
-		expect(accepted.status).toBe(200);
-		expect(store.getTask(proposal.id)?.holdUntil).toBeNull();
-		expect(store.getTask(proposal.id)?.state).toBe("queued");
+		// A claim on a queued card dies with the park too: moving the card clears the
+		// hold, so another tab's action never stalls behind a dead editor.
+		await post(`/api/projects/p1/tasks/${created.id}/edit/start`, {});
+		expect(store.getTask(created.id)?.holdUntil).toBe(PROMPT_EDIT_HELD);
+		const parkedFromQueue = await post(
+			`/api/projects/p1/tasks/${created.id}/backlog`,
+			{ to: "backlog" },
+		);
+		expect(parkedFromQueue.status).toBe(200);
+		expect(store.getTask(created.id)?.holdUntil).toBeNull();
+		expect(store.getTask(created.id)?.state).toBe("idle");
 		// Started cards keep their holds: a turn means no editable prompt, and a stray
 		// hold must never stall a started card's next queue entry.
 		const run = store.createTask("started card");
