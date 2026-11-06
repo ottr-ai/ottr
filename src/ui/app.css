@@ -626,7 +626,7 @@ textarea {
 .meter[data-level="crit"] .meter-value {
 	color: var(--crit-text);
 }
-/* App bar quiet line: running count, tightest quota as a time-over-quota twin bar, machine dot.
+/* App bar quiet line: running count, then the tightest quota as a time-over-quota twin bar.
    The twin bar uses the popover's .qt shapes: a thin bright time line, a boxed quota bar. */
 .sb-grp {
 	display: inline-flex;
@@ -721,15 +721,26 @@ textarea {
 .sb-twin[data-level="crit"] .q i {
 	background: var(--crit);
 }
-.sb-mach {
+/* The System warning link beside the meters, present only while a container warns: the amber
+   triangle alone, its reasons in the accessible name and tooltip. It takes over the meters'
+   auto margin, so the trailing icons keep the bar's right edge. */
+.meters:has(~ .sb-warn) {
+	margin-right: 0;
+}
+.sb-warn {
 	display: inline-flex;
-	color: var(--normal-fill);
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	margin-right: auto;
+	border: 1px solid transparent;
+	border-radius: 4px;
 }
-.sb-mach[data-level="high"] {
-	color: var(--alarm);
-}
-.sb-mach[data-level="crit"] {
-	color: var(--crit);
+.sb-warn:hover {
+	background: var(--panel);
+	border-color: var(--line-soft);
 }
 /* Phone-only bar chrome: the areas popout trigger; at wide viewports the rail takes its
    place, and the bar's first icon folds the rail instead (.rail-toggle, hidden on phones).
@@ -1187,87 +1198,6 @@ textarea {
 	display: block;
 	flex: 1;
 	width: auto;
-}
-/* Machine load in the system popover: CPU and RAM side by side, one column per window against
-   the 85 % band line; the CPU columns carry a bright notch at the peak sample. */
-.mc {
-	display: grid;
-	grid-template-columns: 1fr 1fr;
-	gap: 14px;
-}
-.mc h3 {
-	margin: 0 0 6px;
-	font-size: 12px;
-	font-weight: 600;
-	color: var(--text);
-}
-.mc-cols {
-	position: relative;
-	display: grid;
-	grid-template-columns: repeat(3, 1fr);
-	align-items: end;
-	gap: 8px;
-	height: 56px;
-	border-bottom: 1px solid var(--line);
-}
-.mc-band {
-	position: absolute;
-	z-index: 1;
-	right: -2px;
-	bottom: 85%;
-	left: -2px;
-	height: 1px;
-	background: var(--text);
-	opacity: 0.7;
-}
-.mc-col {
-	position: relative;
-	height: 100%;
-	background: var(--well);
-}
-.mc-col i {
-	position: absolute;
-	right: 0;
-	bottom: 0;
-	left: 0;
-	background: var(--normal-fill);
-	transition: height 0.4s var(--ease);
-}
-.mc-col[data-level="high"] i {
-	background: var(--alarm);
-}
-.mc-col[data-level="crit"] i {
-	background: var(--crit);
-}
-.mc-col s {
-	position: absolute;
-	right: -2px;
-	left: -2px;
-	height: 2px;
-	background: var(--text-strong);
-	text-decoration: none;
-}
-.mc-keys {
-	display: grid;
-	grid-template-columns: repeat(3, 1fr);
-	gap: 8px;
-	margin-top: 4px;
-	font-size: 11.5px;
-	text-align: center;
-	color: var(--dim);
-	font-variant-numeric: tabular-nums;
-}
-.mc-keys b {
-	display: block;
-	font-size: 12.5px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
-.mc-keys b[data-level="high"] {
-	color: var(--alarm);
-}
-.mc-keys b[data-level="crit"] {
-	color: var(--crit-text);
 }
 /* Quota windows in the system popover: one grid row per window. The time line and the quota bar
    differ in shape and weight (a thin bright line with an end dot, a boxed grey bar), not only tone. */
@@ -2228,6 +2158,7 @@ button.notif-link {
 }
 .project-id h1,
 .overview h1,
+.system-view h1,
 .empty h1 {
 	font-size: 20px;
 	font-weight: 600;
@@ -4413,6 +4344,192 @@ dialog.confirm-dialog {
 .settings-sec > .meter .meter-track {
 	display: block;
 	width: auto;
+}
+/* ---- System view (/system): containers, the Docker VM and the holds. ---- */
+.system-view {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+}
+/* The containers table is a data table: it scrolls sideways inside its .ov-wrap card on narrow
+   panes (WCAG 1.4.10 exempts data tables from reflow); the page itself never does. */
+.sys {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 13px;
+	font-variant-numeric: tabular-nums;
+}
+.sys th,
+.sys td {
+	padding: 10px 14px;
+	text-align: left;
+	vertical-align: top;
+	white-space: nowrap;
+	border-bottom: 1px solid var(--line-soft);
+}
+.sys tr:last-child > * {
+	border-bottom: 0;
+}
+.sys thead th {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+}
+.sys tbody th {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.sys td {
+	color: var(--text-strong);
+}
+.sys-sub,
+.sys-gap {
+	color: var(--dim);
+}
+.sys-name {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+.sys-name .mark {
+	width: 12px;
+	height: 12px;
+}
+/* A warning row: amber tint, the warning mark, and the reasons as text under the name, so
+   the hue never carries the warning alone. */
+.sys tr[data-warn] > * {
+	background: var(--alarm-bg);
+}
+.sys-warns {
+	margin: 4px 0 0;
+	padding: 0;
+	list-style: none;
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--text-strong);
+}
+.sys-metric {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+.sys-cards {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px 8px;
+}
+.sys-cards + .sys-cards {
+	margin-top: 4px;
+}
+/* The VM CPU readout: the chart beside the %, inside the value cell. */
+.sys-metric-inline {
+	flex-direction: row;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 10px;
+}
+.sys-dur {
+	white-space: nowrap;
+}
+/* Phones: each container row becomes a block and each data cell carries its column name, so
+   no column is cut off. The table, its <th scope> headers and its caption stay for screen
+   readers; the visual header row is hidden (the cell labels repeat it). */
+@media (max-width: 720px) {
+	.sys thead {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+	}
+	.sys tr,
+	.sys tbody th,
+	.sys td {
+		display: block;
+	}
+	.sys tr {
+		border-bottom: 1px solid var(--line-soft);
+	}
+	.sys tr:last-child {
+		border-bottom: 0;
+	}
+	.sys th,
+	.sys td {
+		border-bottom: 0;
+		padding: 6px 14px;
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+	.sys tbody th {
+		padding-top: 10px;
+	}
+	.sys td:last-child {
+		padding-bottom: 10px;
+	}
+	.sys td[data-label] {
+		display: grid;
+		grid-template-columns: 7.5em minmax(0, 1fr);
+		gap: 14px;
+	}
+	.sys td[data-label]::before {
+		/* Empty alt text: the <th scope> header already names the cell for screen readers. */
+		content: attr(data-label) / "";
+		color: var(--dim);
+	}
+	/* A cell's value can be several nodes (a count and its "+N in 1 h" span): every node after
+	   the label stays in the value column instead of wrapping into the label column. */
+	.sys td[data-label] > * {
+		grid-column: 2;
+	}
+}
+/* One hour on a recessed strip; a gap in the line is a gap in the samples. */
+.spark {
+	overflow: hidden;
+	display: block;
+	width: 120px;
+	height: 24px;
+	background: var(--well);
+	border-radius: 1px;
+}
+.spark polyline {
+	fill: none;
+	stroke: var(--text);
+	stroke-width: 1.5;
+	stroke-linejoin: round;
+}
+.spark circle {
+	fill: var(--text);
+}
+/* The VM and holds readouts: label and value rows on the table's card stock. */
+.sys-kv {
+	display: grid;
+	gap: 8px;
+	margin: 0;
+	padding: 12px 14px;
+	font-size: 13px;
+	font-variant-numeric: tabular-nums;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+}
+.sys-kv > div {
+	display: grid;
+	grid-template-columns: 7.5em minmax(0, 1fr);
+	gap: 14px;
+}
+.sys-kv dt {
+	color: var(--dim);
+}
+.sys-kv dd {
+	margin: 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.sys-commits {
+	margin: 4px 0 0;
+	padding-left: 18px;
+	font-size: 12.5px;
+	color: var(--text);
 }
 /* ---- Settings page: a config bench beside a section rail, not a dialog. ---- */
 .settings-page {
@@ -7058,13 +7175,7 @@ button.log-mode[aria-pressed="true"] {
 	display: none;
 }
 
-/* Mid-width windows and phones: the bar drops words first, then the twin bar, so it never
-   outgrows the window. The figures and the machine dot always stay. */
-@media (max-width: 1140px) {
-	.sb-hide-mid {
-		display: none;
-	}
-}
+/* Phones: the bar drops its words, so it never outgrows the window. The figures stay. */
 @media (max-width: 720px) {
 	.sb-hide-phone {
 		display: none;

@@ -846,6 +846,44 @@ describe("GET /signins", () => {
 	});
 });
 
+describe("GET /stats", () => {
+	test("unauthenticated /stats answers 401 like /sweep", async () => {
+		const url = start({ token: "tok", cgroupRoot: join(dir, "no-cgroup") });
+		expect((await fetch(`${url}/stats`)).status).toBe(401);
+	});
+
+	test("GET /stats reports the worker's own cgroup and mutation lock", async () => {
+		const root = join(dir, "stats-cgroup");
+		mkdirSync(root, { recursive: true });
+		writeFileSync(join(root, "cpu.stat"), "usage_usec 4200\nuser_usec 4000\n");
+		writeFileSync(join(root, "cpu.max"), "200000 100000\n");
+		writeFileSync(join(root, "memory.current"), "1048576\n");
+		writeFileSync(join(root, "memory.max"), "max\n");
+		writeFileSync(
+			join(root, "memory.events"),
+			"low 0\nhigh 0\nmax 7\noom 2\noom_kill 1\noom_group_kill 0\n",
+		);
+		const lockPath = join(dir, "stats.lock");
+		writeFileSync(lockPath, JSON.stringify({ pid: process.pid }));
+		const url = start({ token: "tok", cgroupRoot: root, lockPath });
+		const res = await fetch(`${url}/stats`, {
+			headers: { "x-otwr-token": "tok" },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(typeof body.at).toBe("number");
+		expect({ ...body, at: 0 } as Record<string, unknown>).toEqual({
+			at: 0,
+			cpuUsageUsec: 4200,
+			cpuMax: { quotaUsec: 200000, periodUsec: 100000 },
+			memoryCurrent: 1048576,
+			memoryMax: "max",
+			memoryEvents: { max: 7, oom: 2, oomKill: 1 },
+			lock: { exists: true, pid: process.pid, alive: true },
+		});
+	});
+});
+
 describe("runWorker", () => {
 	test("non-sentinel lines go to the sink; sentinel settles the result and logs the stderr tail", async () => {
 		const errPath = join(dir, "err2-omp.js");

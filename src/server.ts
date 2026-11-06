@@ -546,6 +546,17 @@ const app = createApp({
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
 	workerTarget,
 	runnerTurns: () => loop.runnerTurns(),
+	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
+	liveRuns: () =>
+		[...loop.running].map(([key, e]) => {
+			const slash = key.indexOf("/");
+			return {
+				project: key.slice(0, slash),
+				id: key.slice(slash + 1),
+				runner: e.url ? new URL(e.url).hostname : "server",
+				progress: e.progress ?? null,
+			};
+		}),
 	claimedPids,
 	progressOf: (project, id) => {
 		const entry = loop.running.get(`${project}/${id}`);
@@ -628,8 +639,8 @@ setInterval(() => {
 	app.publishState();
 }, 1000);
 
-// Stats sampler, one for all tabs (and for /api/stats in polling mode): stats, self-update
-// checks and the usage quota live behind sampleStats() in the request layer.
+// System sampler, one for all tabs (and for /api/system in polling mode): container and VM
+// readings, self-update checks and the usage quota live behind sampleStats() in the request layer.
 void app.sampleStats();
 setInterval(() => void app.sampleStats(), 30_000);
 

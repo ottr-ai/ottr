@@ -15,6 +15,7 @@ import { redirectProxyHint } from "./proxyHint.ts";
 import { ensureProjectPython } from "./python.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
+import { readCgroup } from "./systemStats.ts";
 import { buildToolsPath, ensureProjectTools } from "./tools.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
@@ -98,6 +99,10 @@ export function serveWorker(opts: {
 	detachedTtlMs?: number;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
+	/** Only for tests: the cgroup v2 directory GET /stats reads instead of /sys/fs/cgroup. */
+	cgroupRoot?: string;
+	/** Only for tests: the mutation lock file GET /stats reads instead of tmpdir()/ott-stryker.lock. */
+	lockPath?: string;
 }): Bun.Server<never> {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
@@ -149,6 +154,15 @@ export function serveWorker(opts: {
 						error: `${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
 					});
 				}
+			}
+			// The System view's per-container numbers: the worker reads its own cgroup, since
+			// the server's /proc sees only the whole Docker VM.
+			if (request.method === "GET" && url.pathname === "/stats") {
+				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
+					return new Response("unauthorized", { status: 401 });
+				return Response.json(
+					readCgroup({ root: opts.cgroupRoot, lockPath: opts.lockPath }),
+				);
 			}
 			if (request.method === "POST" && url.pathname === "/sweep") {
 				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)

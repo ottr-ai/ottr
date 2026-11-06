@@ -66,31 +66,35 @@ describe("parseServerMessage", () => {
 				deadSignIns: [],
 			},
 		});
-		expect(
-			parseServerMessage(
-				JSON.stringify({
-					type: "stats",
-					stats: {
-						cpu: 3,
-						ram: { usedGiB: 1, totalGiB: 2, pct: 50 },
-						windows: [],
-					},
-				}),
-			),
-		).toEqual({
-			type: "stats",
-			stats: {
-				cpu: 3,
-				ram: { usedGiB: 1, totalGiB: 2, pct: 50 },
-				windows: [],
+		const system = {
+			at: 1,
+			containers: [],
+			vm: {
+				cpuPct: null,
+				cpus: 4,
+				load1: null,
+				memAvailable: null,
+				memTotal: null,
+				history: [],
 			},
-		});
-		// A frame without the window list (an older server) is dropped, not half-rendered.
+			holds: {
+				drainUntil: null,
+				drainCommits: null,
+				maxTotal: null,
+				running: 0,
+				queued: 0,
+				oldestQueuedAt: null,
+			},
+		};
+		expect(
+			parseServerMessage(JSON.stringify({ type: "system", system })),
+		).toEqual({ type: "system", system });
+		// A frame without the holds (an older or broken server) is dropped, not half-rendered.
 		expect(
 			parseServerMessage(
 				JSON.stringify({
-					type: "stats",
-					stats: { cpu: 3, ram: { usedGiB: 1, totalGiB: 2, pct: 50 } },
+					type: "system",
+					system: { at: 1, containers: [], vm: system.vm },
 				}),
 			),
 		).toBeNull();
@@ -173,15 +177,17 @@ describe("parseServerMessage", () => {
 						typeof (s as Record<string, unknown>).serverVersion === "string"
 					);
 				}
-				case "stats": {
-					const s = m.stats as Record<string, unknown>;
+				case "system": {
+					const s = m.system as Record<string, unknown>;
 					return (
 						typeof s === "object" &&
 						s !== null &&
-						typeof s.cpu === "number" &&
-						typeof s.ram === "object" &&
-						s.ram !== null &&
-						typeof (s.ram as Record<string, unknown>).pct === "number"
+						typeof s.at === "number" &&
+						Array.isArray(s.containers) &&
+						typeof s.vm === "object" &&
+						s.vm !== null &&
+						typeof s.holds === "object" &&
+						s.holds !== null
 					);
 				}
 				case "update":
@@ -494,7 +500,26 @@ describe("connectPolling", () => {
 	});
 
 	const STATE = { tasks: [], seenAnswers: [], serverVersion: "v" };
-	const STATS = { cpu: 0, ram: { usedGiB: 0, totalGiB: 1, pct: 0 } };
+	const SYSTEM = {
+		at: 0,
+		containers: [],
+		vm: {
+			cpuPct: null,
+			cpus: 1,
+			load1: null,
+			memAvailable: null,
+			memTotal: null,
+			history: [],
+		},
+		holds: {
+			drainUntil: null,
+			drainCommits: null,
+			maxTotal: null,
+			running: 0,
+			queued: 0,
+			oldestQueuedAt: null,
+		},
+	};
 	const makeHandlers = () => {
 		const seen: {
 			state: unknown;
@@ -527,28 +552,28 @@ describe("connectPolling", () => {
 		return { h, seen };
 	};
 
-	test("happy path: state poll, stats event, and the update poll", async () => {
+	test("happy path: state poll, system event, and the update poll", async () => {
 		routes["/api/state"] = () => ok(STATE);
-		routes["/api/stats"] = () => ok(STATS);
+		routes["/api/system"] = () => ok(SYSTEM);
 		routes["/api/update"] = () => ok({ behind: 3, commits: ["feat: a"] });
-		const statsEvents: unknown[] = [];
-		liveEvents.addEventListener("stats", (e: Event) => {
-			if (e instanceof CustomEvent) statsEvents.push(e.detail);
+		const systemEvents: unknown[] = [];
+		liveEvents.addEventListener("system", (e: Event) => {
+			if (e instanceof CustomEvent) systemEvents.push(e.detail);
 		});
 		const { h, seen } = makeHandlers();
 		const dispose = connectPolling(h);
 		await drain();
-		expect(calls).toEqual(["/api/state", "/api/stats"]);
+		expect(calls).toEqual(["/api/state", "/api/system"]);
 		expect(seen.state).toEqual(STATE);
 		expect(seen.online).toBe(1);
 		expect(seen.offline).toBe(0);
-		expect(statsEvents).toEqual([STATS]);
+		expect(systemEvents).toEqual([SYSTEM]);
 
 		advance(300_000);
 		await drain();
 		// every 5 s poll plus the first update poll at the 300 s mark
 		expect(calls.filter((p) => p === "/api/state")).toHaveLength(61);
-		expect(calls.filter((p) => p === "/api/stats")).toHaveLength(61);
+		expect(calls.filter((p) => p === "/api/system")).toHaveLength(61);
 		expect(calls.filter((p) => p === "/api/update")).toHaveLength(1);
 		expect(seen.behind).toBe(3);
 		expect(seen.commits).toEqual(["feat: a"]);
@@ -588,7 +613,7 @@ describe("connectPolling", () => {
 
 	test("refreshState polls at once and restarts the cadence from the refresh", async () => {
 		routes["/api/state"] = () => ok(STATE);
-		routes["/api/stats"] = () => ok(STATS);
+		routes["/api/system"] = () => ok(SYSTEM);
 		const { h, seen } = makeHandlers();
 		const dispose = connectPolling(h);
 		await drain();
@@ -612,16 +637,16 @@ describe("connectPolling", () => {
 
 	test("refreshState does nothing after dispose", async () => {
 		routes["/api/state"] = () => ok(STATE);
-		routes["/api/stats"] = () => ok(STATS);
+		routes["/api/system"] = () => ok(SYSTEM);
 		const { h } = makeHandlers();
 		const dispose = connectPolling(h);
 		await drain();
-		expect(calls).toEqual(["/api/state", "/api/stats"]);
+		expect(calls).toEqual(["/api/state", "/api/system"]);
 		dispose();
 		refreshState();
 		await drain();
 		advance(5000);
 		await drain();
-		expect(calls).toEqual(["/api/state", "/api/stats"]);
+		expect(calls).toEqual(["/api/state", "/api/system"]);
 	});
 });

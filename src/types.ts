@@ -1062,23 +1062,109 @@ export interface ReleasePlan {
 	blocked: string | null;
 }
 
-export interface MachineStats {
-	/** CPU usage in percent, averaged over the last 15 minutes of samples. */
-	cpu: number;
-	/** RAM usage; usedGiB and pct are 15-minute averages, totalGiB reads live. */
-	ram: { usedGiB: number; totalGiB: number; pct: number };
-	/** CPU and RAM per look-back window (15 min, 1 h, 24 h). The board keeps samples only since
-	 *  it started, so coveredMinutes can be shorter than minutes. */
-	windows: {
-		minutes: number;
-		coveredMinutes: number;
-		/** Average CPU in percent. */
-		cpu: number;
-		/** Highest single CPU sample in the window, in percent. */
-		cpuPeak: number;
-		/** Average RAM in percent of the live total. */
-		ramPct: number;
-	}[];
+/** One container's own cgroup v2 numbers plus its mutation lock, as read inside that container
+ *  (worker GET /stats, and the server reading itself). Any unreadable field is null. */
+export interface CgroupReading {
+	/** Epoch ms of the read. */
+	at: number;
+	/** cpu.stat usage_usec: CPU time used since the container started. */
+	cpuUsageUsec: number | null;
+	/** cpu.max: the quota per period in microseconds, or "max" (no quota). */
+	cpuMax: { quotaUsec: number; periodUsec: number } | "max" | null;
+	/** memory.current minus memory.stat inactive_file (docker stats' usage), in bytes. */
+	memoryCurrent: number | null;
+	/** memory.max in bytes, or "max" (no limit). */
+	memoryMax: number | "max" | null;
+	/** memory.events counters since the container started. */
+	memoryEvents: { max: number; oom: number; oomKill: number } | null;
+	/** `<os.tmpdir()>/ott-stryker.lock`: exists, the pid it holds (null when unparsable), and
+	 *  whether that pid is alive (EPERM counts as alive). */
+	lock: { exists: boolean; pid: number | null; alive: boolean };
+}
+
+/** One 30 s sample of a System row's history; null fields are a gap (unreachable, unreadable). */
+export interface SystemPoint {
+	at: number;
+	/** CPU in percent of one CPU (docker stats style: 1585 is valid). */
+	cpu: number | null;
+	/** Memory used in bytes. */
+	mem: number | null;
+}
+
+export interface SystemCard {
+	project: string;
+	id: string;
+}
+
+/** One container in the System view: the server, then each OTTR_WORKER_URLS worker. */
+export interface ContainerRow {
+	/** "server", or the worker url's hostname (e.g. "worker-a"). */
+	name: string;
+	/** False while the worker's GET /stats fails; every reading field is null then. */
+	reachable: boolean;
+	/** Epoch ms of the first failed poll in the current outage; null while reachable. */
+	unreachableSince: number | null;
+	/** Latest CPU in percent of one CPU; null without two readings. */
+	cpuPct: number | null;
+	/** CPUs the container may use: cpu.max quota/period, or the VM CPU count when "max". */
+	cpuShare: number | null;
+	memUsed: number | null;
+	/** memory.max in bytes; null = no limit (or unreadable: see memUsed). */
+	memLimit: number | null;
+	/** memory.events max and oom_kill since the container started. */
+	memMaxHits: number | null;
+	oomKills: number | null;
+	/** Growth of those counters over the last hour of readings. */
+	memMaxHitsHour: number | null;
+	oomKillsHour: number | null;
+	/** Last hour, oldest first, at most 120 points. */
+	history: SystemPoint[];
+	/** The board's live runs on this container (merge and local turns count as "server"). */
+	cards: SystemCard[];
+	/** holderPid null = free (no lock file, or its holder is dead). holderCard: the one live
+	 *  run here whose progress is Stryker running, when exactly one is. waiters: live runs
+	 *  here whose progress is "Stryker waiting for the mutation lock". */
+	lock: {
+		holderPid: number | null;
+		holderCard: SystemCard | null;
+		waiters: SystemCard[];
+	};
+	/** Warning reasons in plain text ("memory 93 %", "OOM kill in the last hour",
+	 *  "CPU at 90 % of its share for 5 min"); empty = ok. */
+	warnings: string[];
+}
+
+/** The Docker VM as the server's /proc sees it. Never warns. */
+export interface VmRow {
+	/** CPU busy percent of the whole VM (0..100); null until two /proc/stat reads. */
+	cpuPct: number | null;
+	cpus: number;
+	load1: number | null;
+	memAvailable: number | null;
+	memTotal: number | null;
+	/** Last hour, oldest first, at most 120 points; mem = memTotal - memAvailable. */
+	history: SystemPoint[];
+}
+
+/** Board-wide holds: the update hold, the global cap, the queue. */
+export interface SystemHolds {
+	drainUntil: number | null;
+	drainCommits: string[] | null;
+	maxTotal: number | null;
+	/** Running slots (slotUse sum). */
+	running: number;
+	/** queueOrder length. */
+	queued: number;
+	/** queuedAt (else createdAt) of the first card in queueOrder; null when nothing queues. */
+	oldestQueuedAt: number | null;
+}
+
+/** GET /api/system and the socket's "system" frame. */
+export interface SystemSnapshot {
+	at: number;
+	containers: ContainerRow[];
+	vm: VmRow;
+	holds: SystemHolds;
 }
 
 /** Appended to a PR review posted with the board token (the gh path): that review goes out
@@ -1141,10 +1227,10 @@ export interface PerfResponse {
 
 /**
  * Board socket (`GET /api/ws`): push-only, the server ignores inbound frames. On open it sends
- * `state`, `update` and the latest `stats`; afterwards:
+ * `state`, `update` and the latest `system`; afterwards:
  * - `state`: whenever the serialized StateResponse changes (checked after every mutating request,
  *   every scheduler run, and every 1 s while a tab is connected);
- * - `stats`: every 30 s, one sampler for all tabs; values are 15-minute averages;
+ * - `system`: every 30 s, one sampler for all tabs; the containers' and VM's readings and holds;
  * - `update`: when the behind-count changes (refreshed every 5 min while a tab is connected);
  * - `log`: the task's log file grew; at most one per 250 ms per task. Fetch the bytes with
  *   `GET /api/projects/:project/tasks/:id/log?from=N`;
@@ -1152,7 +1238,7 @@ export interface PerfResponse {
  */
 export type ServerMessage =
 	| { type: "state"; state: StateResponse }
-	| { type: "stats"; stats: MachineStats }
+	| { type: "system"; system: SystemSnapshot }
 	| { type: "update"; behind: number; commits: string[] }
 	| { type: "log"; project: string; id: string }
 	| { type: "ping" };

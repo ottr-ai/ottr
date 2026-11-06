@@ -1,8 +1,8 @@
 import type {
-	MachineStats,
 	QuotaState,
 	ServerMessage,
 	StateResponse,
+	SystemSnapshot,
 } from "../types.ts";
 
 /** Handlers the App passes to its one live socket. */
@@ -38,20 +38,20 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
 				return null;
 			return { type: "state", state: st as unknown as StateResponse }; // server-produced frame; the fields the UI dereferences first are checked above
 		}
-		case "stats": {
-			const s = m.stats;
+		case "system": {
+			const s = m.system;
 			if (typeof s !== "object" || s === null) return null;
-			const st = s as Record<string, unknown>;
+			const sy = s as Record<string, unknown>;
 			if (
-				typeof st.cpu !== "number" ||
-				typeof st.ram !== "object" ||
-				st.ram === null ||
-				!Array.isArray(st.windows)
+				typeof sy.at !== "number" ||
+				!Array.isArray(sy.containers) ||
+				typeof sy.vm !== "object" ||
+				sy.vm === null ||
+				typeof sy.holds !== "object" ||
+				sy.holds === null
 			)
 				return null;
-			const ram = st.ram as Record<string, unknown>;
-			if (typeof ram.pct !== "number") return null;
-			return { type: "stats", stats: st as unknown as MachineStats }; // server-produced frame; the fields the UI dereferences first are checked above
+			return { type: "system", system: sy as unknown as SystemSnapshot }; // server-produced frame; the fields the UI dereferences first are checked above
 		}
 		case "update":
 			if (
@@ -78,14 +78,14 @@ export function reconnectDelay(attempt: number): number {
 	return Math.min(5000, 500 * 2 ** attempt);
 }
 
-/** Events the socket fans out to components that don't hold the handlers (stats meters, log views, resync). */
+/** Events the socket fans out to components that don't hold the handlers (system view, log views, resync). */
 export const liveEvents = new EventTarget();
 
-let lastStats: MachineStats | null = null;
+let lastSystem: SystemSnapshot | null = null;
 
-/** The last pushed stats, so a component mounting between frames renders immediately. */
-export function latestStats(): MachineStats | null {
-	return lastStats;
+/** The last pushed system snapshot, so a component mounting between frames renders immediately. */
+export function latestSystem(): SystemSnapshot | null {
+	return lastSystem;
 }
 
 let lastQuota: QuotaState | null = null;
@@ -163,10 +163,10 @@ export function connectLive(h: LiveHandlers): () => void {
 				case "update":
 					h.onUpdate(msg.behind, msg.commits);
 					break;
-				case "stats":
-					lastStats = msg.stats;
+				case "system":
+					lastSystem = msg.system;
 					liveEvents.dispatchEvent(
-						new CustomEvent("stats", { detail: msg.stats }),
+						new CustomEvent("system", { detail: msg.system }),
 					);
 					break;
 				case "log":
@@ -236,13 +236,13 @@ export function connectPolling(h: LiveHandlers): () => void {
 				h.onState(state);
 				h.onOnline();
 				liveEvents.dispatchEvent(new Event("open"));
-				void fetch("/api/stats")
+				void fetch("/api/system")
 					.then(async (sr) => {
 						if (!sr.ok) return;
-						const stats = (await sr.json()) as MachineStats;
-						lastStats = stats;
+						const system = (await sr.json()) as SystemSnapshot;
+						lastSystem = system;
 						liveEvents.dispatchEvent(
-							new CustomEvent("stats", { detail: stats }),
+							new CustomEvent("system", { detail: system }),
 						);
 					})
 					.catch(() => {});

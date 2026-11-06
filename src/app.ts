@@ -10,7 +10,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { cpus, freemem, homedir, totalmem } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
@@ -115,7 +115,6 @@ import {
 	signIns,
 	signOutEverywhere,
 } from "./login.ts";
-import { STATS_KEEP_MS, type StatsSample, statsFrame } from "./machineStats.ts";
 import {
 	checkMemoryHealth,
 	type MemoryHealth,
@@ -183,6 +182,7 @@ import {
 	openWorkBlockers,
 	PROMPT_EDIT_HELD,
 	pushHold,
+	queueOrder,
 	type ReviewTask,
 	releaseHeldMerges,
 	reviewBlocked,
@@ -194,6 +194,14 @@ import {
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { derivedTaskPrefix, ProjectStore } from "./store.ts";
+import {
+	createSystemSampler,
+	fetchWorkerStats,
+	type LiveRun,
+	type RunnerReading,
+	readCgroup,
+	readVm,
+} from "./systemStats.ts";
 import {
 	ENV_NAME,
 	envListPath,
@@ -217,7 +225,6 @@ import {
 	type AppCheck,
 	answeredCard,
 	doneReadKey,
-	type MachineStats,
 	type OrphanProcess,
 	type PerfRange,
 	PRIORITIES,
@@ -231,6 +238,7 @@ import {
 	recommendsSteps,
 	type ServerMessage,
 	type StateResponse,
+	type SystemHolds,
 	type Task,
 	type TaskCard,
 	type TaskView,
@@ -239,6 +247,7 @@ import {
 	VERSION_RE,
 } from "./types.ts";
 import board from "./ui/index.html";
+import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import {
 	addSkip,
 	loadSkips,
@@ -399,6 +408,9 @@ interface AppDeps {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** The board's live runs (project, id, runner hostname or "server", Stryker progress), so the
+	 * /system view can name the runs waiting on a runner's mutation lock; absent = none. */
+	liveRuns?: () => LiveRun[];
 	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
@@ -2321,11 +2333,16 @@ export function createApp(deps: AppDeps) {
 	 * in-memory like drainUntil, no commit subjects, never shown in the notice bar. */
 	const runnerDrains = new Map<string, number>();
 
-	function stateResponse(): StateResponse {
+	/** Every project's cards, newest first, plus the kept-worktree counts: the card slice of
+	 * stateResponse, shared with the /system holds so both count the same cards. */
+	function boardCards(now: number): {
+		tasks: TaskCard[];
+		keptHeld: number;
+		keptStale: number;
+	} {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
 		let keptStale = 0;
-		const now = Date.now();
 		for (const e of deps.projects.values()) {
 			try {
 				const days = e.store.getSettings().keptWorktreeDays;
@@ -2413,6 +2430,29 @@ export function createApp(deps: AppDeps) {
 			}
 		}
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
+		return { tasks, keptHeld, keptStale };
+	}
+
+	/** The /system holds, from the same drain values and cards the state frame ships. */
+	function systemHolds(now: number): SystemHolds {
+		const { tasks } = boardCards(now);
+		const slots = slotUse(tasks);
+		const queue = queueOrder(tasks);
+		const first = queue[0];
+		return {
+			drainUntil: drainUntil > now ? drainUntil : null,
+			drainCommits: drainUntil > now ? drainCommits : null,
+			maxTotal: deps.shared.maxTotalRuns,
+			running: SLOT_STAGES.reduce((sum, s) => sum + slots[s], 0),
+			queued: queue.length,
+			oldestQueuedAt:
+				first === undefined ? null : (first.queuedAt ?? first.createdAt),
+		};
+	}
+
+	function stateResponse(): StateResponse {
+		const now = Date.now();
+		const { tasks, keptHeld, keptStale } = boardCards(now);
 		const scan = currentOrphanScan();
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
 		let list: SignIn[] = [];
@@ -3362,34 +3402,30 @@ export function createApp(deps: AppDeps) {
 		return json({ ok: true });
 	}
 
-	// Rolling machine stats: CPU and RAM averaged over 15 min, 1 h and 24 h (statsFrame) so a
-	// supervisor sizes runner caps from slow numbers, not a live gauge. RAM total reads live.
-	// ponytail: 24 h of 30 s samples in memory (2,880 entries); a restart starts the history over.
-	const samples: StatsSample[] = [];
-	let lastFrame: MachineStats | null = null;
+	// The /system view's sampler: per-container cgroup readings (server, then each worker) and
+	// the Docker VM, one point per 30 s tick over the last hour.
+	const system = createSystemSampler();
 
-	async function measureStats(): Promise<void> {
-		const before = cpus();
-		await Bun.sleep(100);
-		const after = cpus();
-		let idle = 0;
-		let total = 0;
-		for (let i = 0; i < before.length; i++) {
-			const b = before[i]!;
-			const a = after[i]!;
-			const d = (k: keyof typeof b.times) => a.times[k] - b.times[k];
-			idle += d("idle");
-			total += d("user") + d("nice") + d("sys") + d("idle") + d("irq");
-		}
-		const now = Date.now();
-		while (samples.length > 0 && samples[0]!.at < now - STATS_KEEP_MS)
-			samples.shift();
-		samples.push({
-			at: now,
-			cpu: total === 0 ? 0 : 100 * (1 - idle / total),
-			ramUsed: totalmem() - freemem(),
-		});
-		lastFrame = statsFrame(samples, now, totalmem());
+	/** One tick's readings: the server's cgroup, every worker's GET /stats in parallel, the VM. */
+	async function measureSystem(): Promise<void> {
+		const reading = readCgroup();
+		const target = deps.workerTarget;
+		const workers = await Promise.all(
+			(target?.urls ?? []).flatMap((url) => {
+				let name: string;
+				try {
+					name = new URL(url).hostname;
+				} catch {
+					return []; // A malformed url names no row.
+				}
+				return [
+					fetchWorkerStats(url, target?.token).then(
+						(r): RunnerReading => ({ name, reading: r }),
+					),
+				];
+			}),
+		);
+		system.record([{ name: "server", reading }, ...workers], readVm());
 	}
 	let behind = 0;
 	let behindCommits: string[] = [];
@@ -3401,10 +3437,11 @@ export function createApp(deps: AppDeps) {
 	// path below must be a no-op before that (boot-time schedule() runs first).
 	let sockets = 0;
 	let lastStateJson = "";
-	let lastStatsJson: string | null = null;
+	/** The last "system" frame, replayed to a socket on open so the view renders before the next tick. */
+	let lastSystemJson: string | null = null;
 	/** Card slice of the last state frame: the push diff's baseline (kept in memory, no JSON round-trip). */
 	let lastTasks: TaskCard[] | null = null;
-	let sampling = false; // one 30 s stats sample in flight (each takes >= 100 ms of CPU window)
+	let sampling = false; // one 30 s system sample in flight (worker fetches can take seconds)
 	let refreshingBehind = false;
 
 	function publish(msg: ServerMessage): void {
@@ -3498,17 +3535,19 @@ export function createApp(deps: AppDeps) {
 	function sampleStats(): void {
 		if (sampling) return;
 		sampling = true;
-		void measureStats()
+		void measureSystem()
 			.then(() => {
-				if (lastFrame === null) return;
-				const text = JSON.stringify({
-					type: "stats",
-					stats: lastFrame,
-				} satisfies ServerMessage);
-				lastStatsJson = text;
-				// Publish every sample: publish() no-ops with 0 sockets, and /api/stats in
-				// polling mode keeps serving lastFrame.
-				publish({ type: "stats", stats: lastFrame });
+				const now = Date.now();
+				const snap = system.snapshot(
+					deps.liveRuns?.() ?? [],
+					systemHolds(now),
+					now,
+				);
+				const msg = { type: "system", system: snap } satisfies ServerMessage;
+				lastSystemJson = JSON.stringify(msg);
+				// Publish every sample: publish() no-ops with 0 sockets, and /api/system in
+				// polling mode builds a fresh snapshot.
+				publish(msg);
 			})
 			.catch(() => {
 				// A failed sample skips one tick.
@@ -3569,6 +3608,7 @@ export function createApp(deps: AppDeps) {
 		"/projects/:project": board,
 		"/projects/:project/tasks/:id": board,
 		"/settings": board,
+		"/system": board,
 		"/settings/:project": board,
 		// --- Web Push (begin): service worker for notifications; the sibling PWA branch adds its static routes here too ---
 		"/sw.js": () =>
@@ -4332,8 +4372,14 @@ export function createApp(deps: AppDeps) {
 					return json({ ok: true });
 				}),
 		},
-		"/api/stats": {
-			GET: (req) => api(req, async () => json(lastFrame)),
+		"/api/system": {
+			GET: (req) =>
+				api(req, async () => {
+					const now = Date.now();
+					return json(
+						system.snapshot(deps.liveRuns?.() ?? [], systemHolds(now), now),
+					);
+				}),
 		},
 		"/api/performance": {
 			GET: (req) =>
@@ -6999,7 +7045,7 @@ export function createApp(deps: AppDeps) {
 							commits: behindCommits,
 						} satisfies ServerMessage),
 					);
-					if (lastStatsJson !== null) ws.send(lastStatsJson);
+					if (lastSystemJson !== null) ws.send(lastSystemJson);
 				},
 				// Push-only: inbound frames are never parsed.
 				message() {},

@@ -6,6 +6,7 @@ import {
 	projectPath,
 	readPath,
 	SETTINGS_HASH,
+	SYSTEM_VIEW,
 	settingsNavigate,
 	settingsPath,
 	settingsSub,
@@ -81,7 +82,7 @@ test("settingsSub routes General and non-settings hashes", () => {
 	expect(settingsSub("")).toEqual({ onSettings: false, project: null });
 });
 
-test("readPath reads all five path shapes", () => {
+test("readPath reads all six path shapes", () => {
 	install("/");
 	expect(readPath()).toEqual({ view: "", task: null });
 	install("/projects/p1");
@@ -92,6 +93,8 @@ test("readPath reads all five path shapes", () => {
 	expect(readPath()).toEqual({ view: SETTINGS_HASH, task: null });
 	install("/settings/p1");
 	expect(readPath()).toEqual({ view: `${SETTINGS_HASH}/p1`, task: null });
+	install("/system");
+	expect(readPath()).toEqual({ view: SYSTEM_VIEW, task: null });
 });
 
 test("readPath decodes each segment exactly once", () => {
@@ -126,6 +129,7 @@ test("path builders encode every segment exactly once", () => {
 	expect(viewPath("50%off")).toBe("/projects/50%25off");
 	expect(viewPath(SETTINGS_HASH)).toBe("/settings");
 	expect(viewPath(`${SETTINGS_HASH}/50%off`)).toBe("/settings/50%25off");
+	expect(viewPath(SYSTEM_VIEW)).toBe("/system");
 });
 
 test("migrateHash rewrites the old hash URLs to paths", () => {

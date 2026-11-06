@@ -31,7 +31,6 @@ import {
 	doneReadKey,
 	type GhStatus,
 	type KeptChoice,
-	type MachineStats,
 	MERGE_HOLD_MISMATCH_REASON,
 	PERF_RANGES,
 	type PerfMetrics,
@@ -48,6 +47,9 @@ import {
 	recommendsSteps,
 	type Stage,
 	type StateResponse,
+	type SystemCard,
+	type SystemPoint,
+	type SystemSnapshot,
 	type TaskCard,
 	type TaskView,
 	type TurnView,
@@ -162,6 +164,7 @@ import {
 	navClick,
 	projectPath,
 	readPath,
+	SYSTEM_VIEW,
 	settingsPath,
 	settingsSub,
 	taskPath,
@@ -187,7 +190,7 @@ import {
 import {
 	connectLive,
 	connectPolling,
-	latestStats,
+	latestSystem,
 	liveEvents,
 	refreshState,
 } from "./socket.ts";
@@ -920,36 +923,35 @@ function Card({
 	);
 }
 
-/** Machine stats pushed every 30 s over the board socket; cpu and ram are 15-minute averages, no trend. */
-function useStats(): MachineStats | null {
-	const [stats, setStats] = useState<MachineStats | null>(latestStats);
+/** The System snapshot: pushed every 30 s over the board socket, polled from /api/system in
+ *  production mode. Null until the first sample lands. */
+function useSystem(): SystemSnapshot | null {
+	const [system, setSystem] = useState<SystemSnapshot | null>(latestSystem);
 	useEffect(() => {
-		const onStats = (e: Event): void => {
-			setStats((e as CustomEvent<MachineStats>).detail);
+		const onSystem = (e: Event): void => {
+			setSystem((e as CustomEvent<SystemSnapshot>).detail);
 		};
-		liveEvents.addEventListener("stats", onStats);
-		return () => liveEvents.removeEventListener("stats", onStats);
+		liveEvents.addEventListener("system", onSystem);
+		return () => liveEvents.removeEventListener("system", onSystem);
 	}, []);
-	return stats;
+	return system;
 }
 
-type MachineWindow = MachineStats["windows"][number];
-
-/** "15 min", "1 h", "24 h": a machine-stats window length for labels. */
-const windowName = (minutes: number): string =>
-	minutes % 60 === 0 ? `${minutes / 60} h` : `${minutes} min`;
-
-/** Overview indicators in the app bar; the button opens the detail popover (agents, quota, and machine load over 15 min, 1 h and 24 h). */
+/** Overview indicators in the app bar; the button opens the detail popover (agents and quota).
+ *  While any container warns, a warning link to the System view sits beside the button. */
 function SystemBar({
 	tasks,
 	maxTotal,
 	quota,
+	navigate,
 }: {
 	tasks: TaskCard[];
 	maxTotal: number | null;
 	quota: QuotaState | null;
+	/** Plain-click navigation to a view path (see navClick). */
+	navigate: (path: string) => void;
 }) {
-	const stats = useStats();
+	const system = useSystem();
 	const catalog = useModels();
 	const slots = slotUse(tasks);
 	const used = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
@@ -962,29 +964,21 @@ function SystemBar({
 	const quotaPct = tightest?.usedPct ?? null;
 	const quotaLevel = loadLevel(quotaPct);
 	const quotaGone = tightest === null ? null : windowGone(tightest, Date.now());
-	const cpu = stats?.cpu ?? null;
-	const ram = stats?.ram.pct ?? null;
-	const machineLevel = loadLevel(
-		cpu === null || ram === null ? null : Math.max(cpu, ram),
-	);
-	const machineWord =
-		machineLevel === "na"
-			? "Machine n/a"
-			: machineLevel === "high"
-				? "Machine busy"
-				: machineLevel === "crit"
-					? "Machine overloaded"
-					: "Machine ok";
+	// One line per warning container, its first reason only: the System view lists them all.
+	const warned = (system?.containers ?? [])
+		.filter((c) => c.warnings.length > 0)
+		.map((c) => `${c.name} ${c.warnings[0]}`)
+		.join("; ");
 	return (
 		<>
-			{/* Quiet line: the running count first, the tightest quota as a time-over-quota twin bar,
-			    one dot for machine health. Every number and the 24 h history live in the popover. */}
+			{/* Quiet line: the running count first, then the tightest quota as a time-over-quota
+			    twin bar. Every number lives in the popover. */}
 			<button
 				type="button"
 				className="meters"
 				popoverTarget="system-detail"
-				aria-label={`${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}, ${machineWord}. Agent, quota and machine details`}
-				title="Agent, quota and machine details"
+				aria-label={`${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}. Agent and quota details`}
+				title="Agent and quota details"
 			>
 				<span className="sb-grp">
 					<Mark kind="running" />
@@ -1012,25 +1006,10 @@ function SystemBar({
 						{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
 					</span>
 				</span>
-				<span className="sb-sep" aria-hidden="true" />
-				<span
-					className="sb-grp"
-					title={`CPU ${cpu ?? "n/a"} %, RAM ${ram ?? "n/a"} %, 15-minute averages`}
-				>
-					{/* A pulse glyph, not a dot: the running mark is already a grey dot. */}
-					<span
-						className="sb-mach"
-						data-level={machineLevel}
-						aria-hidden="true"
-					>
-						<Icon name="activity" size={14} />
-					</span>
-					<span className="sb-lbl sb-hide-mid">{machineWord}</span>
-				</span>
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
-				{/* Order by urgency: agents first (big figures, no table to read), quota second,
-				    the machine averages last on one line. Running counts preparing todo slots too. */}
+				{/* Order by urgency: agents first (big figures, no table to read), quota second.
+				    Running counts preparing todo slots too. */}
 				<section>
 					<h2>Agents</h2>
 					<dl className="ag-nums">
@@ -1162,71 +1141,432 @@ function SystemBar({
 						</>
 					)}
 				</section>
-				{/* Machine load: CPU and RAM side by side, one column per window (15 min, 1 h, 24 h)
-				    against the 85 % band line; the CPU columns carry a notch at the peak sample. */}
-				<section>
-					<h2>Machine</h2>
-					{stats === null ? (
-						<p className="caption">No machine sample yet.</p>
+			</div>
+			{/* Outside the meters button: a link cannot nest in a button. Rendered only while a
+			    container warns, so the bar stays grey at rest. */}
+			{warned !== "" && (
+				<a
+					className="sb-warn"
+					href={viewPath(SYSTEM_VIEW)}
+					aria-label={`System warning: ${warned}`}
+					title={`System warning: ${warned}`}
+					onClick={(e) => navClick(e, navigate)}
+				>
+					<Mark kind="needs" />
+				</a>
+			)}
+		</>
+	);
+}
+
+const HOUR_MS = 3_600_000;
+
+/** Bytes as GiB with one decimal: every System memory figure uses this one unit. */
+function gib(bytes: number): string {
+	return (bytes / 1024 ** 3).toFixed(1);
+}
+
+/** "15:04": the time of day for the System view's since and until stamps. */
+function clockTime(ms: number): string {
+	return new Date(ms).toLocaleTimeString(undefined, {
+		hour: "2-digit",
+		minute: "2-digit",
+		hourCycle: "h23",
+	});
+}
+
+/** One hour of a System row as a small line chart. A null point (unreachable, unreadable)
+ *  breaks the line, so an outage reads as a gap and never as zero. The y scale runs to the
+ *  row's ceiling (its CPU share, its memory limit) when known, so a full chart means full. */
+function Sparkline({
+	history,
+	pick,
+	end,
+	ceiling,
+	label,
+	format,
+}: {
+	history: SystemPoint[];
+	pick: (p: SystemPoint) => number | null;
+	/** The snapshot's time: the chart's right edge, one hour after its left edge. */
+	end: number;
+	ceiling: number | null;
+	/** The accessible name's lead, e.g. "CPU last hour". */
+	label: string;
+	format: (v: number) => string;
+}) {
+	const w = 120;
+	const h = 24;
+	const nums = history.map(pick).filter((v): v is number => v !== null);
+	if (nums.length === 0)
+		return (
+			<svg
+				className="spark"
+				viewBox={`0 0 ${w} ${h}`}
+				role="img"
+				aria-label={`${label}: no data`}
+			/>
+		);
+	const lo = Math.min(...nums);
+	const hi = Math.max(...nums);
+	// y runs over [0, top]; a zero top (all-idle hour) would divide by zero.
+	const top = Math.max(ceiling ?? 0, hi, 0) || 1;
+	// The 1.5px stroke stays inside the box: points sit `pad` in from the top and bottom edges.
+	const pad = 1.5;
+	// Consecutive non-null points form one run; each run is its own polyline.
+	type Run = { at: number; xy: Array<[number, number]> };
+	const runs: Run[] = [];
+	let run: Run | null = null;
+	for (const p of history) {
+		const v = pick(p);
+		if (v === null) {
+			run = null;
+			continue;
+		}
+		if (run === null) {
+			run = { at: p.at, xy: [] };
+			runs.push(run);
+		}
+		run.xy.push([
+			clamp(w * (1 - (end - p.at) / HOUR_MS), 0, w),
+			h - pad - (clamp(v, 0, top) / top) * (h - 2 * pad),
+		]);
+	}
+	return (
+		<svg
+			className="spark"
+			viewBox={`0 0 ${w} ${h}`}
+			role="img"
+			aria-label={`${label}: min ${format(lo)}, max ${format(hi)}`}
+		>
+			{runs.map(({ at, xy }) =>
+				// A lone sample between two gaps has no line to draw: a dot marks it.
+				xy.length === 1 ? (
+					<circle key={at} cx={xy[0]?.[0]} cy={xy[0]?.[1]} r="1.5" />
+				) : (
+					<polyline
+						key={at}
+						points={xy
+							.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`)
+							.join(" ")}
+					/>
+				),
+			)}
+		</svg>
+	);
+}
+
+/** A live run's card in the System view: a link that opens its drawer, like every card link
+ *  on the board. The card's title rides the tooltip. */
+function SystemCardLink({
+	card,
+	tasks,
+	openTask,
+}: {
+	card: SystemCard;
+	tasks: TaskCard[];
+	openTask: (id: string) => void;
+}) {
+	const t = tasks.find((x) => x.project === card.project && x.id === card.id);
+	return (
+		<a
+			href={taskPath(card.project, card.id)}
+			title={t?.sessionTitle}
+			onClick={(e) => navClick(e, () => openTask(card.id))}
+		>
+			{card.id}
+		</a>
+	);
+}
+
+/** A memory.events counter since the container started, plus its growth over the last hour. */
+function eventCount(total: number | null, hour: number | null): ReactNode {
+	if (total === null) return "n/a";
+	return (
+		<>
+			{total}
+			{hour !== null && <span className="sys-sub"> +{hour} in 1 h</span>}
+		</>
+	);
+}
+
+/** The System view at /system: one row per container (the server, then each worker), the
+ *  Docker VM, and the board-wide holds. Containers and VM come from the 30 s System snapshot;
+ *  the holds read the live board state with the top bar's own slotUse and queueOrder, so the
+ *  two always show the same numbers. */
+function SystemView({
+	state,
+	openTask,
+}: {
+	state: StateResponse;
+	openTask: (id: string) => void;
+}) {
+	const system = useSystem();
+	const tasks = state.tasks;
+	const slots = slotUse(tasks);
+	const running = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
+	const queue = queueOrder(tasks);
+	const oldest = queue[0];
+	const links = (cards: SystemCard[]): ReactNode =>
+		cards.map((c) => (
+			<SystemCardLink
+				key={`${c.project}/${c.id}`}
+				card={c}
+				tasks={tasks}
+				openTask={openTask}
+			/>
+		));
+	return (
+		<section className="system-view" aria-labelledby="system-title">
+			<div>
+				<h1 id="system-title">System</h1>
+				{system === null ? (
+					<p className="caption" role="status">
+						Waiting for the first sample…
+					</p>
+				) : (
+					<p className="caption">
+						Sampled every 30 s, last at {clockTime(system.at)}. Charts show the
+						last hour.
+					</p>
+				)}
+			</div>
+			{system !== null && (
+				<section aria-labelledby="sys-containers">
+					<h2 className="ov-sec" id="sys-containers">
+						Containers
+					</h2>
+					{system.containers.length === 0 ? (
+						<p className="caption">No container sampled yet.</p>
 					) : (
-						<>
-							<div className="mc">
-								{(
-									[
-										["CPU", (w: MachineWindow) => w.cpu, true],
-										[
-											`RAM of ${stats.ram.totalGiB} GiB`,
-											(w: MachineWindow) => w.ramPct,
-											false,
-										],
-									] as const
-								).map(([name, pick, peak]) => (
-									<div key={name}>
-										<h3>{name}</h3>
-										<div
-											className="mc-cols"
-											role="img"
-											aria-label={`${name}: ${stats.windows.map((w) => `${Math.round(pick(w))} % over ${windowName(w.minutes)}`).join(", ")}`}
-										>
-											<span className="mc-band" />
-											{stats.windows.map((w) => (
-												<span
-													key={w.minutes}
-													className="mc-col"
-													data-level={loadLevel(pick(w))}
-												>
-													<i style={{ height: `${clamp(pick(w), 0, 100)}%` }} />
-													{peak && (
-														<s
-															style={{ bottom: `${clamp(w.cpuPeak, 0, 100)}%` }}
-														/>
+						<div className="ov-wrap">
+							<table className="sys">
+								<caption className="sr">
+									Containers: CPU and memory now and over the last hour, memory
+									limit hits, OOM kills, live turns and the mutation lock
+								</caption>
+								<thead>
+									<tr>
+										<th scope="col">Container</th>
+										<th scope="col">CPU</th>
+										<th scope="col">Memory</th>
+										<th scope="col">Limit hits</th>
+										<th scope="col">OOM kills</th>
+										<th scope="col">Turns</th>
+										<th scope="col">Mutation lock</th>
+									</tr>
+								</thead>
+								<tbody>
+									{system.containers.map((c) => {
+										const warn = c.warnings.length > 0;
+										return (
+											<tr key={c.name} data-warn={warn || undefined}>
+												<th scope="row">
+													<span className="sys-name">
+														{warn && <Mark kind="needs" />}
+														{c.name}
+													</span>
+													{/* The reasons in text: amber alone never carries a warning. */}
+													{warn && (
+														<ul className="sys-warns">
+															{c.warnings.map((w) => (
+																<li key={w}>{w}</li>
+															))}
+														</ul>
 													)}
-												</span>
-											))}
-										</div>
-										<div className="mc-keys" aria-hidden="true">
-											{stats.windows.map((w) => (
-												<span key={w.minutes}>
-													<b data-level={loadLevel(pick(w))}>
-														{Math.round(pick(w))} %
-													</b>
-													{windowName(w.minutes)}
-												</span>
-											))}
-										</div>
-									</div>
-								))}
-							</div>
-							<p className="caption">
-								Line: the {BAND_LIMIT} % limit. CPU notch: the peak sample.
-								{stats.windows.some((w) => w.coveredMinutes < w.minutes) &&
-									` History since the board started: ${Math.max(...stats.windows.map((w) => w.coveredMinutes))} min.`}
-							</p>
-						</>
+												</th>
+												{c.reachable ? (
+													<>
+														<td data-label="CPU">
+															<div className="sys-metric">
+																<span>
+																	{c.cpuPct === null
+																		? "n/a"
+																		: `${Math.round(c.cpuPct)} %`}
+																	{c.cpuShare !== null && (
+																		<span className="sys-sub">
+																			{/* One decimal at most: "16", "1.5". */}{" "}
+																			of {Math.round(c.cpuShare * 10) / 10} CPUs
+																		</span>
+																	)}
+																</span>
+																<Sparkline
+																	history={c.history}
+																	pick={(p) => p.cpu}
+																	end={system.at}
+																	ceiling={
+																		c.cpuShare === null
+																			? null
+																			: c.cpuShare * 100
+																	}
+																	label="CPU last hour"
+																	format={(v) => `${Math.round(v)} %`}
+																/>
+															</div>
+														</td>
+														<td data-label="Memory">
+															<div className="sys-metric">
+																<span>
+																	{c.memUsed === null
+																		? "n/a"
+																		: c.memLimit !== null && c.memLimit > 0
+																			? `${gib(c.memUsed)} / ${gib(c.memLimit)} GiB (${Math.round((c.memUsed / c.memLimit) * 100)} %)`
+																			: `${gib(c.memUsed)} GiB · no limit`}
+																</span>
+																<Sparkline
+																	history={c.history}
+																	pick={(p) => p.mem}
+																	end={system.at}
+																	ceiling={c.memLimit}
+																	label="Memory last hour"
+																	format={(v) => `${gib(v)} GiB`}
+																/>
+															</div>
+														</td>
+														<td data-label="Limit hits">
+															{eventCount(c.memMaxHits, c.memMaxHitsHour)}
+														</td>
+														<td data-label="OOM kills">
+															{eventCount(c.oomKills, c.oomKillsHour)}
+														</td>
+													</>
+												) : (
+													<td colSpan={4} className="sys-gap">
+														{c.unreachableSince === null
+															? "not reachable"
+															: `not reachable since ${clockTime(c.unreachableSince)}`}
+													</td>
+												)}
+												<td data-label="Turns">
+													{c.cards.length === 0 ? (
+														<span className="sys-sub">none</span>
+													) : (
+														<span className="sys-cards">{links(c.cards)}</span>
+													)}
+												</td>
+												<td data-label="Mutation lock">
+													<span className="sys-cards">
+														{!c.reachable ? (
+															"n/a"
+														) : c.lock.holderPid === null ? (
+															"free"
+														) : (
+															<>
+																<span>pid {c.lock.holderPid}</span>
+																{c.lock.holderCard !== null &&
+																	links([c.lock.holderCard])}
+															</>
+														)}
+													</span>
+													{c.lock.waiters.length > 0 && (
+														<span className="sys-cards">
+															<span className="sys-sub">
+																{c.lock.waiters.length} waiting:
+															</span>
+															{links(c.lock.waiters)}
+														</span>
+													)}
+												</td>
+											</tr>
+										);
+									})}
+								</tbody>
+							</table>
+						</div>
 					)}
 				</section>
-			</div>
-		</>
+			)}
+			{system !== null && (
+				<section aria-labelledby="sys-vm">
+					<h2 className="ov-sec" id="sys-vm">
+						Docker VM
+					</h2>
+					<dl className="sys-kv">
+						<div>
+							<dt>CPU</dt>
+							<dd className="sys-metric sys-metric-inline">
+								<span>
+									{system.vm.cpuPct === null
+										? "n/a"
+										: `${Math.round(system.vm.cpuPct)} %`}
+								</span>
+								<Sparkline
+									history={system.vm.history}
+									pick={(p) => p.cpu}
+									end={system.at}
+									ceiling={100}
+									label="VM CPU last hour"
+									format={(v) => `${Math.round(v)} %`}
+								/>
+							</dd>
+						</div>
+						<div>
+							<dt>Load</dt>
+							<dd>
+								{system.vm.load1 === null
+									? "n/a"
+									: `load ${system.vm.load1.toFixed(2)} / ${system.vm.cpus} CPUs`}
+							</dd>
+						</div>
+						<div>
+							<dt>Memory</dt>
+							<dd>
+								{system.vm.memAvailable === null || system.vm.memTotal === null
+									? "n/a"
+									: `${gib(system.vm.memAvailable)} / ${gib(system.vm.memTotal)} GiB available`}
+							</dd>
+						</div>
+					</dl>
+				</section>
+			)}
+			<section aria-labelledby="sys-holds">
+				<h2 className="ov-sec" id="sys-holds">
+					Holds
+				</h2>
+				<dl className="sys-kv">
+					{state.drainUntil !== null && (
+						<div>
+							<dt>Update</dt>
+							<dd>
+								Update hold until {clockTime(state.drainUntil)}
+								{(state.drainCommits ?? []).length > 0 && (
+									<ul className="sys-commits">
+										{(state.drainCommits ?? []).map((c) => (
+											<li key={c}>{c}</li>
+										))}
+									</ul>
+								)}
+							</dd>
+						</div>
+					)}
+					<div>
+						<dt>Agent cap</dt>
+						<dd>
+							{state.maxTotal === null
+								? `no cap · ${running} running`
+								: `${running} / ${state.maxTotal} running`}
+						</dd>
+					</div>
+					<div>
+						<dt>Queue</dt>
+						<dd>
+							{oldest === undefined ? (
+								"empty"
+							) : (
+								<>
+									{queue.length} queued · oldest waiting{" "}
+									<span className="sys-dur">
+										{duration(
+											Date.now() - (oldest.queuedAt ?? oldest.createdAt),
+										)}
+									</span>
+								</>
+							)}
+						</dd>
+					</div>
+				</dl>
+			</section>
+		</section>
 	);
 }
 
@@ -10051,8 +10391,8 @@ function railRow(
 	return { p, running, needs, asks, waiting, unread, top, summary };
 }
 
-/** The project rail's rows: Overview, Add project, one link per project with its one ranked
- * mark, and the "Ottr <version>" footer line. The desktop rail renders it, and the phone
+/** The project rail's rows: Overview, System, Add project, one link per project with its one
+ * ranked mark, and the "Ottr <version>" footer line. The desktop rail renders it, and the phone
  * popout under the bar's grid button reuses it (always expanded there). */
 function RailRows({
 	projects,
@@ -10061,6 +10401,7 @@ function RailRows({
 	seenDoneSince,
 	project,
 	overviewCurrent,
+	systemCurrent,
 	version,
 	collapsed,
 	navigate,
@@ -10074,8 +10415,10 @@ function RailRows({
 	seenAnswers: Set<string>;
 	seenDoneSince: number;
 	project: ProjectView | null;
-	/** Overview is the open page (no project and no settings page). */
+	/** Overview is the open page (no project, no settings page, not the System view). */
 	overviewCurrent: boolean;
+	/** The System view is the open page. */
+	systemCurrent: boolean;
 	version: string | null;
 	/** Folded desktop rail: the rows show only their plates, so each one gets a title tooltip. */
 	collapsed: boolean;
@@ -10104,6 +10447,18 @@ function RailRows({
 					<Icon name="grid" size={13} />
 				</span>
 				<span className="area-name rail-label">Overview</span>
+			</a>
+			<a
+				className="area"
+				aria-current={systemCurrent ? "page" : undefined}
+				href={viewPath(SYSTEM_VIEW)}
+				onClick={go}
+				title={collapsed ? "System" : undefined}
+			>
+				<span className="rail-plate icon">
+					<Icon name="activity" size={13} />
+				</span>
+				<span className="area-name rail-label">System</span>
 			</a>
 			<button
 				type="button"
@@ -10534,7 +10889,7 @@ export function App() {
 		return () => window.removeEventListener("popstate", onPop);
 	}, []);
 
-	// One push-only socket per tab: state, update banner and stats all arrive over it.
+	// One push-only socket per tab: state, update banner and System snapshots all arrive over it.
 	// Every state frame is diffed against the last one so tasks that just started needing
 	// the user fire a desktop notification (only while the tab is hidden; see notify.ts).
 	const seenTasks = useRef<TaskCard[] | null>(null);
@@ -10736,8 +11091,15 @@ export function App() {
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
 	// switch once Ottr ships releases.
 	const checkProject = mapRepo("ottr-ai/ottr", projects);
-	const project = projects.find((p) => p.name === view) ?? null;
+	// The System view's view string shares the namespace of project names, like "settings":
+	// on /system no project is current.
+	const onSystem = view === SYSTEM_VIEW;
+	const project = onSystem
+		? null
+		: (projects.find((p) => p.name === view) ?? null);
 	const settingsRoute = settingsSub(view);
+	const overviewCurrent =
+		project === null && !settingsRoute.onSettings && !onSystem;
 	const selected =
 		selectedId === null
 			? null
@@ -11201,7 +11563,8 @@ export function App() {
 						seenAnswers={seenAnswers}
 						seenDoneSince={seenDoneSince}
 						project={project}
-						overviewCurrent={project === null && !settingsRoute.onSettings}
+						overviewCurrent={overviewCurrent}
+						systemCurrent={onSystem}
 						version={bootVersion}
 						collapsed={false}
 						navigate={navigate}
@@ -11231,6 +11594,7 @@ export function App() {
 						tasks={tasks}
 						maxTotal={state.maxTotal}
 						quota={state.quota}
+						navigate={navigate}
 					/>
 				)}
 				{checkProject !== null && (
@@ -11430,7 +11794,8 @@ export function App() {
 						seenAnswers={seenAnswers}
 						seenDoneSince={seenDoneSince}
 						project={project}
-						overviewCurrent={project === null && !settingsRoute.onSettings}
+						overviewCurrent={overviewCurrent}
+						systemCurrent={onSystem}
 						version={bootVersion}
 						collapsed={railCollapsed}
 						navigate={navigate}
@@ -11526,6 +11891,8 @@ export function App() {
 							view={view}
 							openTask={openTask}
 						/>
+					) : onSystem ? (
+						<SystemView state={state} openTask={openTask} />
 					) : project === null ? (
 						<Overview
 							projects={projects}

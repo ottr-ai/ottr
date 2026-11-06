@@ -178,11 +178,26 @@ const fetchMock = (async (input: RequestInfo | URL) => {
 		body = { onboarding: false, version: "vtest", live: false };
 	else if (url === "/api/state") body = state;
 	else if (url === "/api/update") body = { behind: 0, commits: [] };
-	else if (url === "/api/stats")
+	else if (url === "/api/system")
 		body = {
-			cpu: 1,
-			ram: { usedGiB: 1, totalGiB: 8, pct: 12 },
-			windows: [],
+			at: 1,
+			containers: [],
+			vm: {
+				cpuPct: null,
+				cpus: 4,
+				load1: null,
+				memAvailable: null,
+				memTotal: null,
+				history: [],
+			},
+			holds: {
+				drainUntil: null,
+				drainCommits: null,
+				maxTotal: null,
+				running: 0,
+				queued: 0,
+				oldestQueuedAt: null,
+			},
 		};
 	else {
 		// The drawer's detail fetch: a TaskView built from the board card.

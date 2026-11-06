@@ -1,5 +1,8 @@
 export const SETTINGS_HASH = "settings";
 
+/** The System view's view string and path segment: containers, the Docker VM and the holds. */
+export const SYSTEM_VIEW = "system";
+
 /** "settings" opens General; "settings/<project>" opens that project's page; other views are not settings. */
 export function settingsSub(view: string): {
 	onSettings: boolean;
@@ -35,8 +38,9 @@ export function historyTask(
 
 /** The view string and open card id from location.pathname: "/" is the overview,
  * "/projects/<project>" a project, "/projects/<project>/tasks/<id>" that project with the
- * card's drawer open, "/settings" and "/settings/<project>" Settings. Each segment is
- * percent-decoded exactly once. An unknown or malformed path falls back to the overview. */
+ * card's drawer open, "/settings" and "/settings/<project>" Settings, "/system" the System
+ * view. Each segment is percent-decoded exactly once. An unknown or malformed path falls
+ * back to the overview. */
 export function readPath(): PathView {
 	const segs = location.pathname
 		.split("/")
@@ -53,6 +57,8 @@ export function readPath(): PathView {
 		if (segs.length === 2)
 			return { view: `${SETTINGS_HASH}/${segs[1]}`, task: null };
 	}
+	if (segs[0] === SYSTEM_VIEW && segs.length === 1)
+		return { view: SYSTEM_VIEW, task: null };
 	return { view: "", task: null };
 }
 
@@ -83,9 +89,10 @@ export function settingsPath(project: string | null): string {
 }
 
 /** The path that names a view string without a card: "" → "/", a project its project path,
- * "settings" and "settings/<project>" their settings paths. */
+ * "settings" and "settings/<project>" their settings paths, "system" the System view. */
 export function viewPath(view: string): string {
 	if (view === SETTINGS_HASH) return settingsPath(null);
+	if (view === SYSTEM_VIEW) return `/${SYSTEM_VIEW}`;
 	const s = settingsSub(view);
 	if (s.onSettings && s.project !== null) return settingsPath(s.project);
 	return view === "" ? "/" : projectPath(view);
