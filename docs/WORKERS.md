@@ -158,7 +158,7 @@ turns and work turns all get the new omp. Two parts do the work:
    that is not running and waits for the server's health; it recreates nothing.
 
    Versions can mix only as old server with new worker, during a roll and after a
-   stopped roll. The worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`)
+   stopped roll. The worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`, `GET /signins`)
    stays compatible for one version in this direction. New server with old worker
    never persists: the server rolls after every worker rolled, and the per-runner
    holds and the detach before the server step mean no undetached turn runs on an
@@ -937,6 +937,33 @@ podman machine stop; podman machine start
 ```
 
 The start output must then include `API forwarding listening on: npipe:////./pipe/docker_engine`. Keep the CLI default connection on the same side as Podman Desktop: with a rootful machine, use `podman-machine-default-root`.
+
+### The stack starts without provider sign-ins, or recreates fail with `Not a directory`
+
+Two failures from the same cause: `OTTR_OAUTH_DIR` or `OTTR_AGENT_DB` pointing at a
+wrong host path. Rootful Podman creates an empty folder for a missing bind source
+instead of failing, so the stack starts with broken credential mounts.
+
+Symptom (a): the stack starts, but Settings and turns have no provider sign-in, and
+the logs show `ottr-entry:` refusing with the `OTTR_OAUTH_DIR` or `OTTR_AGENT_DB`
+message.
+
+Fix: correct the host path in the compose env file and recreate the stack.
+
+Symptom (b): after fixing `OTTR_AGENT_DB`, every `docker compose up` loops with
+`crun: mount ... agent.db: Not a directory`. The home volume keeps the empty
+`agent.db` folder crun created as the bind mountpoint, and the bind itself is the
+thing that fails, so no stack container can reach the folder.
+
+Fix:
+
+```sh
+docker compose run --rm home-repair
+docker compose up -d
+```
+
+The one-off mounts the home volume without the agent.db bind and removes the empty
+folder (only an empty one; a real file or a non-empty folder is refused).
 
 ### The board times out after the stack was recreated (WSL mirrored networking)
 

@@ -250,6 +250,22 @@ services:
       - node install-user.mjs --home /etc/ottr/home --force "$$@" && node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"
       - board-seed
 
+  # Repair for the empty agent.db folder: a wrong OTTR_AGENT_DB host path makes rootful
+  # Podman create an empty folder, and the home volume keeps it — the bind mount then
+  # fails on every recreate with `crun: mount ... agent.db: Not a directory`, because
+  # the folder is only reachable from a container that does NOT bind the failing path.
+  # This one-off mounts the home volume WITHOUT the agent.db bind and removes the empty
+  # folder (only an empty one; a non-empty folder or a real file is refused). The image
+  # entrypoint /ottr-entry.sh handles it: first argument repair-agent-db. Usage:
+  #   docker compose run --rm home-repair
+  home-repair:
+    image: ${OTTR_IMAGE:-ottr-worker:local}
+    profiles: [repair]
+    logging: *logging
+    volumes:
+      - home:/root
+    command: [repair-agent-db]
+
   # Memory lives in the shared Hindsight server named by HINDSIGHT_API_URL
   # (tenant-key auth); set the URL in the compose env file or in Settings.
 

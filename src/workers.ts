@@ -6,9 +6,10 @@ import {
 	readlinkSync,
 	statSync,
 } from "node:fs";
-import { hostname } from "node:os";
-import { isAbsolute } from "node:path";
+import { homedir, hostname } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
+import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { ensureProjectPython } from "./python.ts";
 import type { RunSink } from "./runner.ts";
@@ -40,6 +41,14 @@ export interface WorkerRequest {
 	stdin: string;
 	env: Record<string, string>;
 }
+
+/**
+ * The worker's own omp store: the default home location, even when the board pins its own copy
+ * elsewhere (R5-1; the same path `loginStores` in src/login.ts resolves for the workers' store,
+ * compose binds it as OTTR_AGENT_DB).
+ */
+const workerAgentDb = (): string =>
+	join(process.env.HOME ?? homedir(), ".omp", "agent", "agent.db");
 
 /**
  * One live or detached run. A detached entry stays in runChildren (its keep-set), keeps
@@ -86,6 +95,8 @@ export function serveWorker(opts: {
 	sweepKill?: typeof process.kill;
 	/** Only for tests: the expiry of /detached entries instead of 24 h. */
 	detachedTtlMs?: number;
+	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
+	readSignIns?: () => SignIn[];
 }): Bun.Server<never> {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
@@ -112,6 +123,25 @@ export function serveWorker(opts: {
 			const url = new URL(request.url);
 			if (request.method === "GET" && url.pathname === "/healthz")
 				return new Response("ok");
+			// OTTR-548: the worker self-reports its own store's sign-ins; the board never reads
+			// the worker store (R5-1). Always HTTP 200: the board's tick decides what a null
+			// signIns list means, and a warning must never start with a failed request.
+			if (request.method === "GET" && url.pathname === "/signins") {
+				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
+					return new Response("unauthorized", { status: 401 });
+				const dbPath = workerAgentDb();
+				try {
+					// A readonly open of a missing path fails with a message that names no file.
+					if (!existsSync(dbPath)) throw new Error(`${dbPath} does not exist`);
+					const read = opts.readSignIns ?? (() => signIns(dbPath));
+					return Response.json({ signIns: read() });
+				} catch (err) {
+					return Response.json({
+						signIns: null,
+						error: `${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
+					});
+				}
+			}
 			if (request.method === "POST" && url.pathname === "/sweep") {
 				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
 					return new Response("unauthorized", { status: 401 });

@@ -528,6 +528,8 @@ const app = createApp({
 		})),
 		{ id: "local", url: null },
 	],
+	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
+	workerTarget,
 	runnerTurns: () => loop.runnerTurns(),
 	claimedPids,
 	progressOf: (project, id) => {
@@ -594,6 +596,10 @@ setInterval(() => void app.idleReviewTick(), 5 * 60_000);
 
 // Memory health: boot + interval, never per turn (docs/specs/memory-backend.md).
 setInterval(() => void app.memoryHealthTick(), 60_000);
+
+// OTTR-548: worker sign-in self-reports, 60 s tick (the boot call is createApp's, like memory
+// health); the state warnings read only the tick's cache — advisory, fail-soft.
+setInterval(() => void app.workerSignInTick(), 60_000);
 
 // 1 s diff tick: catches file-driven changes no code path writes (omp session titles, AGENTS.md
 // appearing, main-checkout dirtiness). ponytail: replace with fs watchers if the state build ever

@@ -21,6 +21,40 @@ refuse_home_pin GIT_CONFIG_GLOBAL "$GIT_CONFIG_GLOBAL"
 refuse_home_pin GH_CONFIG_DIR "$GH_CONFIG_DIR"
 refuse_home_pin PI_CODING_AGENT_DIR "$PI_CODING_AGENT_DIR"
 refuse_home_pin OTTR_BOARD_OMP_HOME "$OTTR_BOARD_OMP_HOME"
+# Repair mode: remove the empty agent.db folder a wrong host path left in the home
+# volume. The repair container mounts only the home volume, not the failing agent.db
+# bind, so it reaches the folder. It removes ONLY an empty directory: a real or
+# missing agent.db has nothing to do, and a non-empty folder is refused untouched.
+if [ "${1:-}" = "repair-agent-db" ]; then
+	shift
+	db="${OTTR_AGENT_DB:-/root/.omp/agent/agent.db}"
+	if [ -d "$db" ] && [ -z "$(ls -A "$db")" ]; then
+		rmdir "$db"
+		echo "ottr-entry: removed the empty folder $db; recreate the stack now" >&2
+	elif [ -d "$db" ]; then
+		echo "ottr-entry: OTTR_AGENT_DB=$db is a non-empty directory; removing it would delete data — refusing, remove nothing" >&2
+		exit 1
+	else
+		echo "ottr-entry: nothing to repair at OTTR_AGENT_DB=$db (not an empty folder)" >&2
+		exit 0
+	fi
+	exit 0
+fi
+# Credential mounts: compose interpolates OTTR_OAUTH_DIR and OTTR_AGENT_DB on the host,
+# so a wrong host path makes rootful Podman create an empty folder inside the container
+# and the stack starts with broken credential mounts that nothing reports. Refuse to
+# start before anything is written. Both variables are not inside the container env,
+# hence the fixed defaults. README, "Podman", and docs/WORKERS.md, Troubleshooting.
+db="${OTTR_AGENT_DB:-/root/.omp/agent/agent.db}"
+if [ ! -f "$db" ]; then
+	echo "ottr-entry: OTTR_AGENT_DB=$db is not a regular file: a wrong host path made rootful Podman create an empty folder; after fixing the path the home volume keeps that folder and the next recreate fails with 'crun: mount ... agent.db: Not a directory' — repair with docker compose run --rm home-repair. See README, \"Podman\" and docs/WORKERS.md, Troubleshooting; refusing to start" >&2
+	exit 1
+fi
+oauth="${OTTR_OAUTH_DIR:-/root/.omp/oauth}"
+if [ ! -d "$oauth" ] || [ -z "$(ls -A "$oauth")" ]; then
+	echo "ottr-entry: OTTR_OAUTH_DIR=$oauth is not a non-empty directory: a wrong host path made rootful Podman create an empty folder. Fix the host path and sign in again. See README, \"Podman\" and docs/WORKERS.md, Troubleshooting; refusing to start" >&2
+	exit 1
+fi
 # R5-1: this script never copies from $HOME. A missing pinned git config gets the fixed
 # Ottr identity (the one src/app.ts commits with). gh starts empty: its config can name
 # commands (browser, pager). The omp agent dir only gets content from the trusted seed,

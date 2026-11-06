@@ -335,6 +335,33 @@ Sign-out marks the provider's rows `deleted by user` in the board store and,
 when the worker store is a different file and exists, in the worker store too.
 That removes the provider's legacy rows with one user step.
 
+### Worker sign-in warning
+
+The board cannot see the worker store (R5-1), so a worker whose store lost a
+sign-in (the `OTTR_AGENT_DB` mount pointing at a wrong host path, for example)
+would go unnoticed: the board's own warnings cover the board store only. So
+the worker self-reports. Each worker answers a token-gated `GET /signins`
+with its own store's sign-ins (`{signIns: [...]}` as `signIns()` in
+`src/login.ts` reads them), or `{signIns: null, error}` — HTTP 200 in both
+cases — when its store is missing or unreadable; the error names the path and
+the cause. The board never reads the worker store itself: it polls the
+endpoint on a 60 s tick (`workerSignInTick` in `src/app.ts`) and keeps the
+last report per worker.
+
+From the reports the board shows one warning per worker and provider when a
+model role uses the provider and all of these hold: the worker's report has
+no active row for it, the board lends nothing for it (no active `lent`
+sign-in — the lent env token would cover worker turns), and no env key is set
+(the same rule `boardWarnings` applies to the board store). The warning names
+the fix: seed the worker store from a host db that has the sign-in, or set
+the provider's API key in the environment. An unreadable worker store gets
+one warning per worker, not one per provider.
+
+Advisory only: an old worker without the route (404), a failed fetch, or a
+non-JSON answer means an unknown state and warns nothing, and the state
+response reads only the tick's cache, so every failure mode degrades to no
+warning, never a failed state.
+
 ## Status and API shape
 
 `GET /api/provider-login` returns `{signIns, pending, providers}` — the board

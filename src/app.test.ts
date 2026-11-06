@@ -37,6 +37,7 @@ import {
 	type Entry,
 	reconcileLayerUse,
 	storedProjectPaths,
+	workerSignInWarnings,
 } from "./app.ts";
 import { hashPassword, signSession } from "./auth.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
@@ -194,7 +195,9 @@ afterAll(() => {
 	for (const g of mountStores) g.close();
 	for (const d of sshTempDirs) rmSync(d, { recursive: true, force: true });
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-});
+	// The whole-shutdown sweep (every mounted server's graceful stop, then the root rm) passes
+	// bun's 5 s hook default on a loaded machine (OTTR-548 gate): a ceiling, not a wait.
+}, 60_000);
 
 const projectDir = join(root, "p1");
 mkdirSync(projectDir, { recursive: true });
@@ -9290,6 +9293,244 @@ describe("board warnings", () => {
 			expect(twins).toHaveLength(2);
 			for (const w of twins) expect(w).toContain("holds 1 merge");
 		}));
+});
+
+describe("worker sign-in warnings", () => {
+	// The report shape the tick caches; ids are worker hostnames only — "local" never appears.
+	const report = (
+		signIns: SignIn[] | null,
+		error: string | null = null,
+	): { signIns: SignIn[] | null; error: string | null; at: number } => ({
+		signIns,
+		error,
+		at: 1_762_000_000_000,
+	});
+	const ZAI_ACTIVE: SignIn = {
+		provider: "zai",
+		kind: "oauth",
+		active: true,
+		cause: null,
+		lent: false,
+	};
+	const roles = { default: "zai/glm-5:high" };
+	const MISSING = (id: string, role = "default") =>
+		`Worker ${id} has no active sign-in for zai (role ${role}): the workers' store (OTTR_AGENT_DB) lacks it, the board does not lend this provider, and no env key is set; seed the store from a host db that has the sign-in, or set its API key in the environment.`;
+	const UNREADABLE = (id: string, error: string) =>
+		`Worker ${id} has no readable credential store (${error}); worker turns keep their own credential, so sign-ins that the board does not lend are missing (OTTR_AGENT_DB; docs/WORKERS.md, Provider sign-in).`;
+
+	test("a worker report without the role's provider warns, once per worker", () => {
+		const reports = new Map([
+			["worker-a", report([])],
+			["worker-b", report([])],
+		]);
+		expect(workerSignInWarnings(reports, [], roles, {})).toEqual([
+			MISSING("worker-a"),
+			MISSING("worker-b"),
+		]);
+		// Two roles on one provider: the first role names it.
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([])]]),
+				[],
+				{ default: "zai/glm-5", smol: "zai/glm-4" },
+				{},
+			),
+		).toEqual([MISSING("worker-a")]);
+	});
+
+	test("a board sign-in lent for the provider silences it: the lent env token covers worker turns", () => {
+		const lentZai: SignIn = {
+			provider: "zai",
+			kind: "oauth",
+			active: true,
+			cause: null,
+			lent: true,
+		};
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([])]]),
+				[lentZai],
+				roles,
+				{},
+			),
+		).toEqual([]);
+	});
+
+	test("the provider's env key silences it, openai-codex riding the OpenAI key", () => {
+		expect(
+			workerSignInWarnings(new Map([["worker-a", report([])]]), [], roles, {
+				ZAI_API_KEY: "k",
+			}),
+		).toEqual([]);
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([])]]),
+				[],
+				{ default: "openai-codex/gpt-5:high" },
+				{ OPENAI_API_KEY: "k" },
+			),
+		).toEqual([]);
+	});
+
+	test("an unreadable worker store gets one warning per worker, naming the error", () => {
+		const error = "/mnt/data/agent.db: file is not a database";
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report(null, error)]]),
+				[],
+				roles,
+				{},
+			),
+		).toEqual([UNREADABLE("worker-a", error)]);
+	});
+
+	test("an unknown report (old worker, failed fetch) warns nothing", () => {
+		expect(
+			workerSignInWarnings(new Map([["worker-a", null]]), [], roles, {}),
+		).toEqual([]);
+		// No workers configured: an empty cache warns nothing.
+		expect(workerSignInWarnings(new Map(), [], roles, {})).toEqual([]);
+	});
+
+	test("a worker whose own store has the provider active warns nothing", () => {
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([ZAI_ACTIVE])]]),
+				[],
+				roles,
+				{},
+			),
+		).toEqual([]);
+		// A disabled row is not active: the provider needs a new sign-in.
+		const disabled: SignIn = {
+			provider: "zai",
+			kind: "oauth",
+			active: false,
+			cause: "oauth refresh failed: invalid_grant",
+			lent: false,
+		};
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([disabled])]]),
+				[],
+				roles,
+				{},
+			),
+		).toEqual([MISSING("worker-a")]);
+	});
+
+	test("only worker runners appear in the map: local never warns, unknown ids stay graceful", () => {
+		const out = workerSignInWarnings(
+			new Map([["worker-a", report([])]]),
+			[],
+			roles,
+			{},
+		);
+		expect(out).toEqual([MISSING("worker-a")]);
+		expect(out.some((w) => w.includes("local"))).toBe(false);
+		// An id no longer in the runner list (a removed worker) still warns as itself.
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-gone", report([])]]),
+				[],
+				roles,
+				{},
+			),
+		).toEqual([MISSING("worker-gone")]);
+		// A role selector without a provider prefix names no provider to check.
+		expect(
+			workerSignInWarnings(
+				new Map([["worker-a", report([])]]),
+				[],
+				{ default: "claude-opus-5-5" },
+				{},
+			),
+		).toEqual([]);
+	});
+
+	test("stateResponse ships the worker warning from the tick's cache", async () => {
+		// A stand-in worker the tick can poll, flipping between a report and an unreadable store.
+		let answer: { signIns: unknown; error?: string } = { signIns: [] };
+		const fakeWorker = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				if (new URL(req.url).pathname !== "/signins")
+					return new Response("not found", { status: 404 });
+				if (req.headers.get("x-otwr-token") !== "tok")
+					return new Response("unauthorized", { status: 401 });
+				return Response.json(answer);
+			},
+		});
+		// A seeded agent dir with one zai role: the board store stays silent for the worker
+		// warnings to stand out, and no host env key can silence them.
+		const agentTmp = mkdtempSync(join(tmpdir(), "ottr-worker-warn"));
+		writeFileSync(
+			join(agentTmp, "config.yml"),
+			"modelRoles:\n  default: zai/glm-5:high\n",
+		);
+		const savedAgent = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentTmp;
+		const savedKey = process.env.ZAI_API_KEY;
+		delete process.env.ZAI_API_KEY;
+		const workerApp = createApp({
+			gstore,
+			defaultDir: root,
+			projects: new Map(),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				idleReviews: true,
+				removedPaths: [],
+				envValues: {},
+				projectPaths: [],
+				projectOrder: [],
+			},
+			serverRef: { current: undefined },
+			workerTarget: {
+				urls: [`http://127.0.0.1:${fakeWorker.port}`],
+				token: "tok",
+			},
+		});
+		const srv = Bun.serve({ port: 0, ...workerApp.serveOptions });
+		workerApp.serverRef.current = srv;
+		mounted.push(srv);
+		const state = async () =>
+			(await (
+				await fetch(new URL("/api/state", srv.url), {
+					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+				})
+			).json()) as { warnings: string[] };
+		try {
+			await workerApp.workerSignInTick();
+			let warnings = (await state()).warnings;
+			expect(warnings).toContain(MISSING("127.0.0.1"));
+			// An unreadable store (the OTTR-548 symptom): the single store warning replaces
+			// the per-provider one.
+			const error = `${agentTmp}/agent.db: file is not a database`;
+			answer = { signIns: null, error };
+			await workerApp.workerSignInTick();
+			warnings = (await state()).warnings;
+			expect(warnings).toContain(UNREADABLE("127.0.0.1", error));
+			expect(
+				warnings.some((w) =>
+					w.startsWith("Worker 127.0.0.1 has no active sign-in"),
+				),
+			).toBe(false);
+		} finally {
+			fakeWorker.stop(true);
+			if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedAgent;
+			if (savedKey === undefined) delete process.env.ZAI_API_KEY;
+			else process.env.ZAI_API_KEY = savedKey;
+			rmSync(agentTmp, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("token expiry reminders", () => {

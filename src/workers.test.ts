@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
@@ -9,7 +10,8 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
 import {
 	detachedRuns,
@@ -760,6 +762,86 @@ describe("serveWorker", () => {
 			process.off("uncaughtException", onError);
 		}
 	}, 15000);
+});
+
+describe("GET /signins", () => {
+	// omp's auth_credentials as a seeded sign-in writes it (src/app.test.ts builds the same).
+	const SCHEMA = `CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY,
+		provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
+		disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`;
+
+	function credStore(path: string, list: Array<[string, string | null]>): void {
+		// A fresh store each call: a later list must not keep an earlier row.
+		rmSync(path, { force: true });
+		mkdirSync(dirname(path), { recursive: true });
+		const db = new Database(path);
+		db.exec(SCHEMA);
+		const add = db.prepare(
+			"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES (?, 'oauth', '{}', ?, 1, 1)",
+		);
+		for (const [provider, cause] of list) add.run(provider, cause);
+		add.finalize(); // an unfinalized statement keeps the file open on Windows
+		db.close();
+	}
+
+	test("unauthenticated /signins answers 401 like /sweep", async () => {
+		const url = start({ token: "tok", readSignIns: () => [] });
+		expect((await fetch(`${url}/signins`)).status).toBe(401);
+	});
+
+	test("GET /signins reports the worker store's sign-ins", async () => {
+		const dbPath = join(dir, "signins-home", ".omp", "agent", "agent.db");
+		credStore(dbPath, [
+			["anthropic", null],
+			["cursor", null],
+		]);
+		const url = start({ token: "tok", readSignIns: () => signIns(dbPath) });
+		const res = await fetch(`${url}/signins`, {
+			headers: { "x-otwr-token": "tok" },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			signIns: [
+				// Sorted by provider; lent only for a LENT_ENV provider (src/login.ts).
+				{
+					provider: "anthropic",
+					kind: "oauth",
+					active: true,
+					cause: null,
+					lent: true,
+				},
+				{
+					provider: "cursor",
+					kind: "oauth",
+					active: true,
+					cause: null,
+					lent: false,
+				},
+			],
+		});
+	});
+
+	test("an unreadable store answers 200 {signIns: null, error} naming the path", async () => {
+		// The default resolution is the request-time HOME (loginStores' worker path), so a
+		// directory where the store must be exercises the real unreadable-store answer.
+		const home = join(dir, "signins-broken-home");
+		mkdirSync(join(home, ".omp", "agent", "agent.db"), { recursive: true });
+		const saved = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const url = start({ token: "tok" });
+			const res = await fetch(`${url}/signins`, {
+				headers: { "x-otwr-token": "tok" },
+			});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { signIns: null; error: string };
+			expect(body.signIns).toBeNull();
+			expect(body.error).toContain(join(home, ".omp", "agent", "agent.db"));
+		} finally {
+			if (saved === undefined) delete process.env.HOME;
+			else process.env.HOME = saved;
+		}
+	});
 });
 
 describe("runWorker", () => {

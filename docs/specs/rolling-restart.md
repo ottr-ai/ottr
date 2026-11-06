@@ -290,9 +290,11 @@ Workers roll first, the server last. The only mixed pairs are:
 
 - old server ↔ new worker: transient during the roll, and persistent after a
   stopped roll (a worker passed health, a later one failed). Compatibility
-  rule: the worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`) and
-  the server's requests to it stay compatible for one version in this
-  direction; the worker API gains only optional response fields.
+  rule: the worker HTTP API (`GET /healthz`, `POST /run`, `POST /sweep`,
+  `GET /signins`) and the server's requests to it stay compatible for one
+  version in this direction; the worker API gains only optional response
+  fields and additive endpoints (an old worker's 404 is a valid answer — the
+  sign-in warning treats it as an unknown state and warns nothing).
 - new server ↔ old worker: never persists. The server rolls after every worker
   rolled, and the per-runner holds and detach before the server step mean no
   turn of the roll runs on an old worker while the new server boots. A worker

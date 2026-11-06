@@ -252,6 +252,7 @@ import {
 	saveSubs,
 	sendAll,
 } from "./webpush.ts";
+import type { WorkerTarget } from "./workers.ts";
 import {
 	archReviewDelta,
 	diffStat,
@@ -385,6 +386,9 @@ interface AppDeps {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
+	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
+	workerTarget?: WorkerTarget | null;
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -657,6 +661,68 @@ export function boardWarnings(
 		),
 	])
 		if (w !== null) out.push(w);
+	return out;
+}
+
+/** One worker's last sign-in self-report from the tick: its store's sign-ins, or error when the
+ * store is missing or unreadable; `at` stamps the tick that fetched the report. */
+export interface WorkerSignInReport {
+	signIns: SignIn[] | null;
+	error: string | null;
+	at: number;
+}
+
+/**
+ * OTTR-548: warnings for workers whose own credential store lacks a sign-in a model role uses.
+ * The board cannot see the worker store (R5-1), so each worker self-reports on GET /signins and
+ * workerSignInTick caches the report; this reads only that cache. A report of `null` (an old
+ * worker's 404, a failed fetch, a non-JSON answer) warns nothing — advisory, fail-soft. A report
+ * with `signIns: null` (an unreadable store, the wrong-host-path OTTR_AGENT_DB mount) gets one
+ * warning per worker, not one per provider. Otherwise the exemptions mirror boardWarnings: the
+ * worker's own active row, a board sign-in lent for the provider (the lent env token covers
+ * worker turns), or the provider's env key; several roles sharing a provider — the first names it.
+ */
+export function workerSignInWarnings(
+	reports: ReadonlyMap<string, WorkerSignInReport | null>,
+	boardList: readonly SignIn[],
+	roles: Readonly<Record<string, string>>,
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	const lent = new Set(
+		boardList.filter((s) => s.active && s.lent).map((s) => s.provider),
+	);
+	const out: string[] = [];
+	for (const [id, report] of reports) {
+		if (report === null) continue; // Unknown worker state warns nothing.
+		if (report.signIns === null) {
+			out.push(
+				`Worker ${id} has no readable credential store (${report.error}); worker turns keep their own credential, so sign-ins that the board does not lend are missing (OTTR_AGENT_DB; docs/WORKERS.md, Provider sign-in).`,
+			);
+			continue;
+		}
+		const active = new Set(
+			report.signIns.filter((s) => s.active).map((s) => s.provider),
+		);
+		const named = new Set<string>();
+		for (const [role, selector] of Object.entries(roles)) {
+			// Selectors without a provider prefix name no provider to check.
+			const i = selector.indexOf("/");
+			if (i <= 0) continue;
+			const provider = selector.slice(0, i).toLowerCase();
+			// Several roles may share a provider — the first role names it.
+			if (named.has(provider)) continue;
+			named.add(provider);
+			if (active.has(provider) || lent.has(provider)) continue;
+			// openai-codex rides the OpenAI key.
+			const envKey =
+				env[`${provider.replaceAll("-", "_").toUpperCase()}_API_KEY`] ??
+				(provider.startsWith("openai") ? env.OPENAI_API_KEY : undefined);
+			if (envKey !== undefined && envKey !== "") continue;
+			out.push(
+				`Worker ${id} has no active sign-in for ${provider} (role ${role}): the workers' store (OTTR_AGENT_DB) lacks it, the board does not lend this provider, and no env key is set; seed the store from a host db that has the sign-in, or set its API key in the environment.`,
+			);
+		}
+	}
 	return out;
 }
 /**
@@ -1010,6 +1076,50 @@ export function createApp(deps: AppDeps) {
 			// plumbing, and it must never take the board down.
 			logError("memory health check", err);
 		}
+	}
+	// OTTR-548: the workers' last sign-in self-reports, by runner id (the url's hostname, the
+	// id /api/drain lists). null = unknown: the fetch failed, an old worker answered 404, or a
+	// non-JSON body — workerSignInWarnings warns nothing for those, never a failed state.
+	const workerSignInReports = new Map<string, WorkerSignInReport | null>();
+	async function workerSignInTick(): Promise<void> {
+		const target = deps.workerTarget;
+		if (!target || target.urls.length === 0) return;
+		await Promise.all(
+			target.urls.map(async (url) => {
+				let report: WorkerSignInReport | null = null;
+				try {
+					const res = await fetch(`${url}/signins`, {
+						headers: {
+							...(target.token ? { "x-otwr-token": target.token } : {}),
+						},
+						// redirect: "manual": the worker token must never follow a redirect off-host.
+						redirect: "manual",
+						signal: AbortSignal.timeout(5_000),
+					});
+					if (res.status !== 200) throw new Error(`responded ${res.status}`);
+					const body = (await res.json()) as {
+						signIns?: unknown;
+						error?: unknown;
+					};
+					if (typeof body.error === "string")
+						report = { signIns: null, error: body.error, at: Date.now() };
+					else if (Array.isArray(body.signIns))
+						report = {
+							signIns: body.signIns as SignIn[],
+							error: null,
+							at: Date.now(),
+						};
+					else throw new Error("sent a body without signIns");
+				} catch {
+					report = null; // An unreachable or old worker warns nothing.
+				}
+				try {
+					workerSignInReports.set(new URL(url).hostname, report);
+				} catch {
+					// A malformed configured url never warns.
+				}
+			}),
+		);
 	}
 	function applyHindsight(): void {
 		if (hindsightUrl !== null) process.env.HINDSIGHT_API_URL = hindsightUrl;
@@ -1799,6 +1909,8 @@ export function createApp(deps: AppDeps) {
 	}
 	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
 	void memoryHealthTick();
+	// OTTR-548: the workers' sign-in self-reports boot + interval (src/server.ts), advisory only.
+	void workerSignInTick();
 	const logins = providerLogin();
 
 	function json(v: unknown, status = 200): Response {
@@ -2265,6 +2377,8 @@ export function createApp(deps: AppDeps) {
 			drainCommits: drainUntil > now ? drainCommits : null,
 			warnings: [
 				...boardWarnings(list, roles, undefined, undefined, tasks, now),
+				// OTTR-548: the workers' self-reported sign-ins; reads only the tick's cache.
+				...workerSignInWarnings(workerSignInReports, list, roles),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),
@@ -6656,6 +6770,7 @@ export function createApp(deps: AppDeps) {
 		alateProvisionTick,
 		idleReviewTick,
 		memoryHealthTick,
+		workerSignInTick,
 		refreshUpdates,
 		tokenReminderTick,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
