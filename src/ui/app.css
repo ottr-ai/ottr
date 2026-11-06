@@ -338,6 +338,31 @@ button.thumb > .icon-svg,
 	}
 }
 
+/* Delayed feedback (loading UX): a placeholder or busy spinner shows only when the wait
+   outlasts its delay, so a fast load or action never flashes one. Pure CSS — opacity
+   holds at 0 through the animation delay, then wait-show fades the element in and
+   `forwards` keeps it. Two shapes: `button > .spinner` waits 400ms (the button itself
+   still disables and blocks double clicks at once), and `.wait` on a placeholder line
+   (board boot, drawer sections, dialogs, settings panels) waits 1s. The save tick below
+   reuses the same keyframes at 250ms. Keep `spin` first and a wait animation second in
+   every spinner animation list — the reduced-motion override below addresses the two by
+   position. */
+button > .spinner {
+	opacity: 0;
+	animation:
+		spin 0.7s linear infinite,
+		wait-show 0s 0.4s forwards;
+}
+.wait {
+	opacity: 0;
+	animation: wait-show 0s 1s forwards;
+}
+@keyframes wait-show {
+	to {
+		opacity: 1;
+	}
+}
+
 /* Spinner inside a text line (hints, loading/dim status lines) instead of a flex button. */
 .hint .spinner,
 .loading .spinner,
@@ -4844,8 +4869,9 @@ dialog.confirm-dialog {
 	align-items: center;
 	gap: 6px;
 }
-/* Save tick beside a control that saves at once. The spinner waits 250ms before it shows,
-   so a quick save goes straight to the check; the check draws its stroke, then fades. */
+/* Save tick beside a control that saves at once. The spinner waits 250ms before it shows
+   (the shared wait-show keyframes), so a quick save goes straight to the check; the check
+   draws its stroke, then fades. */
 .save-tick {
 	display: inline-grid;
 	place-items: center;
@@ -4859,7 +4885,7 @@ dialog.confirm-dialog {
 	opacity: 0;
 	animation:
 		spin 0.7s linear infinite,
-		save-tick-wait 0s 0.25s forwards;
+		wait-show 0s 0.25s forwards;
 }
 .save-tick svg {
 	width: 16px;
@@ -4880,11 +4906,6 @@ dialog.confirm-dialog {
 	font-size: 12px;
 	font-weight: 400;
 	color: var(--crit);
-}
-@keyframes save-tick-wait {
-	to {
-		opacity: 1;
-	}
 }
 @keyframes save-tick-draw {
 	to {
@@ -7040,10 +7061,13 @@ button.log-mode[aria-pressed="true"] {
 		animation-iteration-count: 1 !important;
 		transition-duration: 0.01ms !important;
 	}
-	/* Progress feedback stays legible: the spinner keeps turning. */
+	/* Progress feedback stays legible: the spinner keeps turning. The values address the
+	   animations by position (spin first, a trailing wait-show second): the wait collapses
+	   to an instant fade whose delay still holds the element back, so reduced motion keeps
+	   both the turning and the nothing-under-a-second rule. */
 	.spinner {
-		animation-duration: 0.7s !important;
-		animation-iteration-count: infinite !important;
+		animation-duration: 0.7s, 0.01ms !important;
+		animation-iteration-count: infinite, 1 !important;
 	}
 }
 

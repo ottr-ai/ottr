@@ -1243,7 +1243,7 @@ function WorkflowModal({
 				<CloseButton />
 			</div>
 			{result === null ? (
-				<p className="hint">Loading…</p>
+				<p className="hint wait">Loading…</p>
 			) : "failed" in result ? (
 				<p className="hint" role="alert">
 					The diagram failed to load.
@@ -1331,7 +1331,7 @@ function MermaidDiagram({ code }: { code: string }) {
 				</pre>
 			</>
 		);
-	if (svg === null) return <p className="hint">Drawing…</p>;
+	if (svg === null) return <p className="hint wait">Drawing…</p>;
 	// biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid's strict mode sanitizes the SVG
 	return (
 		<div className="hiw-diagram" dangerouslySetInnerHTML={{ __html: svg }} />
@@ -1407,7 +1407,7 @@ function HowItWorksModal({
 				</span>
 			</div>
 			{result === null ? (
-				<p className="hint">Loading…</p>
+				<p className="hint wait">Loading…</p>
 			) : "missing" in result ? (
 				<p className="hint">
 					The target branch has no docs/how-it-works.md yet. Use Create/update
@@ -1486,7 +1486,7 @@ function DiffModal({
 				<CloseButton />
 			</div>
 			{result === null ? (
-				<p className="hint diff-empty">Loading…</p>
+				<p className="hint diff-empty wait">Loading…</p>
 			) : "failed" in result ? (
 				<p className="hint diff-empty">Diff unavailable.</p>
 			) : sections.length === 0 ? (
@@ -2551,7 +2551,7 @@ function ReleaseDialog({
 					<CloseButton />
 				</div>
 				{loading && (
-					<p className="hint" role="status">
+					<p className="hint wait" role="status">
 						<span className="spinner" aria-hidden="true" />
 						Reading the target…
 					</p>
@@ -2593,7 +2593,7 @@ function ReleaseDialog({
 							</ul>
 						)}
 						{summaryBusy && (
-							<p className="hint" role="status">
+							<p className="hint wait" role="status">
 								<span className="spinner" aria-hidden="true" />
 								Consolidating the notes…
 							</p>
@@ -3724,7 +3724,7 @@ export function Overview({
 				</p>
 			)}
 			{perf === null && err === null && (
-				<p className="loading" role="status">
+				<p className="loading wait" role="status">
 					<span className="spinner" aria-hidden="true" />
 					Loading performance…
 				</p>
@@ -4092,7 +4092,7 @@ function Provisioning({
 				</p>
 			)}
 			{data === null && err === null && (
-				<p className="loading" role="status">
+				<p className="loading wait" role="status">
 					<span className="spinner" aria-hidden="true" />
 					Loading provisioning…
 				</p>
@@ -6510,7 +6510,7 @@ function DrawerSec({
 /** The in-flight line a lazy drawer section holds its space with (Work steps, the file lists). */
 function DrawerLoading() {
 	return (
-		<p className="dim" role="status">
+		<p className="dim wait" role="status">
 			<span className="spinner" aria-hidden="true" />
 			Loading…
 		</p>
@@ -11289,7 +11289,7 @@ export function App() {
 
 				<main className="main">
 					{state === null ? (
-						<p className="loading" role="status">
+						<p className="loading wait" role="status">
 							<span className="spinner" aria-hidden="true" />
 							Loading board…
 						</p>

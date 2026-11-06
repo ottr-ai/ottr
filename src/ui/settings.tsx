@@ -340,7 +340,7 @@ export function ProjectSetupSteps({
 								</span>
 							</label>
 							{facts === null ? (
-								<p className="hint loading">
+								<p className="hint loading wait">
 									<span className="spinner" aria-hidden="true" />
 									Loading GitHub facts
 								</p>
@@ -3144,7 +3144,7 @@ function ModelRolesSection() {
 					</button>
 				</p>
 			) : state === null || catalog === null ? (
-				<p className="hint" role="status">
+				<p className="hint wait" role="status">
 					<span className="spinner" aria-hidden="true" />
 					Loading the model roles…
 				</p>
