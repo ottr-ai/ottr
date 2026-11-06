@@ -163,6 +163,17 @@ code {
 	font-size: 12.5px;
 }
 
+/* "(optional)" after a field label: dim like the hints, never bold or uppercase. An explicit
+   font-size keeps it visible inside the prompt-card caption, which hides at font-size 0. */
+.opt-mark {
+	margin-left: 4px;
+	font-size: 12px;
+	font-weight: 400;
+	letter-spacing: normal;
+	text-transform: none;
+	color: var(--dim);
+}
+
 /* Review-model nudge in the Start review dialog: visible recommendation, not a warning. */
 .model-notice {
 	margin: 0;

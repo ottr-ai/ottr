@@ -2182,6 +2182,7 @@ export function GitHostsSection() {
 						</DefRow>
 						<DefRow
 							name="Username"
+							optional
 							help="The username that git sends with the token. GitHub hosts use x-access-token; most other hosts accept oauth2."
 						>
 							<label>
@@ -3859,6 +3860,7 @@ function AlateSection() {
 									label="Alate server URL"
 									text="Where the alate server runs. The board asks this server to provision rules, settings, skills and plugins to the workers."
 								/>
+								<span className="opt-mark">(optional)</span>
 							</b>
 							<code>http(s) URL</code>
 						</div>
@@ -3881,6 +3883,7 @@ function AlateSection() {
 									label="Alate API key"
 									text="The key that the alate server prints at its first start. The board sends it with each provisioning request."
 								/>
+								<span className="opt-mark">(optional)</span>
 							</b>
 							<code>secret · stored, never shown</code>
 						</div>
@@ -3951,6 +3954,7 @@ function DefRow({
 	desc,
 	shape,
 	help,
+	optional,
 	action,
 	children,
 }: {
@@ -3958,6 +3962,9 @@ function DefRow({
 	desc?: string;
 	shape?: string;
 	help?: string;
+	/** Marks an optional field with a dim "(optional)" after the name (rows with an
+	 *  `empty = …` shape line already say it and skip the mark). */
+	optional?: boolean;
 	action?: ReactNode;
 	children: ReactNode;
 }) {
@@ -3967,6 +3974,7 @@ function DefRow({
 				<b>
 					{name}
 					{help !== undefined && <Help label={name} text={help} />}
+					{optional === true && <span className="opt-mark">(optional)</span>}
 				</b>
 				{desc !== undefined && <span>{desc}</span>}
 				{shape !== undefined && <code>{shape}</code>}
@@ -4889,6 +4897,7 @@ export function ProjectSettingsForm({
 							}
 							help="Up to 4 characters shown on the plate instead of any icon: this upload, the owner's avatar or the host's favicon. Empty shows the images again."
 							shape="Up to 4 characters"
+							optional
 						>
 							<form
 								id={markerFormId}
@@ -4943,6 +4952,7 @@ export function ProjectSettingsForm({
 							<DefRow
 								name="Display name"
 								action={save}
+								optional
 								help="A friendly name for the board. The folder and the repo keep their real names."
 							>
 								<label>

@@ -1705,6 +1705,7 @@ function ModelField({
 				<label className="field">
 					<span className="field-head">
 						Model
+						<span className="opt-mark">(optional)</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
 						{worst !== null && (
@@ -2580,6 +2581,7 @@ function ReleaseDialog({
 										spellCheck={false}
 										aria-label="Release version"
 									/>
+									<span className="opt-mark">(optional)</span>
 								</strong>
 								<span>
 									{first
@@ -5966,6 +5968,7 @@ export function AddProjectModal({
 									</legend>
 									<label>
 										Username
+										<span className="opt-mark">(optional)</span>
 										<input
 											value={tokUser}
 											onChange={(e) => setTokUser(e.target.value)}
@@ -9827,6 +9830,7 @@ export function AuthPage({
 					{setup && (
 						<label>
 							GitHub host
+							<span className="opt-mark">(optional)</span>
 							<input
 								type="text"
 								autoComplete="off"

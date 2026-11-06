@@ -191,6 +191,8 @@ A rounded child inside a rounded parent never has a radius ≥ the parent's; wit
 
 **The Settings-Row Rule.** A typed field explains itself in its "?" badge. A checkbox or a read-only fact explains itself in visible text. No setting does both. Buttons sit at the right, and only typed fields wait for a Save.
 
+**The Optional-Field Rule.** The board never marks required fields — no asterisks anywhere. An optional field says so instead: in dialogs, "(optional)" follows the label in dim text (the `.opt-mark` span); in settings, the mono shape line under the name already says what an empty value does (`empty = no cap`, `empty = from folder name`) and no "(optional)" is added to those rows.
+
 **The Verb-Label Rule.** Every button label is a verb in sentence case, with an object when the verb alone is unclear. One label means one action across the whole board, and an icon never stands in for a label it cannot carry on its own.
 
 **The Sentence-Case Rule.** Every UI label — buttons, links, menu items, dialog titles, tooltips, shortcut chips and confirm-dialog pairs — uses sentence case: capitalize the first word and proper nouns only ("New task", "Add draft", "New GitHub issue"). Capitalization inside a label is style, not grammar; the mixed convention ("New Task" beside "Add draft") is the visible defect, so one convention holds across the surface. Sources: [Microsoft Style Guide, Capitalization](https://learn.microsoft.com/en-us/style-guide/capitalization), [GOV.UK Design System, Button](https://design-system.service.gov.uk/components/button/), [Material Design, Grammar and punctuation](https://m3.material.io/foundations/content-design/style-guide/grammar-and-punctuation).
