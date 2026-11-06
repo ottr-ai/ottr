@@ -3413,14 +3413,20 @@ export function ProjectBoard({
 										<button
 											type="button"
 											className="view-toggle"
-											title={
-												grouped
-													? "Show one flat list, newest done first"
-													: "Group done cards by topic"
-											}
-											onClick={() => setGrouped((g) => !g)}
+											aria-pressed={grouped}
+											title="Group done cards by topic"
+											onClick={() => setGrouped(true)}
 										>
-											{grouped ? "By time" : "By topic"}
+											By topic
+										</button>
+										<button
+											type="button"
+											className="view-toggle"
+											aria-pressed={!grouped}
+											title="Show one flat list, newest done first"
+											onClick={() => setGrouped(false)}
+										>
+											By time
 										</button>
 										{doneGroups !== null && (
 											<>

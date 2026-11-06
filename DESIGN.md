@@ -169,7 +169,7 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
     - Delete: the item leaves the board for good. Remove: the item leaves a list, but its data stays (a project, a key, a token). Discard: unsaved work goes. Cancel task: a queued or running task stops.
     - Cancel only closes a dialog. When the dialog's action itself contains "Cancel", the safe button names what it keeps (`confirmDialog(..., { cancel: "Keep task" })`).
     - Open setup (the setup wizard), Start review, Create release / Start release / Release again, Plan with agent (the backlog interview), Discuss rules (the rules interview).
-  - **Toggles name the next state:** "Turn on" / "Turn off", "By topic" / "By time".
+  - **Toggles name the next state:** "Turn on" / "Turn off". A next-state toggle is for on/off only. A choice between alternatives is a segmented pair of pressed buttons that shows the current view, each segment naming the view it represents ("By topic" / "By time", "Turn log" / "Full log").
   - **No jargon or tool names:** "Send code", not "Send to omp". "Plan with agent", not "Grill".
   - **No "now":** an action button runs on click, so "Provision" and "Propose" are enough.
   - **Ellipsis:** only when the button asks for more input before it acts ("Add image…"). A progress label also ends in one ("Provisioning…").

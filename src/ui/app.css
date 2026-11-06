@@ -3173,12 +3173,18 @@ a.release:hover {
 	border-radius: 3px;
 	cursor: pointer;
 }
-/* The text view toggle keeps its label width; only the icon controls are squares. */
+/* The text segments keep their label width; only the icon controls are squares. */
 .lane-tools .view-toggle {
 	width: auto;
 	padding: 0 7px;
 	white-space: nowrap;
 	font: 600 12px / 1.4 var(--font);
+}
+/* The pressed segment names the view the lane shows, like the card log's pair. */
+.lane-tools .view-toggle[aria-pressed="true"] {
+	color: var(--text-strong);
+	background: var(--card);
+	border-color: var(--line);
 }
 .lane-tools button:hover {
 	color: var(--text-strong);
