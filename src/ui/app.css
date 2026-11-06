@@ -197,7 +197,8 @@ button {
 	transition:
 		background-color 0.12s var(--ease),
 		border-color 0.12s var(--ease),
-		color 0.12s var(--ease);
+		color 0.12s var(--ease),
+		transform 0.12s var(--ease);
 }
 button:hover {
 	background: var(--card-hover);
@@ -205,6 +206,21 @@ button:hover {
 }
 button:active {
 	background: var(--card-active);
+}
+/* A pressed control compresses to 0.97 (DESIGN.md § Components → Buttons).
+	 Stretched hit-area buttons stay still: scaling them shifts the whole card or row. */
+button:active:not(
+	:disabled,
+	.turn-head,
+	.model-option,
+	.theme-choice,
+	.alarm-link,
+	.menu-row,
+	.area-add,
+	.project-menu > button,
+	.model-trigger
+) {
+	transform: scale(0.97);
 }
 button:disabled {
 	opacity: 0.5;
