@@ -7906,16 +7906,64 @@ export function Drawer({
 						t.id === row.followUpOf &&
 						t.project === (row.followUpOfProject ?? row.project),
 				) ?? null);
+	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
+	// retro and the source card sits above it. Null when the parent is no retro.
+	const retroSource =
+		parent === null || parent.kind !== "retro" || parent.followUpOf === null
+			? null
+			: {
+					id: parent.followUpOf,
+					card:
+						tasks.find(
+							(t) =>
+								t.id === parent.followUpOf &&
+								t.project === (parent.followUpOfProject ?? parent.project),
+						) ?? null,
+				};
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
-	// A retro is no follow-up row: the Work steps already list its turns.
+	// Retros are follow-up rows too; each retro's proposals hang one more level in under it.
 	const kids = tasks
 		.filter(
 			(t) =>
 				t.followUpOf === row.id &&
-				t.kind !== "retro" &&
 				(t.followUpOfProject ?? t.project) === row.project,
 		)
 		.sort((a, b) => a.createdAt - b.createdAt);
+	// One pass over the board collects every retro's proposals (any card filed off the retro,
+	// whatever its reason now says), so the rail never scans the board once per retro.
+	const proposals = new Map<string, TaskCard[]>();
+	for (const k of kids) if (k.kind === "retro") proposals.set(k.id, []);
+	if (proposals.size > 0)
+		for (const t of tasks)
+			if (
+				t.followUpOf !== null &&
+				(t.followUpOfProject ?? t.project) === row.project
+			)
+				proposals.get(t.followUpOf)?.push(t);
+	for (const list of proposals.values())
+		list.sort((a, b) => a.createdAt - b.createdAt);
+	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
+	const branchRow = (k: TaskCard, tag: string): ReactNode => (
+		<LineageCardLink
+			card={k}
+			selfProject={row.project}
+			tag={tag}
+			onOpenTask={onOpenTask}
+			state={
+				<span
+					className={
+						k.state === "needs_you"
+							? "st st-needs_you" + (k.asked !== null ? " st-asked" : "")
+							: "st"
+					}
+				>
+					{/* Same alarm marks as the meta line: markup, not ::before. */}
+					{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
+					{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
+				</span>
+			}
+		/>
+	);
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	const [reply, setReply] = useState("");
@@ -8547,6 +8595,28 @@ export function Drawer({
 					{(row.followUpOf !== null || kids.length > 0) && (
 						<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
 							<ol className="lineage-rail">
+								{retroSource !== null &&
+									(retroSource.card === null ? (
+										<li className="lineage-gone">
+											<span
+												className="lineage-row"
+												title={`${retroSource.id} is not on the board`}
+											>
+												<span className="lineage-key">{retroSource.id}</span>
+												<span className="lineage-title">Not on the board</span>
+												<span className="lineage-tag">retro source</span>
+											</span>
+										</li>
+									) : (
+										<li>
+											<LineageCardLink
+												card={retroSource.card}
+												selfProject={row.project}
+												tag="retro source"
+												onOpenTask={onOpenTask}
+											/>
+										</li>
+									))}
 								{row.followUpOf !== null &&
 									(parent === null ? (
 										// The state no longer carries the parent (a cancelled card): the
@@ -8566,7 +8636,7 @@ export function Drawer({
 											<LineageCardLink
 												card={parent}
 												selfProject={row.project}
-												tag="parent"
+												tag={retroSource !== null ? "retro" : "parent"}
 												onOpenTask={onOpenTask}
 											/>
 										</li>
@@ -8581,37 +8651,31 @@ export function Drawer({
 									</span>
 									{kids.length > 0 && (
 										<ol className="lineage-branch" aria-label="Follow-ups">
-											{kids.map((k) => (
-												<li key={k.id}>
-													<LineageCardLink
-														card={k}
-														selfProject={row.project}
-														tag=""
-														onOpenTask={onOpenTask}
-														state={
-															<span
-																className={
-																	k.state === "needs_you"
-																		? "st st-needs_you" +
-																			(k.asked !== null ? " st-asked" : "")
-																		: "st"
-																}
-															>
-																{/* Same alarm marks as the meta line: markup, not ::before. */}
-																{k.state === "needs_you" && (
-																	<Mark kind={cardMark(k)} />
-																)}
-																{statusLine(
-																	k,
-																	project.hasRules,
-																	holdFor(k, tasks),
-																	draining,
-																)}
-															</span>
+											{kids.map((k) => {
+												const props = proposals.get(k.id);
+												return (
+													<li
+														key={k.id}
+														className={
+															props !== undefined && props.length > 0
+																? "lineage-holds"
+																: undefined
 														}
-													/>
-												</li>
-											))}
+													>
+														{branchRow(k, k.kind === "retro" ? "retro" : "")}
+														{props !== undefined && props.length > 0 && (
+															<ol
+																className="lineage-branch"
+																aria-label="Proposals"
+															>
+																{props.map((p) => (
+																	<li key={p.id}>{branchRow(p, "")}</li>
+																))}
+															</ol>
+														)}
+													</li>
+												);
+											})}
 										</ol>
 									)}
 								</li>

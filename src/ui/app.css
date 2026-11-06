@@ -5901,6 +5901,18 @@ dialog.drawer[open]::backdrop {
 	height: 1px;
 	background: var(--line);
 }
+/* A retro row holds its proposals as a second branch: like this card, its node and thread end
+   at its own row, and the nested branch's stem hangs from that node. */
+.lineage-rail .lineage-branch li.lineage-holds::after {
+	top: 15px;
+}
+.lineage-rail .lineage-branch li.lineage-holds:last-child::before {
+	bottom: auto;
+	height: 15px;
+}
+.lineage-branch li.lineage-holds > .lineage-row::before {
+	top: 15px;
+}
 .lineage-row {
 	display: grid;
 	grid-template-columns: auto minmax(0, 1fr) auto;

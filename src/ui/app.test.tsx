@@ -1910,6 +1910,153 @@ describe("Drawer parent chip", () => {
 		expect(html.indexOf('class="lineage-branch"')).toBeGreaterThan(at("S-1"));
 		for (const id of ["K-1", "K-2", "K-3"]) expect(branch).toContain(`>${id}<`);
 	});
+
+	describe("retros in the lineage", () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const card = (
+			id: string,
+			followUpOf: string,
+			createdAt: number,
+			over: Partial<TaskCard> = {},
+		) => cardFixture({ id, followUpOf, createdAt, ...over });
+		const at = (html: string, id: string) => html.indexOf(`>${id}<`);
+		const PROPOSALS = 'aria-label="Proposals"';
+
+		test("a retro is a follow-up row and its proposals nest under it, oldest first", () => {
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={self}
+					tasks={[
+						card("P-2", "R-1", 4000),
+						card("R-1", "S-1", 2000, { kind: "retro" }),
+						card("F-1", "S-1", 1000),
+						// An accepted proposal no longer carries the proposal reason.
+						card("P-1", "R-1", 3000, { needsReason: null }),
+					]}
+				/>,
+			);
+			expect(at(html, "F-1")).toBeGreaterThan(at(html, "S-1"));
+			expect(at(html, "R-1")).toBeGreaterThan(at(html, "F-1"));
+			const nest = html.indexOf(PROPOSALS);
+			expect(nest).toBeGreaterThan(at(html, "R-1"));
+			expect(at(html, "P-1")).toBeGreaterThan(nest);
+			expect(at(html, "P-2")).toBeGreaterThan(at(html, "P-1"));
+			const rRow = html.slice(at(html, "R-1"), nest);
+			expect(rRow).toContain('<span class="lineage-tag">retro</span>');
+			expect(rRow).toContain('<span class="st">queued</span>');
+			expect(html).toContain('href="/projects/proj/tasks/P-1"');
+			expect(html).toContain('href="/projects/proj/tasks/R-1"');
+		});
+
+		test("each retro lists only its own proposals, retros oldest first", () => {
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={self}
+					tasks={[
+						card("R-2", "S-1", 3000, { kind: "retro" }),
+						card("Q-2", "R-2", 4000),
+						card("R-1", "S-1", 1000, { kind: "retro" }),
+						card("Q-1", "R-1", 2000),
+					]}
+				/>,
+			);
+			const parts = html.split(PROPOSALS);
+			expect(parts).toHaveLength(3);
+			expect(parts[0]).toContain(">R-1<");
+			expect(parts[0]).not.toContain(">R-2<");
+			expect(parts[1]).toContain(">Q-1<");
+			expect(parts[1]!.indexOf(">Q-1<")).toBeLessThan(
+				parts[1]!.indexOf(">R-2<"),
+			);
+			expect(parts[2]).toContain(">Q-2<");
+			expect(parts[2]).not.toContain(">Q-1<");
+		});
+
+		test("a cancelled retro and a declined proposal keep their cancelled state", () => {
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={self}
+					tasks={[
+						card("R-1", "S-1", 1000, { kind: "retro", cancelledAt: 1500 }),
+						card("P-1", "R-1", 2000, { cancelledAt: 2500 }),
+					]}
+				/>,
+			);
+			expect(html.match(/>cancelled</g)).toHaveLength(2);
+			expect(at(html, "P-1")).toBeGreaterThan(html.indexOf(PROPOSALS));
+		});
+
+		test("a plain follow-up's own follow-ups do not nest", () => {
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={self}
+					tasks={[card("F-1", "S-1", 1000), card("G-1", "F-1", 2000)]}
+				/>,
+			);
+			expect(html).toContain(">F-1<");
+			expect(html).not.toContain(">G-1<");
+			expect(html).not.toContain(PROPOSALS);
+		});
+
+		test("a proposal's rail reads retro source, retro, this card", () => {
+			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={proposal}
+					tasks={[
+						card("S-1", "V-1", 500, { sessionTitle: "Source work" }),
+						card("R-1", "S-1", 1000, { kind: "retro" }),
+					]}
+				/>,
+			);
+			expect(at(html, "S-1")).toBeGreaterThan(-1);
+			expect(at(html, "R-1")).toBeGreaterThan(at(html, "S-1"));
+			expect(html.indexOf('aria-current="true"')).toBeGreaterThan(
+				at(html, "R-1"),
+			);
+			expect(html).toContain('href="/projects/proj/tasks/S-1"');
+			const sRow = html.slice(at(html, "S-1"), at(html, "R-1"));
+			expect(sRow).toContain(">retro source<");
+			const rRow = html.slice(at(html, "R-1"), html.indexOf("lineage-self"));
+			expect(rRow).toContain(">retro<");
+			// The chain stops at the source: its own parent is not shown.
+			expect(html).not.toContain(">V-1<");
+		});
+
+		test("a retro source off the board renders inert", () => {
+			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={proposal}
+					tasks={[card("R-1", "S-9", 1000, { kind: "retro" })]}
+				/>,
+			);
+			expect(html).toContain('title="S-9 is not on the board"');
+			expect(html).not.toContain("/tasks/S-9");
+			const gone = html.slice(html.indexOf("lineage-gone"), at(html, "R-1"));
+			expect(gone).toContain(">retro source<");
+		});
+
+		test("a parent that is no retro gets no grandparent row", () => {
+			const child = childCard({ id: "C-1", followUpOf: "P-1" });
+			const html = renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={child}
+					tasks={[card("P-1", "G-1", 1000), card("G-1", "", 500)]}
+				/>,
+			);
+			expect(html).toContain(">P-1<");
+			expect(html).not.toContain(">G-1<");
+			expect(html).not.toContain(">retro source<");
+		});
+	});
 });
 
 describe("ranOnLabel", () => {
