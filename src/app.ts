@@ -5295,13 +5295,6 @@ export function createApp(deps: AppDeps) {
 							? (e.store.getSettings().retroSince ?? Date.now())
 							: null;
 					}
-					// issueWatch off -> on moves issueWatchSince to now: only issues opened after the
-					// (re-)enable file cards. Saving true while on keeps the mark; off leaves it.
-					if (
-						patch.issueWatch === true &&
-						e.store.getSettings().issueWatch !== true
-					)
-						patch.issueWatchSince = Date.now();
 					// A new targetBranch must move e.target at once: the board, the supervisor,
 					// the diffs and the gates read it until the next turn. A save that does not
 					// touch the target leaves it alone. The save proves the branch resolves
@@ -5315,6 +5308,15 @@ export function createApp(deps: AppDeps) {
 							return json({ error: errmsg(err) }, 409);
 						}
 					}
+					// issueWatch off -> on moves issueWatchSince to now: only issues opened after the
+					// (re-)enable file cards. Saving true while on keeps the mark; off leaves it. Set
+					// after every await above, from the live setting, so the mark is the moment the
+					// watch actually turns on.
+					if (
+						patch.issueWatch === true &&
+						e.store.getSettings().issueWatch !== true
+					)
+						patch.issueWatchSince = Date.now();
 					e.store.setSettings(patch);
 					if (patch.targetBranch !== undefined) await refreshRemote(e);
 					return json(projectView(e));

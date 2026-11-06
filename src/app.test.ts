@@ -6098,6 +6098,43 @@ describe("project settings validation", () => {
 		e.store.close();
 	});
 
+	test("issueWatch with a targetBranch marks the moment the save lands, not the request start", async () => {
+		const dir = join(root, "watch-target-proj");
+		const add = await post("/api/projects", { name: "watch-target-proj" });
+		expect(add.status).toBe(200);
+		const e = projects.get("watch-target-proj")!;
+		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		const start = Date.parse("2026-03-01T00:00:00Z");
+		const later = start + 60_000;
+		// The clock moves while the route awaits its targetBranch git check: an issue opened
+		// then, with the watch still off, must sit before the saved mark.
+		const realSpawn = Bun.spawn;
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((
+			...args: Parameters<typeof Bun.spawn>
+		) => {
+			// The route's first git spawn is resolveTarget's check; git() spawns gitExe()'s path.
+			const argv = args[0] as string[];
+			if (/(^|[/\\])git(\.exe)?$/.test(argv[0] ?? ""))
+				setSystemTime(new Date(later));
+			return realSpawn(...args);
+		}) as typeof Bun.spawn);
+		setSystemTime(new Date(start));
+		try {
+			const res = await post("/api/projects/watch-target-proj/settings", {
+				issueWatch: true,
+				targetBranch: "feature",
+			});
+			expect(res.status).toBe(200);
+		} finally {
+			spawn.mockRestore();
+			setSystemTime();
+		}
+		expect(e.store.getSettings().issueWatch).toBe(true);
+		expect(e.store.getSettings().issueWatchSince).toBe(later);
+		projects.delete("watch-target-proj");
+		e.store.close();
+	});
+
 	test("saving an unresolvable targetBranch returns 409 and keeps the old target", async () => {
 		const dir = join(root, "target-bad-proj");
 		const add = await post("/api/projects", { name: "target-bad-proj" });

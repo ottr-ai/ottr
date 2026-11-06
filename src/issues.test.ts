@@ -500,33 +500,36 @@ describe("createIssueWatcher", () => {
 		expect(store.issueCardsFiledSince(0)).toBe(0);
 	});
 
-	test("turning the watch off during the label check stops label writes", async () => {
-		const { dir, store } = newStore(true);
-		const fake = fakeGh();
-		fake.setOpen("o/r", [issue(6)]);
-		const gate = Promise.withResolvers<void>();
-		const reached = Promise.withResolvers<void>();
-		const watcher = createIssueWatcher({
-			projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
-			log: () => {},
-			gh: async (args) => {
-				if (args.some((a) => a.endsWith(`/labels/${TRACKED_LABEL}`))) {
-					reached.resolve();
-					await gate.promise;
-				}
-				return fake.gh(args);
-			},
-			now: () => SINCE + ISSUE_GATES.DAY_MS,
+	for (const exists of [true, false])
+		test(`turning the watch off during the label check stops label writes (label ${exists ? "exists" : "missing: no create"})`, async () => {
+			const { dir, store } = newStore(true);
+			const fake = fakeGh();
+			fake.setLabelExists(exists);
+			fake.setOpen("o/r", [issue(6)]);
+			const gate = Promise.withResolvers<void>();
+			const reached = Promise.withResolvers<void>();
+			const watcher = createIssueWatcher({
+				projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
+				log: () => {},
+				gh: async (args) => {
+					if (args.some((a) => a.endsWith(`/labels/${TRACKED_LABEL}`))) {
+						reached.resolve();
+						await gate.promise;
+					}
+					return fake.gh(args);
+				},
+				now: () => SINCE + ISSUE_GATES.DAY_MS,
+			});
+			const tick = watcher.tick();
+			await reached.promise;
+			expect(store.getIssueWatch(6)).not.toBeNull();
+			store.setSettings({ issueWatch: false });
+			gate.resolve();
+			await tick;
+			expect(fake.created).toEqual([]);
+			expect(fake.labelled).toEqual([]);
+			expect(store.unlabelledIssues()).toEqual([6]);
 		});
-		const tick = watcher.tick();
-		await reached.promise;
-		expect(store.getIssueWatch(6)).not.toBeNull();
-		store.setSettings({ issueWatch: false });
-		gate.resolve();
-		await tick;
-		expect(fake.labelled).toEqual([]);
-		expect(store.unlabelledIssues()).toEqual([6]);
-	});
 
 	test("pages run newest first: 10,000 older open issues cannot hide a new one", async () => {
 		const { dir, store } = newStore(true);

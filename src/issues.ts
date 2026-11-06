@@ -176,8 +176,13 @@ export function createIssueWatcher(deps: {
 	const gh = deps.gh ?? runGh;
 	const now = deps.now ?? Date.now;
 
-	/** Makes sure the repo has the tracked label; false (logged) when it could not. */
-	async function ensureLabel(project: ForkProject, repo: string) {
+	/** Makes sure the repo has the tracked label; false (logged) when it could not, or when
+	 *  the watch changed during the check (`watching` guards the create write). */
+	async function ensureLabel(
+		project: ForkProject,
+		repo: string,
+		watching: () => boolean,
+	) {
 		const r = await gh(["api", `repos/${repo}/labels/${TRACKED_LABEL}`]);
 		if (r.code === 0) return true;
 		if (!notFound(r)) {
@@ -186,6 +191,7 @@ export function createIssueWatcher(deps: {
 			);
 			return false;
 		}
+		if (!watching()) return false;
 		const c = await gh([
 			"api",
 			"-X",
@@ -276,7 +282,11 @@ export function createIssueWatcher(deps: {
 		// Labels go on after filing, from the table: a failed label call retries next tick
 		// without filing the issue again.
 		const unlabelled = store.unlabelledIssues();
-		if (unlabelled.length === 0 || !(await ensureLabel(project, repo))) return;
+		if (
+			unlabelled.length === 0 ||
+			!(await ensureLabel(project, repo, watching))
+		)
+			return;
 		for (const n of unlabelled) {
 			if (!watching()) return;
 			const r = await gh([
