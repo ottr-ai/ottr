@@ -26,9 +26,11 @@ export default {
   // Sandbox outside any git repo: the test clones/inspects repos, a sandbox inside this repo
   // would nest them.
   tempDirName: base.tempDirName,
-  // ignoreStatic on, measured 2026-11-06 at 1da6398: 27 static mutants of 1,286, all killed
-  // in the baseline run, so ignoring them moved the score 94.71% -> 94.52% (static removal is
-  // the only cause) and cut the mutant phase 5m53s -> 5m18s.
+  // ignoreStatic on, measured 2026-11-06 at 1da6398: 27 static mutants of 1,286, all killed in
+  // the baseline run. The score moved 94.71% -> 94.52%: removing the 27 statics alone gives
+  // 94.60% (1191/1259), and one non-static mutant flipped Killed -> Survived between the two
+  // runs (1,189 -> 1,188 killed, 36 -> 37 survived), the other 0.08 points. Mutant phase
+  // 5m53s -> 5m18s.
   ignoreStatic: true,
   // break = measured score rounded down (94.52% with ignoreStatic, 2026-11-06 at 1da6398;
   // raised from 91 = the 91.97% measured 2026-10-31 at 4f6d93b plus the survivor-kill
