@@ -1704,8 +1704,12 @@ function ModelField({
 			<div className="model-fields">
 				<label className="field">
 					<span className="field-head">
-						Model
-						<span className="opt-mark">(optional)</span>
+						{/* Name and mark share one flex child: the head is space-between, so a loose
+						    third child would float mid-row between label and quota chip. */}
+						<span className="field-head-name">
+							Model
+							<span className="opt-mark">(optional)</span>
+						</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
 						{worst !== null && (

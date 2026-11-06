@@ -6699,6 +6699,32 @@ button.log-mode[aria-pressed="true"] {
 	margin-top: 8px;
 	font-size: 0;
 }
+/* New task / Follow up: the caption's name group joins the picker's own row — the visible
+   "(optional)" sits in the elastic gap column, flush against the model trigger. Left loose,
+   the head drops to an implicit full-width row below the box, where the mark reads as a
+   stray label of the actions row under the card. The quota chip keeps its implicit row. */
+.prompt-card > .model-fields .field-head {
+	display: contents;
+}
+.prompt-card > .model-fields .field-head-name {
+	grid-column: 2;
+	grid-row: 3;
+	justify-self: end;
+	align-self: center;
+	margin-right: 6px;
+	margin-bottom: 8px;
+	font-size: 0;
+}
+.prompt-card > .model-fields .model-quota {
+	grid-area: quota;
+	justify-self: end;
+	margin-top: 8px;
+}
+/* Reply / Steer: the caption row hugs the picker's edge too, so the visible mark never
+   sits alone at the hidden name's left edge. */
+.composer-actions .model-fields .field-head {
+	justify-content: flex-end;
+}
 /* Tool row: each control keeps its own height, centred on the row, 8px from the box walls. */
 .prompt-card .model-fields .field > :not(.field-head) {
 	grid-area: model;
