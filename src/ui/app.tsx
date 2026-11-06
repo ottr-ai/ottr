@@ -726,7 +726,8 @@ function Card({
 				{/* Needs attention: the error takes the prompt line until the state clears; the
 				    card-open title also carries it. Ask rounds keep the prompt: their reason just
 				    echoes the first question the drawer's ask panel shows in full. A live turn
-				    whose log went silent past the board's limit takes the same line. */}
+				    whose log went silent past the board's limit takes the same line as
+				    .card-silent — grey, it reports, it does not alarm. */}
 				{task.state === "needs_you" &&
 				task.asked === null &&
 				task.needsReason !== null ? (
@@ -734,7 +735,7 @@ function Card({
 						{task.needsReason}
 					</span>
 				) : silent !== null ? (
-					<span className="card-error" title={silent}>
+					<span className="card-error card-silent" title={silent}>
 						{silent}
 					</span>
 				) : (
@@ -3089,7 +3090,7 @@ export function ProjectBoard({
 							{q === "" ? boardTotal : `${shown.length}/${boardTotal}`}
 						</span>
 					</span>
-					{/* Only an overdue review stays out, as the alarm nudge; every other action waits in the menu. */}
+					{/* Only an overdue review stays out, as the grey nudge; every other action waits in the menu. */}
 					{project.archReview?.due && !project.archReview.running && (
 						<button
 							type="button"
@@ -8062,6 +8063,7 @@ export function Drawer({
 											<span
 												className={c.reviewed ? "late-mark" : "late-mark warn"}
 											>
+												{!c.reviewed && <Mark kind="needs" />}
 												{c.reviewed ? "review fix" : "not reviewed"}
 											</span>
 										</li>

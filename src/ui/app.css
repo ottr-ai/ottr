@@ -2221,9 +2221,9 @@ button.notif-link {
 .project-meta a:hover {
 	text-decoration: underline;
 }
-/* Architecture-review-due badge: alarm tint, it is a nudge not an error. */
+/* Architecture-review-due badge: a nudge, not an error — grey like the live badge. */
 .project-meta .arch-due {
-	color: var(--alarm);
+	color: var(--dim);
 	font-weight: 600;
 }
 /* A review already queued or running: normal state, so grey — not an alarm. */
@@ -2233,14 +2233,8 @@ button.notif-link {
 }
 /* Header actions: one square "more" button opens a menu of the project's actions, so
    the bar holds only the search, the menu and New task. An overdue review stays out
-   as the one alarm nudge; the status span next to the name carries the words. */
-.project-actions .arch-start {
-	color: var(--alarm);
-}
-.project-actions .arch-start:hover {
-	color: var(--alarm);
-	background: var(--alarm-bg);
-}
+   as the one nudge; the status span next to the name carries the words. The button
+   keeps grey stock: a review due is a nudge, not an alarm (Grey-Is-Normal). */
 .project-more {
 	anchor-name: --project-more;
 	aspect-ratio: 1;
@@ -2386,7 +2380,12 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	white-space: nowrap;
 	font-size: 12px;
 }
+/* Not-reviewed: amber stays, and the needs triangle rides it — an alarm needs a shape
+   as well as a hue (Redundant-Coding). */
 .late-mark.warn {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
 	color: var(--alarm);
 }
 .advisory {
@@ -2699,12 +2698,17 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	line-height: 1.35;
 	color: var(--dim);
 }
-/* The needs-attention error sits where the prompt excerpt would; amber like the card's meta line. */
+/* The needs-attention error sits where the prompt excerpt would; amber — the card is
+   needs-you and its border carries the alarm shape. The silent-run line adds
+   .card-silent: it reports, it does not alarm, so it stays grey like the excerpt. */
 .card-error {
 	color: var(--alarm);
 }
-/* Stalled release: the "findings done, merges wait" line under the card meta; error-toned like
-   the needs-attention line, but dimmer — it reports, it does not alarm. */
+.card-error.card-silent {
+	color: var(--dim);
+}
+/* Stalled release: the "findings done, merges wait" line under the card meta; grey —
+   it reports, it does not alarm. */
 .card-hold {
 	display: -webkit-box;
 	-webkit-line-clamp: 2;
@@ -2712,8 +2716,7 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	overflow: hidden;
 	font-size: 12px;
 	line-height: 1.35;
-	color: var(--alarm);
-	opacity: 0.85;
+	color: var(--dim);
 }
 /* Follow-up marker: the send icon from the Follow up button, at the right end of the card's head. */
 .card-fu {
