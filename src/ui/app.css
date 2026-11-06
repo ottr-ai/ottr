@@ -3433,11 +3433,16 @@ a.release:hover {
 
 /* Range pills ride the section head's right edge; the spinner slots in before them. */
 .perf-range {
-	display: flex;
+	position: relative;
+	display: grid;
+	/* Equal pills: each 1fr track sizes to the widest label even in this
+	   shrink-to-fit strip (css-grid intrinsic sizing); a flex row would hug every
+	   label instead. The refresh spinner floats left of the group, out of flow. */
+	grid-template-columns: repeat(6, 1fr);
+	grid-auto-columns: 1fr;
 	margin-left: auto;
 	border: 1px solid var(--line-soft);
 	border-radius: 6px;
-	overflow: hidden;
 }
 .perf-range button {
 	padding: 2px 9px;
@@ -3446,6 +3451,21 @@ a.release:hover {
 	border: 0;
 	border-radius: 0;
 	color: var(--dim);
+}
+.perf-range button:first-of-type {
+	/* The strip clips nothing, so the end pills round themselves under the border. */
+	border-top-left-radius: 5px;
+	border-bottom-left-radius: 5px;
+}
+.perf-range button:last-of-type {
+	border-top-right-radius: 5px;
+	border-bottom-right-radius: 5px;
+}
+.perf-range .spinner {
+	position: absolute;
+	right: 100%;
+	top: 50%;
+	margin: -6.5px 6px 0 0;
 }
 .perf-range button + button {
 	border-left: 1px solid var(--line-soft);
@@ -5034,6 +5054,7 @@ dialog.confirm-dialog {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
+	flex: 1 1 0; /* segmented control: equal segments, not content width */
 	min-height: 32px;
 	padding: 0 14px;
 	margin-bottom: -1px;
@@ -5061,7 +5082,8 @@ dialog.confirm-dialog {
 	outline-offset: -1px;
 }
 .stage-tabs button {
-	flex: 1 0 auto; /* never shrink under the label: tabs grow to fill, or the strip scrolls */
+	/* Equal segments (shared rule above); min-width:auto keeps the label whole,
+	   so a strip too tight for all four scrolls instead of cutting a label. */
 	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
 	gap: 6px;
 	white-space: nowrap;
@@ -6302,6 +6324,7 @@ button.diff-path {
 	margin: 0 0 4px;
 }
 button.log-mode {
+	flex: 1 1 0; /* segmented control: the two modes split the log head evenly */
 	min-height: 22px;
 	padding: 0 8px;
 	font-size: 12px;
