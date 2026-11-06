@@ -9411,6 +9411,7 @@ export function Drawer({
 								<>
 									<button
 										type="button"
+										className="primary"
 										title={
 											editOpen
 												? editGuardTitle
