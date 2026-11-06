@@ -2218,7 +2218,7 @@ function NewTaskDialog({
 			label={`New task for ${label}`}
 			heading="New task"
 			sub={<ProjectSub project={project} />}
-			inputLabel="What should the agent do?"
+			inputLabel="Task"
 			placeholder="Describe the task in plain language"
 			hint="Enter adds the task. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
@@ -2263,7 +2263,7 @@ function BacklogDialog({
 			label={`Add draft for ${label}`}
 			heading="Add draft"
 			sub={<ProjectSub project={project} />}
-			inputLabel="What is the idea?"
+			inputLabel="Idea"
 			placeholder="Describe the idea in plain language"
 			hint="Enter parks the draft in the backlog. Shift+Enter starts a new line. Images: paste, drop or browse. No model pick: a draft runs no agent."
 			icon="send"
@@ -2411,7 +2411,7 @@ function FollowUpDialog({
 			label={`Follow up on ${task.sessionTitle ?? task.title}`}
 			heading="Follow up"
 			sub={task.sessionTitle ?? task.title}
-			inputLabel="What should the agent do next?"
+			inputLabel="Next step"
 			placeholder="Describe the follow-up task…"
 			hint="Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
@@ -7143,7 +7143,7 @@ function PromptEditForm({
 				rows={6}
 				value={edit}
 				onChange={(e) => onEdit(e.target.value)}
-				placeholder="What should the agent do?"
+				placeholder="Task"
 			/>
 			<div className="reply-actions">
 				<button type="button" onClick={() => onEdit(null)}>

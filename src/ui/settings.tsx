@@ -403,7 +403,8 @@ export function ProjectSetupSteps({
 				<section className="setup-sec">
 					<h3>Runners</h3>
 					<label className="settings-field">
-						Max tasks of this project running at once (empty = no cap)
+						Runner cap
+						<span className="hint">empty = no cap</span>
 						<input
 							type="number"
 							min={1}
@@ -413,7 +414,10 @@ export function ProjectSetupSteps({
 						/>
 					</label>
 					<label className="settings-field">
-						Extra paths copied into new worktrees (one per line)
+						Extra paths
+						<span className="hint">
+							copied into new worktrees, one per line
+						</span>
 						<textarea
 							rows={3}
 							value={extra}
@@ -5017,7 +5021,7 @@ export function ProjectSettingsForm({
 										min={1}
 										value={mp}
 										onChange={(e) => setMp(e.target.value)}
-										aria-label="Max tasks of this project running at once (empty = no cap)"
+										aria-label="Runner cap"
 									/>
 								</label>
 							</DefRow>
@@ -5079,7 +5083,7 @@ export function ProjectSettingsForm({
 								value={extra}
 								onChange={(e) => setExtra(e.target.value)}
 								placeholder="scripts/release.mjs"
-								aria-label="Extra paths copied into new worktrees (one per line)"
+								aria-label="Extra paths"
 							/>
 						</label>
 					</DefRow>

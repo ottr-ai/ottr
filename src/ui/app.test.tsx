@@ -4013,7 +4013,7 @@ const compose = (extra?: Partial<Parameters<typeof ComposeDialog>[0]>) => ({
 	label: "New task for demo",
 	heading: "New task",
 	sub: null,
-	inputLabel: "What should the agent do?",
+	inputLabel: "Task",
 	placeholder: "Describe the task",
 	hint: "hint",
 	icon: "plus" as const,

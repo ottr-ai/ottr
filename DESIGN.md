@@ -176,6 +176,7 @@ A rounded child inside a rounded parent never has a radius ≥ the parent's; wit
   - **No "now":** an action button runs on click, so "Provision" and "Propose" are enough.
   - **Ellipsis:** only when the button asks for more input before it acts ("Add image…"). A progress label also ends in one ("Provisioning…").
   - **Destructive confirm:** the confirm button repeats the action's label ("Cancel task", "Remove project"), never "OK" or "Confirm".
+- **Noun labels** — headings, field labels and setting names lead with the noun ("Task", "Runner cap", "Extra paths"); buttons keep the Verb-Label Rule.
 - **Icons on buttons** — sources: [NN/g, Icon Usability](https://www.nngroup.com/articles/icon-usability/), [Apple HIG Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons), [Red Hat Button](https://ux.redhat.com/elements/button/guidelines/).
   - **A visible text label by default.** Few icons are universal: close (x), search, plus for add, the help "?", and the horizontal ellipsis "⋯" for a menu of further actions. Every other icon-only button needs `aria-label` and a `title` tooltip. A tooltip does not replace a label on touch screens, because they have no hover.
   - **One icon, one meaning.** An icon that already means one action never stands for a second action. Pick a different glyph, or show the text label.
