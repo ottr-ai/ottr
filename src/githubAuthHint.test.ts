@@ -5,7 +5,11 @@ const SAML =
 	"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to an organization that has SAML SSO enabled.";
 const DOCS = "https://docs.github.com/en/authentication/troubleshooting-saml";
 
-const TOKEN = { host: "acme.ghe.com", username: "x", token: "ghs_tkn123456" };
+const TOKEN = {
+	host: "acme.ghe.com",
+	username: "x",
+	token: "ghs_aaaa0000aaaa0000",
+};
 
 /** fetchImpl recording the URL and init, answering status with a JSON body. */
 function stub(
@@ -40,7 +44,7 @@ describe("githubAuthHint", () => {
 		expect(s.calls[0]?.init?.method).toBeUndefined(); // GET is the default
 		expect(
 			(s.calls[0]?.init?.headers as Record<string, string>)?.Authorization,
-		).toBe("Bearer ghs_tkn123456");
+		).toBe("Bearer ghs_aaaa0000aaaa0000");
 		expect((s.calls[0]?.init?.headers as Record<string, string>)?.Accept).toBe(
 			"application/vnd.github+json",
 		);
@@ -57,8 +61,8 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
-			secrets: ["ghp_env12345678"],
+			envToken: "ghp_aaaa0000aaaa0000",
+			secrets: ["ghp_aaaa0000aaaa0000"],
 			fetchImpl: s.fetch,
 		});
 		expect(s.calls[0]?.url).toBe("https://api.github.com/repos/o/r");
@@ -71,8 +75,8 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://git.acme.corp/o/r", {
 			configuredHost: "git.acme.corp",
 			tokens: [],
-			envToken: "ghp_env12345678",
-			secrets: ["ghp_env12345678"],
+			envToken: "ghp_aaaa0000aaaa0000",
+			secrets: ["ghp_aaaa0000aaaa0000"],
 			fetchImpl: s.fetch,
 		});
 		expect(s.calls[0]?.url).toBe("https://git.acme.corp/api/v3/repos/o/r");
@@ -84,13 +88,13 @@ describe("githubAuthHint", () => {
 		await githubAuthHint("https://acme.ghe.com/o/r.git", {
 			configuredHost: "github.com",
 			tokens: [TOKEN],
-			envToken: "ghp_env12345678",
-			secrets: [TOKEN.token, "ghp_env12345678"],
+			envToken: "ghp_aaaa0000aaaa0000",
+			secrets: [TOKEN.token, "ghp_aaaa0000aaaa0000"],
 			fetchImpl: s.fetch,
 		});
 		expect(
 			(s.calls[0]?.init?.headers as Record<string, string>)?.Authorization,
-		).toBe("Bearer ghs_tkn123456");
+		).toBe("Bearer ghs_aaaa0000aaaa0000");
 	});
 
 	test("a non-GitHub host returns null and never fetches", async () => {
@@ -98,7 +102,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://gitlab.com/o/r.git", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -111,7 +115,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("ssh://github.com/o/r.git", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -124,7 +128,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r/extra", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -150,7 +154,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -162,7 +166,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -174,7 +178,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});
@@ -185,7 +189,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: async () => new Response("<html>nope</html>", { status: 403 }),
 		});
@@ -197,7 +201,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			timeoutMs: 20,
 			fetchImpl: (_url, init) => {
@@ -211,16 +215,16 @@ describe("githubAuthHint", () => {
 
 	test("a token echoed in GitHub's message comes back redacted", async () => {
 		const s = stub(403, {
-			message: `Bad credentials: ghp_env12345678 is invalid. ${SAML}`,
+			message: `Bad credentials: ghp_aaaa0000aaaa0000 is invalid. ${SAML}`,
 		});
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
-			secrets: ["ghp_env12345678"],
+			envToken: "ghp_aaaa0000aaaa0000",
+			secrets: ["ghp_aaaa0000aaaa0000"],
 			fetchImpl: s.fetch,
 		});
-		expect(hint).not.toContain("ghp_env12345678");
+		expect(hint).not.toContain("ghp_aaaa0000aaaa0000");
 		expect(hint).toContain("[REDACTED]");
 	});
 
@@ -230,7 +234,7 @@ describe("githubAuthHint", () => {
 		const hint = await githubAuthHint("https://github.com/o/r", {
 			configuredHost: "github.com",
 			tokens: [],
-			envToken: "ghp_env12345678",
+			envToken: "ghp_aaaa0000aaaa0000",
 			secrets: [],
 			fetchImpl: s.fetch,
 		});

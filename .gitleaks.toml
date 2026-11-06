@@ -49,3 +49,16 @@ commits = ["9fc23a988c46bc57a9a8b93cd15155bdbb672c87"]
 [[allowlists]]
 description = "fake GitHub token fixtures in commit 985b7c6, replaced by the zero-suffix style on the tip"
 commits = ["985b7c6ea775d4f8f923b8d5dcf13d906f4b7026"]
+
+# Commit 1b168b3 added fake GitHub tokens to the githubAuthHint test in
+# src/githubAuthHint.test.ts. The 13- and 15-character values hold all
+# distinct characters, so generic-api-key's entropy bar of 3.7 flags them.
+# The tip commit moves them to the zero-suffix fixture style, but the
+# finding lives in that commit's patch, which history keeps forever.
+# Scoped to the one commit: a real token never looks like
+# `ghs_aaaa0000aaaa0000`, and a secret-shaped string anywhere else stays
+# flagged.
+
+[[allowlists]]
+description = "fake GitHub token fixtures in commit 1b168b3, replaced by the zero-suffix style on the tip"
+commits = ["1b168b3a108a57db157e8489865f4ef00d40dcd4"]
