@@ -6824,7 +6824,7 @@ function PrReviewSection({
 								</span>
 							)}
 						<BusyButton
-							className="primary"
+							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
 							disabled={note.trim() === ""}
 							run={() =>
 								act(async () => {
