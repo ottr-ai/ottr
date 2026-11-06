@@ -6509,7 +6509,7 @@ button.log-mode[aria-pressed="true"] {
 }
 .turn-head .icon-svg {
 	color: var(--dim);
-	transition: transform 0.15s ease;
+	transition: transform 120ms var(--ease);
 }
 .turn-head[aria-expanded="true"] .icon-svg {
 	transform: rotate(
