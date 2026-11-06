@@ -18,7 +18,7 @@
 	--accent-ink: #14181d;
 	--accent-bg: #26303a;
 	--accent-line: #46596e;
-	--normal-fill: #8f979f; /* indicator fill inside the normal band */
+	--normal-fill: #8f979f; /* indicator fill inside the normal band; the solid fill of non-interactive status marks */
 	--alarm: #f0b429; /* needs you, above the normal band */
 	--alarm-bg: #3b3322;
 	--alarm-line: #6b5627;
@@ -29,6 +29,7 @@
 	--crit-text: #ffb4ae; /* crit-coloured text on normal surfaces */
 	--on-alarm: #14181d; /* ink on a solid amber fill */
 	--on-crit: #1d0d0c; /* ink on a solid red fill */
+	--on-grey: #14181d; /* ink on a solid grey fill: status you cannot click */
 	--diff-add: #7cc97f; /* added diff lines: the one non-alarm colour, diff text only */
 	--diff-add-bg: rgb(63 138 66 / 0.16);
 	--line-hover: #5a616a;
@@ -62,7 +63,7 @@
 	--accent-ink: #f2f7fc;
 	--accent-bg: #e7eef5;
 	--accent-line: #b0c6dc;
-	--normal-fill: #8a929b;
+	--normal-fill: #8a929b; /* indicator fill inside the normal band; the solid fill of non-interactive status marks */
 	--alarm: #9a6a00;
 	--alarm-bg: #f9f0d8;
 	--alarm-line: #d8b96a;
@@ -73,6 +74,7 @@
 	--crit-text: #b3261e;
 	--on-alarm: #ffffff;
 	--on-crit: #ffffff;
+	--on-grey: #14181d; /* ink on a solid grey fill: status you cannot click */
 	--diff-add: #1a7f37;
 	--diff-add-bg: rgb(52 153 77 / 0.14);
 	--scrim: rgba(30, 34, 40, 0.4);
@@ -1424,8 +1426,9 @@ textarea {
 
 /* ---- Notification bell (the inbox in the app bar) ----
    Clear: grey bell. Standing: the most urgent mark plus the total (grey for notices).
-   Lit: solid fill in the most urgent NEW entry's hue, ink on it, the inverted mark and
-   "N new"; the fill is the signal, the mark and the word keep it readable without colour. */
+   Lit: solid fill in the most urgent NEW entry's colour — alarm hue, or the grey status
+   fill for asks and notices — ink on it, the inverted mark and "N new"; the fill is the
+   signal, the mark and the word keep it readable without colour. */
 .inbox {
 	gap: 6px;
 }
@@ -1439,8 +1442,9 @@ textarea {
 }
 .inbox[data-level="asked"],
 .inbox[data-level="info"] {
-	--lit: var(--accent);
-	--lit-ink: var(--accent-ink);
+	/* New question or notice: the grey status fill — steel stays clickable-only (One-Edge). */
+	--lit: var(--normal-fill);
+	--lit-ink: var(--on-grey);
 }
 .inbox-n {
 	font-size: 12.5px;
@@ -1464,8 +1468,8 @@ textarea {
 .inbox.lit .inbox-n {
 	color: inherit;
 }
-/* No mark on the bell: the bell itself carries the level. While something needs you it fills in
-   the level colour and the count stays white; new notices fill the whole button and the bell turns ink. */
+/* No mark on the bell: the bell itself carries the level. While an alarm tops the inbox it
+   fills in the alarm's hue and the count stays white; a new ask or notice fills grey and the bell turns ink. */
 .inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
 		.lit
 	)
@@ -2975,7 +2979,7 @@ a.release:hover {
 	color: var(--accent-hover);
 	border-color: var(--accent);
 }
-/* Inbox badge: a done card with something to read whose drawer never opened; opening clears it (a steps report only its drawer buttons clear). */
+/* Inbox badge: a done card with something to read whose drawer never opened; opening clears it (a steps report only its drawer buttons clear). Grey status fill — steel stays clickable (One-Edge Rule). */
 .card .unread {
 	flex-shrink: 0;
 	padding: 0 6px;
@@ -2983,8 +2987,8 @@ a.release:hover {
 	font-size: 11.5px;
 	font-weight: 500;
 	line-height: 18px;
-	color: var(--accent-ink);
-	background: var(--accent);
+	color: var(--on-grey);
+	background: var(--normal-fill);
 	border-radius: 3px;
 }
 /* Task key: the speaking id (e.g. OTTR-1) leads the card's head as quiet mono metadata. */
@@ -3157,9 +3161,9 @@ a.release:hover {
 }
 /* The alarm chip on a stage tab: solid fill in the alarm's hue, ink on it, the inverted
    mark and the count — the lit-bell language. The fill pins the chip to its own tab, so a
-   squeezed strip cannot leave it adrift between neighbours. Ask rounds ride the steel
-   accent: input requested, not a stall. Same tokens as the card alarm coding, so the tab
-   echoes the card it points at. */
+   squeezed strip cannot leave it adrift between neighbours. Ask rounds fill the grey
+   status colour — input requested, not a stall, and steel stays clickable-only (One-Edge
+   Rule). Same tokens as the card alarm coding, so the tab echoes the card it points at. */
 .count.needs {
 	display: inline-flex;
 	align-items: center;
@@ -3178,12 +3182,12 @@ a.release:hover {
 	stroke: var(--alarm); /* inverted mark, so it reads on the solid fill */
 }
 .count.needs.asked {
-	color: var(--accent-ink);
-	background: var(--accent);
-	border-color: var(--accent);
+	color: var(--on-grey);
+	background: var(--normal-fill);
+	border-color: var(--normal-fill);
 }
 .count.needs.asked .mark-ink {
-	stroke: var(--accent);
+	stroke: var(--normal-fill);
 }
 /* Landed work recedes: recessed stock, lighter title weight. A review parked at merging is
    idle too but not landed; it waits like a queued card (see cardMark in status.ts). */
