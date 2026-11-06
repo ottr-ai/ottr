@@ -163,6 +163,27 @@ export function stripGitAuthEnv(env: Record<string, string | undefined>): void {
 	}
 }
 
+/** Proxy URL variable names (`i` flag covers the lower-case twins); NO_PROXY is a host
+ * list, never a URL with credentials, and never matches. */
+const PROXY_URL_ENV = /^(HTTPS?_PROXY|ALL_PROXY)$/i;
+
+/** Rewrites every proxy URL variable in place without its userinfo: the corporate proxy's
+ * `http://user:pass@proxy:8080` becomes `http://proxy:8080`, so no turn env carries the
+ * credentials. A value without userinfo, or without a `scheme://` authority to hang a
+ * userinfo on (`user:pass@proxy:8080`, `http:proxy:8080`), stays byte-identical: never
+ * mangle a proxy value the strip cannot read confidently. */
+export function stripProxyCredentials(
+	env: Record<string, string | undefined>,
+): void {
+	for (const k of Object.keys(env)) {
+		if (!PROXY_URL_ENV.test(k)) continue;
+		const value = env[k];
+		if (value === undefined) continue;
+		const stripped = value.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/?#]*@/i, "$1");
+		if (stripped !== value) env[k] = stripped;
+	}
+}
+
 export function gitEnv(
 	args: readonly string[],
 	auth: Record<string, string> = {},

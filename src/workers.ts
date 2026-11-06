@@ -15,7 +15,7 @@ import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
 import { buildToolsPath, ensureProjectTools } from "./tools.ts";
 import type { RunResult } from "./types.ts";
-import { stripGitAuthEnv } from "./worktree.ts";
+import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
 
 /**
  * Sentinel key of the final response line: the daemon streams omp stdout lines
@@ -247,6 +247,9 @@ export function serveWorker(opts: {
 			delete env.OTTR_WORKER_TOKEN;
 			// Same strip as childEnv on the server: no turn ever needs the alate key.
 			delete env.ALATE_API_KEY;
+			// Same strip as childEnv on the server: the container env can carry a
+			// corporate proxy URL with credentials; a turn keeps host and port only.
+			stripProxyCredentials(env);
 			let child: ChildProcess;
 			// The tools link dir is per tool set: project pins, then _all pins, then the container
 			// PATH. The daemon's own PATH never changes, and two projects never see each

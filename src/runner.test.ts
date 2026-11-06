@@ -212,6 +212,30 @@ describe("childEnv", () => {
 			}),
 		).toEqual({ PATH: "/bin", GH_TOKEN: "ghp_x" });
 	});
+	test("strips proxy credentials; a proxy URL without userinfo stays byte-identical", () => {
+		expect(
+			childEnv({
+				base: {
+					PATH: "/bin",
+					HTTP_PROXY: "http://proxy:8080",
+					HTTPS_PROXY: "http://user:pass@proxy:8080",
+					https_proxy: "http://otherserver:s3cret@proxy:3128",
+					ALL_PROXY: "socks5://user:pass@proxy:1080",
+					// No scheme:// authority: not a URL the strip can read; unchanged.
+					all_proxy: "user:pass@proxy:1080",
+					NO_PROXY: "localhost,127.0.0.1",
+				},
+			}),
+		).toEqual({
+			PATH: "/bin",
+			HTTP_PROXY: "http://proxy:8080",
+			HTTPS_PROXY: "http://proxy:8080",
+			https_proxy: "http://proxy:3128",
+			ALL_PROXY: "socks5://proxy:1080",
+			all_proxy: "user:pass@proxy:1080",
+			NO_PROXY: "localhost,127.0.0.1",
+		});
+	});
 	test("stripBoard removes the board coordinates (a retro run proposes through the tracker)", () => {
 		expect(
 			childEnv({

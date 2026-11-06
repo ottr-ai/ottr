@@ -274,6 +274,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Run due reviews while idle | on | **Settings**; when the board is idle for 2 hours with no turn running, Ottr files a due architecture review card by itself. See [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
 | Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
 | Kept-worktree quarantine | 7 days | **Settings** |
+| Proxy variables | inherited from the board's env | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case names. Ottr strips the userinfo (`user:pass@`) from these URLs before it builds a turn's environment, so the proxy's credentials never reach an agent; the host and port stay. If a turn then cannot reach the network, use a proxy whose URL carries no credentials (for example one that allow-lists the stack's addresses instead) |
 
 ## GitHub tokens
 

@@ -36,6 +36,7 @@ import {
 	gitSecrets,
 	redact,
 	redactingWriter,
+	stripProxyCredentials,
 } from "./worktree.ts";
 
 export type { WorkerTarget };
@@ -80,6 +81,10 @@ export function childEnv(o: {
 	// no turn ever calls alate (only the board's server-side client does), so a turn
 	// that held it could rewrite the fleet's rules, skills and plugins (R5-1 class).
 	delete env.ALATE_API_KEY;
+	// Same strip in serveWorker: a corporate proxy URL with credentials
+	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
+	// port stay, so the proxy still routes the turn's network calls.
+	stripProxyCredentials(env);
 	if (o.sessionName) env.OTTR_SESSION_NAME = o.sessionName;
 	if (o.board) {
 		if (!env.OTTR_BOARD_URL) env.OTTR_BOARD_URL = o.board.url;

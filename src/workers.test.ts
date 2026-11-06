@@ -420,6 +420,53 @@ describe("serveWorker", () => {
 		}
 	}, 30_000);
 
+	test("omp never sees proxy credentials, from the container env or the request", async () => {
+		const planted: Record<string, string> = {
+			HTTP_PROXY: "http://user:pass@proxy:8080",
+			HTTPS_PROXY: "http://user:pass@proxy:8080",
+			ALL_PROXY: "socks5://user:pass@proxy:1080",
+			// The test's own fetches to the loopback daemon must bypass the planted proxy.
+			NO_PROXY: "127.0.0.1,localhost",
+		};
+		const saved = Object.fromEntries(
+			Object.keys(planted).map((k) => [k, process.env[k]]),
+		);
+		Object.assign(process.env, planted);
+		try {
+			const url = start({ ompPath: process.execPath });
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "r-proxy",
+					argv: [envDumpPath],
+					cwd: dir,
+					stdin: "",
+					env: {
+						http_proxy: "http://forwarded:creds@proxy:8080",
+						HTTPS_PROXY: "http://proxy:8080",
+						NO_PROXY: "localhost,127.0.0.1",
+					},
+				}),
+			});
+			const env = JSON.parse((await readLines(res))[0] ?? "") as Record<
+				string,
+				string
+			>;
+			expect(env.HTTP_PROXY).toBe("http://proxy:8080");
+			expect(env.HTTPS_PROXY).toBe("http://proxy:8080");
+			expect(env.ALL_PROXY).toBe("socks5://proxy:1080");
+			expect(env.http_proxy).toBe("http://proxy:8080");
+			// NO_PROXY is a host list, never a URL: it travels untouched.
+			expect(env.NO_PROXY).toBe("localhost,127.0.0.1");
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+		}
+	}, 30_000);
+
 	test("stderr accumulates into the sentinel tail", async () => {
 		const errPath = join(dir, "err-omp.js");
 		writeFileSync(
