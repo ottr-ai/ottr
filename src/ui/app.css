@@ -3110,6 +3110,18 @@ a.release:hover {
 	border-style: solid;
 	border-color: var(--line-hover);
 }
+/* The B shortcut badge: the New task kbd's shape in the quiet button's neutral ink. */
+.lane-add kbd {
+	font-family: inherit;
+	font-size: 11px;
+	line-height: 1;
+	padding: 3px 5px;
+	margin: 0 0 0 2px; /* .lane-add has no 2px bottom padding to offset, unlike button > kbd */
+	color: inherit;
+	background: color-mix(in srgb, currentColor 10%, transparent);
+	border: 1px solid var(--line-hover);
+	border-radius: 3px;
+}
 /* Done lane "Show more": a quiet full-width button under the last page of cards. */
 .lane-more {
 	display: flex;
@@ -7123,7 +7135,8 @@ button.log-mode[aria-pressed="true"] {
 		padding-bottom: 72px; /* FAB 56px + 16px bottom offset */
 	}
 	/* No hardware keyboard on touch: the shortcut badge is noise and costs width. */
-	.project-actions kbd {
+	.project-actions kbd,
+	.lane-add kbd {
 		display: none;
 	}
 	/* The FAB replaces the header New task button: the board's only primary action stays

@@ -5046,6 +5046,7 @@ export function LaneCol({
 							>
 								<Icon name="plus" size={12} />
 								Add draft
+								<kbd>B</kbd>
 							</button>
 						)}
 					</p>
