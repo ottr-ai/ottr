@@ -10178,6 +10178,45 @@ describe("review findings check", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
+	test("a Claude review checked by Claude warns on the review card", async () => {
+		// Claude via github-copilot routes to the critic role (the vendor decides, not the
+		// provider prefix); a critic that also points at Claude warns on the card.
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			modelRoles: () => ({ critic: "anthropic/claude-opus-5-5:medium" }),
+			commitSubjects: async () => ["a1 fix it upstream"],
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				const result =
+					record.runs.length === 1
+						? runResult({
+								model: "github-copilot/claude-sonnet-4-5",
+								outcome: { status: "answered", summary: "review done" },
+								recorded: record.recorded,
+							})
+						: runResult({
+								finalText: '[{"id":1,"keep":true,"reason":""}]',
+							});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		expect(record.runs[1]!.model).toBe("anthropic/claude-opus-5-5:medium");
+		const after = store.getTask(review.id)!;
+		expect(after.summary).toContain(
+			"check 0s on anthropic/claude-opus-5-5:medium — same vendor as the review",
+		);
+	});
+
 	test("a release's recorded blockers file as findings and park it at merging, unapproved", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Blocker: the notes drop the late commits", 1)];
@@ -11358,6 +11397,84 @@ describe("work card check", () => {
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs[1]!.model).toBe("openai-codex/gpt-6.1-sol:max");
+	});
+
+	test("a check that runs on the work model itself warns on the card", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
+			workCheck: () => true,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									// Another thinking level is still the same model.
+									model: "zai/glm-5.3-flash:high",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const run = store.getTask(task.id)!.workCheckLog[0]!;
+		expect(run.outcome).toBe("pass");
+		expect(run.model).toBe("zai/glm-5.3-flash:medium");
+		expect(run.warn).toBe(
+			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
+		);
+	});
+
+	test("a check on the work model's vendor, another model, warns with the vendor reason", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({ adversary: "zai/glm-5:medium" }),
+			workCheck: () => true,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									model: "zai/glm-5.3-flash",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.workCheckLog[0]!.warn).toBe(
+			"The check model zai/glm-5:medium is from the same vendor as the run it checks — no second-vendor opinion.",
+		);
 	});
 });
 
@@ -15298,7 +15415,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			expect(kidsOf(store, review.id)).toEqual([]);
 			const after = store.getTask(review.id)!;
 			expect(after.summary).toBe(
-				"review done\nFindings: 2 recorded, 0 filed, 2 not filed (check 4s).",
+				"review done\nFindings: 2 recorded, 0 filed, 2 not filed (check 4s on fake/default-model).",
 			);
 			expect(after.details).toContain(
 				"## Findings\n- none filed\n- dropped: Bug A — dup of #7\n- dropped: Bug B — handled at src/x.ts:42",

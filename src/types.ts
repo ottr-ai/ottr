@@ -430,6 +430,9 @@ export interface WorkCheckRun {
 	durationMs: number;
 	/** The failed-run reason when outcome is "error". */
 	error?: string;
+	/** Why the check gives no second-model opinion: it ran on the checked run's own model
+	 *  or at least its vendor (checkModelWarning). Absent when the check differs in vendor. */
+	warn?: string;
 }
 
 /** What to do with one kept worktree file when finishing the card without an agent turn. */

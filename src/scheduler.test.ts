@@ -12,6 +12,7 @@ import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import {
 	applyCheckVerdicts,
 	archReviewView,
+	checkModelWarning,
 	checkRoleFor,
 	demoteUnquoted,
 	depHold,
@@ -25,6 +26,7 @@ import {
 	liveCard,
 	mergeAnywayPatch,
 	mergeHold,
+	modelVendor,
 	openWorkBlockers,
 	overrideWorkBlockers,
 	PUSH_HOLD,
@@ -1392,10 +1394,72 @@ describe("review check policy", () => {
 		});
 	});
 
-	test("checkRoleFor picks critic for Anthropic reviews, adversary otherwise", () => {
+	test("checkRoleFor picks the role by model vendor, not provider prefix", () => {
+		// Claude through another provider is still Anthropic: the critic role checks it.
 		expect(checkRoleFor("anthropic/claude-opus-5-5")).toBe("critic");
+		expect(checkRoleFor("github-copilot/claude-sonnet-4-5")).toBe("critic");
+		expect(checkRoleFor("openrouter/anthropic/claude-opus-4-1")).toBe("critic");
+		expect(checkRoleFor("bedrock/us.anthropic.claude-sonnet-4-5")).toBe(
+			"critic",
+		);
+		// Other vendors and unknown ids keep the adversary role.
 		expect(checkRoleFor("openai/gpt-6.1")).toBe("adversary");
+		expect(checkRoleFor("openai-codex/gpt-5.6-luna")).toBe("adversary");
+		expect(checkRoleFor("zai/glm-5.3-flash")).toBe("adversary");
+		expect(checkRoleFor("fake/default-model")).toBe("adversary");
 		expect(checkRoleFor(null)).toBe("adversary");
+	});
+
+	test("modelVendor reads the vendor from the model id after the provider prefix", () => {
+		expect(modelVendor("anthropic/claude-opus-5-5")).toBe("anthropic");
+		expect(modelVendor("github-copilot/claude-x")).toBe("anthropic");
+		expect(modelVendor("openrouter/anthropic/claude-x")).toBe("anthropic");
+		// Bedrock's dotted qualifiers and region prefixes do not hide the vendor.
+		expect(modelVendor("bedrock/us.anthropic.claude-sonnet-4-5")).toBe(
+			"anthropic",
+		);
+		expect(modelVendor("openai/gpt-6.1")).toBe("openai");
+		expect(modelVendor("azure/o4-mini")).toBe("openai");
+		expect(modelVendor("google/gemini-3-pro")).toBe("google");
+		expect(modelVendor("zai/glm-5.3-flash")).toBe("zai");
+		// The thinking suffix is ignored; the vendor path counts.
+		expect(modelVendor("zai/glm-5.3-flash:high")).toBe("zai");
+		expect(modelVendor("moonshotai/kimi-k2")).toBe("moonshot");
+		expect(modelVendor("mistral/mistral-large-2")).toBe("mistral");
+		expect(modelVendor("openrouter/qwen/qwen-2.5-72b-instruct")).toBe("qwen");
+		expect(modelVendor("amazon/nova-2")).toBe("amazon");
+		// No known token: unknown vendor, never a bare Object.prototype member read.
+		expect(modelVendor("fake/default-model")).toBeNull();
+		expect(modelVendor("provider/constructor")).toBeNull();
+		expect(modelVendor("provider/")).toBeNull();
+	});
+
+	test("checkModelWarning flags a check on the checked run's own model or vendor", () => {
+		// Same model: the thinking level apart at most.
+		expect(
+			checkModelWarning("zai/glm-5.3-flash", "zai/glm-5.3-flash:medium"),
+		).toBe("same model");
+		// Same vendor, another model.
+		expect(checkModelWarning("zai/glm-5.3-flash", "zai/glm-5")).toBe(
+			"same vendor",
+		);
+		// Claude checking Claude through another provider.
+		expect(
+			checkModelWarning(
+				"github-copilot/claude-sonnet-4-5",
+				"anthropic/claude-opus-5-5",
+			),
+		).toBe("same vendor");
+		// A second vendor gives no warning.
+		expect(
+			checkModelWarning("anthropic/claude-opus-5-5", "openai-codex/gpt-6.1"),
+		).toBeNull();
+		// Unknown vendors cannot be claimed the same.
+		expect(
+			checkModelWarning("fake/default-model", "fake/other-model"),
+		).toBeNull();
+		expect(checkModelWarning(null, "zai/glm")).toBeNull();
+		expect(checkModelWarning("zai/glm", null)).toBeNull();
 	});
 
 	describe("parseCheckVerdicts", () => {

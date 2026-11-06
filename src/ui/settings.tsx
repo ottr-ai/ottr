@@ -46,6 +46,7 @@ import {
 import {
 	addRoleError,
 	classifyRolesSave,
+	missingCheckRoles,
 	ownField,
 	type RolesState,
 	rolesDirty,
@@ -3012,6 +3013,9 @@ function ModelRolesSection() {
 		a.name.localeCompare(b.name),
 	);
 	const dirty = state !== null && rolesDirty(rows, state.roles);
+	// The check roles the board would fall back from: without them a check runs on the
+	// default model, which is often the model it checks.
+	const missing = missingCheckRoles(rows.map(([name]) => name));
 	const setValue = (name: string, value: string): void => {
 		setRows((rs) => rs.map((r) => (r[0] === name ? [name, value] : r)));
 		setFields((f) =>
@@ -3231,6 +3235,14 @@ function ModelRolesSection() {
 							);
 						})}
 					</div>
+					{missing.length > 0 && (
+						<p className="hint">
+							<Mark kind="warn" /> No {missing.join(" or ")} role
+							{missing.length > 1 ? "s" : ""}: second-model checks fall back to
+							the default model, which is often the model they check. critic
+							checks Anthropic models, adversary the rest.
+						</p>
+					)}
 					{ro !== null && (
 						<>
 							<p className="auth-error" role="alert">

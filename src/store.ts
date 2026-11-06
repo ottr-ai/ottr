@@ -560,6 +560,7 @@ function parseWorkCheckLog(raw: string): WorkCheckRun[] {
 			notes: r.notes.filter((n): n is string => typeof n === "string"),
 			durationMs: typeof r.durationMs === "number" ? r.durationMs : 0,
 			error: typeof r.error === "string" ? r.error : undefined,
+			warn: typeof r.warn === "string" ? r.warn : undefined,
 		});
 	}
 	return runs.slice(-20);

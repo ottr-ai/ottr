@@ -42,6 +42,14 @@ export function roleWarnings(
 		: [`No active sign-in for ${provider} on the board`];
 }
 
+/** The check roles missing from the edited role names: critic checks Anthropic models,
+    adversary checks the rest. A missing role runs its checks on the default model, which is
+    often the model they check — the editor flags the gap so the fallback is a decision. */
+export function missingCheckRoles(roles: readonly string[]): string[] {
+	const have = new Set(roles);
+	return ["critic", "adversary"].filter((role) => !have.has(role));
+}
+
 /** Board seed state after a save: "copy" when the board reads the provisioned copy (no seed),
     "done" when the board copy holds the saved roles, "replaced" when a seed ran after the save
     (its commit differs from `seedAtSave`) and left other roles, else "wait". Roles alone cannot

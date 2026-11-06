@@ -63,6 +63,7 @@ import {
 } from "./runner.ts";
 import {
 	applyCheckVerdicts,
+	checkModelWarning,
 	checkRoleFor,
 	demoteUnquoted,
 	depHold,
@@ -3660,6 +3661,10 @@ export function createTurnLoop(
 				}[] = [];
 				let checkMs = 0;
 				let checkFailed: string | null = null;
+				// The model the check resolves to (the role's selector, else the board's default
+				// role — omp's fallback) and why it gives no second-model opinion, for the card.
+				let checkModel: string | null = null;
+				let checkWarn: "same model" | "same vendor" | null = null;
 				if (checkOn) {
 					// Input as data: the findings (numbered from 1), the frozen sha, the open cards,
 					// and the commits main gained since the review — the one git fact a run without
@@ -3684,6 +3689,10 @@ export function createTurnLoop(
 					]);
 					const roles = (ops.modelRoles ?? modelRoles)();
 					const selector = roles[checkRoleFor(result.model)];
+					// A missing role falls back to the board's default role (omp's default
+					// model), which is often the reviewed model itself — shown on the card.
+					checkModel = selector ?? roles.default ?? null;
+					checkWarn = checkModelWarning(result.model, checkModel);
 					const input = reviewCheckPrompt({
 						sha: task.base ?? "",
 						findings: selected.map((f, i) => ({
@@ -3802,7 +3811,7 @@ export function createTurnLoop(
 						),
 					];
 					store.updateTask(id, {
-						summary: `${cur.summary ?? "Review finished"}\nFindings: ${reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${checkOn ? ` (check ${(checkMs / 1000).toFixed(0)}s)` : ""}.`,
+						summary: `${cur.summary ?? "Review finished"}\nFindings: ${reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${checkOn ? ` (check ${(checkMs / 1000).toFixed(0)}s on ${checkModel ?? "default model"}${checkWarn === null ? "" : ` — ${checkWarn} as the review`})` : ""}.`,
 						details: `${cur.details ?? ""}\n\n## Findings\n${
 							filed.length > 0
 								? filed.map((cid) => `- filed as card #${cid}`).join("\n")
@@ -3917,6 +3926,20 @@ export function createTurnLoop(
 						}
 						const roles = (ops.modelRoles ?? modelRoles)();
 						const selector = roles[checkRoleFor(result.model)];
+						// The check must not be the model it checks: a missing role falls back
+						// to the board's default role (omp's default model), often the work
+						// model itself. Same model or vendor goes on the card as a warning.
+						const checkModel = selector ?? roles.default ?? null;
+						const checkWarn = checkModelWarning(result.model, checkModel);
+						const warn =
+							checkWarn === null
+								? {}
+								: {
+										warn:
+											checkWarn === "same model"
+												? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
+												: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
+									};
 						const input = workCheckPrompt({
 							title: task.title,
 							prompt: task.prompt,
@@ -4020,6 +4043,7 @@ export function createTurnLoop(
 										blockers: split.blockers,
 										notes: split.notes,
 										durationMs: checkMs,
+										...warn,
 									};
 									const allRuns = [...runs, run].slice(-20);
 									log(
@@ -4072,6 +4096,7 @@ export function createTurnLoop(
 										blockers: [],
 										notes: [],
 										durationMs: checkMs,
+										...warn,
 										error: checkFailed,
 									},
 								],

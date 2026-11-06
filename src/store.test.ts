@@ -990,6 +990,43 @@ describe("keptFiles", () => {
 	});
 });
 
+describe("work check log", () => {
+	test("a run's warn survives a reopen; rows without one stay warnless", () => {
+		const store = open(join(root, "wc-log"));
+		const task = store.createTask("checked work");
+		store.updateTask(task.id, {
+			workCheckLog: [
+				{
+					at: 1000,
+					model: "zai/glm-5.3-flash:medium",
+					outcome: "pass",
+					blockers: [],
+					notes: [],
+					durationMs: 5000,
+					warn: "The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
+				},
+				{
+					at: 2000,
+					model: "anthropic/claude-opus-5-5",
+					outcome: "blockers",
+					blockers: [{ finding: "off by one", quote: "i <= n" }],
+					notes: ["a note"],
+					durationMs: 6000,
+				},
+			],
+		});
+		store.close();
+		const reopened = open(join(root, "wc-log"));
+		const log = reopened.getTask(task.id)?.workCheckLog ?? [];
+		expect(log).toHaveLength(2);
+		expect(log[0]?.warn).toBe(
+			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
+		);
+		expect(log[1]?.warn).toBeUndefined();
+		reopened.close();
+	});
+});
+
 describe("uncommittedFiles", () => {
 	test("updateTask stores and clears the list; fresh stores default to empty", () => {
 		const store = open(join(root, "uncommitted"));

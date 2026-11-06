@@ -83,6 +83,7 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - A remove button for each row. An add form with a role name, then the new row takes the first catalog model.
 - **Save** is off while nothing changed or a save runs. A 400 shows each `fields` message at its row (`aria-describedby`, `aria-invalid`). A 409 with `roles` loads the current values and shows the conflict message. Other errors show in an alert.
 - A row warns when its provider (the selector text before `/`) has no active sign-in on the board: "No active sign-in for <provider> on the board". A store with `active: null` gives no warning.
+- The section flags a missing check role: without `critic` (which checks Anthropic models) or `adversary` (which checks the rest), the second-model check falls back to the default model, which is often the model it checks. The flag tracks the edited rows, before any save.
 - After a commit, the section shows each step and its result:
   1. "Committed <short sha> to the data repo."
   2. The provision: running, then success, or the failed scripts and their error. A failure keeps the commit and says so.

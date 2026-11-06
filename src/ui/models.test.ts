@@ -8,6 +8,7 @@ import {
 	displayModel,
 	fetchCatalog,
 	loadCatalog,
+	missingCheckRoles,
 	modelMatches,
 	modelRows,
 	ownField,
@@ -18,6 +19,15 @@ import {
 	seedStep,
 	stepIndex,
 } from "./models.ts";
+
+test("missingCheckRoles lists the check roles the edited roles lack", () => {
+	expect(missingCheckRoles(["default", "slow"])).toEqual([
+		"critic",
+		"adversary",
+	]);
+	expect(missingCheckRoles(["adversary"])).toEqual(["critic"]);
+	expect(missingCheckRoles(["critic", "adversary", "default"])).toEqual([]);
+});
 
 test("rolesDirty compares rows with the roles in order", () => {
 	const roles = { default: "a/x", slow: "b/y" };

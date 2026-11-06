@@ -8434,6 +8434,11 @@ export function Drawer({
 											{" · "}
 											{stamp(run.at)} · {duration(run.durationMs)}
 										</p>
+										{run.warn !== undefined && (
+											<p className="hint">
+												<Mark kind="warn" /> {run.warn}
+											</p>
+										)}
 										{run.error !== undefined && (
 											<p className="dim">{run.error}</p>
 										)}
@@ -8693,6 +8698,11 @@ export function Drawer({
 												<div className="dim turn-sum">
 													{run.error ??
 														`${nb} ${nb === 1 ? "blocker" : "blockers"} · ${nn} ${nn === 1 ? "note" : "notes"}`}
+												</div>
+											)}
+											{run.warn !== undefined && (
+												<div className="dim turn-sum">
+													<Mark kind="warn" /> {run.warn}
 												</div>
 											)}
 										</li>
