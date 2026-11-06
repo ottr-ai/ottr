@@ -186,8 +186,8 @@ describe("parseIssuePage", () => {
 			{ ...good, number: 10, pull_request: null },
 		]);
 		expect(out.map((i) => i.number)).toEqual([1, 9, 10]);
-		expect(out[0]!.title.startsWith("hix")).toBe(true);
-		expect(out[0]!.title.length).toBe(120);
+		// The title keeps its full length: redaction runs on it before any cut.
+		expect(out[0]!.title).toBe(`hi${"x".repeat(200)}`);
 		expect(out[0]!.createdAt).toBe(SINCE + MIN);
 		expect(out[0]!.isPull).toBe(false);
 		expect(out[1]!.title).toBe("");
@@ -440,5 +440,132 @@ describe("createIssueWatcher", () => {
 		expect(fake.calls.every((c) => c.some((x) => x.includes("o/b")))).toBe(
 			true,
 		);
+	});
+
+	test("a quoted credential ending past the 120-char cut is withheld, not cut open", async () => {
+		const s = setup();
+		const value = "Zq8vN3pL7wR2tY6kM4";
+		// 121 chars: the closing quote sits at index 120, just past the card title's cut.
+		const title = `${"a".repeat(91)} password="${value}"`;
+		expect(title.length).toBe(121);
+		s.open([issue(11, { title })]);
+		await s.watcher.tick();
+		const c = s.cards()[0]!;
+		expect(c.title).toBe("Issue #11");
+		expect(c.title).not.toContain(value);
+		expect(c.prompt).not.toContain(value);
+	});
+
+	test("a token straddling the 120-char cut is redacted whole, no prefix leaks", async () => {
+		const s = setup();
+		s.open([issue(12, { title: `${"x".repeat(100)} ${TOKEN}` })]);
+		await s.watcher.tick();
+		const c = s.cards()[0]!;
+		expect(c.title).toBe(`Issue #12: ${"x".repeat(100)} [REDACTED]`);
+		expect(c.title).not.toContain("ghp_");
+		expect(c.prompt).not.toContain("ghp_");
+	});
+
+	test("an off/on cycle during the listing call files and labels nothing from the old mark", async () => {
+		const { dir, store } = newStore(true);
+		const fake = fakeGh();
+		// Opened 5 minutes after the first mark, before the re-enable mark.
+		fake.setOpen("o/r", [issue(5, { at: 5 })]);
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		let listing = 0;
+		const watcher = createIssueWatcher({
+			projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
+			log: () => {},
+			gh: async (args) => {
+				if (args.some((a) => a.includes("/issues?")) && listing++ === 0) {
+					reached.resolve();
+					await gate.promise;
+				}
+				return fake.gh(args);
+			},
+			now: () => SINCE + ISSUE_GATES.DAY_MS,
+		});
+		const tick = watcher.tick();
+		await reached.promise;
+		store.setSettings({ issueWatch: false });
+		store.setSettings({ issueWatch: true, issueWatchSince: SINCE + 10 * MIN });
+		gate.resolve();
+		await tick;
+		expect(store.getIssueWatch(5)).toBeNull();
+		expect(fake.labelled).toEqual([]);
+		// The next tick reads the new mark: the issue opened while off stays unfiled.
+		await watcher.tick();
+		expect(store.getIssueWatch(5)).toBeNull();
+		expect(store.issueCardsFiledSince(0)).toBe(0);
+	});
+
+	test("turning the watch off during the label check stops label writes", async () => {
+		const { dir, store } = newStore(true);
+		const fake = fakeGh();
+		fake.setOpen("o/r", [issue(6)]);
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const watcher = createIssueWatcher({
+			projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
+			log: () => {},
+			gh: async (args) => {
+				if (args.some((a) => a.endsWith(`/labels/${TRACKED_LABEL}`))) {
+					reached.resolve();
+					await gate.promise;
+				}
+				return fake.gh(args);
+			},
+			now: () => SINCE + ISSUE_GATES.DAY_MS,
+		});
+		const tick = watcher.tick();
+		await reached.promise;
+		expect(store.getIssueWatch(6)).not.toBeNull();
+		store.setSettings({ issueWatch: false });
+		gate.resolve();
+		await tick;
+		expect(fake.labelled).toEqual([]);
+		expect(store.unlabelledIssues()).toEqual([6]);
+	});
+
+	test("pages run newest first: 10,000 older open issues cannot hide a new one", async () => {
+		const { dir, store } = newStore(true);
+		const fake = fakeGh();
+		const old = Array.from({ length: 10_000 }, (_, i) =>
+			issue(i + 1, { at: -1 - i }),
+		);
+		const pages: string[] = [];
+		const serve = (all: unknown[]) =>
+			createIssueWatcher({
+				projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
+				log: () => {},
+				gh: async (args) => {
+					const path = args.find((a) => a.includes("/issues?"));
+					if (path === undefined) return fake.gh(args);
+					pages.push(path);
+					const page = Number(path.match(/[?&]page=(\d+)/)![1]);
+					return ok(JSON.stringify(all.slice((page - 1) * 100, page * 100)));
+				},
+				now: () => SINCE + ISSUE_GATES.DAY_MS,
+			});
+		// Newest first, as direction=desc returns them.
+		await serve([issue(10_001, { at: 5 }), ...old]).tick();
+		expect(store.getIssueWatch(10_001)).not.toBeNull();
+		expect(pages.length).toBe(1);
+		expect(pages[0]).toContain("direction=desc");
+		// 150 new issues fill page 1 and half of page 2: both pages are read, the scan stops
+		// at the page that reaches below the mark, and the cap still takes the oldest first.
+		const fresh = Array.from({ length: 150 }, (_, i) =>
+			issue(20_000 + i, { at: 1000 - i }),
+		);
+		pages.length = 0;
+		await serve([...fresh, ...old]).tick();
+		expect(pages.length).toBe(2);
+		const filed = fresh
+			.map((x) => x.number)
+			.filter((n) => store.getIssueWatch(n) !== null)
+			.sort((a, b) => a - b);
+		// One slot went to #10001 above: 9 more, the 9 oldest of the fresh ones.
+		expect(filed).toEqual(Array.from({ length: 9 }, (_, i) => 20_141 + i));
 	});
 });
