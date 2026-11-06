@@ -1,9 +1,9 @@
 name: Audit
 
 # Weekly static and periodic audit: fresh advisories for the lockfile, Dockerfile checks,
-# a pinned Trivy run over the worker image, and an OWASP ZAP baseline scan over a throwaway
-# board. Contents-read everywhere; no secrets; every downloaded binary and image is
-# checksum- or digest-pinned.
+# pinned Trivy runs over the worker image and the repo tree, and an OWASP ZAP baseline
+# scan over a throwaway board. Contents-read everywhere; no secrets; every downloaded
+# binary and image is checksum- or digest-pinned.
 
 on:
   schedule:
@@ -55,6 +55,13 @@ jobs:
           tar -xzf /tmp/trivy.tar.gz -C /tmp
           /tmp/trivy --version
       - run: /tmp/trivy image --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ottr-worker:audit
+      # Weekly repo-tree scan with the binary installed above: secrets in the checkout
+      # plus Dockerfile misconfiguration (CI's gitleaks and zizmor cover git history and
+      # workflow files; src SAST is tracked separately). Warn-only for the first runs —
+      # the known finding is DS-0002 (no USER directive in Dockerfile.worker, HIGH);
+      # after triage add --exit-code 1 so HIGH/CRITICAL findings fail the job, like the
+      # image scan above.
+      - run: /tmp/trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL .
 
   zap:
     runs-on: ubuntu-latest
