@@ -176,6 +176,10 @@ export interface ProjectSettings {
 	prMode: boolean;
 	/** Weekly trending scout: file a read-only scout card for this project at each GitHub trending scan (off by default). */
 	trendingScout: boolean;
+	/** Hourly issue watch: file each new open GitHub issue as a backlog card and label it ottr-tracked (off by default). */
+	issueWatch: boolean;
+	/** When issueWatch last turned on (epoch ms); null while never enabled. */
+	issueWatchSince: number | null;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 	/**

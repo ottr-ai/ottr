@@ -664,6 +664,10 @@ setInterval(() => void app.forkResearchTick(), 3_600_000);
 void app.prReviewTick();
 setInterval(() => void app.prReviewTick(), 3_600_000);
 
+// Issue watch: hourly poll; files new open GitHub issues as backlog cards, capped per day.
+void app.issueWatchTick();
+setInterval(() => void app.issueWatchTick(), 3_600_000);
+
 // Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
 void app.tokenReminderTick();
 setInterval(() => void app.tokenReminderTick(), 86_400_000);

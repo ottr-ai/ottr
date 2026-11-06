@@ -101,6 +101,7 @@ import {
 	saveImages,
 	sniffImage,
 } from "./images.ts";
+import { createIssueWatcher } from "./issues.ts";
 import { rebuildLayerUse } from "./layers.ts";
 import {
 	agentDir,
@@ -1334,6 +1335,13 @@ export function createApp(deps: AppDeps) {
 		// A re-review rewrites a draft the user may have read: the mark must go,
 		// or the updated card never wears the unread badge again.
 		forgetSeen: (taskId) => saveSeen(loadSeen().filter((id) => id !== taskId)),
+	});
+
+	// Issue watcher: same live project Map; files new open GitHub issues as backlog cards.
+	const issueWatcher = createIssueWatcher({
+		projects: () => deps.projects.values(),
+		log: (msg: string) => console.log(`[issues] ${msg}`),
+		gh,
 	});
 
 	/**
@@ -2876,6 +2884,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof pm !== "boolean")
 				return json({ error: "prMode must be a boolean" }, 400);
 			patch.prMode = pm;
+		}
+		const iw = body.issueWatch;
+		if (iw !== undefined) {
+			if (typeof iw !== "boolean")
+				return json({ error: "issueWatch must be a boolean" }, 400);
+			patch.issueWatch = iw;
 		}
 		const psc = body.pushSyncCommits;
 		if (psc !== undefined) {
@@ -5281,6 +5295,13 @@ export function createApp(deps: AppDeps) {
 							? (e.store.getSettings().retroSince ?? Date.now())
 							: null;
 					}
+					// issueWatch off -> on moves issueWatchSince to now: only issues opened after the
+					// (re-)enable file cards. Saving true while on keeps the mark; off leaves it.
+					if (
+						patch.issueWatch === true &&
+						e.store.getSettings().issueWatch !== true
+					)
+						patch.issueWatchSince = Date.now();
 					// A new targetBranch must move e.target at once: the board, the supervisor,
 					// the diffs and the gates read it until the next turn. A save that does not
 					// touch the target leaves it alone. The save proves the branch resolves
@@ -7269,5 +7290,6 @@ export function createApp(deps: AppDeps) {
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
 		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
 		prReviewIdle: () => prWatcher.reviewIdle(),
+		issueWatchTick: (opts?: { manual?: string }) => issueWatcher.tick(opts),
 	};
 }

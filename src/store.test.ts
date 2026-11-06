@@ -320,6 +320,8 @@ describe("settings", () => {
 			prReviews: false,
 			prMode: false,
 			trendingScout: false,
+			issueWatch: false,
+			issueWatchSince: null,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -346,6 +348,8 @@ describe("settings", () => {
 			prReviews: false,
 			prMode: false,
 			trendingScout: false,
+			issueWatch: false,
+			issueWatchSince: null,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -3269,6 +3273,80 @@ describe("trending verdicts", () => {
 			}).ok,
 		).toBe(false);
 		expect(store.listTrendingVerdicts()).toEqual([]);
+	});
+});
+
+describe("issue watch store methods", () => {
+	test("settings default off and issueWatchSince round-trips a number", () => {
+		const dir = join(root, "issue-settings");
+		let store = open(dir);
+		expect(DEFAULT_SETTINGS.issueWatch).toBe(false);
+		expect(store.getSettings().issueWatch).toBe(false);
+		expect(store.getSettings().issueWatchSince).toBeNull();
+		const since = 1_700_000_000_000;
+		store.setSettings({ issueWatch: true, issueWatchSince: since });
+		store.close();
+		store = open(dir);
+		expect(store.getSettings().issueWatch).toBe(true);
+		expect(store.getSettings().issueWatchSince).toBe(since);
+		store.close();
+	});
+
+	test("fileIssueCard files an idle backlog work card and an unlabelled row", () => {
+		const store = open(join(root, "issue-file"));
+		const card = store.fileIssueCard({
+			number: 7,
+			title: "Crash on start",
+			prompt: "Fix GitHub issue #7",
+			now: 1000,
+		});
+		expect(card).toMatchObject({
+			title: "Crash on start",
+			prompt: "Fix GitHub issue #7",
+			kind: "work",
+			stage: "backlog",
+			state: "idle",
+			topic: "github issue",
+			queuedAt: null,
+		});
+		expect(store.getIssueWatch(7)).toEqual({
+			number: 7,
+			taskId: card.id,
+			labelled: false,
+			filedAt: 1000,
+		});
+		expect(store.getIssueWatch(8)).toBeNull();
+	});
+
+	test("a second fileIssueCard for the same number throws and leaves no extra card", () => {
+		const store = open(join(root, "issue-dup"));
+		const o = { number: 3, title: "t", prompt: "p", now: 1 };
+		store.fileIssueCard(o);
+		const before = store.listTasks().length;
+		expect(() => store.fileIssueCard({ ...o, now: 2 })).toThrow();
+		expect(store.listTasks()).toHaveLength(before);
+		expect(store.getIssueWatch(3)?.filedAt).toBe(1);
+	});
+
+	test("issueCardsFiledSince counts rows filed at or after since", () => {
+		const store = open(join(root, "issue-since"));
+		store.fileIssueCard({ number: 1, title: "a", prompt: "a", now: 100 });
+		store.fileIssueCard({ number: 2, title: "b", prompt: "b", now: 200 });
+		store.fileIssueCard({ number: 3, title: "c", prompt: "c", now: 300 });
+		expect(store.issueCardsFiledSince(200)).toBe(2);
+		expect(store.issueCardsFiledSince(201)).toBe(1);
+		expect(store.issueCardsFiledSince(0)).toBe(3);
+		expect(store.issueCardsFiledSince(301)).toBe(0);
+	});
+
+	test("unlabelledIssues lists ascending until markIssueLabelled", () => {
+		const store = open(join(root, "issue-label"));
+		store.fileIssueCard({ number: 9, title: "a", prompt: "a", now: 1 });
+		store.fileIssueCard({ number: 4, title: "b", prompt: "b", now: 1 });
+		expect(store.unlabelledIssues()).toEqual([4, 9]);
+		store.markIssueLabelled(4);
+		expect(store.unlabelledIssues()).toEqual([9]);
+		expect(store.getIssueWatch(4)?.labelled).toBe(true);
 	});
 });
 

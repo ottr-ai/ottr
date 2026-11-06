@@ -8633,6 +8633,37 @@ describe("PR review routes", () => {
 		p1.github = null;
 	});
 
+	test("issueWatch on sets issueWatchSince, a re-save keeps it, off then on moves it", async () => {
+		const bad = await post("/api/projects/p1/settings", { issueWatch: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("issueWatch must be a boolean");
+		await post("/api/projects/p1/settings", { issueWatch: false });
+		store.setSettings({ issueWatchSince: 12345 });
+		const before = Date.now();
+		// The mark is server-owned: a client value is ignored.
+		const on = await post("/api/projects/p1/settings", {
+			issueWatch: true,
+			issueWatchSince: 1,
+		});
+		expect(on.status).toBe(200);
+		const first = store.getSettings().issueWatchSince ?? 0;
+		expect(first).toBeGreaterThanOrEqual(before);
+		expect(first).toBeLessThanOrEqual(Date.now());
+		// Re-saving true while on keeps the mark (pinned to a known value to prove it).
+		store.setSettings({ issueWatchSince: 777 });
+		await post("/api/projects/p1/settings", { issueWatch: true });
+		expect(store.getSettings().issueWatchSince).toBe(777);
+		// Off leaves the mark; on again moves it to now.
+		await post("/api/projects/p1/settings", { issueWatch: false });
+		expect(store.getSettings().issueWatch).toBe(false);
+		expect(store.getSettings().issueWatchSince).toBe(777);
+		const again = Date.now();
+		await post("/api/projects/p1/settings", { issueWatch: true });
+		expect(store.getSettings().issueWatchSince ?? 0).toBeGreaterThanOrEqual(
+			again,
+		);
+	});
+
 	test("prs/check refuses an unknown project and one without a GitHub remote", async () => {
 		const res = await post("/api/projects/p1/prs/check", {});
 		expect(res.status).toBe(409);

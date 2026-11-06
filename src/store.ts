@@ -76,6 +76,8 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	trendingScout: false,
 	prReviews: false,
 	prMode: false,
+	issueWatch: false,
+	issueWatchSince: null,
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
@@ -219,6 +221,13 @@ CREATE TABLE IF NOT EXISTS trending_verdict (
   scout_card_id TEXT,
   proposal_card_id TEXT
 );
+CREATE TABLE IF NOT EXISTS issue_watch (
+  number INTEGER PRIMARY KEY,
+  task_id TEXT,
+  labelled INTEGER NOT NULL DEFAULT 0,
+  filed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_issue_watch_filed_at ON issue_watch (filed_at);
 -- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -900,6 +909,8 @@ const SETTINGS_SHAPES = {
 	trendingScout: "boolean",
 	prReviews: "boolean",
 	prMode: "boolean",
+	issueWatch: "boolean",
+	issueWatchSince: "number",
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
@@ -2032,6 +2043,90 @@ export class ProjectStore {
 			)
 			.get(number);
 		return r ? toPrReview(r) : null;
+	}
+
+	/** One issue_watch row by GitHub issue number, or null. */
+	getIssueWatch(number: number): {
+		number: number;
+		taskId: string | null;
+		labelled: boolean;
+		filedAt: number;
+	} | null {
+		const r = this.db
+			.query<
+				{
+					number: number;
+					task_id: string | null;
+					labelled: number;
+					filed_at: number;
+				},
+				[number]
+			>("SELECT * FROM issue_watch WHERE number = ?")
+			.get(number);
+		return r
+			? {
+					number: r.number,
+					taskId: r.task_id,
+					labelled: r.labelled !== 0,
+					filedAt: r.filed_at,
+				}
+			: null;
+	}
+
+	/** Count of issue cards filed at or after `since`. */
+	issueCardsFiledSince(since: number): number {
+		return (
+			this.db
+				.query<{ n: number }, [number]>(
+					"SELECT COUNT(*) AS n FROM issue_watch WHERE filed_at >= ?",
+				)
+				.get(since)?.n ?? 0
+		);
+	}
+
+	/** Files a backlog card for an issue and records its watch row in one transaction; throws if the issue was already filed. */
+	fileIssueCard(o: {
+		number: number;
+		title: string;
+		prompt: string;
+		now: number;
+	}): Task {
+		const tx = this.db.transaction((): string => {
+			const card = this.createTask(o.prompt, null, "work");
+			this.updateTask(card.id, {
+				title: o.title,
+				topic: "github issue",
+				stage: "backlog",
+				state: "idle",
+				queuedAt: null,
+			});
+			this.db.run(
+				"INSERT INTO issue_watch (number, task_id, labelled, filed_at) VALUES (?, ?, 0, ?)",
+				[o.number, card.id, o.now],
+			);
+			return card.id;
+		});
+		const id = tx();
+		const task = this.getTask(id);
+		if (task === null) throw new Error(`unknown task: ${id}`);
+		return task;
+	}
+
+	/** Issue numbers filed but not yet labelled on GitHub, ascending. */
+	unlabelledIssues(): number[] {
+		return this.db
+			.query<{ number: number }, []>(
+				"SELECT number FROM issue_watch WHERE labelled = 0 ORDER BY number",
+			)
+			.all()
+			.map((r) => r.number);
+	}
+
+	/** Marks an issue's tracking label as applied. */
+	markIssueLabelled(number: number): void {
+		this.db.run("UPDATE issue_watch SET labelled = 1 WHERE number = ?", [
+			number,
+		]);
 	}
 
 	getPrReviewByTask(taskId: string): PrReviewRow | null {

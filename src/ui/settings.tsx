@@ -4176,7 +4176,7 @@ function SaveCard({
 	);
 }
 
-/** Updates chip: how many of the project's five automations are on (saved values, not the draft). */
+/** Updates chip: how many of the project's six automations are on (saved values, not the draft). */
 function updatesChip(s: ProjectView["settings"]): {
 	label: string;
 	tone: ChipTone;
@@ -4187,8 +4187,9 @@ function updatesChip(s: ProjectView["settings"]): {
 		s.forkResearch,
 		s.prReviews,
 		s.trendingScout,
+		s.issueWatch,
 	].filter(Boolean).length;
-	return { label: `${on} of 5 on`, tone: on > 0 ? "ok" : "off" };
+	return { label: `${on} of 6 on`, tone: on > 0 ? "ok" : "off" };
 }
 
 type SettingsCardProps = {
@@ -5349,6 +5350,14 @@ export function ProjectSettingsForm({
 							checked={st.prMode}
 							disabled={project.github === null && !st.prMode}
 							save={(v) => send({ prMode: v })}
+							act={act}
+						/>
+						<CheckRow
+							name="Issue watch"
+							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+							checked={st.issueWatch}
+							disabled={project.github === null && !st.issueWatch}
+							save={(v) => send({ issueWatch: v })}
 							act={act}
 						/>
 						<CheckRow
