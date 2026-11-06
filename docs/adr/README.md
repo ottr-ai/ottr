@@ -64,3 +64,4 @@ existing number plus one.
 | 0005 | The omp pin follows npm automatically | accepted |
 | 0006 | Dependency licenses are allowlisted | accepted |
 | 0007 | The merge target is a project setting | accepted |
+| 0008 | PR mode is a per-project choice | accepted |
