@@ -6433,7 +6433,7 @@ function KeptFilesPanel({
 			))}
 			<div className="kept-actions">
 				<BusyButton
-					className="primary"
+					className="danger"
 					run={async () =>
 						(await confirmDialog(
 							`Finish and discard the worktree?\n\nApplies the choices above, then deletes:\n${task.worktree ?? "the worktree"}${task.branch !== null ? `\nbranch ${task.branch}` : ""}\n\nMoved files are copied to the main checkout first; ignored files are added to .git/info/exclude; deleted files are lost.`,
