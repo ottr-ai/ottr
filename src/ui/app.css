@@ -1072,10 +1072,10 @@ textarea {
 	transform: scale(0.95);
 	transform-origin: top left;
 	transition:
-		opacity 0.16s var(--ease),
-		transform 0.16s var(--ease),
-		display 0.16s allow-discrete,
-		overlay 0.16s allow-discrete;
+		opacity 0.13s var(--ease),
+		transform 0.13s var(--ease),
+		display 0.13s allow-discrete,
+		overlay 0.13s allow-discrete;
 }
 .popover.notif-pop {
 	transform-origin: top right;
@@ -5494,6 +5494,15 @@ dialog.drawer {
 		transform 0.2s var(--ease),
 		display 0.2s allow-discrete,
 		overlay 0.2s allow-discrete;
+}
+/* Exits run about 20% shorter than entrances: the destination state owns the
+   transition durations, so the closed state sets 0.16s while the 0.2s opening
+   is untouched; the backdrop follows the same timings. */
+dialog.drawer:not([open]) {
+	transition-duration: 0.16s;
+}
+dialog.drawer:not([open])::backdrop {
+	transition-duration: 0.16s;
 }
 dialog.drawer[open] {
 	opacity: 1;
