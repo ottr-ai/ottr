@@ -104,6 +104,7 @@ export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
 COMPOSE_PROFILES=alate
 ALATE_URL=http://alate:4570
 ALATE_API_KEY=$(openssl rand -hex 32)
+# OTTR_GITHUB_HOST=acme.ghe.com   # set before onboarding when GitHub lives on *.ghe.com
 EOF
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
@@ -128,7 +129,7 @@ $env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth d
 if (-not (Test-Path .env)) {
   $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
   $key = 'ALATE_API_KEY=' + (($b | ForEach-Object { $_.ToString('x2') }) -join '')
-  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key) | Set-Content .env
+  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key, '# OTTR_GITHUB_HOST=acme.ghe.com') | Set-Content .env
 }
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
@@ -136,7 +137,7 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]`, `Test-Path`, and `[ -f .env ]` guards keep the existing `agent.db` snapshot and the same Alate key, and the named volumes keep the board data.
+The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]`, `Test-Path`, and `[ -f .env ]` guards keep the existing `agent.db` snapshot and the same Alate key, and the named volumes keep the board data. Set `OTTR_GITHUB_HOST` before onboarding (a commented line in `.env` works); otherwise a `*.ghe.com` token is checked against `github.com`, so the expiry probe and the GitHub API calls would aim at the wrong host.
 
 The `export` and `$env:` values live only in the current shell. Compose also reads a `.env` file in the same folder by itself, so put the values there (one `NAME=value` per line, for example `OTTR_WORKER_TOKEN=...`) and a new shell needs no exports. The Alate lines in the quick start already write the three Alate settings there; keep the `ALATE_API_KEY` line, because the board and alate must share one key.
 
@@ -157,6 +158,7 @@ export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
 COMPOSE_PROFILES=alate
 ALATE_URL=http://alate:4570
 ALATE_API_KEY=$(openssl rand -hex 32)
+# OTTR_GITHUB_HOST=acme.ghe.com   # set before onboarding when GitHub lives on *.ghe.com
 EOF
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 [ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
@@ -179,7 +181,7 @@ $env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth d
 if (-not (Test-Path .env)) {
   $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
   $key = 'ALATE_API_KEY=' + (($b | ForEach-Object { $_.ToString('x2') }) -join '')
-  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key) | Set-Content .env
+  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key, '# OTTR_GITHUB_HOST=acme.ghe.com') | Set-Content .env
 }
 # Seed it once with a consistent copy of the host db. Never mount the live file.
 if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
@@ -254,7 +256,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
 | Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |
-| GitHub token | none | asked at onboarding; **Settings → Git hosts → GitHub token** replaces it; stored in `.tasks/tracker.db`. Settings shows the expiry date of this token and of the compose seed token, and the board pushes a reminder from 30 days before an expiry (spec: [docs/specs/token-expiry.md](docs/specs/token-expiry.md)). A GHE board needs a token issued on its own host, and git pushes to that host use the per-host tokens from **Settings → Git hosts** |
+| GitHub token | none | asked at onboarding; **Settings → Git hosts → GitHub token** replaces it; stored in `.tasks/tracker.db`. Settings shows the expiry date of this token and of the compose seed token, and the board pushes a reminder from 30 days before an expiry (spec: [docs/specs/token-expiry.md](docs/specs/token-expiry.md)). Which token serves what, and which permissions to give it: [GitHub tokens](#github-tokens) |
 | GitHub host | `github.com` | env `OTTR_GITHUB_HOST` (a bare hostname), or **Settings → Git hosts → GitHub host**; a saved value wins over the env until cleared. A host under `*.ghe.com` is GitHub Enterprise Cloud with data residency (API at `api.<host>`); any other host is GitHub Enterprise Server (API at `<host>/api/v3`). Spec: [docs/specs/github-host.md](docs/specs/github-host.md) |
 | GitHub App | none | optional; **Settings → Git hosts → GitHub App**; when set, posted PR reviews show as the app identity (`ottr[bot]` with a bot badge) instead of your own account; stored in `.tasks/tracker.db`; the key is write-only. Spec: [docs/specs/github-app.md](docs/specs/github-app.md); setup steps below |
 | Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Git hosts**: per-host HTTPS tokens (optional username) and a global SSH key; a project can set its own key in its **Settings**. Projects on other hosts clone with any `https://…`, `git@host:…` or `ssh://host[:port]/…` URL and work with plain git; the GitHub extras stay GitHub-only. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. |
@@ -272,6 +274,31 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Run due reviews while idle | on | **Settings**; when the board is idle for 2 hours with no turn running, Ottr files a due architecture review card by itself. See [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
 | Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
 | Kept-worktree quarantine | 7 days | **Settings** |
+
+## GitHub tokens
+
+Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. Per-host tokens under **Settings → Git hosts** are git credentials for hosts other than the configured GitHub host; on `github.com` itself the board token also serves the board's own git fetches and pushes, so a per-host token is only needed for a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or another non-GitHub git host.
+
+### Recommended token
+
+Use a fine-grained personal access token:
+
+| Permission | Why |
+| --- | --- |
+| Metadata: Read | always granted; expiry probe, repo lookups |
+| Contents: Read and write | clone, fetch, merge pushes, releases, and the Alate data-repo `config.yml` commit |
+| Pull requests: Read and write | Dependabot/PR watch cards, posting PR reviews |
+| Actions: Read | CI watch after merges |
+| Workflows: Read and write | only if tasks may change `.github/workflows` files; without it, a push that touches a workflow file fails |
+| Administration: Read and write | only for **Add project → New** with a GitHub repo (`gh repo create`); the repo is created under your user account, not an org |
+
+A classic token also works: the `repo` scope covers everything above, plus the `workflow` scope only if tasks change workflow files.
+
+### Enterprise orgs
+
+- A fine-grained token reaches only the repositories of its resource owner, so for an org repository the token must be owned by (or authorized for) the org. If the org does not allow org-owned fine-grained tokens for members, use a classic token.
+- With SAML SSO enforced, authorize the token for the org under **Settings → Developer settings → Tokens (classic) → Configure SSO → Authorize**. Without that step, git shows a bare `403`.
+- Git over HTTPS to a `*.ghe.com` host with no Git hosts token fails with `fatal: could not read Username for 'https://<host>': terminal prompts disabled` — the fix is the per-host token under **Settings → Git hosts**.
 
 ### GitHub App setup
 
