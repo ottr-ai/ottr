@@ -14,6 +14,12 @@ import { dirname, join } from "node:path";
 
 const script = join(import.meta.dir, "..", "docker", "ottr-entry.sh");
 const root = mkdtempSync(join(tmpdir(), "ottr-entry-"));
+// The container always boots with its credential mounts present: a regular agent.db
+// and a non-empty oauth dir. run() passes them like compose would (docker/ottr-entry.sh
+// reads OTTR_AGENT_DB / OTTR_OAUTH_DIR, which compose interpolates on the host).
+writeFileSync(join(root, "agent.db"), "db");
+mkdirSync(join(root, "oauth"), { recursive: true });
+writeFileSync(join(root, "oauth", "creds.json"), "{}");
 afterAll(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
 
 const IDENTITY = "[user]\n\tname = Ottr\n\temail = ottr@localhost\n";
@@ -49,10 +55,18 @@ function write(path: string, text: string): void {
 	writeFileSync(path, text);
 }
 
-/** Runs the entry script with a minimal env: PATH plus exactly what the case passes. */
+/** Runs the entry script with a minimal env: PATH plus exactly what the case passes.
+ *  The credential mounts stand in for the container's volumes: the script refuses to
+ *  boot without a regular agent.db and a non-empty oauth dir, so cases that test the
+ *  mount refusal pass their own OTTR_AGENT_DB / OTTR_OAUTH_DIR (docker/ottr-entry.test.ts). */
 function run(env: Record<string, string>, ...cmd: string[]) {
 	const r = Bun.spawnSync(["sh", script, ...cmd], {
-		env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...env },
+		env: {
+			PATH: process.env.PATH ?? "/usr/bin:/bin",
+			OTTR_AGENT_DB: join(root, "agent.db"),
+			OTTR_OAUTH_DIR: join(root, "oauth"),
+			...env,
+		},
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

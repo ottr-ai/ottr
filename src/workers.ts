@@ -132,9 +132,16 @@ export function serveWorker(opts: {
 					return new Response("unauthorized", { status: 401 });
 				const dbPath = workerAgentDb();
 				try {
-					// A readonly open of a missing path fails with a message that names no file.
-					if (!existsSync(dbPath)) throw new Error(`${dbPath} does not exist`);
-					const read = opts.readSignIns ?? (() => signIns(dbPath));
+					// The injected reader answers without touching the worker's own store.
+					// The default guards first: a readonly open of a missing path fails
+					// with a message that names no file.
+					const read =
+						opts.readSignIns ??
+						(() => {
+							if (!existsSync(dbPath))
+								throw new Error(`${dbPath} does not exist`);
+							return signIns(dbPath);
+						});
 					return Response.json({ signIns: read() });
 				} catch (err) {
 					return Response.json({
