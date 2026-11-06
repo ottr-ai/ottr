@@ -11894,6 +11894,60 @@ describe("turn survivor round 5 — helpers", () => {
 		expect(await generateTitle("name me", gateway("x", 1).spawn)).toBeNull();
 	});
 
+	test("generateTitle: the OTTR-538 refusal gets no title and the system prompt forbids opening links", async () => {
+		const causes: string[] = [];
+		const g = gateway(
+			"I can't open links, including TikTok, so I can't see what's in that video. Could",
+		);
+		const title = await generateTitle(
+			"https://vm.tiktok.com/ZGdXh1whN/ any new advice for us?",
+			g.spawn,
+			(c) => causes.push(c),
+		);
+		expect(title).toBeNull();
+		expect(causes).toEqual(["not a title (refusal reply)"]);
+		expect(g.requests).toHaveLength(1);
+		expect(g.requests[0]!.body.messages[0]!.content).toContain(
+			"never open links",
+		);
+	});
+
+	test("generateTitle: a curly-apostrophe refusal is rejected like a straight one", async () => {
+		const causes: string[] = [];
+		const title = await generateTitle(
+			"name me",
+			gateway("I can\u2019t open links").spawn,
+			(c) => causes.push(c),
+		);
+		expect(title).toBeNull();
+		expect(causes).toEqual(["not a title (refusal reply)"]);
+	});
+
+	test("generateTitle: a reply over 8 words is not a title", async () => {
+		const causes: string[] = [];
+		// 10 words: Add configurable retry backoff windows for every queue worker pool.
+		const reply =
+			"Add configurable retry backoff windows for every queue worker pool";
+		const title = await generateTitle("name me", gateway(reply).spawn, (c) =>
+			causes.push(c),
+		);
+		expect(title).toBeNull();
+		expect(causes).toEqual(["not a title (over 8 words)"]);
+	});
+
+	test("generateTitle: a normal 3-8 word reply still names the card", async () => {
+		const g = gateway("Check TikTok link for advice");
+		expect(
+			await generateTitle(
+				"https://vm.tiktok.com/ZGdXh1whN/ any new advice for us?",
+				g.spawn,
+			),
+		).toBe("Check TikTok link for advice");
+		// The 8-word cap boundary holds: eight words pass.
+		const eight = "Fix the flaky login redirect test in CI";
+		expect(await generateTitle("name me", gateway(eight).spawn)).toBe(eight);
+	});
+
 	test("uiFiles: test/ folders, extra suffixes and root ui/ code", () => {
 		expect(
 			uiFiles([
