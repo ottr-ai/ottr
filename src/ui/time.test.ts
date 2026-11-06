@@ -55,8 +55,7 @@ describe("duration", () => {
 });
 
 describe("turnDuration", () => {
-	test("says running while the turn is live, else the shared duration format", () => {
-		expect(turnDuration({ startedAt: NOW, endedAt: null })).toBe("running");
+	test("formats a finished turn's elapsed duration in the shared duration format", () => {
 		expect(turnDuration({ startedAt: NOW, endedAt: NOW + 42 * 1000 })).toBe(
 			"42s",
 		);
@@ -69,6 +68,8 @@ describe("turnDuration", () => {
 		// A stamp glitch never renders a negative duration.
 		expect(turnDuration({ startedAt: NOW + 1000, endedAt: NOW })).toBe("0s");
 	});
+	// A live turn no longer reads "running" here: the drawer renders the ticking
+	// elapsed clock instead (LiveElapsed in app.tsx), so turnDuration is finished-only.
 });
 
 describe("stamp", () => {

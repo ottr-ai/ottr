@@ -716,6 +716,76 @@ describe("LaneCol backlog divider", () => {
 		expect(html).not.toContain("elapsed<");
 		expect(html).not.toContain(">Stryker<");
 	});
+
+	test("a live turn's card meta ticks elapsed instead of the card age, then estimates", () => {
+		const since = Date.now() - 65_000;
+		const live = cardFixture({
+			id: "l1",
+			stage: "in_progress",
+			state: "running",
+			runStartedAt: since,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="in_progress" tasks={[live]} />,
+		).replaceAll("<!-- -->", "");
+		// The ticking elapsed clock replaces the card age.
+		expect(html).toMatch(/class="card-meta"[^>]*>\s*1m /);
+		expect(html).not.toContain("ago</span>");
+		// The status words move into the ticking line, not a second fragment.
+		expect(html).toContain("1m · running");
+		// Thin history: no estimate without etaMs.
+		expect(html).not.toContain("about");
+
+		const withEta = cardFixture({
+			id: "l2",
+			stage: "in_progress",
+			state: "running",
+			runStartedAt: since,
+			// The +30s keeps the remaining floor mid-bucket: real-clock drift between the
+			// fixture and the render must not flip "about 4m left" down to "3m left".
+			etaMs: 65_000 + 4 * 60_000 + 30_000,
+		});
+		const etaHtml = renderToStaticMarkup(
+			<LaneCol {...base} stage="in_progress" tasks={[withEta]} />,
+		).replaceAll("<!-- -->", "");
+		expect(etaHtml).toContain("1m · running · about 4m left ");
+
+		// The estimate is used up once the median is behind the elapsed time.
+		const spent = cardFixture({
+			id: "l3",
+			stage: "in_progress",
+			state: "running",
+			runStartedAt: since,
+			etaMs: 60_000,
+		});
+		const spentHtml = renderToStaticMarkup(
+			<LaneCol {...base} stage="in_progress" tasks={[spent]} />,
+		).replaceAll("<!-- -->", "");
+		expect(spentHtml).not.toContain("about");
+		expect(spentHtml).toContain("1m · running");
+	});
+
+	test("a running card with a Stryker line keeps its Mutation span and takes no median estimate", () => {
+		const since = Date.now() - 65_000;
+		const run = cardFixture({
+			id: "m2",
+			stage: "in_progress",
+			state: "running",
+			runStartedAt: since,
+			etaMs: 65_000 + 4 * 60_000,
+			progress:
+				"Stryker 68% · 4454/6523 · 38 survived (0.9%) · ~2h 59m elapsed · ~1h 23m left",
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).toContain(">Mutation 68% · ~1h 23m left<");
+		// The card meta still ticks elapsed, but the card's own progress is the better
+		// estimate: no median "about X left" and no duplicate status words.
+		expect(html).toMatch(/class="card-meta"[^>]*>\s*1m\s*</);
+		expect(html).not.toContain("about 4m left");
+		expect(html).not.toContain("· running");
+	});
 });
 
 describe("done lane star section", () => {
@@ -3441,6 +3511,47 @@ describe("Drawer research report button", () => {
 			},
 		};
 	};
+
+	test("a live turn's chip ticks elapsed instead of reading running", async () => {
+		// The Work steps chip shows the shared duration for a finished turn; the live
+		// turn renders the ticking elapsed clock (LiveElapsed), never the old word.
+		const liveTurn = {
+			id: 1,
+			taskId: "R-1",
+			kind: "work",
+			input: null,
+			inputBy: null,
+			startedAt: Date.now() - 65_000,
+			endedAt: null,
+			pid: null,
+			exitCode: null,
+			outcome: null,
+			summary: null,
+			details: null,
+			question: null,
+			error: null,
+			model: null,
+		};
+		detailBody.turns = [liveTurn] as unknown as typeof detailBody.turns;
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "in_progress",
+			state: "running",
+			// The pre-fetch render builds the steps from the row: the short cast's
+			// missing workCheckLog would crash workSteps (same set as the siblings).
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		const dur = container.querySelector(".turn-dur")?.textContent ?? "";
+		expect(dur).toContain("1m");
+		expect(dur).not.toBe("running");
+		await act(async () => {
+			detailBody.turns = [];
+		});
+		await unmount();
+	});
 
 	test("a done research card whose report recommends steps shows Implement steps", async () => {
 		const row = cardFixture({

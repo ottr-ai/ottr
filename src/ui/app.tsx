@@ -194,6 +194,7 @@ import {
 import {
 	alarmLabel,
 	cardMark,
+	etaLeft,
 	holdFor,
 	reReleaseOf,
 	splitAlarms,
@@ -586,6 +587,33 @@ export function triageWait(a: TaskCard, b: TaskCard): number {
 	return ra - rb || a.updatedAt - b.updatedAt;
 }
 
+/** A live turn's ticking clock: elapsed time, then "about X left" while the median estimate
+ * (etaMs) still has room, then the status words. Re-renders once a second while mounted; pure
+ * text with no animation, so reduced motion is unaffected. */
+function LiveElapsed({
+	since,
+	status,
+	etaMs,
+}: {
+	since: number;
+	status?: string | null;
+	etaMs?: number;
+}) {
+	const [, setTick] = useState(0);
+	useEffect(() => {
+		const t = setInterval(() => setTick((x) => x + 1), 1000);
+		return () => clearInterval(t);
+	}, []);
+	const eta = etaMs !== undefined ? etaLeft(etaMs, since) : null;
+	return (
+		<>
+			{duration(Math.max(0, Date.now() - since))}
+			{status != null && status !== "" && <> · {status}</>}
+			{eta !== null && <> · {eta}</>}
+		</>
+	);
+}
+
 function Card({
 	task,
 	hasRules,
@@ -765,12 +793,24 @@ function Card({
 								: task.createdAt),
 					)}
 				>
-					{task.cancelledAt !== null
-						? landed(task.cancelledAt)
-						: task.stage === "done" && task.doneAt !== null
-							? landed(task.doneAt)
-							: age(task.createdAt)}{" "}
-					{sp === null && <>· {statusLine(task, hasRules, hold, drain)}</>}
+					{task.cancelledAt !== null ? (
+						landed(task.cancelledAt)
+					) : task.stage === "done" && task.doneAt !== null ? (
+						landed(task.doneAt)
+					) : task.runStartedAt !== undefined ? (
+						<LiveElapsed
+							since={task.runStartedAt}
+							status={
+								sp === null ? statusLine(task, hasRules, hold, drain) : null
+							}
+							etaMs={sp === null ? task.etaMs : undefined}
+						/>
+					) : (
+						age(task.createdAt)
+					)}{" "}
+					{sp === null && task.runStartedAt === undefined && (
+						<>· {statusLine(task, hasRules, hold, drain)}</>
+					)}
 					{commits !== null && (
 						<span
 							className="commits"
@@ -8937,7 +8977,16 @@ export function Drawer({
 												<span className="turn-time">
 													{new Date(t.startedAt).toLocaleTimeString()}
 												</span>
-												<span className="turn-dur">{turnDuration(t)}</span>
+												<span className="turn-dur">
+													{t.endedAt === null ? (
+														<LiveElapsed since={t.startedAt} />
+													) : (
+														turnDuration({
+															startedAt: t.startedAt,
+															endedAt: t.endedAt,
+														})
+													)}
+												</span>
 											</button>
 											{s.kind === "finding" && (
 												<div className="dim turn-sum">{s.finding.title}</div>

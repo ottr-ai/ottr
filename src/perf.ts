@@ -73,7 +73,8 @@ function slice(facts: PerfFacts, w0: number, w1: number): Slice {
 	};
 }
 
-function median(xs: number[]): number | null {
+/** Median of the list; null only when empty (turnMedians never passes an empty list). */
+export function median(xs: number[]): number | null {
 	if (xs.length === 0) return null;
 	const s = [...xs].sort((a, b) => a - b);
 	const mid = s.length >> 1;
@@ -85,6 +86,33 @@ function nearestRank(xs: number[], p: number): number | null {
 	if (xs.length === 0) return null;
 	const s = [...xs].sort((a, b) => a - b);
 	return s[Math.ceil(p * s.length) - 1]!;
+}
+
+/** Minimum completed turns backing one ETA estimate; thinner history ships elapsed only. */
+export const ETA_MIN_HISTORY = 3;
+
+/** Group key of a turn's duration sample: kind plus model, where null model = the board default. */
+export function turnMedianKey(kind: string, model: string | null): string {
+	return `${kind}|${model ?? ""}`;
+}
+
+/** Per kind|model median wall length of completed turns; groups thinner than ETA_MIN_HISTORY are dropped. */
+export function turnMedians(
+	rows: Iterable<{ kind: string; model: string | null; ms: number }>,
+): Map<string, number> {
+	const groups = new Map<string, number[]>();
+	for (const r of rows) {
+		const key = turnMedianKey(r.kind, r.model);
+		const list = groups.get(key);
+		if (list === undefined) groups.set(key, [r.ms]);
+		else list.push(r.ms);
+	}
+	const medians = new Map<string, number>();
+	for (const [key, list] of groups) {
+		if (list.length < ETA_MIN_HISTORY) continue;
+		medians.set(key, median(list)!);
+	}
+	return medians;
 }
 
 /**

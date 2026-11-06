@@ -135,7 +135,7 @@ import {
 	orphanView,
 	summarizeCmd,
 } from "./orphans.ts";
-import { perfMetrics } from "./perf.ts";
+import { perfMetrics, turnMedianKey, turnMedians } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
 import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
 import {
@@ -2330,6 +2330,7 @@ export function createApp(deps: AppDeps) {
 			try {
 				const days = e.store.getSettings().keptWorktreeDays;
 				const cards: TaskCard[] = [];
+				const medians = turnMedians(e.store.turnDurations());
 				for (const t of e.store.listTasks()) {
 					if (
 						t.state === "needs_you" &&
@@ -2358,6 +2359,19 @@ export function createApp(deps: AppDeps) {
 						// run whose meter moves keeps a silent log from warning (OTTR-448).
 						progress?.at,
 					);
+					const extra: Pick<TaskCard, "runStartedAt" | "etaMs"> = {};
+					if (t.state === "running") {
+						// Live turn facts: the client ticks elapsed from runStartedAt and counts etaMs down
+						// as "about X left". Between finish and the next poll no turn is open: neither ships.
+						const live = e.store
+							.listTurns(t.id)
+							.find((x) => x.endedAt === null);
+						if (live !== undefined) {
+							extra.runStartedAt = live.startedAt;
+							const ms = medians.get(turnMedianKey(live.kind, live.model));
+							if (ms !== undefined) extra.etaMs = ms;
+						}
+					}
 					cards.push({
 						...card,
 						steps: viewSteps(t),
@@ -2372,6 +2386,7 @@ export function createApp(deps: AppDeps) {
 							: {}),
 						...(progress ? { progress: progress.text } : {}),
 						...(silent !== null ? { silentSince: silent } : {}),
+						...extra,
 					});
 				}
 				// Name the queued merges each open release holds on the release card, so the board

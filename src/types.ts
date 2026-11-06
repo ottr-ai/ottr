@@ -808,6 +808,10 @@ export type TaskCard = Omit<
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
 	 * gets no git, so the server derives the fact (pushHold) and stamps it. */
 	pushHold?: boolean;
+	/** Epoch ms the card's live turn started; present only while a turn is running (state "running"). The card ticks the elapsed time from it. */
+	runStartedAt?: number;
+	/** Median wall length (ms) of this card's completed same-project/kind/model turns; present only when at least ETA_MIN_HISTORY (src/perf.ts) completed turns back it. The client counts it down as "about X left" and falls back to elapsed only. */
+	etaMs?: number;
 };
 
 /** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */

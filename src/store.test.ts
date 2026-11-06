@@ -2859,6 +2859,37 @@ describe("arch-review changed-line coverage", () => {
 				{ endedAt: 400, failed: false, cost: null },
 			]);
 		});
+
+		test("turnDurations returns completed turns only, with null model kept and glitch rows dropped", () => {
+			const dir = join(root, "turn-durations");
+			const store = open(dir);
+			const t = store.createTask("timed");
+			// Two completed turns with real durations, one with the default (null) model.
+			const a = store.startTurn(t.id, "work", "p", null);
+			store.finishTurn(a.id, { endedAt: a.startedAt + 1000, model: "a/one" });
+			const b = store.startTurn(t.id, "merge", "p", null);
+			store.finishTurn(b.id, { endedAt: b.startedAt + 3000 });
+			// A still-open turn is not a duration sample.
+			store.startTurn(t.id, "work", "p", null);
+			// A stamp glitch (ended before it started) is filtered, not shipped.
+			const glitch = store.startTurn(t.id, "work", "p", null);
+			const glitchEnd = glitch.startedAt + 500;
+			store.finishTurn(glitch.id, { endedAt: glitchEnd });
+			store.close();
+			const raw = new Database(join(dir, ".tasks", "tasks.db"));
+			raw.run(
+				"UPDATE turns SET started_at = ended_at + 2000 WHERE ended_at = ?",
+				[glitchEnd],
+			);
+			raw.close();
+			const rows = open(dir)
+				.turnDurations()
+				.sort((x, y) => x.ms - y.ms);
+			expect(rows).toEqual([
+				{ kind: "work", model: "a/one", ms: 1000 },
+				{ kind: "merge", model: null, ms: 3000 },
+			]);
+		});
 	});
 
 	describe("lifecycle helpers", () => {

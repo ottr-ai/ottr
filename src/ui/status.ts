@@ -6,6 +6,20 @@ import {
 	reviewFindings,
 } from "../scheduler.ts";
 import type { Task, TaskCard } from "../types.ts";
+import { duration } from "./time.ts";
+
+/** "about X left" for a live turn against its project/kind/model median turn length, in the
+ * mutation-run style. null once the median is used up (elapsed time alone from there) — and
+ * the card renders no estimate at all without etaMs (thin history; perf.ts ETA_MIN_HISTORY). */
+export function etaLeft(
+	etaMs: number,
+	startedAt: number,
+	now: number = Date.now(),
+): string | null {
+	const left = etaMs - Math.max(0, now - startedAt);
+	if (left <= 0) return null;
+	return `about ${duration(left)} left`;
+}
 
 /** Split a live Stryker or Python mutate.py progress line into its parts; format produced by src/stryker.ts.
  * Returns null for text with no numbers (including "mutate.py running"). `rest` is the tail after `n/total`. */

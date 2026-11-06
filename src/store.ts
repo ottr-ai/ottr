@@ -2323,6 +2323,19 @@ export class ProjectStore {
 	}
 
 	/**
+	 * Raw completed-turn durations for the ETA medians; shapes facts only —
+	 * the median and the history threshold live in perf.ts (turnMedians).
+	 * `ended_at >= started_at` filters stamp glitches.
+	 */
+	turnDurations(): Array<{ kind: TurnKind; model: string | null; ms: number }> {
+		return this.db
+			.query<{ kind: TurnKind; model: string | null; ms: number }, []>(
+				"SELECT kind, model, ended_at - started_at AS ms FROM turns WHERE ended_at IS NOT NULL AND ended_at >= started_at",
+			)
+			.all();
+	}
+
+	/**
 	 * The Overview performance facts of this project: flat task
 	 * and turn rows for the pure perfMetrics. A few aggregates, no N+1: a task's done
 	 * time is its latest stage→done event, the first-pass penalty any needs_you state

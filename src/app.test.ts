@@ -75,6 +75,7 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
+import type { TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
 	doneReadKey,
@@ -6876,6 +6877,60 @@ describe("silent live turns", () => {
 		fakeProgress = null;
 		row = await rowOf();
 		expect(row?.silentSince).toBe(logAt);
+	});
+});
+
+describe("turn ETA facts on /api/state (OTTR-587)", () => {
+	/** Completed work turns with the given model and durations — the backing history. */
+	const history = (taskId: string, model: string, ms: number[]) => {
+		for (const duration of ms) {
+			const turn = store.startTurn(taskId, "work", ".", null, null, model);
+			store.finishTurn(turn.id, { endedAt: turn.startedAt + duration });
+		}
+	};
+	const state = async () => {
+		const res = await get("/api/state");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { tasks: TaskCard[] };
+		return body;
+	};
+
+	test("a running card backed by 3+ same-kind/model turns ships runStartedAt and the median", async () => {
+		const t = store.createTask("eta full history");
+		history(t.id, "eta/one", [1000, 2000, 4000]);
+		store.updateTask(t.id, { state: "running" });
+		const live = store.startTurn(t.id, "work", ".", null, null, "eta/one");
+		const card = (await state()).tasks.find((c) => c.id === t.id)!;
+		expect(card.runStartedAt).toBe(live.startedAt);
+		expect(card.etaMs).toBe(2000);
+	});
+
+	test("thin history ships runStartedAt only; the client falls back to elapsed", async () => {
+		const t = store.createTask("eta thin history");
+		history(t.id, "eta/two", [1000, 3000]);
+		store.updateTask(t.id, { state: "running" });
+		const live = store.startTurn(t.id, "work", ".", null, null, "eta/two");
+		const card = (await state()).tasks.find((c) => c.id === t.id)!;
+		expect(card.runStartedAt).toBe(live.startedAt);
+		expect(card.etaMs).toBeUndefined();
+	});
+
+	test("a card with no live turn ships neither fact", async () => {
+		const t = store.createTask("eta idle card");
+		history(t.id, "eta/three", [1000, 2000, 3000]);
+		const card = (await state()).tasks.find((c) => c.id === t.id)!;
+		expect(card.runStartedAt).toBeUndefined();
+		expect(card.etaMs).toBeUndefined();
+	});
+
+	test("completed turns of another model do not back the live turn's estimate", async () => {
+		const t = store.createTask("eta other model");
+		history(t.id, "eta/four", [1000, 2000, 3000]);
+		store.updateTask(t.id, { state: "running" });
+		const live = store.startTurn(t.id, "work", ".", null, null, "eta/other");
+		const card = (await state()).tasks.find((c) => c.id === t.id)!;
+		expect(card.runStartedAt).toBe(live.startedAt);
+		expect(card.etaMs).toBeUndefined();
 	});
 });
 

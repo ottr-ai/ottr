@@ -41,12 +41,11 @@ export function duration(ms: number): string {
 	return `${Math.floor(min / 1440)}d ${Math.floor((min % 1440) / 60)}h`;
 }
 
-/** Drawer turn chip: the same duration format, or "running" while the turn is live. */
+/** Drawer turn chip for a finished turn: the elapsed duration. A live turn renders the ticking elapsed clock instead (LiveElapsed in app.tsx). */
 export function turnDuration(t: {
 	startedAt: number;
-	endedAt: number | null;
+	endedAt: number;
 }): string {
-	if (t.endedAt === null) return "running";
 	return duration(Math.max(0, t.endedAt - t.startedAt));
 }
 

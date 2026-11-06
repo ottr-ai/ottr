@@ -4,6 +4,7 @@ import type { TaskCard } from "../types.ts";
 import {
 	alarmLabel,
 	cardMark,
+	etaLeft,
 	holdFor,
 	releaseHolding,
 	reReleaseOf,
@@ -423,4 +424,15 @@ test("holdFor names the stamped push hold, only on the held card", () => {
 	expect(
 		holdFor(card({ id: "m2", stage: "merging", state: "queued" }), []),
 	).toBeNull();
+});
+
+test("etaLeft gives the mutation-run style estimate until the median is used up", () => {
+	const started = 1790683200000;
+	// 4 minutes of median, 1 minute in: about 3m left.
+	expect(etaLeft(4 * 60_000, started, started + 60_000)).toBe("about 3m left");
+	// Two units at most, like the Stryker readout (duration() always renders both).
+	expect(etaLeft(2 * 3600_000, started, started)).toBe("about 2h 0m left");
+	// The median used up: elapsed alone from there.
+	expect(etaLeft(60_000, started, started + 60_000)).toBeNull();
+	expect(etaLeft(60_000, started, started + 120_000)).toBeNull();
 });
