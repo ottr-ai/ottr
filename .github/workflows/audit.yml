@@ -1,9 +1,9 @@
 name: Audit
 
 # Weekly static and periodic audit: fresh advisories for the lockfile, Dockerfile checks,
-# pinned Trivy runs over the worker image and the repo tree, and an OWASP ZAP baseline
-# scan over a throwaway board. Contents-read everywhere; no secrets; every downloaded
-# binary and image is checksum- or digest-pinned.
+# pinned Trivy runs over the worker image and the repo tree, a warn-only Opengrep SAST
+# scan over src/, and an OWASP ZAP baseline scan over a throwaway board. Contents-read
+# everywhere; no secrets; every downloaded binary and image is checksum- or digest-pinned.
 
 on:
   schedule:
@@ -27,6 +27,137 @@ jobs:
       - run: bun install --frozen-lockfile
       # Same lockfile, fresh advisory feed: finds new advisories in existing deps.
       - run: bun audit --audit-level=high
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Opengrep 1.33.1 (2026-10-29): the newest stable release (the v2.0.0-* entries are
+      # pre-release alphas). SHA-256 of opengrep_manylinux_x86. The release publishes no
+      # checksums file (none from v1.16.5 to v1.33.1 does, only per-binary sigstore
+      # .cert/.sig), so this digest was taken from the release asset itself over HTTPS
+      # when pinning.
+      OPENGREP_SHA256: 46e8133cc490f9f50518061590ce2f6be5a08afaeda034471c0ceda4b3899808
+      # Repo-authored rules instead of a registry pull: the Semgrep registry rules carry
+      # the restrictive Semgrep Rules License, and Opengrep's own opengrep-rules fork is
+      # LGPL-2.1 plus a Commons Clause (its maintainers call it research-only), so neither
+      # is open enough to fetch. First triage (2026-11-06, 1.33.1): 16 findings over src/
+      # (158 files) — 12 shell-command interpolations, 4 SQL interpolations. None is a
+      # true positive: the 9 production hits (src/login.ts, src/store.ts) interpolate
+      # locally defined constants (PRAGMA numbers, table/column names from literals), and
+      # the other 7 sit in *.test.ts fixtures (ssh-keygen onto temp dirs, DDL strings).
+      # Strict flip once the run stays this quiet: append --error to the scan so findings
+      # exit 1. Today findings exit 0 and only a broken rules file or a crashed scan fails
+      # the job; --exclude "*.test.*" would drop the fixture noise at the same time.
+      OPENGREP_RULES: |
+        rules:
+          - id: ottr-eval-dynamic-argument
+            message: "eval() on a non-literal expression executes arbitrary code; untrusted data here is code injection"
+            severity: WARNING
+            languages: [typescript, javascript]
+            patterns:
+              - pattern: eval($X)
+              - pattern-not: eval("...")
+              - pattern-not: eval('...')
+
+          - id: ottr-new-function-dynamic
+            message: "new Function() compiles a runtime-built string into executable code; untrusted data here is code injection"
+            severity: WARNING
+            languages: [typescript, javascript]
+            patterns:
+              - pattern: new Function($X)
+              - metavariable-regex:
+                  metavariable: $X
+                  regex: "^[^\"'`]"
+
+          - id: ottr-new-function-template-interpolation
+            message: "new Function() on an interpolated template compiles runtime data into executable code"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern: "new Function(`...${$X}...`)"
+
+          - id: ottr-shell-exec-template-interpolation
+            message: "shell command built with string interpolation; untrusted data reaches the shell"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern-either:
+              - pattern: "exec(`...${$X}...`)"
+              - pattern: "execSync(`...${$X}...`)"
+              - pattern: "$CP.exec(`...${$X}...`)"
+              - pattern: "$CP.execSync(`...${$X}...`)"
+
+          - id: ottr-hash-md5-sha1
+            message: "MD5/SHA-1 are broken for security purposes; use SHA-256 or stronger"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern-either:
+              - pattern: createHash("md5")
+              - pattern: createHash("sha1")
+
+          - id: ottr-tls-reject-unauthorized-false
+            message: "rejectUnauthorized: false disables TLS certificate validation (man-in-the-middle risk)"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern: "rejectUnauthorized: false"
+
+          - id: ottr-node-tls-env-disabled
+            message: "NODE_TLS_REJECT_UNAUTHORIZED set in code disables TLS validation process-wide"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern: "process.env.NODE_TLS_REJECT_UNAUTHORIZED = $X"
+
+          - id: ottr-jwt-none-algorithm
+            message: "JWT algorithms list containing none accepts unsigned tokens"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern-either:
+              - pattern: "algorithms: [\"none\", ...]"
+              - pattern: "algorithms: [..., \"none\"]"
+
+          - id: ottr-dynamic-require
+            message: "require() of a runtime-built path hides the dependency graph from bundlers and audits"
+            severity: INFO
+            languages: [typescript, javascript]
+            patterns:
+              - pattern: require($X)
+              - metavariable-regex:
+                  metavariable: $X
+                  regex: "^[^\"'`]"
+
+          - id: ottr-require-template-interpolation
+            message: "require() of an interpolated template path hides the dependency graph from bundlers and audits"
+            severity: INFO
+            languages: [typescript, javascript]
+            pattern: "require(`...${$X}...`)"
+
+          - id: ottr-dangerous-html
+            message: "dangerouslySetInnerHTML renders raw HTML (XSS sink)"
+            severity: INFO
+            languages: [typescript, javascript]
+            pattern: "dangerouslySetInnerHTML: $X"
+
+          - id: ottr-sql-template-interpolation
+            message: "SQL statement built with string interpolation; untrusted data reaches the query"
+            severity: WARNING
+            languages: [typescript, javascript]
+            pattern-either:
+              - pattern: "$DB.prepare(`...${$X}...`)"
+              - pattern: "$DB.query(`...${$X}...`)"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Opengrep (checksum-verified binary)
+        run: |
+          curl -fsSLo /tmp/opengrep \
+            https://github.com/opengrep/opengrep/releases/download/v1.33.1/opengrep_manylinux_x86
+          echo "$OPENGREP_SHA256  /tmp/opengrep" | sha256sum -c -
+          chmod +x /tmp/opengrep
+          /tmp/opengrep --version
+      - name: SAST over src/ (warn-only)
+        run: |
+          printf '%s' "$OPENGREP_RULES" > "$RUNNER_TEMP/ottr-rules.yaml"
+          /tmp/opengrep scan --config "$RUNNER_TEMP/ottr-rules.yaml" src/
 
   image:
     runs-on: ubuntu-latest
