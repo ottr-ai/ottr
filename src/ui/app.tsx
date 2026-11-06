@@ -28,6 +28,7 @@ import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
 	type AskQuestion,
+	doneReadKey,
 	type GhStatus,
 	type KeptChoice,
 	type MachineStats,
@@ -137,6 +138,7 @@ import {
 	taskEntryKey,
 } from "./notify.ts";
 import {
+	autoMarkOnOpen,
 	donePage,
 	doneReadable,
 	doneUnread,
@@ -145,7 +147,6 @@ import {
 	laneCounts,
 	laneOrder,
 	laneStage,
-	markOnOpen,
 	onBoard,
 	railTop,
 	reorderIds,
@@ -10141,11 +10142,23 @@ export function App() {
 	const updateCount = updateIds.length;
 	/** Only a card with something to read (an answer, a PR review) counts as seen: opening
 	 * a card before that lands must not hide the "new" badge it earns. */
-	const markSeen = useCallback(
-		(t: TaskCard | null | undefined) => {
-			if (t == null || !(seenable(t) || doneReadable(t, seenDoneSince))) return;
-			setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
-			void post("/api/seen", { ids: [t.id] }).catch(() =>
+	const markSeen = useCallback((t: TaskCard | null | undefined) => {
+		if (t == null || !seenable(t)) return;
+		setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
+		void post("/api/seen", { ids: [t.id] }).catch(() =>
+			setNotice(
+				"Saving the read state failed; this card may show as unread on your other devices.",
+			),
+		);
+	}, []);
+	/** OTTR-566: marks this completion of a done card read for the rail's dot. The key carries
+	 * doneAt, so a card that returns to Done later is unread again. */
+	const markDoneRead = useCallback(
+		(t: TaskCard) => {
+			if (!doneReadable(t, seenDoneSince) || t.doneAt === null) return;
+			const key = doneReadKey({ id: t.id, doneAt: t.doneAt });
+			setSeenAnswers((s) => (s.has(key) ? s : new Set(s).add(key)));
+			void post("/api/seen", { ids: [key] }).catch(() =>
 				setNotice(
 					"Saving the read state failed; this card may show as unread on your other devices.",
 				),
@@ -10184,9 +10197,9 @@ export function App() {
 				setView(card.project);
 			}
 			setSelectedId(id);
-			if (card !== undefined && markOnOpen(card, seenDoneSince)) markSeen(card);
+			if (card !== undefined && autoMarkOnOpen(card)) markSeen(card);
 		},
-		[tasks, markSeen, seenDoneSince],
+		[tasks, markSeen],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -10546,6 +10559,13 @@ export function App() {
 		selectedId === null
 			? null
 			: (tasks.find((t) => t.id === selectedId) ?? null);
+	// OTTR-566: an open drawer is the read event for the rail's done dot, whatever opened it
+	// (a card click, a pasted/deep-link URL, or the task finishing while its drawer is open).
+	// doneUnread checks seenAnswers, so a mark already made is not posted again.
+	useEffect(() => {
+		if (selected !== null && doneUnread(selected, seenAnswers, seenDoneSince))
+			markDoneRead(selected);
+	}, [selected, seenAnswers, seenDoneSince, markDoneRead]);
 	const selectedProject =
 		selected === null
 			? null
@@ -11410,7 +11430,7 @@ export function App() {
 					onClose={() => {
 						if (selected === null) return; // same deferred close; do not re-mark it read
 						// An answer that landed while the drawer was open counts as read.
-						if (markOnOpen(selected, seenDoneSince)) markSeen(selected);
+						if (autoMarkOnOpen(selected)) markSeen(selected);
 						closeDrawer();
 					}}
 					onFollowed={(id, from) => {

@@ -835,6 +835,12 @@ export const recommendsSteps = (report: string): boolean =>
 	// A heading holding "recommended … steps", up to three words between.
 	/^\s*#{1,6}\s+.*\brecommended(?:\s+\S+){0,3}\s+steps\b/im.test(report);
 
+/** OTTR-566: the read mark of one completion, `<id>@<doneAt>`, kept in the same seen set as the
+ * plain-id answer marks. Keyed by doneAt so a task that lands in Done again is unread again, and
+ * apart from the id mark so the rail dot clears on drawer open while a steps report stays pinned. */
+export const doneReadKey = (t: { id: string; doneAt: number }): string =>
+	`${t.id}@${t.doneAt}`;
+
 /** One upstream item kind, as the provider contract allows (U3). */
 export type UpdateKind = "image-pin" | "mcp" | "rule-set" | "skill" | "plugin";
 

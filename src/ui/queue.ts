@@ -1,6 +1,6 @@
 import { queueOrder } from "../scheduler.ts";
 import type { RunState, Stage, Task, TaskCard } from "../types.ts";
-import { recommendsSteps } from "../types.ts";
+import { doneReadKey, recommendsSteps } from "../types.ts";
 
 /** Card facts the lane counts and the search filter read. */
 type LaneTask = Pick<
@@ -84,7 +84,8 @@ export function doneReadable(
 	);
 }
 
-/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). */
+/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). The read mark
+ * is keyed by completion (`id@doneAt`), so a card that returns to Done is unread again. */
 export function doneUnread(
 	t: Pick<
 		TaskCard,
@@ -93,27 +94,11 @@ export function doneUnread(
 	seen: ReadonlySet<string>,
 	since: number,
 ): boolean {
-	return doneReadable(t, since) && !seen.has(t.id);
-}
-
-/** Whether opening a card marks it read. Cards with their own read semantics (answered, PR review,
- * research) keep them — a steps report stays pinned until its buttons; any other post-baseline
- * done card is read once opened. */
-export function markOnOpen(
-	t: Pick<
-		TaskCard,
-		| "answered"
-		| "cancelledAt"
-		| "kind"
-		| "stage"
-		| "research"
-		| "steps"
-		| "state"
-		| "doneAt"
-	>,
-	since: number,
-): boolean {
-	return seenable(t) ? autoMarkOnOpen(t) : doneReadable(t, since);
+	return (
+		doneReadable(t, since) &&
+		t.doneAt !== null &&
+		!seen.has(doneReadKey({ id: t.id, doneAt: t.doneAt }))
+	);
 }
 
 /** The one mark a rail row shows, by rank: needs action > asked > running > unread done. */

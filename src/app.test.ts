@@ -76,6 +76,7 @@ import {
 } from "./turn.ts";
 import {
 	type AddProjectResponse,
+	doneReadKey,
 	type PrReviewRow,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
@@ -6844,10 +6845,14 @@ describe("read marks (/api/seen)", () => {
 	test("marks stick for answered and done cards and drop everything else", async () => {
 		const read = store.createTask("a done question card");
 		answer(read.id);
-		// OTTR-566: every card done after the boot baseline can be read, answered or not —
-		// the rail's unread-done dot clears on it.
+		// A plain done card without an answer has no Inbox pin: its plain id mark drops, but
+		// (OTTR-566) its per-completion key sticks — the rail's unread-done dot clears on it.
 		const plain = store.createTask("a done card without an answer");
 		store.updateTask(plain.id, { stage: "done", state: "idle" });
+		const plainKey = doneReadKey({
+			id: plain.id,
+			doneAt: store.getTask(plain.id)!.doneAt!,
+		});
 		const todo = store.createTask("still queued");
 		const retro = store.createTask(
 			`${RETRO_MARKER}a retro of it`,
@@ -6855,15 +6860,21 @@ describe("read marks (/api/seen)", () => {
 			"retro",
 		);
 		answer(retro.id);
+		const retroKey = doneReadKey({
+			id: retro.id,
+			doneAt: store.getTask(retro.id)!.doneAt!,
+		});
 		const res = await post("/api/seen", {
-			ids: [read.id, plain.id, todo.id, retro.id],
+			ids: [read.id, plain.id, plainKey, todo.id, retro.id, retroKey],
 		});
 		expect(res.status).toBe(200);
 		const seen = await seenIn();
 		expect(seen).toContain(read.id);
-		expect(seen).toContain(plain.id);
+		expect(seen).not.toContain(plain.id);
+		expect(seen).toContain(plainKey);
 		expect(seen).not.toContain(todo.id);
 		expect(seen).not.toContain(retro.id);
+		expect(seen).not.toContain(retroKey);
 	});
 
 	test("a card done at or before the baseline drops its mark; the baseline ships in /api/state", async () => {
@@ -6882,24 +6893,27 @@ describe("read marks (/api/seen)", () => {
 		const baseline = Date.now() + 60_000;
 		g.set("seen_done_since", baseline);
 		const m = mount({ gstore: g, projects });
-		const res = await m.call("/api/seen", { ids: [old.id] });
+		const oldKey = doneReadKey({
+			id: old.id,
+			doneAt: store.getTask(old.id)!.doneAt!,
+		});
+		const res = await m.call("/api/seen", { ids: [oldKey] });
 		expect(res.status).toBe(200);
 		const body = (await (await m.call("/api/state")).json()) as {
 			seenAnswers: string[];
 			seenDoneSince: number;
 		};
 		expect(body.seenDoneSince).toBe(baseline);
-		expect(body.seenAnswers).not.toContain(old.id);
+		expect(body.seenAnswers).not.toContain(oldKey);
 	});
 
-	test("a mark whose card left the done stage decays on the next write", async () => {
+	test("a mark whose card left the answered state decays on the next write", async () => {
 		const first = store.createTask("a question card that gets superseded");
 		answer(first.id);
 		await post("/api/seen", { ids: [first.id] });
 		expect(await seenIn()).toContain(first.id);
-		// A follow-up reopens the card and its work turn is not an answer: the card is
-		// neither answered nor done, so the read mark must not survive it.
-		store.updateTask(first.id, { stage: "in_progress" });
+		// A follow-up's work turn is not an answer: the card is no longer answered, so the
+		// read mark must not survive it.
 		const turn = store.startTurn(first.id, "work", ".", null);
 		store.finishTurn(turn.id, {
 			outcome: "ready",
@@ -6917,6 +6931,30 @@ describe("read marks (/api/seen)", () => {
 			.listTasks()
 			.find((t) => t.title === "a done question card");
 		expect(read && seen.includes(read.id)).toBe(true);
+	});
+
+	test("a re-done card's old completion key decays and its new one starts unread", async () => {
+		const t = store.createTask("a card that comes back to done");
+		store.updateTask(t.id, { stage: "done", state: "idle" });
+		const first = store.getTask(t.id)!.doneAt!;
+		const oldKey = doneReadKey({ id: t.id, doneAt: first });
+		await post("/api/seen", { ids: [oldKey] });
+		expect(await seenIn()).toContain(oldKey);
+		store.updateTask(t.id, { stage: "in_progress" });
+		while (Date.now() <= first) {}
+		store.updateTask(t.id, { stage: "done", state: "idle" });
+		const again = store.getTask(t.id)!.doneAt!;
+		expect(again).toBeGreaterThan(first);
+		const newKey = doneReadKey({ id: t.id, doneAt: again });
+		const other = store.createTask("another answered card");
+		answer(other.id);
+		await post("/api/seen", { ids: [other.id] });
+		const seen = await seenIn();
+		expect(seen).toContain(other.id);
+		expect(seen).not.toContain(oldKey);
+		expect(seen).not.toContain(newKey);
+		await post("/api/seen", { ids: [newKey] });
+		expect(await seenIn()).toContain(newKey);
 	});
 
 	test("unreading removes a mark; the card can be read again after", async () => {

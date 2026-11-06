@@ -216,6 +216,7 @@ import {
 	APPROVE_REPLY,
 	type AppCheck,
 	answeredCard,
+	doneReadKey,
 	type MachineStats,
 	type OrphanProcess,
 	type PerfRange,
@@ -304,10 +305,13 @@ function removeIcons(root: string, tasksDir: string): void {
 const IMAGE_BODY_BYTES = 32 * 1024 * 1024;
 const LOG_CHUNK_BYTES = 256 * 1024;
 /** A route param that names a task: legacy 8-hex or the project's `PREFIX-n` handle, either
- * with a retro child suffix `-retro[-k]`. One constant, so resolveTask and /api/seen cannot
- * drift apart. */
+ * with a retro child suffix `-retro[-k]`. resolveTask reads it; SEEN_ID_RE below repeats it
+ * with the optional completion suffix, so change both together. */
 const TASK_ID_RE =
 	/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)(?:-retro(?:-[0-9]+)?)?$/;
+/** A /api/seen mark: a task id (TASK_ID_RE), or (OTTR-566) one completion's `doneReadKey`, `<id>@<doneAt>`. */
+const SEEN_ID_RE =
+	/^(?:[0-9a-f]{8}|[A-Z0-9]{1,8}-[0-9]+)(?:-retro(?:-[0-9]+)?)?(?:@[0-9]+)?$/;
 /** How long one POST /api/drain holds new turns. scripts/update-image.ts renews it every 30 s
  * while it waits, so a hold that the script stops renewing lapses on its own. DELETE ends it
  * at once: the script does that when its 1 h limit ends the wait. */
@@ -835,12 +839,13 @@ export function createApp(deps: AppDeps) {
 				: "unknown";
 	}
 
-	/** Ids of the cards a read mark can stick to right now, by the same rule the state frame
-	 * ships (stateResponse): question-only answered cards, pr_review cards, done research
-	 * cards whose report resolves to a steps value, and (OTTR-566, the rail's unread-done dot)
-	 * any non-retro card done after the seenDoneSince baseline. Marks a client
-	 * sends for anything else are stale — a pre-server-sync tab imported marks for cards it merely
-	 * had open — so /api/seen drops them and the store decays instead of poisoning the board. */
+	/** Read-mark keys a mark can stick to right now, by the same rule the state frame
+	 * ships (stateResponse): plain ids of question-only answered cards, pr_review cards and
+	 * done research cards whose report resolves to a steps value, plus (OTTR-566, the rail's
+	 * unread-done dot) a per-completion key `<id>@<doneAt>` for every non-retro card done after
+	 * the seenDoneSince baseline — a re-done card gets a new key, so its old one decays. Marks a
+	 * client sends for anything else are stale — a pre-server-sync tab imported marks for cards
+	 * it merely had open — so /api/seen drops them and the store decays instead of poisoning the board. */
 	function seenableIds(): Set<string> {
 		const ids = new Set<string>();
 		for (const e of deps.projects.values()) {
@@ -855,13 +860,17 @@ export function createApp(deps: AppDeps) {
 							(t.research &&
 								t.stage === "done" &&
 								t.report !== null &&
-								viewSteps(t) !== "unknown") ||
-							(t.stage === "done" &&
-								!isRetro(t) &&
-								t.doneAt !== null &&
-								t.doneAt > seenDoneSince))
+								viewSteps(t) !== "unknown"))
 					)
 						ids.add(t.id);
+					if (
+						t.cancelledAt === null &&
+						t.stage === "done" &&
+						!isRetro(t) &&
+						t.doneAt !== null &&
+						t.doneAt > seenDoneSince
+					)
+						ids.add(doneReadKey({ id: t.id, doneAt: t.doneAt }));
 				}
 			} catch (err) {
 				// A sick store contributes nothing, like in stateResponse.
@@ -4236,7 +4245,7 @@ export function createApp(deps: AppDeps) {
 					if (
 						!Array.isArray(ids) ||
 						ids.length > 10000 ||
-						ids.some((id) => typeof id !== "string" || !TASK_ID_RE.test(id))
+						ids.some((id) => typeof id !== "string" || !SEEN_ID_RE.test(id))
 					)
 						return json({ error: "invalid ids" }, 400);
 					// unread: true makes a read result unread again; unmentioned ids leave the

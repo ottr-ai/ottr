@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
+import { doneReadKey } from "../types.ts";
 import {
 	autoMarkOnOpen,
 	donePage,
@@ -10,7 +11,6 @@ import {
 	laneCounts,
 	laneOrder,
 	laneStage,
-	markOnOpen,
 	railTop,
 	reorderIds,
 	researchSteps,
@@ -596,14 +596,22 @@ describe("doneUnread", () => {
 				since,
 			),
 		).toBe(false);
-		expect(doneUnread(done("a", since + 1), new Set(["a"]), since)).toBe(false);
+		expect(
+			doneUnread(done("a", since + 1), new Set([`a@${since + 1}`]), since),
+		).toBe(false);
+		expect(doneUnread(done("a", since + 1), new Set(["a"]), since)).toBe(true);
+		expect(
+			doneUnread(done("a", since + 2), new Set([`a@${since + 1}`]), since),
+		).toBe(true);
 		expect(doneReadable(done("a", since + 1), since)).toBe(true);
 	});
-	test("markOnOpen keeps a steps report pinned and marks a plain done card", () => {
-		expect(
-			markOnOpen(done("r", since + 1, { research: true, steps: "yes" }), since),
-		).toBe(false);
-		expect(markOnOpen(done("p", since + 1), since)).toBe(true);
-		expect(markOnOpen(done("old", since), since)).toBe(false);
+	test("a steps report's rail dot follows its done key, its Inbox pin the plain id", () => {
+		const r = done("r", since + 1, { research: true, steps: "yes" });
+		const key = doneReadKey({ id: "r", doneAt: since + 1 });
+		expect(doneUnread(r, new Set(), since)).toBe(true);
+		expect(doneUnread(r, new Set(["r"]), since)).toBe(true);
+		expect(doneUnread(r, new Set([key]), since)).toBe(false);
+		expect(isUnread(r, new Set([key]))).toBe(true);
+		expect(isUnread(r, new Set(["r"]))).toBe(false);
 	});
 });
