@@ -3118,7 +3118,6 @@ a.release:hover {
 	padding: 3px 5px;
 	margin: 0 0 0 2px; /* .lane-add has no 2px bottom padding to offset, unlike button > kbd */
 	color: inherit;
-	background: color-mix(in srgb, currentColor 10%, transparent);
 	border: 1px solid var(--line-hover);
 	border-radius: 3px;
 }
