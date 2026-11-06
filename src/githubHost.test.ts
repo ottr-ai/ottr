@@ -6,6 +6,7 @@ import {
 	GITHUB_HOST_ENV,
 	type GithubHost,
 	ghEnvFor,
+	gheNoticeHost,
 	githubHost,
 	hostMatcher,
 	parseGithubHost,
@@ -217,6 +218,42 @@ describe("githubHost", () => {
 					expect(parseGithubHost(bad)).toHaveProperty("error");
 				}),
 			);
+		});
+	});
+
+	describe("gheNoticeHost", () => {
+		test("a ghe.com origin on the default host names the tenant for the notice", () => {
+			expect(gheNoticeHost("https://acme.ghe.com/acme/widget", null)).toBe(
+				"acme.ghe.com",
+			);
+			expect(
+				gheNoticeHost("https://acme.ghe.com/acme/widget", "github.com"),
+			).toBe("acme.ghe.com");
+		});
+
+		test("the origin's own tenant configured means no notice", () => {
+			expect(
+				gheNoticeHost("https://acme.ghe.com/acme/widget", "acme.ghe.com"),
+			).toBeNull();
+			// Host comparison is case-insensitive on both sides; the URL parser
+			// lowercases the remote hostname itself.
+			expect(
+				gheNoticeHost("https://ACME.Ghe.com/acme/widget", "acme.ghe.com"),
+			).toBeNull();
+		});
+
+		test("a github.com origin and non-remotes never notice", () => {
+			expect(
+				gheNoticeHost("https://github.com/acme/widget", "github.com"),
+			).toBeNull();
+			// Bare ghe.com is not a tenant (same rule as defaultGitUsername).
+			expect(gheNoticeHost("https://ghe.com/o/r", null)).toBeNull();
+			expect(
+				gheNoticeHost("https://acme.ghe.com.evil.test/o/r", null),
+			).toBeNull();
+			expect(gheNoticeHost("https://gitlab.com/o/r", null)).toBeNull();
+			expect(gheNoticeHost(null, null)).toBeNull();
+			expect(gheNoticeHost("not a url", null)).toBeNull();
 		});
 	});
 });

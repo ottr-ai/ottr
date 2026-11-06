@@ -3242,6 +3242,23 @@ export function ProjectBoard({
 					<BusyButton run={pushMain}>Push to origin</BusyButton>
 				</p>
 			)}
+			{project.githubHostNotice && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					<span>
+						GitHub features off: set GitHub host to{" "}
+						<code>{project.githubHostNotice}</code> under{" "}
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => openSettingsSection("github-host-block")}
+						>
+							Settings → Git hosts → GitHub host
+						</button>
+						.
+					</span>
+				</p>
+			)}
 			{!project.hasRules && (
 				<p className="advisory">
 					<Icon name="info" size={14} />

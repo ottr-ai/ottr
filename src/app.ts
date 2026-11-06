@@ -87,8 +87,10 @@ import {
 } from "./githubApp.ts";
 import { GIT_HTTP_AUTH_STATUS, githubAuthHint } from "./githubAuthHint.ts";
 import {
+	configuredGithubHostname,
 	DEFAULT_GITHUB_HOST,
 	GITHUB_HOST_ENV,
+	gheNoticeHost,
 	githubHost,
 	parseGithubHost,
 } from "./githubHost.ts";
@@ -2227,6 +2229,7 @@ export function createApp(deps: AppDeps) {
 			mainBranch: e.mainBranch,
 			mainUnpushed: e.mainUnpushed,
 			github: e.github,
+			githubHostNotice: gheNoticeHost(e.remote, configuredGithubHostname()),
 			remote: e.remote,
 			latestRelease: e.latestRelease,
 			latestReleaseUrl: e.latestReleaseUrl ?? null,

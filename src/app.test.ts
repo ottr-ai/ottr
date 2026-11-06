@@ -5915,6 +5915,61 @@ describe("pushSyncCommits setting and ProjectView fields", () => {
 	});
 });
 
+describe("projectView githubHostNotice", () => {
+	const savedHost = process.env.OTTR_GITHUB_HOST;
+	const restoreHost = () => {
+		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedHost;
+	};
+	const noticeOf = async (): Promise<string | null> => {
+		const res = await get("/api/state");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			projects: { name: string; githubHostNotice: string | null }[];
+		};
+		return b.projects.find((p) => p.name === "p1")!.githubHostNotice;
+	};
+	/** Stamps p1's origin remote for one assertion; refreshRemote owns the field on boot. */
+	const withRemote = async (
+		remote: string | null,
+		run: () => Promise<void>,
+	): Promise<void> => {
+		const e = projects.get("p1")!;
+		if (e === undefined) throw new Error("p1 is not registered");
+		const prev = e.remote;
+		e.remote = remote;
+		try {
+			await run();
+		} finally {
+			e.remote = prev;
+		}
+	};
+
+	test("a ghe.com origin with the default host carries the notice", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		await withRemote("https://acme.ghe.com/acme/widget", async () => {
+			expect(await noticeOf()).toBe("acme.ghe.com");
+		});
+		restoreHost();
+	});
+
+	test("the origin's own tenant configured clears the notice", async () => {
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		await withRemote("https://acme.ghe.com/acme/widget", async () => {
+			expect(await noticeOf()).toBeNull();
+		});
+		restoreHost();
+	});
+
+	test("a github.com origin carries no notice", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		await withRemote("https://github.com/acme/widget", async () => {
+			expect(await noticeOf()).toBeNull();
+		});
+		restoreHost();
+	});
+});
+
 describe("project icon", () => {
 	// 1x1 transparent PNG, base64.
 	const png = new Uint8Array(

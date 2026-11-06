@@ -135,3 +135,28 @@ export function isGithubRepoHost(
 		host === configuredHost
 	);
 }
+
+/**
+ * The *.ghe.com tenant of an origin remote that the configured GitHub host does not name —
+ * the mismatch that leaves every GitHub feature off (githubUrl matches only the configured
+ * host, so the board derives no repo and serves no link, CI watch, Dependabot, reviews or
+ * releases). Returns the tenant host for the project notice, null when GitHub features are
+ * on or the remote is not a ghe.com tenant. A null configured host (an invalid setting)
+ * counts as a mismatch: the features are off either way, and pointing at the tenant is the
+ * fix. Pure and syntactic: never probes the remote over the network.
+ */
+export function gheNoticeHost(
+	remote: string | null,
+	configuredHost: string | null,
+): string | null {
+	if (remote === null) return null;
+	let u: URL;
+	try {
+		u = new URL(remote);
+	} catch {
+		return null;
+	}
+	const host = u.hostname.toLowerCase();
+	if (!host.endsWith(".ghe.com")) return null;
+	return host === (configuredHost ?? "").toLowerCase() ? null : host;
+}

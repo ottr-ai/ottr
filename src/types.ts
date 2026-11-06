@@ -695,6 +695,11 @@ export interface ProjectView {
 	mainUnpushed: boolean;
 	/** HTTPS URL of the project's GitHub remote (origin preferred); null when it has none. */
 	github: string | null;
+	/** The origin remote sits on a *.ghe.com tenant the configured GitHub host does not name,
+	 * so every GitHub feature stays off: the notice names that tenant, to set under
+	 * Settings → Git hosts → GitHub host. Null when the features are on or the origin is
+	 * not a ghe.com tenant. */
+	githubHostNotice: string | null;
 	/** Latest release: the repo's latest GitHub release (its name when the tag is not
 	 * `vX.Y.Z`), else the highest `vX.Y.Z` tag merged into the target; null until the first
 	 * scan or when both are unknown. */

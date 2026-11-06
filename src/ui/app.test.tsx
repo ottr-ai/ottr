@@ -4578,11 +4578,20 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).toContain("has commits origin lacks");
 	});
 
+	test("a ghe.com origin mismatch names the host and links the GitHub host setting", () => {
+		const html = renderBoard(projectWith({ githubHostNotice: "acme.ghe.com" }));
+		expect(html).toContain("GitHub features off: set GitHub host to");
+		expect(html).toContain("<code>acme.ghe.com</code>");
+		expect(html).toContain('class="notif-link"');
+		expect(html).toContain("Settings → Git hosts → GitHub host");
+	});
+
 	test("a clean project renders neither advisory", () => {
 		const html = renderBoard(projectWith({}));
 		expect(html).not.toContain("Push to origin");
 		expect(html).not.toContain("never to a task branch.");
 		expect(html).not.toContain("has commits origin lacks");
+		expect(html).not.toContain("GitHub features off");
 	});
 });
 
