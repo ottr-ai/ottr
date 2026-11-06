@@ -17,6 +17,7 @@ import type { pidAlive } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
+import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
 import {
 	type DecodedImage,
 	MAX_IMAGE_BYTES,
@@ -435,6 +436,8 @@ export interface TurnOps {
 	checkedOutBranch: typeof checkedOutBranch;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
+	/** Git 401/403 hint: asks GitHub's API why a GitHub-host push/fetch failed; null when it cannot say more. */
+	githubAuthHint: (url: string) => Promise<string | null>;
 	/** OTTR-394: fetches the target branch from the pinned origin so a queued rebase turn rebases onto the moved tip (git() adds the host auth). */
 	fetchOriginBranch: typeof fetchOriginBranch;
 	/** OTTR-510: the automatic push-race retry rebases the local target branch onto the fetched
@@ -2413,6 +2416,19 @@ export function createTurnLoop(
 			// below push through the same closure. `refused` stays null for every non-merge
 			// turn: only a merge settle pays for the hold-tip read.
 			let refused: string | null = null;
+			// Appends the GitHub-API hint under a bare 401/403; the git error stands alone
+			// when the probe cannot say more. Never throws.
+			const withAuthHint = async (
+				url: string,
+				error: string,
+			): Promise<string> => {
+				if (!GIT_HTTP_AUTH_STATUS.test(error)) return error;
+				try {
+					return error + ((await ops.githubAuthHint(url)) ?? "");
+				} catch {
+					return error;
+				}
+			};
 			const runPush = (): Promise<
 				| { status: "skipped" }
 				| { status: "pushed"; output: string }
@@ -2431,6 +2447,16 @@ export function createTurnLoop(
 								task.branch ?? "",
 								holdTip,
 								settings.originUrl,
+							)
+							.then(async (p) =>
+								(p.status === "failed" || p.status === "rejected") &&
+								typeof settings.originUrl === "string" &&
+								settings.originUrl !== ""
+									? {
+											...p,
+											error: await withAuthHint(settings.originUrl, p.error),
+										}
+									: p,
 							)
 							.catch((err: unknown) => ({
 								status: "failed" as const,
@@ -2584,7 +2610,9 @@ export function createTurnLoop(
 						const fetchError = await ops
 							.fetchOriginBranch(e.path, branch, settings.originUrl)
 							.then(() => null)
-							.catch((err: unknown) => errmsg(err));
+							.catch((err: unknown) =>
+								withAuthHint(settings.originUrl ?? "", errmsg(err)),
+							);
 						if (fetchError !== null) {
 							// The re-check's own reason (a network error, a token-refresh failure)
 							// rides the park reason; the retry stays off without a proven origin tip.
@@ -2690,7 +2718,9 @@ export function createTurnLoop(
 							: await ops
 									.fetchOriginBranch(e.path, branch, settings.originUrl)
 									.then(() => null)
-									.catch((err: unknown) => errmsg(err));
+									.catch((err: unknown) =>
+										withAuthHint(settings.originUrl ?? "", errmsg(err)),
+									);
 					if (fetchError !== null) {
 						next = {
 							stage: "merging",
@@ -2712,7 +2742,9 @@ export function createTurnLoop(
 									: await ops
 											.fetchOriginBranch(e.path, branch, settings.originUrl)
 											.then(() => null)
-											.catch((err: unknown) => errmsg(err));
+											.catch((err: unknown) =>
+												withAuthHint(settings.originUrl ?? "", errmsg(err)),
+											);
 							if (refetchError !== null) {
 								log(
 									`! origin re-fetch before the recovery turn failed: ${refetchError}`,

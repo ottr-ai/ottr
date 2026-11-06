@@ -6031,6 +6031,8 @@ button.diff-path {
 	border: 1px solid var(--alarm-line);
 	border-radius: 4px;
 	overflow-wrap: anywhere;
+	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
+	white-space: pre-line;
 }
 .needs-reason::before,
 .decide-reason::before {
@@ -7185,6 +7187,8 @@ button.log-mode[aria-pressed="true"] {
 	margin: 0;
 	color: var(--crit-text);
 	font-size: 12.5px;
+	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
+	white-space: pre-line;
 }
 /* A changed SSH host key: a warning, not an error — the app's grey attention edge. */
 .trust-warn {

@@ -84,6 +84,7 @@ import {
 	parseAppPem,
 	validateAppCredentials,
 } from "./githubApp.ts";
+import { GIT_HTTP_AUTH_STATUS, githubAuthHint } from "./githubAuthHint.ts";
 import {
 	DEFAULT_GITHUB_HOST,
 	GITHUB_HOST_ENV,
@@ -395,6 +396,14 @@ interface AppDeps {
 	workersHome?: string;
 	/** ssh-keyscan seam for the host-key check; defaults to realKeyscan. Tests inject a stub. */
 	keyscan?: Keyscan;
+	/**
+	 * Fetch/timeout seam for the git 401/403 GitHub-API probe (githubAuthHint); defaults
+	 * to fetch with a 5 s ceiling. Tests inject a stub or a shorter ceiling.
+	 */
+	githubAuthProbe?: {
+		fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
+		timeoutMs?: number;
+	};
 	/** Model catalog seam for the model roles editor; defaults to modelList. */
 	models?: () => Promise<ModelOption[]>;
 	/**
@@ -2955,7 +2964,19 @@ export function createApp(deps: AppDeps) {
 		if (r.code !== 0) {
 			const line =
 				r.stderr.trim().split("\n").filter(Boolean).pop() ?? "git clone failed";
-			const error = `git clone failed: ${redact(line, gitSecrets()).slice(0, 300)}`;
+			let error = `git clone failed: ${redact(line, gitSecrets()).slice(0, 300)}`;
+			// A bare 401/403 from a GitHub host hides the real cause (SAML enforcement, an IP
+			// allow list, a token policy); the REST API names it under the git error.
+			if (remote.scheme === "https" && GIT_HTTP_AUTH_STATUS.test(r.stderr))
+				error +=
+					(await githubAuthHint(url, {
+						configuredHost: githubHost().host,
+						tokens: gitTokens,
+						envToken: process.env.GH_TOKEN ?? null,
+						secrets: gitSecrets(),
+						fetchImpl: deps.githubAuthProbe?.fetchImpl,
+						timeoutMs: deps.githubAuthProbe?.timeoutMs,
+					})) ?? "";
 			// Classify the failure only after a failed clone: an auth answer has the form offer
 			// the token step for that host (spec: needsToken).
 			if (remote.scheme === "https") {
@@ -3799,7 +3820,21 @@ export function createApp(deps: AppDeps) {
 						// Only the candidate: an unsaved token must never enter the global secret set.
 						[cand.token],
 					);
-					if ("error" in t) return json({ error: t.error }, 400);
+					if ("error" in t) {
+						// Same hint as the clone: the bare 403 on the token test names the SAML cause.
+						if (GIT_HTTP_AUTH_STATUS.test(t.error)) {
+							const hint = await githubAuthHint(String(r.body.testUrl).trim(), {
+								configuredHost: githubHost().host,
+								tokens: [cand],
+								envToken: null,
+								secrets: [...gitSecrets(), cand.token],
+								fetchImpl: deps.githubAuthProbe?.fetchImpl,
+								timeoutMs: deps.githubAuthProbe?.timeoutMs,
+							});
+							if (hint !== null) return json({ error: t.error + hint }, 400);
+						}
+						return json({ error: t.error }, 400);
+					}
 					// One token per host: a re-save replaces the host's old entry.
 					gitTokens = [...gitTokens.filter((x) => x.host !== cand.host), cand];
 					saveConfig();
@@ -6770,6 +6805,17 @@ export function createApp(deps: AppDeps) {
 				key: existsSync(sshPaths(sshDir).global),
 				envToken: process.env.GH_TOKEN ?? null,
 				githubHost: githubHost().host,
+			}),
+		// The git 401/403 hint for the merge push and the origin fetches on the card: same
+		// inputs as pushAuthKind, one line under git's error, never a value.
+		githubAuthHint: (url: string): Promise<string | null> =>
+			githubAuthHint(url, {
+				configuredHost: githubHost().host,
+				tokens: gitTokens,
+				envToken: process.env.GH_TOKEN ?? null,
+				secrets: gitSecrets(),
+				fetchImpl: deps.githubAuthProbe?.fetchImpl,
+				timeoutMs: deps.githubAuthProbe?.timeoutMs,
 			}),
 		// OTTR-454: a per-runner hold gates new turns on one runner only.
 		drainedRunner: (id: string) => Date.now() < (runnerDrains.get(id) ?? 0),

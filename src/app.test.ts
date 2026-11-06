@@ -370,6 +370,8 @@ function mount(
 		githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 		sshDir?: string;
 		keyscan?: Keyscan;
+		/** Fetch/timeout seam for the git 401/403 probe; passed through to createApp. */
+		githubAuthProbe?: Parameters<typeof createApp>[0]["githubAuthProbe"];
 		models?: Parameters<typeof createApp>[0]["models"];
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
@@ -424,6 +426,7 @@ function mount(
 		githubAppFetch: input.githubAppFetch,
 		sshDir: input.sshDir,
 		keyscan: input.keyscan,
+		githubAuthProbe: input.githubAuthProbe,
 		models: input.models,
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		serverRef: { current: undefined },
@@ -10045,4 +10048,132 @@ describe("project order route", () => {
 	});
 	// Permutations and the append rule are property-tested at the unit level
 	// (src/projectOrder.test.ts); these HTTP examples pin the route wiring.
+});
+
+describe("git 401/403 GitHub hint", () => {
+	// A TLS fake git server: every clone/ls-remote against it dies with git's bare
+	// "returned error: 403", which the hint path must explain via GitHub's REST API.
+	const tlsDir = mkdtempSync(join(tmpdir(), "app-tls-"));
+	execSync(
+		`openssl req -x509 -newkey rsa:2048 -keyout ${join(tlsDir, "key.pem")} -out ${join(tlsDir, "cert.pem")} -days 1 -nodes -subj "/CN=localhost"`,
+	);
+	const tls = Bun.serve({
+		port: 0,
+		tls: {
+			cert: readFileSync(join(tlsDir, "cert.pem")),
+			key: readFileSync(join(tlsDir, "key.pem")),
+		},
+		fetch: (req) =>
+			new URL(req.url).pathname.endsWith("/info/refs")
+				? new Response("blocked", { status: 403 })
+				: new Response("nope", { status: 404 }),
+	});
+	const tlsPort = tls.port;
+	const SAML_HINT =
+		"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to an organization that has SAML SSO enabled.";
+	const DOCS = "https://docs.github.com/en/authentication/troubleshooting-saml";
+	const url = `https://localhost:${tlsPort}/org/repo.git`;
+	const saved = {
+		GIT_SSL_NO_VERIFY: process.env.GIT_SSL_NO_VERIFY,
+		OTTR_GITHUB_HOST: process.env.OTTR_GITHUB_HOST,
+		GH_TOKEN: process.env.GH_TOKEN,
+	};
+	// beforeAll, never describe-body level: body-level writes run at file load and leak
+	// into every sibling describe (their hosts and PR URLs come out on localhost), and a
+	// sibling's afterAll restore would clobber them before these tests run.
+	beforeAll(() => {
+		process.env.GIT_SSL_NO_VERIFY = "1";
+		process.env.OTTR_GITHUB_HOST = "localhost";
+		process.env.GH_TOKEN = "ghs_hinttoken000000001";
+	});
+	afterAll(() => {
+		tls.stop(true);
+		if (saved.GIT_SSL_NO_VERIFY === undefined)
+			delete process.env.GIT_SSL_NO_VERIFY;
+		else process.env.GIT_SSL_NO_VERIFY = saved.GIT_SSL_NO_VERIFY;
+		if (saved.OTTR_GITHUB_HOST === undefined)
+			delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = saved.OTTR_GITHUB_HOST;
+		if (saved.GH_TOKEN === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = saved.GH_TOKEN;
+		rmSync(tlsDir, { recursive: true, force: true });
+	});
+
+	/** One app per test: own global store and default dir, plus the probe seam. */
+	const boot = (
+		githubAuthProbe: Parameters<typeof createApp>[0]["githubAuthProbe"],
+	) => {
+		const i = mounted.length;
+		const g = GlobalStore.open(join(root, `g-hint-${i}`));
+		mountStores.push(g);
+		const m = mount({
+			gstore: g,
+			defaultDir: join(root, `hint-dir-${i}`),
+			githubAuthProbe,
+		});
+		mkdirSync(join(root, `hint-dir-${i}`), { recursive: true });
+		return m;
+	};
+
+	test("a clone's bare 403 carries the SAML message from the REST probe", async () => {
+		const probeCalls: { url: string; init?: RequestInit }[] = [];
+		const m = boot({
+			fetchImpl: async (u, init) => {
+				probeCalls.push({ url: String(u), init });
+				return new Response(
+					JSON.stringify({ message: SAML_HINT, documentation_url: DOCS }),
+					{ status: 403 },
+				);
+			},
+		});
+		const res = await m.call("/api/projects", { url });
+		expect(res.status).toBe(400);
+		const b = (await res.json()) as {
+			error: string;
+			needsToken?: string;
+		};
+		expect(b.error).toContain("git clone failed");
+		expect(b.error).toContain("The requested URL returned error: 403");
+		expect(b.error).toContain(SAML_HINT);
+		expect(b.error).not.toContain("ghs_hinttoken000000001");
+		expect(b.needsToken).toBe(`localhost:${tlsPort}`);
+		expect(probeCalls).toHaveLength(1);
+		expect(probeCalls[0]?.url).toContain("/repos/org/repo");
+		expect(
+			(probeCalls[0]?.init?.headers as Record<string, string>)?.Authorization,
+		).toBe("Bearer ghs_hinttoken000000001");
+	});
+
+	test("a probe that cannot answer in time leaves the bare git error", async () => {
+		const m = boot({
+			fetchImpl: () => new Promise<Response>(() => {}),
+			timeoutMs: 50,
+		});
+		const res = await m.call("/api/projects", { url });
+		expect(res.status).toBe(400);
+		const b = (await res.json()) as { error: string };
+		expect(b.error).toContain("The requested URL returned error: 403");
+		expect(b.error).not.toContain("GitHub:");
+		expect(b.error).not.toContain("SAML");
+	});
+
+	test("the token test's bare 403 carries the SAML hint without echoing the token", async () => {
+		const m = boot({
+			fetchImpl: async () =>
+				new Response(
+					JSON.stringify({ message: SAML_HINT, documentation_url: DOCS }),
+					{ status: 403 },
+				),
+		});
+		const res = await m.call("/api/git-hosts/tokens", {
+			host: `localhost:${tlsPort}`,
+			username: "oauth2",
+			token: "ghp_candtoken123456",
+			testUrl: url,
+		});
+		expect(res.status).toBe(400);
+		const b = (await res.json()) as { error: string };
+		expect(b.error).toContain(SAML_HINT);
+		expect(b.error).not.toContain("ghp_candtoken123456");
+	});
 });

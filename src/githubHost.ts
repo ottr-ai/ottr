@@ -90,3 +90,16 @@ export function hostMatcher(host: string): RegExp {
 	const esc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	return new RegExp(`(?<![\\w.-])${esc}[:/]`, "i");
 }
+
+/** True when a remote host is one whose REST API can explain a git 401/403: github.com,
+    a *.ghe.com tenant, or the board's configured host (Enterprise Server included). */
+export function isGithubRepoHost(
+	host: string,
+	configuredHost: string,
+): boolean {
+	return (
+		host === DEFAULT_GITHUB_HOST ||
+		host.endsWith(".ghe.com") ||
+		host === configuredHost
+	);
+}

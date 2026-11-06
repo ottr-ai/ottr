@@ -449,6 +449,7 @@ const loop = createTurnLoop(projects, {
 	serverMergePush,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),
+	githubAuthHint: (url) => app.githubAuthHint(url),
 	fetchOriginBranch,
 	rebaseTargetBranch,
 	runMergeGates,

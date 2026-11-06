@@ -214,6 +214,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		// Fails closed like the real git read: containment must be proven, never assumed.
 		targetContains: async () => false,
 		serverMergePush: async () => ({ status: "skipped" as const }),
+		githubAuthHint: async () => null,
 		fetchOriginBranch: async () => null,
 		// No rejected push in the default fixtures: the merge hold's git fact stays false.
 		branchUnpushed: async () => false,
@@ -4944,6 +4945,52 @@ describe("turn ci watch pinning", () => {
 		expect(logText(store, task.id)).toContain(
 			"the retry push of origin/main rejected after the automatic rebase",
 		);
+	});
+
+	test("a failed push under a bare 403 appends the GitHub SAML hint to the park reason", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error:
+					"fatal: unable to access 'https://acme.ghe.com/o/r.git/': The requested URL returned error: 403",
+				output: "! [RESTRICTED]",
+			}),
+			githubAuthHint: async () =>
+				"\nGitHub: Resource protected by organization SAML enforcement. You must grant your Personal Access token access to an organization that has SAML SSO enabled.",
+		});
+		store.setSettings({
+			originUrl: "https://acme.ghe.com/o/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toContain("Server push to origin failed:");
+		expect(t.needsReason).toContain(
+			"Resource protected by organization SAML enforcement",
+		);
+	});
+
+	test("a failed push where the probe cannot answer parks the bare git error only", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error:
+					"fatal: unable to access 'https://acme.ghe.com/o/r.git/': The requested URL returned error: 403",
+				output: "! [RESTRICTED]",
+			}),
+			githubAuthHint: async () => null,
+		});
+		store.setSettings({
+			originUrl: "https://acme.ghe.com/o/r.git",
+			maxParallel: 0,
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toContain("Server push to origin failed:");
+		expect(t.needsReason).toContain("returned error: 403");
+		expect(t.needsReason).not.toContain("GitHub:");
 	});
 
 	test("a failed (non-conflict) automatic rebase parks needs_you", async () => {
