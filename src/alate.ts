@@ -24,7 +24,7 @@ export async function noRedirectFetch(
 	return res;
 }
 
-/** GET <alate.url>/health shared by the proxy route and the U9 trigger. */
+/** GET <alate.url>/health shared by the proxy route and the U9 trigger. A redirect is an error, never a hop (internal call; a proxy bounce must name NO_PROXY). */
 export async function alateHealth(
 	alate: Alate,
 ): Promise<
@@ -39,9 +39,11 @@ export async function alateHealth(
 		};
 	let res: Response;
 	try {
-		res = await fetch(`${alate.url}/health`, {
-			signal: AbortSignal.timeout(5000),
-		});
+		res = await noRedirectFetch(
+			`${alate.url}/health`,
+			{ signal: AbortSignal.timeout(5000) },
+			{ proxyHint: true },
+		);
 	} catch (err) {
 		return {
 			ok: false,

@@ -230,6 +230,31 @@ describe("alateHealth", () => {
 			});
 		}
 	});
+	test("cross-host redirect is 502 with NO_PROXY hint", async () => {
+		serve(
+			() =>
+				new Response(null, {
+					status: 302,
+					headers: { location: "http://www.example.com/health" },
+				}),
+		);
+		expect(await alateHealth(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error: `cannot reach alate server: ${alate.url}/health answered 302 (redirect not followed; a proxy may intercept this call: check NO_PROXY)`,
+		});
+	});
+	test("same-host redirect is 502 without the hint", async () => {
+		serve(
+			() =>
+				new Response(null, { status: 302, headers: { location: "/health" } }),
+		);
+		expect(await alateHealth(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error: `cannot reach alate server: ${alate.url}/health answered 302 (redirect not followed)`,
+		});
+	});
 	test("non-object body is 502", async () => {
 		for (const body of ["3", "null", "not json"]) {
 			serve(() => new Response(body));

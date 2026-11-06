@@ -19,8 +19,10 @@ import {
 	matchSweepTarget,
 	runWorker,
 	serveWorker,
+	sweepWorker,
 	WORKER_DONE,
 	WorkerConnectError,
+	type WorkerTarget,
 } from "./workers.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "ottr-workers-"));
@@ -1592,6 +1594,70 @@ describe("detach protocol", () => {
 		// Unknown id: the worker answers 404, which surfaces as WorkerConnectError.
 		await expect(killDetached(url, "sekrit", "nope")).rejects.toBeInstanceOf(
 			WorkerConnectError,
+		);
+	}, 30_000);
+
+	test("sweepWorker names a proxy on a cross-host redirect", async () => {
+		const redir = Bun.serve({
+			port: 0,
+			// redirect: "manual" never follows this; the cross-host location must
+			// surface the NO_PROXY hint in the WorkerConnectError message.
+			fetch: () => Response.redirect("http://www.example.com/run", 302),
+		});
+		servers.push(redir as Bun.Server<never>);
+		await expect(
+			sweepWorker(
+				{ token: undefined } as WorkerTarget,
+				`http://127.0.0.1:${redir.port}`,
+			),
+		).rejects.toThrow(
+			"redirect not followed; a proxy may intercept this call: check NO_PROXY",
+		);
+	}, 30_000);
+
+	test("detachedRuns names a proxy on a cross-host redirect", async () => {
+		const redir = Bun.serve({
+			port: 0,
+			// redirect: "manual" never follows this; the cross-host location must
+			// surface the NO_PROXY hint in the WorkerConnectError message.
+			fetch: () => Response.redirect("http://www.example.com/run", 302),
+		});
+		servers.push(redir as Bun.Server<never>);
+		await expect(
+			detachedRuns(`http://127.0.0.1:${redir.port}`),
+		).rejects.toThrow(
+			"redirect not followed; a proxy may intercept this call: check NO_PROXY",
+		);
+	}, 30_000);
+
+	test("detachedRuns omits the proxy hint on a same-origin redirect", async () => {
+		const redir = Bun.serve({
+			port: 0,
+			// Same-host bounce: the message names the redirect but must not blame
+			// a proxy.
+			fetch: (req) => Response.redirect(new URL(req.url).origin + "/run", 302),
+		});
+		servers.push(redir as Bun.Server<never>);
+		const err = await detachedRuns(`http://127.0.0.1:${redir.port}`).catch(
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(WorkerConnectError);
+		expect(String(err)).toContain("redirect not followed");
+		expect(String(err)).not.toContain("NO_PROXY");
+	}, 30_000);
+
+	test("killDetached names a proxy on a cross-host redirect", async () => {
+		const redir = Bun.serve({
+			port: 0,
+			// redirect: "manual" never follows this; the cross-host location must
+			// surface the NO_PROXY hint in the WorkerConnectError message.
+			fetch: () => Response.redirect("http://www.example.com/run", 302),
+		});
+		servers.push(redir as Bun.Server<never>);
+		await expect(
+			killDetached(`http://127.0.0.1:${redir.port}`, undefined, "x"),
+		).rejects.toThrow(
+			"redirect not followed; a proxy may intercept this call: check NO_PROXY",
 		);
 	}, 30_000);
 });

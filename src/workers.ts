@@ -732,9 +732,10 @@ export async function sweepWorker(
 		throw new WorkerConnectError(String(err));
 	}
 	if (res.status !== 200) {
+		const redirected = res.status >= 300 && res.status < 400;
 		const body = (await res.text()).trim().slice(0, 300);
 		throw new WorkerConnectError(
-			`worker ${url}/sweep responded ${res.status}${body ? `: ${body}` : ""}`,
+			`worker ${url}/sweep responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
 		);
 	}
 	const stopped = (await res.json()) as unknown;
@@ -762,9 +763,10 @@ export async function detachedRuns(
 		throw new WorkerConnectError(String(err));
 	}
 	if (res.status !== 200) {
+		const redirected = res.status >= 300 && res.status < 400;
 		const body = (await res.text()).trim().slice(0, 300);
 		throw new WorkerConnectError(
-			`worker ${url}/detached responded ${res.status}${body ? `: ${body}` : ""}`,
+			`worker ${url}/detached responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
 		);
 	}
 	const runs = (await res.json()) as unknown;
@@ -798,9 +800,10 @@ export async function killDetached(
 		throw new WorkerConnectError(String(err));
 	}
 	if (res.status !== 200) {
+		const redirected = res.status >= 300 && res.status < 400;
 		const body = (await res.text()).trim().slice(0, 300);
 		throw new WorkerConnectError(
-			`worker ${url}/detach/kill responded ${res.status}${body ? `: ${body}` : ""}`,
+			`worker ${url}/detach/kill responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
 		);
 	}
 }
