@@ -6841,11 +6841,13 @@ describe("read marks (/api/seen)", () => {
 		return body.seenAnswers;
 	};
 
-	test("marks stick for answered cards and drop everything else", async () => {
+	test("marks stick for answered and done cards and drop everything else", async () => {
 		const read = store.createTask("a done question card");
 		answer(read.id);
-		const unanswered = store.createTask("a done card without an answer");
-		store.updateTask(unanswered.id, { stage: "done", state: "idle" });
+		// OTTR-566: every card done after the boot baseline can be read, answered or not —
+		// the rail's unread-done dot clears on it.
+		const plain = store.createTask("a done card without an answer");
+		store.updateTask(plain.id, { stage: "done", state: "idle" });
 		const todo = store.createTask("still queued");
 		const retro = store.createTask(
 			`${RETRO_MARKER}a retro of it`,
@@ -6854,23 +6856,50 @@ describe("read marks (/api/seen)", () => {
 		);
 		answer(retro.id);
 		const res = await post("/api/seen", {
-			ids: [read.id, unanswered.id, todo.id, retro.id],
+			ids: [read.id, plain.id, todo.id, retro.id],
 		});
 		expect(res.status).toBe(200);
 		const seen = await seenIn();
 		expect(seen).toContain(read.id);
-		expect(seen).not.toContain(unanswered.id);
+		expect(seen).toContain(plain.id);
 		expect(seen).not.toContain(todo.id);
 		expect(seen).not.toContain(retro.id);
 	});
 
-	test("a mark whose card left the answered state decays on the next write", async () => {
+	test("a card done at or before the baseline drops its mark; the baseline ships in /api/state", async () => {
+		// The shared app stamped its baseline once at boot and ships it unchanged.
+		const shared = (await (await get("/api/state")).json()) as {
+			seenDoneSince: unknown;
+		};
+		expect(typeof shared.seenDoneSince).toBe("number");
+		expect(shared.seenDoneSince).toBe(gstore.get<number>("seen_done_since"));
+		const old = store.createTask("a card done before the rail dot shipped");
+		store.updateTask(old.id, { stage: "done", state: "idle" });
+		// A store that already holds a baseline keeps it at boot (no restamp): one past
+		// this card's doneAt makes it a pre-rollout card, which counts as read already.
+		const g = GlobalStore.open(join(root, "g-seen-baseline"));
+		mountStores.push(g);
+		const baseline = Date.now() + 60_000;
+		g.set("seen_done_since", baseline);
+		const m = mount({ gstore: g, projects });
+		const res = await m.call("/api/seen", { ids: [old.id] });
+		expect(res.status).toBe(200);
+		const body = (await (await m.call("/api/state")).json()) as {
+			seenAnswers: string[];
+			seenDoneSince: number;
+		};
+		expect(body.seenDoneSince).toBe(baseline);
+		expect(body.seenAnswers).not.toContain(old.id);
+	});
+
+	test("a mark whose card left the done stage decays on the next write", async () => {
 		const first = store.createTask("a question card that gets superseded");
 		answer(first.id);
 		await post("/api/seen", { ids: [first.id] });
 		expect(await seenIn()).toContain(first.id);
-		// A later work turn that is not an answer takes the card out of "answered";
-		// the read mark must not survive it.
+		// A follow-up reopens the card and its work turn is not an answer: the card is
+		// neither answered nor done, so the read mark must not survive it.
+		store.updateTask(first.id, { stage: "in_progress" });
 		const turn = store.startTurn(first.id, "work", ".", null);
 		store.finishTurn(turn.id, {
 			outcome: "ready",

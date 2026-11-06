@@ -3,11 +3,15 @@ import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import {
 	autoMarkOnOpen,
 	donePage,
+	doneReadable,
+	doneUnread,
 	dropBeforeId,
 	isUnread,
 	laneCounts,
 	laneOrder,
 	laneStage,
+	markOnOpen,
+	railTop,
 	reorderIds,
 	researchSteps,
 	seenable,
@@ -553,5 +557,53 @@ describe("donePage", () => {
 		const page = donePage(tasks, (t) => t === "t5" || t === "t30", 20);
 		expect(page.shown).toEqual(n(31));
 		expect(page.hidden).toBe(14);
+	});
+});
+
+describe("railTop", () => {
+	test("ranks needs > asked > running > unread", () => {
+		const z = { needs: 0, asks: 0, running: 0, unread: 0 };
+		expect(railTop(z)).toBeNull();
+		expect(railTop({ ...z, unread: 2 })).toBe("unread");
+		expect(railTop({ ...z, running: 1, unread: 2 })).toBe("running");
+		expect(railTop({ ...z, asks: 1, running: 1, unread: 1 })).toBe("asked");
+		expect(railTop({ needs: 1, asks: 1, running: 1, unread: 1 })).toBe("needs");
+	});
+});
+
+describe("doneUnread", () => {
+	const since = 1000;
+	const done = (
+		id: string,
+		doneAt: number | null,
+		over: Parameters<typeof card>[3] = {},
+	) => ({ ...card(id, "done", "idle", over), doneAt });
+	test("only post-baseline, uncancelled, on-board done cards count", () => {
+		const none = new Set<string>();
+		expect(doneUnread(done("a", since), none, since)).toBe(false);
+		expect(doneUnread(done("a", since + 1), none, since)).toBe(true);
+		expect(doneUnread(done("a", null), none, since)).toBe(false);
+		expect(
+			doneUnread(done("a", since + 1, { cancelledAt: 5 }), none, since),
+		).toBe(false);
+		expect(
+			doneUnread(done("a", since + 1, { kind: "retro" }), none, since),
+		).toBe(false);
+		expect(
+			doneUnread(
+				{ ...card("a", "todo", "idle"), doneAt: since + 1 },
+				none,
+				since,
+			),
+		).toBe(false);
+		expect(doneUnread(done("a", since + 1), new Set(["a"]), since)).toBe(false);
+		expect(doneReadable(done("a", since + 1), since)).toBe(true);
+	});
+	test("markOnOpen keeps a steps report pinned and marks a plain done card", () => {
+		expect(
+			markOnOpen(done("r", since + 1, { research: true, steps: "yes" }), since),
+		).toBe(false);
+		expect(markOnOpen(done("p", since + 1), since)).toBe(true);
+		expect(markOnOpen(done("old", since), since)).toBe(false);
 	});
 });

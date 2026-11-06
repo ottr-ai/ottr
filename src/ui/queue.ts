@@ -68,6 +68,68 @@ export function autoMarkOnOpen(
 	return seenable(t) && researchSteps(t) !== "yes";
 }
 
+/** OTTR-566: a done card whose opening counts as a read for the rail's unread dot. Cancelled and
+ * retro cards never count; cards done at or before the server's baseline (`since`) count as read,
+ * so the feature does not light every project with history on first load. */
+export function doneReadable(
+	t: Pick<TaskCard, "stage" | "cancelledAt" | "kind" | "state" | "doneAt">,
+	since: number,
+): boolean {
+	return (
+		t.stage === "done" &&
+		t.cancelledAt === null &&
+		onBoard(t) &&
+		t.doneAt !== null &&
+		t.doneAt > since
+	);
+}
+
+/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). */
+export function doneUnread(
+	t: Pick<
+		TaskCard,
+		"id" | "stage" | "cancelledAt" | "kind" | "state" | "doneAt"
+	>,
+	seen: ReadonlySet<string>,
+	since: number,
+): boolean {
+	return doneReadable(t, since) && !seen.has(t.id);
+}
+
+/** Whether opening a card marks it read. Cards with their own read semantics (answered, PR review,
+ * research) keep them — a steps report stays pinned until its buttons; any other post-baseline
+ * done card is read once opened. */
+export function markOnOpen(
+	t: Pick<
+		TaskCard,
+		| "answered"
+		| "cancelledAt"
+		| "kind"
+		| "stage"
+		| "research"
+		| "steps"
+		| "state"
+		| "doneAt"
+	>,
+	since: number,
+): boolean {
+	return seenable(t) ? autoMarkOnOpen(t) : doneReadable(t, since);
+}
+
+/** The one mark a rail row shows, by rank: needs action > asked > running > unread done. */
+export function railTop(c: {
+	needs: number;
+	asks: number;
+	running: number;
+	unread: number;
+}): "needs" | "asked" | "running" | "unread" | null {
+	if (c.needs > 0) return "needs";
+	if (c.asks > 0) return "asked";
+	if (c.running > 0) return "running";
+	if (c.unread > 0) return "unread";
+	return null;
+}
+
 const STAGES = [
 	"todo",
 	"in_progress",

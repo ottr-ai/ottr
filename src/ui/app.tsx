@@ -137,14 +137,17 @@ import {
 	taskEntryKey,
 } from "./notify.ts";
 import {
-	autoMarkOnOpen,
 	donePage,
+	doneReadable,
+	doneUnread,
 	dropBeforeId,
 	isUnread,
 	laneCounts,
 	laneOrder,
 	laneStage,
+	markOnOpen,
 	onBoard,
+	railTop,
 	reorderIds,
 	researchSteps,
 	SLOT_STAGES,
@@ -9836,32 +9839,32 @@ function loadTheme(): Theme {
 /** Server version this tab last saw; sessionStorage keeps it across the one guarded reload. */
 let seenVersion: string | null = sessionStorage.getItem(SEEN_VERSION_KEY);
 
-/** One project's rail counts: the four exclusive states, the most urgent mark, and a spoken summary. */
-function railRow(p: ProjectView, tasks: TaskCard[]) {
+/** One project's rail counts: the exclusive states, the most urgent mark, and a spoken summary. */
+function railRow(
+	p: ProjectView,
+	tasks: TaskCard[],
+	seen: ReadonlySet<string>,
+	since: number,
+) {
 	const own = tasks.filter((t) => t.project === p.name);
 	const split = splitAlarms(own);
 	const running = split.running.length;
 	const needs = split.needs.length;
 	const asks = split.asks.length;
 	const waiting = own.filter((t) => t.state === "queued").length;
-	// The one mark a row shows, by rank: needs action > asked > running. Waiting has no mark.
-	const top =
-		needs > 0
-			? ("needs" as const)
-			: asks > 0
-				? ("asked" as const)
-				: running > 0
-					? ("running" as const)
-					: null;
+	const unread = own.filter((t) => doneUnread(t, seen, since)).length;
+	// The one mark a row shows, by rank: needs action > asked > running > unread done. Waiting has no mark.
+	const top = railTop({ needs, asks, running, unread });
 	const summary = [
 		needs > 0 ? `${needs} need action` : "",
 		asks > 0 ? `${asks} asked` : "",
 		running > 0 ? `${running} running` : "",
+		unread > 0 ? `${unread} done unread` : "",
 		waiting > 0 ? `${waiting} waiting` : "",
 	]
 		.filter((s) => s !== "")
 		.join(", ");
-	return { p, running, needs, asks, waiting, top, summary };
+	return { p, running, needs, asks, waiting, unread, top, summary };
 }
 
 /** The project rail's rows: Overview, Add project, one link per project with its one ranked
@@ -9870,6 +9873,8 @@ function railRow(p: ProjectView, tasks: TaskCard[]) {
 function RailRows({
 	projects,
 	tasks,
+	seenAnswers,
+	seenDoneSince,
 	project,
 	overviewCurrent,
 	version,
@@ -9881,6 +9886,9 @@ function RailRows({
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
+	/** Read marks and the server's done baseline, for the unread-done dot. */
+	seenAnswers: Set<string>;
+	seenDoneSince: number;
 	project: ProjectView | null;
 	/** Overview is the open page (no project and no settings page). */
 	overviewCurrent: boolean;
@@ -9931,7 +9939,7 @@ function RailRows({
 			<p className="areas-label">Projects</p>
 			<ul>
 				{projects.map((p) => {
-					const r = railRow(p, tasks);
+					const r = railRow(p, tasks, seenAnswers, seenDoneSince);
 					return (
 						<li key={p.name}>
 							<a
@@ -10117,6 +10125,8 @@ export function App() {
 	);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
+	/** OTTR-566: the server's baseline; done cards with doneAt at or before it count as read. Infinity until the first frame so nothing flashes unread. */
+	const [seenDoneSince, setSeenDoneSince] = useState(Number.POSITIVE_INFINITY);
 	/** One-shot localStorage → server migration of seen answers, run after the first state load. */
 	const migratedSeen = useRef(false);
 	// Hoisted above markSeen/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
@@ -10131,15 +10141,18 @@ export function App() {
 	const updateCount = updateIds.length;
 	/** Only a card with something to read (an answer, a PR review) counts as seen: opening
 	 * a card before that lands must not hide the "new" badge it earns. */
-	const markSeen = useCallback((t: TaskCard | null | undefined) => {
-		if (t == null || !seenable(t)) return;
-		setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
-		void post("/api/seen", { ids: [t.id] }).catch(() =>
-			setNotice(
-				"Saving the read state failed; this card may show as unread on your other devices.",
-			),
-		);
-	}, []);
+	const markSeen = useCallback(
+		(t: TaskCard | null | undefined) => {
+			if (t == null || !(seenable(t) || doneReadable(t, seenDoneSince))) return;
+			setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
+			void post("/api/seen", { ids: [t.id] }).catch(() =>
+				setNotice(
+					"Saving the read state failed; this card may show as unread on your other devices.",
+				),
+			);
+		},
+		[seenDoneSince],
+	);
 	/** The reverse of markSeen: puts a read answer back to unread, locally and on the server. */
 	const markUnread = useCallback((t: TaskCard | null | undefined) => {
 		if (t == null || !seenable(t)) return;
@@ -10171,9 +10184,9 @@ export function App() {
 				setView(card.project);
 			}
 			setSelectedId(id);
-			if (card !== undefined && autoMarkOnOpen(card)) markSeen(card);
+			if (card !== undefined && markOnOpen(card, seenDoneSince)) markSeen(card);
 		},
-		[tasks, markSeen],
+		[tasks, markSeen, seenDoneSince],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -10347,6 +10360,7 @@ export function App() {
 				);
 				// Append-only union: a local mark between frames must survive the next server frame.
 				setSeenAnswers((prev) => new Set([...prev, ...s.seenAnswers]));
+				setSeenDoneSince(s.seenDoneSince);
 				if (!migratedSeen.current) {
 					migratedSeen.current = true;
 					const local = [...loadSeenAnswers()];
@@ -10981,6 +10995,8 @@ export function App() {
 					<RailRows
 						projects={projects}
 						tasks={tasks}
+						seenAnswers={seenAnswers}
+						seenDoneSince={seenDoneSince}
 						project={project}
 						overviewCurrent={project === null && !settingsRoute.onSettings}
 						version={bootVersion}
@@ -11208,6 +11224,8 @@ export function App() {
 					<RailRows
 						projects={projects}
 						tasks={tasks}
+						seenAnswers={seenAnswers}
+						seenDoneSince={seenDoneSince}
 						project={project}
 						overviewCurrent={project === null && !settingsRoute.onSettings}
 						version={bootVersion}
@@ -11392,7 +11410,7 @@ export function App() {
 					onClose={() => {
 						if (selected === null) return; // same deferred close; do not re-mark it read
 						// An answer that landed while the drawer was open counts as read.
-						if (autoMarkOnOpen(selected)) markSeen(selected);
+						if (markOnOpen(selected, seenDoneSince)) markSeen(selected);
 						closeDrawer();
 					}}
 					onFollowed={(id, from) => {

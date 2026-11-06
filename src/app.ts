@@ -815,6 +815,17 @@ export function createApp(deps: AppDeps) {
 		deps.gstore.set("seen_answers", [...new Set(ids)].sort());
 	}
 
+	/** OTTR-566: epoch ms before which every done card counts as read. Stamped once on the
+	 * first boot after rollout — at app creation, not lazily per request — so cards done
+	 * before the rail dot shipped never light it up; a missing/corrupt row restamps. */
+	const storedDoneSince: unknown = deps.gstore.get<unknown>("seen_done_since");
+	const seenDoneSince =
+		typeof storedDoneSince === "number" && Number.isFinite(storedDoneSince)
+			? storedDoneSince
+			: Date.now();
+	if (seenDoneSince !== storedDoneSince)
+		deps.gstore.set("seen_done_since", seenDoneSince);
+
 	/** OTTR-488: card-view steps — the stored value, except legacy 'unknown' rows resolve against the stored report at read time (no row rewrite). 'unknown' in a view means quiet. */
 	function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
 		return t.steps !== "unknown"
@@ -825,8 +836,9 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** Ids of the cards a read mark can stick to right now, by the same rule the state frame
-	 * ships (stateResponse): question-only answered cards, pr_review cards, and done research
-	 * cards whose report resolves to a steps value. Marks a client
+	 * ships (stateResponse): question-only answered cards, pr_review cards, done research
+	 * cards whose report resolves to a steps value, and (OTTR-566, the rail's unread-done dot)
+	 * any non-retro card done after the seenDoneSince baseline. Marks a client
 	 * sends for anything else are stale — a pre-server-sync tab imported marks for cards it merely
 	 * had open — so /api/seen drops them and the store decays instead of poisoning the board. */
 	function seenableIds(): Set<string> {
@@ -843,7 +855,11 @@ export function createApp(deps: AppDeps) {
 							(t.research &&
 								t.stage === "done" &&
 								t.report !== null &&
-								viewSteps(t) !== "unknown"))
+								viewSteps(t) !== "unknown") ||
+							(t.stage === "done" &&
+								!isRetro(t) &&
+								t.doneAt !== null &&
+								t.doneAt > seenDoneSince))
 					)
 						ids.add(t.id);
 				}
@@ -2406,6 +2422,7 @@ export function createApp(deps: AppDeps) {
 			onboarding: admin === null,
 			user: admin?.name ?? null,
 			seenAnswers: loadSeen(),
+			seenDoneSince,
 			orphans: scan.orphans,
 			orphansError: scan.error,
 			keptWorktrees: { held: keptHeld, stale: keptStale },

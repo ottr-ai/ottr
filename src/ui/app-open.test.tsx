@@ -159,6 +159,7 @@ const state = {
 	onboarding: false,
 	user: null,
 	seenAnswers: [],
+	seenDoneSince: 0,
 	orphans: [],
 	orphansError: null,
 	keptWorktrees: { held: 0, stale: 0 },

@@ -941,6 +941,8 @@ export interface StateResponse {
 	user: string | null;
 	/** Task ids the user has read; global, server-persisted. */
 	seenAnswers: string[];
+	/** Epoch ms baseline, stamped once server-side: done tasks with doneAt at or before it count as read. */
+	seenDoneSince: number;
 	/** Advisory: agent-launcher processes no running turn claims (machine-global); the tracker never kills them. */
 	orphans: OrphanProcess[];
 	/** Error from the last orphan process scan; null when the scan succeeded. Advisory only. */

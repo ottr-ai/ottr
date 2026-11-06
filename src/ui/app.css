@@ -422,6 +422,10 @@ textarea {
 .mark-asked {
 	fill: var(--accent);
 }
+/* OTTR-566: a finished task nobody opened yet — the rail's steel dot. */
+.mark-unread {
+	fill: var(--accent);
+}
 .mark-asked .mark-ink {
 	stroke: var(--accent-ink);
 }

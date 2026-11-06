@@ -504,11 +504,14 @@ type MarkKind =
 	| "queued"
 	| "done"
 	| "cancelled"
-	| "star";
+	| "star"
+	| "unread";
 
 // Redundant state coding (ISA-101): shape carries the state; colour is spent only on alarms (amber, red).
 // Ask rounds are the exception: the question mark rides the steel accent — input requested, not a stall.
 const MARK_SHAPES: Record<MarkKind, ReactNode> = {
+	// Steel accent dot = a finished task not opened yet (OTTR-566); same dot as running, the colour tells them apart.
+	unread: <circle cx="8" cy="8" r="4.5" />,
 	needs: (
 		<>
 			<path d="M8 1.4 15.4 14.6H.6z" />
