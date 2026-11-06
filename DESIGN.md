@@ -136,6 +136,8 @@ Flat by default. Panels, cards, and the active area are separated by 1px lines (
 
 Small radii, technical not friendly: 3px for chips and micro-badges, 4px for buttons, inputs, cards, and area rows, 6px for large containers (stages, overview table, dialogs, popover). State marks are exact: filled dot (running, preparing), ring (queued), check (done), triangle (needs-you), square (critical) — all 16px viewBox, 12–14px rendered, with dark "!" ink strokes; on the red square the ink flips to near-white. The single exception: the phone-only New task FAB is a 56px full circle — a floating action only reads as a primary target when it is a circle.
 
+A rounded child inside a rounded parent never has a radius ≥ the parent's; with ≤ 6px of padding between them, outer = inner + padding. Tight panels follow it exactly: the account menu is 10px around its 4px rows (6px padding), the project menu 8px around its 4px buttons (4px padding), and an image inside the project tag sits 1px under the plate (it lives inside the plate's 1px border). With more padding the child only steps down, never up: dialog blocks are 4px inside the 6px dialog. Off-scale radii are listed, never silently added: the menu panels' 10px and 8px exist only by that rule, and the state chip keeps a 999px pill — a full pill is the deliberate shape of a status chip, not a radius step.
+
 **The Shape-Says-It Rule.** State marks are a closed set of five glyphs. New states pick a glyph, not a colour.
 
 ## Components

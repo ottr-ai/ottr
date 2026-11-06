@@ -1859,7 +1859,8 @@ button.notif-link {
 	color: var(--text);
 	background: var(--field);
 	border: 1px solid var(--line);
-	border-radius: 8px;
+	/* 10px = the 4px rows + the 6px padding: concentric corners (DESIGN.md, Shapes). */
+	border-radius: 10px;
 	box-shadow: var(--shadow-overlay);
 }
 @supports (position-anchor: auto) {
@@ -2110,7 +2111,13 @@ button.notif-link {
 	width: 100%;
 	height: 100%;
 	object-fit: cover;
-	border-radius: inherit;
+	/* Concentric with the plate: the image sits inside its 1px border, so one step
+	   under the plate's radius — inherit lands 1px large. */
+	border-radius: 2px;
+}
+.project-id .ptag img,
+.icon-preview .ptag img {
+	border-radius: 3px;
 }
 /* An image icon stands alone: no plate behind it, so a transparent icon stays
    transparent. The plate is the monogram's alone. Contain, not cover, so a
@@ -2251,7 +2258,8 @@ button.notif-link {
 	color: var(--text);
 	background: var(--field);
 	border: 1px solid var(--line);
-	border-radius: 6px;
+	/* 8px = the 4px buttons + the 4px padding: concentric corners (DESIGN.md, Shapes). */
+	border-radius: 8px;
 	box-shadow: var(--shadow-overlay);
 }
 .project-menu:popover-open {
@@ -4130,7 +4138,7 @@ dialog.diff-view {
 	line-height: 1.5;
 	background: var(--well);
 	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+	border-radius: 4px;
 	padding: 4px 0;
 }
 .deepen-diff div {
@@ -4298,7 +4306,7 @@ dialog.confirm-dialog {
 	padding: 12px;
 	background: var(--panel);
 	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+	border-radius: 4px;
 }
 /* The panel holds the fields: same column rhythm as the form. The inactive panel stays in
    layout but visibility: hidden keeps it unseen, unfocusable and out of the a11y tree. */
@@ -4604,7 +4612,7 @@ dialog.confirm-dialog {
 	padding: 7px 10px;
 	background: var(--field);
 	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+	border-radius: 4px;
 	cursor: grab;
 }
 .projects-order li:active {
@@ -5072,7 +5080,7 @@ dialog.confirm-dialog {
 	padding: 12px;
 	background: var(--panel);
 	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+	border-radius: 4px;
 }
 .setup-sec h3 {
 	margin: 0;
@@ -6076,7 +6084,7 @@ button.diff-path {
 	color: var(--text);
 	background: transparent;
 	border: 1px solid var(--line);
-	border-radius: 4px;
+	border-radius: 3px;
 	cursor: pointer;
 }
 .kept-choice:hover {
@@ -6103,7 +6111,7 @@ button.diff-path {
 	color: var(--text-strong);
 	background: var(--alarm-bg);
 	border: 1px solid var(--alarm-line);
-	border-radius: 4px;
+	border-radius: 3px;
 	overflow-wrap: anywhere;
 	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
 	white-space: pre-line;
@@ -6323,7 +6331,7 @@ button.log-mode[aria-pressed="true"] {
 	padding: 8px 10px;
 	background: var(--well);
 	border: 1px solid var(--line-soft);
-	border-radius: 4px;
+	border-radius: 3px;
 	overflow-x: auto;
 }
 .md pre code {
@@ -6614,7 +6622,7 @@ button.log-mode[aria-pressed="true"] {
 	grid-area: 1 / 1 / 4 / -1;
 	background: var(--well);
 	border: 1px solid var(--line);
-	border-radius: 6px;
+	border-radius: 4px;
 	pointer-events: none;
 }
 .prompt-card:has(textarea:focus-visible)::before {
@@ -6861,6 +6869,8 @@ button.log-mode[aria-pressed="true"] {
 	background: var(--panel);
 	border: 1px solid var(--line);
 	border-radius: 3px;
+	/* Sits at the bubble's tail corner: 1px stays under the bubble's 2px tail. */
+	border-bottom-right-radius: 1px;
 }
 /* Meta and the card actions sit above the docked composer. */
 .meta-block {
@@ -7128,7 +7138,7 @@ button.log-mode[aria-pressed="true"] {
 	padding: 2px 2px 2px 8px;
 	background: var(--panel);
 	border: 1px solid var(--line-soft);
-	border-radius: 6px;
+	border-radius: 4px;
 	font-size: 12px;
 }
 .access-key > code {
