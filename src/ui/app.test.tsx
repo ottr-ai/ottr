@@ -4474,6 +4474,7 @@ describe("Drawer proposal panel editing (client)", () => {
 			shots: [],
 			keptFiles: [],
 			workCheckLog: [],
+			updateIds: [],
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
@@ -5124,5 +5125,94 @@ describe("AuthPage setup form", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+describe("Drawer PR link", () => {
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: "https://github.com/octo/repo",
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		read: false,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+		tasks: [],
+	};
+
+	test("a card with an open PR links PR #N from its drawer meta", () => {
+		const card = cardFixture({
+			id: "P-12",
+			stage: "merging",
+			state: "idle",
+			workCheckLog: [],
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			updateIds: [],
+			branch: "ott/ottr-1-do-a-thing",
+			prNumber: 12,
+			prUrl: "https://github.com/octo/repo/pull/12",
+			prHeadSha: "4f2c9ab1fullsha0000000000000000000000000",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={card} />);
+		expect(html).toContain("<dt>PR</dt>");
+		expect(html).toContain('href="https://github.com/octo/repo/pull/12"');
+		expect(html).toContain("PR #12");
+		expect(html).toContain('rel="noopener noreferrer"');
+	});
+
+	test("without a PR number the drawer shows no PR row", () => {
+		const card = cardFixture({
+			id: "P-13",
+			stage: "merging",
+			state: "idle",
+			workCheckLog: [],
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			updateIds: [],
+			branch: "ott/ottr-2-do-a-thing",
+			prNumber: null,
+			prUrl: null,
+			prHeadSha: null,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={card} />);
+		expect(html).not.toContain("<dt>PR</dt>");
+		expect(html).not.toContain("PR #");
+	});
+
+	test("a PR number without a URL renders plain text, not a link", () => {
+		const card = cardFixture({
+			id: "P-14",
+			stage: "merging",
+			state: "idle",
+			workCheckLog: [],
+			images: [],
+			pendingImages: [],
+			shots: [],
+			keptFiles: [],
+			updateIds: [],
+			prNumber: 14,
+			prUrl: null,
+			prHeadSha: null,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={card} />);
+		expect(html).toContain("<dt>PR</dt>");
+		expect(html).toContain("PR #14");
+		expect(html).not.toMatch(/<dt>PR<\/dt><dd><a/);
 	});
 });

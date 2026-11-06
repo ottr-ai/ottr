@@ -33,8 +33,21 @@ interface FakeOps extends SupervisorOps {
 	calls: {
 		remove: { mainPath: string; worktreePath: string; branch: string | null }[];
 		quarantine: { worktreePath: string; quarantineDir: string }[];
+		fetches: string[];
 		scheduled: number;
 	};
+	// prPass: every `gh api ...` call's args, in order
+	apiCalls: string[][];
+	// prPass: per-call override keyed by the api URL; null result falls through to the default
+	apiResult:
+		| ((
+				url: string,
+		  ) => { code: number; stdout: string; stderr: string } | Error)
+		| null;
+	// prPass: ref -> sha; missing refs read null (git failure / absent ref)
+	targetShas: Record<string, string | null>;
+	// prPass: fetchOriginBranch returns this error text instead of null when set
+	fetchErr: string | null;
 	unsaved: string | null;
 	status: string[];
 	failUnsaved: boolean;
@@ -63,7 +76,11 @@ interface FakeOps extends SupervisorOps {
 
 function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 	const ops: FakeOps = {
-		calls: { remove: [], quarantine: [], scheduled: 0 },
+		calls: { remove: [], quarantine: [], fetches: [], scheduled: 0 },
+		apiCalls: [],
+		apiResult: null,
+		targetShas: {},
+		fetchErr: null,
 		unsaved: null,
 		status: [],
 		failUnsaved: false,
@@ -123,6 +140,14 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 				);
 			}
 			ops.ghCalls += 1;
+			if (args[0] === "api") {
+				ops.apiCalls.push(args);
+				const r = ops.apiResult?.(args[1] ?? "");
+				if (r !== undefined && r !== null) {
+					if (r instanceof Error) throw r;
+					return r;
+				}
+			}
 			if (ops.ghResult instanceof Error) throw ops.ghResult;
 			return ops.ghResult ?? { code: 0, stdout: "", stderr: "" };
 		},
@@ -139,6 +164,11 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			return [];
 		},
 		targetCommits: async () => 3,
+		targetSha: async (_mainPath, ref) => ops.targetShas[ref] ?? null,
+		fetchOriginBranch: async (_mainPath, branch) => {
+			ops.calls.fetches.push(branch);
+			return ops.fetchErr;
+		},
 		sweepWorker: async (url) => {
 			ops.sweepUrls.push(url);
 			if (ops.sweepErr) throw ops.sweepErr;
@@ -2643,6 +2673,349 @@ describe("worker sweep", () => {
 		const ops = fakeOps();
 		await tick(new Map([[e.name, e]]), ops);
 		expect(ops.sweepUrls).toEqual([]);
+		store.close();
+	});
+});
+
+// ---- prPass: PR merge/close watch ------------------------------------------
+
+const MERGE_SHA = "b".repeat(40);
+const OTHER_SHA = "d".repeat(40);
+
+/** Merging card with an open PR whose head is CI-watched. */
+function prCard(store: ProjectStore, n = 7, head = "abc1234567890"): Task {
+	const t = store.createTask("parent");
+	store.updateTask(t.id, {
+		stage: "merging",
+		state: "idle",
+		prNumber: n,
+		prUrl: `https://github.com/acme/widget/pull/${n}`,
+		prHeadSha: head,
+		pushSha: head,
+		branch: "ottr/552",
+		base: "main",
+	});
+	return t;
+}
+
+function prModeProject(name: string): ProjectStore {
+	const dir = join(root, name);
+	mkdirSync(dir, { recursive: true });
+	const store = ProjectStore.open(dir);
+	store.setSettings({ prMode: true });
+	return store;
+}
+
+/** One valid open-PR list entry per number (the shape parsePullPage accepts). */
+function openPage(ns: number[]): string {
+	return JSON.stringify(
+		ns.map((n) => ({
+			number: n,
+			state: "open",
+			draft: false,
+			title: `PR ${n}`,
+			head: { sha: "c".repeat(40) },
+		})),
+	);
+}
+
+function pullBody(o: {
+	state?: string;
+	mergedAt?: string | null;
+	mergeSha?: string | null;
+}): string {
+	return JSON.stringify({
+		number: 7,
+		state: o.state ?? "closed",
+		merged_at: o.mergedAt ?? null,
+		merge_commit_sha: o.mergeSha ?? null,
+	});
+}
+
+const openList = (ns: number[]) => ({
+	code: 0,
+	stdout: openPage(ns),
+	stderr: "",
+});
+
+describe("prPass", () => {
+	test("PR merged finishes the card done and removes the worktree", async () => {
+		const store = prModeProject("pr-merged");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		mkdirSync(join(root, "pr-merged", ".wt"), { recursive: true });
+		const t = prCard(store);
+		store.updateTask(t.id, { worktree: join(root, "pr-merged", ".wt") });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
+		expect(ops.calls.fetches).toEqual(["main"]);
+		expect(ops.calls.remove).toEqual([
+			{
+				mainPath: join(root, "main"),
+				worktreePath: join(root, "pr-merged", ".wt"),
+				branch: "ottr/552",
+			},
+		]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 merged; card done");
+		store.close();
+	});
+
+	test("merge commit off the fetched origin tip leaves pushSha null", async () => {
+		const store = prModeProject("pr-merged-off-origin");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": OTHER_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBeNull();
+		expect(after.releaseVersion).toBeNull();
+		store.close();
+	});
+
+	test("release stamp only when a tag points at the merged commit", async () => {
+		const store = prModeProject("pr-release-stamp");
+		const t = prCard(store);
+		const turn = store.startTurn(t.id, "merge", "merge", null);
+		store.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			outcome: "integrated",
+			summary: "Released v0.28.2",
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: {
+				"refs/remotes/origin/main": MERGE_SHA,
+				"refs/tags/v0.28.2": MERGE_SHA,
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!.releaseVersion).toBe("v0.28.2");
+		store.close();
+	});
+
+	test("no tag on the merged commit leaves releaseVersion null", async () => {
+		const store = prModeProject("pr-release-no-tag");
+		const t = prCard(store);
+		const turn = store.startTurn(t.id, "merge", "merge", null);
+		store.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			outcome: "integrated",
+			summary: "Released v0.28.2",
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: {
+				"refs/remotes/origin/main": MERGE_SHA,
+				"refs/tags/v0.28.2": OTHER_SHA,
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!.releaseVersion).toBeNull();
+		expect(store.getTask(t.id)!.stage).toBe("done");
+		store.close();
+	});
+
+	test("PR closed unmerged parks the card needs_you with the reason", async () => {
+		const store = prModeProject("pr-closed");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? { code: 0, stdout: pullBody({}), stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("PR #7 closed without merging");
+		expect(after.pushSha).toBeNull();
+		expect(after.prNumber).toBe(7);
+		expect(after.prUrl).toContain("/pull/7");
+		expect(ops.calls.remove).toEqual([]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 closed without merging");
+		store.close();
+	});
+
+	test("PR still open: no write and no gh call beyond the list", async () => {
+		const store = prModeProject("pr-open");
+		const t = prCard(store);
+		const ops = fakeOps({ apiResult: () => openList([7]) });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.pushSha).toBe("abc1234567890");
+		const polls = ops.apiCalls.filter((a) =>
+			a[1]!.includes("pulls?state=open"),
+		);
+		expect(polls).toHaveLength(1);
+		expect(ops.calls.fetches).toEqual([]);
+		store.close();
+	});
+
+	test("one list call per window; a second tick inside the window polls nothing", async () => {
+		const store = prModeProject("pr-window");
+		prCard(store);
+		const ops = fakeOps({ apiResult: () => openList([7]) });
+		const projects = new Map([["proj", entry(store)]]);
+		await tick(projects, ops);
+		expect(
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")),
+		).toHaveLength(1);
+		await tick(projects, ops);
+		expect(
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")),
+		).toHaveLength(1);
+		store.close();
+	});
+
+	test("garbage PR body is logged and skipped; the card is untouched", async () => {
+		const store = prModeProject("pr-garbage");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? { code: 0, stdout: "{not json", stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.pushSha).toBe("abc1234567890");
+		store.close();
+	});
+
+	test("unexpected list body skips the whole window with no per-PR call", async () => {
+		const store = prModeProject("pr-garbage-list");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: () => ({ code: 0, stdout: '{"message":"nope"}', stderr: "" }),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")),
+		).toHaveLength(1);
+		expect(store.getTask(t.id)!.stage).toBe("merging");
+		store.close();
+	});
+
+	test("failed gh read leaves the card for the next window", async () => {
+		const store = prModeProject("pr-gh-fail");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: () => ({ code: 1, stdout: "", stderr: "rate limited" }),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")),
+		).toHaveLength(1); // list failed; no per-PR call
+		expect(store.getTask(t.id)!.stage).toBe("merging");
+		store.close();
+	});
+});
+
+// ---- CI watch on the PR head ------------------------------------------------
+
+describe("CI on the PR head", () => {
+	test("failed run replies once on the same card and clears pushSha", async () => {
+		const dir = join(root, "ci-pr-head");
+		const store = ProjectStore.open(dir);
+		const t = prCard(store);
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						id: 42,
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://example.com/run/42",
+					},
+				]),
+				stderr: "",
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.pushSha).toBeNull();
+		expect(
+			after.pendingPrompt?.startsWith(
+				"CI failed on the PR head of this card (abc1234 on ottr/552):",
+			),
+		).toBe(true);
+		expect(after.pendingPrompt).toContain(
+			"- build: failure - https://example.com/run/42",
+		);
+		expect(after.pendingPrompt).toContain(
+			"Fix on the branch and report ready; the tracker pushes the branch and updates the pull request.",
+		);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain(
+			"CI failed on the PR head abc1234; replied for a fix",
+		);
+		// One fix per head: the cleared pushSha keeps the second tick from replying again.
+		const scheduled = ops.calls.scheduled;
+		const prompt = after.pendingPrompt;
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!.pendingPrompt).toBe(prompt);
+		expect(ops.calls.scheduled).toBe(scheduled);
 		store.close();
 	});
 });

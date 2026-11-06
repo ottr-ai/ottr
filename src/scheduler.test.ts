@@ -192,6 +192,9 @@ function task(p: Partial<Task> = {}): Task {
 		keptFiles: [],
 		followUpOf: null,
 		followUpOfProject: null,
+		prNumber: null,
+		prUrl: null,
+		prHeadSha: null,
 		pushSha: null,
 		pushRetries: 0,
 		mergeHead: null,
@@ -296,6 +299,31 @@ describe("push hold (OTTR-506)", () => {
 		expect(
 			pickRunnable([replied, heldA, todo], { ...opts, mainUnpushed: true }),
 		).toEqual([replied, todo]);
+	});
+
+	test("prMode bypasses the unpushed-main hold and picks a queued merge", () => {
+		// PR mode never writes local main, so "waiting for main to reach origin" is inert.
+		const held = task({ stage: "merging", queuedAt: 100 });
+		expect(
+			mergeHold([held], held, { mainUnpushed: true, prMode: true }),
+		).toBeNull();
+		// Without prMode the PUSH_HOLD still applies.
+		expect(mergeHold([held], held, { mainUnpushed: true })).toBe(PUSH_HOLD);
+		const todo = task({ queuedAt: 300 });
+		expect(
+			pickRunnable([held, todo], { ...opts, mainUnpushed: true, prMode: true }),
+		).toEqual([held, todo]);
+	});
+
+	test("prMode picks a merging card with prNumber null but not one with an open PR", () => {
+		const withPr = task({ stage: "merging", queuedAt: 100, prNumber: 42 });
+		const noPr = task({ stage: "merging", queuedAt: 200 });
+		expect(pickRunnable([withPr, noPr], { ...opts, prMode: true })).toEqual([
+			noPr,
+		]);
+		// The prNumber gate applies outside PR mode too.
+		expect(pickRunnable([withPr, noPr], opts)).toEqual([noPr]);
+		expect(pickRunnable([withPr], { ...opts, prMode: true })).toEqual([]);
 	});
 
 	test("pushHold: queued merges wait, the retry card and every other stage run", () => {

@@ -2355,8 +2355,9 @@ export function createApp(deps: AppDeps) {
 					if (held.length > 0) card.heldMerges = held.map((h) => h.id);
 				}
 				// OTTR-506: stamp the queued merges the push hold parks (local main has commits
-				// origin lacks), so the board names the hold — the browser gets no git.
-				if (e.mainUnpushed === true) {
+				// origin lacks), so the board names the hold — the browser gets no git. PR mode
+				// never writes the local target branch (OTTR-552), so the hold names nothing there.
+				if (e.mainUnpushed === true && e.store.getSettings().prMode !== true) {
 					for (const card of cards) {
 						if (card.cancelledAt === null && pushHold(true, card) !== null)
 							card.pushHold = true;
@@ -2711,6 +2712,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof pr !== "boolean")
 				return json({ error: "prReviews must be a boolean" }, 400);
 			patch.prReviews = pr;
+		}
+		const pm = body.prMode;
+		if (pm !== undefined) {
+			if (typeof pm !== "boolean")
+				return json({ error: "prMode must be a boolean" }, 400);
+			patch.prMode = pm;
 		}
 		const psc = body.pushSyncCommits;
 		if (psc !== undefined) {
@@ -5077,6 +5084,13 @@ export function createApp(deps: AppDeps) {
 					// so a 400 never leaves a half-applied settings save behind.
 					const patch = parseSettingsPatch(r.body);
 					if (patch instanceof Response) return patch;
+					// PR mode needs a GitHub host: the merge flow pushes the branch and opens
+					// a PR there (same fact the prs/check route 409s on).
+					if (patch.prMode === true && e.github === null)
+						return json(
+							{ error: "prMode needs a GitHub remote on the configured host" },
+							400,
+						);
 					// retro -> retroSince: on keeps the existing mark (a re-save must not move
 					// it), off clears it. Validated as a boolean by parseSettingsPatch.
 					if (typeof r.body.retro === "boolean") {

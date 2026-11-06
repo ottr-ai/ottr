@@ -67,6 +67,103 @@ export function parsePullPage(body: unknown): PullInfo[] {
 	return out;
 }
 
+/** A created PR is untrusted: only a positive-int number and an optional string html_url pass. */
+export function parseCreatedPr(body: string): OpenedPr | null {
+	let j: unknown;
+	try {
+		j = JSON.parse(body);
+	} catch {
+		return null;
+	}
+	if (typeof j !== "object" || j === null) return null;
+	const x = j as Record<string, unknown>;
+	if (
+		typeof x.number !== "number" ||
+		!Number.isInteger(x.number) ||
+		x.number <= 0
+	)
+		return null;
+	return {
+		number: x.number,
+		url:
+			typeof x.html_url === "string" && x.html_url !== "" ? x.html_url : null,
+	};
+}
+
+export interface OpenedPr {
+	number: number;
+	url: string | null;
+}
+
+/**
+ * PR mode's settle step two: adopt an existing open PR for the head (a retry after a
+ * half-done settle must not open a second PR), else create one. The response is parsed
+ * as untrusted data (parsePullPage's rules). A failed gh call or an unparseable body
+ * returns the failure with gh's capped stderr — the caller parks the card on it.
+ */
+export async function openPullRequest(o: {
+	repo: string;
+	owner: string;
+	branch: string;
+	base: string;
+	title: string;
+	body: string;
+	gh?: GhFn;
+}): Promise<{ ok: true; pr: OpenedPr } | { ok: false; error: string }> {
+	const gh = o.gh ?? runGh;
+	// Adopt: one existing open PR whose head is this branch short-circuits the create.
+	const a = await gh([
+		"api",
+		`repos/${o.repo}/pulls?state=open&head=${o.owner}:${o.branch}&per_page=1`,
+	]);
+	if (a.code === 0) {
+		let page: PullInfo[] = [];
+		try {
+			page = parsePullPage(JSON.parse(a.stdout) as unknown);
+		} catch {
+			// unreadable adopt page: fall through to create
+		}
+		if (page.length > 0) {
+			const p = page[0]!;
+			return {
+				ok: true,
+				pr: { number: p.number, url: prUrl(o.repo, p.number) },
+			};
+		}
+	}
+	const r = await gh([
+		"api",
+		`repos/${o.repo}/pulls`,
+		"-X",
+		"POST",
+		"-f",
+		`head=${o.branch}`,
+		"-f",
+		`base=${o.base}`,
+		"-f",
+		`title=${o.title}`,
+		"-f",
+		`body=${o.body}`,
+	]);
+	if (r.code !== 0) {
+		const err = r.stderr.trim().split("\n").filter(Boolean).pop() ?? "";
+		return {
+			ok: false,
+			error:
+				err !== ""
+					? err.slice(0, 300)
+					: `gh pull-request create exited ${r.code}`,
+		};
+	}
+	const pr = parseCreatedPr(r.stdout);
+	if (pr === null)
+		return {
+			ok: false,
+			error: `gh pull-request create returned an unreadable body: ${r.stdout.trim().slice(0, 300)}`,
+		};
+	return { ok: true, pr };
+}
+
 async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {
 	const pulls: PullInfo[] = [];
 	for (let page = 1; page <= 100; page++) {

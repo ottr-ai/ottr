@@ -17632,3 +17632,272 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 		expect(calls).toHaveLength(0);
 	});
 });
+
+describe("turn PR-mode merge settle", () => {
+	function prMergeSetup(overrides: Partial<TurnOps> = {}) {
+		const record = baseRecord();
+		const setup = setupWith(record, {
+			prIntegrated: async () => true,
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-tip" : "sha-old",
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async () => ({
+				ok: true as const,
+				pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+			}),
+			serverMergePush: async () => {
+				throw new Error("serverMergePush must not run in PR mode");
+			},
+			runMergeGates: async () => {
+				throw new Error("merge gates must not run in PR mode");
+			},
+			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+				record.runs.push(o as never);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "integrated",
+								summary: "rebased",
+								details: "gates green",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+			...overrides,
+		});
+		const e = setup.projects.get(setup.store.name)!;
+		e.github = "https://github.com/acme/repo.git";
+		setup.store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/repo.git",
+		});
+		const task = setup.store.createTask("merge please");
+		setup.store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		return { ...setup, e, task };
+	}
+
+	test("an integrated PR-mode merge pushes the branch and opens the PR", async () => {
+		const pushes: unknown[][] = [];
+		const opens: {
+			repo: string;
+			owner: string;
+			branch: string;
+			base: string;
+			title: string;
+			body: string;
+		}[] = [];
+		const { store, record, loop, task } = prMergeSetup({
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(pushes).toEqual([
+			[store.path, "ott/m", "https://github.com/acme/repo.git"],
+		]);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			owner: "acme",
+			branch: "ott/m",
+			base: "main",
+			title: "merge please",
+		});
+		expect(opens[0]!.body).toContain("rebased");
+		expect(opens[0]!.body).toContain("gates green");
+		expect(opens[0]!.body).toContain(task.id);
+		expect(opens[0]!.body).toContain("Ottr");
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prNumber).toBe(12);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/12");
+		expect(after.prHeadSha).toBe("sha-tip");
+		expect(after.pushSha).toBe("sha-tip");
+		// The done write never ran: the worktree stays.
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(logText(store, task.id)).toContain("- PR #12 opened (base main)");
+		// The merge prompt used the PR variant.
+		expect(record.runs[0]!.prompt).toContain("opens the pull request");
+		expect(record.runs[0]!.prompt).not.toContain("git merge --ff-only");
+	});
+
+	test("a failed branch push parks merging/needs_you and never opens the PR", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			pushBranch: async () => ({
+				status: "failed" as const,
+				error: "fatal: [REDACTED] denied",
+				output: "fatal: [REDACTED] denied",
+			}),
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 1, url: null } };
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("fatal: [REDACTED] denied");
+		expect(after.prNumber).toBe(null);
+		expect(opened).toBe(false);
+		expect(logText(store, task.id)).toContain("git's full push output");
+	});
+
+	test("a failed gh call parks merging/needs_you with the gh error", async () => {
+		const { store, loop, task } = prMergeSetup({
+			openPr: async () => ({
+				ok: false as const,
+				error: "HTTP 422: Validation Failed",
+			}),
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("HTTP 422: Validation Failed");
+		expect(after.prNumber).toBe(null);
+	});
+
+	test("an unproven integration ships nothing and parks not-on-target", async () => {
+		const { store, loop, task } = prMergeSetup({
+			prIntegrated: async () => false,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("not on origin/main");
+		expect(after.prNumber).toBe(null);
+	});
+
+	test("a card already carrying a PR never re-ships", async () => {
+		const pushes: unknown[][] = [];
+		const { store, loop, task } = prMergeSetup({
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		store.updateTask(task.id, { prNumber: 12 });
+		await loop.runTurn(store.name, task.id);
+		expect(pushes).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prNumber).toBe(12);
+	});
+
+	test("a needs_you report never ships even with a clean rebased tree", async () => {
+		const pushes: unknown[][] = [];
+		const { store, record, loop, task } = prMergeSetup({
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run for a needs_you report");
+			},
+			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+				record.runs.push(o as never);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "needs_you",
+								summary: "blocking finding",
+								question:
+									"A high finding blocks the ship: rotate the leaked key first.",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(pushes).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		// classify parks the card with the agent's question; the ship step and
+		// its prNext override never ran.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("rotate the leaked key first");
+		expect(after.prNumber).toBe(null);
+	});
+
+	test("a merge turn without a receipt parks instead of landing or shipping", async () => {
+		const { store, record, loop, task } = prMergeSetup({
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run without a receipt");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run without a receipt");
+			},
+			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+				record.runs.push(o as never);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(runResult({})),
+					kill: async () => {},
+				};
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("without calling report_outcome");
+		expect(after.prNumber).toBe(null);
+	});
+
+	test("a PR-mode project schedules its queued merge even with main unpushed", async () => {
+		const record = baseRecord();
+		const s = setupWith(record, {
+			prIntegrated: async () => true,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async () => ({
+				ok: true as const,
+				pr: { number: 12, url: null },
+			}),
+		});
+		const e = s.projects.get(s.store.name)!;
+		e.github = "https://github.com/acme/repo.git";
+		e.mainUnpushed = true;
+		s.store.setSettings({ prMode: true });
+		const task = s.store.createTask("merge please");
+		s.store.updateTask(task.id, {
+			stage: "merging",
+			state: "queued",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		s.loop.schedule();
+		await flushPromises();
+		expect(record.runs).toHaveLength(1);
+		expect(record.runs[0]!.prompt).toContain("opens the pull request");
+	});
+});

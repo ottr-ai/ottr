@@ -4,13 +4,14 @@ import { writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
 import { githubHost } from "./githubHost.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
+import { parsePullPage } from "./prs.ts";
 import { ownerRepo } from "./release.ts";
 import { collectRetroFacts, factsMarkdown, frictionFilter } from "./retro.ts";
 import { classify } from "./runner.ts";
 import { isRetro, isReview, liveCard } from "./scheduler.ts";
 import { readTranscript } from "./session.ts";
 import type { ProjectStore } from "./store.ts";
-import { isKeptReason } from "./turn.ts";
+import { isKeptReason, parseReleaseVersion } from "./turn.ts";
 import type {
 	GitFacts,
 	OutcomeStatus,
@@ -22,6 +23,7 @@ import type { SweptProcess, WorkerTarget } from "./workers.ts";
 import type {
 	branchMergedOrGone,
 	commitsAhead,
+	fetchOriginBranch,
 	isClean,
 	isIntegrated,
 	quarantineUntracked,
@@ -58,6 +60,10 @@ export interface SupervisorOps {
 	worktreeLinked: typeof worktreeLinked;
 	branchMergedOrGone: typeof branchMergedOrGone;
 	quarantineUntracked: typeof quarantineUntracked;
+	/** OTTR-552 prPass: reads a ref in the main checkout; null on git failure. */
+	targetSha(mainPath: string, ref: string): Promise<string | null>;
+	/** OTTR-552 prPass: fetches a branch from the pinned origin (git() adds the host auth). */
+	fetchOriginBranch: typeof fetchOriginBranch;
 	targetCommits(
 		mainPath: string,
 		target: string | null,
@@ -69,6 +75,7 @@ const GH_FAIL_LIMIT = 10; // consecutive gh api failures before giving up
 const CLEANUP_RETRY_MS = 10 * 60 * 1000; // spacing between removal retries
 const CLEANUP_TRIES = 3; // then give up (folder stays; logged)
 const DEPENDABOT_POLL_MS = 60 * 60 * 1000; // one gh pr list per project per hour
+const PR_POLL_MS = 5 * 60_000; // one open-PR list per project per poll window
 const CI_LOG_LINES = 200; // tail kept per failed run in a follow-up handoff; full log stays on GitHub
 
 /** One GitHub Actions workflow run from the head_sha query; `id` feeds `gh run view --log-failed`. */
@@ -201,6 +208,28 @@ function dependabotPrs(
 	});
 }
 
+/** Own fields of one pull from `repos/{repo}/pulls/N`; only what prPass decides on. The body is
+ * untrusted: anything else (or a surprise shape) is null and the caller logs and skips. Pure. */
+interface PrDetail {
+	state: "open" | "closed";
+	merged: boolean;
+	mergeCommit: string | null;
+}
+
+function parsePull(body: unknown): PrDetail | null {
+	if (typeof body !== "object" || body === null) return null;
+	const x = body as Record<string, unknown>;
+	const sha = x.merge_commit_sha;
+	if (x.state !== "open" && x.state !== "closed") return null;
+	if (x.merged_at !== null && typeof x.merged_at !== "string") return null;
+	if (sha !== null && sha !== undefined && typeof sha !== "string") return null;
+	return {
+		state: x.state,
+		merged: typeof x.merged_at === "string",
+		mergeCommit: typeof sha === "string" ? sha : null,
+	};
+}
+
 /** The tracker's own git-proof rejection strings and the outcome each expects in the last
  * turn row; only these prove the git facts moved, so only these are safe to re-judge on
  * fresh facts. Anything else is an ask, a guard or a human reason and stays untouched. */
@@ -322,6 +351,8 @@ export function createSupervisor(
 	const retroSkips = new Map<string, Set<string>>();
 	// project -> last Dependabot poll; memory only, so the first tick after a start polls.
 	const dependabotPolls = new Map<string, number>();
+	// project -> last open-PR poll; memory only, so the first tick after a start polls.
+	const prPolls = new Map<string, number>();
 
 	async function cleanupPass(e: SupervisorEntry, t: Task): Promise<void> {
 		if (
@@ -1026,6 +1057,40 @@ export function createSupervisor(
 
 		const failed = runs.filter((r) => ciVerdict([r]) === "failed");
 		const refetch = `gh run view <run-id> --log-failed --repo ${repo}`;
+		// OTTR-552: a PR-mode card in Merging watches its PR head, not a merge push; a failed
+		// run replies on the same card instead of filing a follow-up. Clearing pushSha here is
+		// the one-fix-per-head dedupe — the next push re-pins pushSha at settle.
+		if (t.stage === "merging" && t.prNumber !== null) {
+			const short = t.pushSha.slice(0, 7);
+			const logs = await ciLogSection(e, t, failed, repo);
+			const text = [
+				[
+					`CI failed on the PR head of this card (${short} on ${t.branch ?? "the branch"}):`,
+					...failed.map((r) => `- ${r.name}: ${r.conclusion} - ${r.html_url}`),
+				].join("\n"),
+				`Find the cause (e.g. ${refetch}).`,
+				"Fix on the branch and report ready; the tracker pushes the branch and updates the pull request.",
+				logs,
+			]
+				.filter((x) => x !== "")
+				.join("\n\n");
+			if (wentStale(e.store, t)) return;
+			e.store.updateTask(t.id, {
+				stage: "in_progress",
+				state: "queued",
+				queuedAt: ops.now(),
+				pendingPrompt: text,
+				pendingBy: "supervisor",
+				pushSha: null,
+			});
+			ops.appendLog(
+				e.store,
+				t.id,
+				`supervisor: CI failed on the PR head ${short}; replied for a fix`,
+			);
+			ops.schedule();
+			return;
+		}
 		const fetchCause = `Find the cause (e.g. ${refetch}), fix it, and land the fix through a normal merge.`;
 		const head = [
 			`CI failed on the merge push of this card's parent task (${t.pushSha.slice(0, 7)} on ${e.target ?? "the target branch"}).`,
@@ -1163,6 +1228,183 @@ export function createSupervisor(
 		}
 	}
 
+	/** PR merged on GitHub: finish the card like a merge turn's done write — fetch the target,
+	 * pin pushSha to the merge commit when it is the fetched origin tip, stamp the release when
+	 * a tag points at that commit, remove the worktree. A reply, steer or cancel landing during
+	 * the awaits stops every write below it. Never throws. */
+	async function finishPrMerge(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: Task,
+		mergeCommit: string,
+	): Promise<void> {
+		const target = e.target ?? t.base;
+		if (target === null) {
+			console.error(
+				`supervisor: project ${e.name}: no target branch; PR merge skipped`,
+			);
+			return;
+		}
+		const short = target.replace(/^origin\//, "");
+		if (settings.originUrl !== null)
+			await ops
+				.fetchOriginBranch(e.path, short, settings.originUrl)
+				.catch(() => "fetch failed");
+		const originTip = await ops
+			.targetSha(e.path, `refs/remotes/origin/${short}`)
+			.catch(() => null);
+		// Exact tip match only: a later merge moving origin past this one leaves the pin and
+		// stamp off rather than pinning a sha CI never watched.
+		const onOrigin = originTip !== null && originTip === mergeCommit;
+		if (wentStale(e.store, t)) return;
+		const wt = t.worktree;
+		const uncommitted =
+			wt !== null && existsSync(wt) ? await ops.statusFiles(wt) : [];
+		// Re-checked past the statusFiles await: a reply landing there must not lose its
+		// queued prompt to this write.
+		if (wentStale(e.store, t)) return;
+		e.store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+			pushSha: onOrigin ? mergeCommit : null,
+			uncommittedFiles: uncommitted,
+		});
+		// Release stamp, same rule as turn.ts's done block: the report must name the version and
+		// a real tag of that name must point at the merged commit on origin.
+		const last = e.store.listTurns(t.id).at(-1);
+		const version =
+			last?.outcome === "integrated"
+				? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
+				: null;
+		if (version !== null && onOrigin) {
+			const tagged = await ops
+				.targetSha(e.path, `refs/tags/${version}`)
+				.catch(() => null);
+			if (tagged === mergeCommit)
+				e.store.updateTask(t.id, { releaseVersion: version });
+		}
+		if (wt !== null && existsSync(wt)) {
+			try {
+				await ops.removeWorktree({
+					mainPath: e.path,
+					worktreePath: wt,
+					branch: t.branch,
+				});
+				ops.appendLog(e.store, t.id, "supervisor: worktree removed");
+			} catch (err) {
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: worktree removal failed: ${errmsg(err)}`,
+				);
+			}
+		}
+		ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${t.prNumber} merged; card done`,
+		);
+	}
+
+	/** One PR pass per project, at most one open-PR list per poll window: a tracked Merging card
+	 * whose PR left the open set gets one per-PR call to read its settled state — merged finishes
+	 * the card, closed unmerged parks it needs_you. The pass never merges or closes anything and
+	 * never throws; a failed poll retries at the next window. */
+	async function prPass(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+	): Promise<void> {
+		if (settings.prMode !== true || e.github === null) return;
+		const repo = ownerRepo(e.github);
+		if (repo === null) return;
+		const last = prPolls.get(e.name);
+		if (last !== undefined && ops.now() - last < PR_POLL_MS) return;
+		prPolls.set(e.name, ops.now());
+		const res = await ops
+			.gh(["api", `repos/${repo}/pulls?state=open&per_page=100`])
+			.catch((err: unknown) => ({ code: 1, stdout: "", stderr: errmsg(err) }));
+		if (res.code !== 0) {
+			console.error(
+				`supervisor: project ${e.name}: PR poll failed: ${(res.stderr || "unknown error").slice(0, 200)}`,
+			);
+			return;
+		}
+		let page: unknown;
+		try {
+			page = JSON.parse(res.stdout);
+		} catch (err) {
+			console.error(
+				`supervisor: project ${e.name}: PR poll failed: ${errmsg(err).slice(0, 200)}`,
+			);
+			return;
+		}
+		if (!Array.isArray(page)) {
+			console.error(
+				`supervisor: project ${e.name}: PR poll failed: unexpected body`,
+			);
+			return;
+		}
+		const open = new Set(parsePullPage(page).map((p) => p.number));
+		for (const t of e.store.listTasks()) {
+			if (
+				t.stage !== "merging" ||
+				t.prNumber === null ||
+				t.cancelledAt !== null
+			)
+				continue;
+			if (open.has(t.prNumber)) continue;
+			const r = await ops
+				.gh(["api", `repos/${repo}/pulls/${t.prNumber}`])
+				.catch((err: unknown) => ({
+					code: 1,
+					stdout: "",
+					stderr: errmsg(err),
+				}));
+			if (r.code !== 0) {
+				console.error(
+					`supervisor: project ${e.name}: PR #${t.prNumber} read failed: ${(r.stderr || "unknown error").slice(0, 200)}`,
+				);
+				continue;
+			}
+			let pr: PrDetail | null;
+			try {
+				pr = parsePull(JSON.parse(r.stdout));
+			} catch {
+				pr = null;
+			}
+			if (pr === null) {
+				console.error(
+					`supervisor: project ${e.name}: PR #${t.prNumber}: unparseable body; skipped`,
+				);
+				continue;
+			}
+			if (pr.state === "open") continue; // reopened between the list and this read
+			if (pr.merged && pr.mergeCommit !== null)
+				await finishPrMerge(e, settings, t, pr.mergeCommit);
+			else if (pr.merged) {
+				// merged_at set but no merge commit: nothing to pin CI to; leave the card watched.
+				console.error(
+					`supervisor: project ${e.name}: PR #${t.prNumber} merged with no merge commit; skipped`,
+				);
+			} else {
+				if (wentStale(e.store, t)) continue;
+				e.store.updateTask(t.id, {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: `PR #${t.prNumber} closed without merging`,
+					pushSha: null,
+				});
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: PR #${t.prNumber} closed without merging; card parked`,
+				);
+				ops.schedule();
+			}
+		}
+	}
+
 	// The worker pool is shared across projects, so the sweep runs once per tick, not per
 	// project; workers only answer for their own container's /proc.
 	async function workerSweepPass(): Promise<void> {
@@ -1214,6 +1456,7 @@ export function createSupervisor(
 						}
 						if (settings.autoTend) await tendPass(e, tasks, settings);
 						await dependabotPass(e);
+						await prPass(e, settings);
 					} catch (err) {
 						console.error(`supervisor: project ${e.name}:`, err);
 					}

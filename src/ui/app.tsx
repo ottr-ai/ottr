@@ -9470,6 +9470,24 @@ export function Drawer({
 								<dt>Branch</dt>
 								<dd>{task.branch ?? "-"}</dd>
 							</div>
+							{task.prNumber !== null && (
+								<div>
+									<dt>PR</dt>
+									<dd>
+										{task.prUrl !== null ? (
+											<a
+												href={task.prUrl}
+												target="_blank"
+												rel="noopener noreferrer"
+											>
+												PR #{task.prNumber}
+											</a>
+										) : (
+											`PR #${task.prNumber}`
+										)}
+									</dd>
+								</div>
+							)}
 							<div>
 								<dt>Worktree</dt>
 								<dd>{task.worktree ?? "-"}</dd>

@@ -82,15 +82,24 @@ ${ONE_SHOT}`;
 
 export const RESEARCH_REPORT = "research-report.md";
 
-export function mergePrompt(o: { branch: string; target: string }): string {
+export function mergePrompt(o: {
+	branch: string;
+	target: string;
+	pr?: boolean;
+}): string {
 	const targetBranch = o.target.startsWith("origin/")
 		? o.target.slice("origin/".length)
 		: o.target;
+	const prMode = o.pr === true;
 	return `Your turn to integrate ${o.branch}: rebase onto ${o.target} (resolve conflicts keeping both intents), re-run the project's verification, then integrate exactly as AGENTS.md prescribes.
 If the rebase pulled in commits that touch dependencies, install again in locked/frozen mode before re-running the gates.
 Before you integrate, run the diff-security-review skill on the branch diff against the target (docs-only diffs skip it); a confirmed high or medium finding blocks the merge: fix it on the branch and re-run the gates, or call report_outcome with needs_you.
-Then, in the main checkout, fast-forward ${targetBranch} to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so ${targetBranch} holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
-Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated. If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.
+${
+	prMode
+		? `Do not merge and do not push: after you report integrated, the server pushes ${o.branch} and opens the pull request (base ${targetBranch}, head ${o.branch}) on GitHub.`
+		: `Then, in the main checkout, fast-forward ${targetBranch} to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so ${targetBranch} holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
+Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated.`
+} If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.
 ${RENAME}
 Call rename with a 3-8 word title before your first report_outcome.
 ${NO_DESTRUCTION}

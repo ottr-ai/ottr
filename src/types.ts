@@ -172,6 +172,8 @@ export interface ProjectSettings {
 	forkResearch: boolean;
 	/** Hourly PR watch: file or requeue a read-only review card for each settled open PR (off by default). */
 	prReviews: boolean;
+	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
+	prMode: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 	/**
@@ -353,6 +355,10 @@ export interface Task {
 	followUpOfProject: string | null;
 	/** CI watch: sha of the merge push whose GitHub Actions verdict the supervisor awaits; null once checked, skipped, or given up on. */
 	pushSha: string | null;
+	/** PR mode: open PR-mode pull request; null outside PR mode. */
+	prNumber: number | null;
+	prUrl: string | null;
+	prHeadSha: string | null;
 	/** OTTR-394: automatic rebase retries a rejected server push has spent (budget 2 per card). */
 	pushRetries: number;
 	/** Integration target head when the task finished (stamped with `commits`); the anchor that attributes a release's late commits to the card that merged them. null when unmeasured or not done. */

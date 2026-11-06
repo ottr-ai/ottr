@@ -16,6 +16,7 @@ import { GlobalStore } from "./globalStore.ts";
 import { boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { openPullRequest } from "./prs.ts";
 import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
@@ -73,6 +74,8 @@ import {
 	isIntegrated,
 	mergeHoldMismatch,
 	originRemoteUrl,
+	prIntegrated,
+	pushBranch,
 	quarantineUntracked,
 	rebaseTargetBranch,
 	remoteUrl,
@@ -452,6 +455,12 @@ const loop = createTurnLoop(projects, {
 	branchUnpushed,
 	checkedOutBranch,
 	serverMergePush,
+	// OTTR-552 PR mode: the ship step pushes the card branch (server git credentials,
+	// force-with-lease) and adopts or opens the PR via gh; the integrated proof is a
+	// clean worktree with origin/<target> an ancestor of HEAD.
+	pushBranch,
+	openPr: openPullRequest,
+	prIntegrated,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),
 	githubAuthHint: (url) => app.githubAuthHint(url),
@@ -587,6 +596,8 @@ const supervisor = createSupervisor(
 		branchMergedOrGone,
 		quarantineUntracked,
 		targetCommits,
+		targetSha,
+		fetchOriginBranch,
 	},
 	workerTarget,
 );

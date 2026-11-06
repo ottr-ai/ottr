@@ -8098,6 +8098,25 @@ describe("PR review routes", () => {
 		expect(store.getSettings().prReviews).toBe(false);
 	});
 
+	test("project settings route accepts prMode and rejects non-boolean", async () => {
+		const p1 = projects.get("p1")!;
+		const bad = await post("/api/projects/p1/settings", { prMode: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("prMode must be a boolean");
+		const noRemote = await post("/api/projects/p1/settings", { prMode: true });
+		expect(noRemote.status).toBe(400);
+		expect(await errorOf(noRemote)).toBe(
+			"prMode needs a GitHub remote on the configured host",
+		);
+		p1.github = "https://github.com/Octo/Repo.GIT";
+		const ok = await post("/api/projects/p1/settings", { prMode: true });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().prMode).toBe(true);
+		await post("/api/projects/p1/settings", { prMode: false });
+		expect(store.getSettings().prMode).toBe(false);
+		p1.github = null;
+	});
+
 	test("prs/check refuses an unknown project and one without a GitHub remote", async () => {
 		const res = await post("/api/projects/p1/prs/check", {});
 		expect(res.status).toBe(409);

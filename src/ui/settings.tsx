@@ -5268,6 +5268,14 @@ export function ProjectSettingsForm({
 							act={act}
 						/>
 						<CheckRow
+							name="PR mode"
+							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
+							checked={st.prMode}
+							disabled={project.github === null && !st.prMode}
+							save={(v) => send({ prMode: v })}
+							act={act}
+						/>
+						<CheckRow
 							name="Push sync commits"
 							desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
 							checked={st.pushSyncCommits}

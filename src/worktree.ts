@@ -1389,6 +1389,78 @@ export async function serverMergePush(
 }
 
 /**
+ * PR mode's server-side branch push: pushes the card branch's tip to the pinned origin from the
+ * main checkout with the same credential plumbing as serverMergePush (git() adds the host auth;
+ * per-host tokens or the ssh key), the server-pinned originUrl named instead of the remote name
+ * (R5-1). The lease pins the remote-tracking tip this push read first, so a concurrent rewrite
+ * of the branch rejects: the server is the card branch's only writer, but a rebase between two
+ * pushes rewrites history, so the update must be forced-with-a-lease, never a plain push. Like
+ * serverMergePush, a push by URL moves no remote-tracking ref, so the tip this push landed is
+ * recorded on `refs/remotes/origin/<branch>`. A push git rejects because the remote moved
+ * ("! [rejected]", "fetch first", or a --force-with-lease "stale info") returns `rejected`;
+ * any other failure stays `failed`. Errors carry the reason lines and `output` the complete
+ * redacted output, the same shape as serverMergePush (OTTR-465).
+ */
+export async function pushBranch(
+	mainPath: string,
+	branch: string,
+	originUrl: string,
+): Promise<
+	| { status: "pushed"; output: string }
+	| { status: "failed" | "rejected"; error: string; output?: string }
+> {
+	const sha = async (ref: string) => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+			mainPath,
+		);
+		return r.code === 0 ? r.stdout.trim() : null;
+	};
+	const guard = await checkPinnedRemote(mainPath, originUrl);
+	if (guard !== null) return { status: "failed", error: guard };
+	const tip = await sha(`refs/remotes/origin/${branch}`);
+	const r = await git(
+		[
+			"push",
+			// Absent a remote-tracking tip (first push of the branch) there is nothing to lease
+			// against: the push itself establishes the branch on origin.
+			...(tip !== null
+				? [`--force-with-lease=refs/heads/${branch}:${tip}`]
+				: []),
+			originUrl,
+			`refs/heads/${branch}:refs/heads/${branch}`,
+		],
+		mainPath,
+	);
+	if (r.code === 0) {
+		const local = await sha(`refs/heads/${branch}`);
+		if (local !== null)
+			await git(
+				["update-ref", `refs/remotes/origin/${branch}`, local],
+				mainPath,
+			);
+		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
+	}
+	const output = cappedPushOutput(
+		redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+	);
+	const reasons = r.stderr
+		.split("\n")
+		.filter((line) => PUSH_REASON_LINE.test(line))
+		.join("\n")
+		.trim();
+	const error = redactUrlCredentials(
+		reasons !== ""
+			? reasons
+			: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git push exited ${r.code}`),
+	);
+	if (/! \[rejected\]|fetch first|stale info/.test(r.stderr))
+		return { status: "rejected", error, output };
+	return { status: "failed", error, output };
+}
+
+/**
  * OTTR-394: the server-side fetch that backs an automatic rebase retry. A rejected merge
  * push means origin moved while the merge ran; the queued rebase turn needs a current
  * origin/<branch> to rebase onto, and the merge agent holds no git credentials (D6). The
@@ -1716,6 +1788,24 @@ export async function branchMergedOrGone(
 	const r = await git(
 		["merge-base", "--is-ancestor", branch, target],
 		mainPath,
+	);
+	return r.code === 0;
+}
+
+/** OTTR-552: the PR-mode integrated proof — the worktree tree is clean and origin's
+ * target ref is an ancestor of HEAD, i.e. the rebase a PR-mode merge turn performs
+ * is complete and nothing is uncommitted. Both checks run in the worktree; a git
+ * failure is not a proof. */
+export async function prIntegrated(
+	_mainPath: string,
+	worktreePath: string,
+	target: string,
+): Promise<boolean> {
+	const clean = await isClean(worktreePath);
+	if (!clean) return false;
+	const r = await git(
+		["merge-base", "--is-ancestor", target, "HEAD"],
+		worktreePath,
 	);
 	return r.code === 0;
 }

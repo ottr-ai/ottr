@@ -470,6 +470,7 @@ describe("ProjectSettingsForm target branch", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prMode: false,
 			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
@@ -705,6 +706,7 @@ describe("ProjectSettingsForm icon text marker", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prMode: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -1075,6 +1077,7 @@ describe("ProjectSettingsForm review counter", () => {
 				retroFilter: true,
 				forkResearch: false,
 				prReviews: false,
+				prMode: false,
 				setupChecklist: false,
 				targetBranch: null,
 				originUrl: null,
@@ -1816,6 +1819,174 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		} finally {
 			await unmount();
 		}
+	});
+	describe("ProjectSettingsForm PR mode", () => {
+		/** A project fixture with a settable GitHub remote and PR mode state. */
+		const projectWith = (github: string | null, prMode: boolean): ProjectView =>
+			({
+				name: "proj",
+				icon: null,
+				remote: github,
+				github,
+				hasRules: true,
+				gitless: false,
+				archReviewCap: 30,
+				settings: {
+					maxParallel: 2,
+					copyExtra: [],
+					displayName: null,
+					releaseCommand: null,
+					archReviewCap: 30,
+					maxImages: 4,
+					keptWorktreeDays: 7,
+					autoTend: false,
+					autoTendLimit: 5,
+					tendChurnGlobs: [],
+					holdUpdateMerges: false,
+					retroSince: null,
+					retroFilter: true,
+					forkResearch: false,
+					prReviews: false,
+					prMode,
+					setupChecklist: false,
+					targetBranch: null,
+					originUrl: null,
+				},
+			}) as unknown as ProjectView;
+
+		/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
+		async function mount(
+			project: ProjectView,
+			fetchMock: typeof fetch,
+		): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = fetchMock;
+			const container = window.document.createElement(
+				"div",
+			) as unknown as HTMLDivElement;
+			window.document.body.appendChild(container as unknown as HappyNode);
+			const root = createRoot(container);
+			await act(async () => {
+				root.render(
+					<ProjectSettingsForm
+						project={project}
+						tasks={[]}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						openTask={() => {}}
+					/>,
+				);
+			});
+			return {
+				container,
+				unmount: async () => {
+					await act(async () => {
+						root.unmount();
+					});
+					container.remove();
+					globalThis.fetch = realFetch;
+				},
+			};
+		}
+
+		/** The PR mode checkbox, found through its row label like the push sync test. */
+		const prModeRow = (container: HTMLDivElement) => {
+			const label = [...container.querySelectorAll("label")].find((l) =>
+				l.textContent?.includes("PR mode"),
+			);
+			if (label === undefined) throw new Error("PR mode row missing");
+			const input = container.querySelector<HTMLInputElement>(
+				`input[id="${label.htmlFor}"]`,
+			);
+			if (input === null) throw new Error("PR mode checkbox did not render");
+			return input;
+		};
+
+		const fetchMockFor = (
+			project: ProjectView,
+			read: (postBody: Record<string, unknown> | undefined) => void,
+		): typeof fetch =>
+			(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (
+					url.endsWith("/api/projects/proj/settings") &&
+					init?.method === "POST"
+				) {
+					const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+					read(body);
+					return new Response(JSON.stringify(project), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url.endsWith("/api/projects/proj/ssh-key"))
+					return new Response(JSON.stringify({ own: null, expiresAt: null }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+			}) as typeof fetch;
+
+		test("renders checked from the setting and toggling posts prMode true and false", async () => {
+			const posts: (Record<string, unknown> | undefined)[] = [];
+			const project = projectWith("https://github.com/octo/repo", true);
+			const { container, unmount } = await mount(
+				project,
+				fetchMockFor(project, (body) => posts.push(body)),
+			);
+			try {
+				const input = prModeRow(container);
+				expect(input.checked).toBe(true);
+				expect(input.disabled).toBe(false);
+				await act(async () => {
+					onChangeOf(input)({
+						target: { checked: false },
+						currentTarget: input,
+					});
+				});
+				expect(posts[0]?.prMode).toBe(false);
+				await act(async () => {
+					onChangeOf(input)({
+						target: { checked: true },
+						currentTarget: input,
+					});
+				});
+				expect(posts[1]?.prMode).toBe(true);
+			} finally {
+				await unmount();
+			}
+		});
+		test("without a GitHub remote the row renders off and disabled until saved on", async () => {
+			const project = projectWith(null, false);
+			const { container, unmount } = await mount(
+				project,
+				fetchMockFor(project, () => {}),
+			);
+			try {
+				const input = prModeRow(container);
+				expect(input.checked).toBe(false);
+				expect(input.disabled).toBe(true);
+				expect(container.textContent).toContain("Needs a GitHub remote.");
+			} finally {
+				await unmount();
+			}
+		});
+		test("saved on without a GitHub remote keeps the row enabled", async () => {
+			const project = projectWith(null, true);
+			const { container, unmount } = await mount(
+				project,
+				fetchMockFor(project, () => {}),
+			);
+			try {
+				const input = prModeRow(container);
+				expect(input.checked).toBe(true);
+				expect(input.disabled).toBe(false);
+			} finally {
+				await unmount();
+			}
+		});
 	});
 
 	test("with no board token the button stays hidden even for github.com", async () => {

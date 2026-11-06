@@ -164,11 +164,12 @@ export function pushHold(
  * exactly the commit this one saw, and a release ships only reviewed work plus the fixes it asked
  * for. Findings themselves never wait: holding one could deadlock the review that waits for it.
  * While local main has commits origin lacks (a rejected server push, `o.mainUnpushed`), every
- * queued merge but the rejected card's rebase retry waits too (pushHold). */
+ * queued merge but the rejected card's rebase retry waits too (pushHold). With `o.prMode`, main
+ * is never written locally, so that hold is inert. */
 export function mergeHold(
 	tasks: readonly ReviewTask[],
 	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries" | "pendingBy">,
-	o: { mainUnpushed?: boolean } = {},
+	o: { mainUnpushed?: boolean; prMode?: boolean } = {},
 ): string | null {
 	for (const r of tasks) {
 		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
@@ -186,7 +187,7 @@ export function mergeHold(
 		)
 			return "waiting for the review's findings to be implemented";
 	}
-	if (o.mainUnpushed === true) {
+	if (o.mainUnpushed === true && o.prMode !== true) {
 		const held = pushHold(true, merge);
 		if (held !== null) return held;
 	}
@@ -401,6 +402,9 @@ export function pickRunnable(
 		 * rejected server push). Every queued merge but the rejected card's rebase retry waits
 		 * (pushHold); the retry runs first, and its push ends the hold. */
 		mainUnpushed?: boolean;
+		/** True while the project merges via PR: a card with an open PR is never picked for
+		 * another merge turn, and mainUnpushed's hold is inert (mergeHold). */
+		prMode?: boolean;
 	},
 ): Task[] {
 	const live = tasks.filter((t) => t.cancelledAt === null);
@@ -421,14 +425,19 @@ export function pickRunnable(
 
 	// The merge slot: only if no merge turn is already running, take the oldest queued merge that no
 	// open review holds. An open release holds every merge but its findings', so no merge can race
-	// its publish (mergeHold). While local main has commits origin lacks, only the rejected
-	// card's rebase retry may start (pushHold), so the retry repairs main before anything merges.
+	// its publish (mergeHold).
+	// While local main has commits origin lacks, only the rejected card's rebase retry may
+	// start (pushHold), so the retry repairs main before anything merges — except in PR mode,
+	// where main is never written locally.
 	if (!running.some((t) => t.stage === "merging")) {
 		const merge = queued.find(
 			(t) =>
 				t.stage === "merging" &&
-				mergeHold(live, t, { mainUnpushed: o.mainUnpushed === true }) ===
-					null &&
+				t.prNumber === null &&
+				mergeHold(live, t, {
+					mainUnpushed: o.mainUnpushed === true,
+					prMode: o.prMode === true,
+				}) === null &&
 				depHold(live, t) === null,
 		);
 		if (merge) {

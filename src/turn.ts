@@ -48,8 +48,10 @@ import {
 	workCheckSendBack,
 	workPrompt,
 } from "./prompts.ts";
+import type { openPullRequest } from "./prs.ts";
 import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
+import { ownerRepo } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
 	classify,
@@ -92,6 +94,8 @@ import type {
 	DiffFileStat,
 	GitFacts,
 	LatestImage,
+	Next,
+	Outcome,
 	ProjectSettings,
 	QuotaState,
 	RecordedFinding,
@@ -126,6 +130,7 @@ import type {
 	isClean,
 	isIntegrated,
 	mergeHoldMismatch,
+	pushBranch,
 	rebaseTargetBranch,
 	removeWorktree,
 	resetBranchTo,
@@ -372,6 +377,16 @@ async function heldMergeOnBranchTip(
 		: `card #${parked.id} parks a held merge that is still the local tip of refs/heads/${branch} (its park could not reset the branch); resolve that card and reset the branch to origin first`;
 }
 
+/** PR mode: the pull request body — the integrated report's summary/details (whichever
+ * non-empty), the task id, and a footer naming Ottr as the opener. */
+function prBody(task: Task, outcome: Outcome | null): string {
+	const report = [outcome?.summary ?? "", outcome?.details ?? ""]
+		.map((s) => s.trim())
+		.filter((s) => s !== "")
+		.join("\n\n");
+	return `${report !== "" ? report : "Integrated the card branch."}\n\nTask: ${task.id}\n\n---\n<sub>Opened by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker.</sub>`;
+}
+
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
 export const UI_SHOT_WARNING =
 	"! UI files changed but no screenshot was attached — pass one in report_outcome's shots field";
@@ -528,6 +543,16 @@ export interface TurnOps {
 	runMergeGates: typeof runMergeGates;
 	/** OTTR-465: the credential kinds the server's git can use for a push to a URL (a card-log line, never a value); null for a non-URL pin. */
 	pushAuthKind?: (url: string) => string | null;
+	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
+	pushBranch?: typeof pushBranch;
+	/** PR mode: adopts or opens the pull request for the card branch (gh via runGh). */
+	openPr?: typeof openPullRequest;
+	/** PR mode: the integrated proof — clean worktree tree and origin/<target> an ancestor of HEAD. */
+	prIntegrated?: (
+		mainPath: string,
+		worktreePath: string,
+		target: string,
+	) => Promise<boolean>;
 	/** OTTR-465: wait before the single origin-unchanged push retry (default 30 s); tests pass 0. */
 	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
@@ -1367,6 +1392,7 @@ export function createTurnLoop(
 					hasRules: ops.hasRules(e.path),
 					only: drained ? e.store.boardCheckId() : undefined,
 					mainUnpushed: e.mainUnpushed === true,
+					prMode: settings.prMode === true,
 				});
 				for (const t of runnable) {
 					if (cap !== null && active() >= cap) return;
@@ -1957,7 +1983,13 @@ export function createTurnLoop(
 									siblings,
 									note: plan.note,
 								})
-							: withNote(mergePrompt({ branch: branch!, target }));
+							: withNote(
+									mergePrompt({
+										branch: branch!,
+										target,
+										pr: settings.prMode === true,
+									}),
+								);
 			// Reply turn: only the reply's images. Work turn: original prompt is re-sent, so its images plus any
 			// not-yet-sent reply images (a reply note before the first omp session). Merge turns get none.
 			const turnImages =
@@ -2509,6 +2541,9 @@ export function createTurnLoop(
 					return error;
 				}
 			};
+			// PR mode: the settle's ship step decides the card's next state itself (merging/idle
+			// with the PR stored, or a needs_you park); it overrides classify's done.
+			let prNext: Next | null = null;
 			const runPush = (): Promise<
 				| { status: "skipped" }
 				| { status: "pushed"; output: string }
@@ -2543,192 +2578,355 @@ export function createTurnLoop(
 								error: errmsg(err),
 							}));
 			if (kind === "merge" && !interview && !grill && !releaseCard) {
-				// An approved merge hold fixes what may ship. The merge turn resumes the same agent
-				// session and could commit beyond the approved head, so the push set
-				// (target..refs/heads/<branch>) must carry exactly the approved patches
-				// (base..approvedHead). Fails closed: git trouble parks the card. A reply to the
-				// mismatch park approves the exact parked head, so a sha-equal re-merge pushes.
-				const approvedHeads = [task.updateMergeHead, task.forkMergeHead].filter(
-					(h) => h !== null,
-				);
-				const branch = target.startsWith("origin/")
-					? target.slice("origin/".length)
-					: null;
-				const localHead =
-					branch === null || approvedHeads.length === 0
-						? null
-						: await ops
-								.targetSha(e.path, `refs/heads/${branch}`)
-								.catch(() => null);
-				if (branch !== null && approvedHeads.length > 0) {
-					if (localHead !== null && approvedHeads.includes(localHead)) {
-						// the exact head a reply approved: nothing new to judge
+				// PR mode ships the card branch itself: the server pushes the branch and opens the
+				// pull request, so nothing local is ever pushed to the target — the merge-hold
+				// machinery and serverMergePush of the target must not run for these cards.
+				if (settings.prMode === true) {
+					// The ship step settles an integrated report and nothing else: the PR prompt
+					// rebases before the gates and the security review, so a clean rebased tree
+					// alone proves nothing about their verdict. A needs_you report (a blocking
+					// finding, a failed gate) must reach classify and park with the agent's
+					// question — prNext stays null so classify decides.
+					if (result.outcome?.status !== "integrated") {
+						if (result.outcome === null)
+							// A lost receipt must not land via classify's git-integrated done
+							// path: nothing was merged, so ask for a human instead.
+							prNext = {
+								stage: "merging",
+								state: "needs_you",
+								needsReason:
+									"The agent finished without calling report_outcome.",
+							};
+					} else if (task.prNumber !== null) {
+						// A card already carrying a PR never re-ships: its PR is open and the
+						// tracker waits on GitHub; the card just stays merging/idle.
+						prNext = { stage: "merging", state: "idle", needsReason: null };
+					} else if (ops.pushBranch === undefined || ops.openPr === undefined) {
+						prNext = {
+							stage: "merging",
+							state: "needs_you",
+							needsReason:
+								"PR mode is on but the server's ship step is not wired; restart the board",
+						};
 					} else {
-						for (const ah of approvedHeads) {
-							const { mismatch, pushDiff, auditedTip } = await ops
-								.mergeHoldMismatch(e.path, target, base, ah, settings.originUrl)
-								.catch(() => ({
-									mismatch: true,
-									pushDiff: null,
-									auditedTip: null,
+						// Ship a proven integration: the same proof classify reads (clean tree,
+						// origin/<target> an ancestor of HEAD). An unproven integrated report
+						// ships nothing — classify takes the not-on-target park.
+						const proof = await ops
+							.prIntegrated?.(e.path, wt, target)
+							.catch(() => false);
+						const prBranch = task.branch ?? "";
+						const tip =
+							proof === true
+								? await ops
+										.targetSha(e.path, `refs/heads/${prBranch}`)
+										.catch(() => null)
+								: null;
+						if (proof !== true) {
+							// No ship: classify parks the integrated report as not-on-target.
+						} else if (tip === null || prBranch === "") {
+							prNext = {
+								stage: "merging",
+								state: "needs_you",
+								needsReason: `PR mode could not read the branch tip for ${prBranch || "(no branch)"}`,
+							};
+						} else if (settings.originUrl === null) {
+							prNext = {
+								stage: "merging",
+								state: "needs_you",
+								needsReason:
+									"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before pushing the branch",
+							};
+						} else {
+							const pr = await ops
+								.pushBranch(e.path, prBranch, settings.originUrl)
+								.catch((err: unknown) => ({
+									status: "failed" as const,
+									error: errmsg(err),
 								}));
-							if (mismatch) {
-								holdMismatch = MERGE_HOLD_MISMATCH_REASON;
-								holdHead = localHead;
-								// Same cap as the merge-start capture: bigger diffs keep their numstat.
-								holdDiff =
-									pushDiff === null
+							if (pr.status === "pushed") {
+								log(`- pushed ${prBranch} from the server`);
+							} else {
+								log(
+									`! server push of ${prBranch} ${pr.status === "rejected" ? "rejected" : "failed"}: ${pr.error}`,
+								);
+								const pushOut = "output" in pr ? (pr.output ?? null) : null;
+								if (pushOut !== null)
+									log(`git's full push output:\n${pushOut}`);
+								const kindAuth =
+									settings.originUrl === null
 										? null
-										: pushDiff.length > 200_000
-											? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
-											: pushDiff;
-								holdFiles =
-									holdDiff === null
-										? null
-										: await ops
-												.diffStat(e.path, target, `refs/heads/${branch}`)
-												.catch(() => null);
-								log("! held merge carries patches beyond the approved head");
-								// OTTR-326: the park resets the branch to the gate's audited tip so the
-								// held patches cannot ship with a later card's un-gated push; the
-								// reviewer still reads them from holdDiff/holdFiles. Without an audited
-								// tip (gate fetch failed) there is no trusted tip to reset to, and the
-								// push refusal below keeps the branch pinned instead.
-								const reset =
-									auditedTip !== null &&
-									(await ops
-										.resetBranchTo(e.path, branch, auditedTip)
-										.catch(() => false));
-								if (!reset)
-									log(
-										"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
-									);
-								break;
+										: (ops.pushAuthKind?.(settings.originUrl) ?? null);
+								if (kindAuth !== null) log(`- push auth: ${kindAuth}`);
+								prNext = {
+									stage: "merging",
+									state: "needs_you",
+									needsReason: `Server push to origin failed: ${pr.error}`,
+								};
 							}
-							holdTip = auditedTip;
+							if (pr.status === "pushed") {
+								// The PR needs a GitHub remote: PR mode without one is not a state
+								// the board holds, but the setting can drift — fail closed here.
+								const repo = e.github === null ? null : ownerRepo(e.github);
+								if (repo === null) {
+									prNext = {
+										stage: "merging",
+										state: "needs_you",
+										needsReason:
+											"PR mode requires a GitHub remote on the project; disable PR mode or add the remote",
+									};
+								} else {
+									const slash = repo.indexOf("/");
+									const opened = await ops
+										.openPr({
+											repo,
+											owner: repo.slice(0, slash),
+											branch: prBranch,
+											base: target.replace(/^origin\//, ""),
+											title: task.title,
+											body: prBody(task, result.outcome),
+										})
+										.catch((err: unknown) => ({
+											ok: false as const,
+											error: errmsg(err),
+										}));
+									if (!opened.ok) {
+										log(`! opening the pull request failed: ${opened.error}`);
+										prNext = {
+											stage: "merging",
+											state: "needs_you",
+											needsReason: `Opening the pull request failed: ${opened.error}`,
+										};
+									} else {
+										store.updateTask(id, {
+											stage: "merging",
+											state: "idle",
+											needsReason: null,
+											prNumber: opened.pr.number,
+											prUrl: opened.pr.url,
+											prHeadSha: tip,
+											pushSha: tip,
+										});
+										appendLog(
+											store,
+											id,
+											`- PR #${opened.pr.number} opened (base ${target.replace(/^origin\//, "")})`,
+										);
+										prNext = {
+											stage: "merging",
+											state: "idle",
+											needsReason: null,
+										};
+									}
+								}
+							}
 						}
 					}
-				}
-				// OTTR-326: a park whose branch reset could not run leaves the held patches as the
-				// local tip; no other card may push the branch while that head sits there.
-				refused = await heldMergeOnBranchTip(store, id, e.path, branch, ops);
-				if (holdMismatch === null) {
-					let p = await runPush();
-					let authLogged = false;
-					for (let attempt = 1; ; attempt++) {
-						if (p.status === "skipped") break;
-						if (p.status === "pushed") {
-							// A retry that landed erases the earlier failure: the card lands instead
-							// of parking on an error the second push already resolved.
-							pushError = null;
-							pushOutput = null;
-							pushRejected = false;
-							// OTTR-506: the push put the target on origin, so the merge hold lifts
-							// at once instead of waiting for the tick's branchUnpushed refresh.
-							e.mainUnpushed = false;
-							log(`- pushed ${target} from the server`);
-							// The agent's own push has no credentials (D6). A merge agent that stopped at
-							// needs_you on that authentication failure did integrate: the server push landed
-							// it, so the report becomes integrated with the push output in details.
-							const o = result.outcome;
-							const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
-							if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
-								result = {
-									...result,
-									asked: null,
-									outcome: {
-										...o,
-										status: "integrated",
-										question: undefined,
-										details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
-									},
-								};
-								log(
-									"- needs_you on a push authentication failure resolved: the server pushed",
-								);
+				} else {
+					// An approved merge hold fixes what may ship. The merge turn resumes the same agent
+					// session and could commit beyond the approved head, so the push set
+					// (target..refs/heads/<branch>) must carry exactly the approved patches
+					// (base..approvedHead). Fails closed: git trouble parks the card. A reply to the
+					// mismatch park approves the exact parked head, so a sha-equal re-merge pushes.
+					const approvedHeads = [
+						task.updateMergeHead,
+						task.forkMergeHead,
+					].filter((h) => h !== null);
+					const branch = target.startsWith("origin/")
+						? target.slice("origin/".length)
+						: null;
+					const localHead =
+						branch === null || approvedHeads.length === 0
+							? null
+							: await ops
+									.targetSha(e.path, `refs/heads/${branch}`)
+									.catch(() => null);
+					if (branch !== null && approvedHeads.length > 0) {
+						if (localHead !== null && approvedHeads.includes(localHead)) {
+							// the exact head a reply approved: nothing new to judge
+						} else {
+							for (const ah of approvedHeads) {
+								const { mismatch, pushDiff, auditedTip } = await ops
+									.mergeHoldMismatch(
+										e.path,
+										target,
+										base,
+										ah,
+										settings.originUrl,
+									)
+									.catch(() => ({
+										mismatch: true,
+										pushDiff: null,
+										auditedTip: null,
+									}));
+								if (mismatch) {
+									holdMismatch = MERGE_HOLD_MISMATCH_REASON;
+									holdHead = localHead;
+									// Same cap as the merge-start capture: bigger diffs keep their numstat.
+									holdDiff =
+										pushDiff === null
+											? null
+											: pushDiff.length > 200_000
+												? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
+												: pushDiff;
+									holdFiles =
+										holdDiff === null
+											? null
+											: await ops
+													.diffStat(e.path, target, `refs/heads/${branch}`)
+													.catch(() => null);
+									log("! held merge carries patches beyond the approved head");
+									// OTTR-326: the park resets the branch to the gate's audited tip so the
+									// held patches cannot ship with a later card's un-gated push; the
+									// reviewer still reads them from holdDiff/holdFiles. Without an audited
+									// tip (gate fetch failed) there is no trusted tip to reset to, and the
+									// push refusal below keeps the branch pinned instead.
+									const reset =
+										auditedTip !== null &&
+										(await ops
+											.resetBranchTo(e.path, branch, auditedTip)
+											.catch(() => false));
+									if (!reset)
+										log(
+											"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
+										);
+									break;
+								}
+								holdTip = auditedTip;
 							}
-							break;
 						}
-						pushRejected = p.status === "rejected";
-						pushError = p.error;
-						pushOutput = p.output ?? null;
-						log(
-							`! server push of ${target} ${pushRejected ? "rejected" : "failed"}: ${p.error}`,
-						);
-						// OTTR-465: the card log keeps git's complete output, so the cause a
-						// permission failure points at (a missing App installation, a token scope)
-						// stays visible, and one line names the credential kinds the push could use.
-						if (pushOutput !== null)
-							log(`git's full push output:\n${pushOutput}`);
-						if (!authLogged) {
-							authLogged = true;
-							const kind =
-								settings.originUrl === null
-									? null
-									: (ops.pushAuthKind?.(settings.originUrl) ?? null);
-							if (kind !== null) log(`- push auth: ${kind}`);
-						}
-						// OTTR-465: a push can fail while origin never moved (a dropped connection,
-						// a token-refresh hiccup): ALAT-60 landed unchanged on a later merge turn.
-						// One retry, when a fetch proves the push should still be a fast-forward —
-						// origin's tip still sits at the base the merge started from, or the local
-						// head is a fast-forward of it. A rejected push (origin moved) takes the
-						// OTTR-394 rebase path below instead.
-						if (
-							pushRejected ||
-							refused !== null ||
-							branch === null ||
-							attempt > 1
-						)
-							break;
-						if (settings.originUrl === null) {
+					}
+					// OTTR-326: a park whose branch reset could not run leaves the held patches as the
+					// local tip; no other card may push the branch while that head sits there.
+					refused = await heldMergeOnBranchTip(store, id, e.path, branch, ops);
+					if (holdMismatch === null) {
+						let p = await runPush();
+						let authLogged = false;
+						for (let attempt = 1; ; attempt++) {
+							if (p.status === "skipped") break;
+							if (p.status === "pushed") {
+								// A retry that landed erases the earlier failure: the card lands instead
+								// of parking on an error the second push already resolved.
+								pushError = null;
+								pushOutput = null;
+								pushRejected = false;
+								// OTTR-506: the push put the target on origin, so the merge hold lifts
+								// at once instead of waiting for the tick's branchUnpushed refresh.
+								e.mainUnpushed = false;
+								log(`- pushed ${target} from the server`);
+								// The agent's own push has no credentials (D6). A merge agent that stopped at
+								// needs_you on that authentication failure did integrate: the server push landed
+								// it, so the report becomes integrated with the push output in details.
+								const o = result.outcome;
+								const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
+								if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
+									result = {
+										...result,
+										asked: null,
+										outcome: {
+											...o,
+											status: "integrated",
+											question: undefined,
+											details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
+										},
+									};
+									log(
+										"- needs_you on a push authentication failure resolved: the server pushed",
+									);
+								}
+								break;
+							}
+							pushRejected = p.status === "rejected";
+							pushError = p.error;
+							pushOutput = p.output ?? null;
 							log(
-								"! no pinned origin URL; cannot re-check origin's tip before a push retry",
+								`! server push of ${target} ${pushRejected ? "rejected" : "failed"}: ${p.error}`,
 							);
-							break;
-						}
-						const fetchError = await ops
-							.fetchOriginBranch(e.path, branch, settings.originUrl)
-							.then(() => null)
-							.catch((err: unknown) =>
-								withAuthHint(settings.originUrl ?? "", errmsg(err)),
-							);
-						if (fetchError !== null) {
-							// The re-check's own reason (a network error, a token-refresh failure)
-							// rides the park reason; the retry stays off without a proven origin tip.
-							recheckError = fetchError;
+							// OTTR-465: the card log keeps git's complete output, so the cause a
+							// permission failure points at (a missing App installation, a token scope)
+							// stays visible, and one line names the credential kinds the push could use.
+							if (pushOutput !== null)
+								log(`git's full push output:\n${pushOutput}`);
+							if (!authLogged) {
+								authLogged = true;
+								const kind =
+									settings.originUrl === null
+										? null
+										: (ops.pushAuthKind?.(settings.originUrl) ?? null);
+								if (kind !== null) log(`- push auth: ${kind}`);
+							}
+							// OTTR-465: a push can fail while origin never moved (a dropped connection,
+							// a token-refresh hiccup): ALAT-60 landed unchanged on a later merge turn.
+							// One retry, when a fetch proves the push should still be a fast-forward —
+							// origin's tip still sits at the base the merge started from, or the local
+							// head is a fast-forward of it. A rejected push (origin moved) takes the
+							// OTTR-394 rebase path below instead.
+							if (
+								pushRejected ||
+								refused !== null ||
+								branch === null ||
+								attempt > 1
+							)
+								break;
+							if (settings.originUrl === null) {
+								log(
+									"! no pinned origin URL; cannot re-check origin's tip before a push retry",
+								);
+								break;
+							}
+							const fetchError = await ops
+								.fetchOriginBranch(e.path, branch, settings.originUrl)
+								.then(() => null)
+								.catch((err: unknown) =>
+									withAuthHint(settings.originUrl ?? "", errmsg(err)),
+								);
+							if (fetchError !== null) {
+								// The re-check's own reason (a network error, a token-refresh failure)
+								// rides the park reason; the retry stays off without a proven origin tip.
+								recheckError = fetchError;
+								log(
+									`! origin re-check before a push retry failed: ${fetchError}`,
+								);
+								break;
+							}
+							const originTip = await ops
+								.targetSha(e.path, `refs/remotes/origin/${branch}`)
+								.catch(() => null);
+							const localTip = await ops
+								.targetSha(e.path, `refs/heads/${branch}`)
+								.catch(() => null);
+							const fastForward =
+								originTip !== null &&
+								localTip !== null &&
+								(await ops
+									.targetContains(e.path, originTip, localTip)
+									.catch(() => false));
+							if (!fastForward) {
+								log(
+									"! origin moved or its tip is unreadable; not retrying the push",
+								);
+								break;
+							}
+							const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
 							log(
-								`! origin re-check before a push retry failed: ${fetchError}`,
+								`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
 							);
-							break;
+							await new Promise<void>((r) => setTimeout(r, waitMs));
+							p = await runPush();
 						}
-						const originTip = await ops
-							.targetSha(e.path, `refs/remotes/origin/${branch}`)
-							.catch(() => null);
-						const localTip = await ops
-							.targetSha(e.path, `refs/heads/${branch}`)
-							.catch(() => null);
-						const fastForward =
-							originTip !== null &&
-							localTip !== null &&
-							(await ops
-								.targetContains(e.path, originTip, localTip)
-								.catch(() => false));
-						if (!fastForward) {
-							log(
-								"! origin moved or its tip is unreadable; not retrying the push",
-							);
-							break;
-						}
-						const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
-						log(
-							`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
-						);
-						await new Promise<void>((r) => setTimeout(r, waitMs));
-						p = await runPush();
 					}
 				}
 			}
+			// PR mode proves the rebase instead of the merge: origin/<target> an ancestor of the
+			// worktree HEAD on a clean tree — the branch is rebased and ready for the server's
+			// mechanical steps. Every other project keeps today's targetContains proof.
+			const prModeFacts =
+				kind === "merge" &&
+				!interview &&
+				!grill &&
+				!fromMain &&
+				!releaseCard &&
+				settings.prMode === true;
 			const facts: GitFacts = {
 				// An interview card runs in the main checkout with no base branch: the commits-ahead
 				// gate would count its own AGENTS.md commit and trap the card, so it stays exempt.
@@ -2743,7 +2941,11 @@ export function createTurnLoop(
 					? await ops
 							.branchMergedOrGone(e.path, task.branch ?? "", target)
 							.catch(() => false)
-					: await ops.isIntegrated(wt, target).catch(() => false),
+					: prModeFacts
+						? ((await ops
+								.prIntegrated?.(e.path, wt, target)
+								.catch(() => false)) ?? false)
+						: await ops.isIntegrated(wt, target).catch(() => false),
 			};
 			// Landable clean commits with the report file gone: the card did real work after its
 			// research mark. Clear the flag and classify like any other work turn — the ready
@@ -2769,6 +2971,9 @@ export function createTurnLoop(
 						dir: ops.http400Dir,
 					}),
 			});
+			// The PR-mode ship step owns the card's next state: it never lands, so the done
+			// write below (pushSha pinning, worktree removal, release stamping) is skipped.
+			if (prNext !== null) next = prNext;
 			// A failed server push keeps the card at merging with git's reason: the worktree stays.
 			// OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
 			// server fetches origin with its own credentials, then — OTTR-510 — rebases the

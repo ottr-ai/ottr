@@ -6,7 +6,9 @@ import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import {
 	createPrWatcher,
+	openPullRequest,
 	PR_GATES,
+	parseCreatedPr,
 	parseDraft,
 	parsePullPage,
 	prUrl,
@@ -145,6 +147,110 @@ function setup(
 		cards: () => store.listTasks().filter((x) => x.kind === "pr_review"),
 	};
 }
+
+describe("parseCreatedPr", () => {
+	test("accepts a positive-int number with an optional html_url", () => {
+		expect(
+			parseCreatedPr('{"number":7,"html_url":"https://x/pull/7"}'),
+		).toEqual({ number: 7, url: "https://x/pull/7" });
+		expect(parseCreatedPr('{"number":3}')).toEqual({ number: 3, url: null });
+		expect(parseCreatedPr('{"number":3,"html_url":42}')).toEqual({
+			number: 3,
+			url: null,
+		});
+	});
+
+	test("rejects malformed bodies without throwing", () => {
+		expect(parseCreatedPr("not json")).toBe(null);
+		expect(parseCreatedPr("[]")).toBe(null);
+		expect(parseCreatedPr('{"number":0}')).toBe(null);
+		expect(parseCreatedPr('{"number":1.5}')).toBe(null);
+		expect(parseCreatedPr('{"number":"2"}')).toBe(null);
+		expect(parseCreatedPr("null")).toBe(null);
+	});
+});
+
+describe("openPullRequest", () => {
+	const args = {
+		repo: "o/r",
+		owner: "o",
+		branch: "ott/x",
+		base: "main",
+		title: "T",
+		body: "B",
+	};
+
+	test("creates the PR and parses the created body", async () => {
+		const calls: string[][] = [];
+		const gh: GhFn = async (a) => {
+			calls.push(a);
+			return {
+				code: 0,
+				stdout: JSON.stringify({ number: 9, html_url: "https://x/pull/9" }),
+				stderr: "",
+			};
+		};
+		const r = await openPullRequest({ ...args, gh });
+		expect(r.ok).toBe(true);
+		if (r.ok) expect(r.pr).toEqual({ number: 9, url: "https://x/pull/9" });
+		expect(calls).toHaveLength(2);
+		expect(calls[0]).toEqual([
+			"api",
+			"repos/o/r/pulls?state=open&head=o:ott/x&per_page=1",
+		]);
+		expect(calls[1]).toEqual([
+			"api",
+			"repos/o/r/pulls",
+			"-X",
+			"POST",
+			"-f",
+			"head=ott/x",
+			"-f",
+			"base=main",
+			"-f",
+			"title=T",
+			"-f",
+			"body=B",
+		]);
+	});
+
+	test("adopts an existing open PR without a create call", async () => {
+		const calls: string[][] = [];
+		const gh: GhFn = async (a) => {
+			calls.push(a);
+			return {
+				code: 0,
+				stdout: JSON.stringify([pr(5, sha("a"))]),
+				stderr: "",
+			};
+		};
+		const r = await openPullRequest({ ...args, gh });
+		expect(r.ok).toBe(true);
+		if (r.ok) expect(r.pr.number).toBe(5);
+		expect(calls).toHaveLength(1);
+	});
+
+	test("a failed gh call carries the capped stderr", async () => {
+		const gh: GhFn = async () => ({
+			code: 1,
+			stdout: "",
+			stderr: `line1\n${"x".repeat(400)}`,
+		});
+		const r = await openPullRequest({ ...args, gh });
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.error.length).toBeLessThanOrEqual(300);
+			expect(r.error.startsWith("x")).toBe(true);
+		}
+	});
+
+	test("an unparseable created body errors", async () => {
+		const gh: GhFn = async () => ({ code: 0, stdout: "{}", stderr: "" });
+		const r = await openPullRequest({ ...args, gh });
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).toContain("unreadable body");
+	});
+});
 
 describe("parsePullPage", () => {
 	test("skips malformed entries and cleans the title", () => {

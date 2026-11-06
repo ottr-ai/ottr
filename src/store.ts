@@ -72,6 +72,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	retroFilter: true,
 	forkResearch: false,
 	prReviews: false,
+	prMode: false,
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
@@ -255,6 +256,9 @@ interface TaskRow {
 	follow_up_of: string | null;
 	follow_up_of_project: string | null;
 	push_sha: string | null;
+	pr_number: number | null;
+	pr_url: string | null;
+	pr_head_sha: string | null;
 	topic: string | null;
 	depends_on: string;
 	update_ids: string;
@@ -400,6 +404,9 @@ function toTask(project: string, r: TaskRow): Task {
 		followUpOf: r.follow_up_of,
 		followUpOfProject: r.follow_up_of_project,
 		pushSha: r.push_sha,
+		prNumber: r.pr_number,
+		prUrl: r.pr_url,
+		prHeadSha: r.pr_head_sha,
 		topic: r.topic,
 		dependsOn: parseStringList(r.depends_on),
 		updateIds: parseStringList(r.update_ids),
@@ -625,6 +632,9 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	followUpOf: "follow_up_of",
 	followUpOfProject: "follow_up_of_project",
 	pushSha: "push_sha",
+	prNumber: "pr_number",
+	prUrl: "pr_url",
+	prHeadSha: "pr_head_sha",
 	topic: "topic",
 	dependsOn: "depends_on",
 	updateIds: "update_ids",
@@ -874,6 +884,7 @@ const SETTINGS_SHAPES = {
 	retroFilter: "boolean",
 	forkResearch: "boolean",
 	prReviews: "boolean",
+	prMode: "boolean",
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
@@ -1259,6 +1270,14 @@ export class ProjectStore {
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
 			);
+		// OTTR-552 PR-mode PR fields: ALTER-only after both CHECK rebuilds, same reason as
+		// push_retries above — a rebuild's explicit column list would drop them.
+		if (!cols.includes("pr_number"))
+			db.exec("ALTER TABLE tasks ADD COLUMN pr_number INTEGER");
+		if (!cols.includes("pr_url"))
+			db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
+		if (!cols.includes("pr_head_sha"))
+			db.exec("ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT");
 		const turnCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
 			.all()

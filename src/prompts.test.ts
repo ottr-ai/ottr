@@ -55,6 +55,54 @@ describe("no-destruction rule", () => {
 	});
 });
 
+describe("mergePrompt PR variant", () => {
+	test("the PR variant opens the pull request instead of merging", () => {
+		const p = mergePrompt({
+			branch: "ott/x",
+			target: "origin/main",
+			pr: true,
+		});
+		expect(p).toContain(
+			"the server pushes ott/x and opens the pull request (base main, head ott/x) on GitHub",
+		);
+		expect(p).not.toContain("git merge --ff-only");
+		expect(p).not.toContain("fast-forward main");
+	});
+
+	test("the PR variant keeps the rebase, install and security-review steps", () => {
+		const p = mergePrompt({
+			branch: "ott/x",
+			target: "origin/develop",
+			pr: true,
+		});
+		expect(p).toContain("rebase onto origin/develop");
+		expect(p).toContain("locked/frozen mode");
+		const sec = p.indexOf("diff-security-review");
+		const prSentence = p.indexOf("opens the pull request");
+		expect(sec).toBeGreaterThan(-1);
+		expect(sec).toBeLessThan(prSentence);
+	});
+
+	test("the PR variant keeps the needs_you escape and the integrated outcome", () => {
+		const p = mergePrompt({
+			branch: "ott/x",
+			target: "origin/main",
+			pr: true,
+		});
+		expect(p).toContain("needs_you and the exact rule that blocks it");
+		expect(p).toContain(
+			"integrated (summary is one line; put the integration output, e.g. release stdout, verbatim in details)",
+		);
+		expect(p).toContain("Do not merge and do not push");
+	});
+
+	test("the default path (pr falsy) still names the ff-merge", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p).not.toContain("opens the pull request");
+		expect(p).toContain("git merge --ff-only ott/x");
+	});
+});
+
 describe("summary requirement", () => {
 	test("work prompt's ready outcome names the one-line summary", () => {
 		expect(workPrompt({ text: "t", branch: "b", siblings: [] })).toContain(
@@ -695,6 +743,9 @@ describe("handoffMarkdown research report", () => {
 		keptFiles: [],
 		followUpOf: null,
 		followUpOfProject: null,
+		prNumber: null,
+		prUrl: null,
+		prHeadSha: null,
 		pushSha: null,
 		mergeHead: null,
 		kind: "work" as const,

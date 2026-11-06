@@ -318,6 +318,7 @@ describe("settings", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prMode: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -342,6 +343,7 @@ describe("settings", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prMode: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -859,6 +861,37 @@ describe("keptFiles", () => {
 		const reopened = open(join(root, "push-sha-link"));
 		expect(reopened.getTask(task.id)?.pushSha).toBe("abc12345");
 		expect(reopened.updateTask(task.id, { pushSha: null }).pushSha).toBe(null);
+		reopened.close();
+	});
+
+	test("updateTask round-trips the PR-mode fields and they survive a reopen", () => {
+		const store = open(join(root, "pr-task-fields"));
+		const task = store.createTask("pr me");
+		expect(task.prNumber).toBe(null);
+		expect(task.prUrl).toBe(null);
+		expect(task.prHeadSha).toBe(null);
+		const updated = store.updateTask(task.id, {
+			prNumber: 7,
+			prUrl: "https://github.com/octo/repo/pull/7",
+			prHeadSha: "def67890",
+		});
+		expect(updated.prNumber).toBe(7);
+		expect(updated.prUrl).toBe("https://github.com/octo/repo/pull/7");
+		expect(updated.prHeadSha).toBe("def67890");
+		store.close();
+		const reopened = open(join(root, "pr-task-fields"));
+		const back = reopened.getTask(task.id)!;
+		expect(back.prNumber).toBe(7);
+		expect(back.prUrl).toBe("https://github.com/octo/repo/pull/7");
+		expect(back.prHeadSha).toBe("def67890");
+		const cleared = reopened.updateTask(task.id, {
+			prNumber: null,
+			prUrl: null,
+			prHeadSha: null,
+		});
+		expect(cleared.prNumber).toBe(null);
+		expect(cleared.prUrl).toBe(null);
+		expect(cleared.prHeadSha).toBe(null);
 		reopened.close();
 	});
 
@@ -2982,6 +3015,16 @@ describe("pr review store methods", () => {
 	test("prReviews defaults to false", () => {
 		expect(DEFAULT_SETTINGS.prReviews).toBe(false);
 		expect(open(join(root, "pr-settings")).getSettings().prReviews).toBe(false);
+	});
+
+	test("prMode defaults to false and persists across reopen", () => {
+		expect(DEFAULT_SETTINGS.prMode).toBe(false);
+		const store = open(join(root, "pr-mode"));
+		expect(store.getSettings().prMode).toBe(false);
+		store.setSettings({ prMode: true });
+		expect(store.getSettings().prMode).toBe(true);
+		store.close();
+		expect(open(join(root, "pr-mode")).getSettings().prMode).toBe(true);
 	});
 
 	test("savePrReview upserts by number and round-trips booleans and nulls", () => {
