@@ -52,6 +52,8 @@ When a running turn writes nothing to its task log for 2 hours, its card shows a
 
 If a turn fails without stderr, its card shows the provider's error when the event stream has one. The task log records it too. Ottr removes stored secrets, labeled secrets, URL credentials, and common API tokens from this error. A check run that dies because its model's provider has no usable sign-in names the provider on the card, with the fix: sign in again under Settings. The bell lists an advisory for every configured model role whose provider's stored sign-in omp has disabled, with omp's disabled cause and the role names.
 
+The **System** page (`/system`, in the sidebar under Overview) shows where the machine runs out. Each container (the server, then each worker in `OTTR_WORKER_URLS`) gets one row. A row shows its CPU against its share, memory used against its limit (as `docker stats` counts it), memory limit hits, OOM kills, the turns running on it, and its mutation lock holder and waiters, with one-hour sparklines. The numbers come from the container's own cgroup v2 files; workers report theirs on `GET /stats`. A row turns amber, with the reason as text, at 90 % of its memory limit, after an OOM kill in the last hour, or at 90 % of its CPU share for 5 minutes. The header then shows a warning mark that links to the page. A worker that does not answer reads "not reachable since HH:MM". The page also shows the Docker VM (CPU, load, available memory) and the board-wide holds: the update hold with its commits, running agents against the cap, and the queue with its oldest wait. Samples come every 30 s; the hour of history lives in memory and starts over when the board restarts.
+
 ## Workflows: review and release
 
 <p align="center">
