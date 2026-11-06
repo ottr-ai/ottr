@@ -140,7 +140,7 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
 
 ## Components
 
-- **Buttons** — 32px min-height, 4px radius, card-grey stock with a 1px line. Variants: primary (steel fill, dark ink, weight 600), danger (red line, transparent fill, red text that gains a red wash on hover), ghost and icon (transparent until hover). Disabled is 50% opacity, never reflowed.
+- **Buttons** — 32px min-height, 4px radius, card-grey stock with a 1px line. Variants: primary (steel fill, dark ink, weight 600), danger (red line, transparent fill, red text that gains a red wash on hover), ghost and icon (transparent until hover). Disabled is 50% opacity, never reflowed. **One primary per surface:** when a screen stacks sections that each carry a steel button — the task drawer above all — at most one may render `primary`. Priority when several could: the card's decision (hold approve, proposal accept, ask send) first, then a done PR-review card's Post review, then the composer submit (Reply/Steer) and the generic Follow up. Edit-form Saves (prompt, steering, release notes) and every other candidate render stock grey.
 - **New task FAB** — phones only (≤720px viewport): 56px full circle fixed bottom-right 16px inside the safe area, steel fill, dark ink plus icon, 1px line edge, no shadow — an in-page control, not an overlay. It replaces the header New task button in that tier, keeping one steel-filled control on screen (One-Edge); 160ms rise on the shared easing, collapsed under reduced motion.
 - **Inputs** — recessed `--well` fill, 1px line, 4px radius; hover lightens the line, focus-visible turns it steel.
 - **Area list item** — 36px row, transparent line; hover shows panel grey; the current page carries the steel border — the One-Edge in navigation.
@@ -211,6 +211,7 @@ The board targets **WCAG 2.1 AA**, enforced through the design system itself, th
 ### Do's
 
 - Do render every healthy state in grey, with bright tabular values for anything numeric.
+- Do give every drawer state at most one `primary` — the decision when there is one, else the card's own next action; every other section renders stock grey.
 - Do pair every amber or red with its shape — triangle, square, or band tick.
 - Do keep the steel accent as the only interactive colour; one edge per screen for selection.
 - Do use native `<dialog>` and the Popover API for modality and light-dismiss detail.
@@ -223,6 +224,7 @@ The board targets **WCAG 2.1 AA**, enforced through the design system itself, th
 ### Don'ts
 
 - Don't colour charts, columns, badges, or counts that are not alarming — this is not a GitHub-dark kanban.
+- Don't show two `primary` buttons on one screen; when drawer sections compete for the fill, the Buttons priority picks the winner.
 - Don't add gradients, glass, blur, or glow; surfaces are flat fills on 1px lines.
 - Don't make alarms blink, pulse, or repeat; an alarm arrives once, like an unacknowledged HMI alarm.
 - Don't put shadows on in-page surfaces; shadow means top-layer overlay.

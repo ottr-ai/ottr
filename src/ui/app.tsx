@@ -414,7 +414,8 @@ function ImageBrowseButton({
 }
 
 /** The action row under Reply and Steer: the run settings (model, thinking) over one button
- * bar with Add image at its left edge; `primary` is the form's submit. */
+ * bar with Add image at its left edge; `primary` is the form's submit — stock grey when a
+ * decision section owns the loud slot (one primary per surface, DESIGN.md → Buttons). */
 function ComposerActions({
 	onAddImages,
 	catalog,
@@ -7150,7 +7151,9 @@ function PromptEditForm({
 				</button>
 				<button
 					type="submit"
-					className={"primary" + (editSave.failed ? " failed" : "")}
+					// One primary per surface: edit saves stay stock grey; the decision
+					// (or nothing) owns the loud slot.
+					className={editSave.failed ? "failed" : undefined}
 					disabled={!editValid || editSave.busy}
 					aria-busy={editSave.busy || undefined}
 				>
@@ -7642,6 +7645,17 @@ export function Drawer({
 		(task.stage === "done"
 			? task.turns.findLast((t) => t.kind === "work" && t.summary !== null)
 			: undefined) ?? task;
+	// One primary per surface (DESIGN.md → Buttons): the drawer stacks sections that each
+	// carry a steel button, so at most one may claim the fill. The card's decision wins —
+	// hold approve, proposal accept, ask send, kept-files finish — and the composer's
+	// Reply renders stock grey beside it. On a done PR-review card the section's Post
+	// review outranks the generic Follow up the same way.
+	const decisionPrimary =
+		askedNow ||
+		(task.state === "needs_you" && task.holdHead !== null) ||
+		proposal ||
+		(task.state === "needs_you" && task.keptFiles.length > 0);
+	const prReviewOpen = task.kind === "pr_review" && task.prReview !== undefined;
 	// PR review card: the watcher saves each draft as the done card's details.
 	const prDraft =
 		task.kind === "pr_review" &&
@@ -8267,11 +8281,10 @@ export function Drawer({
 											)}
 											Add to notes
 										</button>
+										{/* One primary per surface: the notes Save stays stock grey. */}
 										<button
 											type="submit"
-											className={
-												"primary" + (notesSave.failed ? " failed" : "")
-											}
+											className={notesSave.failed ? "failed" : undefined}
 											disabled={!notesValid || notesSave.busy}
 											aria-busy={notesSave.busy || undefined}
 										>
@@ -8941,11 +8954,11 @@ export function Drawer({
 															>
 																Cancel
 															</button>
+															{/* One primary per surface: the edit Save stays stock grey. */}
 															<button
 																type="submit"
 																className={
-																	"primary" +
-																	(steerEditSave.failed ? " failed" : "")
+																	steerEditSave.failed ? "failed" : undefined
 																}
 																disabled={
 																	steerEdit.trim().length === 0 ||
@@ -9122,9 +9135,11 @@ export function Drawer({
 						)}
 					{followUp ? (
 						<div className="followup-cta">
+							{/* One primary per surface: the PR section's Post review outranks
+							    the generic Follow up, which renders stock grey beside it. */}
 							<button
 								type="button"
-								className="primary"
+								className={prReviewOpen ? undefined : "primary"}
 								onClick={() => setFollowOpen(true)}
 							>
 								<Icon name="send" />
@@ -9243,8 +9258,15 @@ export function Drawer({
 									primary={
 										<button
 											type="submit"
+											// One primary per surface: while a decision section owns
+											// the loud slot (hold, proposal, ask, kept files), the
+											// composer's Reply renders stock grey.
 											className={
-												"primary" + (replySend.failed ? " failed" : "")
+												decisionPrimary
+													? replySend.failed
+														? "failed"
+														: undefined
+													: `primary${replySend.failed ? " failed" : ""}`
 											}
 											disabled={replySend.busy}
 											aria-busy={replySend.busy || undefined}

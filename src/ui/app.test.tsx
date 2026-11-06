@@ -2579,6 +2579,13 @@ describe("Drawer approve button", () => {
 		usedTotal: 0,
 		maxTotal: null,
 	};
+	// The drawer itself is a native <dialog>, and closed compose dialogs render their
+	// children into static markup. One primary per surface judges what is on screen,
+	// so the closed `class="dialog"` blocks come out before counting; the drawer stays.
+	const visiblePrimaries = (html: string): string[] =>
+		html
+			.replace(/<dialog class="dialog"[\s\S]*?<\/dialog>/g, "")
+			.match(/class="primary"/g) ?? [];
 
 	test("a parked merge hold renders the approve button", () => {
 		const task = cardFixture({
@@ -2591,6 +2598,78 @@ describe("Drawer approve button", () => {
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain("Approve merge");
+	});
+
+	test("a parked hold keeps Approve merge the only primary; Reply drops to grey", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason:
+				"Update card: read the summary, then reply to approve the merge.",
+			holdHead: "sha-parked",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		// One primary per surface: the hold bar's decision wins, the composer's submit demotes.
+		expect(visiblePrimaries(html)).toHaveLength(1);
+		// Closed compose dialogs also render their children; judge the visible reply form.
+		const visible = html.replace(
+			/<dialog class="dialog"[\s\S]*?<\/dialog>/g,
+			"",
+		);
+		expect(visible).not.toContain('type="submit" class="primary"');
+	});
+
+	test("a plain needs-you card keeps Reply as the one primary", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+			holdHead: null,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(visiblePrimaries(html)).toHaveLength(1);
+		expect(html).toContain('type="submit" class="primary"');
+	});
+
+	test("a done PR-review card keeps Post review primary; Follow up drops to grey", () => {
+		const task = cardFixture({
+			...drawerFields,
+			kind: "pr_review",
+			details: "Looks good — one nit below.",
+			stage: "done",
+			state: "idle",
+			prReview: {
+				url: "https://github.com/acme/repo/pull/7",
+				number: 7,
+				state: "open",
+				reviewedHead: "sha-1",
+				postedHead: null,
+				postedLogin: null,
+				postedUrl: null,
+				postError: null,
+			},
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Post review");
+		expect(html).toContain("Follow up");
+		expect(visiblePrimaries(html)).toHaveLength(1);
+		expect(html).toContain('<div class="followup-cta"><button type="button">');
+	});
+
+	test("a done research card keeps Follow up as the one primary", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Follow up");
+		expect(visiblePrimaries(html)).toHaveLength(1);
+		expect(html).toContain(
+			'<div class="followup-cta"><button type="button" class="primary">',
+		);
 	});
 
 	test("a needs-you card without a parked hold renders none", () => {
