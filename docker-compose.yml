@@ -282,10 +282,18 @@ services:
   alate:
     image: ${ALATE_IMAGE:-ghcr.io/ottr-ai/alate:latest}
     profiles: [alate]
-    command: node server.ts --host 0.0.0.0 --config /state/server-config.json --db /state/alate.db
+    # Podman injects the host proxy env (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) into every
+    # container; its NO_PROXY names no compose services, so http://alate:4570 and
+    # http://ottr:<port> from the board would bounce off the corporate proxy. The image
+    # is external and carries no ottr entry script, so bind-mount one and source it.
+    entrypoint:
+      - sh
+      - -c
+      - . /no-proxy.sh && exec node server.ts --host 0.0.0.0 --config /state/server-config.json --db /state/alate.db
     restart: unless-stopped
     logging: *logging
     volumes:
+      - ./docker/no-proxy.sh:/no-proxy.sh:ro
       - home:/root # alate provisions the workers' shared agent layer here
       - alate-state:/state
     environment:

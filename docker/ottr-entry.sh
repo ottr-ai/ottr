@@ -83,4 +83,13 @@ if [ -n "$PI_CODING_AGENT_DIR" ]; then
 		echo "ottr-entry: R5-1: $PI_CODING_AGENT_DIR is not seeded; refused the shared home $HOME as its source (worker-writable). The board's omp runs without the agent layer until a trusted seed: docker compose run --rm board-seed --repo <owner/name> (docs/WORKERS.md)" >&2
 	fi
 fi
+# Podman injects the host proxy env (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) into every
+# container and its NO_PROXY names no compose services, so internal calls
+# (http://alate:4570, http://worker-a:8787, http://ottr:<port>) would go to the
+# corporate proxy and bounce. Sourced: appends the service names, keeping the
+# injected host list. Compose cannot see the injected value; the entry script can.
+# Sibling-relative: the image COPYs both scripts to /, and the host-side gate
+# scripts/ottr-entry.test.ts runs the script straight from docker/, where the
+# sibling also exists.
+. "$(dirname "$0")/no-proxy.sh"
 exec "$@"

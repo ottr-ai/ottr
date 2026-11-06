@@ -179,6 +179,7 @@ ENV OTTR_VERSION=${OTTR_VERSION}
 ENV NODE_OPTIONS=--require=/app/src/stryker-tap.cjs
 
 COPY docker/ottr-entry.sh /ottr-entry.sh
+COPY docker/no-proxy.sh /no-proxy.sh
 RUN chmod +x /ottr-entry.sh
 
 EXPOSE 4747 8787
