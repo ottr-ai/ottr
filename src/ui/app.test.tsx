@@ -21,6 +21,8 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
+// Static: models.ts touches no browser global at load, so hoisting is safe.
+import { resetCatalogCache } from "./models.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -2552,6 +2554,111 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			parked,
 			"Move to todo",
 			"Puts the card in the todo lane so the agent can start it",
+		);
+	});
+
+	// The Plan with agent / Move to todo dialogs read the shared model catalog.
+	// Each test answers /api/models itself and clears the cache after, so later
+	// tests keep their retry-on-empty behavior; every other request degrades to
+	// the row (the drawer's failed detail fetch), as in expectGuard above.
+	const withCatalog = async (
+		roles: Record<string, string>,
+		cardModel: string | null,
+		open: "Plan with agent" | "Move to todo",
+		want: string,
+	): Promise<void> => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			if (String(input).endsWith("/api/models"))
+				return new Response(
+					JSON.stringify({
+						models: [
+							{
+								id: "anthropic/claude-opus-5-5",
+								selector: "anthropic/claude-opus-5-5",
+								name: "Claude Opus 5.5",
+								contextWindow: null,
+							},
+							{
+								id: "zai/glm-5.3-flash",
+								selector: "zai/glm-5.3-flash",
+								name: "GLM 5.3 Flash",
+								contextWindow: null,
+							},
+						],
+						roles,
+					}),
+					{ status: 200 },
+				);
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		resetCatalogCache();
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const parked = cardFixture({
+			...drawerFields,
+			stage: "backlog",
+			state: "idle",
+			prompt: "parked idea",
+			...(cardModel !== null ? { model: cardModel } : {}),
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={parked} />);
+			});
+			// One more act lets the catalog fetch land before the dialog opens.
+			await act(async () => {});
+			await act(async () => {
+				onClickOf(button(container, open))({});
+			});
+			expect(
+				container
+					.querySelector("button.model-trigger")
+					?.getAttribute("aria-label"),
+			).toBe(want);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			resetCatalogCache();
+		}
+	};
+
+	test("Plan with agent opens on the plan role's model", async () => {
+		await withCatalog(
+			{
+				default: "zai/glm-5.3-flash",
+				plan: "anthropic/claude-opus-5-5:medium",
+			},
+			null,
+			"Plan with agent",
+			"Model: anthropic/claude-opus-5-5:medium",
+		);
+	});
+
+	test("Move to todo keeps the card's model even with a plan role", async () => {
+		await withCatalog(
+			{
+				default: "zai/glm-5.3-flash",
+				plan: "anthropic/claude-opus-5-5:medium",
+			},
+			"zai/glm-5.3-flash",
+			"Move to todo",
+			"Model: zai/glm-5.3-flash",
+		);
+	});
+
+	test("Plan with agent keeps the card's model when no plan or slow role is assigned", async () => {
+		await withCatalog(
+			{ default: "zai/glm-5.3-flash" },
+			"zai/glm-5.3-flash",
+			"Plan with agent",
+			"Model: zai/glm-5.3-flash",
 		);
 	});
 

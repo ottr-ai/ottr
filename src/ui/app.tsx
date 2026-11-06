@@ -2315,13 +2315,16 @@ function BacklogModelDialog({
 	const send = useBusy();
 	useEffect(() => {
 		if (open) {
-			setModel(currentModel ?? "");
+			// Plan with agent opens on the plan role's model (else slow, like the review and
+			// release dialogs); with neither role assigned the card's own model stays.
+			const rm = mode === "grill" ? reviewModel(catalog) : null;
+			setModel(rm !== null ? rm.model : (currentModel ?? ""));
 		} else {
 			setModel("");
 			setModelQuery("");
 			setErr(null);
 		}
-	}, [open, currentModel]);
+	}, [open, currentModel, mode, catalog]);
 	return (
 		<Modal
 			open={open}
