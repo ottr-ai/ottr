@@ -525,6 +525,61 @@ describe("createPrWatcher", () => {
 		expect(msg).toContain("re-review");
 	});
 
+	test("the re-review prompt lists earlier findings only while some stay open or partly fixed", async () => {
+		const s = setup();
+		s.setOpen([pr(27, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(27)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 27)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(27, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "earlier review body", "2026-01-01T00:00:00Z"),
+		]);
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The first review's prompt has no paragraph; the re-review's carries the
+		// still-open branch: list only the open or partly fixed ones, with evidence.
+		expect(s.prompts[0]).not.toContain("still open or partly fixed");
+		expect(s.prompts.at(-1)).toContain(
+			"still open or partly fixed, list exactly those findings",
+		);
+		expect(s.prompts.at(-1)).toContain("evidence from the diff");
+	});
+
+	test("the re-review prompt thanks and skips the list when every earlier finding is fixed", async () => {
+		const s = setup();
+		s.setOpen([pr(28, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(28)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 28)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(28, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "earlier review body", "2026-01-01T00:00:00Z"),
+		]);
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts.at(-1)).toContain(
+			"one short line of thanks and give only new findings",
+		);
+		expect(s.prompts.at(-1)).toContain("no per-finding list");
+	});
+
 	test("a re-review over budget drops the oldest comments first and says so", async () => {
 		const s = setup();
 		s.setOpen([pr(23, sha("a"))]);
