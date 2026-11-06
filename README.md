@@ -137,7 +137,7 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]`, `Test-Path`, and `[ -f .env ]` guards keep the existing `agent.db` snapshot and the same Alate key, and the named volumes keep the board data. Set `OTTR_GITHUB_HOST` before onboarding (a commented line in `.env` works); otherwise a `*.ghe.com` token is checked against `github.com`, so the expiry probe and the GitHub API calls would aim at the wrong host.
+The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]`, `Test-Path`, and `[ -f .env ]` guards keep the existing `agent.db` snapshot and the same Alate key, and the named volumes keep the board data. Set `OTTR_GITHUB_HOST` before onboarding: uncomment the `# OTTR_GITHUB_HOST=acme.ghe.com` line in `.env` and replace the example host with yours (compose ignores the line while it stays commented); otherwise a `*.ghe.com` token is checked against `github.com`, so the expiry probe and the GitHub API calls would aim at the wrong host.
 
 The `export` and `$env:` values live only in the current shell. Compose also reads a `.env` file in the same folder by itself, so put the values there (one `NAME=value` per line, for example `OTTR_WORKER_TOKEN=...`) and a new shell needs no exports. The Alate lines in the quick start already write the three Alate settings there; keep the `ALATE_API_KEY` line, because the board and alate must share one key.
 
@@ -277,7 +277,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 
 ## GitHub tokens
 
-Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. Per-host tokens under **Settings → Git hosts** are git credentials for hosts other than the configured GitHub host; on `github.com` itself the board token also serves the board's own git fetches and pushes, so a per-host token is only needed for a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or another non-GitHub git host.
+Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. The board token also serves the board's own git fetches and pushes on `github.com` itself: the worker image's git credential helper is pinned to `https://github.com` (`Dockerfile.worker`). Git on every other host — a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or any non-GitHub git host — needs its own per-host token under **Settings → Git hosts**.
 
 ### Recommended token
 
