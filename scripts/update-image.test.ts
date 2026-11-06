@@ -121,6 +121,12 @@ function fakes(
 		/** Exit code and output of `compose restart server` (a failed seed-only restart). */
 		restart?: number;
 		restartOut?: string;
+		/** The deployed commit the server volume records (the `cat` exec's output). */
+		deployedRecord?: string;
+		/** The restart-wait start the server volume records (the `cat` exec's output; "" = none). */
+		waitSince?: string;
+		/** The card ids the board answers for the running turns ("!fail" makes the exec exit 1). */
+		waitTurns?: string;
 		/** The board's answers to GET /api/drain, in order; the last one repeats. Without
 		 *  them the board answers 404 (one version older) and the run keeps the legacy
 		 *  whole-board flow. */
@@ -175,6 +181,15 @@ function fakes(
 			const detach = !drain && !health && line.includes("'/detach'");
 			const dlist =
 				!drain && !health && !detach && line.includes('"/detached"');
+			// The wait-turns read fetches /api/state like the count, but maps the
+			// card ids out instead of counting.
+			const wt =
+				!drain &&
+				!health &&
+				!detach &&
+				!dlist &&
+				line.includes("/api/state") &&
+				line.includes(".map((t) => t.id)");
 			if (drain) drains.push(line);
 			if (args.includes("board-seed")) {
 				seedRuns.push(line);
@@ -185,11 +200,21 @@ function fakes(
 					out: o.seedCode ? "the seed step failed\n" : "",
 				};
 			}
-			if (line.includes("seed-commit") || line.includes("seed-token-expires")) {
+			if (
+				line.includes("seed-commit") ||
+				line.includes("seed-token-expires") ||
+				line.includes("build-commit") ||
+				line.includes("restart-waiting-since")
+			) {
 				// The read is the `cat` exec, the write is the `printf` exec.
 				calls.push(line);
-				if (line.includes("cat "))
+				if (line.includes("cat ")) {
+					if (line.includes("restart-waiting-since"))
+						return { code: 0, out: `${o.waitSince ?? ""}\n` };
+					if (line.includes("build-commit"))
+						return { code: 0, out: `${o.deployedRecord ?? ""}\n` };
 					return { code: 0, out: `${o.seedRecord ?? ""}\n` };
+				}
 				seedWrites.push(line);
 				return { code: 0, out: "" };
 			}
@@ -218,7 +243,9 @@ function fakes(
 										? " -e <detach>"
 										: dlist
 											? " -e <detached>"
-											: " -e <count>",
+											: wt
+												? " -e <wait>"
+												: " -e <count>",
 				),
 			);
 			if (args.includes("build")) {
@@ -313,6 +340,11 @@ function fakes(
 					? { code, out: "HTTP 500\n" }
 					: { code: 0, out: '{"ok":true}\n' };
 			}
+			if (wt) {
+				// A failed read prints the board's HTTP status and exits 1, like the other scripts.
+				if (o.waitTurns === "!fail") return { code: 1, out: "HTTP 500\n" };
+				return { code: 0, out: `${o.waitTurns ?? ""}\n` };
+			}
 			if (get) {
 				// No answer at all is the mixed-version fallback: a board one version
 				// older has no GET /api/drain, and the run keeps the whole-board flow.
@@ -397,6 +429,7 @@ function fakes(
 
 const BUILD = "compose -f c.yml build server";
 const COUNT = "compose -f c.yml exec -T server bun -e <count>";
+const WAIT = "compose -f c.yml exec -T server bun -e <wait>";
 const HOLD = "compose -f c.yml exec -T server bun -e <hold>";
 const FREE = "compose -f c.yml exec -T server bun -e <free>";
 const PS = "compose -f c.yml ps --services --status running";
@@ -428,6 +461,16 @@ const SIDE_COMPARE = [
 ];
 const UP = "compose -f c.yml up -d --wait";
 const PRUNE = "image prune --force --filter label=ottr.image=worker";
+/** The deploy record a settled run writes before the prune: the server's commit, and the wait clock reset. */
+const DEPLOYED = (main: string) =>
+	`compose -f c.yml exec -T server sh -c printf %s '${must(main, "log", "-1", "--format=%h")}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since`;
+/** The wait report's execs, as the fake records them. */
+const CAT_BUILD =
+	"compose -f c.yml exec -T server sh -c cat /etc/ottr/build-commit";
+const CAT_WAIT =
+	"compose -f c.yml exec -T server sh -c cat /etc/ottr/restart-waiting-since";
+const WAIT_WRITE = (at: number) =>
+	`compose -f c.yml exec -T server sh -c printf %s '${at}' > /etc/ottr/restart-waiting-since`;
 const GET = "compose -f c.yml exec -T server bun -e <get>";
 const HEALTH = "compose -f c.yml exec -T server bun -e <health>";
 const RUNNING3 = "server\nworker-a\nworker-b";
@@ -537,6 +580,7 @@ describe("updateImage", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.at(-1)).toEndWith("with omp 1.1.0");
@@ -570,7 +614,17 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			CAT_BUILD,
+		]);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run: the restart waits for a later run",
 		);
@@ -594,6 +648,9 @@ describe("updateImage", () => {
 			CONFIG,
 			"image inspect --platform linux/amd64 -f {{.Id}} ottr-worker:local",
 			COUNT,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			CAT_BUILD,
 		]);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run: the restart waits for a later run",
@@ -626,6 +683,7 @@ describe("updateImage", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -639,7 +697,7 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.waits).toHaveLength(81);
-		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+		expect(f.calls.slice(-2)).toEqual([DEPLOYED(main), PRUNE]);
 		expect(f.logs.join("\n")).not.toContain("waits for a later run");
 	}, 60_000);
 
@@ -649,7 +707,12 @@ describe("updateImage", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		// 120 polls of 30 s fill the hour; one more would end past it.
 		expect(f.waits).toHaveLength(120);
-		expect(f.calls.slice(-3)).toEqual([HOLD, COUNT, FREE]);
+		// The deferred restart ends the run with its wait report.
+		expect(f.calls.slice(-3)).toEqual([
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+			CAT_BUILD,
+		]);
 		expect(f.calls).not.toContain(UP);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run after 60 min of hold: the hold ends, and the restart waits for a later run",
@@ -660,7 +723,8 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ newImage: true, turns: "1", free: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls.at(-1)).toBe(FREE);
+		expect(f.calls.at(-4)).toBe(FREE);
+		expect(f.calls.at(-1)).toBe(CAT_BUILD);
 		expect(f.logs.join("\n")).toContain(
 			"1 turns run after 60 min of hold, and the board cannot end the hold (HTTP 404): it lapses 30 min after the last renewal",
 		);
@@ -680,6 +744,9 @@ describe("updateImage", () => {
 			COUNT,
 			HOLD,
 			COUNT,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 30_000),
+			CAT_BUILD,
 		]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("the board cannot hold new turns: HTTP 404");
@@ -690,7 +757,18 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ newImage: true, hold: 1, turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, HOLD, COUNT]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			HOLD,
+			COUNT,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			CAT_BUILD,
+		]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("the board cannot hold new turns: HTTP 404");
 		expect(log).toContain("2 turns run: the restart waits for a later run");
@@ -753,7 +831,17 @@ describe("updateImage", () => {
 				"WARN[0000] Found orphan containers ([ottr-old-1]) for this project.\n10\n",
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			GET,
+			...COMPARE,
+			COUNT,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			CAT_BUILD,
+		]);
 		expect(f.logs.join("\n")).toContain("10 turns run");
 	}, 60_000);
 
@@ -762,7 +850,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ running: "" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, UP, PRUNE]);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, UP, DEPLOYED(main), PRUNE]);
 		expect(f.logs.join("\n")).toContain("no running board");
 	}, 60_000);
 
@@ -801,6 +889,7 @@ describe("updateImage", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(drainBody(f)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
@@ -853,7 +942,7 @@ describe("updateImage", () => {
 			const f = fakes({ newImage: true, turns: ["1", "0"] });
 			expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 			expect(drainBody(f)).toEqual({ commits: [] });
-			expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+			expect(f.calls.slice(-2)).toEqual([DEPLOYED(main), PRUNE]);
 		} finally {
 			mock.module("../src/worktree.ts", () => ({ ...realWorktree }));
 		}
@@ -908,6 +997,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.built).toEqual(BUILT_BUMP);
@@ -953,6 +1043,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -998,6 +1089,7 @@ describe("updateImage", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1022,6 +1114,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1042,7 +1135,7 @@ describe("updateImage", () => {
 			"sidecar: docker compose up --wait failed: container sidecar exited (1)",
 		);
 		expect(log).not.toContain("sidecar: the stack runs");
-		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+		expect(f.calls.slice(-2)).toEqual([DEPLOYED(main), PRUNE]);
 	}, 60_000);
 
 	test("a compose config without another checkout deploys exactly the server", async () => {
@@ -1061,6 +1154,7 @@ describe("updateImage", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1080,6 +1174,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		const f2 = fakes({
@@ -1095,6 +1190,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f2.logs.join("\n")).not.toContain("skipping");
@@ -1126,6 +1222,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1167,6 +1264,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.built.map((b) => existsSync(b.tree))).toEqual([false]);
@@ -1214,6 +1312,7 @@ describe("updateImage", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1305,6 +1404,7 @@ describe("rolling restart", () => {
 			HOLD,
 			UP_SVC("server"),
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		// Each hold names only its own runner, and the renewal re-holds worker-a;
@@ -1370,6 +1470,7 @@ describe("rolling restart", () => {
 			HOLD,
 			UP_SVC("server"),
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		// The probe skips the busy polls: the exec runs only when the board says idle.
@@ -1406,7 +1507,12 @@ describe("rolling restart", () => {
 		expect(f.calls).not.toContain(UP_SVC("worker-b"));
 		expect(f.calls).not.toContain(UP_SVC("server"));
 		expect(f.calls).not.toContain(UP);
-		expect(f.calls.slice(-2)).toEqual([FREE, PRUNE]);
+		// The stuck roll ends with the wait report: both workers kept their hour.
+		expect(f.calls.slice(-3)).toEqual([
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 120 * 60_000),
+			CAT_BUILD,
+		]);
 		expect(f.logs.join("\n")).toContain(
 			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
 		);
@@ -1416,7 +1522,9 @@ describe("rolling restart", () => {
 		expect(f.logs.join("\n")).toContain(
 			"the server restart waits for a later run",
 		);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 120 * 60_000),
+		]);
 	}, 60_000);
 
 	test("a failed detached-list read stops the roll", async () => {
@@ -1503,7 +1611,12 @@ describe("rolling restart", () => {
 		// would recreate the stuck worker and the server, and that kills the stuck turn.
 		expect(f.calls).toContain(UP_SVC("worker-b"));
 		expect(f.calls).not.toContain(UP);
-		expect(f.calls.slice(-2)).toEqual([FREE, PRUNE]);
+		// The stuck roll ends with the wait report.
+		expect(f.calls.slice(-3)).toEqual([
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+			CAT_BUILD,
+		]);
 		expect(f.logs.join("\n")).toContain(
 			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
 		);
@@ -1513,7 +1626,9 @@ describe("rolling restart", () => {
 		// The stuck runner is undrained, and the seed record waits for the restart.
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+		]);
 	}, 60_000);
 
 	test("a refused renewal ends the wait: the runner is released and the roll stops", async () => {
@@ -1532,6 +1647,73 @@ describe("rolling restart", () => {
 		expect(f.calls).not.toContain(UP_SVC("worker-a"));
 		expect(f.logs.join("\n")).toContain(
 			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
+		);
+	}, 60_000);
+
+	test("a deferred restart names the commits the image and the server hold", async () => {
+		const { main } = checkout();
+		const short = must(main, "log", "-1", "--format=%h");
+		const old = `1f51101${"0".repeat(33)}`;
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)], // worker-a keeps its turn at every read
+			deployedRecord: old,
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.waits).toHaveLength(120);
+		// The deferral's last line names both commits: what the image holds and
+		// what the running server still has.
+		expect(f.logs.at(-1)).toBe(
+			`the image holds main at ${short} with omp 1.0.0; the server still runs ${old} until a later run restarts it`,
+		);
+		expect(f.logs.join("\n")).not.toContain("the stack runs main at");
+		expect(f.logs.join("\n")).toContain("the server restart has waited 0 min");
+		// The first deferral starts the wait clock next to the seed record.
+		expect(f.seedWrites).toEqual([
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+		]);
+	}, 60_000);
+
+	test("a restart wait past 6 h warns and names the turns that hold it", async () => {
+		const { main } = checkout();
+		const short = must(main, "log", "-1", "--format=%h");
+		const old = `1f51101${"0".repeat(33)}`;
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			deployedRecord: old,
+			// 7 h before the fake clock's start; the run's own hour of polls makes 8 h.
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
+			waitTurns: "OTTR-517 OTTR-402",
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.join("\n")).toContain("the server restart has waited 8 h");
+		expect(f.calls).toContain(WAIT);
+		expect(f.logs.join("\n")).toContain(
+			"warning: the server restart still waits; these turns hold it: OTTR-517 OTTR-402",
+		);
+		expect(f.logs.at(-1)).toBe(
+			`the image holds main at ${short} with omp 1.0.0; the server still runs ${old} until a later run restarts it`,
+		);
+		// The first deferral time stays: the clock keeps counting from it.
+		expect(f.seedWrites).toEqual([]);
+	}, 60_000);
+
+	test("a wait whose turns cannot be read warns without naming them", async () => {
+		const { main } = checkout();
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			// 7 h before the fake clock's start; the run's own hour of polls makes 8 h.
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
+			waitTurns: "!fail", // the board's /api/state answers 500
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"warning: the server restart still waits, and its turns cannot be read",
 		);
 	}, 60_000);
 
@@ -1600,6 +1782,7 @@ describe("rolling restart", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(postBody(f, 0)).toEqual({ commits: ["chore: bump omp to 1.1.0"] });
@@ -1645,6 +1828,7 @@ describe("rolling restart", () => {
 			HOLD,
 			UP_SVC("server"),
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -1666,6 +1850,7 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
@@ -1711,11 +1896,12 @@ describe("rolling restart", () => {
 			RESTART,
 			UP,
 			write,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(postBody(f, 0)).toEqual({ runner: "local" });
 		expect(f.calls).not.toContain(COUNT);
-		expect(f.seedWrites).toEqual([write]);
+		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
 	}, 60_000);
 
 	test("a busy worker detaches before the server restarts, and the idle one skips", async () => {
@@ -1760,6 +1946,7 @@ describe("rolling restart", () => {
 			RESTART,
 			UP,
 			write,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.calls).not.toContain(COUNT);
@@ -1821,6 +2008,7 @@ describe("rolling restart", () => {
 			DETACH_SVC("worker-a"),
 			UP_SVC("server"),
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -1854,8 +2042,9 @@ describe("rolling restart", () => {
 		expect(f.logs.join("\n")).toContain(
 			"worker-a cannot detach its turn (HTTP 404): the holds end, and the server step waits for a later run",
 		);
-		// The seed record waits for the run that actually rolls the server.
-		expect(f.seedWrites).toEqual([]);
+		// The seed record waits for the run that actually rolls the server; the
+		// first deferral starts the wait clock.
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
 	test("a preparing turn holds every runner idle until it starts", async () => {
@@ -2099,6 +2288,7 @@ describe("rolling restart", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -2121,6 +2311,7 @@ describe("rolling restart", () => {
 			HOLD,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -2237,7 +2428,9 @@ describe("rolling restart", () => {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(0);
-		expect(f.seedWrites).toHaveLength(1);
+		// The start records the seed, and the deploy record rides the settle.
+		expect(f.seedWrites).toHaveLength(2);
+		expect(f.seedWrites.at(-1)).toBe(DEPLOYED(main));
 	}, 60_000);
 
 	test("a legacy stop leaves the seed record unwritten", async () => {
@@ -2571,7 +2764,7 @@ describe("rolling restart", () => {
 		);
 		expect(f.calls).not.toContain(RESTART);
 		expect(f.calls).not.toContain(UP);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16) + 30_000)]);
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("local"))).toBe(true);
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
@@ -2662,6 +2855,7 @@ describe("arch-review survivor kills", () => {
 			"image inspect -f {{.Id}} ottr-worker:local",
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			"image prune --force --filter label=ottr.image=worker",
 		]);
 		expect(f.logs.join("\n")).not.toContain("no running board");
@@ -2704,7 +2898,7 @@ describe("board seed", () => {
 		).toBe(0);
 		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
 		expect(f.seedRuns).toEqual([seedRun]);
-		expect(f.seedWrites).toEqual([write]);
+		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
 		// A seeded layer joins the image change as a restart reason: the hold happens, and
 		// a server that keeps its image restarts after up.
 		expect(f.calls).toEqual([
@@ -2724,6 +2918,7 @@ describe("board seed", () => {
 			// The record lands after the restart: a run that ends early leaves it
 			// unwritten, so the next run seeds again and retries.
 			write,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -2747,7 +2942,7 @@ describe("board seed", () => {
 			}),
 		).toBe(0);
 		expect(f.seedRuns).toEqual([]);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
 			BUILD,
 			CFGJSON,
@@ -2757,6 +2952,7 @@ describe("board seed", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -2778,11 +2974,11 @@ describe("board seed", () => {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(1);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("board seed failed: the seed step failed");
 		expect(log).toContain("the stack runs main at");
-		expect(f.calls.slice(-2)).toEqual([UP, PRUNE]);
+		expect(f.calls.slice(-2)).toEqual([DEPLOYED(main), PRUNE]);
 	}, 60_000);
 
 	test("a failed seed exits 1 even when running turns hold the restart", async () => {
@@ -2816,7 +3012,7 @@ describe("board seed", () => {
 			}),
 		).toBe(1);
 		expect(f.seedRuns).toEqual([]);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.logs.join("\n")).toContain("set ALATE_IMAGE in the env file");
 		expect(f.calls).toEqual([
 			BUILD,
@@ -2829,6 +3025,7 @@ describe("board seed", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -2881,9 +3078,11 @@ describe("board seed", () => {
 		).toBe(0);
 		expect(f.calls).not.toContain(RESTART);
 		expect(f.calls).toContain(HOLD);
-		// The recreate counts as the board taking the seed, so the record follows up.
-		expect(f.calls.slice(-2)).toEqual([
+		// The recreate counts as the board taking the seed, so the record follows up,
+		// and the deploy record rides the settle.
+		expect(f.calls.slice(-3)).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -2906,7 +3105,10 @@ describe("board seed", () => {
 		).toBe(0);
 		expect(busy.seedRuns).toHaveLength(1);
 		// The record stays unwritten: the next run must seed again and restart then.
-		expect(busy.seedWrites).toEqual([]);
+		// The deferral starts the wait clock after the run's own hour of polls.
+		expect(busy.seedWrites).toEqual([
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+		]);
 		expect(busy.calls).not.toContain(UP);
 		expect(busy.calls).not.toContain(RESTART);
 		// Run 2: an idle board — the retry seeds, restarts, and records the commit.
@@ -2923,6 +3125,7 @@ describe("board seed", () => {
 		expect(idle.seedRuns).toHaveLength(1);
 		expect(idle.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+			DEPLOYED(main),
 		]);
 		expect(idle.calls).toContain(RESTART);
 	}, 60_000);
@@ -2932,7 +3135,7 @@ describe("board seed", () => {
 		const f = fakes();
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps, {})).toBe(0);
 		expect(f.seedRuns).toEqual([]);
-		expect(f.seedWrites).toEqual([]);
+		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
 			BUILD,
 			CFGJSON,
@@ -2941,6 +3144,7 @@ describe("board seed", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -2960,6 +3164,7 @@ describe("board seed", () => {
 			}),
 		).toBe(0);
 		expect(f.seedRuns).toEqual([]);
+		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
 			BUILD,
 			CFGJSON,
@@ -2969,6 +3174,7 @@ describe("board seed", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 		expect(f.logs.join("\n")).toContain("ALATE_DATA wins over ALATE_DATA_REPO");
@@ -3064,12 +3270,14 @@ describe("board seed", () => {
 		]);
 		expect(f.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
+			DEPLOYED(main),
 		]);
 		expect(g.seedRuns).toEqual([
 			"compose -f c.yml run --rm --no-deps board-seed --repo example/data@seed",
 		]);
 		expect(g.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${other}' > /etc/ottr/seed-commit`,
+			DEPLOYED(main),
 		]);
 	}, 60_000);
 
@@ -3100,7 +3308,7 @@ describe("board seed", () => {
 		});
 		for (const { repo, f } of runs) {
 			expect(f.seedRuns).toEqual([]);
-			expect(f.seedWrites).toEqual([]);
+			expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 			expect(f.calls).toEqual([
 				BUILD,
 				CFGJSON,
@@ -3109,6 +3317,7 @@ describe("board seed", () => {
 				...COMPARE,
 				COUNT,
 				UP,
+				DEPLOYED(main),
 				PRUNE,
 			]);
 			expect(f.logs.join("\n")).toContain(
@@ -3169,14 +3378,17 @@ describe("board seed", () => {
 		expect(dated.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
 			`compose -f c.yml exec -T server sh -c printf %s '${iso}' > /etc/ottr/seed-token-expires`,
+			DEPLOYED(main),
 		]);
 		expect(dated.logs.join("\n")).toContain(`board seed token expires ${iso}`);
-		expect(undated.seedWrites.at(-1)).toBe(
+		expect(undated.seedWrites.at(-2)).toBe(
 			"compose -f c.yml exec -T server sh -c printf %s 'none' > /etc/ottr/seed-token-expires",
 		);
 		expect(undated.logs.join("\n")).toContain("board seed token expires none");
 		for (const f of [badDate, refused, thrown]) {
-			expect(f.seedWrites.at(-1)).not.toContain("seed-token-expires");
+			expect(f.seedWrites.some((l) => l.includes("seed-token-expires"))).toBe(
+				false,
+			);
 			expect(f.logs.join("\n")).toContain(
 				"board seed token expiry check failed",
 			);
@@ -3411,6 +3623,7 @@ describe("helpers survivor kills", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -3427,6 +3640,7 @@ describe("helpers survivor kills", () => {
 			...COMPARE,
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -3449,6 +3663,7 @@ describe("helpers survivor kills", () => {
 			...COMPARE.slice(2),
 			COUNT,
 			UP,
+			DEPLOYED(main),
 			PRUNE,
 		]);
 	}, 60_000);
@@ -3763,7 +3978,9 @@ describe("deploy flow survivor kills", () => {
 		expect(f.logs).toContain(
 			"board seed failed: the seed commit cannot be recorded; the next run seeds again",
 		);
-		expect(f.logs.at(-1)).toStartWith("the stack runs main at");
+		// The deploy completed: its success line and its own advisory record failure.
+		expect(f.logs.join("\n")).toContain("the stack runs main at");
+		expect(f.logs.join("\n")).toContain("the deploy record failed");
 	}, 60_000);
 });
 
@@ -3798,8 +4015,18 @@ describe("sidecar and seed survivor kills", () => {
 		}
 		return seen;
 	}
-	const NO_SIDECAR = [BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT, UP, PRUNE];
-	const WITH_SIDECAR = [
+	const NO_SIDECAR = (main: string) => [
+		BUILD,
+		CFGJSON,
+		PS,
+		GET,
+		...COMPARE,
+		COUNT,
+		UP,
+		DEPLOYED(main),
+		PRUNE,
+	];
+	const WITH_SIDECAR = (main: string) => [
 		BUILD,
 		CFGJSON,
 		SIDE_BUILD,
@@ -3809,6 +4036,7 @@ describe("sidecar and seed survivor kills", () => {
 		...COMPARE,
 		COUNT,
 		UP,
+		DEPLOYED(main),
 		PRUNE,
 	];
 	const services = (s: Record<string, unknown>) =>
@@ -3831,7 +4059,7 @@ describe("sidecar and seed survivor kills", () => {
 				: undefined,
 		);
 		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
-		expect(f.calls).toEqual(WITH_SIDECAR.filter((c) => c !== CFGJSON));
+		expect(f.calls).toEqual(WITH_SIDECAR(main).filter((c) => c !== CFGJSON));
 		expect(f.logs.join("\n")).not.toContain("stays as it is");
 	}, 60_000);
 
@@ -3862,7 +4090,7 @@ describe("sidecar and seed survivor kills", () => {
 			const f = fakes({ turns: "0" });
 			const deps = over(f, (l) => (l === CFGJSON ? cfg : undefined));
 			expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
-			expect(f.calls).toEqual(NO_SIDECAR.filter((c) => c !== CFGJSON));
+			expect(f.calls).toEqual(NO_SIDECAR(main).filter((c) => c !== CFGJSON));
 			expect(f.logs.some((l) => l.startsWith(line))).toBe(true);
 			expect(f.logs.join("\n")).not.toContain("not JSON");
 			expect(f.logs.join("\n")).not.toContain("skipping");
@@ -3877,7 +4105,7 @@ describe("sidecar and seed survivor kills", () => {
 				l === CFGJSON ? { code: 0, out } : undefined,
 			);
 			expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
-			expect(f.calls).toEqual(NO_SIDECAR.filter((c) => c !== CFGJSON));
+			expect(f.calls).toEqual(NO_SIDECAR(main).filter((c) => c !== CFGJSON));
 			expect(f.logs).toContain(
 				"compose config is not JSON: deploying no foreign checkouts",
 			);
@@ -3904,7 +4132,7 @@ describe("sidecar and seed survivor kills", () => {
 			l === CFGJSON ? { code: 0, out: json } : undefined,
 		);
 		expect(await updateImage(main, ["-f", "c.yml"], deps)).toBe(0);
-		expect(f.calls).toEqual(WITH_SIDECAR.filter((c) => c !== CFGJSON));
+		expect(f.calls).toEqual(WITH_SIDECAR(main).filter((c) => c !== CFGJSON));
 		const log = f.logs.join("\n");
 		expect(log).not.toContain("skipping");
 		// A clean checkout on main fast-forwards: nothing to report about it.
@@ -3969,7 +4197,7 @@ describe("sidecar and seed survivor kills", () => {
 		expect(f.logs).toContain(
 			`skipping sidecar: no worktree of origin/main from ${side.main}`,
 		);
-		expect(f.calls).toEqual(NO_SIDECAR);
+		expect(f.calls).toEqual(NO_SIDECAR(main));
 		expect(trees).toHaveLength(1);
 		expect(existsSync(trees[0]!)).toBe(false);
 		expect(existsSync(`${trees[0]}.yml`)).toBe(false);
@@ -3995,7 +4223,7 @@ describe("sidecar and seed survivor kills", () => {
 			`skipping sidecar: no worktree of origin/main from ${side.main}`,
 		);
 		expect(seen.filter((a) => a[0] === "worktree")).toEqual([]);
-		expect(f.calls).toEqual(NO_SIDECAR);
+		expect(f.calls).toEqual(NO_SIDECAR(main));
 	}, 60_000);
 
 	test("an origin that cannot be fetched stops the run before any build", async () => {
@@ -4037,7 +4265,7 @@ describe("sidecar and seed survivor kills", () => {
 				await updateImage(main, ["-f", "c.yml"], f.deps, { ALATE_DATA: empty }),
 			).toBe(1);
 			expect(f.seedRuns).toEqual([]);
-			expect(f.calls).toEqual(NO_SIDECAR);
+			expect(f.calls).toEqual(NO_SIDECAR(main));
 			expect(f.logs).toContain(
 				`board seed failed: git rev-parse HEAD failed in ${empty}`,
 			);
@@ -4064,7 +4292,7 @@ describe("sidecar and seed survivor kills", () => {
 				},
 			);
 			expect(f.seedRuns).toEqual([]);
-			expect(f.calls).toEqual(NO_SIDECAR);
+			expect(f.calls).toEqual(NO_SIDECAR(main));
 			expect(f.logs).toContain(
 				"board seed failed: git ls-remote example/data failed",
 			);
@@ -4123,6 +4351,7 @@ describe("sidecar and seed survivor kills", () => {
 						UP,
 						RESTART,
 						write,
+						DEPLOYED(main),
 						PRUNE,
 					],
 				},

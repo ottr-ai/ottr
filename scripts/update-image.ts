@@ -103,12 +103,20 @@ const DETACHED_LIST =
 	'if (r.status === 404) console.log("[]");' +
 	'else if (!r.ok) { console.log("HTTP " + r.status); process.exit(1); }' +
 	"else console.log(await r.text());";
+// The running turns a deferred server restart waits for: card ids from /api/state,
+// read like the count. They name the warning line a long wait logs.
+const WAIT_TURNS =
+	"const s = await (await fetch('http://127.0.0.1:' + process.env.PORT + '/api/state')).json();" +
+	"console.log(s.tasks.filter((t) => t.state === 'running' || t.state === 'preparing').map((t) => t.id).join(' '));";
 // The runner poll repeats every 30 s while a hold waits its turns out. The scheduled task
 // starts no second run meanwhile (IgnoreNew), so the run that built the image restarts the stack.
 const POLL_MS = 30_000;
 // A hold lasts at most 1 h, so a long turn (a mutation run of several hours) stops the queue
 // of new turns for 1 h at most. Then the run ends the hold, and a later run tries again.
 const HOLD_LIMIT_MS = 60 * 60_000;
+// A deferred server restart logs its wait, and warns past 6 h: a turn that holds the
+// restart overnight must not sit in the log unnamed.
+const RESTART_WAIT_WARN_MS = 6 * 60 * 60_000;
 // A rolled worker must answer its healthz soon: at most 5 min, then the roll stops and
 // keeps the not-yet-rolled containers on the old image.
 const CONNECT_LIMIT_MS = HOLD_LIMIT_MS / 12;
@@ -116,6 +124,14 @@ const CONNECT_LIMIT_MS = HOLD_LIMIT_MS / 12;
 /** The real docker dep puts stderr first: compose warnings come before the answer's last line. */
 const lastLine = (out: string): string =>
 	out.trim().split("\n").at(-1)?.trim() ?? "";
+
+/** A wait in hours and minutes: 0 min, 7 h 5 min, and exact hours without minutes (8 h). */
+const fmtWait = (ms: number): string => {
+	const m = Math.round(ms / 60_000);
+	if (m < 60) return `${m} min`;
+	const h = Math.floor(m / 60);
+	return m % 60 === 0 ? `${h} h` : `${h} h ${m % 60} min`;
+};
 
 /** The env-file keys this script reads itself; compose reads the rest from --env-file. */
 const SCRIPT_KEYS = new Set([
@@ -1444,6 +1460,92 @@ async function recordSeed(
 	return seedFailed;
 }
 
+/**
+ * Records the commit the running server holds and clears the restart-wait clock, after
+ * the board took the deploy (a rolled server, a legacy restart, or a start). Advisory:
+ * a failed write only degrades a later deferral's line, and never fails the run.
+ */
+async function recordDeployed(
+	d: Deps,
+	compose: string[],
+	head: string,
+): Promise<void> {
+	const w = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		"server",
+		"sh",
+		"-c",
+		`printf %s '${head}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since`,
+	);
+	if (w.code !== 0)
+		d.log(
+			"the deploy record failed: a later deferral cannot name the server's commit",
+		);
+}
+
+/**
+ * The wait report a deferred server restart ends the run with: how long the restart has
+ * already waited (the first deferral time, kept next to the seed record), a warning past
+ * RESTART_WAIT_WARN_MS that names the turns that hold it, and both commits — the main
+ * the image holds and the one the running server still has. The server keeps running,
+ * so every exec answers. Advisory: a failed read or write only degrades a line.
+ */
+async function reportRestartWait(
+	d: Deps,
+	compose: string[],
+	head: string,
+	omp: string,
+): Promise<void> {
+	const exec = (code: string) =>
+		d.docker("compose", ...compose, "exec", "-T", "server", "sh", "-c", code);
+	// The first deferral writes its time; a later one counts from it, so the wait
+	// survives the hourly runs on the board-config volume.
+	const since = await exec("cat /etc/ottr/restart-waiting-since");
+	const kept = since.code === 0 ? since.out.trim() : "";
+	let first = Number(kept);
+	if (!Number.isInteger(first) || first <= 0) {
+		first = d.now();
+		const w = await exec(
+			`printf %s '${first}' > /etc/ottr/restart-waiting-since`,
+		);
+		if (w.code !== 0)
+			d.log("the wait record failed: a later run starts the wait clock again");
+	}
+	d.log(`the server restart has waited ${fmtWait(d.now() - first)}`);
+	if (d.now() - first > RESTART_WAIT_WARN_MS) {
+		const t = await d.docker(
+			"compose",
+			...compose,
+			"exec",
+			"-T",
+			"server",
+			"bun",
+			"-e",
+			WAIT_TURNS,
+		);
+		const ids = t.code === 0 ? lastLine(t.out).trim() : null;
+		d.log(
+			ids === null
+				? "warning: the server restart still waits, and its turns cannot be read"
+				: ids === ""
+					? "warning: the server restart still waits, and no turn runs any more"
+					: `warning: the server restart still waits; these turns hold it: ${ids}`,
+		);
+	}
+	// The deploy record lands only when the board took the deploy (recordDeployed),
+	// so it names the commit the running server still has.
+	const dep = await exec("cat /etc/ottr/build-commit");
+	const running = dep.code === 0 ? dep.out.trim() : "";
+	d.log(
+		running !== ""
+			? `the image holds main at ${head} with omp ${omp}; the server still runs ${running} until a later run restarts it`
+			: `the image holds main at ${head} with omp ${omp}; the server still runs an older commit until a later run restarts it`,
+	);
+}
+
 /** The run's exit code: 1 when it stopped early or failed, else 0. */
 export async function updateImage(
 	repo: string,
@@ -1481,13 +1583,27 @@ export async function updateImage(
 		seed.wantedSha,
 		stop,
 	);
-	if (rolled.early !== null) return rolled.early;
+	if (rolled.early !== null) {
+		// early 0 is a deferred wait (the seed is fine): the run ends with the wait
+		// report instead of a settled summary. early 1 keeps its stop line.
+		if (rolled.early === 0)
+			await reportRestartWait(d, compose, meta.head, meta.omp);
+		return rolled.early;
+	}
 	// The record lands only after the board took the seed (a rolled server, a legacy
 	// restart, or a start): a stuck runner defers the restart, and the next run seeds
-	// again and retries.
-	const recordFailed = rolled.settled
-		? await recordSeed(d, compose, seed.seeded, seed.wantedSha, seed.expires)
-		: false;
+	// again and retries. The deploy record rides the same rule, and clears the wait.
+	let recordFailed = false;
+	if (rolled.settled) {
+		recordFailed = await recordSeed(
+			d,
+			compose,
+			seed.seeded,
+			seed.wantedSha,
+			seed.expires,
+		);
+		await recordDeployed(d, compose, meta.head);
+	}
 	await d.docker(
 		"image",
 		"prune",
@@ -1495,7 +1611,9 @@ export async function updateImage(
 		"--filter",
 		"label=ottr.image=worker",
 	);
-	d.log(`the stack runs main at ${meta.head} with omp ${meta.omp}`);
+	if (rolled.settled)
+		d.log(`the stack runs main at ${meta.head} with omp ${meta.omp}`);
+	else await reportRestartWait(d, compose, meta.head, meta.omp);
 	// ponytail: a dirty ALATE_DATA checkout records HEAD, so uncommitted edits do not
 	// retrigger a seed; the next pushed commit does.
 	return seed.failed || recordFailed ? 1 : 0;
