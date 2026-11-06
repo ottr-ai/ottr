@@ -58,6 +58,7 @@ import {
 	RULES_INTERVIEW_MARKER,
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
+import { PR_GATES } from "./prs.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	PROMPT_EDIT_HELD,
@@ -383,6 +384,8 @@ function mount(
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
 		>[0]["releaseSummarySpawn"];
+		/** Gateway spawn seam for the PR-review model call; defaults to the real spawn. */
+		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
 	} = {},
 ) {
 	const g =
@@ -433,6 +436,7 @@ function mount(
 		models: input.models,
 		latestRelease: input.latestRelease,
 		releaseSummarySpawn: input.releaseSummarySpawn,
+		prReviewSpawn: input.prReviewSpawn,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -8084,12 +8088,73 @@ describe("PR review routes", () => {
 	let appFetchImpl: (url: string, init?: RequestInit) => Promise<Response> =
 		async () => new Response("{}", { status: 404 });
 	const appCalls: Array<{ url: string; init?: RequestInit }> = [];
+	// The re-review model call: captured prompts plus the gateway answer protocol
+	// (ready line, then one 200 choice), as prs.test.ts's spawn test answers.
+	const prPrompts: string[] = [];
+	/** Canned answers for the read-only gh API GETs a re-review reads; null falls through.
+	 * Only bare two-argument `gh api <path>` calls match: the diff fetch carries -H, and a
+	 * review POST carries -X/-f, so both keep the ghResult flow. */
+	const prApiStub = (
+		args: string[],
+	): { code: number; stdout: string; stderr: string } | null => {
+		if (args.length !== 2 || args[0] !== "api") return null;
+		const path = args[1]!;
+		const pull = path.match(/^repos\/acme\/widget\/pulls\/(\d+)$/);
+		if (pull !== null) {
+			const r = prStore.getPrReview(Number(pull[1]));
+			return {
+				code: 0,
+				stdout: JSON.stringify({
+					head: { sha: r?.head ?? H1 },
+					body: "Please merge.",
+					title: r?.title ?? "Fix it",
+				}),
+				stderr: "",
+			};
+		}
+		const empty =
+			/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)$/.test(
+				path,
+			);
+		if (empty) return { code: 0, stdout: "[]", stderr: "" };
+		if (
+			/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
+				path,
+			)
+		)
+			return {
+				code: 0,
+				stdout: JSON.stringify({ commits: [], files: [] }),
+				stderr: "",
+			};
+		return null;
+	};
 	const m = mount({
 		projects: prProjects,
 		gh: async (args) => {
 			ghCalls.push(args);
 			await ghHook?.();
-			return ghResult;
+			// The read-only GET routes a re-review fetches get canned answers; everything
+			// else (diffs, review POSTs) keeps the ghResult flow.
+			const stubbed = prApiStub(args);
+			return stubbed ?? ghResult;
+		},
+		prReviewSpawn: async (_argv, o) => {
+			prPrompts.push(String(o.stdin));
+			return {
+				code: 0,
+				stdout: [
+					JSON.stringify({ ready: true }),
+					JSON.stringify({
+						id: 1,
+						status: 200,
+						body: {
+							choices: [{ message: { content: "## Re-review\nfresh look" } }],
+						},
+					}),
+				].join("\n"),
+				stderr: "",
+			};
 		},
 		githubAppFetch: async (url, init) => {
 			appCalls.push({ url, init });
@@ -8374,6 +8439,188 @@ describe("PR review routes", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postError: null,
+		});
+	});
+
+	// --- Reply asks for a new draft (OTTR-565): the note runs reviewNow for the current
+	// head and counts against the daily cap like a watcher run. The cap is global per
+	// store and the route reads real Date.now, so the reply tests get their own store:
+	// the watcher runs above would otherwise exhaust the 24h budget and make these
+	// tests order-dependent.
+	describe("PR review reply routes", () => {
+		const replyDir = join(root, "p-pr-reply");
+		mkdirSync(replyDir, { recursive: true });
+		const replyStore = ProjectStore.open(replyDir);
+		afterAll(() => {
+			replyStore.close();
+		});
+		const replyProjects = new Map<string, Entry>();
+		replyProjects.set("pg", {
+			path: replyDir,
+			name: "pg",
+			store: replyStore,
+			target: null,
+			gitless: false,
+			github: "acme/widget",
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		const replyPrompts: string[] = [];
+		/** Same canned read-only GETs as prApiStub, but against the fresh store. */
+		const replyApiStub = (
+			args: string[],
+		): { code: number; stdout: string; stderr: string } | null => {
+			if (args.length !== 2 || args[0] !== "api") return null;
+			const path = args[1]!;
+			const pull = path.match(/^repos\/acme\/widget\/pulls\/(\d+)$/);
+			if (pull !== null) {
+				const r = replyStore.getPrReview(Number(pull[1]));
+				return {
+					code: 0,
+					stdout: JSON.stringify({
+						head: { sha: r?.head ?? H1 },
+						body: "Please merge.",
+						title: r?.title ?? "Fix it",
+					}),
+					stderr: "",
+				};
+			}
+			const empty =
+				/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)$/.test(
+					path,
+				);
+			if (empty) return { code: 0, stdout: "[]", stderr: "" };
+			if (
+				/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
+					path,
+				)
+			)
+				return {
+					code: 0,
+					stdout: JSON.stringify({ commits: [], files: [] }),
+					stderr: "",
+				};
+			return null;
+		};
+		const rm = mount({
+			projects: replyProjects,
+			gh: async (args) =>
+				replyApiStub(args) ?? { code: 0, stdout: "{}", stderr: "" },
+			prReviewSpawn: async (_argv, o) => {
+				replyPrompts.push(String(o.stdin));
+				return {
+					code: 0,
+					stdout: [
+						JSON.stringify({ ready: true }),
+						JSON.stringify({
+							id: 1,
+							status: 200,
+							body: {
+								choices: [{ message: { content: "## Re-review\nfresh look" } }],
+							},
+						}),
+					].join("\n"),
+					stderr: "",
+				};
+			},
+		});
+		const replyRow = (n: number): PrReviewRow => {
+			const r = replyStore.getPrReview(n);
+			if (r === null) throw new Error(`no pr_review row ${n}`);
+			return r;
+		};
+		const replyReviewed = (n: number, head: string): Task => {
+			const prev = replyStore.getPrReview(n);
+			replyStore.savePrReview({
+				number: n,
+				taskId: prev?.taskId ?? null,
+				head,
+				firstSeenAt: 0,
+				reviewedHead: prev?.reviewedHead ?? null,
+				postedHead: prev?.postedHead ?? null,
+				postedUrl: prev?.postedUrl ?? null,
+				postedLogin: prev?.postedLogin ?? null,
+				state: "open",
+				draft: false,
+				title: "Fix it",
+				postError: null,
+			});
+			return replyStore.savePrDraft({
+				run: replyStore.startPrRun(n, head, Date.now()),
+				number: n,
+				head,
+				draft: "draft",
+				prompt: "review",
+			});
+		};
+		const reply = (id: string, body: Record<string, unknown>) =>
+			rm.call(`/api/projects/pg/tasks/${id}/reply`, body);
+
+		test("a pr_review reply runs a new draft for the current head with the note", async () => {
+			const t = replyReviewed(30, H1);
+			const before = replyStore.prReviewRunsSince(0);
+			const res = await reply(t.id, { text: "look at ErrorPanel" });
+			expect(res.status).toBe(200);
+			await rm.app.prReviewIdle();
+			// The attempt took a cap slot, and the saved draft replaced the card's details.
+			expect(replyStore.prReviewRunsSince(0)).toBe(before + 1);
+			expect(replyStore.getTask(t.id)!.details).toBe(
+				"## Re-review\nfresh look",
+			);
+			// The note reached the model's user message.
+			expect(replyPrompts.some((p) => p.includes("look at ErrorPanel"))).toBe(
+				true,
+			);
+		});
+
+		test("a pr_review reply respects the daily cap", async () => {
+			const t = replyReviewed(31, H1);
+			const promptsBefore = replyPrompts.length;
+			for (let i = 0; i < PR_GATES.PROJECT_DAILY_RUNS; i++)
+				replyStore.startPrRun(31, H1, Date.now());
+			const res = await reply(t.id, { text: "again" });
+			expect(res.status).toBe(429);
+			expect(await errorOf(res)).toBe(
+				`daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+			);
+			await rm.app.prReviewIdle();
+			expect(replyPrompts.length).toBe(promptsBefore);
+		});
+
+		test("a pr_review reply refuses a closed PR", async () => {
+			const t = replyReviewed(33, H1);
+			replyStore.savePrReview({ ...replyRow(33), state: "closed" });
+			const res = await reply(t.id, { text: "late note" });
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("PR is closed");
+		});
+
+		test("a pr_review reply rejects empty text and images", async () => {
+			const t = replyReviewed(34, H1);
+			const empty = await reply(t.id, { text: "   " });
+			expect(empty.status).toBe(400);
+			expect(await errorOf(empty)).toBe("text must be 1-20000 characters");
+			const oversized = await reply(t.id, { text: "x".repeat(20001) });
+			expect(oversized.status).toBe(400);
+			const withImage = await reply(t.id, {
+				text: "look",
+				images: ["data:image/png;base64,AAAA"],
+			});
+			expect(withImage.status).toBe(400);
+			expect(await errorOf(withImage)).toBe("PR review notes are text-only");
+		});
+
+		test("a reply on a work card never enters the pr_review branch", async () => {
+			const work = replyStore.createTask("plain card");
+			const res = await reply(work.id, { text: "hello" });
+			// The card is queued, not needs_you: the plain reply path's 409, not the pr_review one.
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("task is not waiting for you");
 		});
 	});
 

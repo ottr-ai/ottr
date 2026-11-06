@@ -3,9 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
+import { PROMPT_CHAR_BUDGET } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import {
 	createPrWatcher,
+	fetchReReviewContext,
 	openPullRequest,
 	PR_GATES,
 	parseCreatedPr,
@@ -51,6 +53,26 @@ const pr = (number: number, head: string, draft = false, title = "t") => ({
 	state: "open",
 	title,
 });
+/** A posted GitHub review whose html_url carries the id the pr_review row stores. */
+const ghReview = (
+	id: number,
+	commitId: string,
+	body: string,
+	submittedAt: string,
+) => ({
+	id,
+	commit_id: commitId,
+	body,
+	submitted_at: submittedAt,
+	user: { login: "bot" },
+	html_url: `${prUrl("o/r", 1)}#pullrequestreview-${id}`,
+});
+/** One conversation or review comment as GitHub returns it. */
+const ghComment = (author: string, date: string, body: string) => ({
+	user: { login: author },
+	created_at: date,
+	body,
+});
 
 function setup(
 	opts: { on?: boolean; github?: string | null; spawn?: SpawnFn } = {},
@@ -68,6 +90,12 @@ function setup(
 	let movedTo: string | null = null;
 	/** Diff overrides by PR number; others get a small default diff. */
 	const diffs = new Map<number, string>();
+	/** Re-review opt-ins: the posted reviews, the two comment sources, and the compare diff. */
+	let reviews: unknown[] = [];
+	let issueComments: unknown[] = [];
+	let pullComments: unknown[] = [];
+	/** null makes the compare GET fail, like a force-pushed branch on GitHub. */
+	let compare: string | null = null;
 	const logs: string[] = [];
 	const prompts: string[] = [];
 	/** Card ids the watcher un-read on a re-review (the board's seen-set drop). */
@@ -95,6 +123,16 @@ function setup(
 					}
 				: (closed.get(n) ?? {});
 			return { code: 0, stdout: JSON.stringify(body), stderr: "" };
+		}
+		if (path.includes("/reviews"))
+			return { code: 0, stdout: JSON.stringify(reviews), stderr: "" };
+		if (path.includes("/issues/") && path.includes("/comments"))
+			return { code: 0, stdout: JSON.stringify(issueComments), stderr: "" };
+		if (path.includes("/comments"))
+			return { code: 0, stdout: JSON.stringify(pullComments), stderr: "" };
+		if (path.includes("/compare/")) {
+			if (compare === null) return { code: 1, stdout: "", stderr: "HTTP 404" };
+			return { code: 0, stdout: compare, stderr: "" };
 		}
 		return { code: 0, stdout: JSON.stringify(open), stderr: "" };
 	};
@@ -140,6 +178,18 @@ function setup(
 		},
 		setMovedTo: (v: string | null) => {
 			movedTo = v;
+		},
+		setReviews: (v: unknown[]) => {
+			reviews = v;
+		},
+		setIssueComments: (v: unknown[]) => {
+			issueComments = v;
+		},
+		setPullComments: (v: unknown[]) => {
+			pullComments = v;
+		},
+		setCompare: (v: string | null) => {
+			compare = v;
 		},
 		advance: (ms: number) => {
 			t += ms;
@@ -289,6 +339,96 @@ describe("review prompt and draft", () => {
 		expect(parseDraft("  ok \n")).toBe("ok");
 		expect(parseDraft("x".repeat(70_000)).length).toBeLessThanOrEqual(65_536);
 	});
+	test("fetchReReviewContext: same head means no range diff, a draft is the fallback, a first review gives null", async () => {
+		const gh: GhFn = async (args) => {
+			const path = args.at(-1) ?? "";
+			if (path.includes("/reviews"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([
+						ghReview(1, sha("a"), "earlier", "2026-01-01T00:00:00Z"),
+					]),
+					stderr: "",
+				};
+			// A failed compare reads as "GitHub cannot give the range".
+			if (path.includes("/compare/"))
+				return { code: 1, stdout: "", stderr: "HTTP 404" };
+			return { code: 0, stdout: "[]", stderr: "" };
+		};
+		const base = { repo: "o/r", number: 1, gh };
+		expect(
+			await fetchReReviewContext({
+				...base,
+				postedHead: sha("a"),
+				postedUrl: `${prUrl("o/r", 1)}#pullrequestreview-1`,
+				postedLogin: null,
+				reviewedHead: sha("a"),
+				head: sha("a"),
+				draftBody: null,
+				draftAt: null,
+			}),
+		).toEqual({ review: "earlier", comments: [], rangeDiff: "" });
+		expect(
+			await fetchReReviewContext({
+				...base,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				reviewedHead: sha("a"),
+				head: sha("c"),
+				draftBody: "saved draft",
+				draftAt: 1234,
+			}),
+		).toEqual({ review: "saved draft", comments: [], rangeDiff: null });
+		expect(
+			await fetchReReviewContext({
+				...base,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				reviewedHead: null,
+				head: sha("a"),
+				draftBody: null,
+				draftAt: null,
+			}),
+		).toBeNull();
+	});
+	test("a same-head re-review renders the no-code-change line; a null range renders the unavailable line", () => {
+		const same = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			earlier: { review: "e", comments: [], rangeDiff: "" },
+		});
+		expect(same).toContain("no code changes since the earlier review's head");
+		const missing = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			earlier: { review: "e", comments: [], rangeDiff: null },
+		});
+		expect(missing).toContain("unavailable");
+		expect(missing).toContain("DIFF\n<<<DATA\n+x\nDATA>>>");
+		expect(missing).not.toContain("RANGE DIFF");
+	});
+	test("a maintainer note lands before the DATA blocks and is never cleaned", () => {
+		const msg = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			note: "focus on the error panel",
+		});
+		expect(msg.indexOf("focus on the error panel")).toBeLessThan(
+			msg.indexOf("<<<DATA"),
+		);
+		expect(msg).toContain("maintainer");
+	});
 });
 
 describe("createPrWatcher", () => {
@@ -321,6 +461,142 @@ describe("createPrWatcher", () => {
 		expect(s.prompts[0]).toContain("TITLE\n<<<DATA\nAdd export\nDATA>>>");
 		expect(s.prompts[0]).toContain("Please merge.");
 		expect(s.prompts[0]).toContain("+pr 7");
+	});
+
+	test("a first review sends no re-review blocks or re-review system paragraph", async () => {
+		const s = setup();
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).not.toContain("EARLIER REVIEW");
+		expect(s.prompts[0]).not.toContain("MAINTAINER NOTE");
+		expect(s.prompts[0]).not.toContain("re-review");
+	});
+
+	test("a re-review of a new head carries the earlier review, comments and range diff", async () => {
+		const s = setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The first review was posted on GitHub as review 1.
+		s.store.savePrReview({
+			...s.store.getPrReview(22)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("c"))]);
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+		]);
+		s.setIssueComments([
+			ghComment("alice", "2026-01-02T00:00:00Z", "Is this still broken?"),
+			ghComment("bob", "2025-12-01T00:00:00Z", "older than the review"),
+		]);
+		s.setPullComments([
+			ghComment("carol", "2026-01-03T00:00:00Z", "The diff here looks wrong"),
+		]);
+		s.setCompare("diff --git a/range b/range\n+range change\n");
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const msg = s.prompts.at(-1)!;
+		expect(msg).toContain(
+			"EARLIER REVIEW\n<<<DATA\nEarlier: the error panel leaks state\nDATA>>>",
+		);
+		expect(msg).toContain(
+			"COMMENT alice 2026-01-02T00:00:00Z\n<<<DATA\nIs this still broken?\nDATA>>>",
+		);
+		expect(msg).toContain("COMMENT carol 2026-01-03T00:00:00Z");
+		expect(msg).not.toContain("older than the review");
+		expect(msg).toContain(
+			"RANGE DIFF\n<<<DATA\ndiff --git a/range b/range\n+range change\n\nDATA>>>",
+		);
+		// The re-review paragraph reached the system prompt.
+		expect(msg).toContain("re-review");
+	});
+
+	test("a re-review over budget drops the oldest comments first and says so", async () => {
+		const s = setup();
+		s.setOpen([pr(23, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(23)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 23)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(23, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "earlier review body", "2026-01-01T00:00:00Z"),
+		]);
+		// 120 comments overshoot the 400k budget (bodies cap at 4000 chars each);
+		// same-head compare: no range diff.
+		s.setIssueComments(
+			Array.from({ length: 120 }, (_, i) =>
+				ghComment(
+					`u${i}`,
+					`2026-${String(Math.floor(i / 28) + 1).padStart(2, "0")}-${String(
+						(i % 28) + 2,
+					).padStart(2, "0")}T00:00:00Z`,
+					`old-${i} ${"x".repeat(20_000)}`,
+				),
+			),
+		);
+		s.setCompare("");
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const msg = s.prompts.at(-1)!;
+		expect(msg.length).toBeLessThanOrEqual(PROMPT_CHAR_BUDGET);
+		expect(msg).toContain("EARLIER REVIEW");
+		expect(msg).toContain("old-119");
+		expect(msg).not.toContain("old-0 ");
+		const cut = msg.match(/(\d+) oldest comments were omitted/);
+		expect(cut).not.toBeNull();
+		expect(Number(cut![1])).toBeGreaterThan(0);
+		expect(Number(cut![1])).toBeLessThan(120);
+	});
+
+	test("a failed compare keeps the full diff and says the range is unavailable", async () => {
+		const s = setup();
+		s.setOpen([pr(26, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(26)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 26)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(26, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "earlier review body", "2026-01-01T00:00:00Z"),
+		]);
+		s.setCompare(null);
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const msg = s.prompts.at(-1)!;
+		expect(msg).toContain("unavailable");
+		expect(msg).toContain(
+			"DIFF\n<<<DATA\ndiff --git a/x b/x\n+pr 26\n\nDATA>>>",
+		);
+		expect(msg).not.toContain("RANGE DIFF");
 	});
 
 	test("the default review asks the gateway for the plan role", async () => {
@@ -617,5 +893,46 @@ describe("createPrWatcher", () => {
 		await watcher.tick();
 		expect(pages.length).toBe(2);
 		expect(s.store.listPrReviews().length).toBe(103);
+	});
+
+	test("reviewNow reviews the refreshed head with the maintainer note, skipping the gates", async () => {
+		const s = setup();
+		s.setOpen([pr(24, sha("a"), false, "Add export")]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.store.getPrReview(24)!.reviewedHead).toBe(sha("a"));
+		// A new head arrives without the quiet gate having elapsed: the explicit request goes anyway.
+		s.setOpen([pr(24, sha("c"))]);
+		await s.watcher.tick();
+		await s.watcher.reviewNow({
+			project: "p",
+			number: 24,
+			note: "focus on the error panel",
+		});
+		await s.watcher.reviewIdle();
+		expect(s.store.getPrReview(24)!.reviewedHead).toBe(sha("c"));
+		expect(s.cards()[0]!.details).toBe("## Summary\nreview 2");
+		const msg = s.prompts.at(-1)!;
+		expect(msg).toContain("focus on the error panel");
+		// The note is the maintainer's trusted text: outside every DATA block.
+		expect(msg.indexOf("focus on the error panel")).toBeLessThan(
+			msg.indexOf("<<<DATA"),
+		);
+		expect(s.store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("a reviewNow at the daily cap starts no run", async () => {
+		const s = setup();
+		s.setOpen([31, 32, 33, 34, 35, 36].map((n) => pr(n, sha("a"))));
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.store.prReviewRunsSince(0)).toBe(PR_GATES.PROJECT_DAILY_RUNS);
+		await s.watcher.reviewNow({ project: "p", number: 31, note: "look again" });
+		await s.watcher.reviewIdle();
+		expect(s.store.prReviewRunsSince(0)).toBe(PR_GATES.PROJECT_DAILY_RUNS);
+		expect(s.logs.some((m) => m.includes("daily cap"))).toBe(true);
+		expect(s.prompts).toHaveLength(PR_GATES.PROJECT_DAILY_RUNS);
 	});
 });

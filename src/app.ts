@@ -149,7 +149,7 @@ import {
 	rulesInterviewPrompt,
 	workCheckSendBack,
 } from "./prompts.ts";
-import { createPrWatcher, prUrl } from "./prs.ts";
+import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
@@ -432,6 +432,8 @@ interface AppDeps {
 	githubAppFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 	/** Gateway spawn seam for the release-summary model call; defaults to the real spawn. Tests inject a stub. */
 	releaseSummarySpawn?: SpawnFn;
+	/** Gateway spawn seam for the PR-review model call; defaults to the real spawn. Tests inject a stub. */
+	prReviewSpawn?: SpawnFn;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -1268,6 +1270,7 @@ export function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
+		spawn: deps.prReviewSpawn,
 		// A re-review rewrites a draft the user may have read: the mark must go,
 		// or the updated card never wears the unread badge again.
 		forgetSeen: (taskId) => saveSeen(loadSeen().filter((id) => id !== taskId)),
@@ -6014,6 +6017,36 @@ export function createApp(deps: AppDeps) {
 					const { e, task } = found;
 					if (task.cancelledAt !== null)
 						return json({ error: "task is cancelled" }, 404);
+					// A pr_review card never replays its prompt as a turn: the reply is a note for
+					// the reviewer, which runs a new draft for the current head and counts against
+					// the daily cap like a watcher run.
+					if (task.kind === "pr_review") {
+						const row = e.store.getPrReviewByTask(task.id);
+						if (row === null || e.github === null)
+							return json({ error: "not a PR review card" }, 409);
+						if (row.state !== "open")
+							return json({ error: `PR is ${row.state}` }, 409);
+						const note = text.trim();
+						if (note === "" || note.length > 20000)
+							return json({ error: "text must be 1-20000 characters" }, 400);
+						if (Array.isArray(r.body.images) && r.body.images.length > 0)
+							return json({ error: "PR review notes are text-only" }, 400);
+						if (
+							e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS) >=
+							PR_GATES.PROJECT_DAILY_RUNS
+						)
+							return json(
+								{
+									error: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+								},
+								429,
+							);
+						// reviewNow never rejects; the catch only guards against a stray throw.
+						void prWatcher
+							.reviewNow({ project: e.name, number: row.number, note })
+							.catch(() => {});
+						return taskResponse(e, task.id);
+					}
 					if (task.state !== "needs_you")
 						return json({ error: "task is not waiting for you" }, 409);
 					const decoded = decodeImages(
@@ -6981,5 +7014,6 @@ export function createApp(deps: AppDeps) {
 		tokenReminderTick,
 		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
 		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
+		prReviewIdle: () => prWatcher.reviewIdle(),
 	};
 }

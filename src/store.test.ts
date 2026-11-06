@@ -3062,6 +3062,37 @@ describe("pr review store methods", () => {
 		expect(store.prReviewRunsSince(1000)).toBe(2);
 	});
 
+	test("lastPrRunAt gives the latest done run's start per head and ignores undone runs", () => {
+		const store = open(join(root, "pr-last-run"));
+		store.savePrReview({
+			number: 12,
+			taskId: null,
+			head: "abc",
+			firstSeenAt: 1,
+			reviewedHead: null,
+			postedHead: null,
+			postedUrl: null,
+			postedLogin: null,
+			state: "open",
+			draft: false,
+			title: "t",
+			postError: null,
+		});
+		const run1 = store.startPrRun(12, "abc", 1000);
+		store.startPrRun(12, "abc", 500);
+		// A failed attempt counts for the cap but is not a review yet.
+		expect(store.lastPrRunAt(12, "abc")).toBeNull();
+		store.savePrDraft({
+			run: run1,
+			number: 12,
+			head: "abc",
+			draft: "d",
+			prompt: "p",
+		});
+		expect(store.lastPrRunAt(12, "abc")).toBe(1000);
+		expect(store.lastPrRunAt(12, "xyz")).toBeNull();
+	});
+
 	test("savePrDraft files one done card, then updates the same card; only saved heads count as reviewed", () => {
 		const store = open(join(root, "pr-draft"));
 		expect(() =>

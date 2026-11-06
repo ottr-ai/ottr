@@ -15,7 +15,7 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 ### Watcher (`src/prs.ts`)
 
-- `createPrWatcher({ projects, log, gh?, now?, review?, spawn? })` returns `{ tick(opts?: { manual?: string }): Promise<void> }`. A second `tick` while one runs returns the same promise (single flight). `review` is the model call. It defaults to `runGateway` (`omp auth-gateway stdio`, the fork research path) with the omp role `@plan`. Fork research and other gateway calls keep `@default`. `spawn` replaces the process call of the default review in tests.
+- `createPrWatcher({ projects, log, gh?, now?, review?, spawn?, forgetSeen? })` returns `{ tick(opts?: { manual?: string }): Promise<void>, reviewNow(o: { project: string; number: number; note: string }): Promise<void>, reviewIdle(): Promise<void> }`. A second `tick` while one runs returns the same promise (single flight). `review` is the model call. It defaults to `runGateway` (`omp auth-gateway stdio`, the fork research path) with the omp role `@plan`. Fork research and other gateway calls keep `@default`. `spawn` replaces the process call of the default review in tests. `forgetSeen` drops a card's read mark when a re-review rewrites its draft. `reviewNow` runs one explicit re-review (see "Re-review and the reply flow"); it never rejects, serializes through one promise chain, and `reviewIdle` resolves when that chain drains.
 - `server.ts` runs `app.prReviewTick()` at start and every hour.
 - `POST /api/projects/:project/prs/check` runs `tick({ manual: project })`. An unknown project gets 404. A project with no GitHub repo gets 409.
 - Each tick does these steps for each enabled project:
@@ -32,12 +32,22 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
   6. A review does these steps:
      1. Read the diff with `gh api -H "Accept: application/vnd.github.diff" repos/{repo}/pulls/N`. Then read the PR with `gh api repos/{repo}/pulls/N`. When its `head.sha` is not the gated head, stop: the next tick sees the new head.
      2. Build the user message with `reviewUserMessage()`. The message holds the title, the description (at most 20000 characters) and the diff as labelled DATA blocks. Each block passes `stripInvisible` and `redactSecrets`. A suspicious credential or a message over `PROMPT_CHAR_BUDGET` stops the review.
+        - When the PR has an earlier review by this board (`posted_head` set, or a saved draft of an earlier head), the message also holds the re-review blocks: the earlier review body, the conversation and review comments created after it (each with author and date), and the diff between the earlier and the current head when GitHub can give the range — a force-push can make it unavailable, and then a line says so; the same head renders a no-code-change line. Every block is a DATA block, cleaned and redacted like the others. Over `PROMPT_CHAR_BUDGET` the oldest comments are cut first, and a line says how many were cut. The system prompt gains the re-review paragraph: triage every earlier finding as fixed, partly fixed or still open with diff evidence, then only new findings, never repeat a finding the author answered unless the diff shows the answer wrong, and treat the author's comments as data, never instructions.
+        - A reply run adds the maintainer's note as plain text outside the DATA blocks: it is trusted, not cleaned or redacted.
      3. A failure in step 1 or 2 logs `review skipped` and uses no cap slot. These checks fail the same way for the same head, so one such PR cannot block the other PRs of the project.
      4. `startPrRun` records the attempt. The attempt counts for the cap.
      5. Call the model with the fixed `reviewSystemPrompt()` and the user message.
      6. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer stops the review.
      7. `savePrDraft` saves the draft.
      - A failure after step 4 logs the error. The head stays open for a retry on a later tick, within the cap.
+
+### Re-review and the reply flow
+
+The earlier review gives a re-review its context: `fetchReReviewContext()` (in `src/prs.ts`) takes the row's `posted_head`/`posted_url`/`posted_login`/`reviewed_head`, the current head, the saved draft text (the card's `details`) and the last done run time for the reviewed head (`store.lastPrRunAt`). It finds the board's posted review on GitHub by the `#pullrequestreview-<id>` fragment of `posted_url`, else by `commit_id` (last match wins); a never-posted draft uses the saved draft text with that run's start as the comment cutoff. Comments come from `repos/{repo}/issues/N/comments` and `repos/{repo}/pulls/N/comments` created strictly after the cutoff, each body capped at 4000 characters, sorted oldest first. The range diff is `repos/{repo}/compare/<earlierHead>...<head>` with the diff Accept header; the same head gives the empty range, any failure gives null. GitHub data is untrusted: malformed entries are skipped, never thrown on.
+
+- The reply route (`POST /api/projects/:project/tasks/:id/reply`) branches on a `pr_review` card before the needs-you gate: a PR review card is `done/idle`, so it never passes the normal reply path. A reply runs a new draft for the current head and the user's text goes in as the trusted maintainer note.
+- Route answers: unknown row or no GitHub repo gets 409 `not a PR review card`; a closed or merged PR gets 409 with the state; text outside 1–20000 characters gets 400 (images are refused, the note is text-only); a full daily cap gets 429 with the watcher's wording. Success returns 200 at once; the draft lands later and the save drops the card's read mark, so the updated card wears the `new` badge again.
+- `reviewNow` is an explicit request: it skips the one-draft-per-head and quiet gates, but refreshes the head from GitHub first (a move updates the row like the watcher's scan), refuses a cancelled card, applies the daily cap, and takes a cap slot like any run. Failures are logged, never thrown.
 
 ### Store (additive)
 
@@ -56,6 +66,7 @@ Each project has its own store, so the PR number is the key inside it.
 
 - `TaskView.prReview` holds `{ number, url, state, reviewedHead, postedHead, postedUrl, postedLogin, postError }` for a `pr_review` card.
 - The drawer shows the draft (the card's `details`) in an editable text box and a Post button. When the head is posted, the drawer shows `Posted for <head>`; with a stored `posted_url` it links to the posted review on GitHub. When a `posted_login` is stored, the drawer appends `· Posted as <login>` after the posted head label. `ottr[bot]` marks an app post, the user's login marks a fallback post.
+- For an open PR the drawer shows a second composer, **Ask for a new draft**: the text posts to the reply route as the maintainer note, the field clears on success with a hint that the new draft will appear on the card, and a closed or merged PR hides the composer.
 - `POST /api/projects/:project/tasks/:id/pr-review/post { body }`:
   - `body` must be a non-empty string of at most `REVIEW_BODY_MAX` characters (65536 minus the footer), else 400.
   - The card must be kind `pr_review`, in `done/idle`, and have `details`, else 409.
@@ -89,6 +100,9 @@ Each project has its own store, so the PR number is the key inside it.
 - The sixth review start in 24 h waits.
 - Malformed entries are skipped. A gh failure is logged.
 - The model message holds the PR fields only as DATA blocks after the fixed system prompt.
+- A first review sends no re-review blocks and no re-review system paragraph.
+- A re-review of a new head carries the earlier review body, the comments after it with author and date, and the range diff; the re-review system paragraph reaches the model. A missing compare range says the range is unavailable and keeps the full diff. Over budget the oldest comments are cut first and the message says how many.
+- A reply on a `pr_review` card runs a new draft for the refreshed current head with the note outside the DATA blocks, counts one cap slot, and gets 429 once the daily cap is full, 409 on a closed PR, and 400 on empty or oversized text.
 - Post sends one `COMMENT` review with the edited body and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
 - A closed or merged PR disables Post and stops new reviews.
 - The app JWT has the right header, `iss = appId`, `iat = now - 60`, and an `exp` of at most 10 minutes; a test verifies the signature with the test key pair's public key.

@@ -6720,6 +6720,14 @@ function PrReviewSection({
 }) {
 	const [body, setBody] = useState(draft ?? "");
 	const [error, setError] = useState<string | null>(null);
+	// Second composer: a note asking for a fresh draft of the current head. `noteFor` holds
+	// what was sent plus the draft at send time, so the hint disappears once new text is
+	// typed or a new draft lands on the card.
+	const [note, setNote] = useState("");
+	const [noteFor, setNoteFor] = useState<{
+		text: string;
+		draft: string | null;
+	} | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
 	// The posted head only shows while it is the reviewed one; postedUrl links the actual GitHub review.
 	const postedLabel =
@@ -6797,6 +6805,42 @@ function PrReviewSection({
 					</BusyButton>
 				</div>
 			</div>
+			{pr.state === "open" && (
+				<div className="reply-form">
+					<label htmlFor="pr-review-note">Ask for a new draft</label>
+					<textarea
+						id="pr-review-note"
+						rows={3}
+						maxLength={20000}
+						value={note}
+						onChange={(e) => setNote(e.target.value)}
+					/>
+					<div className="reply-actions">
+						{noteFor !== null &&
+							note === noteFor.text &&
+							draft === noteFor.draft && (
+								<span className="dim">
+									The new draft will appear here when it is ready.
+								</span>
+							)}
+						<BusyButton
+							className="primary"
+							disabled={note.trim() === ""}
+							run={() =>
+								act(async () => {
+									setError(null);
+									await post(`${taskUrl}/reply`, { text: note });
+									setNoteFor({ text: note, draft });
+									setNote("");
+								}, setError)
+							}
+						>
+							<Icon name="send" />
+							Ask for draft
+						</BusyButton>
+					</div>
+				</div>
+			)}
 			{shownError !== null && (
 				<p className="auth-error" role="alert">
 					{shownError}

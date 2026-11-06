@@ -9,6 +9,7 @@ import type {
 	PerfStat,
 	ProjectView,
 	ProposalSummary,
+	PrReviewView,
 	Task,
 	TaskCard,
 	TaskView,
@@ -403,7 +404,8 @@ describe("UpdateRowLine", () => {
 });
 
 const cardFixture = (
-	over: Partial<TaskCard> & Partial<Pick<Task, "report">>,
+	over: Partial<TaskCard> &
+		Partial<Pick<Task, "details" | "report">> & { prReview?: PrReviewView },
 ): TaskCard =>
 	({
 		id: "t1",
@@ -3468,6 +3470,48 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		// The reply and steer forms key off state needs_you/running; idle shows none.
 		expect(html).not.toContain('id="drawer-reply"');
 		expect(html).not.toContain('label="Steer"');
+	});
+
+	// OTTR-565: the pr_review drawer's second composer asks for a fresh draft.
+	const prView = (state: "open" | "closed") => ({
+		number: 7,
+		url: "https://github.com/acme/widget/pull/7",
+		state,
+		reviewedHead: "c".repeat(40),
+		postedHead: null,
+		postedUrl: null,
+		postedLogin: null,
+		postError: null,
+	});
+
+	test("an open pr_review drawer shows the ask-for-draft composer", () => {
+		const task = cardFixture({
+			...drawerFields,
+			id: "P-1",
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			details: "## Summary\nreview",
+			prReview: prView("open"),
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("Ask for a new draft");
+		expect(html).toContain('id="pr-review-note"');
+	});
+
+	test("a closed pr_review drawer hides the ask-for-draft composer", () => {
+		const task = cardFixture({
+			...drawerFields,
+			id: "P-2",
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			details: "## Summary\nreview",
+			prReview: prView("closed"),
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain("Ask for a new draft");
+		expect(html).not.toContain('id="pr-review-note"');
 	});
 });
 
