@@ -9,6 +9,7 @@ import {
 	createSystemSampler,
 	fetchWorkerStats,
 	HOUR_MS,
+	keepWindow,
 	type LiveRun,
 	MUTATION_LOCK_PATH,
 	parseCgroupReading,
@@ -88,7 +89,7 @@ describe("readCgroup", () => {
 			at: 42,
 			cpuUsageUsec: 123456,
 			cpuMax: { quotaUsec: 200000, periodUsec: 100000 },
-			memoryCurrent: 32428800,
+			memoryCurrent: 52428800,
 			memoryMax: 1073741824,
 			memoryEvents: { max: 12, oom: 3, oomKill: 2 },
 			lock: { exists: false, pid: null, alive: false },
@@ -102,11 +103,13 @@ describe("readCgroup", () => {
 		expect(r.memoryMax).toBe("max");
 	});
 
-	test("missing memory.stat leaves memory.current raw", () => {
-		const root = fakeRoot({ "memory.current": "52428800\n" });
-		expect(readCgroup({ root, lockPath: NO_LOCK }).memoryCurrent).toBe(
-			52428800,
-		);
+	test("memory.current stays raw: page cache in memory.stat counts against the limit", () => {
+		const root = fakeRoot({
+			"memory.current": "950\n",
+			"memory.stat": "anon 700\nfile 250\ninactive_file 200\n",
+			"memory.max": "1000\n",
+		});
+		expect(readCgroup({ root, lockPath: NO_LOCK }).memoryCurrent).toBe(950);
 	});
 
 	test("missing files (cgroup v1) read as null", () => {
@@ -273,10 +276,25 @@ describe("cpuPercent", () => {
 });
 
 describe("counterGrowth", () => {
+	const at = (values: number[]) => values.map((value, i) => ({ at: i, value }));
 	test("sums growth; a counter that went down restarted from 0", () => {
-		expect(counterGrowth([3, 5, 5, 6])).toBe(3);
-		expect(counterGrowth([4, 1, 2])).toBe(2);
-		expect(counterGrowth([7])).toBe(0);
+		expect(counterGrowth(at([3, 5, 5, 6]), 0)).toBe(3);
+		expect(counterGrowth(at([4, 1, 2]), 0)).toBe(2);
+		expect(counterGrowth(at([7]), 0)).toBe(0);
+	});
+	test("an increase counts by the time of the reading that shows it", () => {
+		// Readings at 0, 1, 2: the 0→1 step shows at 1, so a window from 1 still counts it.
+		expect(counterGrowth(at([0, 1, 1]), 1)).toBe(1);
+		expect(counterGrowth(at([0, 1, 1]), 2)).toBe(0);
+	});
+});
+
+describe("keepWindow", () => {
+	test("keeps the newest reading before the window as the baseline", () => {
+		const ev = [{ at: 0 }, { at: 10 }, { at: 20 }, { at: 30 }];
+		expect(keepWindow(ev, 15)).toEqual([{ at: 10 }, { at: 20 }, { at: 30 }]);
+		expect(keepWindow(ev, 0)).toEqual(ev);
+		expect(keepWindow(ev, 99)).toEqual([{ at: 30 }]);
 	});
 });
 
@@ -482,6 +500,32 @@ describe("createSystemSampler", () => {
 		expect(row!.warnings).toEqual([]);
 	});
 
+	test("an OOM kill seen 30 s after the first reading still counts just under one hour later", () => {
+		const sampler = createSystemSampler();
+		let last = 0;
+		for (let at = 0; at <= 3_600_001; at += TICK) {
+			sampler.record(
+				[
+					{
+						name: "server",
+						reading: reading({
+							at,
+							memoryEvents: events(at >= TICK ? 3 : 0, at >= TICK ? 1 : 0),
+						}),
+					},
+				],
+				vmAt(at),
+			);
+			last = at;
+		}
+		// The increase showed at 30 000 ms; at 3 600 001 ms it is 3 570 001 ms old.
+		const [row] = sampler.snapshot([], HOLDS, 3_600_001).containers;
+		expect(last).toBe(3_600_000);
+		expect(row!.oomKillsHour).toBe(1);
+		expect(row!.memMaxHitsHour).toBe(3);
+		expect(row!.warnings).toEqual(["OOM kill in the last hour"]);
+	});
+
 	test("a restarted container counts its new oom_kill value as growth", () => {
 		const sampler = createSystemSampler();
 		sampler.record(
@@ -629,6 +673,12 @@ describe("createSystemSampler", () => {
 			},
 			{ project: "q", id: "C", runner: "server", progress: null },
 			{
+				project: "q",
+				id: "M",
+				runner: "server",
+				progress: "mutate.py running",
+			},
+			{
 				project: "p",
 				id: "D",
 				runner: "worker-a",
@@ -646,7 +696,9 @@ describe("createSystemSampler", () => {
 			{ project: "p", id: "A" },
 			{ project: "p", id: "B" },
 			{ project: "q", id: "C" },
+			{ project: "q", id: "M" },
 		]);
+		// The mutate.py run on the same container is no Stryker holder: A stays the one holder.
 		expect(server!.lock).toEqual({
 			holderPid: 4242,
 			holderCard: { project: "p", id: "A" },

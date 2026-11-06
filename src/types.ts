@@ -1071,7 +1071,7 @@ export interface CgroupReading {
 	cpuUsageUsec: number | null;
 	/** cpu.max: the quota per period in microseconds, or "max" (no quota). */
 	cpuMax: { quotaUsec: number; periodUsec: number } | "max" | null;
-	/** memory.current minus memory.stat inactive_file (docker stats' usage), in bytes. */
+	/** memory.current in bytes (page cache included: the kernel counts it against memory.max). */
 	memoryCurrent: number | null;
 	/** memory.max in bytes, or "max" (no limit). */
 	memoryMax: number | "max" | null;

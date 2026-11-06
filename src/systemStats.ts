@@ -29,6 +29,8 @@ const WARN_FRACTION = 0.9;
 export const CPU_WARN_SAMPLES = 10;
 /** The progress text of a run that waits for another run's mutation lock (src/stryker.ts). */
 const LOCK_WAIT_PREFIX = "Stryker waiting for the mutation lock";
+/** Every Stryker progress text starts with this (src/stryker.ts strykerStatus, runProgress). */
+const STRYKER_PREFIX = "Stryker ";
 
 /** File text, or null when it is missing or unreadable (cgroup v1 has none of these files). */
 function readText(path: string): string | null {
@@ -103,12 +105,6 @@ export function parseMemoryEvents(
 	return { max, oom, oomKill };
 }
 
-/** The `inactive_file N` line of memory.stat; null when missing or garbled. */
-export function parseInactiveFile(text: string | null): number | null {
-	if (text === null) return null;
-	return keyedCounts(text).get("inactive_file") ?? null;
-}
-
 /** The mutation lock file `{"pid":N}`: an unparsable one still exists, but holds no pid.
  *  Liveness mirrors lockHolderAlive in scripts/stryker-load.mjs (EPERM counts as alive). */
 export function readLock(lockPath: string): CgroupReading["lock"] {
@@ -138,13 +134,7 @@ export function readCgroup(opts?: {
 }): CgroupReading {
 	const root = opts?.root ?? "/sys/fs/cgroup";
 	const file = (name: string): string | null => readText(join(root, name));
-	// current − inactive_file matches docker stats; raw memory.current counts page cache and reads near-limit.
-	const current = parseMemoryCurrent(file("memory.current"));
-	const inactive = parseInactiveFile(file("memory.stat"));
-	const memoryCurrent =
-		current !== null && inactive !== null && current - inactive >= 0
-			? current - inactive
-			: current;
+	const memoryCurrent = parseMemoryCurrent(file("memory.current"));
 	return {
 		at: opts?.now ?? Date.now(),
 		cpuUsageUsec: parseCpuStat(file("cpu.stat")),
@@ -348,17 +338,34 @@ export function pushRing(
 	return [...ring, point].filter((p) => p.at >= point.at - HOUR_MS).slice(-cap);
 }
 
-/** Growth of a counter across readings, oldest first. A value lower than the one before means
- *  the container restarted and its counter began again at 0, so that value is all growth since
- *  the restart; the sum is never negative. */
-export function counterGrowth(values: readonly number[]): number {
+/** Growth of a counter within a window, from readings oldest first. An increase counts when
+ *  the reading that shows it is at or after `since`; the reading before it may be older, so the
+ *  last reading before the window serves as the baseline. A value lower than the one before
+ *  means the container restarted and its counter began again at 0, so that value is all growth
+ *  since the restart; the sum is never negative. */
+export function counterGrowth(
+	readings: readonly { at: number; value: number }[],
+	since: number,
+): number {
 	let growth = 0;
-	for (let i = 1; i < values.length; i++) {
-		const prev = values[i - 1]!;
-		const cur = values[i]!;
-		growth += cur >= prev ? cur - prev : cur;
+	for (let i = 1; i < readings.length; i++) {
+		const cur = readings[i]!;
+		if (cur.at < since) continue;
+		const prev = readings[i - 1]!.value;
+		growth += cur.value >= prev ? cur.value - prev : cur.value;
 	}
 	return growth;
+}
+
+/** `events` (oldest first) from `since` on, plus the newest one before `since`: the baseline
+ *  counterGrowth needs for an increase seen in the window's first reading. */
+export function keepWindow<T extends { at: number }>(
+	events: readonly T[],
+	since: number,
+): T[] {
+	const first = events.findIndex((e) => e.at >= since);
+	if (first === -1) return events.slice(-1);
+	return events.slice(Math.max(0, first - 1));
 }
 
 /** The warning reasons of one reachable row. `history` is oldest first; the CPU warning needs
@@ -395,8 +402,12 @@ export function rowLock(
 ): ContainerRow["lock"] {
 	const card = (r: LiveRun): SystemCard => ({ project: r.project, id: r.id });
 	const waiters = runs.filter((r) => r.progress?.startsWith(LOCK_WAIT_PREFIX));
+	// Only a Stryker status can hold the Stryker lock: runProgress also reports mutate.py runs.
 	const running = runs.filter(
-		(r) => r.progress !== null && !r.progress.startsWith(LOCK_WAIT_PREFIX),
+		(r) =>
+			r.progress !== null &&
+			r.progress.startsWith(STRYKER_PREFIX) &&
+			!r.progress.startsWith(LOCK_WAIT_PREFIX),
 	);
 	return {
 		holderPid: lock?.exists && lock.alive ? lock.pid : null,
@@ -430,7 +441,7 @@ export function createSystemSampler(): SystemSampler {
 		vm: VmReading,
 	): RunnerState => {
 		const tick = vm.at;
-		const events = (prev?.events ?? []).filter((e) => e.at >= tick - HOUR_MS);
+		const events = keepWindow(prev?.events ?? [], tick - HOUR_MS);
 		if (reading === null) {
 			// An outage: a gap point, and no previous reading for the next CPU delta, so the
 			// first CPU after it spans one tick, not the whole outage.
@@ -506,12 +517,18 @@ export function createSystemSampler(): SystemSampler {
 					? s.vmCpus
 					: r.cpuMax.quotaUsec / r.cpuMax.periodUsec;
 		const memLimit = typeof r.memoryMax === "number" ? r.memoryMax : null;
-		const hour = s.events.filter((e) => e.at >= now - HOUR_MS);
+		const since = now - HOUR_MS;
 		const memMaxHitsHour = r.memoryEvents
-			? counterGrowth(hour.map((e) => e.max))
+			? counterGrowth(
+					s.events.map((e) => ({ at: e.at, value: e.max })),
+					since,
+				)
 			: null;
 		const oomKillsHour = r.memoryEvents
-			? counterGrowth(hour.map((e) => e.oomKill))
+			? counterGrowth(
+					s.events.map((e) => ({ at: e.at, value: e.oomKill })),
+					since,
+				)
 			: null;
 		return {
 			...base,
