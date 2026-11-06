@@ -6658,7 +6658,9 @@ export function createApp(deps: AppDeps) {
 										},
 										body: JSON.stringify({
 											event: "COMMENT",
-											body: `${body}${REVIEW_FOOTER}`,
+											// No footer: the review posts as the app, so GitHub's Bot badge
+											// already says who posted it.
+											body: body,
 											commit_id: head,
 										}),
 									},

@@ -1041,8 +1041,10 @@ export interface MachineStats {
 	}[];
 }
 
-/** Appended to every posted PR review: the review goes out under the poster's own GitHub
- *  identity, so the body itself says that an AI agent drafted it and a person posted it. */
+/** Appended to a PR review posted with the board token (the gh path): that review goes out
+ *  under the poster's own GitHub identity, so the body itself says that an AI agent drafted
+ *  it and a person posted it. A review posted as the GitHub App carries no footer: GitHub's
+ *  Bot badge already says who posted it. */
 export const REVIEW_FOOTER =
 	"\n\n---\n<sub>Drafted by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker. A person read the draft and posted it.</sub>";
 /** GitHub's limit on a review body (65536 characters) minus the footer: the editable draft's limit. */

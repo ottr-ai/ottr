@@ -8164,7 +8164,7 @@ describe("PR review routes", () => {
 		expect(headers.authorization).toBe("Bearer INSTA");
 		expect(JSON.parse(postCall.init!.body as string)).toEqual({
 			event: "COMMENT",
-			body: `Ship it.${REVIEW_FOOTER}`,
+			body: "Ship it.",
 			commit_id: H1,
 		});
 		const view = (await (

@@ -3,8 +3,8 @@
 A posted PR review should show on GitHub as `ottr[bot]` with the bot badge, not under the
 person's GitHub identity. The user registers a GitHub App once and pastes its App ID and
 PEM private key into Ottr. Ottr then mints short-lived installation tokens and posts
-reviews with them. The REVIEW_FOOTER stays: the badge says who posted, the footer says a
-person clicked Post. Spec: [pr-reviews.md](pr-reviews.md).
+reviews with them. App posts carry no REVIEW_FOOTER: the badge already says the app
+posted the review. The footer stays on the board-token path only. Spec: [pr-reviews.md](pr-reviews.md).
 
 ## Config (board-wide, in the tracker db)
 
@@ -79,7 +79,7 @@ the release and the `post_error` handling it has today. The GitHub call changes:
 
 - With an app configured and an installation found: direct fetch POST to
   `https://api.github.com/repos/{repo}/pulls/{number}/reviews`, JSON body
-  `{ event: "COMMENT", body: <body + REVIEW_FOOTER>, commit_id: <reviewedHead> }`,
+  `{ event: "COMMENT", body: <body>, commit_id: <reviewedHead> }` (no footer),
   `Authorization: Bearer <installation token>`. The board token and `gh` stay unused.
 - With no app configured, or an installation 404: today's `gh` call with the board token.
 - Another app-path failure (bad key, GitHub 5xx, network): 502 like a gh failure —
