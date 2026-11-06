@@ -193,11 +193,45 @@ PowerShell 5.1 drops double quotes inside the arguments of native programs, so t
 
 ### Podman
 
-Podman runs the stack too, with four differences:
+Podman runs the stack too. The Windows + podman-compose notes below are as reported by a
+user on Windows 11 (Podman 6.1.4, rootful, WSL machine; podman-compose 1.6.0) — the
+project has no Windows machine to verify them.
 
 - `podman compose` needs a compose provider. Use Docker Compose v2 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`), or `pip install podman-compose`.
 - Podman has no `local` log driver. Set `OTTR_LOG_DRIVER=k8s-file` (env or `.env`).
-- podman-compose cannot parse Windows paths in volume mounts (`C:\...`). Either use Docker Compose v2 as the provider, or give the Podman machine's paths: `OTTR_OAUTH_DIR=/mnt/c/Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=/mnt/c/Users/<you>/.omp/ottr-agent.db`.
+- Windows + podman-compose cannot take the host paths as written: `C:\...` does not parse in a short volume mount, and a POSIX path like `/mnt/c/Users/<you>/.omp/oauth` goes through Python `abspath`, becomes `C:\mnt\c\...`, and podman mounts `/mnt/c/mnt/c/Users/...`. Rootful podman creates the missing source as an empty folder, so the stack starts with an empty oauth folder and `agent.db` as a folder — provider sign-in then fails, and nothing reports it. Use Docker Compose v2 as the provider, or:
+  - use paths relative to the compose folder, which podman-compose resolves there and the podman client translates into machine paths. From `C:\Users\<you>\ottr`: `OTTR_OAUTH_DIR=../../../../Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=../../../../Users/<you>/.omp/ottr-agent.db`;
+  - or switch the two mounts in your compose copy to the long bind syntax (`type: bind`, `source:` the Windows path, `target:` the container path), which podman-compose takes as-is.
+- Check the mounts after `up` (podman-compose names the container `ottr_server_1`; Docker Compose v2 `ottr-server-1`):
+
+  ```sh
+  podman inspect ottr_server_1 --format "{{range .Mounts}}{{.Source}}{{println}}{{end}}"
+  ```
+
+  A source under `/mnt/c/mnt/c/` means the path was mangled.
+- Repair a `home` volume that kept an empty `agent.db` folder from a bad mount — the next recreate then fails with `crun: mount ... agent.db: Not a directory`. `rmdir` removes only empty directories, so a populated db survives (the volume is `ottr_home`: compose project `ottr`, volume `home`):
+
+  ```sh
+  podman run --rm -v ottr_home:/h busybox rmdir /h/.omp/agent/agent.db
+  ```
+
+- From source, build with podman, not compose — `podman compose build` passes the Windows context path to the remote podman and fails — then start without building:
+
+  ```sh
+  podman build -f Dockerfile.worker -t ottr-worker:local .
+  podman compose up -d --no-build
+  ```
+
+- `board-seed` under podman-compose: `COMPOSE_PROFILES=alate` leaves the `seed` profile off, so `podman compose run --rm board-seed` fails with `missing services [board-seed]`. Activate the profile (Docker Compose v2 starts the service you run without the flag):
+
+  ```sh
+  podman compose --profile seed run --rm board-seed --repo OWNER/NAME
+  # local checkout of the data repo instead of --repo, same relative-path rule as above:
+  podman compose --profile seed run --rm -v ../../../../Users/<you>/agent-data:/data:ro board-seed --data /data
+  ```
+
+- Shell variables beat `.env`: an `OTTR_*` value still set with `$env:` in the session wins over the `.env` file. Remove old values (`Remove-Item Env:OTTR_OAUTH_DIR`, and the rest) before blaming the file.
+- Memory: without `HINDSIGHT_API_URL` (or a saved **Settings → Hindsight** URL) the workers keep their own `mnemopi` store in the `home` volume ([Fleet memory](docs/WORKERS.md#fleet-memory-hindsight)). Two options: copy your local mnemopi store into the volume once, or point your local omp and Ottr at the same Hindsight server. Never bind-mount the host mnemopi folder into the volume: SQLite over the WSL file share with concurrent writers can corrupt the store.
 - The default Podman machine has 2 GiB of RAM, and the server and each worker may use up to 8 GiB. Raise it: `podman machine stop; podman machine set --memory 16384; podman machine start`.
 
 Podman Desktop shows no containers, or the board times out after you recreate the stack? See [docs/WORKERS.md, Troubleshooting](docs/WORKERS.md#troubleshooting).
