@@ -238,7 +238,7 @@ export function payloadsFor(
 	return out;
 }
 
-/** Apple's push service revokes subscriptions that receive pushes without a visible notification, so data-only clear pushes skip these endpoints. Retraction there is best-effort: the next alert push carries `clear`. */
+/** Apple's push service revokes subscriptions that receive pushes without a visible notification, so data-only clear pushes skip these endpoints. The server keeps their pending clear tags and sends them in the next alert push to that device (app.ts batchFor). */
 export function isApplePush(endpoint: string): boolean {
 	try {
 		return new URL(endpoint).hostname.endsWith("push.apple.com");

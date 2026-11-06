@@ -7210,27 +7210,28 @@ describe("web push (R1-1, R2-3)", () => {
 		mkdirSync(dir, { recursive: true });
 		const s = ProjectStore.open(dir);
 		const clock = { now: 1_000_000_000 };
-		const m = mount({
-			projects: new Map<string, Entry>([
-				[
+		const projects = new Map<string, Entry>([
+			[
+				name,
+				{
+					path: dir,
 					name,
-					{
-						path: dir,
-						name,
-						store: s,
-						target: null,
-						gitless: false,
-						github: null,
-						remote: null,
-						dirty: false,
-						mainUnpushed: false,
-						mainBranch: null,
-						latestRelease: null,
-						latestImage: null,
-						archReview: null,
-					},
-				],
-			]),
+					store: s,
+					target: null,
+					gitless: false,
+					github: null,
+					remote: null,
+					dirty: false,
+					mainUnpushed: false,
+					mainBranch: null,
+					latestRelease: null,
+					latestImage: null,
+					archReview: null,
+				},
+			],
+		]);
+		const m = mount({
+			projects,
 			now: () => clock.now,
 		});
 		const subscribe = async (endpoint: string) =>
@@ -7249,7 +7250,9 @@ describe("web push (R1-1, R2-3)", () => {
 			}));
 		const needsYou = (id: string) =>
 			s.updateTask(id, { state: "needs_you", needsReason: "?" });
-		return { s, m, clock, subscribe, sentSince, needsYou };
+		/** A second board process on the same global store and project: a server restart. */
+		const reboot = () => mount({ gstore: m.g, projects, now: () => clock.now });
+		return { s, m, clock, subscribe, sentSince, needsYou, reboot };
 	};
 
 	test("prefs: per-device classes survive a re-subscribe; mute list; 404 unknown endpoint, 400 bad shape", async () => {
@@ -7460,6 +7463,73 @@ describe("web push (R1-1, R2-3)", () => {
 		// A repeated ack changes nothing and sends nothing.
 		await b.m.call("/api/inbox/seen", { taskIds: [t.id] });
 		expect(b.sentSince(from).length).toBe(1);
+	});
+
+	test("Apple: a retraction waits and rides on the next alert to that device", async () => {
+		const b = alertBoard("alert-apple");
+		const apple = "https://web.push.apple.com/later";
+		await b.subscribe(apple);
+		const asked = b.s.createTask("ask");
+		const done = b.s.createTask("finish");
+		const third = b.s.createTask("ask later");
+		b.m.app.publishState();
+		b.needsYou(asked.id);
+		b.m.app.publishState();
+		const from = pushSends.length;
+		await b.m.call("/api/inbox/seen", { taskIds: [asked.id] });
+		// No data-only push to Apple.
+		expect(b.sentSince(from)).toEqual([]);
+		b.s.updateTask(done.id, { stage: "done", state: "idle" });
+		b.m.app.publishState();
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload).toMatchObject({
+			type: "alert",
+			tag: "complete",
+			clear: ["request"],
+		});
+		// Delivered once: the next alert carries no stale retraction.
+		b.needsYou(third.id);
+		b.m.app.publishState();
+		expect(b.sentSince(from)[1]!.payload).toMatchObject({
+			tag: "request",
+			clear: [],
+		});
+	});
+
+	test("a restart keeps the retraction registry: acks and resolutions after reboot still clear", async () => {
+		const b = alertBoard("alert-restart");
+		const fcm = "https://push.example/restart";
+		await b.subscribe(fcm);
+		const acked = b.s.createTask("ask before restart");
+		const resolved = b.s.createTask("resolved while down");
+		b.m.app.publishState();
+		b.needsYou(acked.id);
+		b.m.app.publishState();
+		b.s.updateTask(resolved.id, { stage: "done", state: "idle" });
+		b.m.app.publishState();
+		// While the board is down the card leaves done.
+		b.s.updateTask(resolved.id, { stage: "in_progress" });
+		const r = b.reboot();
+		const from = pushSends.length;
+		r.app.publishState(); // first frame after boot: retracts what resolved meanwhile
+		expect(b.sentSince(from)).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["complete"] } },
+		]);
+		// The pre-restart board object stays alive in this process (a real restart has none),
+		// so count only the request retraction, which only the rebooted board can send.
+		const before = b.sentSince(from).length;
+		expect(
+			(await r.call("/api/inbox/seen", { taskIds: [acked.id] })).status,
+		).toBe(200);
+		expect(
+			b
+				.sentSince(from)
+				.slice(before)
+				.filter((x) => JSON.stringify(x.payload.tags) === '["request"]'),
+		).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+		]);
 	});
 
 	test("the state frame carries inboxSeen; only explicit acks add to it; publishes prune task keys", async () => {
@@ -11786,6 +11856,43 @@ describe("token expiry reminders", () => {
 		setSystemTime(dayAt(2));
 		await served.tokenReminderTick();
 		expect(pushSends.length).toBe(1);
+	});
+
+	test("a reminder follows the alert rules: a focused tab holds it (day left open), Request off skips it", async () => {
+		probeExpiry = null;
+		await call("/api/settings/github-token", { token: TOKEN });
+		writeFileSync(seedFile, EXP);
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: null, lastPushDay: null },
+				seed: { expiresAt: EXP, lastPushDay: null },
+			}),
+		);
+		saveSubs(g, [sub]);
+		setSystemTime(dayAt(1));
+		pushSends.length = 0;
+		const beat = (focused: boolean) =>
+			call("/api/presence", { tab: "expiry-tab", focused });
+		expect((await beat(true)).status).toBe(200);
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(0);
+		expect(
+			JSON.parse(readFileSync(remindersFile, "utf8")).seed.lastPushDay,
+		).toBe(null);
+		// The tab leaves: the same day's next tick delivers.
+		await beat(false);
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+		// A device with Request off never gets the reminder.
+		saveSubs(g, [
+			{ ...sub, classes: { request: false, error: true, complete: true } },
+		]);
+		setSystemTime(dayAt(17));
+		await served.tokenReminderTick();
+		expect(pushSends.length).toBe(1);
+		writeFileSync(seedFile, "none");
+		saveSubs(g, [sub]);
 	});
 
 	test("seedView carries seed.expiresAt through /api/model-roles", async () => {

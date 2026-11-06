@@ -18,6 +18,8 @@ A card produces at most one event per state frame. Error wins over Request, and 
 - The first frame after the server starts.
 - Any event while a board tab is focused. The event is dropped, not sent later; it still sits in the bell.
 
+The GitHub token expiry reminder (once a day, 30 days before expiry and through the last two weeks) follows the same rules: it goes to devices with Request on, never while a board tab is focused, and a held reminder leaves its day open so the next daily check tries again. Project mutes do not apply; the token belongs to the board.
+
 ## Preferences
 
 Preferences live in the global store (`tracker.db`):
@@ -25,6 +27,7 @@ Preferences live in the global store (`tracker.db`):
 - `push_subs`: each subscription carries `classes`, the Request, Error and Complete switches for that device. A subscription without them gets all three on.
 - `notify_muted_projects`: projects that never push, on any device. The bell still lights for them.
 - `inbox_seen`: acknowledged bell entry keys, shared by every device.
+- `notify_live_alerts`: alerts pushed and not yet retracted, plus retractions waiting for an Apple device. A restart keeps them, so the first frame after boot retracts what resolved while the board was down, and later acknowledgements still retract older alerts.
 
 Set them under **Settings → Notifications**. OS notifications need HTTPS, for example `tailscale serve`.
 
@@ -51,5 +54,5 @@ When an alert's cause clears, or you acknowledge it, the server sends a data-onl
 
 Platform caveats:
 
-- Apple push (Safari, iOS) revokes subscriptions that receive pushes without a visible notification. Clear pushes skip Apple endpoints, so retraction there is best-effort: the next alert push closes stale class tags.
+- Apple push (Safari, iOS) revokes subscriptions that receive pushes without a visible notification, so clear pushes skip Apple endpoints. The server keeps the pending tags per Apple device and sends them with the next alert push to that device, which closes the stale notifications before it shows the new one. Until that next alert, the old notification stays.
 - Chrome may show a generic "site updated in the background" notice for a silent push. Retraction on Chrome is best-effort too.

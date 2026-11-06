@@ -972,8 +972,57 @@ export function createApp(deps: AppDeps) {
 	 * publish, which alerts nothing (a restart must not replay the whole board). */
 	let lastAlertInputs: AlertCardInput[] | null = null;
 	/** Alerts pushed and not yet retracted: what a cleared cause or an ack closes on the devices.
-	 * In memory only: after a restart the devices keep what they show until the user closes it. */
+	 * Persisted (GlobalStore `notify_live_alerts`) so a restart can still retract what the
+	 * devices show; the first frame after boot clears what resolved while the board was down. */
+	const ALERT_STATE_KEY = "notify_live_alerts";
+	/** Apple endpoint → class tags whose retraction waits for the next alert push to that device:
+	 * Apple never receives a data-only clear (see isApplePush). Persisted with the registry. */
+	let appleClear = new Map<string, Set<AlertClass>>();
 	let liveAlerts: LiveAlert[] = [];
+	{
+		const raw: unknown = deps.gstore.get<unknown>(ALERT_STATE_KEY);
+		const isClass = (c: unknown): c is AlertClass =>
+			typeof c === "string" && (ALERT_CLASSES as readonly string[]).includes(c);
+		if (typeof raw === "object" && raw !== null) {
+			const r = raw as { alerts?: unknown; appleClear?: unknown };
+			if (Array.isArray(r.alerts))
+				liveAlerts = r.alerts.flatMap((a: unknown): LiveAlert[] => {
+					if (typeof a !== "object" || a === null) return [];
+					const x = a as Record<string, unknown>;
+					return typeof x.key === "string" &&
+						isClass(x.class) &&
+						typeof x.taskId === "string" &&
+						typeof x.project === "string"
+						? [
+								{
+									key: x.key,
+									class: x.class,
+									taskId: x.taskId,
+									project: x.project,
+								},
+							]
+						: [];
+				});
+			if (typeof r.appleClear === "object" && r.appleClear !== null)
+				for (const [endpoint, tags] of Object.entries(r.appleClear)) {
+					const set = new Set(Array.isArray(tags) ? tags.filter(isClass) : []);
+					if (set.size > 0) appleClear.set(endpoint, set);
+				}
+		}
+	}
+	/** Writes the registry and the pending Apple clears; drops pending clears of gone devices. */
+	function saveAlertState(): void {
+		const endpoints = new Set(loadSubs(deps.gstore).map((s) => s.endpoint));
+		appleClear = new Map(
+			[...appleClear].filter(([e, t]) => endpoints.has(e) && t.size > 0),
+		);
+		deps.gstore.set(ALERT_STATE_KEY, {
+			alerts: liveAlerts,
+			appleClear: Object.fromEntries(
+				[...appleClear].map(([e, t]) => [e, [...t]]),
+			),
+		});
+	}
 	/** Board tab id → epoch ms of its last focus heartbeat (POST /api/presence). Map order is
 	 * recency (a heartbeat re-inserts), so the cap drops the stalest tab first. */
 	const focusAt = new Map<string, number>();
@@ -1085,11 +1134,30 @@ export function createApp(deps: AppDeps) {
 		return tagsToClear(removed, liveAlerts);
 	}
 
-	/** A data-only retraction for one device, or nothing for Apple's push service (see isApplePush). */
-	function clearFor(sub: PushSub, tags: AlertClass[]): ClearPayload[] {
-		return tags.length > 0 && !isApplePush(sub.endpoint)
-			? [{ type: "clear", tags }]
-			: [];
+	/** One device's payloads for a pass: its alerts (each carrying `clear`), else a data-only
+	 * retraction. Apple's push service never gets a data-only push, so its retraction waits in
+	 * `appleClear` and rides on the next alert sent to that device. */
+	function batchFor(
+		sub: PushSub,
+		alerts: readonly AlertPayload[],
+		clear: readonly AlertClass[],
+	): Array<AlertPayload | ClearPayload> {
+		if (!isApplePush(sub.endpoint))
+			return alerts.length > 0
+				? [...alerts]
+				: clear.length > 0
+					? [{ type: "clear", tags: [...clear] }]
+					: [];
+		const pending = new Set([
+			...(appleClear.get(sub.endpoint) ?? []),
+			...clear,
+		]);
+		if (alerts.length === 0) {
+			if (pending.size > 0) appleClear.set(sub.endpoint, pending);
+			return [];
+		}
+		appleClear.delete(sub.endpoint);
+		return alerts.map((a) => ({ ...a, clear: [...pending] }));
 	}
 
 	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
@@ -1147,7 +1215,6 @@ export function createApp(deps: AppDeps) {
 		}
 		if (fresh.length === 0 && clear.length === 0) return;
 		const subs = loadSubs(deps.gstore);
-		if (subs.length === 0) return;
 		const muted = new Set(loadMuted());
 		// Grouped bodies count what is still unanswered, not just this frame's arrivals.
 		const liveCount: Record<AlertClass, number> = {
@@ -1156,20 +1223,20 @@ export function createApp(deps: AppDeps) {
 			complete: 0,
 		};
 		for (const a of liveAlerts) if (!muted.has(a.project)) liveCount[a.class]++;
-		sendPushes(
-			subs.map((sub) => {
-				const alerts = payloadsFor(
+		const batches = subs.map((sub) => ({
+			sub,
+			payloads: batchFor(
+				sub,
+				payloadsFor(
 					fresh.filter((e) => deliverable(sub.classes, muted, e)),
 					liveCount,
 					clear,
-				);
-				// An alert payload carries `clear` itself; a device that got none still needs the retraction.
-				return {
-					sub,
-					payloads: alerts.length > 0 ? alerts : clearFor(sub, clear),
-				};
-			}),
-		);
+				),
+				clear,
+			),
+		}));
+		saveAlertState();
+		sendPushes(batches);
 	}
 
 	/** Retraction right after an ack (POST /api/inbox/seen), so the devices close the acked alerts
@@ -1180,12 +1247,12 @@ export function createApp(deps: AppDeps) {
 			clearedAlerts(liveAlerts, lastAlertInputs, new Set(loadInboxSeen())),
 		);
 		if (tags.length === 0) return;
-		sendPushes(
-			loadSubs(deps.gstore).map((sub) => ({
-				sub,
-				payloads: clearFor(sub, tags),
-			})),
-		);
+		const batches = loadSubs(deps.gstore).map((sub) => ({
+			sub,
+			payloads: batchFor(sub, [], tags),
+		}));
+		saveAlertState();
+		sendPushes(batches);
 	}
 
 	/** Single admin (set by /api/setup): null means the board is in onboarding. Loopback never checks it. */
@@ -1292,31 +1359,38 @@ export function createApp(deps: AppDeps) {
 		saveReminders(state);
 		return state.board.expiresAt;
 	}
-	/** Daily reminder: one push per UTC day per token, at 30 days out and through the last two weeks. */
+	/** Daily reminder: one push per UTC day per token, at 30 days out and through the last two weeks.
+	 * It follows the alert rules: Request class (the user must renew the token; no project, so
+	 * project mutes never apply), and a focused board tab holds it — the bell's token warning is
+	 * on screen then. A held reminder leaves the day unmarked, so the next tick tries again. */
 	async function tokenReminderTick(): Promise<void> {
 		await refreshBoardExpiry();
 		const state = loadReminders();
-		const now = new Date();
-		const today = now.toISOString().slice(0, 10);
+		const at = new Date();
+		const today = at.toISOString().slice(0, 10);
 		for (const kind of ["board", "seed"] as const) {
 			const r = state[kind];
 			if (r.expiresAt === null || r.lastPushDay === today) continue;
-			const body = tokenExpiryWarning(kind, r.expiresAt, now);
-			const days = tokenDaysLeft(r.expiresAt, now);
+			const body = tokenExpiryWarning(kind, r.expiresAt, at);
+			const days = tokenDaysLeft(r.expiresAt, at);
 			if (body === null || !(days === 30 || (days >= 0 && days <= 14)))
 				continue;
+			if (presenceHolds(focusAt, now())) continue;
 			try {
-				ensureVapid();
-				await sendAll(
-					loadSubs(deps.gstore),
-					JSON.stringify({
-						title: "Ottr",
-						body,
-						tag: "token-expiry",
-						url: "/",
-					}),
-					(sub, p) => sendNotification(sub, p),
-				);
+				const subs = loadSubs(deps.gstore).filter((s) => s.classes.request);
+				if (subs.length > 0) {
+					ensureVapid();
+					await sendAll(
+						subs,
+						JSON.stringify({
+							title: "Ottr",
+							body,
+							tag: "token-expiry",
+							url: "/",
+						}),
+						(sub, p) => sendNotification(sub, p),
+					);
+				}
 			} catch (err) {
 				logError("token expiry push failed", err);
 			} finally {
