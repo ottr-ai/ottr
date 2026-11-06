@@ -10756,6 +10756,22 @@ describe("work card check", () => {
 		expect(after.workCheckLog[0]!.notes).toEqual(["small nit"]);
 	});
 
+	test("a missing check role records the default role's model, not null", async () => {
+		const head = { sha: "sha1" };
+		// No adversary role in the harness default ({ default: "fake/default-model" }):
+		// the card must name the model the check actually fell back to.
+		const { store, loop } = workCheckCase(head, [pass(["small nit"])]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		// The launch still passes the raw selector (omp resolves its default); the card
+		// record names the model that fallback resolves to.
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
+		expect(after.workCheckLog[0]!.warn).toBeUndefined();
+	});
+
 	test("a blocker whose quote is in the diff sends the card back to the work agent", async () => {
 		const { store, loop } = workCheckCase(
 			{ sha: "sha1" },
@@ -11142,6 +11158,8 @@ describe("work card check", () => {
 		expect(after.workCheckHead).toBeNull();
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
+		// No adversary role: the record names the default role the check fell back to.
+		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
 		expect(after.workCheckLog[0]!.error).toContain("quota exceeded");
 	});
 

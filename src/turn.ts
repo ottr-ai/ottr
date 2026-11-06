@@ -4038,7 +4038,9 @@ export function createTurnLoop(
 									}
 									const run: WorkCheckRun = {
 										at: checkStart,
-										model: selector ?? null,
+										// The resolved model, not just the role selector: with the role
+										// missing, the card must name the default role it fell back to.
+										model: checkModel,
 										outcome: split.blockers.length === 0 ? "pass" : "blockers",
 										blockers: split.blockers,
 										notes: split.notes,
@@ -4091,7 +4093,7 @@ export function createTurnLoop(
 									...priorLog,
 									{
 										at: checkStart,
-										model: selector ?? null,
+										model: checkModel,
 										outcome: "error",
 										blockers: [],
 										notes: [],

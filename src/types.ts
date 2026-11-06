@@ -420,7 +420,9 @@ export interface WorkCheckBlocker {
 export interface WorkCheckRun {
 	/** Epoch milliseconds when the check run started. */
 	at: number;
-	/** Model selector the check ran with (the adversary or critic role's model); null = omp default. */
+	/** Model selector the check ran with: the critic or adversary role's model, else the
+	 *  board's default role (omp's fallback when a model is unset); null = omp's own default
+	 *  (no role names it, so the card shows "default model"). */
 	model: string | null;
 	/** pass = nothing blocks, blockers = real problems found, error = the run itself failed after a retry. */
 	outcome: "pass" | "blockers" | "error";
