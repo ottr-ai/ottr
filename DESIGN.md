@@ -163,7 +163,7 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
 
 - **Button labels** — a label names the action and its result. Sources: [NN/g, UI Copy](https://www.nngroup.com/articles/ui-copy/), [GOV.UK Button](https://design-system.service.gov.uk/components/button/), [Red Hat Button](https://ux.redhat.com/elements/button/guidelines/), [Apple HIG Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons).
   - **Shape:** a verb first, then an object when the verb alone could mean several things ("Copy key", "Replace token", "Add project"). Two to four words, at most 30 characters. No articles, no end punctuation.
-  - **Case:** sentence case ("Open settings", not "Open Settings"). A capital noun reads as a product name.
+  - **Case:** sentence case ("Open settings", not "Open Settings"). A capital noun reads as a product name. The Sentence-Case Rule extends this to every other UI label.
   - **One word per action:** the same action has the same label everywhere, and one label never means two actions. The board's fixed words:
     - Sign in / Sign out / Sign out everywhere (never "Log in" or "Log out").
     - Delete: the item leaves the board for good. Remove: the item leaves a list, but its data stays (a project, a key, a token). Discard: unsaved work goes. Cancel task: a queued or running task stops.
@@ -189,6 +189,8 @@ Small radii, technical not friendly: 3px for chips and micro-badges, 4px for but
 **The Settings-Row Rule.** A typed field explains itself in its "?" badge. A checkbox or a read-only fact explains itself in visible text. No setting does both. Buttons sit at the right, and only typed fields wait for a Save.
 
 **The Verb-Label Rule.** Every button label is a verb in sentence case, with an object when the verb alone is unclear. One label means one action across the whole board, and an icon never stands in for a label it cannot carry on its own.
+
+**The Sentence-Case Rule.** Every UI label — buttons, links, menu items, dialog titles, tooltips, shortcut chips and confirm-dialog pairs — uses sentence case: capitalize the first word and proper nouns only ("New task", "Add draft", "New GitHub issue"). Capitalization inside a label is style, not grammar; the mixed convention ("New Task" beside "Add draft") is the visible defect, so one convention holds across the surface. Sources: [Microsoft Style Guide, Capitalization](https://learn.microsoft.com/en-us/style-guide/capitalization), [GOV.UK Design System, Button](https://design-system.service.gov.uk/components/button/), [Material Design, Grammar and punctuation](https://m3.material.io/foundations/content-design/style-guide/grammar-and-punctuation).
 
 **Motion.** Everything uses one easing, `cubic-bezier(0.2, 0.7, 0.3, 1)`. Durations: 120ms control feedback, 160ms dialogs, 200ms drawer, 220ms alarm-mark arrival and in-column card slides (FLIP), 340ms card flights between stages (FLIP via WAAPI), 400ms indicator ramps, 420ms mark traces when a card lands. Under `prefers-reduced-motion`, all animation collapses to 0.01ms except the spinner, which keeps turning at its normal 0.7s so progress feedback stays legible; the mark trace and the card slides do not run at all.
 
