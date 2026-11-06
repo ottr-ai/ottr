@@ -9,6 +9,7 @@ import {
 } from "react";
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
+import type { AlertClass, ClassPrefs } from "../notifications.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
 import type {
@@ -701,21 +702,76 @@ function TotalRunnersForm({
 	);
 }
 
-/** Settings "Push notifications" section: Web Push opt-in for closed-phone alerts, plus a test. */
-function PushSection() {
+/** The class switches of THIS device, in display order. */
+const CLASS_ROWS: readonly { cls: AlertClass; name: string; desc: string }[] = [
+	{
+		cls: "request",
+		name: "Request",
+		desc: "A task needs you or asks a question",
+	},
+	{ cls: "error", name: "Error", desc: "A turn failed" },
+	{ cls: "complete", name: "Complete", desc: "A task finished or answered" },
+];
+
+/** Settings "Notifications" section: Web Push opt-in for this device, which alert classes it
+ *  gets, per-project mutes (shared by every device), plus a test. */
+function NotificationsSection({
+	projects,
+	act,
+}: {
+	projects: ProjectView[];
+	act: Act;
+}) {
+	// Web Push needs a secure context, a service worker and PushManager; without them the
+	// section explains why and disables every control (the in-app bell still works).
+	// typeof guard: settings render server-side in tests, where window is absent.
+	const supported =
+		typeof window !== "undefined" &&
+		window.isSecureContext &&
+		"serviceWorker" in navigator &&
+		"PushManager" in window;
 	const [enabled, setEnabled] = useState(false);
+	// The endpoint keys this device's class switches on the server; null while unsubscribed.
+	const [endpoint, setEndpoint] = useState<string | null>(null);
+	const [classes, setClasses] = useState<ClassPrefs | null>(null);
+	const [muted, setMuted] = useState<string[]>([]);
 	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
 	useEffect(() => {
+		if (!supported) return;
 		void navigator.serviceWorker
-			?.getRegistration()
+			.getRegistration()
 			.then((reg) => reg?.pushManager.getSubscription())
-			.then((sub) => setEnabled(sub != null))
+			.then((sub) => {
+				setEnabled(sub != null);
+				setEndpoint(sub?.endpoint ?? null);
+			})
 			.catch(() => {});
-	}, []);
+	}, [supported]);
+	// Prefs follow the endpoint: without one only the shared mutes load.
+	useEffect(() => {
+		const q =
+			endpoint === null ? "" : `?endpoint=${encodeURIComponent(endpoint)}`;
+		let live = true;
+		void fetch(`/api/notifications/prefs${q}`)
+			.then((res) =>
+				unwrap<{ classes: ClassPrefs | null; mutedProjects: string[] }>(res),
+			)
+			.then((p) => {
+				if (!live) return;
+				setClasses(p.classes);
+				setMuted(p.mutedProjects);
+			})
+			.catch((err) => {
+				if (live) setError(err instanceof Error ? err.message : String(err));
+			});
+		return () => {
+			live = false;
+		};
+	}, [endpoint]);
 	const enable = (): void =>
 		busy.start(async () => {
 			setError(null);
@@ -736,6 +792,7 @@ function PushSection() {
 				});
 				await post("/api/push/subscribe", sub.toJSON());
 				setEnabled(true);
+				setEndpoint(sub.endpoint);
 				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
@@ -755,6 +812,8 @@ function PushSection() {
 					await sub.unsubscribe();
 				}
 				setEnabled(false);
+				setEndpoint(null);
+				setClasses(null);
 				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
@@ -785,24 +844,35 @@ function PushSection() {
 		) : (
 			<Icon name={icon} />
 		);
+	const saveClass = async (cls: AlertClass, v: boolean): Promise<void> => {
+		if (endpoint === null || classes === null) return;
+		const next = { ...classes, [cls]: v };
+		await post("/api/notifications/prefs", { endpoint, classes: next });
+		setClasses(next);
+	};
+	const saveMute = async (name: string, v: boolean): Promise<void> => {
+		const next = v ? [...muted, name] : muted.filter((m) => m !== name);
+		await post("/api/notifications/prefs", { mutedProjects: next });
+		setMuted(next);
+	};
 	return (
 		<SettingsCard
-			id="push-section"
-			title="Push notifications"
+			id="notifications-section"
+			title="Notifications"
 			status={
 				enabled
 					? { label: "On", tone: "ok", icon: "bell" }
 					: { label: "Off", tone: "off", icon: "bell-off" }
 			}
-			hint="A phone notification when a task needs you, also while the app is closed. Needs HTTPS, for example tailscale serve."
+			hint="A notification on this device when a task needs you, fails or finishes, also while the app is closed. Push pauses while a board tab is focused."
 			footer={
 				<>
 					<button
 						type="button"
 						className="ghost"
 						onClick={run("test", test)}
-						disabled={busy.busy || !enabled}
-						title={enabled ? undefined : "Turn on push notifications first"}
+						disabled={!supported || busy.busy || !enabled}
+						title={enabled ? undefined : "Turn on notifications first"}
 					>
 						{spin("test", sent ? "check" : "send")}
 						{sent ? "Test sent" : "Send test"}
@@ -811,7 +881,7 @@ function PushSection() {
 						<button
 							type="button"
 							onClick={run("off", disable)}
-							disabled={busy.busy}
+							disabled={!supported || busy.busy}
 						>
 							{spin("off", "bell-off")}
 							Turn off
@@ -821,7 +891,7 @@ function PushSection() {
 							type="button"
 							className="primary"
 							onClick={run("on", enable)}
-							disabled={busy.busy}
+							disabled={!supported || busy.busy}
 						>
 							{spin("on", "bell")}
 							Turn on
@@ -830,6 +900,44 @@ function PushSection() {
 				</>
 			}
 		>
+			{!supported && (
+				<p className="notify-hint">
+					OS notifications need HTTPS, for example tailscale serve. The bell
+					still works.
+				</p>
+			)}
+			{enabled && classes !== null && (
+				<fieldset className="notify-group">
+					<legend>This device</legend>
+					{CLASS_ROWS.map((r) => (
+						<CheckRow
+							key={r.cls}
+							name={r.name}
+							desc={r.desc}
+							checked={classes[r.cls]}
+							disabled={!supported}
+							save={(v) => saveClass(r.cls, v)}
+							act={act}
+						/>
+					))}
+				</fieldset>
+			)}
+			{projects.length > 0 && (
+				<fieldset className="notify-group">
+					<legend>Muted projects</legend>
+					{projects.map((p) => (
+						<CheckRow
+							key={p.name}
+							name={`Mute ${projectLabel(p)}`}
+							desc="No push from this project; the bell still shows it"
+							checked={muted.includes(p.name)}
+							disabled={!supported}
+							save={(v) => saveMute(p.name, v)}
+							act={act}
+						/>
+					))}
+				</fieldset>
+			)}
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -4251,7 +4359,7 @@ export const SETTINGS_TOC = [
 		sections: [
 			{ id: "runners-section", label: "Runners" },
 			{ id: "projects-section", label: "Projects" },
-			{ id: "push-section", label: "Push notifications" },
+			{ id: "notifications-section", label: "Notifications" },
 		],
 	},
 	{
@@ -4651,7 +4759,7 @@ export function SettingsPage({
 								act={act}
 							/>
 							<ProjectsOrderSection projects={projects} act={act} />
-							<PushSection />
+							<NotificationsSection projects={projects} act={act} />
 						</section>
 						<section
 							className="settings-group"

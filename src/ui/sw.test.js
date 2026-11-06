@@ -6,13 +6,34 @@ import { afterAll, beforeEach, expect, test } from "bun:test";
 
 const controlled = [];
 const uncontrolled = [];
-const calls = { notifications: [], focused: [], opened: [], closed: 0 };
+const calls = {
+	notifications: [],
+	focused: [],
+	opened: [],
+	closed: 0,
+	trayClosed: [],
+	fetches: [],
+};
+// Notifications currently shown, as { tag, title }.
+const tray = [];
+// What the fake fetch of /api/inbox/seen does: a keys array, or "fail".
+let seenResponse = [];
 const listeners = {};
 
 const previousSelf = globalThis.self;
 afterAll(() => {
 	globalThis.self = previousSelf;
 });
+
+const previousFetch = globalThis.fetch;
+afterAll(() => {
+	globalThis.fetch = previousFetch;
+});
+globalThis.fetch = async (url, init) => {
+	calls.fetches.push({ url, credentials: init?.credentials });
+	if (seenResponse === "fail") throw new Error("offline");
+	return { ok: true, json: async () => ({ keys: seenResponse }) };
+};
 
 globalThis.self = {
 	addEventListener: (type, handler) => {
@@ -21,7 +42,18 @@ globalThis.self = {
 	registration: {
 		showNotification: async (title, options) => {
 			calls.notifications.push({ title, options });
+			tray.push({ tag: options.tag, title });
 		},
+		getNotifications: async ({ tag }) =>
+			tray
+				.filter((n) => n.tag === tag)
+				.map((n) => ({
+					...n,
+					close: () => {
+						tray.splice(tray.indexOf(n), 1);
+						calls.trayClosed.push(n.title);
+					},
+				})),
 	},
 	clients: {
 		matchAll: async (options) => {
@@ -47,6 +79,10 @@ beforeEach(() => {
 	calls.focused.length = 0;
 	calls.opened.length = 0;
 	calls.closed = 0;
+	calls.trayClosed.length = 0;
+	calls.fetches.length = 0;
+	tray.length = 0;
+	seenResponse = [];
 	controlled.length = 0;
 	uncontrolled.length = 0;
 });
@@ -152,4 +188,77 @@ test("notificationclick without notification data opens the board root", async (
 	await click();
 	expect(calls.opened).toEqual(["/"]);
 	expect(calls.closed).toBe(1);
+});
+
+const alert = {
+	type: "alert",
+	title: "p: card",
+	body: "needs you",
+	tag: "request",
+	url: "/projects/p/tasks/1",
+	keys: ["task:1:needs"],
+	clear: [],
+};
+
+test("clear push closes matching notifications and shows nothing", async () => {
+	tray.push(
+		{ tag: "request", title: "a" },
+		{ tag: "error", title: "b" },
+		{ tag: "complete", title: "c" },
+	);
+	await push({ type: "clear", tags: ["request", "complete"] });
+	expect(calls.notifications).toEqual([]);
+	expect(calls.trayClosed.sort()).toEqual(["a", "c"]);
+	expect(tray.map((n) => n.title)).toEqual(["b"]);
+	expect(calls.fetches).toEqual([]);
+});
+
+test("alert push closes its clear tags first, then shows", async () => {
+	tray.push({ tag: "error", title: "old error" });
+	await push({ ...alert, clear: ["error"] });
+	expect(calls.trayClosed).toEqual(["old error"]);
+	expect(calls.fetches).toEqual([
+		{ url: "/api/inbox/seen", credentials: "same-origin" },
+	]);
+	expect(calls.notifications).toEqual([
+		{
+			title: "p: card",
+			options: {
+				body: "needs you",
+				tag: "request",
+				renotify: true,
+				icon: "/icon-192.png",
+				data: { url: "/projects/p/tasks/1" },
+			},
+		},
+	]);
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+});
+
+test("alert push whose keys are all acknowledged shows then closes", async () => {
+	seenResponse = ["task:1:needs", "other"];
+	await push(alert);
+	expect(calls.notifications.length).toBe(1);
+	expect(calls.trayClosed).toEqual(["p: card"]);
+	expect(tray).toEqual([]);
+});
+
+test("alert push with some keys unacknowledged stays shown", async () => {
+	seenResponse = ["task:1:needs"];
+	await push({ ...alert, keys: ["task:1:needs", "task:2:needs"] });
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+});
+
+test("alert push still shows when the seen fetch fails", async () => {
+	seenResponse = "fail";
+	await push(alert);
+	expect(calls.notifications.length).toBe(1);
+	expect(calls.trayClosed).toEqual([]);
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+});
+
+test("untyped push shows without consulting the server", async () => {
+	await push({ title: "Test", body: "hi" });
+	expect(calls.notifications[0].title).toBe("Test");
+	expect(calls.fetches).toEqual([]);
 });

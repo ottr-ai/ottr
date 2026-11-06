@@ -25,7 +25,7 @@ flowchart LR
   ui -->|"HTTP /api/..."| app
   app -->|"board frames over /api/ws"| ui
   app -->|"reads subscriptions"| globalStore
-  app -->|"needs you and done alerts"| push
+  app -->|"request, error and complete alerts"| push
   server -->|"opens"| projectStore
   server -->|"opens"| globalStore
   server -->|"starts, ticks every 5 s"| turnLoop
@@ -48,7 +48,7 @@ flowchart LR
 
 - **Board UI (React)** — `src/ui/app.tsx`, the Settings page in `src/ui/settings.tsx`, live updates in `src/ui/socket.ts` (`connectLive` uses `/api/ws`, `connectPolling` reads `/api/state` every 5 s in production)
 - **HTTP API and WebSocket (createApp)** — `src/app.ts` (`createApp`), request checks in `src/requestGuards.ts`, login in `src/auth.ts`
-- **Web Push** — `src/webpush.ts`
+- **Web Push** — `src/webpush.ts` (subscriptions, sending), event rules in `src/notifications.ts` (`diffEvents`, retraction, presence). See [notifications.md](notifications.md).
 - **Server bootstrap** — `src/server.ts` (`Bun.serve`, project discovery, timers)
 - **Supervisor (every 60 s)** — `src/supervisor.ts` (`tick`: worktree cleanup, CI watch, PR pass, Dependabot cards, `reclassifyPass`, `hygienePass`, worker sweep)
 - **Turn loop (createTurnLoop)** — `src/turn.ts` (`schedule`, `runTurn`, `cancel`, `stopTurn`, `settleLostTurn`)

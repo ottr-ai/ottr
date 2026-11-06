@@ -132,6 +132,26 @@ import {
 } from "./modelRoles.ts";
 import { type ModelOption, modelList, modelRoles } from "./models.ts";
 import {
+	ALERT_CLASSES,
+	ALL_CLASSES_ON,
+	type AlertCardInput,
+	type AlertClass,
+	type AlertEvent,
+	type AlertPayload,
+	type ClassPrefs,
+	type ClearPayload,
+	clearedAlerts,
+	deliverable,
+	diffEvents,
+	isApplePush,
+	type LiveAlert,
+	normalizeSeen,
+	payloadsFor,
+	presenceHolds,
+	tagsToClear,
+	taskEntryKey,
+} from "./notifications.ts";
+import {
 	type OrphanProject,
 	orphanCache,
 	orphanView,
@@ -272,10 +292,9 @@ import {
 import { vmHoldFor, vmState } from "./vmState.ts";
 import { type VmTokens, vmTokenOf } from "./vmTokens.ts";
 import {
-	diffAlerts,
 	loadSubs,
 	PUSH_SUBJECT,
-	payloadsFor,
+	type PushSub,
 	pruneSubs,
 	saveSubs,
 	sendAll,
@@ -301,6 +320,13 @@ import {
 const MAX_BODY_BYTES = 65536;
 /** Timeout for the re-run-failed-jobs GitHub API call, mirroring the trending scan. */
 const RERUN_TIMEOUT_MS = 20_000;
+
+/** A posted list of strings within the route's entry cap. */
+function isStringList(v: unknown, max: number): v is string[] {
+	return (
+		Array.isArray(v) && v.length <= max && v.every((s) => typeof s === "string")
+	);
+}
 
 const ICON_EXTS = ["png", "jpg", "gif", "webp"] as const;
 
@@ -941,44 +967,146 @@ export function createApp(deps: AppDeps) {
 		}
 		return vapid;
 	}
-	/** Fire-and-forget push to every subscriber; prunes 404/410 subs. Never throws into the publish path. */
-	/** Done-channel push count; reset when a board tab opens, i.e. the user has looked. */
-	let pushDoneCount = 0;
-	function pushNeedsYou(
-		prev: Array<{
-			id: string;
-			state: string;
-			stage: string;
-			prompt?: string;
-		}> | null,
-		next: Array<{
-			id: string;
-			state: string;
-			stage: string;
-			prompt?: string;
-			summary: string | null;
-			project: string;
-			title: string;
-			needsReason: string | null;
-			sessionTitle: string | null;
+	// --- Alert push (OTTR-494): the server decides every OS-level event, Web Push delivers it ---
+	/** Card facts of the last published frame: the event diff's baseline. Null until the first
+	 * publish, which alerts nothing (a restart must not replay the whole board). */
+	let lastAlertInputs: AlertCardInput[] | null = null;
+	/** Alerts pushed and not yet retracted: what a cleared cause or an ack closes on the devices.
+	 * In memory only: after a restart the devices keep what they show until the user closes it. */
+	let liveAlerts: LiveAlert[] = [];
+	/** Board tab id → epoch ms of its last focus heartbeat (POST /api/presence). Map order is
+	 * recency (a heartbeat re-inserts), so the cap drops the stalest tab first. */
+	const focusAt = new Map<string, number>();
+	const PRESENCE_TABS_MAX = 200;
+
+	/** Acknowledged inbox keys: shared by every browser, read by the service worker. */
+	function loadInboxSeen(): string[] {
+		return normalizeSeen(deps.gstore.get<unknown>("inbox_seen"));
+	}
+
+	/** Projects whose alerts never push (the bell still lights); missing/corrupt row = none. */
+	function loadMuted(): string[] {
+		const raw: unknown = deps.gstore.get<unknown>("notify_muted_projects");
+		if (!Array.isArray(raw)) return [];
+		return [...new Set(raw.filter((s): s is string => typeof s === "string"))];
+	}
+
+	/** The error of the card's latest settled turn. Reads the card's turns, so callers ask only for
+	 * cards whose state or stage moved (a turn settling always moves one); a sick store keeps `fallback`. */
+	function latestTurnError(
+		project: string,
+		id: string,
+		fallback: Pick<AlertCardInput, "errorTurn" | "errorText"> | undefined,
+	): Pick<AlertCardInput, "errorTurn" | "errorText"> {
+		const none = { errorTurn: null, errorText: null };
+		const e = deps.projects.get(project);
+		if (e === undefined) return none;
+		try {
+			const turns = e.store.listTurns(id);
+			for (let i = turns.length - 1; i >= 0; i--) {
+				const turn = turns[i]!;
+				if (turn.endedAt === null) continue;
+				return turn.error === null
+					? none
+					: { errorTurn: String(turn.id), errorText: turn.error };
+			}
+			return none;
+		} catch (err) {
+			logStoreError(e.store.name, err);
+			return fallback ?? none;
+		}
+	}
+
+	/** The event diff's view of the frame's cards. Error facts carry over from the previous frame
+	 * unless the card's state or stage changed, so a publish never lists every card's turns. */
+	function alertInputs(
+		tasks: readonly TaskCard[],
+		prev: readonly AlertCardInput[] | null,
+	): AlertCardInput[] {
+		const before = new Map((prev ?? []).map((p) => [p.id, p]));
+		return tasks.map((t) => {
+			const old = before.get(t.id);
+			const err =
+				old !== undefined && old.state === t.state && old.stage === t.stage
+					? old
+					: latestTurnError(t.project, t.id, old);
+			return {
+				id: t.id,
+				project: t.project,
+				title: t.title,
+				sessionTitle: t.sessionTitle,
+				state: t.state,
+				stage: t.stage,
+				kind: t.kind,
+				asked: t.asked,
+				answered: t.answered,
+				needsReason: t.needsReason,
+				summary: t.summary,
+				errorTurn: err.errorTurn,
+				errorText: err.errorText,
+			};
+		});
+	}
+
+	/** Drops task-derived seen keys whose occurrence is over: a `task:` key no card's current
+	 * needs_you entry carries, `done:<id>` of a card gone or out of done, `error:<id>:<turn>` of a
+	 * card gone or past that turn. Notice and crit keys stay; the client drops those itself. */
+	function pruneInboxSeen(
+		seen: readonly string[],
+		inputs: readonly AlertCardInput[],
+	): string[] {
+		const byId = new Map<string, AlertCardInput>();
+		const entryKeys = new Set<string>();
+		for (const c of inputs) {
+			byId.set(c.id, c);
+			if (c.state === "needs_you") entryKeys.add(taskEntryKey(c));
+		}
+		return seen.filter((k) => {
+			if (k.startsWith("task:")) return entryKeys.has(k);
+			if (k.startsWith("done:"))
+				return byId.get(k.slice("done:".length))?.stage === "done";
+			if (k.startsWith("error:")) {
+				const rest = k.slice("error:".length);
+				const cut = rest.lastIndexOf(":");
+				return (
+					cut > 0 &&
+					byId.get(rest.slice(0, cut))?.errorTurn === rest.slice(cut + 1)
+				);
+			}
+			return true;
+		});
+	}
+
+	/** Takes `removed` out of the live registry; returns the class tags the devices must close. */
+	function retire(removed: readonly LiveAlert[]): AlertClass[] {
+		if (removed.length === 0) return [];
+		const keys = new Set(removed.map((a) => a.key));
+		liveAlerts = liveAlerts.filter((a) => !keys.has(a.key));
+		return tagsToClear(removed, liveAlerts);
+	}
+
+	/** A data-only retraction for one device, or nothing for Apple's push service (see isApplePush). */
+	function clearFor(sub: PushSub, tags: AlertClass[]): ClearPayload[] {
+		return tags.length > 0 && !isApplePush(sub.endpoint)
+			? [{ type: "clear", tags }]
+			: [];
+	}
+
+	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
+	function sendPushes(
+		batches: ReadonlyArray<{
+			sub: PushSub;
+			payloads: ReadonlyArray<AlertPayload | ClearPayload>;
 		}>,
 	): void {
-		const fired = diffAlerts(prev, next);
-		if (fired.length === 0) return;
-		const byId = new Map(next.map((t) => [t.id, t]));
-		const cards = fired.flatMap((f) => {
-			const c = byId.get(f.id);
-			return c ? [c] : [];
-		});
-		const subs = loadSubs(deps.gstore);
-		if (cards.length === 0 || subs.length === 0) return;
+		if (batches.every((b) => b.payloads.length === 0)) return;
 		ensureVapid();
-		pushDoneCount += cards.filter((c) => c.state !== "needs_you").length;
-		const needsYouTotal = next.filter((t) => t.state === "needs_you").length;
 		void Promise.all(
-			payloadsFor(cards, needsYouTotal, pushDoneCount).map((payload) =>
-				sendAll(subs, JSON.stringify(payload), (sub, p) =>
-					sendNotification(sub, p),
+			batches.flatMap(({ sub, payloads }) =>
+				payloads.map((p) =>
+					sendAll([sub], JSON.stringify(p), (s, body) =>
+						sendNotification(s, body),
+					),
 				),
 			),
 		)
@@ -991,6 +1119,73 @@ export function createApp(deps: AppDeps) {
 				pruneSubs(deps.gstore, gone);
 			})
 			.catch((err) => logError("push failed", err));
+	}
+
+	/** One frame's push pass: retract alerts whose cause cleared or that were acked, then deliver
+	 * the frame's new events per device (class switches, project mute). A focused board tab holds
+	 * the new events — dropped, never sent later; they still sit in the inbox — but never the retraction. */
+	function pushAlerts(
+		inputs: readonly AlertCardInput[],
+		events: readonly AlertEvent[],
+		seen: ReadonlySet<string>,
+	): void {
+		const clear = retire(clearedAlerts(liveAlerts, inputs, seen));
+		const fresh = presenceHolds(focusAt, now())
+			? []
+			: events.filter((e) => !seen.has(e.key));
+		if (fresh.length > 0) {
+			const keys = new Set(fresh.map((e) => e.key));
+			liveAlerts = [
+				...liveAlerts.filter((a) => !keys.has(a.key)),
+				...fresh.map((e) => ({
+					key: e.key,
+					class: e.class,
+					taskId: e.taskId,
+					project: e.project,
+				})),
+			];
+		}
+		if (fresh.length === 0 && clear.length === 0) return;
+		const subs = loadSubs(deps.gstore);
+		if (subs.length === 0) return;
+		const muted = new Set(loadMuted());
+		// Grouped bodies count what is still unanswered, not just this frame's arrivals.
+		const liveCount: Record<AlertClass, number> = {
+			request: 0,
+			error: 0,
+			complete: 0,
+		};
+		for (const a of liveAlerts) if (!muted.has(a.project)) liveCount[a.class]++;
+		sendPushes(
+			subs.map((sub) => {
+				const alerts = payloadsFor(
+					fresh.filter((e) => deliverable(sub.classes, muted, e)),
+					liveCount,
+					clear,
+				);
+				// An alert payload carries `clear` itself; a device that got none still needs the retraction.
+				return {
+					sub,
+					payloads: alerts.length > 0 ? alerts : clearFor(sub, clear),
+				};
+			}),
+		);
+	}
+
+	/** Retraction right after an ack (POST /api/inbox/seen), so the devices close the acked alerts
+	 * at once instead of at the next card change. */
+	function retractAcked(): void {
+		if (lastAlertInputs === null || liveAlerts.length === 0) return;
+		const tags = retire(
+			clearedAlerts(liveAlerts, lastAlertInputs, new Set(loadInboxSeen())),
+		);
+		if (tags.length === 0) return;
+		sendPushes(
+			loadSubs(deps.gstore).map((sub) => ({
+				sub,
+				payloads: clearFor(sub, tags),
+			})),
+		);
 	}
 
 	/** Single admin (set by /api/setup): null means the board is in onboarding. Loopback never checks it. */
@@ -2626,6 +2821,7 @@ export function createApp(deps: AppDeps) {
 			user: admin?.name ?? null,
 			seenAnswers: loadSeen(),
 			seenDoneSince,
+			inboxSeen: loadInboxSeen(),
 			orphans: scan.orphans,
 			orphansError: scan.error,
 			keptWorktrees: { held: keptHeld, stale: keptStale },
@@ -3599,8 +3795,6 @@ export function createApp(deps: AppDeps) {
 	let lastStateJson = "";
 	/** The last "system" frame, replayed to a socket on open so the view renders before the next tick. */
 	let lastSystemJson: string | null = null;
-	/** Card slice of the last state frame: the push diff's baseline (kept in memory, no JSON round-trip). */
-	let lastTasks: TaskCard[] | null = null;
 	let sampling = false; // one 30 s system sample in flight (worker fetches can take seconds)
 	let refreshingBehind = false;
 
@@ -3619,19 +3813,34 @@ export function createApp(deps: AppDeps) {
 		)
 			return false;
 		const state = stateResponse();
+		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
+		const inputs = alertInputs(state.tasks, lastAlertInputs);
+		try {
+			const pruned = pruneInboxSeen(state.inboxSeen, inputs);
+			if (pruned.length !== state.inboxSeen.length) {
+				deps.gstore.set("inbox_seen", pruned);
+				state.inboxSeen = pruned;
+			}
+		} catch (err) {
+			logError("inbox seen prune", err);
+		}
 		const text = JSON.stringify({
 			type: "state",
 			state,
 		} satisfies ServerMessage);
 		if (text === lastStateJson) return false;
-		// Diff the new cards against the kept baseline for cards that just hit "!" and alert
-		// subscribers out-of-band (closed phone app). Fire-and-forget: never in the publish path.
+		// Diff the cards against the kept baseline and push out-of-band (closed phone app).
+		// Fire-and-forget: a push failure never breaks the publish.
 		try {
-			pushNeedsYou(lastTasks, state.tasks);
+			pushAlerts(
+				inputs,
+				diffEvents(lastAlertInputs, inputs),
+				new Set(state.inboxSeen),
+			);
 		} catch (err) {
 			logError("push diff", err);
 		}
-		lastTasks = state.tasks;
+		lastAlertInputs = inputs;
 		lastStateJson = text;
 		if (sockets > 0 && deps.serverRef.current !== undefined)
 			deps.serverRef.current.publish("board", text);
@@ -4410,15 +4619,21 @@ export function createApp(deps: AppDeps) {
 						typeof b?.keys?.auth !== "string"
 					)
 						return json({ error: "invalid subscription" }, 400);
-					const subs = loadSubs(deps.gstore).filter(
-						(s) => s.endpoint !== b.endpoint,
-					);
-					subs.push({
-						endpoint: b.endpoint,
-						keys: { p256dh: b.keys.p256dh, auth: b.keys.auth },
-						addedAt: Date.now(),
-					});
-					saveSubs(deps.gstore, subs);
+					const subs = loadSubs(deps.gstore);
+					// A re-subscribe (key rotation, permission re-grant) keeps the device's class
+					// switches; a new device starts with every class on.
+					const classes =
+						subs.find((s) => s.endpoint === b.endpoint)?.classes ??
+						ALL_CLASSES_ON;
+					saveSubs(deps.gstore, [
+						...subs.filter((s) => s.endpoint !== b.endpoint),
+						{
+							endpoint: b.endpoint,
+							keys: { p256dh: b.keys.p256dh, auth: b.keys.auth },
+							addedAt: Date.now(),
+							classes: { ...classes },
+						},
+					]);
 					return json({ ok: true });
 				}),
 		},
@@ -4470,6 +4685,137 @@ export function createApp(deps: AppDeps) {
 				}),
 		},
 		// --- Web Push (end) ---
+		"/api/notifications/prefs": {
+			GET: (req) =>
+				api(req, async () => {
+					const endpoint = new URL(req.url).searchParams.get("endpoint");
+					const mutedProjects = loadMuted();
+					if (endpoint === null) return json({ classes: null, mutedProjects });
+					const sub = loadSubs(deps.gstore).find(
+						(s) => s.endpoint === endpoint,
+					);
+					return sub === undefined
+						? json({ error: "unknown endpoint" }, 404)
+						: json({ classes: sub.classes, mutedProjects });
+				}),
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const b = r.body;
+					if ("endpoint" in b) {
+						// parsed JSON boundary: trusted only after the per-class boolean check
+						const raw = b.classes as Partial<
+							Record<AlertClass, unknown>
+						> | null;
+						if (
+							typeof b.endpoint !== "string" ||
+							typeof raw !== "object" ||
+							raw === null ||
+							ALERT_CLASSES.some((c) => typeof raw[c] !== "boolean")
+						)
+							return json({ error: "invalid prefs" }, 400);
+						const subs = loadSubs(deps.gstore);
+						const sub = subs.find((s) => s.endpoint === b.endpoint);
+						if (sub === undefined)
+							return json({ error: "unknown endpoint" }, 404);
+						// A fresh object of the three switches: extra posted keys never reach the store.
+						const classes: ClassPrefs = {
+							request: raw.request === true,
+							error: raw.error === true,
+							complete: raw.complete === true,
+						};
+						saveSubs(
+							deps.gstore,
+							subs.map((s) => (s === sub ? { ...s, classes } : s)),
+						);
+						return json({ ok: true });
+					}
+					if (!isStringList(b.mutedProjects, 500))
+						return json({ error: "invalid prefs" }, 400);
+					deps.gstore.set("notify_muted_projects", [
+						...new Set(b.mutedProjects),
+					]);
+					return json({ ok: true });
+				}),
+		},
+		"/api/presence": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const { tab, focused } = r.body;
+					if (
+						typeof tab !== "string" ||
+						tab.length === 0 ||
+						tab.length > 100 ||
+						typeof focused !== "boolean"
+					)
+						return json({ error: "invalid presence" }, 400);
+					// Delete first either way: a heartbeat re-inserts at the end, keeping map order = recency.
+					focusAt.delete(tab);
+					if (focused) {
+						focusAt.set(tab, now());
+						for (const stale of focusAt.keys()) {
+							if (focusAt.size <= PRESENCE_TABS_MAX) break;
+							focusAt.delete(stale);
+						}
+					}
+					return json({ ok: true });
+				}),
+		},
+		"/api/inbox/seen": {
+			GET: (req) => api(req, async () => json({ keys: loadInboxSeen() })),
+			POST: (req) =>
+				api(req, async () => {
+					// Task keys embed the ask JSON, so a "Mark all as read" list outgrows the default cap.
+					const r = await readJson(req, 4 * 1024 * 1024);
+					if ("error" in r) return r.error;
+					const { keys, taskIds, drop } = r.body;
+					const given = [keys, taskIds, drop].filter((v) => v !== undefined);
+					const list = given[0];
+					if (given.length !== 1 || !isStringList(list, 5000))
+						return json({ error: "invalid seen list" }, 400);
+					const before = loadInboxSeen();
+					let next: string[];
+					if (keys !== undefined) next = [...before, ...list];
+					else if (drop !== undefined) {
+						const gone = new Set(list);
+						next = before.filter((k) => !gone.has(k));
+					} else {
+						// A card ack: its current needs_you entry plus every alert it has live on the devices.
+						const ids = new Set(list);
+						const added = liveAlerts
+							.filter((a) => ids.has(a.taskId))
+							.map((a) => a.key);
+						for (const e of deps.projects.values()) {
+							for (const id of ids) {
+								try {
+									const t = e.store.getTask(id);
+									if (t?.state === "needs_you") added.push(taskEntryKey(t));
+								} catch (err) {
+									logStoreError(e.store.name, err);
+								}
+							}
+						}
+						next = [...before, ...added];
+					}
+					const after = normalizeSeen(next);
+					if (
+						after.length !== before.length ||
+						after.some((k, i) => k !== before[i])
+					) {
+						deps.gstore.set("inbox_seen", after);
+						try {
+							retractAcked();
+						} catch (err) {
+							logError("push retraction", err);
+						}
+						publishSoon();
+					}
+					return json({ ok: true });
+				}),
+		},
 		"/api/seen": {
 			POST: (req) =>
 				api(req, async () => {
@@ -7398,7 +7744,6 @@ export function createApp(deps: AppDeps) {
 				open(ws: ServerWebSocket<undefined>) {
 					// Increment BEFORE publishState so this socket is either in the publish or sent the frame.
 					sockets++;
-					pushDoneCount = 0; // the user is looking at the board: done counts restart
 					ws.subscribe("board");
 					if (!publishState()) ws.send(lastStateJson);
 					ws.send(

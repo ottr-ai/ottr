@@ -162,6 +162,7 @@ const state = {
 	user: null,
 	seenAnswers: [],
 	seenDoneSince: 0,
+	inboxSeen: [],
 	orphans: [],
 	orphansError: null,
 	keptWorktrees: { held: 0, stale: 0 },

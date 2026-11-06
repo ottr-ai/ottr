@@ -47,6 +47,7 @@ import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { boardOmpEnv, type SignIn, signIns } from "./login.ts";
 import { modelRoles } from "./models.ts";
+import { ALL_CLASSES_ON, taskEntryKey } from "./notifications.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -2543,6 +2544,7 @@ describe("alate routes", () => {
 					endpoint: "https://push.test/ep1",
 					keys: { p256dh: "k", auth: "a" },
 					addedAt: 0,
+					classes: ALL_CLASSES_ON,
 				},
 			]);
 			alateBody = envelope([goodRec, otherRec]);
@@ -7124,6 +7126,7 @@ describe("web push (R1-1, R2-3)", () => {
 		endpoint: "https://push.example/abc",
 		keys: { p256dh: "k", auth: "a" },
 		addedAt: 1,
+		classes: ALL_CLASSES_ON,
 	};
 
 	test("push config heals a stored @localhost subject", async () => {
@@ -7198,6 +7201,307 @@ describe("web push (R1-1, R2-3)", () => {
 			status: 403,
 		});
 		pushFail = null;
+	});
+
+	/** Isolated board for the alert flow (OTTR-494): own global store, one project named like
+	 * its folder, and a settable clock for the presence window. Sends land in pushSends. */
+	const alertBoard = (name: string) => {
+		const dir = join(root, name);
+		mkdirSync(dir, { recursive: true });
+		const s = ProjectStore.open(dir);
+		const clock = { now: 1_000_000_000 };
+		const m = mount({
+			projects: new Map<string, Entry>([
+				[
+					name,
+					{
+						path: dir,
+						name,
+						store: s,
+						target: null,
+						gitless: false,
+						github: null,
+						remote: null,
+						dirty: false,
+						mainUnpushed: false,
+						mainBranch: null,
+						latestRelease: null,
+						latestImage: null,
+						archReview: null,
+					},
+				],
+			]),
+			now: () => clock.now,
+		});
+		const subscribe = async (endpoint: string) =>
+			expect(
+				(
+					await m.call("/api/push/subscribe", {
+						endpoint,
+						keys: { p256dh: "k", auth: "a" },
+					})
+				).status,
+			).toBe(200);
+		const sentSince = (from: number) =>
+			pushSends.slice(from).map((p) => ({
+				endpoint: p.endpoint,
+				payload: JSON.parse(p.payload) as Record<string, unknown>,
+			}));
+		const needsYou = (id: string) =>
+			s.updateTask(id, { state: "needs_you", needsReason: "?" });
+		return { s, m, clock, subscribe, sentSince, needsYou };
+	};
+
+	test("prefs: per-device classes survive a re-subscribe; mute list; 404 unknown endpoint, 400 bad shape", async () => {
+		const b = alertBoard("alert-prefs");
+		const phone = "https://push.example/phone";
+		const laptop = "https://push.example/laptop";
+		await b.subscribe(phone);
+		await b.subscribe(laptop);
+		const prefsOf = async (endpoint?: string) => {
+			const res = await b.m.call(
+				endpoint === undefined
+					? "/api/notifications/prefs"
+					: `/api/notifications/prefs?endpoint=${encodeURIComponent(endpoint)}`,
+			);
+			return { status: res.status, body: await res.json() };
+		};
+		expect(await prefsOf(phone)).toEqual({
+			status: 200,
+			body: { classes: ALL_CLASSES_ON, mutedProjects: [] },
+		});
+		const quiet = { request: true, error: true, complete: false };
+		expect(
+			(
+				await b.m.call("/api/notifications/prefs", {
+					endpoint: phone,
+					classes: quiet,
+				})
+			).status,
+		).toBe(200);
+		expect((await prefsOf(phone)).body.classes).toEqual(quiet);
+		// Per device: the laptop keeps every class on.
+		expect((await prefsOf(laptop)).body.classes).toEqual(ALL_CLASSES_ON);
+		// A re-subscribe (key rotation) keeps the device's switches.
+		await b.subscribe(phone);
+		expect((await prefsOf(phone)).body.classes).toEqual(quiet);
+		expect(await prefsOf("https://push.example/nobody")).toEqual({
+			status: 404,
+			body: { error: "unknown endpoint" },
+		});
+		const unknown = await b.m.call("/api/notifications/prefs", {
+			endpoint: "https://push.example/nobody",
+			classes: quiet,
+		});
+		expect(unknown.status).toBe(404);
+		const bad = await b.m.call("/api/notifications/prefs", {
+			endpoint: phone,
+			classes: { request: "yes", error: true, complete: true },
+		});
+		expect(bad.status).toBe(400);
+		expect(
+			(
+				await b.m.call("/api/notifications/prefs", {
+					mutedProjects: ["alert-prefs"],
+				})
+			).status,
+		).toBe(200);
+		expect(await prefsOf()).toEqual({
+			status: 200,
+			body: { classes: null, mutedProjects: ["alert-prefs"] },
+		});
+		for (const mutedProjects of [
+			[1],
+			"alert-prefs",
+			Array.from({ length: 501 }, (_, i) => `p${i}`),
+		]) {
+			const res = await b.m.call("/api/notifications/prefs", { mutedProjects });
+			expect(res.status).toBe(400);
+		}
+	});
+
+	test("a device with complete off gets no Complete push; an all-on device does", async () => {
+		const b = alertBoard("alert-complete");
+		const quiet = "https://push.example/quiet";
+		const loud = "https://push.example/loud";
+		await b.subscribe(quiet);
+		await b.subscribe(loud);
+		await b.m.call("/api/notifications/prefs", {
+			endpoint: quiet,
+			classes: { request: true, error: true, complete: false },
+		});
+		const t = b.s.createTask("finish me");
+		b.m.app.publishState(); // baseline: the first frame alerts nothing
+		const from = pushSends.length;
+		b.s.updateTask(t.id, { stage: "done", state: "idle" });
+		expect(b.m.app.publishState()).toBe(true);
+		const sent = b.sentSince(from);
+		expect(sent.map((x) => x.endpoint)).toEqual([loud]);
+		expect(sent[0]!.payload).toMatchObject({
+			type: "alert",
+			tag: "complete",
+			keys: [`done:${t.id}`],
+		});
+	});
+
+	test("an error turn pushes an Error alert keyed by the turn", async () => {
+		const b = alertBoard("alert-error");
+		await b.subscribe("https://push.example/err");
+		const t = b.s.createTask("will fail");
+		b.s.updateTask(t.id, { state: "running" });
+		const turn = b.s.startTurn(t.id, "work", ".", null);
+		b.m.app.publishState(); // baseline: the turn is still open
+		const from = pushSends.length;
+		b.s.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			exitCode: 1,
+			error: "boom",
+		});
+		b.s.updateTask(t.id, { state: "queued" });
+		b.m.app.publishState();
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload).toMatchObject({
+			type: "alert",
+			tag: "error",
+			keys: [`error:${t.id}:${turn.id}`],
+		});
+	});
+
+	test("a muted project pushes nothing, but its card still ships in the state", async () => {
+		const b = alertBoard("alert-muted");
+		await b.subscribe("https://push.example/muted");
+		await b.m.call("/api/notifications/prefs", {
+			mutedProjects: ["alert-muted"],
+		});
+		const t = b.s.createTask("ask quietly");
+		b.m.app.publishState();
+		const from = pushSends.length;
+		b.needsYou(t.id);
+		expect(b.m.app.publishState()).toBe(true);
+		expect(b.sentSince(from)).toEqual([]);
+		const state = (await (await b.m.call("/api/state")).json()) as {
+			tasks: Array<{ id: string; state: string }>;
+		};
+		expect(state.tasks.find((c) => c.id === t.id)?.state).toBe("needs_you");
+	});
+
+	test("a focused tab holds pushes for 60 s; held events are dropped, never sent later", async () => {
+		const b = alertBoard("alert-presence");
+		await b.subscribe("https://push.example/presence");
+		const held = b.s.createTask("held ask");
+		const later = b.s.createTask("later ask");
+		const last = b.s.createTask("last ask");
+		b.m.app.publishState();
+		const beat = (focused: boolean, tab = "tab-1") =>
+			b.m.call("/api/presence", { tab, focused });
+		expect((await beat(true)).status).toBe(200);
+		const from = pushSends.length;
+		b.clock.now += 59_999;
+		b.needsYou(held.id);
+		expect(b.m.app.publishState()).toBe(true);
+		expect(b.sentSince(from)).toEqual([]);
+		// The heartbeat is now exactly 60 s old: sends resume, for the new event only.
+		b.clock.now += 1;
+		b.needsYou(later.id);
+		b.m.app.publishState();
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload.keys).toEqual([
+			taskEntryKey(b.s.getTask(later.id)!),
+		]);
+		// focused:false ends the hold at once.
+		await beat(true);
+		await beat(false);
+		b.needsYou(last.id);
+		b.m.app.publishState();
+		expect(b.sentSince(from).length).toBe(2);
+		// Nothing ever re-sends the held card's alert.
+		b.s.createTask("unrelated");
+		b.m.app.publishState();
+		expect(
+			b
+				.sentSince(from)
+				.some((x) =>
+					JSON.stringify(x.payload.keys).includes(
+						taskEntryKey(b.s.getTask(held.id)!),
+					),
+				),
+		).toBe(false);
+		for (const body of [
+			{ tab: "", focused: true },
+			{ tab: "x".repeat(101), focused: true },
+			{ tab: "tab-1", focused: "yes" },
+		]) {
+			const res = await b.m.call("/api/presence", body);
+			expect(res.status).toBe(400);
+		}
+	});
+
+	test("acking a card via /api/inbox/seen {taskIds} sends a clear with its tag (never to Apple)", async () => {
+		const b = alertBoard("alert-ack");
+		const fcm = "https://push.example/ack";
+		const apple = "https://web.push.apple.com/ack";
+		await b.subscribe(fcm);
+		await b.subscribe(apple);
+		const t = b.s.createTask("ask me");
+		b.m.app.publishState();
+		b.needsYou(t.id);
+		b.m.app.publishState();
+		const from = pushSends.length;
+		const res = await b.m.call("/api/inbox/seen", { taskIds: [t.id] });
+		expect(res.status).toBe(200);
+		expect(b.sentSince(from)).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+		]);
+		expect(await (await b.m.call("/api/inbox/seen")).json()).toEqual({
+			keys: [taskEntryKey(b.s.getTask(t.id)!)],
+		});
+		// A repeated ack changes nothing and sends nothing.
+		await b.m.call("/api/inbox/seen", { taskIds: [t.id] });
+		expect(b.sentSince(from).length).toBe(1);
+	});
+
+	test("the state frame carries inboxSeen; only explicit acks add to it; publishes prune task keys", async () => {
+		const b = alertBoard("alert-seen");
+		await b.subscribe("https://push.example/seen");
+		const t = b.s.createTask("look at me");
+		b.needsYou(t.id);
+		const key = taskEntryKey(b.s.getTask(t.id)!);
+		const inboxSeen = async () => {
+			const body: unknown = await (await b.m.call("/api/state")).json();
+			return typeof body === "object" &&
+				body !== null &&
+				"inboxSeen" in body &&
+				Array.isArray(body.inboxSeen)
+				? [...body.inboxSeen].sort()
+				: null;
+		};
+		expect(await inboxSeen()).toEqual([]);
+		// Opening the card (the drawer fetch) and reading the board acknowledge nothing.
+		expect(
+			(await b.m.call(`/api/projects/alert-seen/tasks/${t.id}`)).status,
+		).toBe(200);
+		b.m.app.publishState();
+		expect(await inboxSeen()).toEqual([]);
+		await b.m.call("/api/inbox/seen", { keys: ["notice:x", key] });
+		expect(await inboxSeen()).toEqual([key, "notice:x"].sort());
+		// The card leaves needs_you: the publish prunes its task key; notice keys stay for the client.
+		b.s.updateTask(t.id, { state: "queued", needsReason: null });
+		b.m.app.publishState();
+		expect(await inboxSeen()).toEqual(["notice:x"]);
+		await b.m.call("/api/inbox/seen", { drop: ["notice:x"] });
+		expect(await inboxSeen()).toEqual([]);
+		for (const body of [
+			{},
+			{ keys: "notice:x" },
+			{ keys: ["a"], drop: ["b"] },
+			{ taskIds: [1] },
+			{ keys: Array.from({ length: 5001 }, (_, i) => `k${i}`) },
+		]) {
+			const res = await b.m.call("/api/inbox/seen", body);
+			expect(res.status).toBe(400);
+		}
 	});
 });
 
@@ -11245,6 +11549,7 @@ describe("token expiry reminders", () => {
 		endpoint: "https://push.test/expiry",
 		keys: { p256dh: "k", auth: "a" },
 		addedAt: 0,
+		classes: ALL_CLASSES_ON,
 	};
 	// Fake calendar: day n of October 2026, so daysLeft against Oct 31 is 31 - n.
 	const dayAt = (n: number) => new Date(Date.UTC(2026, 9, n, 12));

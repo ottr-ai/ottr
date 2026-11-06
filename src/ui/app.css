@@ -1510,10 +1510,15 @@ button.notif-link {
 	display: inline;
 	min-height: 0;
 }
-/* The desktop-notifications switch under the entries; .notify-toggle hides it on coarse pointers. */
+/* The inbox footer ("Mark all as read") under the entries. Sticky at the panel's bottom
+   edge so a long, scrolling list never cuts it off; the negative margins cancel the
+   panel padding so its background covers the rows scrolling beneath it. */
 .inbox-foot {
-	margin-top: 12px;
-	padding-top: 8px;
+	position: sticky;
+	bottom: 0;
+	margin: 12px -16px -16px;
+	padding: 8px 16px 16px;
+	background: var(--field);
 	border-top: 1px solid var(--line-soft);
 }
 /* Server connection lost: fixed at the bottom centre, above page content.
@@ -7614,13 +7619,6 @@ button.log-mode[aria-pressed="true"] {
 	color: var(--dim);
 }
 
-/* --- Web Push (begin): the bell toggle is desktop-only; phones use the push opt-in instead. --- */
-@media (pointer: coarse) {
-	.notify-toggle {
-		display: none;
-	}
-}
-/* --- Web Push (end) --- */
 /* ---- Touch targets ---- */
 
 /* Coarse pointers (phones) get the 44px hit-area floor; desktop keeps its
@@ -8219,4 +8217,28 @@ dialog.updates {
 }
 .updates-inprogress:hover {
 	color: var(--text-strong);
+}
+
+/* Notifications: the device classes and project mutes group as fieldsets for screen readers;
+   the legend reads as a small heading. The card is a flex column with align-items: flex-start,
+   so the fieldset stretches and resets its intrinsic min-width; its rows then span the card
+   like every .alate-def-rows list, with the same rule above the first row. */
+.notify-group {
+	display: grid;
+	align-self: stretch;
+	min-width: 0;
+	width: 100%;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+.notify-group > legend {
+	padding: 8px 0 0;
+	font-weight: 600;
+}
+.settings-sec .notify-group > legend + .alate-def-row {
+	border-top: 1px solid var(--line-soft);
+}
+.notify-hint {
+	color: var(--dim);
 }

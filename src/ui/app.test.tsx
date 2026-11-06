@@ -1678,7 +1678,7 @@ describe("settings TOC", () => {
 			"Agents",
 		]);
 		expect(SETTINGS_TOC.map((g) => g.sections.map((s) => s.label))).toEqual([
-			["Runners", "Projects", "Push notifications"],
+			["Runners", "Projects", "Notifications"],
 			["API key", "Session"],
 			["Git hosts", "Env"],
 			["Provider sign-in", "Model roles", "Alate", "Hindsight"],

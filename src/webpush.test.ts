@@ -3,171 +3,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "./globalStore.ts";
+import { ALL_CLASSES_ON } from "./notifications.ts";
 import {
-	diffAlerts,
 	loadSubs,
 	PUSH_SUBJECT,
 	type PushSub,
-	payloadFor,
-	payloadsFor,
 	pruneSubs,
 	saveSubs,
 	sendAll,
 } from "./webpush.ts";
-
-const card = (id: string, state: string, stage = "in_progress") => ({
-	id,
-	state,
-	stage,
-});
-
-describe("diffAlerts", () => {
-	test("fires on a transition into needs_you", () => {
-		const prev = [card("a", "running"), card("b", "needs_you")];
-		const next = [card("a", "needs_you"), card("b", "needs_you")];
-		expect(diffAlerts(prev, next)).toEqual([card("a", "needs_you")]);
-	});
-	test("first load (null prev) is silent", () => {
-		expect(diffAlerts(null, [card("a", "needs_you")])).toEqual([]);
-	});
-	test("answered/queued transitions are silent", () => {
-		const prev = [card("a", "needs_you"), card("b", "queued")];
-		const next = [card("a", "queued"), card("b", "running")];
-		expect(diffAlerts(prev, next)).toEqual([]);
-	});
-	test("fires on a merging-to-done stage transition with idle state", () => {
-		const prev = [card("a", "idle", "merging")];
-		const next = [card("a", "idle", "done")];
-		expect(diffAlerts(prev, next)).toEqual([card("a", "idle", "done")]);
-	});
-	test("staying in done across frames is silent", () => {
-		const prev = [card("a", "idle", "done")];
-		const next = [card("a", "idle", "done")];
-		expect(diffAlerts(prev, next)).toEqual([]);
-	});
-	test("re-entering done fires again", () => {
-		const leaving = [card("a", "idle", "in_progress")];
-		expect(diffAlerts([card("a", "idle", "done")], leaving)).toEqual([]);
-		expect(diffAlerts(leaving, [card("a", "idle", "done")])).toEqual([
-			card("a", "idle", "done"),
-		]);
-	});
-	test("null prev with a done card is silent", () => {
-		expect(diffAlerts(null, [card("a", "idle", "done")])).toEqual([]);
-	});
-	test("entering done while already needs_you fires once; unknown ids stay silent", () => {
-		const prev = [card("a", "needs_you", "merging"), card("zzz", "idle")];
-		const next = [card("a", "needs_you", "done"), card("q", "idle", "done")];
-		expect(diffAlerts(prev, next)).toEqual([card("a", "needs_you", "done")]);
-	});
-	test("payloadFor keeps the needs reason on a needs_you done card", () => {
-		const p = payloadFor({
-			id: "OTTR-1",
-			title: "do a thing",
-			needsReason: "Release review waiting",
-			sessionTitle: null,
-			project: "ottr",
-		});
-		expect(p.body).toBe("Release review waiting");
-	});
-	test("a retro card never alerts, even entering done or needs_you", () => {
-		const prev = [card("r", "running"), card("s", "idle", "merging")];
-		const next = [
-			{ ...card("r", "needs_you"), kind: "retro" as const },
-			{ ...card("s", "idle", "done"), kind: "retro" as const },
-		];
-		expect(diffAlerts(prev, next)).toEqual([]);
-	});
-	test("a brand-new needs_you card alerts; retro proposals and other new states are silent", () => {
-		const proposal = card("n", "needs_you");
-		expect(diffAlerts([], [proposal])).toEqual([proposal]);
-		expect(
-			diffAlerts([], [{ ...card("n2", "needs_you"), kind: "retro" as const }]),
-		).toEqual([]);
-		expect(diffAlerts([], [card("q", "queued")])).toEqual([]);
-		expect(diffAlerts([], [card("d", "idle", "done")])).toEqual([]);
-	});
-	test("items without a prompt keep the state/stage rules", () => {
-		const prev = [card("a", "running")];
-		expect(diffAlerts(prev, [card("a", "needs_you")])).toEqual([
-			card("a", "needs_you"),
-		]);
-		expect(diffAlerts(prev, [card("a", "idle", "done")])).toEqual([
-			card("a", "idle", "done"),
-		]);
-	});
-});
-
-describe("payloadsFor", () => {
-	const doneCard = () => ({
-		id: "OTTR-1",
-		title: "ship it",
-		state: "idle",
-		needsReason: null,
-		sessionTitle: null,
-		project: "ottr",
-	});
-	const needsCard = () => ({
-		id: "OTTR-2",
-		title: "ask",
-		state: "needs_you",
-		needsReason: "pick one",
-		sessionTitle: "Fix the bug",
-		project: "ottr",
-	});
-
-	test("a lone done card says it was done", () => {
-		expect(payloadsFor([doneCard()], 0, 1)).toEqual([
-			{
-				title: "ship it",
-				body: "ship it was done",
-				tag: "done",
-				url: "/projects/ottr",
-			},
-		]);
-	});
-	test("done cards group into a count", () => {
-		expect(payloadsFor([doneCard(), doneCard()], 0, 5)).toEqual([
-			{ title: "Ottr", body: "5 tasks finished", tag: "done", url: "/" },
-		]);
-	});
-	test("a lone needs card keeps the detailed reason", () => {
-		expect(payloadsFor([needsCard()], 1, 0)).toEqual([
-			{
-				title: "Fix the bug",
-				body: "pick one",
-				tag: "needs_you",
-				url: "/projects/ottr/tasks/OTTR-2",
-			},
-		]);
-	});
-	test("needs cards group into a count of everything pending", () => {
-		expect(payloadsFor([needsCard()], 10, 0)).toEqual([
-			{
-				title: "Ottr",
-				body: "10 tasks need your attention",
-				tag: "needs_you",
-				url: "/",
-			},
-		]);
-	});
-	test("both channels in one frame push separately", () => {
-		expect(payloadsFor([needsCard(), doneCard()], 2, 1)).toEqual([
-			{
-				title: "Ottr",
-				body: "2 tasks need your attention",
-				tag: "needs_you",
-				url: "/",
-			},
-			{
-				title: "ship it",
-				body: "ship it was done",
-				tag: "done",
-				url: "/projects/ottr",
-			},
-		]);
-	});
-});
 
 const pushRoots: string[] = [];
 afterEach(() => {
@@ -185,6 +29,7 @@ describe("saveSubs/loadSubs", () => {
 			endpoint,
 			keys: { p256dh: "p", auth: "a" },
 			addedAt: 1,
+			classes: { ...ALL_CLASSES_ON },
 		});
 		saveSubs(store, [
 			sub("https://x/1"),
@@ -228,8 +73,44 @@ describe("saveSubs/loadSubs", () => {
 				endpoint: "https://x/ok",
 				keys: { p256dh: "p", auth: "a" },
 				addedAt: 7,
+				classes: ALL_CLASSES_ON,
 			},
 		]);
+		store.close();
+	});
+	test("a legacy sub without classes, or with invalid classes, reads all on", () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = GlobalStore.open(root);
+		store.set("push_subs", [
+			{ endpoint: "https://x/a", keys: { p256dh: "p", auth: "a" }, addedAt: 1 },
+			{
+				endpoint: "https://x/b",
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 1,
+				classes: { request: true, error: "no", complete: false },
+			},
+		] as unknown as PushSub[]);
+		expect(loadSubs(store).map((s) => s.classes)).toEqual([
+			ALL_CLASSES_ON,
+			ALL_CLASSES_ON,
+		]);
+		store.close();
+	});
+	test("classes round-trip", () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = GlobalStore.open(root);
+		const classes = { request: false, error: true, complete: false };
+		saveSubs(store, [
+			{
+				endpoint: "https://x/1",
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 1,
+				classes,
+			},
+		]);
+		expect(loadSubs(store)[0]?.classes).toEqual(classes);
 		store.close();
 	});
 });
@@ -239,6 +120,7 @@ describe("sendAll", () => {
 		endpoint: `https://x/${n}`,
 		keys: { p256dh: "p", auth: "a" },
 		addedAt: 1,
+		classes: { ...ALL_CLASSES_ON },
 	});
 	const gone = (code: number) =>
 		Object.assign(Error("gone"), { statusCode: code });
@@ -317,6 +199,7 @@ describe("pruneSubs", () => {
 		endpoint: `https://x/${n}`,
 		keys: { p256dh: "p", auth: "a" },
 		addedAt: 1,
+		classes: { ...ALL_CLASSES_ON },
 	});
 
 	test("prunes against a fresh read, so subs added during the sends survive", async () => {
@@ -348,45 +231,5 @@ describe("pruneSubs", () => {
 			"https://x/3",
 		]);
 		store.close();
-	});
-});
-
-describe("payloadFor", () => {
-	test("shape", () => {
-		expect(
-			payloadFor({
-				id: "OTTR-1",
-				title: "do a thing",
-				needsReason: "Need a decision",
-				sessionTitle: "Fix the bug",
-				project: "ottr",
-			}),
-		).toEqual({
-			title: "Fix the bug",
-			body: "Need a decision",
-			tag: "needs_you",
-			url: "/projects/ottr/tasks/OTTR-1",
-		});
-	});
-	test("percent-encodes the project and the card id once", () => {
-		const p = payloadFor({
-			id: "OTTR 2",
-			title: "do a thing",
-			needsReason: null,
-			sessionTitle: null,
-			project: "50%off",
-		});
-		expect(p.url).toBe("/projects/50%25off/tasks/OTTR%202");
-	});
-	test("fallback body without a reason", () => {
-		const p = payloadFor({
-			id: "OTTR-1",
-			title: "do a thing",
-			needsReason: null,
-			sessionTitle: null,
-			project: "ottr",
-		});
-		expect(p.body).toContain("needs you");
-		expect(p.title).toBe("do a thing");
 	});
 });

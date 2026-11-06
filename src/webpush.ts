@@ -1,7 +1,12 @@
-// Web Push: VAPID keys, subscription store, alert diffing (needs-you + done). Network I/O is injected
-// (`send`) so tests never hit a push service; server.ts passes web-push's sendNotification.
+// Web Push: VAPID subject, subscription store (with per-device alert classes), fan-out. Event
+// diffing and payloads live in notifications.ts. Network I/O is injected (`send`) so tests never
+// hit a push service; server.ts passes web-push's sendNotification.
 import type { GlobalStore } from "./globalStore.ts";
-import type { TaskKind } from "./types.ts";
+import {
+	ALERT_CLASSES,
+	ALL_CLASSES_ON,
+	type ClassPrefs,
+} from "./notifications.ts";
 
 // Apple's push service answers 403 BadJwtToken for an @localhost subject; a real https URL it accepts.
 export const PUSH_SUBJECT = "https://github.com/ottr-ai/ottr";
@@ -10,6 +15,8 @@ export interface PushSub {
 	endpoint: string;
 	keys: { p256dh: string; auth: string };
 	addedAt: number;
+	/** Alert classes this device receives; legacy subs without the field read as all on. */
+	classes: ClassPrefs;
 }
 
 export function loadSubs(store: GlobalStore): PushSub[] {
@@ -27,9 +34,23 @@ export function loadSubs(store: GlobalStore): PushSub[] {
 			endpoint: s.endpoint,
 			keys: { p256dh: s.keys.p256dh, auth: s.keys.auth },
 			addedAt: "addedAt" in s && typeof s.addedAt === "number" ? s.addedAt : 0,
+			classes: parseClasses("classes" in s ? s.classes : undefined),
 		});
 	}
 	return subs;
+}
+
+/** A stored classes field counts only when every class is a boolean; anything else is legacy/corrupt and reads as all on. */
+function parseClasses(raw: unknown): ClassPrefs {
+	if (typeof raw !== "object" || raw === null) return { ...ALL_CLASSES_ON };
+	const rec = raw as Record<string, unknown>;
+	if (!ALERT_CLASSES.every((c) => typeof rec[c] === "boolean"))
+		return { ...ALL_CLASSES_ON };
+	return {
+		request: rec.request as boolean,
+		error: rec.error as boolean,
+		complete: rec.complete as boolean,
+	};
 }
 
 /** One subscription per endpoint: a re-subscribe replaces the older entry. */
@@ -42,106 +63,6 @@ export function saveSubs(store: GlobalStore, subs: PushSub[]): void {
 		deduped.push(s);
 	}
 	store.set("push_subs", deduped);
-}
-
-/** Cards that just transitioned INTO "needs_you" or stage "done"; other brand-new needs_you cards
- * alert, retro cards (kind 'retro') never alert. null prev = first load: silent. */
-export function diffAlerts(
-	prev: Array<{
-		id: string;
-		state: string;
-		stage: string;
-		kind?: TaskKind;
-	}> | null,
-	next: Array<{ id: string; state: string; stage: string; kind?: TaskKind }>,
-): Array<{ id: string; state: string; stage: string; kind?: TaskKind }> {
-	if (prev === null) return [];
-	const before = new Map(prev.map((t) => [t.id, t]));
-	return next.filter((t) => {
-		// Retro cards never alert: their done/needs_you transitions are expected housekeeping.
-		if (t.kind === "retro") return false;
-		const old = before.get(t.id);
-		if (!old) return t.state === "needs_you"; // brand-new: only retro proposals arrive held
-		return (
-			(t.state === "needs_you" && old.state !== "needs_you") ||
-			(t.stage === "done" && old.stage !== "done")
-		);
-	});
-}
-
-/** Detailed payload for a single needs_you card; grouped frames use payloadsFor instead. */
-export function payloadFor(card: {
-	id: string;
-	title: string;
-	needsReason: string | null;
-	sessionTitle: string | null;
-	project: string;
-}): { title: string; body: string; tag: string; url: string } {
-	return {
-		title: card.sessionTitle ?? card.title,
-		body: card.needsReason ?? "This task needs you.",
-		tag: "needs_you",
-		url: `/projects/${encodeURIComponent(card.project)}/tasks/${encodeURIComponent(card.id)}`,
-	};
-}
-
-/**
- * One push per alert channel: same-channel pushes share a tag, so the device replaces the
- * channel's notification instead of stacking one per task. needsYouTotal counts every card
- * currently in needs_you; doneTotal counts done transitions since the user last opened a board.
- */
-type AlertCard = {
-	id: string;
-	title: string;
-	state: string;
-	needsReason: string | null;
-	sessionTitle: string | null;
-	project: string;
-};
-
-export function payloadsFor(
-	fired: AlertCard[],
-	needsYouTotal: number,
-	doneTotal: number,
-): Array<{ title: string; body: string; tag: string; url: string }> {
-	let needs: AlertCard | undefined;
-	let done: AlertCard | undefined;
-	for (const c of fired) {
-		if (c.state === "needs_you") needs ??= c;
-		else done ??= c;
-	}
-	const out: Array<{ title: string; body: string; tag: string; url: string }> =
-		[];
-	if (needs !== undefined) {
-		out.push(
-			needsYouTotal > 1
-				? {
-						title: "Ottr",
-						body: `${needsYouTotal} tasks need your attention`,
-						tag: "needs_you",
-						url: "/",
-					}
-				: payloadFor(needs),
-		);
-	}
-	if (done !== undefined) {
-		out.push(
-			doneTotal > 1
-				? {
-						title: "Ottr",
-						body: `${doneTotal} tasks finished`,
-						tag: "done",
-						url: "/",
-					}
-				: {
-						title: done.sessionTitle ?? done.title,
-						body: `${done.title} was done`,
-						tag: "done",
-						url: `/projects/${encodeURIComponent(done.project)}`,
-					},
-		);
-	}
-	return out;
 }
 
 /**

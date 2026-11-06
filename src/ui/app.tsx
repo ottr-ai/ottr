@@ -19,6 +19,7 @@ import { createRoot } from "react-dom/client";
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
+import { taskEntryKey } from "../notifications.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
@@ -123,25 +124,16 @@ import {
 	alatePendingEntry,
 	clearAskDraft,
 	clearComposeDraft,
-	freshAlerts,
 	type InboxEntry,
 	inboxView,
 	loadAskDrafts,
 	loadComposeDraft,
-	loadInboxSeen,
 	loadSeenAnswers,
-	NOTIFY_KEY,
-	notificationsOn,
-	notificationsSupported,
 	pruneAskDrafts,
 	pruneSeen,
-	requestNotifyPermission,
 	SEEN_KEY,
 	saveAskDraft,
 	saveComposeDraft,
-	saveInboxSeen,
-	showAlerts,
-	taskEntryKey,
 } from "./notify.ts";
 import {
 	autoMarkOnOpen,
@@ -7393,14 +7385,16 @@ export interface OrphanRow {
 }
 
 /** The orphan advisory: a definition line, then one row per process (at most five)
- * with the card link, the command summary, a copy action and a confirm-gated stop. */
+ * with the card link, the command summary, a copy action and a confirm-gated stop.
+ * inboxKey tags every row, so a click anywhere in the advisory acknowledges it. */
 export function OrphanNotice(props: {
 	orphans: OrphanRow[];
 	fresh: boolean;
 	nowMs: number;
 	openTask: (id: string) => void;
+	inboxKey?: string;
 }): ReactNode {
-	const { orphans, fresh, nowMs, openTask } = props;
+	const { orphans, fresh, nowMs, openTask, inboxKey } = props;
 	// In-flight stop requests keyed by pid, so one slow request never disables the others.
 	const [stopping, setStopping] = useState<ReadonlySet<number>>(
 		() => new Set(),
@@ -7451,20 +7445,24 @@ export function OrphanNotice(props: {
 
 	return (
 		<>
-			<p className="notif-line">
+			<p className="notif-line" data-inbox-key={inboxKey}>
 				<Icon name="info" size={16} />
 				<span>
 					An orphan is an agent run that no card owns any more. Check each
 					process before you stop it. Ottr never kills a process on its own.
-					{fresh && <span className="new-tag">New</span>}
 				</span>
+				{fresh && <span className="new-tag">New</span>}
 			</p>
 			{orphans.slice(0, 5).map((o) => {
 				// Narrowed locals: the closures below need non-null card, and property
 				// narrowing does not survive into a callback.
 				const card = o.card;
 				return (
-					<p className="notif-line" key={`orphan:${o.pid}`}>
+					<p
+						className="notif-line"
+						key={`orphan:${o.pid}`}
+						data-inbox-key={inboxKey}
+					>
 						<Icon name="info" size={16} />
 						<span>
 							pid {o.pid}
@@ -7508,7 +7506,7 @@ export function OrphanNotice(props: {
 				);
 			})}
 			{orphans.length > 5 && (
-				<p className="notif-line">
+				<p className="notif-line" data-inbox-key={inboxKey}>
 					<Icon name="info" size={16} />
 					<span>… {orphans.length - 5} more orphaned processes.</span>
 				</p>
@@ -11037,14 +11035,17 @@ export function App() {
 	const [error, setError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
-	/** Acknowledged inbox entry keys; opening the inbox acknowledges everything it lists. */
-	const [inboxSeen, setInboxSeen] =
-		useState<ReadonlySet<string>>(loadInboxSeen);
-	const [inboxOpen, setInboxOpen] = useState(false);
-	/** Rows unacknowledged when the inbox opened, plus arrivals while it stays open: the rows marked New. */
-	const [inboxFresh, setInboxFresh] = useState<ReadonlySet<string>>(
+	/** Inbox keys acknowledged in this tab since the last state frame (optimistic, cleared per frame). */
+	const [ackLocal, setAckLocal] = useState<ReadonlySet<string>>(
 		() => new Set(),
 	);
+	/** Acknowledged inbox entry keys: the server's shared list plus this tab's pending acks. */
+	const inboxSeen: ReadonlySet<string> = new Set([
+		...(state?.inboxSeen ?? []),
+		...ackLocal,
+	]);
+	/** "New" = not acknowledged yet. */
+	const isNew = (key: string): boolean => !inboxSeen.has(key);
 	/** Bumped every 30 s so relative ages re-render; nothing reads the number itself. */
 	const [, setClockTick] = useState(0);
 	const [update, setUpdate] = useState<{
@@ -11109,35 +11110,73 @@ export function App() {
 			});
 	}, []);
 
-	/** Desktop-notification switch; re-reads on mount, so a second tab starts in sync. */
-	const [notify, setNotify] = useState(notificationsOn);
-	const toggleNotify = useCallback(async () => {
-		if (notificationsOn()) {
-			localStorage.removeItem(NOTIFY_KEY);
-			setNotify(false);
-			void (async () => {
-				try {
-					const reg = await navigator.serviceWorker.getRegistration();
-					const sub = await reg?.pushManager.getSubscription();
-					if (!sub) return;
-					await sub.unsubscribe();
-					await post("/api/push/unsubscribe", { endpoint: sub.endpoint });
-				} catch {
-					setNotice(
-						"Unsubscribing this device from push failed; it may still get notifications.",
-					);
-				}
-			})();
-			return;
-		}
-		if ((await requestNotifyPermission()) === "granted") {
-			localStorage.setItem(NOTIFY_KEY, "1");
-			setNotify(true);
-		} else {
-			setNotice(
-				"Desktop notifications stay off. Allow them for this site in the browser's settings, then turn them on again.",
+	/** Shared inbox acknowledgement: optimistic until the next state frame brings the server's list. */
+	const ackInbox = useCallback((keys: string[]) => {
+		setAckLocal((p) => new Set([...p, ...keys]));
+		void post("/api/inbox/seen", { keys }).catch(() => {});
+	}, []);
+	// Clicking an inbox row (or a link or button inside it) acknowledges that entry.
+	useEffect(() => {
+		const onClick = (e: MouseEvent): void => {
+			const row = (e.target as Element | null)?.closest<HTMLElement>(
+				"#inbox [data-inbox-key]",
 			);
-		}
+			const key = row?.dataset.inboxKey;
+			if (key !== undefined && key !== "") ackInbox([key]);
+		};
+		document.addEventListener("click", onClick);
+		return () => document.removeEventListener("click", onClick);
+	}, [ackInbox]);
+	// Opening a card's drawer acknowledges its entries, once per selection.
+	useEffect(() => {
+		if (selectedId === null) return;
+		void post("/api/inbox/seen", { taskIds: [selectedId] }).catch(() => {});
+	}, [selectedId]);
+	// Focus heartbeat: the server holds OS pushes while any board tab is focused, so a user
+	// looking at the board is never pinged on the same machine.
+	useEffect(() => {
+		// randomUUID needs a secure context; a plain-HTTP LAN tab still needs a unique id.
+		const tab =
+			typeof crypto.randomUUID === "function"
+				? crypto.randomUUID()
+				: `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		let timer: number | null = null;
+		const send = (focused: boolean): void => {
+			void fetch("/api/presence", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ tab, focused }),
+				// The unfocus beat must survive the page unloading.
+				keepalive: !focused,
+			}).catch(() => {});
+		};
+		const sync = (): void => {
+			if (document.visibilityState === "visible" && document.hasFocus()) {
+				send(true);
+				timer ??= window.setInterval(() => send(true), 20_000);
+			} else if (timer !== null) {
+				clearInterval(timer);
+				timer = null;
+				send(false);
+			}
+		};
+		const leave = (): void => {
+			clearInterval(timer ?? undefined);
+			timer = null;
+			send(false);
+		};
+		sync();
+		window.addEventListener("focus", sync);
+		window.addEventListener("blur", sync);
+		document.addEventListener("visibilitychange", sync);
+		window.addEventListener("pagehide", leave);
+		return () => {
+			window.removeEventListener("focus", sync);
+			window.removeEventListener("blur", sync);
+			document.removeEventListener("visibilitychange", sync);
+			window.removeEventListener("pagehide", leave);
+			leave();
+		};
 	}, []);
 
 	useEffect(() => {
@@ -11171,16 +11210,13 @@ export function App() {
 	}, []);
 
 	// One push-only socket per tab: state, update banner and System snapshots all arrive over it.
-	// Every state frame is diffed against the last one so tasks that just started needing
-	// the user fire a desktop notification (only while the tab is hidden; see notify.ts).
-	const seenTasks = useRef<TaskCard[] | null>(null);
 	useEffect(() => {
 		if (live === null) return; // boot hasn't answered yet
 		const h = {
 			onState: (s: StateResponse) => {
-				showAlerts(freshAlerts(seenTasks.current, s.tasks));
-				seenTasks.current = s.tasks;
 				setState(s);
+				// The frame carries the server's seen list, which now includes (or settled) every ack sent before it.
+				setAckLocal(new Set());
 				// The open card can vanish (cancelled in another tab): drop the selection,
 				// or the drawer would keep rendering a stale row.
 				setSelectedId((id) =>
@@ -11480,10 +11516,10 @@ export function App() {
 		keptCount.held > 0 ? `kept:${keptCount.held}:${keptCount.stale}` : null;
 	const critLine =
 		error !== null ? (
-			<p className="notif-line">
+			<p className="notif-line" data-inbox-key={critKey ?? undefined}>
 				<Mark kind="crit" />
 				<span>{error}</span>
-				{critKey !== null && inboxFresh.has(critKey) && (
+				{critKey !== null && isNew(critKey) && (
 					<span className="new-tag">New</span>
 				)}
 				<button
@@ -11513,7 +11549,7 @@ export function App() {
 									const owner = projects.find((p) => p.name === t.project);
 									const key = taskEntryKey(t);
 									return (
-										<li key={t.id}>
+										<li key={t.id} data-inbox-key={key}>
 											<a
 												className="alarm-link"
 												href={taskPath(t.project, t.id)}
@@ -11535,9 +11571,7 @@ export function App() {
 												<span className="alarm-title">
 													{t.sessionTitle ?? t.title}
 												</span>
-												{inboxFresh.has(key) && (
-													<span className="new-tag">New</span>
-												)}
+												{isNew(key) && <span className="new-tag">New</span>}
 											</a>
 										</li>
 									);
@@ -11550,10 +11584,10 @@ export function App() {
 		notice !== null || behind > 0 || draining ? (
 			<>
 				{notice !== null && (
-					<p className="notif-line">
+					<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
 						<Icon name="info" size={16} />
 						<span>{notice}</span>
-						{noticeKey !== null && inboxFresh.has(noticeKey) && (
+						{noticeKey !== null && isNew(noticeKey) && (
 							<span className="new-tag">New</span>
 						)}
 						<button
@@ -11568,13 +11602,13 @@ export function App() {
 				)}
 				{draining && (
 					<>
-						<p className="notif-line">
+						<p className="notif-line" data-inbox-key={drainKey ?? undefined}>
 							<Icon name="info" size={16} />
 							<span>
 								An Ottr update is ready. New turns wait until the running turns
 								finish and Ottr restarts.
 							</span>
-							{drainKey !== null && inboxFresh.has(drainKey) && (
+							{drainKey !== null && isNew(drainKey) && (
 								<span className="new-tag">New</span>
 							)}
 						</p>
@@ -11589,14 +11623,14 @@ export function App() {
 				)}
 				{behind > 0 && (
 					<>
-						<p className="notif-line">
+						<p className="notif-line" data-inbox-key={behindKey ?? undefined}>
 							<Icon name="info" size={16} />
 							<span>
 								A new Ottr version is available ({behind} commit
 								{behind === 1 ? "" : "s"}). Stop the server, run{" "}
 								<code>bun run update</code>, then start it again.
 							</span>
-							{behindKey !== null && inboxFresh.has(behindKey) && (
+							{behindKey !== null && isNew(behindKey) && (
 								<span className="new-tag">New</span>
 							)}
 						</p>
@@ -11631,13 +11665,16 @@ export function App() {
 			<>
 				<WarningLines warnings={warnings} />
 				{orphansError !== null && (
-					<p className="notif-line">
+					<p
+						className="notif-line"
+						data-inbox-key={orphansErrorKey ?? undefined}
+					>
 						<Icon name="info" size={16} />
 						<span>
 							Orphan scan failed: {orphansError} — the agent process list may be
 							empty because no scan succeeded.
 						</span>
-						{orphansErrorKey !== null && inboxFresh.has(orphansErrorKey) && (
+						{orphansErrorKey !== null && isNew(orphansErrorKey) && (
 							<span className="new-tag">New</span>
 						)}
 					</p>
@@ -11645,13 +11682,14 @@ export function App() {
 				{orphanList.length > 0 && (
 					<OrphanNotice
 						orphans={orphanList}
-						fresh={orphansKey !== null && inboxFresh.has(orphansKey)}
+						fresh={orphansKey !== null && isNew(orphansKey)}
 						nowMs={nowMs}
 						openTask={openTask}
+						inboxKey={orphansKey ?? undefined}
 					/>
 				)}
 				{keptCount.held > 0 && (
-					<p className="notif-line">
+					<p className="notif-line" data-inbox-key={keptKey ?? undefined}>
 						<Icon name="info" size={16} />
 						<span>
 							{keptCount.held} cancelled card
@@ -11662,13 +11700,13 @@ export function App() {
 								: ""}
 							.
 						</span>
-						{keptKey !== null && inboxFresh.has(keptKey) && (
+						{keptKey !== null && isNew(keptKey) && (
 							<span className="new-tag">New</span>
 						)}
 					</p>
 				)}
 				{alatePendingKey !== null && (
-					<p className="notif-line">
+					<p className="notif-line" data-inbox-key={alatePendingKey}>
 						<Icon name="info" size={16} />
 						<span>
 							Alate is waiting to provision an import.{" "}
@@ -11680,13 +11718,15 @@ export function App() {
 								Open settings
 							</button>
 						</span>
-						{inboxFresh.has(alatePendingKey) && (
-							<span className="new-tag">New</span>
-						)}
+						{isNew(alatePendingKey) && <span className="new-tag">New</span>}
 					</p>
 				)}
 				{signinAdvisories.map((d) => (
-					<p className="notif-line" key={`signin:${d.provider}`}>
+					<p
+						className="notif-line"
+						key={`signin:${d.provider}`}
+						data-inbox-key={`signin:${d.provider}`}
+					>
 						<Icon name="info" size={16} />
 						<span>
 							{d.provider}'s sign-in is disabled — {d.cause}. Used by the{" "}
@@ -11699,7 +11739,7 @@ export function App() {
 								Open settings
 							</button>
 						</span>
-						{inboxFresh.has(`signin:${d.provider}`) && (
+						{isNew(`signin:${d.provider}`) && (
 							<span className="new-tag">New</span>
 						)}
 					</p>
@@ -11750,34 +11790,30 @@ export function App() {
 		: inbox.total > 0
 			? `Notifications, ${inbox.total}`
 			: "Notifications, all clear";
-	const stateLoaded = state !== null;
 	const updateLoaded = update !== null;
 
-	// An entry that cleared loses its acknowledgement, so a recurrence counts as new.
+	// The server prunes task-derived keys (task:, done:, error:) itself; notice and crit keys
+	// only this client can judge, so a cleared one is dropped here and a recurrence counts as
+	// new. Runs once per entry signature, not on every seen-list frame.
+	const serverSeen = state?.inboxSeen;
+	const prunedSig = useRef<string | null>(null);
 	useEffect(() => {
-		if (!stateLoaded) return;
-		setInboxSeen((prev) =>
-			pruneSeen(
-				prev,
-				new Set(JSON.parse(inboxSig) as string[]),
-				(k) => !updateLoaded && k.startsWith("behind:"),
-			),
+		if (serverSeen === undefined) return;
+		const sig = `${updateLoaded}:${inboxSig}`;
+		if (prunedSig.current === sig) return;
+		prunedSig.current = sig;
+		const seen = new Set(serverSeen);
+		const kept = pruneSeen(
+			seen,
+			new Set(JSON.parse(inboxSig) as string[]),
+			(k) =>
+				/^(task|done|error):/.test(k) ||
+				(!updateLoaded && k.startsWith("behind:")),
 		);
-	}, [inboxSig, stateLoaded, updateLoaded]);
-
-	// Opening the inbox acknowledges every entry it lists.
-	useEffect(() => {
-		if (!inboxOpen) return;
-		const add = (JSON.parse(inboxSig) as string[]).filter(
-			(k) => !inboxSeen.has(k),
-		);
-		if (add.length === 0) return;
-		setInboxFresh((p) => new Set([...p, ...add]));
-		setInboxSeen(new Set([...inboxSeen, ...add]));
-	}, [inboxOpen, inboxSig, inboxSeen]);
-
-	// Acknowledgements persist across tabs and reloads.
-	useEffect(() => saveInboxSeen(inboxSeen), [inboxSeen]);
+		if (kept === seen) return;
+		const drop = serverSeen.filter((k) => !kept.has(k));
+		void post("/api/inbox/seen", { drop }).catch(() => {});
+	}, [inboxSig, serverSeen, updateLoaded]);
 
 	// N opens New task for the open project; inert while typing or any modal is up.
 	useEffect(() => {
@@ -11922,16 +11958,7 @@ export function App() {
 						? `${inbox.fresh.length} new notification${inbox.fresh.length === 1 ? "" : "s"}`
 						: ""}
 				</span>
-				<div
-					id="inbox"
-					popover="auto"
-					className="popover notif-pop inbox-pop"
-					onToggle={(e) => {
-						const open = e.newState === "open";
-						setInboxOpen(open);
-						if (open) setInboxFresh(new Set());
-					}}
-				>
+				<div id="inbox" popover="auto" className="popover notif-pop inbox-pop">
 					{critLine !== null && (
 						<section>
 							<h2>Critical</h2>
@@ -11943,7 +11970,7 @@ export function App() {
 						<section>
 							<h2>Upstream updates</h2>
 							<ul className="alarm-list">
-								<li>
+								<li data-inbox-key={updatesKey}>
 									<button
 										type="button"
 										className="alarm-link"
@@ -11957,9 +11984,7 @@ export function App() {
 											{updateCount} update
 											{updateCount === 1 ? "" : "s"} ready to review
 										</span>
-										{inboxFresh.has(updatesKey) && (
-											<span className="new-tag">New</span>
-										)}
+										{isNew(updatesKey) && <span className="new-tag">New</span>}
 									</button>
 								</li>
 							</ul>
@@ -11986,22 +12011,14 @@ export function App() {
 							</p>
 						</section>
 					)}
-					{notificationsSupported() && (
-						<div className="inbox-foot notify-toggle">
+					{inbox.total > 0 && (
+						<div className="inbox-foot">
 							<button
 								type="button"
-								className="theme-choice"
-								aria-pressed={notify}
-								title={
-									notify
-										? "Desktop notifications are on (hidden tabs only)"
-										: "Notify me when a task needs me or is done"
-								}
-								onClick={toggleNotify}
+								disabled={!inbox.lit}
+								onClick={() => ackInbox(entries.map((e) => e.key))}
 							>
-								<Icon name={notify ? "bell" : "bell-off"} size={14} />
-								<span>Desktop notifications</span>
-								{notify && <Icon name="check" size={14} />}
+								Mark all as read
 							</button>
 						</div>
 					)}
