@@ -9555,7 +9555,7 @@ export function Drawer({
  * Onboarding + login page, shown alone when the server asks for them (public-host access).
  * Success reloads the page: the push socket and every fetch then run with the fresh session cookie.
  */
-function AuthPage({
+export function AuthPage({
 	mode,
 	version,
 }: {
@@ -9566,6 +9566,7 @@ function AuthPage({
 	const [password, setPassword] = useState("");
 	const [repeat, setRepeat] = useState("");
 	const [githubToken, setGithubToken] = useState("");
+	const [githubHost, setGithubHost] = useState("");
 	const tokenHint = useId();
 	const [remember, setRemember] = useState(true);
 	const [error, setError] = useState<string | null>(null);
@@ -9580,11 +9581,25 @@ function AuthPage({
 		}
 		setError(null);
 		setBusy(true);
+		const host = githubHost.trim();
 		post(setup ? "/api/setup" : "/api/login", {
 			name: name.trim(),
 			password,
 			...(setup ? { githubToken: githubToken.trim() } : { remember }),
 		})
+			.then(() => {
+				if (setup && host !== "") {
+					return post("/api/settings/github-host", { host }).catch(
+						(err: unknown) => {
+							// The admin exists and the session works; only the host save failed.
+							const msg = err instanceof Error ? err.message : "Request failed";
+							throw new Error(
+								`${msg} You can set the GitHub host later under Settings → Git hosts.`,
+							);
+						},
+					);
+				}
+			})
 			.then(() => {
 				localStorage.removeItem(LOGOUT_KEY);
 				location.reload();
@@ -9649,7 +9664,28 @@ function AuthPage({
 								required
 							/>
 							<span className="hint" id={tokenHint}>
-								Ottr's git fetches and pushes your repos with it (repo access).
+								Serves the GitHub API features (PR reviews, CI watch,
+								Dependabot, releases, token expiry) and gh. Git on hosts other
+								than github.com needs its own token under Settings → Git hosts.
+							</span>
+						</label>
+					)}
+					{setup && (
+						<label>
+							GitHub host
+							<input
+								type="text"
+								autoComplete="off"
+								spellCheck={false}
+								value={githubHost}
+								onChange={(e) => setGithubHost(e.target.value)}
+								aria-label="GitHub host"
+								placeholder="github.com"
+							/>
+							<span className="hint">
+								Empty uses github.com. Set this before onboarding when GitHub
+								lives on a *.ghe.com host, or the token is checked against
+								github.com.
 							</span>
 						</label>
 					)}

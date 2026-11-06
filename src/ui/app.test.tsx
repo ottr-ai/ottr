@@ -57,6 +57,7 @@ const {
 	DeepenReview,
 	OrphanNotice,
 	ranOnLabel,
+	AuthPage,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -4569,5 +4570,266 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).not.toContain("Push to origin");
 		expect(html).not.toContain("never to a task branch.");
 		expect(html).not.toContain("has commits origin lacks");
+	});
+});
+
+describe("AuthPage setup form", () => {
+	// The same happy-dom browser-mount pattern as the other client describes:
+	// React interaction needs browser globals, and afterAll puts them back.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		location: window.location,
+		localStorage: window.localStorage,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
+	const submitEvent = (): Event =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		}) as unknown as Event;
+	/** A React onChange picks up programmatic edits only through the native value setter. */
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+	/** Dispatched input events never reach React's ChangeEventPlugin: call the production onChange. */
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	interface PostCall {
+		url: string;
+		body: unknown;
+	}
+
+	/** Mounts the setup form against `respond`; the cleanup puts fetch and the DOM back. */
+	async function mountAuth(
+		respond: (url: string, body: unknown) => Response,
+	): Promise<{
+		container: HTMLDivElement;
+		form: HTMLFormElement;
+		field: (text: string) => HTMLInputElement;
+		posts: PostCall[];
+		reloadCalls: { n: number };
+		unmount: () => Promise<void>;
+	}> {
+		const posts: PostCall[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body =
+				init?.body === undefined ? null : JSON.parse(String(init.body));
+			if (init?.method === "POST") posts.push({ url, body });
+			return respond(url, body);
+		}) as typeof fetch;
+		// The success path reloads the page; happy-dom's reload would navigate away.
+		const reloadCalls = { n: 0 };
+		window.location.reload = () => {
+			reloadCalls.n++;
+		};
+		// happy-dom's DOM classes do not structurally match lib.dom's; the test
+		// speaks lib types, so the boundary converts once here.
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<AuthPage mode="setup" version={null} />);
+		});
+		const form = container.querySelector("form") as unknown as HTMLFormElement;
+		/** A setup field by its label text; only the token and host inputs carry aria-labels. */
+		const field = (text: string): HTMLInputElement => {
+			const label = [...container.querySelectorAll("label")].find((l) =>
+				(l.textContent ?? "").startsWith(text),
+			);
+			const node = label?.querySelector(
+				"input",
+			) as unknown as HTMLInputElement | null;
+			if (node === null || node === undefined)
+				throw new Error(`no ${text} field`);
+			return node;
+		};
+		return {
+			container,
+			form,
+			field,
+			posts,
+			reloadCalls,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	/** Fills every required field plus the host field ("": leave it empty). */
+	async function fill(
+		field: (text: string) => HTMLInputElement,
+		hostValue: string,
+	): Promise<void> {
+		const set = (text: string, value: string) => {
+			const el = field(text);
+			typeInto(el, value);
+			onChangeOf(el)({ target: el, currentTarget: el });
+		};
+		set("Name", "ada");
+		set("Password", "hunter222");
+		set("Repeat password", "hunter222");
+		set("GitHub token", "ghp_t");
+		if (hostValue !== "") set("GitHub host", hostValue);
+	}
+
+	const hostPosts = (posts: PostCall[]): PostCall[] =>
+		posts.filter((p) => p.url.endsWith("/api/settings/github-host"));
+
+	test("renders the GitHub host field", async () => {
+		const { container, unmount } = await mountAuth(() => Response.json({}));
+		try {
+			expect(
+				container.querySelector('input[aria-label="GitHub host"]'),
+			).not.toBeNull();
+			const hints = [...container.querySelectorAll(".hint")].map(
+				(h) => h.textContent ?? "",
+			);
+			expect(hints.some((t) => t.includes("Settings → Git hosts"))).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("onboarding posts the host like Settings saves it", async () => {
+		const { form, field, posts, reloadCalls, unmount } = await mountAuth(
+			(url, body) => {
+				if (url.endsWith("/api/setup")) {
+					expect(body).toEqual({
+						name: "ada",
+						password: "hunter222",
+						githubToken: "ghp_t",
+					});
+					return Response.json({ ok: true, apiKey: "k" });
+				}
+				if (url.endsWith("/api/settings/github-host")) {
+					return Response.json({ host: "acme.ghe.com", expiresAt: null });
+				}
+				return Response.json({}, { status: 404 });
+			},
+		);
+		try {
+			await act(async () => {
+				await fill(field, "acme.ghe.com");
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			const saved = hostPosts(posts);
+			expect(saved).toHaveLength(1);
+			expect(saved[0]?.body).toEqual({ host: "acme.ghe.com" });
+			expect(reloadCalls.n).toBe(1);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an empty host field skips the host save", async () => {
+		const { form, field, posts, reloadCalls, unmount } = await mountAuth(
+			(url) => {
+				if (url.endsWith("/api/setup")) {
+					return Response.json({ ok: true, apiKey: "k" });
+				}
+				return Response.json({}, { status: 404 });
+			},
+		);
+		try {
+			await act(async () => {
+				await fill(field, "");
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(hostPosts(posts)).toEqual([]);
+			expect(reloadCalls.n).toBe(1);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed host save shows the error and stays", async () => {
+		const { container, form, field, posts, reloadCalls, unmount } =
+			await mountAuth((url) => {
+				if (url.endsWith("/api/setup")) {
+					return Response.json({ ok: true, apiKey: "k" });
+				}
+				if (url.endsWith("/api/settings/github-host")) {
+					return Response.json(
+						{
+							error:
+								"OTTR_GITHUB_HOST: drop the scheme and path; use a bare hostname",
+						},
+						{ status: 400 },
+					);
+				}
+				return Response.json({}, { status: 404 });
+			});
+		try {
+			await act(async () => {
+				await fill(field, "acme.ghe.com");
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(hostPosts(posts)).toHaveLength(1);
+			const alert = container.querySelector('[role="alert"]');
+			expect(alert?.textContent ?? "").toContain("bare hostname");
+			expect(alert?.textContent ?? "").toContain("Settings → Git hosts");
+			expect(reloadCalls.n).toBe(0);
+		} finally {
+			await unmount();
+		}
 	});
 });
