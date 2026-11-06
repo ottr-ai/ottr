@@ -6201,6 +6201,7 @@ export function AskBlock({
 	changed,
 	onOpenDiff,
 	onAnswer,
+	onDraft,
 }: {
 	q: AskQuestion;
 	/** Radio group name: groups a single-choice question's presets. */
@@ -6213,6 +6214,9 @@ export function AskBlock({
 	/** Opens the diff view scoped to the named files (the question's `diff:` links). */
 	onOpenDiff: (files: string[]) => void;
 	onAnswer: (text: string) => void;
+	/** A multi question's live picks as its comma list, or null once nothing is picked:
+	 * a check counts as an answer at once, without the Answer button. */
+	onDraft: (text: string | null) => void;
 }) {
 	const customRef = useRef<HTMLInputElement>(null);
 	const multi = q.multi;
@@ -6236,10 +6240,22 @@ export function AskBlock({
 			.filter((l) => !q.options.some((o) => o.label === l) && l !== "Other")
 			.join(", "),
 	);
-	const togglePick = (label: string): void =>
-		setPicked((p) =>
-			p.includes(label) ? p.filter((l) => l !== label) : [...p, label],
-		);
+	// Multi answer = the checked presets plus the "Other" row (typed text, or the bare
+	// pick when the field stays empty), as one comma list; null when nothing is picked.
+	const multiText = (p: string[], on: boolean, text: string): string | null => {
+		const v = text.trim();
+		const parts = [...p];
+		if (v !== "") parts.push(v);
+		else if (on) parts.push("Other");
+		return parts.length === 0 ? null : parts.join(", ");
+	};
+	const togglePick = (label: string): void => {
+		const next = picked.includes(label)
+			? picked.filter((l) => l !== label)
+			: [...picked, label];
+		setPicked(next);
+		onDraft(multiText(next, customOn, custom));
+	};
 	// The custom row's radio joins the preset group: checked once the saved answer is not a preset.
 	const customChosen =
 		selected !== null && !q.options.some((o) => o.label === selected);
@@ -6249,26 +6265,24 @@ export function AskBlock({
 		onAnswer(text);
 		if (preset) setCustom("");
 	};
-	// Multi answer = the checked presets plus the "Other" row (typed text, or the bare
-	// pick when the field stays empty), sent as one comma list.
 	const customJoined = customOn || custom.trim() !== "";
 	const multiTotal = picked.length + (customJoined ? 1 : 0);
 	const submitMulti = (): void => {
-		const v = custom.trim();
-		const parts = [...picked];
-		if (v !== "") parts.push(v);
-		else if (customOn) parts.push("Other");
-		if (parts.length !== 0) {
-			onAnswer(parts.join(", "));
-			// The typed text stays in the input: that input is the only place the recorded
-			// custom answer is visible (each preset shows as a check instead).
-		}
+		const t = multiText(picked, customOn, custom);
+		// The typed text stays in the input: that input is the only place the recorded
+		// custom answer is visible (each preset shows as a check instead).
+		if (t !== null) onAnswer(t);
 	};
+	// A multi question counts as answered as soon as anything is checked.
+	const done = answered || (multi && multiTotal > 0);
+	// The live picks already are the recorded answer (or both are empty): Answer has nothing to add.
+	const multiRecorded =
+		multi && multiText(picked, customOn, custom) === selected;
 	return (
-		<div className={"ask-q" + (answered ? " answered" : "")}>
+		<div className={"ask-q" + (done ? " answered" : "")}>
 			<p className="ask-text">
 				{/* Shape carries the per-question state: ? = open, check = answered. */}
-				<Mark kind={answered ? "done" : "asked"} />
+				<Mark kind={done ? "done" : "asked"} />
 				{/* One span keeps the parts in normal inline flow: the paragraph is a flex row, and
 					separate flex items per part would wrap the text out of reading order. */}
 				<span>
@@ -6295,7 +6309,7 @@ export function AskBlock({
 					)}
 				</span>
 				<span className="sr">
-					{answered ? " (answered)" : " (needs an answer)"}
+					{done ? " (answered)" : " (needs an answer)"}
 				</span>
 			</p>
 			<div className="ask-options">
@@ -6373,23 +6387,31 @@ export function AskBlock({
 						}
 						const next = !customOn;
 						setCustomOn(next);
+						onDraft(multiText(picked, next, custom));
 						if (next) customRef.current?.focus();
 					}}
 				/>
 				<input
 					ref={customRef}
 					value={custom}
-					onChange={(e) => setCustom(e.target.value)}
+					onChange={(e) => {
+						setCustom(e.target.value);
+						if (multi) onDraft(multiText(picked, customOn, e.target.value));
+					}}
 					placeholder="Other — type your own"
 					aria-label="Other answer"
 					disabled={busy}
 				/>
 				<button
 					type="submit"
-					disabled={busy || (multi ? multiTotal === 0 : custom.trim() === "")}
+					disabled={busy || (multi ? multiRecorded : custom.trim() === "")}
 				>
 					{busy && <span className="spinner" aria-hidden="true" />}
-					{(selected === null ? "Answer" : "Replace answer") +
+					{(selected === null
+						? "Answer"
+						: multiRecorded
+							? "Answered"
+							: "Replace answer") +
 						(multi && multiTotal > 0 ? ` (${multiTotal})` : "")}
 				</button>
 			</form>
@@ -6602,6 +6624,15 @@ function AskPanel({
 							setAnswers(next);
 							saveAskDraft(taskId, { fp, answers: next });
 						}
+					}}
+					onDraft={(t) => {
+						// One question: the reply goes out on Answer, so picks stay local to the block.
+						if (asked.length === 1) return;
+						const next = { ...answers };
+						if (t === null) delete next[qi];
+						else next[qi] = t;
+						setAnswers(next);
+						saveAskDraft(taskId, { fp, answers: next });
 					}}
 				/>
 			))}

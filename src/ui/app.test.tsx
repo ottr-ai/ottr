@@ -1146,6 +1146,7 @@ describe("AskBlock", () => {
 		changed: [],
 		onOpenDiff: () => {},
 		onAnswer: () => {},
+		onDraft: () => {},
 	};
 	const multiQ = {
 		question: "Pick several",
@@ -1201,8 +1202,9 @@ describe("AskBlock", () => {
 		);
 		// Both picked presets render checked; the custom row's checkbox stays unchecked.
 		expect(html.split('checked=""').length - 1).toBe(2);
-		expect(html).toContain("(2)");
-		expect(html).toContain("Replace answer");
+		// The picks already are the recorded answer: the button has nothing to add.
+		expect(html).toContain("Answered (2)");
+		expect(html).toContain('type="submit" disabled=""');
 	});
 
 	test("a single question stays a radio group that answers in one click", () => {
@@ -1311,10 +1313,11 @@ describe("AskBlock multi answers", () => {
 		return props.onChange;
 	};
 
-	/** One mounted multi AskBlock; every onAnswer text lands in `answers`. */
+	/** One mounted multi AskBlock; every onAnswer text lands in `answers`, every onDraft in `drafts`. */
 	async function mountAsk(): Promise<{
 		container: HTMLDivElement;
 		answers: string[];
+		drafts: (string | null)[];
 		form: HTMLFormElement;
 		text: HTMLInputElement;
 		other: HTMLInputElement;
@@ -1326,6 +1329,7 @@ describe("AskBlock multi answers", () => {
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
 		const answers: string[] = [];
+		const drafts: (string | null)[] = [];
 		function Block() {
 			return (
 				<AskBlock
@@ -1338,6 +1342,9 @@ describe("AskBlock multi answers", () => {
 					onOpenDiff={() => {}}
 					onAnswer={(t: string) => {
 						answers.push(t);
+					}}
+					onDraft={(t: string | null) => {
+						drafts.push(t);
 					}}
 				/>
 			);
@@ -1362,8 +1369,29 @@ describe("AskBlock multi answers", () => {
 			button === null
 		)
 			throw new Error("ask block did not render its controls");
-		return { container, answers, form, text, other, button };
+		return { container, answers, drafts, form, text, other, button };
 	}
+
+	test("checking a preset counts as answered at once; unchecking it reopens", async () => {
+		const { container, drafts } = await mountAsk();
+		const box = container.querySelector(
+			'input[aria-label="A"]',
+		) as unknown as HTMLInputElement;
+		const mark = (): string =>
+			container.querySelector(".ask-text .mark")?.getAttribute("class") ?? "";
+		expect(mark()).toContain("mark-asked");
+		await act(async () => {
+			onChangeOf(box)({ target: box, currentTarget: box });
+		});
+		// No Answer click: the check alone records the draft and ticks the question.
+		expect(drafts).toEqual(["A"]);
+		expect(mark()).toContain("mark-done");
+		await act(async () => {
+			onChangeOf(box)({ target: box, currentTarget: box });
+		});
+		expect(drafts).toEqual(["A", null]);
+		expect(mark()).toContain("mark-asked");
+	});
 
 	test("clicking the Other checkbox answers even when the field stays empty", async () => {
 		const { answers, form, other, button } = await mountAsk();
