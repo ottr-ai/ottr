@@ -160,6 +160,40 @@ describe("noRedirectFetch", () => {
 			);
 		}
 	});
+	test("a cross-host 3xx with proxyHint names the proxy", async () => {
+		serve(
+			() =>
+				new Response(null, {
+					status: 302,
+					headers: { location: "http://www.example.com/y" },
+				}),
+		);
+		await expect(
+			noRedirectFetch(`${alate.url}/r`, {}, { proxyHint: true }),
+		).rejects.toThrow(
+			`${alate.url}/r answered 302 (redirect not followed; a proxy may intercept this call: check NO_PROXY)`,
+		);
+	});
+	test("a same-host 3xx with proxyHint adds no hint", async () => {
+		serve(
+			() => new Response(null, { status: 302, headers: { location: "/y" } }),
+		);
+		await expect(
+			noRedirectFetch(`${alate.url}/r`, {}, { proxyHint: true }),
+		).rejects.toThrow(`${alate.url}/r answered 302 (redirect not followed)`);
+	});
+	test("a cross-host 3xx without the opts adds no hint", async () => {
+		serve(
+			() =>
+				new Response(null, {
+					status: 302,
+					headers: { location: "http://www.example.com/y" },
+				}),
+		);
+		await expect(noRedirectFetch(`${alate.url}/r`)).rejects.toThrow(
+			`${alate.url}/r answered 302 (redirect not followed)`,
+		);
+	});
 });
 
 describe("alateHealth", () => {

@@ -961,7 +961,33 @@ describe("runWorker", () => {
 		);
 		expect(err).toBeInstanceOf(WorkerConnectError);
 		expect(String(err)).toContain("redirect not followed");
+		expect(String(err)).toContain(
+			"a proxy may intercept this call: check NO_PROXY",
+		);
 		expect(bounceToken).toBeUndefined();
+	});
+
+	test("a same-origin redirecting worker url rejects without the proxy hint", async () => {
+		const redir = Bun.serve({
+			port: 0,
+			// redirect: "manual" never follows this; the same-origin location only
+			// proves the proxy hint stays off for a same-host bounce.
+			fetch: (req) => Response.redirect(req.url, 302),
+		});
+		servers.push(redir as Bun.Server<never>);
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "c2c", argv: [], cwd: dir, stdin: "", env: {} },
+			{ urls: [redir.url.origin], token: "sekrit" },
+			sink,
+		);
+		const err = await done.then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(WorkerConnectError);
+		expect(String(err)).toContain("redirect not followed");
+		expect(String(err)).not.toContain("NO_PROXY");
 	});
 
 	test("kill aborts and settles killed immediately", async () => {

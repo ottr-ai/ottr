@@ -1,20 +1,26 @@
 // Alate's file editor API and the GitHub commit path for the data repo's omp config.yml.
 import type { GhFn } from "./forks.ts";
+import { redirectProxyHint } from "./proxyHint.ts";
 
 type Alate = { url: string | null; key: string | null };
 
 /**
  * Fetch that never follows a redirect: fetch keeps the Authorization header on a
  * redirect chain, so a redirecting endpoint could bounce the bearer off-host.
- * A 3xx answer is an error with a clear message, never a hop.
+ * A 3xx answer is an error with a clear message, never a hop. Internal callers pass
+ * { proxyHint: true }: when the 3xx Location lands on another host, the error names a
+ * possible proxy interception (Podman injects the host's proxy env into every container).
  */
 export async function noRedirectFetch(
 	url: string,
 	init: RequestInit = {},
+	opts: { proxyHint?: boolean } = {},
 ): Promise<Response> {
 	const res = await fetch(url, { ...init, redirect: "manual" });
 	if (res.status >= 300 && res.status < 400)
-		throw new Error(`${url} answered ${res.status} (redirect not followed)`);
+		throw new Error(
+			`${url} answered ${res.status} (redirect not followed${opts.proxyHint ? redirectProxyHint(url, res) : ""})`,
+		);
 	return res;
 }
 
@@ -100,15 +106,19 @@ export async function alateApi(
 		};
 	let res: Response;
 	try {
-		res = await noRedirectFetch(alate.url + path, {
-			method: init?.method ?? "GET",
-			headers: {
-				authorization: `Bearer ${alate.key}`,
-				...(init ? { "content-type": "application/json" } : {}),
+		res = await noRedirectFetch(
+			alate.url + path,
+			{
+				method: init?.method ?? "GET",
+				headers: {
+					authorization: `Bearer ${alate.key}`,
+					...(init ? { "content-type": "application/json" } : {}),
+				},
+				...(init ? { body: JSON.stringify(init.body) } : {}),
+				signal: AbortSignal.timeout(timeoutMs),
 			},
-			...(init ? { body: JSON.stringify(init.body) } : {}),
-			signal: AbortSignal.timeout(timeoutMs),
-		});
+			{ proxyHint: true },
+		);
 	} catch (err) {
 		// A timed-out write may still land on alate: say so instead of "cannot reach".
 		if ((err as Error).name === "TimeoutError")

@@ -1351,11 +1351,15 @@ export function createApp(deps: AppDeps) {
 			try {
 				let res: Response;
 				try {
-					res = await noRedirectFetch(alate.url + "/api/updates", {
-						headers: { authorization: "Bearer " + alate.key },
-						// Bounded like provision: a hung alate must not hold the pull open.
-						signal: AbortSignal.timeout(10_000),
-					});
+					res = await noRedirectFetch(
+						alate.url + "/api/updates",
+						{
+							headers: { authorization: "Bearer " + alate.key },
+							// Bounded like provision: a hung alate must not hold the pull open.
+							signal: AbortSignal.timeout(10_000),
+						},
+						{ proxyHint: true },
+					);
 				} catch (err) {
 					logError("updates pull failed", err);
 					return;
@@ -1454,14 +1458,18 @@ export function createApp(deps: AppDeps) {
 		try {
 			let res: Response;
 			try {
-				res = await noRedirectFetch(alate.url + "/provision", {
-					method: "POST",
-					headers: { authorization: "Bearer " + alate.key },
-					// Bounded under serveOptions.idleTimeout (120 s) together with the 5 s
-					// health probe in provisionTimedOut: a hung alate must fail the
-					// request, not hold the connection until the idle cut kills it.
-					signal: AbortSignal.timeout(110_000),
-				});
+				res = await noRedirectFetch(
+					alate.url + "/provision",
+					{
+						method: "POST",
+						headers: { authorization: "Bearer " + alate.key },
+						// Bounded under serveOptions.idleTimeout (120 s) together with the 5 s
+						// health probe in provisionTimedOut: a hung alate must fail the
+						// request, not hold the connection until the idle cut kills it.
+						signal: AbortSignal.timeout(110_000),
+					},
+					{ proxyHint: true },
+				);
 			} catch (err) {
 				// Awaited so the in-flight guard holds until the probe answers.
 				if ((err as Error).name === "TimeoutError")

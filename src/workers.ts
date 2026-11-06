@@ -11,6 +11,7 @@ import { isAbsolute, join } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
+import { redirectProxyHint } from "./proxyHint.ts";
 import { ensureProjectPython } from "./python.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
@@ -497,7 +498,7 @@ export function runWorker(
 				const redirected = res.status >= 300 && res.status < 400;
 				const body = (await res.text()).trim().slice(0, 300);
 				throw new WorkerConnectError(
-					`worker ${url} responded ${res.status}${redirected ? " (redirect not followed)" : ""}${body ? `: ${body}` : ""}`,
+					`worker ${url} responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
 				);
 			}
 		} catch (err) {
