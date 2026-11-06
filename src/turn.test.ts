@@ -30,6 +30,7 @@ import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
 	DEP_HELD_PROMPT,
+	followUpPrompt,
 	LOST_SESSION,
 	mergePrompt,
 	PROPOSED_REASON_PREFIX,
@@ -11946,6 +11947,78 @@ describe("turn survivor round 5 — helpers", () => {
 		// The 8-word cap boundary holds: eight words pass.
 		const eight = "Fix the flaky login redirect test in CI";
 		expect(await generateTitle("name me", gateway(eight).spawn)).toBe(eight);
+	});
+
+	test("generateTitle: an OTTR-516 follow-up titles the work with the parent as context, never the handoff path", async () => {
+		const g = gateway("Add report path line to agent docs");
+		const title = await generateTitle(
+			followUpPrompt({
+				text: "Add a report-path line to /workspace/ottr/AGENTS.md so agents read a finished Stryker run's survivors from its report file instead of re-running the gate.",
+				title:
+					"Retro of Take the memory backend choice out of the agent layer: the deployment…",
+				handoffPath: "/data/ottr/handoffs/OTTR-492.md",
+			}),
+			g.spawn,
+		);
+		expect(title).toBe("Add report path line to agent docs");
+		const content = g.requests[0]!.body.messages[1]!.content;
+		expect(content).toContain(
+			"Continues: Retro of Take the memory backend choice out of the agent layer: the deployment…",
+		);
+		expect(content).toContain("Add a report-path line");
+		expect(content).not.toContain("/data/");
+		expect(content).not.toContain("OTTR-492");
+		expect(content).not.toContain("@");
+		expect(content).not.toContain("Read the handoff");
+	});
+
+	test("generateTitle: the Implement steps shape titles the work, not the fixed instruction", async () => {
+		const g = gateway("Implement loading skeleton primitive");
+		const title = await generateTitle(
+			followUpPrompt({
+				// The fixed "Implement steps" text (IMPLEMENT_RECOMMENDATIONS, src/ui/app.tsx).
+				text: "Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.",
+				title: "Loading-state UX advice for Ottr",
+				handoffPath: "/data/ottr/handoffs/OTTR-572.md",
+			}),
+			g.spawn,
+		);
+		expect(title).toBe("Implement loading skeleton primitive");
+		const content = g.requests[0]!.body.messages[1]!.content;
+		expect(content).toContain("Continues: Loading-state UX advice for Ottr");
+		expect(content).toContain("Implement the recommended steps");
+		expect(content).not.toContain("/data/");
+		expect(content).not.toContain("@");
+	});
+
+	test("generateTitle: a reply naming a path or the handoff step is not a title", async () => {
+		const causes: string[] = [];
+		expect(
+			await generateTitle(
+				"name me",
+				gateway("Read @/data/ottr/handoffs/OTTR-516.md first.").spawn,
+				(c) => causes.push(c),
+			),
+		).toBeNull();
+		expect(causes).toEqual(["not a title (names a file path)"]);
+		causes.length = 0;
+		expect(
+			await generateTitle(
+				"name me",
+				gateway(
+					"Read the handoff file to see the report and recommended steps.",
+				).spawn,
+				(c) => causes.push(c),
+			),
+		).toBeNull();
+		expect(causes).toEqual(["not a title (names the handoff step)"]);
+		// OTTR-574's good title survives the path and handoff heads.
+		expect(
+			await generateTitle(
+				"name me",
+				gateway("Implement Button Capitalization Recommendations").spawn,
+			),
+		).toBe("Implement Button Capitalization Recommendations");
 	});
 
 	test("uiFiles: test/ folders, extra suffixes and root ui/ code", () => {
