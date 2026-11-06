@@ -2231,7 +2231,7 @@ export function GitHostsSection() {
 						<button
 							type="submit"
 							disabled={tBusy.busy}
-							className={`primary${tBusy.failed ? " failed" : ""}`}
+							className={tBusy.failed ? "failed" : ""}
 						>
 							{tBusy.busy && <span className="spinner" aria-hidden="true" />}
 							Save token
