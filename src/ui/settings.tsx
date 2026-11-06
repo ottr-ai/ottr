@@ -1466,7 +1466,7 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 					</a>
 				)}
 			</div>
-			{check.missing.length === 0 ? (
+			{check.missing.length === 0 && check.failed.length === 0 ? (
 				<p className="hint notif-line">
 					<Mark kind="done" />
 					<span>
@@ -1477,7 +1477,8 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 								: `Installed on all public board repos; ${check.private.length} private repo${check.private.length === 1 ? "" : "s"} skipped.`}
 					</span>
 				</p>
-			) : (
+			) : null}
+			{check.missing.length > 0 && (
 				<p className="hint notif-line">
 					<Mark kind="warn" />
 					<span>
@@ -1495,6 +1496,15 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 								</a>
 							</>
 						)}
+					</span>
+				</p>
+			)}
+			{check.failed.length > 0 && (
+				<p className="hint notif-line">
+					<Mark kind="warn" />
+					<span>
+						Check failed for{" "}
+						{check.failed.map((f) => `${f.repo} (${f.detail})`).join(", ")}.
 					</span>
 				</p>
 			)}

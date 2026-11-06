@@ -176,7 +176,9 @@ export class AppTokenSource {
 
 /**
  * Reads the app's name (GET /app) and looks up its installation on each repo. A 404 marks the
- * repo missing. Any other answer stops the check with an error that holds only the status.
+ * repo missing, and the visibility probe for it goes out unauthenticated: GitHub answers 401
+ * to a repo endpoint called with the app JWT. A failed lookup of one repo is recorded for that
+ * repo and the check goes on; only a failed app lookup or a transport error sets error.
  */
 export async function checkAppInstalls(deps: {
 	appId: string;
@@ -196,6 +198,7 @@ export async function checkAppInstalls(deps: {
 		repos: deps.repos,
 		missing: [],
 		private: [],
+		failed: [],
 		error: null,
 	};
 	const get = (path: string) =>
@@ -222,15 +225,28 @@ export async function checkAppInstalls(deps: {
 			const res = await get(`/repos/${repo}/installation`);
 			if (res.status === 404) {
 				// A repo the app cannot see is private or gone; those get no
-				// outside PRs, so no warning names them.
-				const probe = await get(`/repos/${repo}`);
+				// outside PRs, so no warning names them. The probe sends no
+				// authorization header: the app JWT is only valid on /app and
+				// installation lookups, and a repo endpoint called with it
+				// answers 401. Unauthenticated, a public repo is 200 and a
+				// private or gone one 404 — exactly what the probe must tell
+				// apart.
+				const probe = await fetchImpl(`${base}/repos/${repo}`, {
+					headers: {
+						accept: "application/vnd.github+json",
+						"user-agent": "Ottr",
+					},
+				});
 				if (probe.status === 404) {
 					out.private.push(repo);
 					continue;
 				}
 				if (!probe.ok) {
-					out.error = `repo lookup for ${repo} answered ${probe.status}`;
-					return out;
+					out.failed.push({
+						repo,
+						detail: `repo lookup answered ${probe.status}`,
+					});
+					continue;
 				}
 				const probeBody = (await probe.json()) as { private?: unknown };
 				if (probeBody.private === true) {
@@ -239,8 +255,10 @@ export async function checkAppInstalls(deps: {
 				}
 				out.missing.push(repo);
 			} else if (!res.ok) {
-				out.error = `installation lookup for ${repo} answered ${res.status}`;
-				return out;
+				out.failed.push({
+					repo,
+					detail: `installation lookup answered ${res.status}`,
+				});
 			}
 		}
 	} catch (err) {
@@ -250,7 +268,7 @@ export async function checkAppInstalls(deps: {
 	return out;
 }
 
-/** The board warning for a check, or null when the app sees every board repo. Pure. */
+/** The board warning for a check, or null when the app sees every board repo; a per-repo failure never warns here. Pure. */
 export function appCheckWarning(check: AppCheck | null): string | null {
 	if (check === null) return null;
 	if (check.error !== null)

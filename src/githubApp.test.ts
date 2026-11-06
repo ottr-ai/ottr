@@ -161,6 +161,51 @@ function headerOf(call: Call | undefined): Record<string, string> {
 	return call?.init?.headers as Record<string, string>;
 }
 
+type Statusish = Response | { status: number };
+
+/**
+ * Fake with GitHub's real status semantics for the install check: /app and
+ * installation lookups answer from their scripts, and a repo endpoint called
+ * WITH the app JWT answers 401 — so a probe that leaks the JWT can never read
+ * as public. Without auth, the repo endpoint answers its probe script.
+ */
+function jwtGuardFake(o: {
+	app?: Statusish;
+	installation: Record<string, Statusish>;
+	probe: Record<string, Statusish>;
+}) {
+	const calls: Call[] = [];
+	const answer = (s: Statusish | undefined): Response =>
+		s instanceof Response
+			? s
+			: new Response("{}", { status: s?.status ?? 500 });
+	const fetchImpl = async (
+		url: string,
+		init?: RequestInit,
+	): Promise<Response> => {
+		const call: Call = { url, init };
+		calls.push(call);
+		const path = url.slice("https://api.github.com".length);
+		if (path === "/app")
+			return answer(
+				o.app ??
+					okResponse({
+						name: "ottr-ai",
+						html_url: "https://github.com/apps/ottr-ai",
+					}),
+			);
+		const installed = /^\/repos\/(.+)\/installation$/.exec(path);
+		if (installed !== null) return answer(o.installation[installed[1]!]);
+		const repo = /^\/repos\/(.+)$/.exec(path)![1]!;
+		const auth = (call.init?.headers as Record<string, string> | undefined)
+			?.authorization;
+		if (typeof auth === "string" && auth !== "")
+			return new Response("{}", { status: 401 });
+		return answer(o.probe[repo]);
+	};
+	return { calls, fetchImpl };
+}
+
 const APP_ID = "1234";
 const OWNER = "octo";
 const REPO = "widget";
@@ -333,6 +378,7 @@ describe("checkAppInstalls", () => {
 			repos: ["octo/a", "octo/b", "skare/c"],
 			missing: ["octo/b", "skare/c"],
 			private: [],
+			failed: [],
 			error: null,
 		});
 		expect(calls.map((c) => c.url)).toEqual([
@@ -344,6 +390,10 @@ describe("checkAppInstalls", () => {
 			"https://api.github.com/repos/skare/c",
 		]);
 		expect(headerOf(calls[0]).authorization).toMatch(/^Bearer /);
+		// The visibility probe goes out unauthenticated; the app JWT is for /app and
+		// the installation lookups only.
+		expect(headerOf(calls[3]).authorization).toBeUndefined();
+		expect(headerOf(calls[5]).authorization).toBeUndefined();
 	});
 
 	test("a private repo stays out of missing", async () => {
@@ -374,17 +424,33 @@ describe("checkAppInstalls", () => {
 			repos: ["octo/a"],
 			missing: [],
 			private: ["octo/a"],
+			failed: [],
 			error: null,
 		});
 	});
 
-	test("a failed repo lookup stops with an error and no key", async () => {
-		const { check } = run(
-			[okResponse(APP), { status: 404 }, { status: 500 }],
-			["octo/a"],
+	test("a failed repo probe records that repo and checks the next one", async () => {
+		const { calls, check } = run(
+			[
+				okResponse(APP),
+				{ status: 404 },
+				{ status: 500 }, // octo/a's probe fails; the check must go on
+				okResponse(INSTALLATION), // octo/b has the app
+			],
+			["octo/a", "octo/b"],
 		);
 		const c = await check;
-		expect(c.error).toBe("repo lookup for octo/a answered 500");
+		expect(c.error).toBeNull();
+		expect(c.failed).toEqual([
+			{ repo: "octo/a", detail: "repo lookup answered 500" },
+		]);
+		expect(c.missing).toEqual([]);
+		expect(calls.map((x) => x.url)).toEqual([
+			"https://api.github.com/app",
+			"https://api.github.com/repos/octo/a/installation",
+			"https://api.github.com/repos/octo/a",
+			"https://api.github.com/repos/octo/b/installation",
+		]);
 		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
 	});
 
@@ -396,11 +462,65 @@ describe("checkAppInstalls", () => {
 		expect(calls.length).toBe(1);
 	});
 
-	test("a non-404 repo failure stops with an error and no key", async () => {
-		const { check } = run([okResponse(APP), { status: 500 }]);
+	test("a failed installation lookup records that repo and checks the next one", async () => {
+		const { calls, check } = run(
+			[
+				okResponse(APP),
+				{ status: 500 }, // octo/a's installation lookup fails; the check must go on
+				{ status: 404 },
+				okResponse({ private: false }), // octo/b is public and app-less
+			],
+			["octo/a", "octo/b"],
+		);
 		const c = await check;
-		expect(c.error).toBe("installation lookup for octo/a answered 500");
+		expect(c.error).toBeNull();
+		expect(c.failed).toEqual([
+			{ repo: "octo/a", detail: "installation lookup answered 500" },
+		]);
+		expect(c.missing).toEqual(["octo/b"]);
+		expect(calls.length).toBe(4);
 		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
+	});
+
+	test("a public repo without the app is missing and the probe carries no app JWT", async () => {
+		const { calls, fetchImpl } = jwtGuardFake({
+			installation: { "octo/pub": { status: 404 } },
+			probe: { "octo/pub": okResponse({ private: false }) },
+		});
+		const c = await checkAppInstalls({
+			appId: APP_ID,
+			keyObject: privateKey,
+			repos: ["octo/pub"],
+			fetchImpl,
+			now: () => NOW,
+		});
+		expect(c.missing).toEqual(["octo/pub"]);
+		expect(c.private).toEqual([]);
+		expect(c.failed).toEqual([]);
+		expect(c.error).toBeNull();
+		const probe = calls.find(
+			(x) => x.url === "https://api.github.com/repos/octo/pub",
+		)!;
+		const headers = probe.init?.headers as Record<string, string> | undefined;
+		expect(headers?.authorization).toBeUndefined();
+	});
+
+	test("a private repo without the app is private; the fake 401s the probe if it ever carries the app JWT", async () => {
+		const { fetchImpl } = jwtGuardFake({
+			installation: { "octo/priv": { status: 404 } },
+			probe: { "octo/priv": { status: 404 } },
+		});
+		const c = await checkAppInstalls({
+			appId: APP_ID,
+			keyObject: privateKey,
+			repos: ["octo/priv"],
+			fetchImpl,
+			now: () => NOW,
+		});
+		expect(c.private).toEqual(["octo/priv"]);
+		expect(c.missing).toEqual([]);
+		expect(c.failed).toEqual([]);
+		expect(c.error).toBeNull();
 	});
 
 	test("a non-https html_url is dropped", async () => {
@@ -422,11 +542,20 @@ describe("appCheckWarning", () => {
 		repos: ["octo/a", "octo/b"],
 		missing: [] as string[],
 		private: [],
+		failed: [] as { repo: string; detail: string }[],
 		error: null,
 	};
 	test("no check or no missing repo gives no warning", () => {
 		expect(appCheckWarning(null)).toBeNull();
 		expect(appCheckWarning(base)).toBeNull();
+	});
+	test("a per-repo failure alone gives no warning; the settings check shows it", () => {
+		expect(
+			appCheckWarning({
+				...base,
+				failed: [{ repo: "octo/a", detail: "repo lookup answered 500" }],
+			}),
+		).toBeNull();
 	});
 	test("missing repos name the app, the repos and the install link", () => {
 		expect(appCheckWarning({ ...base, missing: ["octo/b"] })).toBe(

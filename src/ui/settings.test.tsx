@@ -1006,6 +1006,7 @@ describe("AppCheckLines install summary", () => {
 		repos: [],
 		missing: [],
 		private: [],
+		failed: [],
 		error: null,
 		...over,
 	});
@@ -1022,6 +1023,21 @@ describe("AppCheckLines install summary", () => {
 		expect(html).toContain(
 			"Installed on all public board repos; 1 private repo skipped.",
 		);
+	});
+
+	test("a repo whose check failed shows its own failure, not an all-clear", () => {
+		const html = renderToStaticMarkup(
+			<AppCheckLines
+				check={check({
+					repos: ["octo/a", "octo/b"],
+					failed: [{ repo: "octo/a", detail: "repo lookup answered 500" }],
+				})}
+			/>,
+		);
+		expect(html).toContain(
+			"Check failed for octo/a (repo lookup answered 500).",
+		);
+		expect(html).not.toContain("Installed on all");
 	});
 });
 
