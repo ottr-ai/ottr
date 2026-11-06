@@ -707,7 +707,8 @@ function Card({
 						</span>
 					)}
 					<RankBadges task={task} />
-					{/* Pinned to the head's top right without the provider; the tooltip keeps the full id. */}
+					{/* Pinned to the head's top right without the provider or the thinking effort;
+					    the tooltip keeps the full id with its level. */}
 					{task.stage !== "done" && (
 						<span
 							className="model"
@@ -715,7 +716,7 @@ function Card({
 						>
 							{displayModel(
 								catalog?.models ?? [],
-								task.model ?? task.lastModel ?? "default",
+								splitLevel(task.model ?? task.lastModel ?? "default")[0],
 							)}
 						</span>
 					)}

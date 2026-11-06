@@ -471,6 +471,18 @@ describe("LaneCol backlog divider", () => {
 		);
 		expect(pin).toContain(">big</span>");
 		expect(pin).toContain('title="Main loop model: a/big"');
+		// The thinking effort stays off the chip; the tooltip keeps the full selector.
+		const leveled = cardFixture({
+			id: "t4",
+			stage: "todo",
+			state: "queued",
+			model: "zai/glm-5.3-flash:max",
+		});
+		const eff = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[leveled]} />,
+		);
+		expect(eff).toContain(">glm-5.3-flash</span>");
+		expect(eff).toContain('title="Main loop model: zai/glm-5.3-flash:max"');
 	});
 
 	test("a lane with only backlog cards still renders", () => {
