@@ -482,6 +482,53 @@ describe("checkAppInstalls", () => {
 		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
 	});
 
+	test("a network error on the first repo records it and the later repos are still checked", async () => {
+		const calls: Call[] = [];
+		const fetchImpl = async (
+			url: string,
+			init?: RequestInit,
+		): Promise<Response> => {
+			calls.push({ url, init });
+			if (url.endsWith("/repos/octo/a/installation"))
+				throw new Error("network down");
+			if (url === "https://api.github.com/app") return okResponse(APP);
+			if (url.endsWith("/repos/octo/b/installation"))
+				return okResponse(INSTALLATION);
+			throw new Error(`unexpected call ${url}`);
+		};
+		const c = await checkAppInstalls({
+			appId: APP_ID,
+			keyObject: privateKey,
+			repos: ["octo/a", "octo/b"],
+			fetchImpl,
+			now: () => NOW,
+		});
+		expect(c.error).toBeNull();
+		expect(c.failed).toEqual([{ repo: "octo/a", detail: "network down" }]);
+		expect(c.missing).toEqual([]);
+		expect(calls.map((x) => x.url)).toEqual([
+			"https://api.github.com/app",
+			"https://api.github.com/repos/octo/a/installation",
+			"https://api.github.com/repos/octo/b/installation",
+		]);
+		expect(JSON.stringify(c)).not.toContain("PRIVATE KEY");
+	});
+
+	test("a network error at the app lookup still ends the check", async () => {
+		const fetchImpl = async (): Promise<Response> => {
+			throw new Error("socket hang up");
+		};
+		const c = await checkAppInstalls({
+			appId: APP_ID,
+			keyObject: privateKey,
+			repos: ["octo/a"],
+			fetchImpl,
+			now: () => NOW,
+		});
+		expect(c.error).toBe("socket hang up");
+		expect(c.failed).toEqual([]);
+	});
+
 	test("a public repo without the app is missing and the probe carries no app JWT", async () => {
 		const { calls, fetchImpl } = jwtGuardFake({
 			installation: { "octo/pub": { status: 404 } },
@@ -545,17 +592,33 @@ describe("appCheckWarning", () => {
 		failed: [] as { repo: string; detail: string }[],
 		error: null,
 	};
-	test("no check or no missing repo gives no warning", () => {
+	test("no check, and no missing or failed repo, gives no warning", () => {
 		expect(appCheckWarning(null)).toBeNull();
 		expect(appCheckWarning(base)).toBeNull();
 	});
-	test("a per-repo failure alone gives no warning; the settings check shows it", () => {
+	test("failed repos are listed with their status", () => {
 		expect(
 			appCheckWarning({
 				...base,
-				failed: [{ repo: "octo/a", detail: "repo lookup answered 500" }],
+				failed: [
+					{ repo: "octo/a", detail: "repo lookup answered 500" },
+					{ repo: "octo/b", detail: "network down" },
+				],
 			}),
-		).toBeNull();
+		).toBe(
+			"The check failed for octo/a (repo lookup answered 500), octo/b (network down).",
+		);
+	});
+	test("missing repos and failed repos share one warning", () => {
+		expect(
+			appCheckWarning({
+				...base,
+				missing: ["octo/b"],
+				failed: [{ repo: "octo/a", detail: "network down" }],
+			}),
+		).toBe(
+			"ottr-ai is not installed on octo/b. PR reviews there post under your own identity. Install it at https://github.com/apps/ottr-ai/installations/new. The check failed for octo/a (network down).",
+		);
 	});
 	test("missing repos name the app, the repos and the install link", () => {
 		expect(appCheckWarning({ ...base, missing: ["octo/b"] })).toBe(

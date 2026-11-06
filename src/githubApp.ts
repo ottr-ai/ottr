@@ -177,8 +177,9 @@ export class AppTokenSource {
 /**
  * Reads the app's name (GET /app) and looks up its installation on each repo. A 404 marks the
  * repo missing, and the visibility probe for it goes out unauthenticated: GitHub answers 401
- * to a repo endpoint called with the app JWT. A failed lookup of one repo is recorded for that
- * repo and the check goes on; only a failed app lookup or a transport error sets error.
+ * to a repo endpoint called with the app JWT. Every per-repo failure — a status other than
+ * 200 or 404, or a network error — is recorded for that repo and the check goes on; only a
+ * failed app lookup (status or transport) sets error and ends the check.
  */
 export async function checkAppInstalls(deps: {
 	appId: string;
@@ -221,7 +222,13 @@ export async function checkAppInstalls(deps: {
 			typeof body.html_url === "string" && /^https:\/\//.test(body.html_url)
 				? body.html_url
 				: null;
-		for (const repo of deps.repos) {
+	} catch (err) {
+		// Network failures only; the key never reaches an error text from here.
+		out.error = err instanceof Error ? err.message : String(err);
+		return out;
+	}
+	for (const repo of deps.repos) {
+		try {
 			const res = await get(`/repos/${repo}/installation`);
 			if (res.status === 404) {
 				// A repo the app cannot see is private or gone; those get no
@@ -260,24 +267,39 @@ export async function checkAppInstalls(deps: {
 					detail: `installation lookup answered ${res.status}`,
 				});
 			}
+		} catch (err) {
+			// One repo's network failure must not stop the other repos; the
+			// message holds no key.
+			out.failed.push({
+				repo,
+				detail: err instanceof Error ? err.message : String(err),
+			});
 		}
-	} catch (err) {
-		// Network failures only; the key never reaches an error text from here.
-		out.error = err instanceof Error ? err.message : String(err);
 	}
 	return out;
 }
 
-/** The board warning for a check, or null when the app sees every board repo; a per-repo failure never warns here. Pure. */
+/** The board warning for a check, or null when the app sees every board repo and every lookup answered. Pure. */
 export function appCheckWarning(check: AppCheck | null): string | null {
 	if (check === null) return null;
 	if (check.error !== null)
 		return `The GitHub App check failed (${check.error}). PR reviews can post under your own identity: check the App ID and key under Settings - Git hosts.`;
-	if (check.missing.length === 0) return null;
-	const app = check.name ?? "The GitHub App";
-	const install =
-		check.url === null
-			? "Install it from the app's page on GitHub."
-			: `Install it at ${check.url}/installations/new.`;
-	return `${app} is not installed on ${check.missing.join(", ")}. PR reviews there post under your own identity. ${install}`;
+	const parts: string[] = [];
+	if (check.missing.length > 0) {
+		const app = check.name ?? "The GitHub App";
+		const install =
+			check.url === null
+				? "Install it from the app's page on GitHub."
+				: `Install it at ${check.url}/installations/new.`;
+		parts.push(
+			`${app} is not installed on ${check.missing.join(", ")}. PR reviews there post under your own identity. ${install}`,
+		);
+	}
+	if (check.failed.length > 0)
+		parts.push(
+			`The check failed for ${check.failed
+				.map((f) => `${f.repo} (${f.detail})`)
+				.join(", ")}.`,
+		);
+	return parts.length === 0 ? null : parts.join(" ");
 }

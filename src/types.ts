@@ -241,9 +241,9 @@ export type AppCheck = {
 	missing: string[];
 	/** Board repos without an installation that the app cannot see as public (private or gone); they get no outside pull requests, so no warning names them. */
 	private: string[];
-	/** Board repos whose own lookup failed (anything but 200 or 404) as repo + why; the check went on to the next repo. A failed app lookup lands in error instead. */
+	/** Board repos whose own lookup failed — a status other than 200 or 404, or a network error — as repo + why; the check went on to the next repo. A failed app lookup lands in error instead. */
 	failed: { repo: string; detail: string }[];
-	/** Why the whole check failed: the app lookup answered a failure status or the transport threw; never holds the key. */
+	/** Why the whole check failed: the app lookup answered a failure status or its transport threw; never holds the key. */
 	error: string | null;
 };
 
