@@ -27,6 +27,11 @@ is the check of intent. The rewrite is a deeper version, never a bigger one.
   - The rewrite is a deeper version, never a bigger one: no features, tasks, or
     requirements the user did not ask for; no invented details. Keep the length
     close to the original; cut filler. Write in the language of the original.
+  - Where the draft leaves open a choice only the user can make (scope, flow,
+    limits, acceptance), do not guess it: end the rewrite with a section
+    headed "Open questions" listing each such choice as one question; leave
+    it out when nothing is open (OTTR-523). The work prompt treats a task
+    text with that section as vague and asks those questions before building.
 - `export function deepenPrompt(text: string): string` — the user message that
   carries the draft: `Rewrite this task prompt:\n\n<text>`.
 

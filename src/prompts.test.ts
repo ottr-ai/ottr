@@ -768,4 +768,15 @@ describe("deepen prompt contract", () => {
 			"Rewrite this task prompt:\n\nmy draft",
 		);
 	});
+
+	test("deepen's open questions are the section the work turn asks before building", () => {
+		// The heading is the handoff: a rename on one side would let a deepened vague card build on a guess.
+		const work = workPrompt({ text: "t", branch: "b", siblings: [] });
+		expect(deepenSystem).toContain('section headed "Open questions"');
+		expect(work).toContain(
+			'A task text with an "Open questions" section counts as vague: ask those questions first.',
+		);
+		expect(work).toContain("do not guess and do not change any file");
+		expect(work).toContain("end the turn with needs_you");
+	});
 });

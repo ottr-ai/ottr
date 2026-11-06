@@ -13,7 +13,7 @@ const ONE_SHOT =
 
 /** A vague card must not run on a guess: the work agent grills the user first, like the backlog grill session. */
 const VAGUE_RULE =
-	'If the task text is too vague to build without guessing the user\'s intent — for example "add a password-forgotten feature" with no flow, channel, limits or acceptance check — do not guess and do not change any file: grill the user with the ask tool (1-5 questions, each with 2 to 5 concrete options) on the scope, the flows, the edge cases, the acceptance checks and the non-goals, then end the turn with needs_you; build only once the answers settle the intent. A task text that already says what to build and how to check it runs without questions.';
+	'If the task text is too vague to build without guessing the user\'s intent — for example "add a password-forgotten feature" with no flow, channel, limits or acceptance check — do not guess and do not change any file: grill the user with the ask tool (1-5 questions, each with 2 to 5 concrete options) on the scope, the flows, the edge cases, the acceptance checks and the non-goals, then end the turn with needs_you; build only once the answers settle the intent. A task text with an "Open questions" section counts as vague: ask those questions first. A task text that already says what to build and how to check it runs without questions.';
 
 /** The card shows `details`, not the chat, so an answer has to go there. */
 const WORK_OUTCOMES =
@@ -184,13 +184,14 @@ The tracker parks this card in backlog after your report; it never merges anythi
 }
 
 /** The task composer's opt-in Deepen rewrite contract: the model rewrites the draft into a
- * deeper version and answers with only the rewritten text. Additive export; existing prompt
- * wording stays untouched (AGENTS.md hard stop 3). */
+ * deeper version and answers with only the rewritten text. Intent only the user can settle
+ * becomes an "Open questions" section, which the work prompt's VAGUE_RULE asks before building. */
 export const deepenSystem: string = `Rewrite the user's task prompt into a deeper version.
 Answer with only the rewritten prompt text: no preamble, no quotes, no markdown fences, no commentary.
 Keep the user's intent and their words where they carry meaning.
 Add what a top professional would bring: the goal behind the task (altitude), the expert method, the raw material they would start from, the tools and methods they would use, and an outside check (a test, a command, a number, or another observable result that shows the work is right).
-The rewrite is a deeper version, never a bigger one: no features, tasks, or requirements the user did not ask for; no invented details. Keep the length close to the original; cut filler. Write in the language of the original.`;
+The rewrite is a deeper version, never a bigger one: no features, tasks, or requirements the user did not ask for; no invented details. Keep the length close to the original; cut filler. Write in the language of the original.
+Where the draft leaves open a choice only the user can make (scope, flow, limits, acceptance), do not guess it: end the rewrite with a section headed "Open questions" that lists each such choice as one question. Leave that section out when nothing is open.`;
 
 /** The Deepen user message that carries the draft. */
 export function deepenPrompt(text: string): string {
