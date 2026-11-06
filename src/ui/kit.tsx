@@ -618,20 +618,45 @@ const WINDOW_UNIT_MS = {
 	w: 604_800_000,
 } as const;
 
-/** Share of a quota window that has passed, 0-100, from omp's window id ("5h", "7d") or, when omp
- *  names none, the label ("5 Hours", "7 Day", "Weekly"). Null when the length or the reset is unknown. */
+/** Epoch ms one calendar month before `at`, in UTC; the day clamps to the shorter month
+ *  (Mar 31 -> Feb 28), so a monthly window's length follows the month it covers. */
+function monthBefore(at: number): number {
+	const t = new Date(at);
+	const y = t.getUTCFullYear();
+	const m = t.getUTCMonth() - 1; // Date.UTC rolls -1 over to December of the year before
+	const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+	return Date.UTC(
+		y,
+		m,
+		Math.min(t.getUTCDate(), last),
+		t.getUTCHours(),
+		t.getUTCMinutes(),
+		t.getUTCSeconds(),
+		t.getUTCMilliseconds(),
+	);
+}
+
+/** Share of a quota window that has passed, 0-100: from omp's window id ("5h", "7d", or the
+ *  named "daily", "weekly", "monthly" ids), or, when omp names no id, the window label and the
+ *  limit label ("5 Hours", "7 Day", "Weekly", "Monthly"). A named monthly window is one calendar
+ *  month: it starts one month before resetsAt in UTC. Null when the length or the reset is unknown. */
 export function windowGone(l: QuotaLimit, now: number): number | null {
 	if (l.resetsAt === null) return null;
 	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
 	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
+	const calendar = /(daily|weekly|monthly)/i
+		.exec(`${l.window ?? ""} ${l.windowLabel ?? ""} ${l.label}`)?.[1]
+		?.toLowerCase();
 	const ms = id
 		? Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS]
 		: named
 			? Number(named[1]) *
 				WINDOW_UNIT_MS[named[2]![0]!.toLowerCase() as "h" | "d" | "w"]
-			: /weekly/i.test(l.label)
-				? WINDOW_UNIT_MS.w
-				: null;
+			: calendar === "monthly"
+				? l.resetsAt - monthBefore(l.resetsAt)
+				: calendar !== undefined
+					? WINDOW_UNIT_MS[calendar === "daily" ? "d" : "w"]
+					: null;
 	if (ms === null || ms <= 0) return null;
 	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
 }

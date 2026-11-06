@@ -3,6 +3,7 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+import { parseUsage } from "../quota.ts";
 import type {
 	PerfMetrics,
 	PerfStat,
@@ -77,12 +78,14 @@ describe("windowGone", () => {
 	const now = 1_000 * H;
 	const lim = (o: {
 		window?: string | null;
+		windowLabel?: string | null;
 		label?: string;
 		resetsAt?: number | null;
 	}) => ({
 		provider: "p",
 		label: o.label ?? "x",
 		window: o.window ?? null,
+		windowLabel: o.windowLabel ?? null,
 		plan: null,
 		usedPct: 10,
 		resetsAt: o.resetsAt === undefined ? now + H : o.resetsAt,
@@ -112,8 +115,69 @@ describe("windowGone", () => {
 			),
 		).toBe(75);
 	});
+	test("reads named calendar windows by id (Copilot sends daily/weekly/monthly)", () => {
+		expect(
+			windowGone(lim({ window: "daily", resetsAt: now + 18 * H }), now),
+		).toBe(25);
+		expect(
+			windowGone(lim({ window: "weekly", resetsAt: now + 42 * H }), now),
+		).toBe(75);
+		// omp's window label is read as well: a named window without an id still gets a bar.
+		expect(
+			windowGone(
+				lim({
+					label: "Premium Requests",
+					windowLabel: "Monthly",
+					resetsAt: Date.UTC(2026, 11, 1),
+				}),
+				Date.UTC(2026, 10, 16),
+			),
+		).toBeCloseTo(50);
+	});
+	test("a monthly window starts one calendar month before the reset, in UTC", () => {
+		const day = 86_400_000;
+		// March 1 resets: February 2026 has 28 days, February 2028 (leap) has 29.
+		const mar2026 = Date.UTC(2026, 2, 1);
+		expect(
+			windowGone(
+				lim({ window: "monthly", resetsAt: mar2026 }),
+				mar2026 - 14 * day,
+			),
+		).toBeCloseTo(50);
+		const mar2028 = Date.UTC(2028, 2, 1);
+		expect(
+			windowGone(
+				lim({ window: "monthly", resetsAt: mar2028 }),
+				mar2028 - 14.5 * day,
+			),
+		).toBeCloseTo(50);
+	});
+	test("omp's Copilot payload shape gives the elapsed fraction of the monthly window", () => {
+		const limits = parseUsage(
+			JSON.stringify({
+				reports: [
+					{
+						provider: "github-copilot",
+						limits: [
+							{
+								label: "Premium Requests",
+								window: {
+									id: "monthly",
+									label: "Monthly",
+									resetsAt: Date.UTC(2026, 11, 1),
+								},
+								amount: { usedFraction: 0.4 },
+							},
+						],
+					},
+				],
+			}),
+		);
+		// December's window runs 2026-11-01 -> 2026-12-01 UTC; half gone by Nov 16.
+		expect(windowGone(limits[0]!, Date.UTC(2026, 10, 16))).toBeCloseTo(50);
+	});
 	test("unknown length or reset gives null; a past reset clamps to 100", () => {
-		expect(windowGone(lim({ label: "Monthly" }), now)).toBeNull();
+		expect(windowGone(lim({ label: "Premium Requests" }), now)).toBeNull();
 		expect(windowGone(lim({ window: "5h", resetsAt: null }), now)).toBeNull();
 		expect(windowGone(lim({ window: "5h", resetsAt: now - H }), now)).toBe(100);
 		expect(windowGone(lim({ window: "5h", resetsAt: now + 9 * H }), now)).toBe(

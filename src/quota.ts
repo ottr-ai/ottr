@@ -44,6 +44,8 @@ export function parseUsage(text: string): QuotaLimit[] {
 						? label
 						: String(win.label ?? "limit"),
 				window: typeof win.id === "string" ? win.id : null,
+				windowLabel:
+					typeof win.label === "string" && win.label !== "" ? win.label : null,
 				plan,
 				usedPct: Math.round(fraction * 1000) / 10,
 				resetsAt: num(win.resetsAt),

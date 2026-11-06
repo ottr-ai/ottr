@@ -972,6 +972,8 @@ export interface QuotaLimit {
 	label: string;
 	/** omp's short window id, e.g. "5h" or "7d"; null when omp names no window. */
 	window: string | null;
+	/** omp's window label, e.g. "Monthly"; null when the window has no label. */
+	windowLabel?: string | null;
 	/** The account's plan from omp's metadata, e.g. "plus"; null when omp reports none. */
 	plan: string | null;
 	usedPct: number;
