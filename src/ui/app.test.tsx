@@ -58,6 +58,7 @@ const {
 	ProjectBoard,
 	SEARCH_APPLY_MS,
 	ComposeDialog,
+	FollowUpDialog,
 	DeepenReview,
 	AddProjectModal,
 	OrphanNotice,
@@ -1692,6 +1693,7 @@ describe("Drawer parent chip", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: false,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -1836,6 +1838,7 @@ describe("Drawer meta ran-on row", () => {
 				act={async () => true}
 				onClose={() => {}}
 				onFollowed={() => {}}
+				projects={[]}
 				read={false}
 				onMarkUnread={() => {}}
 				onMarkSeen={() => {}}
@@ -1877,6 +1880,7 @@ describe("Drawer cross-project lineage", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: false,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2023,6 +2027,7 @@ describe("Drawer prompt markdown", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2140,6 +2145,7 @@ describe("Drawer file-section loading placeholders", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2234,6 +2240,7 @@ describe("Drawer queued steering edit", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2300,6 +2307,7 @@ describe("Drawer queued steering edit (client)", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2445,6 +2453,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -2771,6 +2780,7 @@ describe("Drawer approve button", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -3396,6 +3406,7 @@ describe("Drawer research report button", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -3498,6 +3509,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -3881,6 +3893,129 @@ describe("implementSteps", () => {
 	});
 });
 
+describe("FollowUpDialog project picker", () => {
+	// Same happy-dom setup as the drawer tests: globals for this describe only.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const bodies: Array<{ url: string; body: unknown }> = [];
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+		fetch: (url: unknown, init?: RequestInit): Promise<Response> => {
+			const u = String(url);
+			if (!u.endsWith("/follow-up"))
+				return Promise.resolve(new Response("{}", { status: 404 }));
+			bodies.push({ url: u, body: JSON.parse(String(init?.body)) });
+			return Promise.resolve(
+				new Response(JSON.stringify({ id: "N-1", project: "other" }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		},
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	test("files the follow-up into the picked project", async () => {
+		const proj = (name: string) =>
+			({ name, gitless: false, settings: {} }) as unknown as ProjectView;
+		const followed: string[] = [];
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const q = (sel: string): Element => {
+			const node = container.querySelector(sel);
+			if (node === null) throw new Error(`no ${sel}`);
+			return node as unknown as Element;
+		};
+		try {
+			await act(async () => {
+				root.render(
+					<FollowUpDialog
+						task={
+							{
+								...cardFixture({ id: "D-1" }),
+								project: "proj",
+							} as unknown as TaskView
+						}
+						projects={[proj("proj"), proj("other")]}
+						open
+						onClose={() => {}}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onFollowed={(id, from) => followed.push(`${id}:${from}`)}
+					/>,
+				);
+			});
+			const select = q(".followup-project select") as HTMLSelectElement;
+			expect(select.value).toBe("proj");
+			// happy-dom's dispatched events never reach React's event plugin (see onClickOf):
+			// call the handlers React rendered. Its select and form are Proxies that hide own
+			// keys, so the props key comes from the textarea; every node of one root shares it.
+			const form = q("form.dialog-body");
+			const key = Object.getOwnPropertyNames(q("textarea")).find((k) =>
+				k.startsWith("__reactProps$"),
+			);
+			if (key === undefined) throw new Error("no React props");
+			const handler = (node: Element, name: string): ((e: unknown) => void) => {
+				const props: unknown = Reflect.get(node, key);
+				const fn =
+					typeof props === "object" && props !== null
+						? Reflect.get(props, name)
+						: undefined;
+				if (typeof fn !== "function") throw new Error(`no ${name}`);
+				return fn;
+			};
+			await act(async () => {
+				handler(select, "onChange")({ target: { value: "other" } });
+			});
+			await act(async () => {
+				handler(q("textarea"), "onChange")({ target: { value: "next step" } });
+			});
+			await act(async () => {
+				handler(form, "onSubmit")({ preventDefault: () => {} });
+				// The send resolves after the handler returns: let the POST and its state updates land.
+				await Bun.sleep(0);
+			});
+		} finally {
+			await act(async () => root.unmount());
+			container.remove();
+		}
+		expect(bodies).toHaveLength(1);
+		expect(bodies[0]?.url).toBe("/api/projects/proj/tasks/D-1/follow-up");
+		expect(bodies[0]?.body).toMatchObject({
+			text: "next step",
+			project: "other",
+		});
+		expect(followed).toEqual(["N-1:D-1"]);
+	});
+});
+
 describe("path URL card links", () => {
 	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
 	const drawerFields = {
@@ -3910,6 +4045,7 @@ describe("path URL card links", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: false,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -4564,6 +4700,7 @@ describe("Drawer proposal decision panel", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: true,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
@@ -4824,6 +4961,7 @@ describe("Drawer proposal panel editing (client)", () => {
 				act: async () => true,
 				onClose: () => {},
 				onFollowed: () => {},
+				projects: [],
 				read: true,
 				onMarkUnread: () => {},
 				onMarkSeen: () => {},

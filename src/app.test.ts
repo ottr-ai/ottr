@@ -811,6 +811,57 @@ describe("task routes", () => {
 				"followUpOf names cards in several projects: p2, p3",
 			);
 		});
+
+		test("follow-up into another project files the card there with a back link", async () => {
+			const parent = store.createTask("p1 done parent");
+			store.updateTask(parent.id, { stage: "done", state: "idle" });
+			const before = store.listTasks().length;
+			const res = await post(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+				text: "carry on in p2",
+				project: "p2",
+			});
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as { id: string };
+			const kid = p2.store.getTask(view.id)!;
+			expect(kid.followUpOf).toBe(parent.id);
+			expect(kid.followUpOfProject).toBe("p1");
+			expect(
+				existsSync(join(p2.store.tasksDir, "handoffs", `${kid.id}.md`)),
+			).toBe(true);
+			expect(store.listTasks().length).toBe(before);
+		});
+
+		test("follow-up into an unknown project 404s and files nothing", async () => {
+			const parent = store.createTask("p1 done parent, lost target");
+			store.updateTask(parent.id, { stage: "done", state: "idle" });
+			const stores = [store, p2.store, p3.store];
+			const before = stores.map((s) => s.listTasks().length);
+			const res = await post(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+				text: "nowhere",
+				project: "nope",
+			});
+			expect(res.status).toBe(404);
+			expect(await errorOf(res)).toBe("unknown project");
+			expect(stores.map((s) => s.listTasks().length)).toEqual(before);
+		});
+
+		test("follow-up into a gitless project 409s", async () => {
+			const parent = store.createTask("p1 done parent, gitless target");
+			store.updateTask(parent.id, { stage: "done", state: "idle" });
+			const before = p3.store.listTasks().length;
+			p3.gitless = true;
+			try {
+				const res = await post(
+					`/api/projects/p1/tasks/${parent.id}/follow-up`,
+					{ text: "blocked", project: "p3" },
+				);
+				expect(res.status).toBe(409);
+				expect(await errorOf(res)).toBe("init a git repository first");
+			} finally {
+				p3.gitless = false;
+			}
+			expect(p3.store.listTasks().length).toBe(before);
+		});
 	});
 
 	test("state cards omit details and report", async () => {

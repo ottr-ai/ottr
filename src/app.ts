@@ -6226,26 +6226,44 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "text must be 1-20000 characters" }, 400);
 					const model = modelParam(r.body);
 					if (model instanceof Response) return model;
+					// Optional target board: the card lands there, linked back across the border.
+					let target = e;
+					let followUpOfProject: string | null = null;
+					const want = r.body.project;
+					if (
+						want !== undefined &&
+						want !== null &&
+						want !== req.params.project
+					) {
+						if (typeof want !== "string")
+							return json({ error: "project must be a project name" }, 400);
+						const te = deps.projects.get(want);
+						if (!te) return json({ error: "unknown project" }, 404);
+						if (te.gitless)
+							return json({ error: "init a git repository first" }, 409);
+						target = te;
+						followUpOfProject = req.params.project;
+					}
 					const decoded = decodeImages(
 						r.body.images,
-						e.store.getSettings().maxImages,
+						target.store.getSettings().maxImages,
 					);
 					if ("error" in decoded) return json({ error: decoded.error }, 400);
 					// Sync from createTask through updateTask: the 5 s schedule timer must never see the task
 					// without its final prompt (no await in between, so no timer can interleave).
-					const t = e.store.createTask(trimmed, model);
+					const t = target.store.createTask(trimmed, model);
 					let names: string[];
 					try {
 						names =
 							decoded.images.length > 0
 								? saveImages(
-										e.store.dataRoot,
-										e.store.imagesDir(t.id),
+										target.store.dataRoot,
+										target.store.imagesDir(t.id),
 										decoded.images,
 									)
 								: [];
 					} catch (err) {
-						e.store.updateTask(t.id, {
+						target.store.updateTask(t.id, {
 							cancelledAt: Date.now(),
 							state: "idle",
 						});
@@ -6256,12 +6274,12 @@ export function createApp(deps: AppDeps) {
 					}
 					try {
 						const handoffPath = join(
-							e.store.tasksDir,
+							target.store.tasksDir,
 							"handoffs",
 							`${t.id}.md`,
 						);
 						writeBelow(
-							e.store.dataRoot,
+							target.store.dataRoot,
 							handoffPath,
 							handoffMarkdown({
 								task,
@@ -6269,8 +6287,9 @@ export function createApp(deps: AppDeps) {
 								sessionsDir: e.store.sessionsDir,
 							}),
 						);
-						e.store.updateTask(t.id, {
+						target.store.updateTask(t.id, {
 							followUpOf: task.id,
+							followUpOfProject,
 							prompt: followUpPrompt({
 								text: trimmed,
 								title: e.store.frozenTitle(task),
@@ -6279,7 +6298,7 @@ export function createApp(deps: AppDeps) {
 							images: names,
 						});
 					} catch (err) {
-						e.store.updateTask(t.id, {
+						target.store.updateTask(t.id, {
 							cancelledAt: Date.now(),
 							state: "idle",
 						});
@@ -6289,7 +6308,7 @@ export function createApp(deps: AppDeps) {
 						);
 					}
 					deps.schedule();
-					return taskResponse(e, t.id);
+					return taskResponse(target, t.id);
 				}),
 		},
 		"/api/projects/:project/tasks/:id/steer": {

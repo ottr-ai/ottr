@@ -1972,6 +1972,8 @@ export function ComposeDialog({
 	deepen,
 	/** Show the model picker; the draft mask hides it because a draft runs no agent. */
 	showModel,
+	/** One extra control above the prompt card (the follow-up's project picker). */
+	field,
 }: {
 	open: boolean;
 	onClose: () => void;
@@ -1996,6 +1998,7 @@ export function ComposeDialog({
 	/** Deepen the draft: POST /api/projects/:project/deepen. Absent on the backlog draft dialog. */
 	deepen?: (text: string, model: string) => Promise<{ deepened: string }>;
 	showModel?: boolean;
+	field?: ReactNode;
 }) {
 	const [text, setText] = useState("");
 	const [model, setModel] = useState("");
@@ -2107,6 +2110,7 @@ export function ComposeDialog({
 						</h2>
 						<CloseButton />
 					</div>
+					{field}
 					<div className="prompt-card">
 						<PromptInput
 							label={inputLabel}
@@ -2401,19 +2405,27 @@ function BacklogModelDialog({
  * Follow-up on a done task: opens from the done drawer's Follow up button; creates a fresh
  * task that continues in its drawer.
  */
-function FollowUpDialog({
+export function FollowUpDialog({
 	task,
+	projects,
 	open,
 	onClose,
 	act,
 	onFollowed,
 }: {
 	task: TaskView;
+	projects: ProjectView[];
 	open: boolean;
 	onClose: () => void;
 	act: Act;
 	onFollowed: (id: string, from: string) => void;
 }) {
+	const [target, setTarget] = useState(task.project);
+	// Closing drops the pick: the next open defaults to the task's own board again.
+	useEffect(() => {
+		if (!open) setTarget(task.project);
+	}, [open, task.project]);
+	const eligible = projects.filter((p) => !p.gitless);
 	return (
 		<ComposeDialog
 			open={open}
@@ -2428,18 +2440,38 @@ function FollowUpDialog({
 			hint="Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
 			submitLabel="Follow up"
+			field={
+				eligible.length >= 2 && (
+					<label className="triage-rank followup-project">
+						<span>Project</span>
+						<select value={target} onChange={(e) => setTarget(e.target.value)}>
+							{eligible.map((p) => (
+								<option key={p.name} value={p.name}>
+									{projectLabel(p)}
+								</option>
+							))}
+						</select>
+					</label>
+				)
+			}
 			deepen={async (text, model) =>
 				post<{ deepened: string }>(
-					`/api/projects/${encodeURIComponent(task.project)}/deepen`,
+					`/api/projects/${encodeURIComponent(target)}/deepen`,
 					{ prompt: text, model: model || undefined },
 				)
 			}
 			send={async ({ text, images, model }) => {
 				const next = await post<TaskView>(
 					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/follow-up`,
-					{ text, images, model: model || undefined },
+					{
+						text,
+						images,
+						model: model || undefined,
+						project: target === task.project ? undefined : target,
+					},
 				);
-				onFollowed(next.id, task.id); // close the drawer; the board flies the new card out of this one
+				// Close the drawer; the board flies the new card out of this one (another board's card finds no origin).
+				onFollowed(next.id, task.id);
 			}}
 		/>
 	);
@@ -7394,6 +7426,7 @@ export function Drawer({
 	open = true,
 	task: row,
 	project,
+	projects,
 	act,
 	onClose,
 	onFollowed,
@@ -7411,6 +7444,8 @@ export function Drawer({
 	open?: boolean;
 	task: TaskCard;
 	project: ProjectView;
+	/** Every board: the follow-up dialog can file into another project. */
+	projects: ProjectView[];
 	act: Act;
 	onClose: () => void;
 	onFollowed: (id: string, from: string) => void;
@@ -9737,6 +9772,7 @@ export function Drawer({
 			{!cancelled && (
 				<FollowUpDialog
 					task={task}
+					projects={projects}
 					open={followOpen}
 					onClose={() => setFollowOpen(false)}
 					act={act}
@@ -11500,6 +11536,7 @@ export function App() {
 					open={selected !== null}
 					task={drawerTask}
 					project={drawerProject}
+					projects={projects}
 					delta={deltas.get(drawerTask.id)}
 					tasks={tasks.filter(
 						(t) =>
