@@ -7497,6 +7497,60 @@ describe("web push (R1-1, R2-3)", () => {
 		});
 	});
 
+	test("a frame's own alert classes never ride as clear tags on its other payloads", async () => {
+		const b = alertBoard("alert-race");
+		await b.subscribe("https://push.example/race");
+		const old = b.s.createTask("old ask");
+		const fresh = b.s.createTask("new ask");
+		const fin = b.s.createTask("finish");
+		b.m.app.publishState();
+		b.needsYou(old.id);
+		b.m.app.publishState();
+		const from = pushSends.length;
+		// One frame: the old Request resolves while a new Request and a Complete arrive.
+		b.s.updateTask(old.id, { state: "queued" });
+		b.needsYou(fresh.id);
+		b.s.updateTask(fin.id, { stage: "done", state: "idle" });
+		b.m.app.publishState();
+		const sent = b.sentSince(from).map((x) => x.payload);
+		expect(sent.map((p) => p.tag).sort()).toEqual(["complete", "request"]);
+		for (const p of sent) expect(p.clear).toEqual([]);
+	});
+
+	test("Apple: a pending clear of a class this batch alerts is dropped, never closes the new alert", async () => {
+		const b = alertBoard("alert-apple-race");
+		await b.subscribe("https://web.push.apple.com/race");
+		const old = b.s.createTask("old ask");
+		const fresh = b.s.createTask("new ask");
+		const fin = b.s.createTask("finish");
+		b.m.app.publishState();
+		b.needsYou(old.id);
+		b.m.app.publishState();
+		await b.m.call("/api/inbox/seen", { taskIds: [old.id] }); // pending: request
+		const from = pushSends.length;
+		b.needsYou(fresh.id);
+		b.s.updateTask(fin.id, { stage: "done", state: "idle" });
+		b.m.app.publishState();
+		const sent = b.sentSince(from).map((x) => x.payload);
+		expect(sent.map((p) => p.tag).sort()).toEqual(["complete", "request"]);
+		for (const p of sent) expect(p.clear).toEqual([]);
+	});
+
+	test("without any push device or socket, publishes still prune acknowledged task keys", async () => {
+		const b = alertBoard("alert-prune-quiet");
+		const t = b.s.createTask("comes back");
+		b.needsYou(t.id);
+		const key = taskEntryKey(b.s.getTask(t.id)!);
+		await b.m.call("/api/inbox/seen", { keys: [key] });
+		b.s.updateTask(t.id, { state: "queued" });
+		b.m.app.publishState();
+		b.needsYou(t.id);
+		const state = (await (await b.m.call("/api/state")).json()) as {
+			inboxSeen: string[];
+		};
+		expect(state.inboxSeen).toEqual([]);
+	});
+
 	test("a restart keeps the retraction registry: acks and resolutions after reboot still clear", async () => {
 		const b = alertBoard("alert-restart");
 		const fcm = "https://push.example/restart";

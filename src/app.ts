@@ -1136,28 +1136,29 @@ export function createApp(deps: AppDeps) {
 
 	/** One device's payloads for a pass: its alerts (each carrying `clear`), else a data-only
 	 * retraction. Apple's push service never gets a data-only push, so its retraction waits in
-	 * `appleClear` and rides on the next alert sent to that device. */
+	 * `appleClear` and rides on the next alert sent to that device. A class this batch alerts
+	 * replaces its own tag on the device, so its clear tag is dropped: carried on another
+	 * class's payload it could land after the new alert and close it. */
 	function batchFor(
 		sub: PushSub,
 		alerts: readonly AlertPayload[],
 		clear: readonly AlertClass[],
 	): Array<AlertPayload | ClearPayload> {
-		if (!isApplePush(sub.endpoint))
-			return alerts.length > 0
-				? [...alerts]
-				: clear.length > 0
-					? [{ type: "clear", tags: [...clear] }]
-					: [];
+		const apple = isApplePush(sub.endpoint);
 		const pending = new Set([
-			...(appleClear.get(sub.endpoint) ?? []),
+			...(apple ? (appleClear.get(sub.endpoint) ?? []) : []),
 			...clear,
 		]);
 		if (alerts.length === 0) {
-			if (pending.size > 0) appleClear.set(sub.endpoint, pending);
+			if (pending.size === 0) return [];
+			if (!apple) return [{ type: "clear", tags: [...pending] }];
+			appleClear.set(sub.endpoint, pending);
 			return [];
 		}
-		appleClear.delete(sub.endpoint);
-		return alerts.map((a) => ({ ...a, clear: [...pending] }));
+		if (apple) appleClear.delete(sub.endpoint);
+		const shown = new Set(alerts.map((a) => a.tag));
+		const tags = [...pending].filter((t) => !shown.has(t));
+		return alerts.map((a) => ({ ...a, clear: tags }));
 	}
 
 	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
@@ -3878,17 +3879,21 @@ export function createApp(deps: AppDeps) {
 	}
 
 	function publishState(): boolean {
-		// Push works without a board tab (R1-1): skip only when nothing can consume the frame —
-		// no open socket AND no push subscriber. This is what makes needs-you alerts reach the
-		// phone in NODE_ENV=production, where /api/ws is disabled and sockets is always 0.
+		if (deps.serverRef.current === undefined) return false;
+		const consumers = sockets > 0 || loadSubs(deps.gstore).length > 0;
+		// Without a consumer the frame exists only for the seen prune below; skip the state
+		// build (this runs every second) when no task-derived key is acknowledged.
 		if (
-			deps.serverRef.current === undefined ||
-			(sockets === 0 && loadSubs(deps.gstore).length === 0)
+			!consumers &&
+			!loadInboxSeen().some((k) => /^(task|done|error):/.test(k))
 		)
 			return false;
 		const state = stateResponse();
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
 		const inputs = alertInputs(state.tasks, lastAlertInputs);
+		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
+		// comes back with the same key must light the bell again, also on a board polled over
+		// /api/state with no socket and no push device (NODE_ENV=production disables /api/ws).
 		try {
 			const pruned = pruneInboxSeen(state.inboxSeen, inputs);
 			if (pruned.length !== state.inboxSeen.length) {
@@ -3897,6 +3902,13 @@ export function createApp(deps: AppDeps) {
 			}
 		} catch (err) {
 			logError("inbox seen prune", err);
+		}
+		// Push works without a board tab (R1-1): skip the frame only when nothing can consume
+		// it — no open socket AND no push subscriber. The baseline still moves, so a device
+		// that subscribes later is never alerted for changes from before it existed.
+		if (!consumers) {
+			lastAlertInputs = inputs;
+			return false;
 		}
 		const text = JSON.stringify({
 			type: "state",

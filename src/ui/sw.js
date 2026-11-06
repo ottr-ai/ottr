@@ -1,8 +1,9 @@
 // Ottr service worker: shows Web Push notifications and focuses the right board tab on click.
 // Push payloads come in three kinds:
 // - {type:"alert"}: retract the `clear` class tags, then show unless every key was
-//   already acknowledged elsewhere (then show and close at once: browsers require a
-//   visible notification per push under userVisibleOnly).
+//   already acknowledged elsewhere: an acknowledged alert never reaches the screen.
+//   (Chrome may then show its own "updated in the background" notice once its
+//   silent-push allowance runs out; that is the browser's, not an Ottr alert.)
 // - {type:"clear", tags}: retract notifications whose cause cleared; shows nothing.
 //   Apple's push service revokes subscriptions that get pushes without a visible
 //   notification, so the server never sends these to Apple endpoints; there the next
@@ -50,9 +51,8 @@ async function allSeen(keys) {
 
 async function handleAlert(data) {
 	await closeTags(data.clear);
-	const acked = await allSeen(data.keys);
+	if (await allSeen(data.keys)) return;
 	await show(data);
-	if (acked) await closeTags([data.tag]);
 }
 
 self.addEventListener("push", (event) => {

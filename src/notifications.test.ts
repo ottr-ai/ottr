@@ -105,6 +105,22 @@ describe("diffEvents", () => {
 		]);
 		expect(diffEvents([t], [t])).toEqual([]);
 	});
+	test("needs_you a frame after the error, same failed turn, is no request; a new ask still is", () => {
+		const failed = card("A", { state: "queued", errorTurn: "t1" });
+		expect(diffEvents([card("A")], [failed]).map((e) => e.class)).toEqual([
+			"error",
+		]);
+		const needs = card("A", { state: "needs_you", errorTurn: "t1" });
+		expect(diffEvents([failed], [needs])).toEqual([]);
+		const asked = card("A", {
+			state: "needs_you",
+			errorTurn: "t1",
+			asked: ask("which?"),
+		});
+		expect(diffEvents([needs], [asked]).map((e) => e.class)).toEqual([
+			"request",
+		]);
+	});
 	test("error body is capped at 200 chars", () => {
 		const t = card("A", { errorTurn: "t", errorText: "x".repeat(500) });
 		expect(diffEvents([card("A")], [t])[0]?.body).toHaveLength(200);

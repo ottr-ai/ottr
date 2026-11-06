@@ -715,7 +715,7 @@ const CLASS_ROWS: readonly { cls: AlertClass; name: string; desc: string }[] = [
 
 /** Settings "Notifications" section: Web Push opt-in for this device, which alert classes it
  *  gets, per-project mutes (shared by every device), plus a test. */
-function NotificationsSection({
+export function NotificationsSection({
 	projects,
 	act,
 }: {
@@ -762,6 +762,8 @@ function NotificationsSection({
 			)
 			.then((p) => {
 				if (!live) return;
+				classesRef.current = p.classes;
+				mutedRef.current = p.mutedProjects;
 				setClasses(p.classes);
 				setMuted(p.mutedProjects);
 			})
@@ -844,16 +846,52 @@ function NotificationsSection({
 		) : (
 			<Icon name={icon} />
 		);
+	// Saves run one at a time and each sends the latest wanted set, so two switches flipped
+	// before the first answer both land: the second POST carries the first change too.
+	const classesRef = useRef<ClassPrefs | null>(null);
+	const mutedRef = useRef<string[]>([]);
+	const queue = useRef<Promise<unknown>>(Promise.resolve());
+	const serial = (fn: () => Promise<unknown>): Promise<unknown> => {
+		const p = queue.current.then(fn, fn);
+		queue.current = p.catch(() => {});
+		return p;
+	};
 	const saveClass = async (cls: AlertClass, v: boolean): Promise<void> => {
-		if (endpoint === null || classes === null) return;
-		const next = { ...classes, [cls]: v };
-		await post("/api/notifications/prefs", { endpoint, classes: next });
-		setClasses(next);
+		const current = classesRef.current;
+		if (endpoint === null || current === null) return;
+		classesRef.current = { ...current, [cls]: v };
+		setClasses(classesRef.current);
+		try {
+			await serial(() =>
+				post("/api/notifications/prefs", {
+					endpoint,
+					classes: classesRef.current,
+				}),
+			);
+		} catch (err) {
+			// Revert only this switch; a concurrent change of another one stays.
+			if (classesRef.current !== null)
+				classesRef.current = { ...classesRef.current, [cls]: !v };
+			setClasses(classesRef.current);
+			throw err;
+		}
 	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
-		const next = v ? [...muted, name] : muted.filter((m) => m !== name);
-		await post("/api/notifications/prefs", { mutedProjects: next });
-		setMuted(next);
+		const toggle = (list: string[], on: boolean): string[] =>
+			on
+				? [...list.filter((m) => m !== name), name]
+				: list.filter((m) => m !== name);
+		mutedRef.current = toggle(mutedRef.current, v);
+		setMuted(mutedRef.current);
+		try {
+			await serial(() =>
+				post("/api/notifications/prefs", { mutedProjects: mutedRef.current }),
+			);
+		} catch (err) {
+			mutedRef.current = toggle(mutedRef.current, !v);
+			setMuted(mutedRef.current);
+			throw err;
+		}
 	};
 	return (
 		<SettingsCard

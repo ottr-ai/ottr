@@ -94,8 +94,16 @@ export function diffEvents(
 			out.push(ev("error", key, errorBody(t.errorText)));
 			continue;
 		}
+		// The failed turn already alerted as an Error in an earlier frame: the needs_you it
+		// leads to is part of that alert, not a second Request.
+		const errorFollowUp =
+			old !== undefined &&
+			old.state !== "needs_you" &&
+			t.errorTurn !== null &&
+			old.errorTurn === t.errorTurn;
 		if (
 			t.state === "needs_you" &&
+			!errorFollowUp &&
 			(old === undefined ||
 				old.state !== "needs_you" ||
 				taskEntryKey(old) !== taskEntryKey(t))

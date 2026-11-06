@@ -13,6 +13,7 @@ import {
 	AppCheckLines,
 	GitHostsSection,
 	HindsightSection,
+	NotificationsSection,
 	openSettingsSection,
 	ProjectSettingsForm,
 	ProjectsOrderSection,
@@ -2270,6 +2271,77 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			expect(loaded.calls).toBe(2);
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+describe("NotificationsSection", () => {
+	test("two mute switches flipped before the first answer both persist", async () => {
+		const projects = ["alpha", "beta"].map(
+			(name) =>
+				({
+					name,
+					icon: null,
+					settings: { displayName: null, iconText: null },
+				}) as unknown as ProjectView,
+		);
+		const posts: Array<{ body: unknown; done: () => void }> = [];
+		const fetchMock = (async (url: string | URL, init?: RequestInit) => {
+			if (init?.method === "POST")
+				return new Promise<Response>((resolve) =>
+					posts.push({
+						body: JSON.parse(String(init.body)),
+						done: () => resolve(Response.json({ ok: true })),
+					}),
+				);
+			expect(String(url)).toBe("/api/notifications/prefs");
+			return Response.json({ classes: null, mutedProjects: [] });
+		}) as unknown as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<NotificationsSection
+						projects={projects}
+						act={async (fn) => {
+							try {
+								await fn();
+								return true;
+							} catch {
+								return false;
+							}
+						}}
+					/>,
+				);
+			});
+			const boxes = container.querySelectorAll<HTMLInputElement>(
+				'.notify-group input[type="checkbox"]',
+			);
+			expect(boxes.length).toBe(2);
+			await act(async () => {
+				onChangeOf(boxes[0]!)({ target: { checked: true } });
+				onChangeOf(boxes[1]!)({ target: { checked: true } });
+			});
+			// One save in flight at a time; each sends the latest wanted list, so no POST
+			// can drop the other switch's change.
+			expect(posts.length).toBe(1);
+			await act(async () => posts[0]!.done());
+			expect(posts.length).toBe(2);
+			await act(async () => posts[1]!.done());
+			for (const p of posts)
+				expect(p.body).toEqual({ mutedProjects: ["alpha", "beta"] });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
 		}
 	});
 });

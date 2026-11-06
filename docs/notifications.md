@@ -50,7 +50,7 @@ Each board tab sends a heartbeat every 20 s while it is visible and focused, and
 
 ## Retraction
 
-When an alert's cause clears, or you acknowledge it, the server sends a data-only `clear` push with the class tags that have no live alert left. The service worker closes matching notifications. Every alert push also carries the tags to close first. Before it shows an alert, the service worker checks `/api/inbox/seen` and closes the alert at once if it is already acknowledged.
+When an alert's cause clears, or you acknowledge it, the server sends a data-only `clear` push with the class tags that have no live alert left. The service worker closes matching notifications. Every alert push also carries the tags to close first, minus the classes that same pass alerts (a new alert replaces its class's notification itself). Before it shows an alert, the service worker checks `/api/inbox/seen` and shows nothing if every key is already acknowledged.
 
 Platform caveats:
 

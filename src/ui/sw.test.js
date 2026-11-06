@@ -235,11 +235,10 @@ test("alert push closes its clear tags first, then shows", async () => {
 	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
 });
 
-test("alert push whose keys are all acknowledged shows then closes", async () => {
+test("alert push whose keys are all acknowledged shows nothing", async () => {
 	seenResponse = ["task:1:needs", "other"];
 	await push(alert);
-	expect(calls.notifications.length).toBe(1);
-	expect(calls.trayClosed).toEqual(["p: card"]);
+	expect(calls.notifications).toEqual([]);
 	expect(tray).toEqual([]);
 });
 
