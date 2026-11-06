@@ -3402,6 +3402,14 @@ extensions:
 	// Another writer's commit that lands on main right after the save's own ref move.
 	let afterRefMove: (() => void) | null = null;
 	let alateReqs: { method: string; url: string; auth: string | null }[] = [];
+	// Path-source mode: alate serves a local folder ("/data") instead of a GitHub repo.
+	// `folderGit` false makes alate write without committing (commit ""); `putConflict`
+	// simulates the editor's 409. `puts` records the PUT /api/file bodies.
+	let pathMode = false;
+	let folderGit = true;
+	let putConflict = false;
+	let puts: { path: string; base: string; content: string; message: string }[] =
+		[];
 	// gh api calls; `pending` holds the tree content until the ref moves.
 	let ghCalls: string[][] = [];
 	let pending: { content: string; parent: string } | null = null;
@@ -3411,19 +3419,32 @@ extensions:
 		afterImport = null;
 		afterRefMove = null;
 		alateReqs = [];
+		pathMode = false;
+		folderGit = true;
+		putConflict = false;
+		puts = [];
 		ghCalls = [];
 		pending = null;
 	};
-	const source = () => ({
-		kind: "repo",
-		spec: "o/data",
-		name: "o/data",
-		ref: "main",
-		importedSha: snapSha,
-	});
+	const source = () =>
+		pathMode
+			? {
+					kind: "path",
+					spec: "/data",
+					name: "/data",
+					ref: "",
+					importedSha: "",
+				}
+			: {
+					kind: "repo",
+					spec: "o/data",
+					name: "o/data",
+					ref: "main",
+					importedSha: snapSha,
+				};
 	const fake = Bun.serve({
 		port: 0,
-		fetch: (req) => {
+		fetch: async (req) => {
 			const u = new URL(req.url);
 			alateReqs.push({
 				method: req.method,
@@ -3431,12 +3452,41 @@ extensions:
 				auth: req.headers.get("authorization"),
 			});
 			if (u.pathname === "/health")
-				return Response.json({ ok: true, running: false, repo: "o/data" });
+				return Response.json(
+					pathMode
+						? { ok: true, running: false, path: "/data" }
+						: { ok: true, running: false, repo: "o/data" },
+				);
+			if (u.pathname === "/api/file" && req.method === "PUT") {
+				const body = (await req.json()) as {
+					path: string;
+					base: string;
+					content: string;
+					message: string;
+				};
+				if (putConflict || body.base !== sha(snapshot))
+					return Response.json(
+						{
+							error:
+								"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
+						},
+						{ status: 409 },
+					);
+				puts.push(body);
+				snapshot = body.content;
+				return Response.json({
+					ok: true,
+					commit: folderGit ? NEW : "",
+					pushed: false,
+				});
+			}
 			if (u.pathname === "/api/state")
 				return Response.json({ source: source() });
 			if (u.pathname === "/api/import") {
+				// A path source reports importedSha "" forever: the import refreshes the
+				// snapshot but never a commit.
 				snapshot = head;
-				snapSha = headSha;
+				if (!pathMode) snapSha = headSha;
 				const moved = afterImport;
 				afterImport = null;
 				moved?.();
@@ -3806,6 +3856,111 @@ extensions:
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
 		});
+		expect(ghCalls).toEqual([]);
+	});
+
+	test("a git folder source saves with a local commit through alate", async () => {
+		reset();
+		pathMode = true;
+		const get = await m.call("/api/model-roles");
+		expect(get.status).toBe(200);
+		expect(await get.json()).toMatchObject({ base: null, hash: sha(ORIGINAL) });
+		const edited = ORIGINAL.replace(
+			"slow: anthropic/claude-opus-5-5:medium  # planner",
+			"slow: zai/glm-5.3-flash:max  # planner",
+		);
+		const res = await m.call("/api/model-roles", {
+			base: null,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "zai/glm-5.3-flash:max",
+			},
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			commit: NEW,
+			base: null,
+			hash: sha(edited),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "zai/glm-5.3-flash:max",
+			},
+			seed: expect.anything(),
+		});
+		// The save went through alate's editor PUT with the hash the editor loaded.
+		expect(puts).toEqual([
+			{
+				path: "user/omp/agent/config.yml",
+				base: sha(ORIGINAL),
+				content: edited,
+				message: "chore: set the slow model role to zai/glm-5.3-flash:max",
+			},
+		]);
+		expect(ghCalls).toEqual([]);
+		// One import for the conflict check; alate imports inside the PUT, so the route
+		// makes no import call of its own after it.
+		expect(imports()).toHaveLength(1);
+	});
+
+	test("a plain folder source answers read-only and restores the file", async () => {
+		reset();
+		pathMode = true;
+		folderGit = false;
+		const res = await m.call("/api/model-roles", {
+			base: null,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "zai/glm-5.3-flash:max",
+			},
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "read-only: folder source",
+			path: "/data",
+		});
+		// The first PUT wrote the edit, the second undid it byte for byte with the hash
+		// the first PUT gave back.
+		const edited = ORIGINAL.replace(
+			"slow: anthropic/claude-opus-5-5:medium  # planner",
+			"slow: zai/glm-5.3-flash:max  # planner",
+		);
+		expect(puts.map((p) => ({ base: p.base, content: p.content }))).toEqual([
+			{ base: sha(ORIGINAL), content: edited },
+			{ base: sha(edited), content: ORIGINAL },
+		]);
+		expect(snapshot).toBe(ORIGINAL);
+		const get = await m.call("/api/model-roles");
+		expect(get.status).toBe(200);
+		expect(await get.json()).toMatchObject({
+			base: null,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+	});
+
+	test("an alate editor conflict passes through", async () => {
+		reset();
+		pathMode = true;
+		putConflict = true;
+		const res = await m.call("/api/model-roles", {
+			base: null,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "zai/glm-5.3-flash:max",
+			},
+		});
+		expect(res.status).toBe(409);
+		expect(await res.json()).toEqual({
+			error:
+				"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
+		});
+		expect(puts).toEqual([]);
 		expect(ghCalls).toEqual([]);
 	});
 });

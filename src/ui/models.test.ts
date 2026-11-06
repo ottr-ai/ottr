@@ -76,7 +76,13 @@ const seed = { needed: true, commit: null, roles: null, expiresAt: null };
 const tail = " The rows now show the current values. Make your change again.";
 
 test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
-	const body = { commit: "c1", hash: "h1", roles: { a: "b/c" }, seed };
+	const body = {
+		commit: "c1",
+		base: null,
+		hash: "h1",
+		roles: { a: "b/c" },
+		seed,
+	};
 	expect(classifyRolesSave(true, 200, body)).toEqual({
 		kind: "saved",
 		...body,
@@ -90,7 +96,13 @@ test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
 });
 
 test("classifyRolesSave: saved needs ok and every part", () => {
-	const body = { commit: "c1", hash: "h1", roles: { a: "b/c" }, seed };
+	const body = {
+		commit: "c1",
+		base: "b9",
+		hash: "h1",
+		roles: { a: "b/c" },
+		seed,
+	};
 	const failed = (status: number) => ({
 		kind: "failed" as const,
 		error: `HTTP ${status}`,
@@ -106,6 +118,34 @@ test("classifyRolesSave: saved needs ok and every part", () => {
 	expect(classifyRolesSave(true, 200, { ...body, roles: [] })).toEqual(
 		failed(200),
 	);
+});
+
+test("classifyRolesSave: 400 read-only: folder source with a path is readonly", () => {
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "read-only: folder source",
+			path: "/data",
+		}),
+	).toEqual({ kind: "readonly", path: "/data" });
+	expect(
+		classifyRolesSave(false, 400, { error: "read-only: folder source" }),
+	).toEqual({ kind: "failed", error: "read-only: folder source", fields: {} });
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "read-only: folder source",
+			path: 7,
+		}),
+	).toEqual({ kind: "failed", error: "read-only: folder source", fields: {} });
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "Bad roles.",
+			fields: { a: "Unknown model." },
+		}),
+	).toEqual({
+		kind: "failed",
+		error: "Bad roles.",
+		fields: { a: "Unknown model." },
+	});
 });
 
 test("classifyRolesSave: 409 with hash and roles is a conflict", () => {

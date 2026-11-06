@@ -20,6 +20,7 @@ import {
 	loadConfigYml,
 	noRedirectFetch,
 	refreshAlateSnapshot,
+	saveConfigYml,
 } from "./alate.ts";
 import { aptListPath, workerProjects } from "./apt.ts";
 import {
@@ -4744,15 +4745,50 @@ export function createApp(deps: AppDeps) {
 						if (bad !== null) return json(bad, 400);
 						const next = roles as Record<string, string>;
 						const content = editModelRoles(f.body.content, next);
-						const { repo, base: parent } = f.body;
-						if (repo === null || parent === null)
-							return json(
-								{
-									error:
-										"the model roles editor needs a GitHub repo (owner/name) as alate's data source",
-								},
-								400,
+						const { repo, base: parent, path } = f.body;
+						if (repo === null || parent === null) {
+							// A folder source saves through alate's editor PUT: alate checks `base`
+							// (the sha256 the editor loaded) against the folder before writing.
+							const hash = new Bun.CryptoHasher("sha256")
+								.update(content)
+								.digest("hex");
+							const w = await saveConfigYml(
+								alate,
+								content,
+								f.body.hash,
+								commitMessage(current, next),
 							);
+							if (!w.ok) return json({ error: w.error }, w.status);
+							if (w.body.commit === "") {
+								// Plain folder: alate wrote the bytes without a commit. Read-only
+								// must not leave an uncommitted write in an unversioned folder, so
+								// undo byte for byte with the hash the PUT gave us.
+								const back = await saveConfigYml(
+									alate,
+									f.body.content,
+									hash,
+									"chore: revert the uncommitted model roles save",
+								);
+								if (back.ok)
+									return json({ error: "read-only: folder source", path }, 400);
+								return json(
+									{
+										error: `read-only: folder source${path ? ` ${path}` : ""}: the save wrote the file without a commit and the undo failed (${back.error}), so the file holds the attempted roles`,
+									},
+									400,
+								);
+							}
+							// No refresh here: alate imported the new file inside its PUT. `base`
+							// stays null — a path source reports importedSha "" forever, so a
+							// commit as base would 409 every later save.
+							return json({
+								commit: w.body.commit,
+								base: null,
+								hash,
+								roles: readRoles(content),
+								seed: seedView(),
+							});
+						}
 						// The commit's parent is the commit the user loaded, and the branch moves only
 						// as a fast-forward: a commit on main at any time since the read gives 409.
 						// Never retried: a refused write goes back to the user.

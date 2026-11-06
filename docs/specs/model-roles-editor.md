@@ -15,7 +15,8 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
   3. `POST repos/<name>/git/commits` with `parents: [<base>]`.
   4. `PATCH repos/<name>/git/refs/heads/<branch>` with `force: false`. GitHub moves the branch only as a fast-forward. A branch that moved since `<base>` gives "Update is not a fast forward", and Ottr answers 409. Nothing ever force-pushes.
 - `name` must match `owner/name`, `base` must be a 40-character hex commit, and the branch must be a plain ref name. Alate's values reach `gh api` paths only after these checks.
-- A path source (a local data repo in Alate) cannot be saved: the route returns 400.
+- A path source (a local folder in Alate) saves through Alate's `PUT /api/file` instead of GitHub: Ottr sends `{ path, content, base, message }` with `base` the file hash from the read. Alate verifies the hash against the folder, writes the bytes and commits them when the folder is a git repo (`commit` is the new sha, "" when it is not, `pushed` false without an upstream); it imports inside the PUT, so the route makes no import call of its own. Success answers 200 `{ commit, base: null, hash, roles, seed }` — `base` stays null because a path source reports `importedSha` "" forever, so a commit as `base` would 409 every later save. Alate's own PUT holds only the file hash, not a commit parent, so nothing force-pushes and nothing conflicts beyond that hash.
+- A plain (non-git) folder is read-only. The first save discovers it: Alate's PUT answers `commit` "" after writing the bytes. Ottr undoes the write byte for byte (a second PUT with the hash the first gave back) — a read-only source must not keep an uncommitted write in an unversioned folder — and answers 400 `{ error: "read-only: folder source", path }`. When the undo fails, the 400 carries the undo error and no `path` field. The GET cannot know the folder's git-ness in advance, so the editor locks only after that answer.
 - After a commit, Ottr asks Alate to import it (`POST /api/import`), so the provision installs the new commit. The UI then calls the existing `POST /api/alate/provision`.
 - The board copy: on compose (`OTTR_BOARD_OMP_HOME` is set), the hourly deploy seeds it (OTTR-188) and records the seeded commit in `<dirname(OTTR_BOARD_OMP_HOME)>/seed-commit` (`/etc/ottr/seed-commit`). Without `OTTR_BOARD_OMP_HOME`, the board reads the copy that the provision installs, and no seed step applies.
 
@@ -104,7 +105,7 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 
 - Other `config.yml` keys, and edits of a local `config.yml` copy.
 - A board-side git clone of the data repo: Alate reads it, and the GitHub API writes it.
-- Saves to a path source in Alate: these need a GitHub repo source.
+- Git-ness of a folder source known before the first save: the GET cannot see it, so the editor locks only after a save learns the folder is plain (the PUT answers `commit` "").
 - A board-triggered seed: the board container cannot run `board-seed`. The hourly deploy does it.
 - Provider API keys in the env do not clear the sign-in warning.
 - A seed state from git history: the board has no clone of the data repo. The seed step compares the roles and the recorded `seed.commit`, not the commit graph.

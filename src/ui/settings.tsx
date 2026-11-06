@@ -2941,6 +2941,7 @@ function ModelRolesSection() {
 	const [rows, setRows] = useState<Array<[string, string]>>([]);
 	const [fields, setFields] = useState<Record<string, string>>({});
 	const [error, setError] = useState<string | null>(null);
+	const [ro, setRo] = useState<string | null>(null);
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
@@ -3063,9 +3064,16 @@ function ModelRolesSection() {
 					res.status,
 					await res.json().catch(() => ({})),
 				);
+				if (r.kind === "readonly") {
+					setRo(r.path);
+					setRows(Object.entries(state.roles));
+					setError(null);
+					setFields({});
+					return false;
+				}
 				if (r.kind === "saved") {
-					const { commit: sha, hash, roles, seed } = r;
-					setState((old) => old && { ...old, base: sha, hash, roles, seed });
+					const { commit: sha, base, hash, roles, seed } = r;
+					setState((old) => old && { ...old, base, hash, roles, seed });
 					setRows(Object.entries(roles));
 					setSaved({ seedAtSave: seed.commit, after: roles });
 					setCommit(sha);
@@ -3152,7 +3160,7 @@ function ModelRolesSection() {
 										aria-label={`Model for ${name}`}
 										aria-invalid={field !== undefined}
 										aria-describedby={notesId}
-										disabled={save.busy}
+										disabled={save.busy || ro !== null}
 									>
 										{!models.some((m) => m.selector === base) && (
 											<option value={base}>{base} (not in the catalog)</option>
@@ -3171,7 +3179,7 @@ function ModelRolesSection() {
 										aria-label={`Thinking for ${name}`}
 										aria-invalid={field !== undefined}
 										aria-describedby={notesId}
-										disabled={save.busy}
+										disabled={save.busy || ro !== null}
 									>
 										<option value="">Default</option>
 										{THINKING_LEVELS.map((l) => (
@@ -3188,7 +3196,7 @@ function ModelRolesSection() {
 										onClick={() =>
 											setRows((rs) => rs.filter(([n]) => n !== name))
 										}
-										disabled={save.busy}
+										disabled={save.busy || ro !== null}
 									>
 										<Icon name="x" />
 									</button>
@@ -3209,6 +3217,18 @@ function ModelRolesSection() {
 							);
 						})}
 					</div>
+					{ro !== null && (
+						<>
+							<p className="auth-error" role="alert">
+								read-only: folder source {ro}
+							</p>
+							<p className="hint">
+								Alate's data folder is not a git repo, so a save cannot commit.
+								Make the folder a git repo or point Alate at a GitHub repo, then
+								reload the settings.
+							</p>
+						</>
+					)}
 					<form
 						className="role-add"
 						onSubmit={(e) => {
@@ -3229,10 +3249,10 @@ function ModelRolesSection() {
 								autoComplete="off"
 								aria-invalid={addErr !== null}
 								aria-describedby={addErr !== null ? `${uid}-add` : undefined}
-								disabled={save.busy}
+								disabled={save.busy || ro !== null}
 							/>
 						</label>
-						<button type="submit" disabled={save.busy}>
+						<button type="submit" disabled={save.busy || ro !== null}>
 							Add role
 						</button>
 					</form>
@@ -3244,9 +3264,15 @@ function ModelRolesSection() {
 					<div className="alate-def-actions">
 						<button
 							type="button"
-							className={`primary${save.failed ? " failed" : ""}`}
+							// Plain button while read-only: the accent fill reads clickable even at
+							// the disabled opacity, and the editor must read locked.
+							className={
+								ro !== null
+									? undefined
+									: `primary${save.failed ? " failed" : ""}`
+							}
 							onClick={submit}
-							disabled={!dirty || save.busy}
+							disabled={!dirty || save.busy || ro !== null}
 						>
 							{save.busy && <span className="spinner" aria-hidden="true" />}
 							Save

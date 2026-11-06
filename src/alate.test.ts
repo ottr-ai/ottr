@@ -8,6 +8,7 @@ import {
 	loadConfigYml,
 	noRedirectFetch,
 	readConfigYml,
+	saveConfigYml,
 } from "./alate.ts";
 
 type Hit = {
@@ -351,6 +352,7 @@ describe("loadConfigYml", () => {
 				hash: "h",
 				base: SHA40,
 				repo: { name: "o/r", ref: "main" },
+				path: null,
 			},
 		});
 		expect(hits.map((h) => h.path)).toEqual([
@@ -391,12 +393,31 @@ describe("loadConfigYml", () => {
 			stateWith(src);
 			const r = await loadConfigYml(alate, false);
 			expect(r.ok && r.body.repo).toBeNull();
+			// A path source keeps its folder name; anything else keeps path null.
+			expect(r.ok && r.body.path).toBe(src.kind === "path" ? "o/r" : null);
+		}
+		for (const src of [
+			{ kind: "path", name: "" },
+			{ kind: "path", name: 5 },
+			{ kind: "path" },
+		]) {
+			stateWith(src);
+			const r = await loadConfigYml(alate, false);
+			expect(r.ok && r.body.repo).toBeNull();
+			expect(r.ok && r.body.path).toBeNull();
 		}
 	});
 	test("a repo name may start with a dot", async () => {
 		stateWith({ kind: "repo", name: "o/.github" });
 		const r = await loadConfigYml(alate, false);
 		expect(r.ok && r.body.repo).toEqual({ name: "o/.github", ref: "" });
+	});
+	test("a path source keeps its folder and no repo", async () => {
+		stateWith({ kind: "path", name: "/data", ref: "", importedSha: "" });
+		const r = await loadConfigYml(alate, false);
+		expect(r.ok && r.body.path).toBe("/data");
+		expect(r.ok && r.body.repo).toBeNull();
+		expect(r.ok && r.body.base).toBeNull();
 	});
 	test("refresh imports the repo before the path and reads state.source", async () => {
 		serve((_req, url) =>
@@ -470,7 +491,7 @@ describe("loadConfigYml", () => {
 		);
 		expect(await loadConfigYml(alate, true)).toEqual({
 			ok: true,
-			body: { content: "c", hash: "h", base: null, repo: null },
+			body: { content: "c", hash: "h", base: null, repo: null, path: null },
 		});
 	});
 	test("health, state and file failures pass through", async () => {
@@ -497,6 +518,56 @@ describe("loadConfigYml", () => {
 			ok: false,
 			status: 404,
 			error: "no file",
+		});
+	});
+});
+
+describe("saveConfigYml", () => {
+	test("PUTs the file with the exact body and bearer auth", async () => {
+		serve(() => Response.json({ ok: true, commit: SHA40, pushed: false }));
+		expect(
+			await saveConfigYml(alate, "c", "h1", "chore: set the roles"),
+		).toEqual({ ok: true, body: { commit: SHA40, pushed: false } });
+		expect(hits).toEqual([
+			{
+				method: "PUT",
+				path: "/api/file",
+				auth: "Bearer k1",
+				type: "application/json",
+				body: JSON.stringify({
+					path: CONFIG_YML,
+					content: "c",
+					base: "h1",
+					message: "chore: set the roles",
+				}),
+			},
+		]);
+	});
+	test("a conflict passes through with its status", async () => {
+		serve(() =>
+			Response.json(
+				{ error: "user/omp/agent/config.yml changed since it was loaded" },
+				{ status: 409 },
+			),
+		);
+		expect(await saveConfigYml(alate, "c", "h1", "m")).toEqual({
+			ok: false,
+			status: 409,
+			error: "user/omp/agent/config.yml changed since it was loaded",
+		});
+	});
+	test("a 2xx body without commit or pushed is 502", async () => {
+		serve(() => Response.json({ ok: true, pushed: false }));
+		expect(await saveConfigYml(alate, "c", "h1", "m")).toEqual({
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid file response",
+		});
+		serve(() => Response.json({ ok: true, commit: 5, pushed: true }));
+		expect(await saveConfigYml(alate, "c", "h1", "m")).toEqual({
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid file response",
 		});
 	});
 });

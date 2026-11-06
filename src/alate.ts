@@ -179,6 +179,31 @@ export async function readConfigYml(
 		};
 	return { ok: true, body: { content, hash } };
 }
+/** Writes config.yml through alate's file editor PUT. Alate verifies `base` (the sha256 the
+ *  editor loaded) against the folder, writes the bytes and commits them when the folder is a
+ *  git repo (`commit` is the new sha, "" when it is not, `pushed` false when there is no
+ *  upstream). Repo sources never take this path — the board commits to GitHub and asks alate
+ *  to import. */
+export async function saveConfigYml(
+	alate: Alate,
+	content: string,
+	base: string,
+	message: string,
+): Promise<AlateOut<{ commit: string; pushed: boolean }>> {
+	const r = await alateApi(alate, "/api/file", 60_000, {
+		method: "PUT",
+		body: { path: CONFIG_YML, content, base, message },
+	});
+	if (!r.ok) return r;
+	const { commit, pushed } = r.body;
+	if (typeof commit !== "string" || typeof pushed !== "boolean")
+		return {
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid file response",
+		};
+	return { ok: true, body: { commit, pushed } };
+}
 /** Re-imports alate's current data source, so its snapshot sits on the repo head. */
 export async function refreshAlateSnapshot(
 	alate: Alate,
@@ -199,7 +224,8 @@ export async function refreshAlateSnapshot(
 	});
 }
 /** config.yml plus `base`, the data repo commit of alate's snapshot, and `repo`, its GitHub
- *  source (both null for a path source). `refresh` re-imports first, so `base` is the head. */
+ *  source (both null for a path source, where `path` holds the folder path). `refresh`
+ *  re-imports first, so `base` is the head. */
 export async function loadConfigYml(
 	alate: Alate,
 	refresh: boolean,
@@ -209,6 +235,7 @@ export async function loadConfigYml(
 		hash: string;
 		base: string | null;
 		repo: { name: string; ref: string } | null;
+		path: string | null;
 	}>
 > {
 	const s = refresh
@@ -228,9 +255,13 @@ export async function loadConfigYml(
 		REPO_NAME.test(src.name)
 			? { name: src.name, ref: typeof src.ref === "string" ? src.ref : "" }
 			: null;
+	const path =
+		src?.kind === "path" && typeof src.name === "string" && src.name !== ""
+			? src.name
+			: null;
 	const f = await readConfigYml(alate);
 	if (!f.ok) return f;
-	return { ok: true, body: { ...f.body, base, repo } };
+	return { ok: true, body: { ...f.body, base, repo, path } };
 }
 /** One `gh api` call with the board's GitHub token: the parsed JSON body or the error.
  *  GitHub's "not a fast forward" maps to 409. */

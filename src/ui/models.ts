@@ -108,9 +108,14 @@ export type RolesSave =
 	| {
 			kind: "saved";
 			commit: string;
+			base: string | null;
 			hash: string;
 			roles: Record<string, string>;
 			seed: RolesState["seed"];
+	  }
+	| {
+			kind: "readonly";
+			path: string;
 	  }
 	| {
 			kind: "conflict";
@@ -125,7 +130,9 @@ type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj =>
 	typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** Classifies the save response; `body` is untrusted JSON, so only own, well-typed fields count. */
+/** Classifies the save response; `body` is untrusted JSON, so only own, well-typed fields count.
+    A saved answer's `base` is the new commit for GitHub-repo sources, and null for Alate's data
+    folder, which is not a git repo; a 400 with exactly the read-only error locks the editor. */
 export function classifyRolesSave(
 	ok: boolean,
 	status: number,
@@ -142,12 +149,21 @@ export function classifyRolesSave(
 		return isObj(v) ? v : undefined;
 	};
 	const commit = str("commit");
+	const base = own("base");
+	const baseOrNull = typeof base === "string" ? base : null;
 	const hash = str("hash");
 	const roles = obj("roles") as Record<string, string> | undefined;
 	const seed = obj("seed") as RolesState["seed"] | undefined;
 	const error = str("error");
+	const path = str("path");
+	if (
+		status === 400 &&
+		error === "read-only: folder source" &&
+		path !== undefined
+	)
+		return { kind: "readonly", path };
 	if (ok && commit && hash && roles && seed)
-		return { kind: "saved", commit, hash, roles, seed };
+		return { kind: "saved", commit, base: baseOrNull, hash, roles, seed };
 	if (status === 409 && hash && roles)
 		return {
 			kind: "conflict",

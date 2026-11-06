@@ -363,6 +363,14 @@ textarea:hover,
 select:hover {
 	border-color: var(--line-hover);
 }
+/* Same affordance as button:disabled: a locked control must not read as editable
+   (the Model roles read-only state hides this difference otherwise). */
+input:disabled,
+textarea:disabled,
+select:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
