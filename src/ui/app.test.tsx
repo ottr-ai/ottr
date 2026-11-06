@@ -5604,6 +5604,7 @@ describe("Drawer PR link", () => {
 		act: async () => true,
 		onClose: () => {},
 		onFollowed: () => {},
+		projects: [],
 		read: false,
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
