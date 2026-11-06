@@ -28,7 +28,6 @@ import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
 	type AskQuestion,
-	FORK_HOLD_REASON,
 	type GhStatus,
 	type KeptChoice,
 	type MachineStats,
@@ -7168,8 +7167,9 @@ function PromptEditForm({
 }
 
 /** The decision panel of a proposal card: the reason line, the stored five-line summary
- * (or the prompt's first paragraph for older and fork proposals), the three decision
- * buttons and the collapsed full prompt. The panel replaces the needs-reason box and the
+ * (or the prompt's first paragraph for older and fork proposals), the two decision
+ * buttons and the collapsed full prompt. The decline lives in the drawer-actions row's
+ * Cancel task. The panel replaces the needs-reason box and the
  * Prompt section, which stay hidden on proposal cards. */
 function ProposalPanel({
 	task,
@@ -7181,7 +7181,6 @@ function ProposalPanel({
 	edit,
 	onAccept,
 	onEdit,
-	onCancel,
 	onEditChange,
 	editValid,
 	editSave,
@@ -7196,7 +7195,6 @@ function ProposalPanel({
 	edit: string | null;
 	onAccept: () => Promise<boolean>;
 	onEdit: () => void;
-	onCancel: () => Promise<boolean>;
 	onEditChange: (value: string | null) => void;
 	editValid: boolean;
 	editSave: BusyState;
@@ -7270,13 +7268,6 @@ function ProposalPanel({
 				>
 					Edit
 				</button>
-				<BusyButton
-					className="danger"
-					title="Decline this proposal"
-					run={onCancel}
-				>
-					Cancel
-				</BusyButton>
 			</div>
 			{edit !== null ? (
 				<PromptEditForm
@@ -7705,8 +7696,9 @@ export function Drawer({
 		});
 	};
 
-	/** The confirm + cancel flow of the drawer-actions row, shared with the hold bar's
-	 * Cancel card: a fork or mismatch hold message names cancelling the card as an action. */
+	/** The confirm + cancel flow of the drawer-actions row: a fork or mismatch hold
+	 * message names cancelling the card as an action, so the row's Cancel task is the
+	 * hold's decline path too. */
 	const runCancel = async (): Promise<boolean> =>
 		(
 			task.stage === "done"
@@ -7934,7 +7926,6 @@ export function Drawer({
 								edit={edit}
 								onAccept={() => sendReply(".")}
 								onEdit={() => setEdit(task.prompt)}
-								onCancel={runCancel}
 								onEditChange={setEdit}
 								editValid={editValid}
 								editSave={editSave}
@@ -9126,13 +9117,6 @@ export function Drawer({
 									<Icon name="check" />
 									Approve merge
 								</BusyButton>
-								{(task.needsReason === FORK_HOLD_REASON ||
-									task.needsReason === MERGE_HOLD_MISMATCH_REASON) && (
-									<BusyButton className="danger" run={runCancel}>
-										<Icon name="x" />
-										Cancel card
-									</BusyButton>
-								)}
 							</div>
 						)}
 					{followUp ? (
@@ -9242,19 +9226,6 @@ export function Drawer({
 												<Icon name="play" />
 												{proposal ? "Accept" : "Resume"}
 											</BusyButton>
-											{wcMergeable && (
-												<button
-													type="button"
-													className="danger"
-													onClick={() => {
-														setMergeReason("");
-														setMergeError(null);
-														setMergeOpen(true);
-													}}
-												>
-													Merge anyway
-												</button>
-											)}
 										</>
 									}
 									primary={
@@ -9319,19 +9290,6 @@ export function Drawer({
 								setModelQuery={setModelQuery}
 								secondary={
 									<>
-										{wcMergeable && (
-											<button
-												type="button"
-												className="danger"
-												onClick={() => {
-													setMergeReason("");
-													setMergeError(null);
-													setMergeOpen(true);
-												}}
-											>
-												Merge anyway
-											</button>
-										)}
 										{task.state === "running" && (
 											<BusyButton
 												title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
@@ -9451,6 +9409,24 @@ export function Drawer({
 								Mark unread
 							</BusyButton>
 						)}
+						{/* Merge anyway overrides the open work-check blockers through the
+						    reason modal. It used to sit in the reply/steer composer bars; it
+						    moved here so no danger button shares a row with the primary
+						    action. The state guard keeps the old bars' exact reachability. */}
+						{wcMergeable &&
+							(task.state === "needs_you" || task.state === "queued") && (
+								<button
+									type="button"
+									className="danger"
+									onClick={() => {
+										setMergeReason("");
+										setMergeError(null);
+										setMergeOpen(true);
+									}}
+								>
+									Merge anyway
+								</button>
+							)}
 						{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
 						{!cancelled && (

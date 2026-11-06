@@ -2762,7 +2762,7 @@ describe("Drawer approve button", () => {
 		expect(html).not.toContain("Cancel card");
 	});
 
-	test("a fork hold pins approve and cancel actions", () => {
+	test("a fork hold pins the approve action; the decline sits in the drawer-actions row", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "in_progress",
@@ -2772,11 +2772,14 @@ describe("Drawer approve button", () => {
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain("Approve merge");
-		expect(html).toContain("Cancel card");
+		// No danger button beside the primary: the hold bar lost its Cancel card, and
+		// the drawer-actions row's Cancel task (same confirm flow) is the decline path.
+		expect(html).not.toContain("Cancel card");
+		expect(html).toContain("Cancel task");
 		expect(html).not.toContain("Read the summary");
 	});
 
-	test("a mismatch hold pins approve and cancel actions", () => {
+	test("a mismatch hold pins the approve action; the decline sits in the drawer-actions row", () => {
 		// The diff button keys on the fetched diffFiles, which never ride this static render;
 		// the server-side park captures the push-side stat the section then shows.
 		const task = cardFixture({
@@ -2788,7 +2791,10 @@ describe("Drawer approve button", () => {
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain("Approve merge");
-		expect(html).toContain("Cancel card");
+		// No danger button beside the primary: the hold bar lost its Cancel card, and
+		// the drawer-actions row's Cancel task (same confirm flow) is the decline path.
+		expect(html).not.toContain("Cancel card");
+		expect(html).toContain("Cancel task");
 		expect(html).not.toContain("Read the summary");
 	});
 
@@ -4452,7 +4458,7 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain("Second paragraph");
 	});
 
-	test("the panel carries Accept, Edit, Cancel and the collapsed full prompt", () => {
+	test("the panel carries Accept and Edit beside it, and the collapsed full prompt", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "todo",
@@ -4462,11 +4468,12 @@ describe("Drawer proposal decision panel", () => {
 			proposalSummary: summary,
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
-		// Accept is the primary action; Edit and Cancel render beside it.
+		// Accept is the primary action; Edit renders beside it; the decline moved to the
+		// drawer-actions row's Cancel task.
 		expect(html).toContain('class="primary"');
 		expect(html).toContain('title="Start the proposed task"');
 		expect(html).toContain('title="Edit the task text"');
-		expect(html).toContain('title="Decline this proposal"');
+		expect(html).not.toContain("Decline this proposal");
 		// The full prompt sits collapsed under a visible summary.
 		expect(html).toContain("<summary>Full prompt</summary>");
 		// The panel replaces the standalone prompt section and the needs-reason box.
@@ -4475,15 +4482,11 @@ describe("Drawer proposal decision panel", () => {
 		// Real buttons, Tab reachable, visible text as the accessible name.
 		expect(html).toContain(">Accept</button>");
 		expect(html).toContain(">Edit</button>");
-		expect(html).toContain(">Cancel</button>");
-		// The three panel buttons carry no tabindex: keyboard order follows document order.
+		expect(html).toContain(">Cancel task</button>");
+		// The two panel buttons carry no tabindex: keyboard order follows document order.
 		// The drawer dialog itself sets tabindex="-1" as its focus target, so scope to the
 		// buttons' own tags.
-		for (const title of [
-			"Start the proposed task",
-			"Edit the task text",
-			"Decline this proposal",
-		]) {
+		for (const title of ["Start the proposed task", "Edit the task text"]) {
 			const tag = new RegExp(`<button[^>]*title="${title}"[^>]*>`).exec(
 				html,
 			)?.[0];
