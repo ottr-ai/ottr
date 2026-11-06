@@ -197,7 +197,8 @@ button {
 	transition:
 		background-color 0.12s var(--ease),
 		border-color 0.12s var(--ease),
-		color 0.12s var(--ease);
+		color 0.12s var(--ease),
+		transform 0.12s var(--ease);
 }
 button:hover {
 	background: var(--card-hover);
@@ -205,6 +206,25 @@ button:hover {
 }
 button:active {
 	background: var(--card-active);
+}
+/* Press feedback: a control compresses 2% on the control-feedback tier (DESIGN.md §
+   Components → Buttons). Hit areas that cover a whole card or row stay still — scaling
+   them would shift the whole surface: turn heads, menu and list rows (model options,
+   theme choices, menu rows, project-menu and inbox rows), the area list's add row, and
+   the field-wide model trigger. The card's stretched hit area is an anchor
+   (.card-open), not a button. */
+button:active:not(
+	:disabled,
+	.turn-head,
+	.model-option,
+	.theme-choice,
+	.alarm-link,
+	.menu-row,
+	.area-add,
+	.project-menu > button,
+	.model-trigger
+) {
+	transform: scale(0.97);
 }
 button:disabled {
 	opacity: 0.5;
@@ -1015,6 +1035,46 @@ textarea {
 			position-area: top span-all;
 			position-try-fallbacks: bottom span-all;
 			margin: 4px 0;
+		}
+	}
+}
+/* Popover entrances: the panels grow in from the edge that anchors them (scale 0.95 →
+   1) instead of appearing instantly — the meters detail and the anchored pickers from
+   the top left, the bar menus (notifications, areas, theme) from the top right. The
+   closed state holds the exit styles; allow-discrete keeps the panel in the top layer
+   until the exit transition ends, the same pattern dialog.drawer uses. Exits run about
+   20% shorter than entrances. */
+.popover {
+	opacity: 0;
+	transform: scale(0.95);
+	transform-origin: top left;
+	transition:
+		opacity 0.13s var(--ease),
+		transform 0.13s var(--ease),
+		display 0.13s allow-discrete,
+		overlay 0.13s allow-discrete;
+}
+.popover.notif-pop {
+	transform-origin: top right;
+}
+.popover:popover-open {
+	opacity: 1;
+	transform: none;
+	transition-duration: 0.16s;
+}
+@starting-style {
+	.popover:popover-open {
+		opacity: 0;
+		transform: scale(0.95);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.popover {
+		transform: none; /* the fade stays, the scale goes */
+	}
+	@starting-style {
+		.popover:popover-open {
+			transform: none;
 		}
 	}
 }
@@ -5260,6 +5320,15 @@ dialog.drawer {
 		display 0.2s allow-discrete,
 		overlay 0.2s allow-discrete;
 }
+/* Exits run about 20% shorter than entrances: the sheet closes in 160 ms and the scrim
+   fades with it. The destination state owns the durations, so the opening keeps its
+   0.2s; App's close effect holds the dialog 300 ms, past both. */
+dialog.drawer:not([open]) {
+	transition-duration: 0.16s;
+}
+dialog.drawer:not([open])::backdrop {
+	transition-duration: 0.16s;
+}
 dialog.drawer[open] {
 	opacity: 1;
 	transform: none;
@@ -6455,7 +6524,7 @@ button.log-mode[aria-pressed="true"] {
 }
 .turn-head .icon-svg {
 	color: var(--dim);
-	transition: transform 0.15s ease;
+	transition: transform 120ms var(--ease);
 }
 .turn-head[aria-expanded="true"] .icon-svg {
 	transform: rotate(
