@@ -2,6 +2,7 @@ import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
+import { VERSION_RE } from "./types.ts";
 import { checkPinnedRemote, git, spawnPiped } from "./worktree.ts";
 
 export interface ConventionalCommit {
@@ -230,6 +231,118 @@ export async function latestImage(repo: string): Promise<LatestImage | null> {
 				tag,
 				url: `https://github.com/${owner}/${name}/pkgs/container/${name.toLowerCase()}`,
 			};
+}
+
+/** The repo's latest GitHub release, as the board shows it (GET .../releases/latest). */
+export interface LatestGhRelease {
+	/** Display name: the release title, else the tag. Never empty. */
+	name: string;
+	/** The tag the release points at; null when GitHub omits it. */
+	tag: string | null;
+	/** Web page of the release; null when GitHub omits it. */
+	url: string | null;
+	/** True when the tag is `vX.Y.Z`, the only format Ottr's release flow speaks. */
+	semver: boolean;
+}
+
+/** What runGh answers; injectable so tests feed canned `gh api` replies. */
+export type GhReply = { code: number; stdout: string; stderr: string };
+
+/**
+ * The repo's latest GitHub release via `gh api repos/<repo>/releases/latest` — the same
+ * client as the watchers. Total: any failure (gh missing, unauthenticated, network, the
+ * 404 of a repo without releases, a malformed reply) returns null and the caller falls
+ * back to tags.
+ */
+export async function latestGhRelease(
+	repo: string,
+	gh: (args: string[]) => Promise<GhReply> = runGh,
+): Promise<LatestGhRelease | null> {
+	let r: GhReply;
+	try {
+		r = await gh(["api", `repos/${repo}/releases/latest`]);
+	} catch {
+		return null;
+	}
+	if (r.code !== 0) return null;
+	let body: unknown;
+	try {
+		body = JSON.parse(r.stdout);
+	} catch {
+		return null;
+	}
+	if (typeof body !== "object" || body === null) return null;
+	const x = body as Record<string, unknown>;
+	const tag = typeof x.tag_name === "string" ? x.tag_name.trim() : "";
+	const title = typeof x.name === "string" ? x.name.trim() : "";
+	if (tag === "" && title === "") return null;
+	return {
+		name: title === "" ? tag : title,
+		tag: tag === "" ? null : tag,
+		url:
+			typeof x.html_url === "string" && x.html_url !== "" ? x.html_url : null,
+		semver: tag !== "" && VERSION_RE.test(tag),
+	};
+}
+
+// The latest-release probe feeds the chip every scheduler tick and the release dialog;
+// one GitHub call per repo per TTL (the image chip's cadence in server.ts).
+const LATEST_TTL = 15 * 60_000;
+const latestCache = new Map<
+	string,
+	{ at: number; value: LatestGhRelease | null }
+>();
+
+/** Cached latest GitHub release, one probe per repo per TTL; a failed probe seeds null until the next TTL. */
+export async function cachedLatestGhRelease(
+	repo: string,
+): Promise<LatestGhRelease | null> {
+	const cached = latestCache.get(repo);
+	if (cached !== undefined && Date.now() - cached.at < LATEST_TTL)
+		return cached.value;
+	// Seed before fetching so a hung probe cannot stack one request per tick.
+	latestCache.set(repo, { at: Date.now(), value: null });
+	const value = await latestGhRelease(repo);
+	latestCache.set(repo, { at: Date.now(), value });
+	return value;
+}
+
+/** The release chip's fact: the shown release text and the page it links (null = releases/tag link). */
+export interface ReleaseChip {
+	release: string | null;
+	url: string | null;
+}
+
+/**
+ * The project's latest release for the chip: the repo's latest GitHub release when the
+ * project has a GitHub remote and GitHub answers, else the highest `vX.Y.Z` tag merged
+ * into the target — the no-GitHub state and the degraded state while GitHub is
+ * unreachable. A vX.Y.Z release keeps the tag-text chip; any other release shows its own
+ * name and links its page, so a merged vX.Y.Z tag never poses as the current release.
+ */
+export async function releaseChip(o: {
+	/** "owner/name" of the project's GitHub remote; null when it has none. */
+	repo: string | null;
+	mainPath: string;
+	target: string | null;
+	latest?: (repo: string) => Promise<LatestGhRelease | null>;
+}): Promise<ReleaseChip> {
+	if (o.target === null) return { release: null, url: null };
+	if (o.repo !== null) {
+		const gh = await (o.latest ?? cachedLatestGhRelease)(o.repo);
+		if (gh !== null)
+			return gh.semver
+				? { release: gh.tag, url: null }
+				: { release: gh.name, url: gh.url };
+	}
+	const r = await git(
+		["tag", "--list", "v*", "--merged", o.target],
+		o.mainPath,
+	).catch(() => null);
+	return {
+		release: r?.code === 0 ? highestTag(r.stdout.split("\n")) : null,
+		url: null,
+	};
 }
 
 /**

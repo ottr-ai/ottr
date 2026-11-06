@@ -693,8 +693,13 @@ export interface ProjectView {
 	mainUnpushed: boolean;
 	/** HTTPS URL of the project's GitHub remote (origin preferred); null when it has none. */
 	github: string | null;
-	/** Highest vX.Y.Z tag merged into the target; null until the first scan or with no tags. */
+	/** Latest release: the repo's latest GitHub release (its name when the tag is not
+	 * `vX.Y.Z`), else the highest `vX.Y.Z` tag merged into the target; null until the first
+	 * scan or when both are unknown. */
 	latestRelease: string | null;
+	/** Web page of the latest GitHub release when the chip shows its name (a non-`vX.Y.Z`
+	 * release); absent when the chip shows a tag and links `releases/tag/<tag>`. */
+	latestReleaseUrl?: string | null;
 	/** Public ghcr.io image of the repo; probed on a TTL by the scheduler, null without a public image. */
 	latestImage: LatestImage | null;
 	/** Since the last arch review on the target; null with no target, before the first scan, or when git fails. */
@@ -1008,9 +1013,11 @@ export const VERSION_RE = /^v\d+\.\d+\.\d+$/;
 export interface ReleasePlan {
 	/** The commit the release tags, frozen when the plan is made. */
 	sha: string;
-	/** Latest release tag contained in `sha` (highest vX.Y.Z); null before the first release. */
+	/** Latest release tag contained in `sha` (highest vX.Y.Z); null before the first release
+	 * or when the repo's latest GitHub release is not vX.Y.Z (nothing is computed then). */
 	from: string | null;
-	/** Next version per semver from the conventional commits since `from`; "v0.1.0" for the first release. */
+	/** Next version per semver from the conventional commits since `from`; "v0.1.0" for the first
+	 * release; "" when the repo's latest GitHub release is not vX.Y.Z (blocked below). */
 	version: string;
 	/** GitHub release notes (markdown): one bullet per feature, fix or change. */
 	notes: string;
@@ -1018,7 +1025,8 @@ export interface ReleasePlan {
 	commits: number;
 	/** Done tasks whose work is in from..sha, oldest first; question-only and no-op cards are dropped. */
 	tasks: { id: string; title: string }[];
-	/** Why the release can't start now; null when it can. */
+	/** Why the release can't start now; null when it can. Also set when the repo's latest
+	 * GitHub release is not vX.Y.Z. */
 	blocked: string | null;
 }
 

@@ -2564,23 +2564,25 @@ function ReleaseDialog({
 				)}
 				{plan !== null && (
 					<>
-						<p className="release-line">
-							<strong>
-								{first ? "First release:" : `${plan.from} →`}
-								<input
-									className="version-input"
-									value={version}
-									onChange={(e) => setVersion(e.target.value)}
-									spellCheck={false}
-									aria-label="Release version"
-								/>
-							</strong>
-							<span>
-								{first
-									? `${plan.commits} commits up to ${short}`
-									: `${plan.commits} commits since ${plan.from} up to ${short}`}
-							</span>
-						</p>
+						{plan.version !== "" && (
+							<p className="release-line">
+								<strong>
+									{first ? "First release:" : `${plan.from} →`}
+									<input
+										className="version-input"
+										value={version}
+										onChange={(e) => setVersion(e.target.value)}
+										spellCheck={false}
+										aria-label="Release version"
+									/>
+								</strong>
+								<span>
+									{first
+										? `${plan.commits} commits up to ${short}`
+										: `${plan.commits} commits since ${plan.from} up to ${short}`}
+								</span>
+							</p>
+						)}
 						{plan.tasks.length > 0 && (
 							<ul className="release-tasks" aria-label="Tasks in this release">
 								{plan.tasks.map((t) => (
@@ -2994,7 +2996,17 @@ export function ProjectBoard({
 						<h1 id="project-title">{projectLabel(project)}</h1>
 						<p className="project-meta">
 							{project.latestRelease !== null &&
-								(project.github !== null ? (
+								(project.latestReleaseUrl != null ? (
+									<a
+										href={project.latestReleaseUrl}
+										target="_blank"
+										rel="noopener noreferrer"
+										title="Latest release"
+									>
+										<Icon name="tag" size={13} />
+										{project.latestRelease}
+									</a>
+								) : project.github !== null ? (
 									<a
 										href={`${project.github}/releases/tag/${project.latestRelease}`}
 										target="_blank"

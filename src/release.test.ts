@@ -16,12 +16,14 @@ import {
 	includedTasks,
 	lateCommits,
 	lateNotes,
+	latestGhRelease,
 	latestImage,
 	ownerRepo,
 	parseCommit,
 	planRelease,
 	publishRelease,
 	releaseBlocked,
+	releaseChip,
 	runGh,
 	runReleaseCommand,
 } from "./release.ts";
@@ -1258,5 +1260,191 @@ describe("runGh env", () => {
 			else process.env.GH_TOKEN = savedToken;
 			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
 		}
+	});
+});
+
+describe("latestGhRelease", () => {
+	const ghOk = (body: unknown) => async () => ({
+		code: 0,
+		stdout: JSON.stringify(body),
+		stderr: "",
+	});
+
+	test("parses a vX.Y.Z release: the tag is the chip, semver true", async () => {
+		const r = await latestGhRelease(
+			"octo/repo",
+			ghOk({
+				tag_name: "v3.18.6",
+				name: "v3.18.6",
+				html_url: "https://github.com/octo/repo/releases/tag/v3.18.6",
+			}),
+		);
+		expect(r).toEqual({
+			name: "v3.18.6",
+			tag: "v3.18.6",
+			url: "https://github.com/octo/repo/releases/tag/v3.18.6",
+			semver: true,
+		});
+	});
+
+	test("a non-vX.Y.Z release keeps its own name and page", async () => {
+		const r = await latestGhRelease(
+			"octo/repo",
+			ghOk({
+				tag_name: "prod-2026.10.27-09.10.00-abc1234",
+				name: "prod - 2026.10.27-09.10.00-abc1234",
+				html_url:
+					"https://github.com/octo/repo/releases/tag/prod-2026.10.27-09.10.00-abc1234",
+			}),
+		);
+		expect(r).toEqual({
+			name: "prod - 2026.10.27-09.10.00-abc1234",
+			tag: "prod-2026.10.27-09.10.00-abc1234",
+			url: "https://github.com/octo/repo/releases/tag/prod-2026.10.27-09.10.00-abc1234",
+			semver: false,
+		});
+	});
+
+	test("an unnamed release falls back to its tag name", async () => {
+		const r = await latestGhRelease(
+			"octo/repo",
+			ghOk({ tag_name: "v1.2.3", name: null, html_url: "https://x/t/v1.2.3" }),
+		);
+		expect(r?.name).toBe("v1.2.3");
+		expect(r?.semver).toBe(true);
+	});
+
+	test("any failure answers null: no releases, gh error, bad JSON, empty body, throw", async () => {
+		expect(
+			await latestGhRelease("octo/repo", async () => ({
+				code: 404,
+				stdout: "",
+				stderr: "Not Found",
+			})),
+		).toBeNull();
+		expect(
+			await latestGhRelease("octo/repo", async () => ({
+				code: 1,
+				stdout: "",
+				stderr: "gh: no auth",
+			})),
+		).toBeNull();
+		expect(
+			await latestGhRelease("octo/repo", async () => ({
+				code: 0,
+				stdout: "<html>",
+				stderr: "",
+			})),
+		).toBeNull();
+		expect(
+			await latestGhRelease("octo/repo", ghOk("a list, not an object")),
+		).toBeNull();
+		expect(
+			await latestGhRelease("octo/repo", ghOk({ tag_name: "  ", name: "" })),
+		).toBeNull();
+		expect(
+			await latestGhRelease("octo/repo", async () => {
+				throw new Error("gh missing");
+			}),
+		).toBeNull();
+	});
+});
+
+describe("releaseChip", () => {
+	let root = "";
+	let main = "";
+	beforeAll(async () => {
+		sweepStaleFixtures("ott-chip-test-");
+		root = mkdtempSync(join(tmpdir(), "ott-chip-test-"));
+		main = join(root, "main");
+		await must(root, "init", "-q", "-b", "main", main);
+		await must(main, "config", "user.name", "ott");
+		await must(main, "config", "user.email", "ott@example.invalid");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "a");
+		const sha = await must(main, "rev-parse", "HEAD");
+		await must(main, "tag", "v3.18.6", sha);
+		await must(main, "tag", "v0.9.0", sha);
+	}, 60_000);
+	afterAll(
+		() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }),
+		60_000,
+	);
+
+	test("a vX.Y.Z latest release keeps the tag chip (unchanged)", async () => {
+		const chip = await releaseChip({
+			repo: "octo/repo",
+			mainPath: main,
+			target: "main",
+			latest: () =>
+				Promise.resolve({
+					name: "v3.18.7",
+					tag: "v3.18.7",
+					url: "https://github.com/octo/repo/releases/tag/v3.18.7",
+					semver: true,
+				}),
+		});
+		expect(chip).toEqual({ release: "v3.18.7", url: null });
+	});
+
+	test("a non-vX.Y.Z latest release wins over the merged vX.Y.Z tag", async () => {
+		const chip = await releaseChip({
+			repo: "octo/repo",
+			mainPath: main,
+			target: "main",
+			latest: () =>
+				Promise.resolve({
+					name: "prod - 2026.10.27-09.10.00-abc1234",
+					tag: "prod-2026.10.27-09.10.00-abc1234",
+					url: "https://github.com/octo/repo/releases/tag/prod-2026.10.27-09.10.00-abc1234",
+					semver: false,
+				}),
+		});
+		expect(chip).toEqual({
+			release: "prod - 2026.10.27-09.10.00-abc1234",
+			url: "https://github.com/octo/repo/releases/tag/prod-2026.10.27-09.10.00-abc1234",
+		});
+	});
+
+	test("no GitHub remote: the highest merged vX.Y.Z tag", async () => {
+		const chip = await releaseChip({
+			repo: null,
+			mainPath: main,
+			target: "main",
+		});
+		expect(chip).toEqual({ release: "v3.18.6", url: null });
+	});
+
+	test("GitHub failing falls back to tags", async () => {
+		const chip = await releaseChip({
+			repo: "octo/repo",
+			mainPath: main,
+			target: "main",
+			latest: () => Promise.resolve(null),
+		});
+		expect(chip).toEqual({ release: "v3.18.6", url: null });
+	});
+
+	test("git failing answers null, not a throw", async () => {
+		const chip = await releaseChip({
+			repo: null,
+			mainPath: join(root, "nope"),
+			target: "main",
+		});
+		expect(chip).toEqual({ release: null, url: null });
+	});
+
+	test("no target is null without probing", async () => {
+		let probes = 0;
+		const chip = await releaseChip({
+			repo: "octo/repo",
+			mainPath: main,
+			target: null,
+			latest: () => {
+				probes += 1;
+				return Promise.resolve(null);
+			},
+		});
+		expect(chip).toEqual({ release: null, url: null });
+		expect(probes).toBe(0);
 	});
 });

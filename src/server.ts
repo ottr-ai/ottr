@@ -19,10 +19,10 @@ import { platform } from "./platform/index.ts";
 import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
-	highestTag,
 	latestImage,
 	ownerRepo,
 	publishRelease,
+	releaseChip,
 	runGh,
 	runReleaseCommand,
 } from "./release.ts";
@@ -197,17 +197,22 @@ function refreshImage(e: Entry): void {
 		.catch(() => {}); // ghcr unreachable: keep the null seed until the next TTL
 }
 
-/** Highest vX.Y.Z tag merged into the target; null when the target is unknown or the git spawn fails. */
+/** The chip's latest release: the repo's latest GitHub release when the project has a
+ * GitHub remote and GitHub answers, else the highest vX.Y.Z tag merged into the target;
+ * null when the target is unknown, like archReview. */
 async function refreshRelease(e: Entry): Promise<void> {
 	if (e.target === null) {
 		e.latestRelease = null;
+		e.latestReleaseUrl = null;
 		return;
 	}
-	const r = await git(
-		["tag", "--list", "v*", "--merged", e.target],
-		e.path,
-	).catch(() => null);
-	e.latestRelease = r?.code === 0 ? highestTag(r.stdout.split("\n")) : null;
+	const chip = await releaseChip({
+		repo: e.github === null ? null : ownerRepo(e.github),
+		mainPath: e.path,
+		target: e.target,
+	});
+	e.latestRelease = chip.release;
+	e.latestReleaseUrl = chip.url;
 	refreshImage(e);
 }
 

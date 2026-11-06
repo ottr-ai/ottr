@@ -151,7 +151,9 @@ import { createPrWatcher, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
+	cachedLatestGhRelease,
 	includedTasks,
+	type LatestGhRelease,
 	lateCommits,
 	ownerRepo,
 	planRelease,
@@ -325,6 +327,9 @@ interface AppDeps {
 	gstore: GlobalStore;
 	/** gh CLI seam; defaults to runGh. Tests inject a stub for the /github route. */
 	gh?: GhFn;
+	/** Latest GitHub release seam; defaults to the cached probe in release.ts. Tests inject
+	 * a stub for the release chip and the Create release routes. */
+	latestRelease?: (repo: string) => Promise<LatestGhRelease | null>;
 	/** Deepen seam for the composer route; defaults to deepenDraft (one gateway call). Tests inject a stub so no spawn happens. */
 	deepen?: (prompt: string, model: string | null) => Promise<string>;
 	/** Server-side projects root (compose: /workspace via OMP_TRACKER_ROOTS[0]); Add project clones/creates under it. */
@@ -767,6 +772,8 @@ export function reconcileLayerUse(
 
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
+	// The chip's and the release dialog's latest-GitHub-release fact; the seam keeps tests off gh.
+	const latestReleaseOf = deps.latestRelease ?? cachedLatestGhRelease;
 	// GitHub App mint and review post; the seam keeps both off the real network in tests.
 	const githubAppFetch = deps.githubAppFetch ?? noRedirectFetch;
 	// Idle clock (docs/specs/mutation-delta.md §7): only the idle-review logic reads it,
@@ -2222,6 +2229,7 @@ export function createApp(deps: AppDeps) {
 			github: e.github,
 			remote: e.remote,
 			latestRelease: e.latestRelease,
+			latestReleaseUrl: e.latestReleaseUrl ?? null,
 			latestImage: e.latestImage,
 			archReview: e.archReview,
 			settings,
@@ -2231,6 +2239,12 @@ export function createApp(deps: AppDeps) {
 
 	/** One cache per app instance: two trackers (or two test apps) never share a snapshot. */
 	const orphanSnapshot = orphanCache();
+
+	/** Why Create release is off for a repo whose latest GitHub release is not vX.Y.Z: Ottr's
+	 * release flow only speaks vX.Y.Z, so no version is computed and no release card starts. */
+	const nonSemVerBlock = (name: string): string =>
+		`Latest GitHub release "${name}" is not vX.Y.Z; Ottr cannot create the next release for this repo.`;
+
 	/** Agent processes no live turn claims, cached for a few minutes; advisory only, never killed. */
 	function currentOrphanScan(): {
 		orphans: OrphanProcess[];
@@ -5157,6 +5171,22 @@ export function createApp(deps: AppDeps) {
 						originUrl: e.store.getSettings().originUrl,
 					}).catch((err) => json({ error: errmsg(err) }, 409));
 					if (plan instanceof Response) return plan;
+					// The repo's latest GitHub release decides whether a version may be computed:
+					// a repo releasing under other names (a non-vX.Y.Z latest release) must not see
+					// a merged vX.Y.Z tag pose as the current release, so the plan carries nothing
+					// computed and the dialog can only show why.
+					const repo = e.github === null ? null : ownerRepo(e.github);
+					const ghLatest = repo === null ? null : await latestReleaseOf(repo);
+					if (ghLatest !== null && !ghLatest.semver)
+						return json({
+							...plan,
+							from: null,
+							version: "",
+							notes: "",
+							commits: 0,
+							blocked: nonSemVerBlock(ghLatest.name),
+							tasks: [],
+						});
 					// Window start: the last release tag's commit time; merges are serialized, so a
 					// task is in from..sha exactly when it finished after that commit landed.
 					const since =
@@ -5209,6 +5239,11 @@ export function createApp(deps: AppDeps) {
 						originUrl: e.store.getSettings().originUrl,
 					}).catch((err) => json({ error: errmsg(err) }, 409));
 					if (plan instanceof Response) return plan;
+					// Same gate as the GET: a repo releasing under other names gets no Ottr release.
+					const repo = e.github === null ? null : ownerRepo(e.github);
+					const ghLatest = repo === null ? null : await latestReleaseOf(repo);
+					if (ghLatest !== null && !ghLatest.semver)
+						return json({ error: nonSemVerBlock(ghLatest.name) }, 409);
 					// The dialog may override the agent's semver pick; validate the shape and
 					// re-check the tag collision planRelease only ran for its own version.
 					const override = r.body.version;

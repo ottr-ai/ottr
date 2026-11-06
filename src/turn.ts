@@ -349,8 +349,14 @@ export interface TurnProject {
 	 * failed. Refreshed by the scheduler tick like dirty and mainUnpushed (a failed check
 	 * keeps the last value); the off-default banner and turn finding read it. */
 	mainBranch: string | null;
-	/** Highest vX.Y.Z tag merged into the target; refreshed by the scheduler tick, read-only elsewhere. */
+	/** Latest release: the repo's latest GitHub release (its name when the tag is not
+	 * `vX.Y.Z`), else the highest `vX.Y.Z` tag merged into the target; refreshed by the
+	 * scheduler tick, read-only elsewhere. */
 	latestRelease: string | null;
+	/** Web page of the latest GitHub release when the chip shows its name (a non-`vX.Y.Z`
+	 * release); null when the chip shows a tag and links `releases/tag/<tag>`. Refreshed
+	 * beside latestRelease, read-only elsewhere. */
+	latestReleaseUrl?: string | null;
 	/** Public ghcr.io image of the repo; probed on a TTL by the scheduler tick, read-only elsewhere. */
 	latestImage: LatestImage | null;
 	/** Commits since the last arch review on the target; refreshed by the scheduler tick, read-only elsewhere. */

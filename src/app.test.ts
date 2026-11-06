@@ -373,6 +373,8 @@ function mount(
 		/** Fetch/timeout seam for the git 401/403 probe; passed through to createApp. */
 		githubAuthProbe?: Parameters<typeof createApp>[0]["githubAuthProbe"];
 		models?: Parameters<typeof createApp>[0]["models"];
+		/** Latest GitHub release seam (release chip + Create release routes); tests inject. */
+		latestRelease?: Parameters<typeof createApp>[0]["latestRelease"];
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
 		schedule?: () => void;
@@ -428,6 +430,7 @@ function mount(
 		keyscan: input.keyscan,
 		githubAuthProbe: input.githubAuthProbe,
 		models: input.models,
+		latestRelease: input.latestRelease,
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		serverRef: { current: undefined },
 	});
@@ -4312,7 +4315,7 @@ describe("release-summary route", () => {
 
 	const setup = (
 		name: string,
-		opts: { tag?: boolean } = {},
+		opts: { tag?: boolean; github?: string | null } = {},
 	): {
 		dir: string;
 		store: ProjectStore;
@@ -4358,7 +4361,7 @@ describe("release-summary route", () => {
 			store,
 			target: "main",
 			gitless: false,
-			github: null,
+			github: opts.github ?? null,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -4575,6 +4578,176 @@ describe("release-summary route", () => {
 					"notes must be a string of 1-20000 characters",
 				);
 			}
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("GET /release with a non-vX.Y.Z latest GitHub release shows it and computes nothing", async () => {
+		// The fixture's merged v0.1.0 tag must not pose as the current release: the plan
+		// carries the GitHub release's name and page, no from, no version, no notes.
+		const s = setup("p-gh-nonsemver", {
+			github: "https://github.com/octo/repo",
+		});
+		const repos: string[] = [];
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				latestRelease: (repo) => {
+					repos.push(repo);
+					return Promise.resolve({
+						name: "prod - 2026.10.27-09.10.00-abc1234",
+						tag: "prod-2026.10.27-09.10.00-abc1234",
+						url: "https://github.com/octo/repo/releases/tag/prod-2026.10.27-09.10.00-abc1234",
+						semver: false,
+					});
+				},
+			});
+			const res = await call("/api/projects/p-gh-nonsemver/release");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				sha: run(s.dir, "git rev-parse HEAD"),
+				from: null,
+				version: "",
+				notes: "",
+				commits: 0,
+				blocked:
+					'Latest GitHub release "prod - 2026.10.27-09.10.00-abc1234" is not vX.Y.Z; Ottr cannot create the next release for this repo.',
+				tasks: [],
+			});
+			expect(repos).toEqual(["octo/repo"]);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("POST /release with a non-vX.Y.Z latest GitHub release is 409 and starts no card", async () => {
+		const s = setup("p-gh-nonsemver-post", {
+			github: "https://github.com/octo/repo",
+		});
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				latestRelease: () =>
+					Promise.resolve({
+						name: "prod - 2026.10.27-09.10.00-abc1234",
+						tag: "prod-2026.10.27-09.10.00-abc1234",
+						url: null,
+						semver: false,
+					}),
+			});
+			const res = await call("/api/projects/p-gh-nonsemver-post/release", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				'Latest GitHub release "prod - 2026.10.27-09.10.00-abc1234" is not vX.Y.Z; Ottr cannot create the next release for this repo.',
+			);
+			// No release card: the store holds only the fixture's done feature card.
+			expect(
+				s.store.listTasks().filter((t) => t.releaseVersion !== null),
+			).toEqual([]);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("GET /release with a vX.Y.Z latest GitHub release plans as before", async () => {
+		const s = setup("p-gh-semver", {
+			github: "https://github.com/octo/repo",
+		});
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				latestRelease: () =>
+					Promise.resolve({
+						name: "v0.1.0",
+						tag: "v0.1.0",
+						url: "https://github.com/octo/repo/releases/tag/v0.1.0",
+						semver: true,
+					}),
+			});
+			const res = await call("/api/projects/p-gh-semver/release");
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				from: string | null;
+				version: string;
+				blocked: string | null;
+			};
+			expect(b.from).toBe("v0.1.0");
+			expect(b.version).toBe("v0.2.0");
+			expect(b.blocked).toBeNull();
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a project without a GitHub remote skips the release probe", async () => {
+		const s = setup("p-gh-none");
+		let probes = 0;
+		try {
+			const { call } = mount({
+				projects: s.projects,
+				latestRelease: () => {
+					probes += 1;
+					return Promise.resolve(null);
+				},
+			});
+			const res = await call("/api/projects/p-gh-none/release");
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				from: string | null;
+				version: string;
+				blocked: string | null;
+			};
+			// Tag fallback: the plan reads the fixture's merged v0.1.0 tag, as before.
+			expect(b.from).toBe("v0.1.0");
+			expect(b.version).toBe("v0.2.0");
+			expect(b.blocked).toBeNull();
+			expect(probes).toBe(0);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("state carries the chip's latest release name and its page", async () => {
+		const s = setup("p-gh-chip", { github: "https://github.com/octo/repo" });
+		s.projects.get("p-gh-chip")!.latestRelease = "prod - 2026.10.27";
+		s.projects.get("p-gh-chip")!.latestReleaseUrl =
+			"https://github.com/octo/repo/releases/tag/prod-x";
+		try {
+			const { call } = mount({ projects: s.projects });
+			const state = (await (await call("/api/state")).json()) as {
+				projects: Array<{
+					name: string;
+					latestRelease: string | null;
+					latestReleaseUrl?: string | null;
+				}>;
+			};
+			const p = state.projects.find((x) => x.name === "p-gh-chip");
+			expect(p?.latestRelease).toBe("prod - 2026.10.27");
+			expect(p?.latestReleaseUrl).toBe(
+				"https://github.com/octo/repo/releases/tag/prod-x",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("state sends latestReleaseUrl null when the chip shows a tag", async () => {
+		const s = setup("p-gh-chip-tag", {
+			github: "https://github.com/octo/repo",
+		});
+		s.projects.get("p-gh-chip-tag")!.latestRelease = "v0.1.0";
+		try {
+			const { call } = mount({ projects: s.projects });
+			const state = (await (await call("/api/state")).json()) as {
+				projects: Array<{ name: string; latestReleaseUrl?: string | null }>;
+			};
+			expect(
+				state.projects.find((x) => x.name === "p-gh-chip-tag")
+					?.latestReleaseUrl,
+			).toBeNull();
 		} finally {
 			s.cleanup();
 		}
