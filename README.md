@@ -386,6 +386,8 @@ A UI change needs a picture of the new surface. `bun run dev` serves the demo bo
    PORT=$port OTTR_STATE_DIR="$state" timeout 900 bun run dev &
    ```
 
+Never wait for a leftover board to expire: with this step's fresh port and state directory a leftover board cannot block the run, so start the new board at once and let the tracker expire the old one.
+
 2. Wait for readiness by polling the port with a bounded loop, not a fixed sleep, and fail the script when the board never comes up:
 
    ```sh
