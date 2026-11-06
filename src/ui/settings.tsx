@@ -7,6 +7,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
@@ -1400,6 +1401,7 @@ export type GitHostsView = {
 	globalKey: KeyInfo | null;
 	githubApp: GitHubAppView | null;
 	githubHost: string | null;
+	githubTokenSet: boolean;
 };
 
 /** Fetch that keeps the status with the parsed body, so a caller can read a 409's trust data
@@ -1734,6 +1736,7 @@ export function GitHostsSection() {
 	// Add-token form; `replace` pre-fills it from a listed token.
 	const [tHost, setTHost] = useState("");
 	const [tUser, setTUser] = useState("oauth2");
+	const [tUserEdited, setTUserEdited] = useState(false);
 	const [tToken, setTToken] = useState("");
 	const [tUrl, setTUrl] = useState("");
 	const tBusy = useBusy();
@@ -1811,12 +1814,37 @@ export function GitHostsSection() {
 			}
 		})();
 	// The form submit keeps its busy spinner through tBusy; the BusyButton actions track their own.
+	// The board's GitHub token can stand in for the configured GitHub host: the server resolves
+	// the host itself, so the request carries only the test URL.
+	const boardTokenUsable =
+		tHost.trim().toLowerCase() !== "" &&
+		state?.githubTokenSet === true &&
+		state.githubHost !== null &&
+		tHost.trim().toLowerCase() === state.githubHost;
+	const useBoardToken = (): void => {
+		tBusy.start(() =>
+			run(async () => {
+				const { status, data } = await gitReq(
+					"POST",
+					"/api/git-hosts/github-token",
+					{ testUrl: tUrl.trim() },
+				);
+				if (status !== 200) throw new Error(asError(data, status));
+				setTToken("");
+				setTUser(defaultGitUsername(tHost.trim(), state?.githubHost ?? null));
+				await load();
+				return true;
+			}),
+		);
+	};
 	const saveToken = (): void => {
 		tBusy.start(() =>
 			run(async () => {
 				const { status, data } = await gitReq("POST", "/api/git-hosts/tokens", {
 					host: tHost.trim(),
-					username: tUser.trim() || "oauth2",
+					username:
+						tUser.trim() ||
+						defaultGitUsername(tHost.trim(), state?.githubHost ?? null),
 					token: tToken,
 					testUrl: tUrl.trim(),
 				});
@@ -2072,8 +2100,8 @@ export function GitHostsSection() {
 			<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
 				<h4>Other host tokens</h4>
 				<p className="hint">
-					HTTPS tokens for git hosts other than GitHub, one for each host. Ottr
-					tests each token with git ls-remote before it saves the token.
+					HTTPS tokens for git hosts, one for each host. Ottr tests each token
+					with git ls-remote before it saves the token.
 				</p>
 				{state !== null && state.tokens.length > 0 && (
 					<table>
@@ -2090,6 +2118,7 @@ export function GitHostsSection() {
 											onClick={() => {
 												setTHost(t.host);
 												setTUser(t.username);
+												setTUserEdited(true);
 											}}
 										>
 											Replace token
@@ -2122,7 +2151,14 @@ export function GitHostsSection() {
 							<label>
 								<input
 									value={tHost}
-									onChange={(e) => setTHost(e.target.value)}
+									onChange={(e) => {
+										const v = e.target.value;
+										setTHost(v);
+										if (!tUserEdited)
+											setTUser(
+												defaultGitUsername(v.trim(), state?.githubHost ?? null),
+											);
+									}}
 									placeholder="gitlab.com"
 									required
 									aria-label="Host"
@@ -2131,13 +2167,19 @@ export function GitHostsSection() {
 						</DefRow>
 						<DefRow
 							name="Username"
-							help="The username that git sends with the token. Most hosts accept oauth2."
+							help="The username that git sends with the token. GitHub hosts use x-access-token; most other hosts accept oauth2."
 						>
 							<label>
 								<input
 									value={tUser}
-									onChange={(e) => setTUser(e.target.value)}
-									placeholder="oauth2"
+									onChange={(e) => {
+										setTUser(e.target.value);
+										setTUserEdited(true);
+									}}
+									placeholder={defaultGitUsername(
+										tHost.trim(),
+										state?.githubHost ?? null,
+									)}
 									aria-label="Username"
 								/>
 							</label>
@@ -2183,7 +2225,12 @@ export function GitHostsSection() {
 						>
 							{tBusy.busy && <span className="spinner" aria-hidden="true" />}
 							Save token
-						</button>
+						</button>{" "}
+						{boardTokenUsable && (
+							<button type="button" onClick={useBoardToken}>
+								Use the board GitHub token
+							</button>
+						)}
 					</div>
 				</form>
 			</div>

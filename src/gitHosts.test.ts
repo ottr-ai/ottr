@@ -169,6 +169,12 @@ describe("parseGitUrl", () => {
 });
 
 describe("parseGitToken", () => {
+	const saved = process.env.OTTR_GITHUB_HOST;
+	afterAll(() => {
+		if (saved === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = saved;
+	});
+
 	function tokenError(body: Record<string, unknown>): string {
 		const r = parseGitToken(body);
 		return "error" in r ? r.error : "no error";
@@ -182,6 +188,16 @@ describe("parseGitToken", () => {
 			username: "oauth2",
 			token: "glpat-abc",
 		});
+	});
+
+	test("without a username, github defaults to x-access-token and others to oauth2", () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		expect(
+			parseGitToken({ host: "github.com", token: "ghp-abcdef" }),
+		).toMatchObject({ host: "github.com", username: "x-access-token" });
+		expect(
+			parseGitToken({ host: "gitlab.com", token: "glpat-abc" }),
+		).toMatchObject({ host: "gitlab.com", username: "oauth2" });
 	});
 
 	test("rejects bad host, username and token", () => {

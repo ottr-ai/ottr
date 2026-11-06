@@ -16,6 +16,7 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import { commitDeltas } from "../progress.ts";
@@ -23,7 +24,6 @@ import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
-
 import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
@@ -5578,7 +5578,7 @@ export function UpdateRowLine({
 		<div className="updates-row">{body}</div>
 	);
 }
-function AddProjectModal({
+export function AddProjectModal({
 	act,
 	onClose,
 	onAdded,
@@ -5604,6 +5604,13 @@ function AddProjectModal({
 	const [addTrust, setAddTrust] = useState<TrustNeeded | null>(null);
 	const [needsTokenHost, setNeedsTokenHost] = useState<string | null>(null);
 	const [tokUser, setTokUser] = useState("oauth2");
+	// When the hosts view lands and names the configured GitHub host, prefill the
+	// host's token convention ("x-access-token") instead of the generic "oauth2".
+	useEffect(() => {
+		if (needsTokenHost !== null && hosts !== null) {
+			setTokUser(defaultGitUsername(needsTokenHost, hosts.githubHost));
+		}
+	}, [needsTokenHost, hosts]);
 	const [tokToken, setTokToken] = useState("");
 	const repoName = name.trim();
 	const trimmedUrl = url.trim();
@@ -5683,7 +5690,9 @@ function AddProjectModal({
 		void act(async () => {
 			const { status, data } = await gitReq("POST", "/api/git-hosts/tokens", {
 				host: needsTokenHost ?? "",
-				username: tokUser.trim() || "oauth2",
+				username:
+					tokUser.trim() ||
+					defaultGitUsername(needsTokenHost ?? "", hosts?.githubHost ?? null),
 				token: tokToken,
 				testUrl: trimmedUrl,
 			});
@@ -5693,6 +5702,30 @@ function AddProjectModal({
 			addProject(trusted);
 		}, setErr);
 	};
+	// One click opts the board GitHub token in for this host: the server stores it as the
+	// host's entry (username x-access-token) and the Add retries.
+	const useBoardToken = (): void => {
+		void act(async () => {
+			const { status, data } = await gitReq(
+				"POST",
+				"/api/git-hosts/github-token",
+				{
+					testUrl: trimmedUrl,
+				},
+			);
+			if (status !== 200) throw new Error(asError(data, status));
+			setNeedsTokenHost(null);
+			setTokToken("");
+			addProject(trusted);
+		}, setErr);
+	};
+	// The board token can stand in only when the dialog's host IS the configured
+	// GitHub host and the board actually has one.
+	const boardTokenUsable =
+		needsTokenHost !== null &&
+		hosts?.githubTokenSet === true &&
+		hosts.githubHost !== null &&
+		needsTokenHost.toLowerCase() === hosts.githubHost;
 	// The SSH pre-test: Add stays disabled until the current url+key pair passed it.
 	const runSshTest = (trust?: string[]): Promise<TestAnswer> => {
 		if (trust !== undefined) setTrusted(trust);
@@ -5896,7 +5929,10 @@ function AddProjectModal({
 										<input
 											value={tokUser}
 											onChange={(e) => setTokUser(e.target.value)}
-											placeholder="oauth2"
+											placeholder={defaultGitUsername(
+												needsTokenHost ?? "",
+												hosts?.githubHost ?? null,
+											)}
 										/>
 									</label>
 									<label>
@@ -5916,6 +5952,11 @@ function AddProjectModal({
 									>
 										Save token and retry
 									</button>
+									{boardTokenUsable && (
+										<button type="button" onClick={useBoardToken}>
+											Use the board GitHub token
+										</button>
+									)}
 								</fieldset>
 							)}
 						</div>

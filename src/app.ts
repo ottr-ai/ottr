@@ -2798,6 +2798,9 @@ export function createApp(deps: AppDeps) {
 				username: t.username,
 				tokenSet: true,
 			})),
+			// Whether the board itself has a GitHub token, so Settings can offer the click
+			// that stores it as the git-host entry for the configured host.
+			githubTokenSet: githubToken !== null,
 			globalKey: await keyInfo(sshPaths(sshDir).global),
 			// Never the key: the fingerprint is what the user compares against GitHub's.
 			githubApp:
@@ -2810,6 +2813,56 @@ export function createApp(deps: AppDeps) {
 						},
 			githubHost: githubHostView(),
 		};
+	}
+
+	/** Probe a candidate git-host token live and, only then, save it as the host's entry. */
+	async function saveGitToken(
+		cand: GitToken,
+		testUrl: unknown,
+	): Promise<Response> {
+		// A token may only take effect for its own host: the test must be an https
+		// URL there, or the save stops here.
+		const remote = parseGitUrl(testUrl);
+		if (
+			"error" in remote ||
+			remote.scheme !== "https" ||
+			remote.hostKey !== cand.host
+		)
+			return json(
+				{ error: "testUrl must be an https URL on the token's host" },
+				400,
+			);
+		const t = await testRemote(
+			String(testUrl).trim(),
+			gitAuthEnv({
+				ambientHelpers,
+				tokens: [cand],
+				key: null,
+				knownHosts: sshPaths(sshDir).knownHosts,
+			}),
+			// Only the candidate: an unsaved token must never enter the global secret set.
+			[cand.token],
+		);
+		if ("error" in t) {
+			// Same hint as the clone: the bare 403 on the token test names the SAML cause.
+			if (GIT_HTTP_AUTH_STATUS.test(t.error)) {
+				const hint = await githubAuthHint(String(testUrl).trim(), {
+					configuredHost: githubHost().host,
+					tokens: [cand],
+					envToken: null,
+					secrets: [...gitSecrets(), cand.token],
+					fetchImpl: deps.githubAuthProbe?.fetchImpl,
+					timeoutMs: deps.githubAuthProbe?.timeoutMs,
+				});
+				if (hint !== null) return json({ error: t.error + hint }, 400);
+			}
+			return json({ error: t.error }, 400);
+		}
+		// One token per host: a re-save replaces the host's old entry.
+		gitTokens = [...gitTokens.filter((x) => x.host !== cand.host), cand];
+		saveConfig();
+		applyGitSecrets();
+		return json(await gitHostsView());
 	}
 
 	const NO_GLOBAL_KEY =
@@ -3785,7 +3838,7 @@ export function createApp(deps: AppDeps) {
 					return json({ ok: true });
 				}),
 		},
-		// Git hosts other than GitHub. No answer ever holds a token
+		// Per-host git tokens (any host, GitHub included). No answer ever holds a token
 		// or a private key; every saved credential passed a live test first.
 		"/api/git-hosts": {
 			GET: (req) => api(req, async () => json(await gitHostsView())),
@@ -3797,49 +3850,32 @@ export function createApp(deps: AppDeps) {
 					if ("error" in r) return r.error;
 					const cand = parseGitToken(r.body);
 					if ("error" in cand) return json({ error: cand.error }, 400);
-					// A token may only take effect for its own host: the test must be an https
-					// URL there, or the save stops here.
-					const remote = parseGitUrl(r.body.testUrl);
-					if (
-						"error" in remote ||
-						remote.scheme !== "https" ||
-						remote.hostKey !== cand.host
-					)
+					return saveGitToken(cand, r.body.testUrl);
+				}),
+		},
+		// The board GitHub token only becomes a git-host entry through this explicit
+		// endpoint — never reused for git without the click.
+		"/api/git-hosts/github-token": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					if (githubToken === null)
 						return json(
-							{ error: "testUrl must be an https URL on the token's host" },
+							{ error: "the board has no GitHub token to reuse" },
 							400,
 						);
-					const t = await testRemote(
-						String(r.body.testUrl).trim(),
-						gitAuthEnv({
-							ambientHelpers,
-							tokens: [cand],
-							key: null,
-							knownHosts: sshPaths(sshDir).knownHosts,
-						}),
-						// Only the candidate: an unsaved token must never enter the global secret set.
-						[cand.token],
-					);
-					if ("error" in t) {
-						// Same hint as the clone: the bare 403 on the token test names the SAML cause.
-						if (GIT_HTTP_AUTH_STATUS.test(t.error)) {
-							const hint = await githubAuthHint(String(r.body.testUrl).trim(), {
-								configuredHost: githubHost().host,
-								tokens: [cand],
-								envToken: null,
-								secrets: [...gitSecrets(), cand.token],
-								fetchImpl: deps.githubAuthProbe?.fetchImpl,
-								timeoutMs: deps.githubAuthProbe?.timeoutMs,
-							});
-							if (hint !== null) return json({ error: t.error + hint }, 400);
-						}
-						return json({ error: t.error }, 400);
-					}
-					// One token per host: a re-save replaces the host's old entry.
-					gitTokens = [...gitTokens.filter((x) => x.host !== cand.host), cand];
-					saveConfig();
-					applyGitSecrets();
-					return json(await gitHostsView());
+					const host = githubHostView();
+					if (host === null)
+						return json(
+							{ error: `${GITHUB_HOST_ENV}: the configured host is invalid` },
+							400,
+						);
+					// No username on purpose: parseGitToken's per-host default lands
+					// x-access-token for a GitHub host.
+					const cand = parseGitToken({ host, token: githubToken });
+					if ("error" in cand) return json({ error: cand.error }, 400);
+					return saveGitToken(cand, r.body.testUrl);
 				}),
 		},
 		"/api/git-hosts/tokens/:host": {

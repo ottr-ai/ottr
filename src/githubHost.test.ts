@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import {
+	configuredGithubHostname,
 	DEFAULT_GITHUB_HOST,
+	defaultGitUsername,
 	GITHUB_HOST_ENV,
 	type GithubHost,
 	ghEnvFor,
@@ -17,6 +19,76 @@ const host = (raw: string): GithubHost => {
 };
 
 const ALPHA = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+describe("defaultGitUsername", () => {
+	const saved = process.env.OTTR_GITHUB_HOST;
+	const restore = () => {
+		if (saved === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = saved;
+	};
+
+	test("github.com uses x-access-token, gitlab.com keeps oauth2", () => {
+		try {
+			delete process.env.OTTR_GITHUB_HOST;
+			expect(defaultGitUsername("github.com", null)).toBe("x-access-token");
+			expect(defaultGitUsername("gitlab.com", null)).toBe("oauth2");
+			expect(defaultGitUsername("acme.ghe.com", null)).toBe("x-access-token");
+			expect(defaultGitUsername("", null)).toBe("oauth2");
+		} finally {
+			restore();
+		}
+	});
+
+	test("a host with a port compares by its hostname part", () => {
+		expect(defaultGitUsername("github.com:8443", null)).toBe("x-access-token");
+	});
+
+	test("case-insensitive on both sides", () => {
+		expect(defaultGitUsername("GITHUB.COM", null)).toBe("x-access-token");
+		expect(defaultGitUsername("ACME.GHE.COM", null)).toBe("x-access-token");
+	});
+
+	test("bare ghe.com and lookalike hosts are not GitHub hosts", () => {
+		expect(defaultGitUsername("ghe.com", null)).toBe("oauth2");
+		expect(defaultGitUsername("evil-ghe.com", null)).toBe("oauth2");
+	});
+
+	test("the configured enterprise host counts as a GitHub host", () => {
+		expect(defaultGitUsername("git.acme.com", "git.acme.com")).toBe(
+			"x-access-token",
+		);
+		expect(defaultGitUsername("git.acme.com", null)).toBe("oauth2");
+		expect(defaultGitUsername("git.acme.com:8443", "git.acme.com")).toBe(
+			"x-access-token",
+		);
+	});
+});
+
+describe("configuredGithubHostname", () => {
+	const saved = process.env.OTTR_GITHUB_HOST;
+
+	test("unset or blank means the default, invalid means null", () => {
+		const prev = process.env.OTTR_GITHUB_HOST;
+		try {
+			delete process.env.OTTR_GITHUB_HOST;
+			expect(configuredGithubHostname()).toBe("github.com");
+			process.env.OTTR_GITHUB_HOST = "  ";
+			expect(configuredGithubHostname()).toBe("github.com");
+			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+			expect(configuredGithubHostname()).toBe("acme.ghe.com");
+			process.env.OTTR_GITHUB_HOST = "https://x";
+			expect(configuredGithubHostname()).toBe(null);
+		} finally {
+			if (prev === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = prev;
+		}
+	});
+
+	afterAll(() => {
+		if (saved === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = saved;
+	});
+});
 
 describe("githubHost", () => {
 	test("github.com keeps the default shape and GH_TOKEN", () => {

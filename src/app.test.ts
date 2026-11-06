@@ -8409,6 +8409,7 @@ type HostsView = {
 	globalKey: KeyBody | null;
 	githubApp: { id: string; fingerprint: string } | null;
 	githubHost: string | null;
+	githubTokenSet: boolean;
 };
 
 describe("git-host urls on add project", () => {
@@ -8759,9 +8760,11 @@ describe("git-hosts view github host", () => {
 		const savedHost = process.env.OTTR_GITHUB_HOST;
 		try {
 			process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
-			expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
-				"acme.ghe.com",
-			);
+			const withHost = (await (
+				await m.call("/api/git-hosts")
+			).json()) as HostsView;
+			expect(withHost.githubHost).toBe("acme.ghe.com");
+			expect(withHost.githubTokenSet).toBe(false);
 			delete process.env.OTTR_GITHUB_HOST;
 			expect((await (await m.call("/api/git-hosts")).json()).githubHost).toBe(
 				"github.com",
@@ -8774,6 +8777,129 @@ describe("git-hosts view github host", () => {
 			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = savedHost;
 		}
+	});
+});
+
+describe("POST /api/git-hosts/github-token", () => {
+	const savedHost = process.env.OTTR_GITHUB_HOST;
+	const savedGhToken = process.env.GH_TOKEN;
+	afterAll(() => {
+		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedHost;
+		if (savedGhToken === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = savedGhToken;
+	});
+
+	/** The token save probes api.github.com; the stub keeps the test off the network. */
+	const withGithubFetch = async <T>(fn: () => Promise<T>): Promise<T> => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.github.com/repos/ottr-ai/ottr")
+				return new Response(null, { status: 200 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			return await fn();
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	test("stores the board token as x-access-token for the configured host", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		// insteadOf keeps the remainder verbatim: the fixture is <root>/tokened.
+		makeFixture("tokened");
+		const m = mount({ sshDir: join(root, "ssh-gh-token") });
+		await withGithubFetch(async () => {
+			await m.call("/api/settings/github-token", {
+				token: `ghp_${"c".repeat(36)}`,
+			});
+			const res = await m.call("/api/git-hosts/github-token", {
+				testUrl: "https://github.com/octo/tokened",
+			});
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as HostsView;
+			expect(view.tokens).toEqual([
+				{ host: "github.com", username: "x-access-token", tokenSet: true },
+			]);
+		});
+	});
+
+	test("a configured enterprise host lands the entry there, also as x-access-token", async () => {
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		// A rewrite for the enterprise host, so the probe stays on the fixture too.
+		writeFileSync(
+			gitConfigGlobal,
+			[
+				`[url "file://${fixtureRepos}/ghe"]`,
+				"\tinsteadOf = https://acme.ghe.com/octo",
+				"",
+			].join("\n"),
+			{ flag: "a" },
+		);
+		makeFixture("ghe/tokened");
+		const m = mount({ sshDir: join(root, "ssh-gh-token-ghe") });
+		// A ghe.com probe hits api.<host>/user; the stub answers it.
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.acme.ghe.com/user")
+				return new Response(null, { status: 200 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			await m.call("/api/settings/github-token", {
+				token: `ghp_${"d".repeat(36)}`,
+			});
+			const res = await m.call("/api/git-hosts/github-token", {
+				testUrl: "https://acme.ghe.com/octo/tokened",
+			});
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as HostsView;
+			expect(view.tokens).toEqual([
+				{ host: "acme.ghe.com", username: "x-access-token", tokenSet: true },
+			]);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("400 without a board token or with a testUrl off the host", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const m = mount({ sshDir: join(root, "ssh-gh-token-none") });
+		const none = await m.call("/api/git-hosts/github-token", {
+			testUrl: "https://github.com/octo/tokened",
+		});
+		expect(none.status).toBe(400);
+		const noneBody = (await none.json()) as { error: string };
+		expect(noneBody.error).toContain("no GitHub token");
+		const m2 = mount({ sshDir: join(root, "ssh-gh-token-off") });
+		await withGithubFetch(async () => {
+			await m2.call("/api/settings/github-token", {
+				token: `ghp_${"e".repeat(36)}`,
+			});
+			const missing = await m2.call("/api/git-hosts/github-token", {});
+			expect(missing.status).toBe(400);
+			const off = await m2.call("/api/git-hosts/github-token", {
+				testUrl: "https://gitlab.com/octo/tokened",
+			});
+			expect(off.status).toBe(400);
+			const offBody = (await off.json()) as { error: string };
+			expect(offBody.error).toBe(
+				"testUrl must be an https URL on the token's host",
+			);
+			const view = (await (
+				await m2.call("/api/git-hosts")
+			).json()) as HostsView;
+			expect(view.tokens).toEqual([]);
+		});
 	});
 });
 

@@ -55,6 +55,7 @@ const {
 	SEARCH_APPLY_MS,
 	ComposeDialog,
 	DeepenReview,
+	AddProjectModal,
 	OrphanNotice,
 	ranOnLabel,
 	AuthPage,
@@ -4582,6 +4583,277 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).not.toContain("Push to origin");
 		expect(html).not.toContain("never to a task branch.");
 		expect(html).not.toContain("has commits origin lacks");
+	});
+});
+
+describe("AddProjectModal board GitHub token reuse", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// AskBlock tests above: installed after app.tsx's import, removed after.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
+	const submitEvent = (): Event =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		}) as unknown as Event;
+
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1, copyExtra: [] },
+	} as unknown as ProjectView;
+
+	const hostsView = (githubTokenSet: boolean): Record<string, unknown> => ({
+		tokens: githubTokenSet
+			? [{ host: "github.com", username: "x-access-token", tokenSet: true }]
+			: [],
+		globalKey: null,
+		githubApp: null,
+		githubHost: "github.com",
+		githubTokenSet,
+	});
+
+	async function mountAdd(githubTokenSet: boolean): Promise<{
+		container: HTMLDivElement;
+		root: ReturnType<typeof createRoot>;
+		posts: { url: string; body: Record<string, unknown> }[];
+		added: string[];
+		restore: () => void;
+	}> {
+		const posts: { url: string; body: Record<string, unknown> }[] = [];
+		const added: string[] = [];
+		let projectCalls = 0;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			if (url.endsWith("/api/gh-status")) {
+				return new Response("{}", { status: 404 });
+			}
+			if (url.endsWith("/api/git-hosts")) {
+				return new Response(JSON.stringify(hostsView(githubTokenSet)), {
+					status: 200,
+				});
+			}
+			if (url.endsWith("/api/projects") && method === "POST") {
+				projectCalls += 1;
+				posts.push({
+					url,
+					body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+				});
+				if (projectCalls === 1) {
+					return new Response(
+						JSON.stringify({
+							error: "Authentication failed",
+							needsToken: "github.com",
+						}),
+						{ status: 400 },
+					);
+				}
+				return new Response(JSON.stringify({ project, interview: "i1" }), {
+					status: 200,
+				});
+			}
+			if (url.endsWith("/api/git-hosts/github-token")) {
+				posts.push({
+					url,
+					body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+				});
+				return new Response(JSON.stringify(hostsView(true)), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		// Minimal Act: run the work, hand a failure to the dialog's inline error.
+		const actProp = async (
+			fn: () => Promise<void>,
+			onError?: (message: string) => void,
+		): Promise<boolean> => {
+			try {
+				await fn();
+			} catch (e) {
+				onError?.(e instanceof Error ? e.message : String(e));
+				return false;
+			}
+			return true;
+		};
+		try {
+			await act(async () => {
+				root.render(
+					<AddProjectModal
+						act={actProp}
+						onClose={() => {}}
+						onAdded={(interview: string) => added.push(interview)}
+					/>,
+				);
+			});
+		} catch (e) {
+			globalThis.fetch = realFetch;
+			throw e;
+		}
+		return {
+			container,
+			root,
+			posts,
+			added,
+			restore: () => {
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("the board token button retries Add with the prefilled x-access-token", async () => {
+		const { container, root, posts, added, restore } = await mountAdd(true);
+		try {
+			const urlInput = container.querySelector(
+				"input[data-autofocus]",
+			) as unknown as HTMLInputElement;
+			expect(urlInput).not.toBeNull();
+			await act(async () => {
+				typeInto(urlInput, "https://github.com/o/r.git");
+				onChangeOf(urlInput)({
+					target: urlInput,
+					currentTarget: urlInput,
+				});
+			});
+			const form = container.querySelector(
+				"form",
+			) as unknown as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// The 400's needsToken opened the token step, pre-filled with the
+			// GitHub host's convention, and the board token button is offered.
+			const user = container.querySelector(
+				"fieldset input",
+			) as unknown as HTMLInputElement;
+			expect(user.value).toBe("x-access-token");
+			const boardButton = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Use the board GitHub token",
+			);
+			expect(boardButton).toBeDefined();
+			await act(async () => {
+				onClickOf(boardButton as unknown as Element)({});
+			});
+			expect(
+				posts.find((p) => p.url.endsWith("/api/git-hosts/github-token"))?.body,
+			).toEqual({ testUrl: "https://github.com/o/r.git" });
+			expect(posts.filter((p) => p.url.endsWith("/api/projects")).length).toBe(
+				2,
+			);
+			expect(added).toEqual(["i1"]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("without a board token the button is absent", async () => {
+		const { container, root, restore } = await mountAdd(false);
+		try {
+			const urlInput = container.querySelector(
+				"input[data-autofocus]",
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(urlInput, "https://github.com/o/r.git");
+				onChangeOf(urlInput)({
+					target: urlInput,
+					currentTarget: urlInput,
+				});
+			});
+			const form = container.querySelector(
+				"form",
+			) as unknown as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(container.textContent).toContain("Token for github.com");
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Use the board GitHub token",
+				),
+			).toBe(false);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
 	});
 });
 

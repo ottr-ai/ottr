@@ -49,6 +49,38 @@ export function parseGithubHost(raw: unknown): GithubHost | { error: string } {
 	return { host, isDefault, apiBase, webBase: `https://${host}` };
 }
 
+/**
+ * The configured GitHub hostname, env-only and total: the default when the setting is unset
+ * or blank, null when it is invalid. The pure shape of githubHostView() in app.ts.
+ */
+export function configuredGithubHostname(
+	env: Record<string, string | undefined> = process.env,
+): string | null {
+	const raw = env[GITHUB_HOST_ENV];
+	if (raw === undefined || raw.trim() === "") return DEFAULT_GITHUB_HOST;
+	const parsed = parseGithubHost(raw);
+	return "error" in parsed ? null : parsed.host;
+}
+
+/**
+ * The username a stored git-host token defaults to, per host. GitHub ignores the username,
+ * but its own credential helper uses x-access-token, so that is the convention there;
+ * oauth2 is GitLab's. A host:port entry compares by its hostname part only; a hostname
+ * that is not github.com, a *.ghe.com tenant or the configured enterprise host is not
+ * treated as GitHub.
+ */
+export function defaultGitUsername(
+	host: string,
+	configured: string | null,
+): string {
+	const name = (host.split(":", 1)[0] ?? "").toLowerCase();
+	const isGithub =
+		name === "github.com" ||
+		name.endsWith(".ghe.com") ||
+		(configured !== null && name === configured.toLowerCase());
+	return isGithub ? "x-access-token" : "oauth2";
+}
+
 function defaultHost(): GithubHost {
 	const parsed = parseGithubHost(DEFAULT_GITHUB_HOST);
 	if ("error" in parsed) throw new Error(parsed.error); // unreachable: a constant

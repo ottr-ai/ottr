@@ -1726,3 +1726,189 @@ describe("HindsightSection memory backend", () => {
 		}
 	});
 });
+
+describe("GitHostsSection board GitHub token reuse", () => {
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	const view = (githubTokenSet: boolean) => ({
+		tokens: [],
+		globalKey: null,
+		githubApp: null,
+		githubHost: "github.com",
+		githubTokenSet,
+	});
+
+	/** Mock for /api/git-hosts and the GitHub token check; `extra` handles the rest. */
+	const baseMock = (
+		fixture: ReturnType<typeof view>,
+		loaded: { calls: number },
+		extra: (url: string, init?: RequestInit) => Response | undefined,
+	): typeof fetch =>
+		(async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
+				loaded.calls += 1;
+				return ok(fixture);
+			}
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			const hit = extra(url, init);
+			if (hit !== undefined) return hit;
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+
+	test("the board-token button shows only for the configured GitHub host with a token", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(view(true), loaded, () => undefined),
+		);
+		try {
+			const hostInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Host']",
+			);
+			if (hostInput === null) throw new Error("Host input did not render");
+			const buttons = (): Element[] =>
+				Array.from(
+					container.querySelectorAll("#host-tokens-block form button"),
+				);
+			// No host typed yet: hidden.
+			expect(
+				buttons().some((b) => b.textContent === "Use the board GitHub token"),
+			).toBe(false);
+			// The configured GitHub host: shown.
+			await act(async () => {
+				typeInto(hostInput, "github.com");
+				onChangeOf(hostInput)({ target: hostInput, currentTarget: hostInput });
+			});
+			expect(
+				buttons().some((b) => b.textContent === "Use the board GitHub token"),
+			).toBe(true);
+			// Another host: hidden again.
+			await act(async () => {
+				typeInto(hostInput, "gitlab.com");
+				onChangeOf(hostInput)({ target: hostInput, currentTarget: hostInput });
+			});
+			expect(
+				buttons().some((b) => b.textContent === "Use the board GitHub token"),
+			).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("with no board token the button stays hidden even for github.com", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(view(false), loaded, () => undefined),
+		);
+		try {
+			const hostInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Host']",
+			);
+			if (hostInput === null) throw new Error("Host input did not render");
+			await act(async () => {
+				typeInto(hostInput, "github.com");
+				onChangeOf(hostInput)({ target: hostInput, currentTarget: hostInput });
+			});
+			expect(
+				Array.from(
+					container.querySelectorAll("#host-tokens-block form button"),
+				).some((b) => b.textContent === "Use the board GitHub token"),
+			).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("typing a host prefills the username with the host's convention until edited", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(view(true), loaded, () => undefined),
+		);
+		try {
+			const hostInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Host']",
+			);
+			const userInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Username']",
+			);
+			if (hostInput === null || userInput === null)
+				throw new Error("form inputs did not render");
+			const setHost = async (value: string): Promise<void> => {
+				await act(async () => {
+					typeInto(hostInput, value);
+					onChangeOf(hostInput)({
+						target: hostInput,
+						currentTarget: hostInput,
+					});
+				});
+			};
+			await setHost("acme.ghe.com");
+			expect(userInput.value).toBe("x-access-token");
+			await setHost("gitlab.com");
+			expect(userInput.value).toBe("oauth2");
+			// A manual edit pins the username; later host changes keep it.
+			await act(async () => {
+				typeInto(userInput, "my-login");
+				onChangeOf(userInput)({ target: userInput, currentTarget: userInput });
+			});
+			await setHost("acme.ghe.com");
+			expect(userInput.value).toBe("my-login");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("clicking the button POSTs the test URL and refreshes the view", async () => {
+		const loaded = { calls: 0 };
+		let postCalls = 0;
+		let postBody: { testUrl?: string } | undefined;
+		const fetchMock = baseMock(view(true), loaded, (url, init) => {
+			if (
+				url.endsWith("/api/git-hosts/github-token") &&
+				init?.method === "POST"
+			) {
+				postCalls += 1;
+				postBody = JSON.parse(String(init.body));
+				return ok({ host: "github.com", username: "x-access-token" });
+			}
+			return undefined;
+		});
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			const hostInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Host']",
+			);
+			const urlInput = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Test URL (a repository the token can read)']",
+			);
+			if (hostInput === null || urlInput === null)
+				throw new Error("form inputs did not render");
+			await act(async () => {
+				typeInto(hostInput, "github.com");
+				onChangeOf(hostInput)({ target: hostInput, currentTarget: hostInput });
+				typeInto(urlInput, "https://github.com/acme/repo.git");
+				onChangeOf(urlInput)({ target: urlInput, currentTarget: urlInput });
+			});
+			expect(loaded.calls).toBe(1);
+			const button = Array.from(
+				container.querySelectorAll("#host-tokens-block form button"),
+			).find((b) => b.textContent === "Use the board GitHub token");
+			if (button === undefined) throw new Error("board token button missing");
+			await act(async () => {
+				onClickOf(button)({ target: button, currentTarget: button });
+			});
+			expect(postCalls).toBe(1);
+			expect(postBody).toEqual({ testUrl: "https://github.com/acme/repo.git" });
+			expect(loaded.calls).toBe(2);
+		} finally {
+			await unmount();
+		}
+	});
+});

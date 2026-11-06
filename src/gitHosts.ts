@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { configuredGithubHostname, defaultGitUsername } from "./githubHost.ts";
 import { git, redact } from "./worktree.ts";
 
 export const GIT_URL_ERROR =
@@ -207,9 +208,12 @@ export function parseGitToken(
 		return {
 			error: "token must be 8-512 printable characters without whitespace",
 		};
+	const hostKey =
+		parsed.port === null ? parsed.host : `${parsed.host}:${parsed.port}`;
 	return {
-		host: parsed.port === null ? parsed.host : `${parsed.host}:${parsed.port}`,
-		username: username ?? "oauth2",
+		host: hostKey,
+		username:
+			username ?? defaultGitUsername(hostKey, configuredGithubHostname()),
 		token,
 	};
 }
