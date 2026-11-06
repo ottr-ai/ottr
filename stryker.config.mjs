@@ -63,6 +63,10 @@ export default {
   // R8-3 staleness is gone). Release reviews run --force so a release never reuses verdicts
   // across fixture, config, dependency or Stryker-version changes the differ cannot see
   // (docs/ARCH-REVIEWS.md "Delta gate").
+  // Rerun scope, measured 2026-11-06 at 2021d0d on the warm cache: one edited literal in
+  // src/webpush.ts gave "17,181 of 18,581 mutant result(s) are reused", so only the 115
+  // invalidated webpush.ts mutants joined the 1,285 still untested; no other file reran.
+  // Open: the changed-test-file case (killed mutants whose culprit test changed) is unmeasured.
   incremental: true,
   incrementalFile: "reports/stryker-incremental-main.json",
   // Half of the host CPUs (os.availableParallelism()), at least 1, so a run never asks for more
