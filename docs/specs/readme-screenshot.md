@@ -25,9 +25,10 @@ fixed afterwards (a5019bd) by hand. Two gaps:
   data only, never a real board.
 - Drives Chrome headless over CDP with Bun's WebSocket client. No npm dependency:
   adding one is an AGENTS.md hard stop.
-- Chrome discovery: `OTTR_SCREENSHOT_CHROME` env wins, else the newest Chrome in the
-  puppeteer cache (`~/.cache/puppeteer/chrome*`), else `google-chrome` / `chromium` on
-  PATH. Clear error and exit 1 when none exists.
+- Chrome discovery: `OTTR_SCREENSHOT_CHROME` env wins, else the newest Chrome across the
+  puppeteer caches (`~/.cache/puppeteer/chrome*`, then `/root/.cache/puppeteer/chrome*`
+  for a service HOME such as `/etc/ottr/home`; the homedir build wins a version tie), else
+  `google-chrome` / `chromium` on PATH. Clear error and exit 1 when none exists.
 - Emulated view: 1440x900, deviceScaleFactor 1, `prefers-color-scheme: dark`, locale
   `en-US` (else dates render in the host locale, e.g. "27. Okt.").
 - Opens `http://127.0.0.1:<port>/#lumen` (the Lumen demo project), waits 2.5 s for the

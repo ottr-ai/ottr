@@ -26,15 +26,25 @@ function fail(message: string): never {
 	process.exit(1);
 }
 
-/** Chrome builds found in the puppeteer cache, newest version first. */
+/**
+ * Chrome builds found in the puppeteer caches, newest version first. The homedir cache comes
+ * first, then /root's: a service HOME (/etc/ottr/home) leaves the homedir cache empty. The
+ * stable sort keeps the homedir build ahead on a version tie.
+ */
 function cacheBuilds(): { path: string; version: string }[] {
 	const layouts = [
 		{ re: /^linux-(\d[\d.]*)$/, exe: "chrome-linux64/chrome" },
 		{ re: /^win-(\d[\d.]*)$/, exe: "chrome-win64/chrome.exe" },
 	];
+	const roots = new Set([
+		join(homedir(), ".cache", "puppeteer"),
+		join("/root", ".cache", "puppeteer"),
+	]);
+	const cacheDirs = [...roots].flatMap((root) =>
+		["chrome", "chrome-headless-shell"].map((name) => join(root, name)),
+	);
 	const builds: { path: string; version: string }[] = [];
-	for (const name of ["chrome", "chrome-headless-shell"]) {
-		const cacheDir = join(homedir(), ".cache", "puppeteer", name);
+	for (const cacheDir of cacheDirs) {
 		let entries: string[] = [];
 		try {
 			entries = readdirSync(cacheDir);
