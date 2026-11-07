@@ -79,11 +79,18 @@ export function redactSecrets(s: string): {
 	return { text, hits, paused: null };
 }
 
-/** Untrusted text for a prompt: stripInvisible then redactSecrets; throws when redaction pauses. */
+/** The DATA fence markers; untrusted text must never carry one, or it could end its block early. */
+const DATA_FENCE_RE = /<<<DATA|DATA>>>/g;
+
+/**
+ * Untrusted text for a prompt: stripInvisible, redactSecrets, and every DATA fence marker
+ * replaced so the text cannot end its block and pose as trusted prompt text; throws when
+ * redaction pauses.
+ */
 export function clean(s: string): string {
 	const red = redactSecrets(stripInvisible(s).text);
 	if (red.paused !== null) throw new Error(red.paused);
-	return red.text;
+	return red.text.replace(DATA_FENCE_RE, "[fence marker removed]");
 }
 
 /** Fixed system prompt; all fork content arrives as data blocks in the user message. */
