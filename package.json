@@ -21,7 +21,7 @@
     "web-push": "3.6.7"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.3",
+    "@biomejs/biome": "2.6.4",
     "@hughescr/stryker-bun-runner": "^1.6.0",
     "@stryker-mutator/core": "^10.1.1",
     "@types/bun": "^1.4.4",
@@ -30,7 +30,7 @@
     "fast-check": "^4.10.2",
     "happy-dom": "^21.0.4",
     "jscpd": "5.4.2",
-    "knip": "6.43.0",
+    "knip": "6.44.0",
     "typescript": "^7.0.2"
   }
 }
