@@ -10,7 +10,8 @@ import {
 import { createRoot } from "react-dom/client";
 import type { ProjectView, QuotaLimit, QuotaState } from "../types.ts";
 import { latestQuota, liveEvents } from "./socket.ts";
-import { stamp, until } from "./time.ts";
+import { etaLeft } from "./status.ts";
+import { duration, stamp, until } from "./time.ts";
 
 export function clamp(n: number, lo: number, hi: number): number {
 	return Math.min(hi, Math.max(lo, n));
@@ -675,6 +676,34 @@ export function Skeleton({
 				),
 			)}
 		</div>
+	);
+}
+
+/** A live turn's ticking clock: elapsed time, then "about X left" while the median estimate
+ * (etaMs) still has room, then the status words. Re-renders once a second while mounted; pure
+ * text with no animation, so reduced motion is unaffected. Long-wait lines reuse it for the
+ * elapsed part alone ("Consolidating the notes… · 2m", "Provisioning the workers… · 4m"). */
+export function LiveElapsed({
+	since,
+	status,
+	etaMs,
+}: {
+	since: number;
+	status?: string | null;
+	etaMs?: number;
+}) {
+	const [, setTick] = useState(0);
+	useEffect(() => {
+		const t = setInterval(() => setTick((x) => x + 1), 1000);
+		return () => clearInterval(t);
+	}, []);
+	const eta = etaMs !== undefined ? etaLeft(etaMs, since) : null;
+	return (
+		<>
+			{duration(Math.max(0, Date.now() - since))}
+			{status != null && status !== "" && <> · {status}</>}
+			{eta !== null && <> · {eta}</>}
+		</>
 	);
 }
 

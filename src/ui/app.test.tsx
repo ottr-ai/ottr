@@ -786,6 +786,85 @@ describe("LaneCol backlog divider", () => {
 		expect(html).not.toContain("about 4m left");
 		expect(html).not.toContain("· running");
 	});
+
+	test("a running review card counts its landed findings instead of reading running", () => {
+		const since = Date.now() - 65_000;
+		const review = cardFixture({
+			id: "rv1",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			runStartedAt: since,
+		});
+		const done = cardFixture({
+			id: "f1",
+			title: "finding one",
+			followUpOf: "rv1",
+			stage: "done",
+			state: "idle",
+			doneAt: 5,
+		});
+		const open = cardFixture({
+			id: "f2",
+			title: "finding two",
+			followUpOf: "rv1",
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="in_progress"
+				tasks={[review]}
+				projectTasks={[review, done, open]}
+			/>,
+		).replaceAll("<!-- -->", "");
+		// The count rides the ticking meta line in place of the bare "running".
+		expect(html).toContain("1m · 1 of 2 findings done");
+		expect(html).not.toContain("· running<");
+	});
+
+	test("a queued card names its queue slot", () => {
+		const second = cardFixture({
+			id: "q2",
+			stage: "todo",
+			state: "queued",
+			queuedAt: 20,
+		});
+		const first = cardFixture({
+			id: "q1",
+			stage: "todo",
+			state: "queued",
+			queuedAt: 10,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="todo"
+				tasks={[first, second]}
+				projectTasks={[first, second]}
+			/>,
+		).replaceAll("<!-- -->", "");
+		// Earlier queuedAt runs first, so q1 reads #1.
+		expect(html).toContain("#1 in queue");
+		expect(html).toContain("#2 in queue");
+		expect(html).not.toContain(">queued<");
+	});
+
+	test("a held card counts down instead of showing the raw hold stamp", () => {
+		const held = cardFixture({
+			id: "h1",
+			stage: "todo",
+			state: "queued",
+			needsReason: "usage limit: openai-codex resets 14:00",
+			// Half a minute inside the 13m bucket: the floor survives the render's Date.now.
+			holdUntil: Date.now() + 13 * 60_000 + 30_000,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[held]} projectTasks={[held]} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).toContain("held · 13m left");
+		// The raw reset stamp stays off the card face.
+		expect(html).not.toContain("resets 14:00");
+	});
 });
 
 describe("done lane star section", () => {

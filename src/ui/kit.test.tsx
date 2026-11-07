@@ -4,7 +4,13 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { clampPan, Skeleton, ZoomableImage, zoomAt } from "./kit.tsx";
+import {
+	clampPan,
+	LiveElapsed,
+	Skeleton,
+	ZoomableImage,
+	zoomAt,
+} from "./kit.tsx";
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -246,4 +252,37 @@ test("Skeleton renders a labelled status region in the asked shape", () => {
 	);
 	// Each definition row is a label stub plus a field stub.
 	expect(pairs.match(/skeleton-bone/g)).toHaveLength(4);
+});
+
+test("LiveElapsed ticks the elapsed duration, then the status words and the estimate", () => {
+	const now = Date.now();
+	// 65s in: one unit, floored. The static render needs no timer.
+	expect(renderToStaticMarkup(<LiveElapsed since={now - 65_000} />)).toContain(
+		"1m",
+	);
+	// The status words and the median estimate ride the same line, mutation-run style.
+	expect(
+		renderToStaticMarkup(
+			<LiveElapsed
+				since={now - 65_000}
+				status="running"
+				etaMs={65_000 + 4 * 60_000 + 30_000}
+			/>,
+		),
+	).toContain("1m · running · about 4m left");
+	// No etaMs (thin history): elapsed and status only.
+	expect(
+		renderToStaticMarkup(<LiveElapsed since={now - 65_000} status="running" />),
+	).toContain("1m · running");
+	// A spent median renders no estimate, and an empty status no separator.
+	expect(
+		renderToStaticMarkup(
+			<LiveElapsed since={now - 65_000} status="" etaMs={60_000} />,
+		),
+	).toContain("1m");
+	expect(
+		renderToStaticMarkup(
+			<LiveElapsed since={now - 65_000} status="" etaMs={60_000} />,
+		),
+	).not.toContain("·");
 });

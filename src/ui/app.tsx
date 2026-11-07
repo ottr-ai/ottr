@@ -22,7 +22,7 @@ import type { ModelOption } from "../models.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
-import { queueOrder, waitingOn } from "../scheduler.ts";
+import { queueOrder, type ReviewTask, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
 import {
 	type AddProjectResponse,
@@ -87,6 +87,7 @@ import {
 	Icon,
 	type IconName,
 	interviewMsg,
+	LiveElapsed,
 	LOGOUT_KEY,
 	loadLevel,
 	logOut,
@@ -200,7 +201,6 @@ import {
 import {
 	alarmLabel,
 	cardMark,
-	etaLeft,
 	holdFor,
 	reReleaseOf,
 	splitAlarms,
@@ -593,33 +593,6 @@ export function triageWait(a: TaskCard, b: TaskCard): number {
 	return ra - rb || a.updatedAt - b.updatedAt;
 }
 
-/** A live turn's ticking clock: elapsed time, then "about X left" while the median estimate
- * (etaMs) still has room, then the status words. Re-renders once a second while mounted; pure
- * text with no animation, so reduced motion is unaffected. */
-function LiveElapsed({
-	since,
-	status,
-	etaMs,
-}: {
-	since: number;
-	status?: string | null;
-	etaMs?: number;
-}) {
-	const [, setTick] = useState(0);
-	useEffect(() => {
-		const t = setInterval(() => setTick((x) => x + 1), 1000);
-		return () => clearInterval(t);
-	}, []);
-	const eta = etaMs !== undefined ? etaLeft(etaMs, since) : null;
-	return (
-		<>
-			{duration(Math.max(0, Date.now() - since))}
-			{status != null && status !== "" && <> · {status}</>}
-			{eta !== null && <> · {eta}</>}
-		</>
-	);
-}
-
 function Card({
 	task,
 	hasRules,
@@ -631,6 +604,7 @@ function Card({
 	drag,
 	hold,
 	drain,
+	tasks,
 	locked,
 	holdRelease,
 	onOpenTask,
@@ -650,6 +624,10 @@ function Card({
 	hold?: string | null;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	drain?: boolean;
+	/** The project's cards: a running review counts its landed findings, a queued card names
+	 * its queue slot (statusLine's tasks argument); undefined drops both refinements. */
+	tasks?: readonly (ReviewTask &
+		Pick<TaskCard, "title" | "state" | "queuedAt">)[];
 	/** A reorder request for this card is in flight; the card dims and cannot start another drag. */
 	locked?: boolean;
 	/** The release card whose heldMerges list names this card; null or undefined otherwise. */
@@ -807,7 +785,9 @@ function Card({
 						<LiveElapsed
 							since={task.runStartedAt}
 							status={
-								sp === null ? statusLine(task, hasRules, hold, drain) : null
+								sp === null
+									? statusLine(task, hasRules, hold, drain, tasks)
+									: null
 							}
 							etaMs={sp === null ? task.etaMs : undefined}
 						/>
@@ -815,7 +795,7 @@ function Card({
 						age(task.createdAt)
 					)}{" "}
 					{sp === null && task.runStartedAt === undefined && (
-						<>· {statusLine(task, hasRules, hold, drain)}</>
+						<>· {statusLine(task, hasRules, hold, drain, tasks)}</>
 					)}
 					{commits !== null && (
 						<span
@@ -2891,6 +2871,8 @@ function ReleaseDialog({
 	const [err, setErr] = useState<string | null>(null);
 	const [notesDraft, setNotesDraft] = useState<string | null>(null);
 	const [summaryBusy, setSummaryBusy] = useState(false);
+	/** When the notes consolidation call started; the busy line ticks its elapsed time. */
+	const [summarySince, setSummarySince] = useState<number | null>(null);
 	const [summaryReason, setSummaryReason] = useState<string | null>(null);
 	const [showCommits, setShowCommits] = useState(false);
 	const edited = useRef(false);
@@ -2909,6 +2891,7 @@ function ReleaseDialog({
 		setErr(null);
 		setNotesDraft(null);
 		setSummaryBusy(false);
+		setSummarySince(null);
 		setSummaryReason(null);
 		setShowCommits(false);
 		edited.current = false;
@@ -2923,6 +2906,7 @@ function ReleaseDialog({
 				setVersion(data.version);
 				if (data.from !== null) {
 					setSummaryBusy(true);
+					setSummarySince(Date.now());
 					post<{ summary: string | null; reason: string | null }>(
 						`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
 						{ sha: data.sha },
@@ -3026,6 +3010,12 @@ function ReleaseDialog({
 							<p className="hint wait" role="status">
 								<span className="spinner" aria-hidden="true" />
 								Consolidating the notes…
+								{summarySince !== null && (
+									<>
+										{" · "}
+										<LiveElapsed since={summarySince} />
+									</>
+								)}
 							</p>
 						)}
 						{summaryReason !== null && (
@@ -5234,6 +5224,7 @@ export function LaneCol({
 			delta={deltas.get(t.id)}
 			hold={holdFor(t, projectTasks)}
 			drain={draining}
+			tasks={projectTasks}
 			fuOf={t.followUpOf}
 			onOpen={() => open(t.id)}
 			unread={unread(t)}

@@ -6,8 +6,11 @@ import {
 	cardMark,
 	etaLeft,
 	holdFor,
+	holdLeft,
+	queuePosition,
 	releaseHolding,
 	reReleaseOf,
+	reviewProgress,
 	splitAlarms,
 	statusLine,
 	strykerProgress,
@@ -17,6 +20,7 @@ import {
 const t = (
 	overrides: Partial<Parameters<typeof statusLine>[0]> = {},
 ): Parameters<typeof statusLine>[0] => ({
+	id: "t1",
 	cancelledAt: null,
 	state: "queued",
 	stage: "todo",
@@ -24,6 +28,9 @@ const t = (
 	pendingPrompt: null,
 	asked: null,
 	holdUntil: null,
+	kind: "work",
+	releaseVersion: null,
+	doneAt: null,
 	...overrides,
 });
 
@@ -324,24 +331,109 @@ test("strykerStats splits the stats tail into readout rows", () => {
 	expect(strykerStats("")).toEqual([]);
 });
 
-test("statusLine queued with a future holdUntil shows its hold reason", () => {
+test("statusLine queued with a future holdUntil counts down instead of the raw stamp", () => {
 	const reason = "usage limit: openai-codex resets 14:00";
+	// Half a minute inside the 13m bucket: the floor stays 12m across the two Date.now calls.
 	expect(
 		statusLine(
 			t({
 				stage: "in_progress",
 				needsReason: reason,
-				holdUntil: Date.now() + 60_000,
+				holdUntil: Date.now() + 13 * 60_000 + 30_000,
 			}),
 			true,
 		),
-	).toBe(reason);
+	).toBe("held · 13m left");
 	expect(
 		statusLine(
 			t({ stage: "in_progress", needsReason: reason, holdUntil: 1 }),
 			true,
 		),
 	).toBe("resuming");
+});
+
+test("holdLeft counts down in the shared until format, null once due", () => {
+	const now = 1_790_683_200_000;
+	expect(holdLeft(now + 12 * 60_000 + 30_000, now)).toBe("held · 12m left");
+	expect(holdLeft(now + 90 * 60_000, now)).toBe("held · 1h 30m left");
+	expect(holdLeft(now, now)).toBeNull();
+	expect(holdLeft(now - 1, now)).toBeNull();
+});
+
+test("queuePosition reads the card's queueOrder slot", () => {
+	// Earlier queuedAt runs first, so q2 is #1.
+	const q1 = card({ id: "q1", state: "queued", queuedAt: 20 });
+	const q2 = card({ id: "q2", state: "queued", queuedAt: 10 });
+	const run = card({ id: "r9", state: "running", stage: "in_progress" });
+	expect(queuePosition([run, q1, q2], q2)).toBe("#1 in queue");
+	expect(queuePosition([run, q1, q2], q1)).toBe("#2 in queue");
+	// Running, cancelled and unknown cards have no slot.
+	expect(queuePosition([run, q1, q2], run)).toBeNull();
+	expect(
+		queuePosition(
+			[run, q1, q2],
+			card({ id: "zz", state: "queued", cancelledAt: 5 }),
+		),
+	).toBeNull();
+	expect(queuePosition([], card({ id: "q3", state: "queued" }))).toBeNull();
+	// Through statusLine the plain "queued" words become the slot; a held card keeps its hold.
+	// needsReason rides explicitly: the card fixture casts, so unfilled fields are undefined.
+	const plain = card({
+		id: "p1",
+		state: "queued",
+		stage: "todo",
+		queuedAt: 30,
+		needsReason: null,
+		pendingPrompt: null,
+		holdUntil: null,
+		asked: null,
+	});
+	expect(statusLine(plain, true, null, false, [q1, q2, plain])).toBe(
+		"#3 in queue",
+	);
+	expect(
+		statusLine({ ...plain, stage: "merging" }, true, "blocked by X", false, [
+			q1,
+			q2,
+			plain,
+		]),
+	).toBe("blocked by X");
+});
+
+test("reviewProgress counts a running review's landed findings", () => {
+	const r = review({ stage: "in_progress", state: "running" });
+	const done1 = finding({ id: "f1", stage: "done", state: "idle", doneAt: 5 });
+	const open = finding({ id: "f2" });
+	const gone = finding({ id: "f3", cancelledAt: 5 });
+	// A cancelled finding is not open: like reReleaseOf, it counts as handled.
+	expect(reviewProgress([r, done1, open, gone], r)).toBe(
+		"2 of 3 findings done",
+	);
+	// A release card runs the same review: it counts too.
+	const rel = release({ state: "running", stage: "in_progress", doneAt: null });
+	expect(reviewProgress([rel, done1, open], rel)).toBe("1 of 2 findings done");
+	// Not running, not a review, or no finding yet: null, the plain words stay.
+	expect(
+		reviewProgress([r, done1, open], review({ stage: "in_progress" })),
+	).toBeNull();
+	expect(
+		reviewProgress(
+			[r, done1, open],
+			review({ stage: "in_progress", state: "idle" }),
+		),
+	).toBeNull();
+	expect(reviewProgress([r], r)).toBeNull();
+	// Through statusLine the count replaces "running" on the card; progress outranks it.
+	expect(statusLine(r, true, null, false, [r, done1, open, gone])).toBe(
+		"2 of 3 findings done",
+	);
+	expect(statusLine(r, true, null, false)).toBe("running");
+	expect(
+		statusLine({ ...r, progress: "Stryker 5% · 1/10" }, true, null, false, [
+			r,
+			done1,
+		]),
+	).toBe("Stryker 5% · 1/10");
 });
 
 const release = (over: Partial<TaskCard> = {}): TaskCard =>

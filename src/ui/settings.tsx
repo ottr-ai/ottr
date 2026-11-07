@@ -31,6 +31,7 @@ import {
 	type IconName,
 	type InstantSave,
 	interviewMsg,
+	LiveElapsed,
 	logOut,
 	Mark,
 	Meter,
@@ -2968,6 +2969,8 @@ function ModelRolesSection() {
 		after: Record<string, string>;
 	} | null>(null);
 	const [prov, setProv] = useState<ProvisionStep | null>(null);
+	/** When this page's provision call started; the running line ticks its elapsed time. */
+	const [provSince, setProvSince] = useState<number | null>(null);
 	const save = useBusy();
 	const uid = useId();
 	const load = useCallback(
@@ -3036,6 +3039,7 @@ function ModelRolesSection() {
 	};
 	const provision = async (): Promise<void> => {
 		setProv({ state: "running" });
+		setProvSince(Date.now());
 		try {
 			const res = await post<{
 				ok: boolean;
@@ -3059,6 +3063,9 @@ function ModelRolesSection() {
 				results: [],
 				error: err instanceof Error ? err.message : String(err),
 			});
+		} finally {
+			// "still" hands the watch to the Alate section: this line stops counting.
+			setProvSince(null);
 		}
 	};
 	const submit = (): void =>
@@ -3069,6 +3076,7 @@ function ModelRolesSection() {
 			setCommit(null);
 			setSaved(null);
 			setProv(null);
+			setProvSince(null);
 			try {
 				const res = await fetch("/api/model-roles", {
 					method: "POST",
@@ -3322,6 +3330,12 @@ function ModelRolesSection() {
 								<>
 									<span className="spinner" aria-hidden="true" />
 									Provisioning the workers…
+									{provSince !== null && (
+										<>
+											{" · "}
+											<LiveElapsed since={provSince} />
+										</>
+									)}
 								</>
 							) : prov.state === "still" ? (
 								<>

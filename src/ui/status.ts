@@ -1,12 +1,14 @@
 import {
 	depHold,
+	isReview,
 	mergeHold,
 	PUSH_HOLD,
+	queueOrder,
 	type ReviewTask,
 	reviewFindings,
 } from "../scheduler.ts";
 import type { Task, TaskCard } from "../types.ts";
-import { duration } from "./time.ts";
+import { duration, until } from "./time.ts";
 
 /** "about X left" for a live turn against its project/kind/model median turn length, in the
  * mutation-run style. null once the median is used up (elapsed time alone from there) — and
@@ -65,6 +67,44 @@ export function strykerStats(rest: string): Array<{
 	});
 }
 
+/** "k of N findings done" while a review or release card runs: counts how many of the
+ * review's findings (reviewFindings) have already landed (done) or been cancelled. null
+ * when t is not a running review or no finding is filed yet — the plain "running" stays. */
+export function reviewProgress(
+	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
+	t: Pick<Task, "id" | "kind" | "releaseVersion" | "doneAt" | "state">,
+): string | null {
+	if (t.state !== "running" || !isReview(t)) return null;
+	const findings = reviewFindings(tasks, t);
+	const n = findings.length;
+	if (n === 0) return null;
+	const done = findings.filter(
+		(f) => f.stage === "done" || f.cancelledAt !== null,
+	).length;
+	return `${done} of ${n} findings done`;
+}
+
+/** "#2 in queue" for a queued card: its position in queueOrder, the order the tracker and
+ * the column render. null when t is not queued or not in the list — the plain words stay. */
+export function queuePosition(
+	tasks: readonly (ReviewTask & Pick<Task, "title" | "state" | "queuedAt">)[],
+	t: Pick<Task, "id" | "state" | "cancelledAt">,
+): string | null {
+	if (t.state !== "queued" || t.cancelledAt !== null) return null;
+	const n = queueOrder(tasks).findIndex((q) => q.id === t.id) + 1;
+	return n > 0 ? `#${n} in queue` : null;
+}
+
+/** "held · 12m left" for a card the tracker parked until a future holdUntil (a usage
+ * limit): the countdown replaces the raw reset stamp the reason names. null once past. */
+export function holdLeft(
+	holdUntil: number,
+	now: number = Date.now(),
+): string | null {
+	if (holdUntil <= now) return null;
+	return `held · ${until(holdUntil, now)} left`;
+}
+
 export function statusLine(
 	t: Pick<
 		TaskCard,
@@ -76,11 +116,18 @@ export function statusLine(
 		| "asked"
 		| "progress"
 		| "holdUntil"
+		| "kind"
+		| "releaseVersion"
+		| "doneAt"
+		| "id"
 	>,
 	hasRules: boolean,
 	hold?: string | null,
 	/** True while an update holds new turns (POST /api/drain): every queued card waits for the restart. */
 	drain = false,
+	/** The project's cards, when the caller has them: counts a running review's findings
+	 * (reviewProgress) and a queued card's position (queuePosition). */
+	tasks?: readonly (ReviewTask & Pick<Task, "title" | "state" | "queuedAt">)[],
 ): string {
 	// A cancelled card is final; the card's "Cancelled" chip carries the time.
 	if (t.cancelledAt !== null) return "cancelled";
@@ -89,9 +136,10 @@ export function statusLine(
 		return t.stage === "backlog"
 			? "grill queued"
 			: t.needsReason !== null
-				? // A future holdUntil holds the card (a usage limit): show why.
+				? // A future holdUntil holds the card (a usage limit): count down instead of
+					// the raw reset stamp the reason carries.
 					t.holdUntil !== null && t.holdUntil > Date.now()
-					? t.needsReason
+					? (holdLeft(t.holdUntil) ?? t.needsReason)
 					: "resuming"
 				: t.pendingPrompt !== null
 					? drain
@@ -106,9 +154,10 @@ export function statusLine(
 							? hold
 							: drain
 								? "waiting for the update restart"
-								: "queued";
+								: (queuePosition(tasks ?? [], t) ?? "queued");
 	if (t.state === "preparing") return "preparing";
-	if (t.state === "running") return t.progress ?? "running";
+	if (t.state === "running")
+		return t.progress ?? reviewProgress(tasks ?? [], t) ?? "running";
 	if (t.state === "needs_you")
 		return t.asked !== null ? "question asked" : "action required";
 	// A review card parked while its findings land: the reason is the status.
