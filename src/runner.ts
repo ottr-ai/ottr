@@ -346,6 +346,9 @@ export const WORKER_LOST = "the worker running this turn died";
 /** Opens the model-restore reason; classify and runTurn match it in the previous turn's error. */
 export const MODEL_RESTORE = "This board cannot load the session's model";
 
+/** Opens the usage-limit continue reason; classify matches it in the previous turn's error. */
+export const QUOTA_LIMIT = "The run stopped at the provider's usage limit";
+
 /**
  * omp writes one JSON file per rejected HTTP 400 request under its state root:
  * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
@@ -420,6 +423,17 @@ export function deathLine(stderr: string): string | undefined {
 		lines.at(-1) ??
 		all.at(-1);
 	return line?.replace(/^error: /, "").replace(/\.$/, "");
+}
+
+/** True when the run stopped at the provider's usage or quota limit: a retry before the
+ * reset fails the same way. Covers omp's usage_limit_reached, the human "usage limit"
+ * wording, and the gateways' "quota exhausted" / "quota exceeded" / "no quota" /
+ * insufficient_quota forms. Rate limits stay out: they clear in seconds, so an immediate
+ * retry is right for them. Shared with the check runs' hold logic in turn.ts. */
+export function hitUsageLimit(r: RunResult): boolean {
+	return /usage_limit_reached|usage limit|quota exhausted|quota exceeded|no quota|insufficient_quota/i.test(
+		`${r.stderrTail}\n${r.providerError ?? ""}`,
+	);
 }
 
 /** Pure: decide where a task goes after a turn. First matching rule wins.
@@ -540,6 +554,22 @@ export function classify(o: {
 				state: "queued",
 				needsReason: `${MODEL_RESTORE} ${lost} (no sign-in for its provider here) - retrying with the board's default model role. Cancel to stop it instead.`,
 			};
+		// The run died at the provider's usage or quota limit: a retry before the reset fails
+		// the same way. One automatic continue per streak (worker-lost's rule): the settle in
+		// turn.ts stamps the provider's reset as holdUntil on the queued card when the provider
+		// reports one, so the continue fires after the reset; without a known reset the retry
+		// starts at once, and this same rule's second death parks for a human.
+		if (hitUsageLimit(result))
+			return o.previousError?.startsWith(QUOTA_LIMIT)
+				? needs(
+						`${QUOTA_LIMIT} again after the automatic continue${last ? `: ${last}` : ""}. Reply after the limit resets, or switch the card's model, then reply.`,
+					)
+				: {
+						stage,
+						state: "queued",
+						needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+						pendingPrompt: ".",
+					};
 		const ctx = last
 			? `: ${last}`
 			: result.dispatch

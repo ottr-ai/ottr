@@ -601,6 +601,9 @@ export interface Next {
 	needsReason: string | null;
 	/** Automatic continue, sent as the next turn's reply. */
 	pendingPrompt?: string;
+	/** Epoch ms before which the scheduler must not start the queued card: a usage-limit
+	 * continue waiting for the provider's reset. Absent keeps the column. */
+	holdUntil?: number;
 	/** Who authored pendingPrompt; defaults to "supervisor" when the settle writes it. */
 	pendingBy?: "user" | "supervisor" | null;
 	/** Outstanding agent ask to store on the task (the "?" state); absent/undefined clears nothing by itself. */

@@ -40,7 +40,7 @@ import {
 	replyPrompt,
 	restartResumePrompt,
 } from "./prompts.ts";
-import { WORKER_LOST } from "./runner.ts";
+import { hitUsageLimit, WORKER_LOST } from "./runner.ts";
 import {
 	FINDINGS_HOLD,
 	isRetro,
@@ -61,7 +61,6 @@ import {
 	FORK_HOLD_REASON,
 	generateTitle,
 	getSettingsLogged,
-	hitUsageLimit,
 	isKeptReason,
 	keptReason,
 	logStoreError,
@@ -10457,7 +10456,10 @@ describe("review findings check", () => {
 								recorded: record.recorded,
 							})
 						: record.runs.length === 2
-							? runResult({ exitCode: 1, stderrTail: "quota exceeded\n" })
+							? runResult({
+									exitCode: 1,
+									stderrTail: "error: the provider dropped the connection\n",
+								})
 							: runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' });
 				return {
 					pid: 4242,
@@ -10511,7 +10513,8 @@ describe("review findings check", () => {
 	});
 
 	/** A review whose check hits the openai-codex usage limit; `duringQuota` runs while the
-	 * board awaits the quota, where a cancel or a steer can land. */
+	 * board awaits the quota for the check's hold (the second fetch — the start gate's own
+	 * fetch comes first), where a cancel or a steer can land. */
 	async function limitedReview(
 		duringQuota: (store: ProjectStore, id: string) => void = () => {},
 	) {
@@ -10519,10 +10522,12 @@ describe("review findings check", () => {
 		record.recorded = [finding("Bug A", 1)];
 		const resetsAt = Date.now() + 3_600_000;
 		const ref: { id: string; store?: ProjectStore } = { id: "" };
+		let quotaCalls = 0;
 		const { store, loop } = setupWith(record, {
 			commitsAhead: async () => 0,
 			quota: async () => {
-				duringQuota(ref.store!, ref.id);
+				quotaCalls++;
+				if (quotaCalls === 2) duringQuota(ref.store!, ref.id);
 				return {
 					limits: [
 						{
@@ -10600,6 +10605,198 @@ describe("review findings check", () => {
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toStartWith("also check the docs\n\n");
 		expect(after.pendingPrompt).toContain("usage limit");
+	});
+
+	// The dispatched model's provider is out of quota: starts hold until the reset, deaths
+	// continue once, and the death's continue waits for the provider's reported reset. A
+	// queued continue without a reset is picked up at once by the loop's own schedule(), so
+	// these tests flush until the chain reaches a terminal state (a park or a success).
+	describe("usage-limit start gate and auto-continue", () => {
+		const fakeQuota =
+			(provider: string, usedPct: number, resetsAt: number | null) =>
+			async () => ({
+				limits: [
+					{
+						provider,
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct,
+						resetsAt,
+					},
+				],
+				error: null,
+				at: Date.now(),
+			});
+		const dyingRun =
+			(record: Recorded, model = "fake/glm") =>
+			(o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							exitCode: 1,
+							model,
+							providerError: "429 quota exhausted",
+						}),
+					),
+					kill: async () => {},
+				};
+			};
+		const runnableIds = (store: ProjectStore, now?: number) =>
+			pickRunnable(store.listTasks(), {
+				maxParallel: null,
+				hasRules: true,
+				now,
+			}).map((t) => t.id);
+		/** Drains the loop's own background turns until the card leaves the given states. */
+		const untilSettled = async (
+			store: ProjectStore,
+			id: string,
+			inFlight: (state: string, stage: string) => boolean,
+		) => {
+			for (let i = 0; i < 100; i++) {
+				const t = store.getTask(id)!;
+				if (!inFlight(t.state, t.stage)) return;
+				await flushPromises();
+			}
+		};
+
+		test("a start at the provider's limit holds the card until the reset and starts nothing", async () => {
+			const resetsAt = Date.now() + 3_600_000;
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 100, resetsAt),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			expect(record.runs).toHaveLength(0);
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(resetsAt);
+			expect(after.needsReason).toContain("The fake usage limit is reached");
+			expect(after.needsReason).toContain("starts the task again");
+			expect(runnableIds(store)).not.toContain(task.id);
+			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
+		});
+
+		test("a run the provider stops mid-turn continues automatically until its reset", async () => {
+			const resetsAt = Date.now() + 3_600_000;
+			const record = baseRecord();
+			// No default role: the start gate cannot bind a provider, so the run goes out;
+			// the served model's provider is the one the death's continue waits for.
+			const { store, loop } = setupWith(record, {
+				modelRoles: () => ({}),
+				quota: fakeQuota("fake", 100, resetsAt),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			expect(record.runs).toHaveLength(1);
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(resetsAt);
+			expect(after.pendingPrompt).toBe(".");
+			expect(after.needsReason).toStartWith(
+				"The run stopped at the provider's usage limit",
+			);
+			expect(after.needsReason).toContain("fake limit resets at");
+			// The turn row carries the reason, so the next classify sees the streak.
+			expect(store.listTurns(task.id).at(-1)!.error).toStartWith(
+				"The run stopped at the provider's usage limit",
+			);
+			// Held past the reset: the scheduler starts the continue then, not now.
+			expect(runnableIds(store)).not.toContain(task.id);
+			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
+		});
+
+		test("a quota death without a known reset continues at once, and the next death parks", async () => {
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 60, Date.now() + 3_600_000),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+			// The first settle queued a continue with no hold: the loop's schedule() starts it
+			// right away, it dies the same way, and the streak rule parks for a human.
+			await untilSettled(
+				store,
+				task.id,
+				(state, stage) =>
+					state === "preparing" ||
+					state === "running" ||
+					(state === "queued" && stage === "in_progress"),
+			);
+
+			expect(record.runs).toHaveLength(2);
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toContain(
+				"The run stopped at the provider's usage limit again after the automatic continue",
+			);
+			expect(after.needsReason).toContain("429 quota exhausted");
+			expect(after.pendingPrompt).toBeNull();
+			const rows = store.listTurns(task.id);
+			expect(rows).toHaveLength(2);
+			expect(rows[0]!.error).toBe(
+				"The run stopped at the provider's usage limit - continuing automatically. Cancel to stop it instead.",
+			);
+		});
+
+		test("the automatic continue runs the task and its success settles normally", async () => {
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				commitsAhead: async () => 0,
+				quota: fakeQuota("fake", 60, Date.now() + 3_600_000),
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess");
+					// The continue succeeds with an answered outcome and no commits: the card
+					// settles done/idle, which the merge queue does not pick up, so the
+					// background chain ends here.
+					const result =
+						record.runs.length === 1
+							? runResult({
+									exitCode: 1,
+									model: "fake/glm",
+									providerError: "429 quota exhausted",
+								})
+							: runResult({
+									outcome: { status: "answered", summary: "continued fine" },
+								});
+					return {
+						pid: 4242,
+						done: Promise.resolve(result),
+						kill: async () => {},
+					};
+				},
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+			await untilSettled(
+				store,
+				task.id,
+				(state, stage) =>
+					state === "preparing" ||
+					state === "running" ||
+					(state === "queued" && stage === "in_progress"),
+			);
+
+			expect(record.runs).toHaveLength(2);
+			const after = store.getTask(task.id)!;
+			// The continue's successful run settled the card like any answered work turn.
+			expect(after.stage).toBe("done");
+			expect(after.state).toBe("idle");
+			expect(after.needsReason).toBeNull();
+			expect(after.pendingPrompt).toBeNull();
+			expect(store.listTurns(task.id)).toHaveLength(2);
+		});
 	});
 
 	test("the check holds a global cap slot while it runs", async () => {
@@ -11290,8 +11487,12 @@ describe("work card check", () => {
 
 	test("a check that fails twice leaves the card needs_you without stamping the head", async () => {
 		const head = { sha: "sha1" };
-		const quota = runResult({ exitCode: 1, stderrTail: "quota exceeded\n" });
-		const { store, record, loop } = workCheckCase(head, [quota, quota]);
+		// A transient failure, not a usage limit: the limit skips the retry and holds instead.
+		const transient = runResult({
+			exitCode: 1,
+			stderrTail: "error: the provider dropped the connection\n",
+		});
+		const { store, record, loop } = workCheckCase(head, [transient, transient]);
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
@@ -11305,7 +11506,9 @@ describe("work card check", () => {
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
 		// No adversary role: the record names the default role the check fell back to.
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
-		expect(after.workCheckLog[0]!.error).toContain("quota exceeded");
+		expect(after.workCheckLog[0]!.error).toContain(
+			"the provider dropped the connection",
+		);
 	});
 
 	const usageLimited = runResult({

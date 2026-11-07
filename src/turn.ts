@@ -58,7 +58,9 @@ import {
 	classify,
 	deathLine,
 	findHttp400Rejection,
+	hitUsageLimit,
 	MODEL_RESTORE,
+	QUOTA_LIMIT,
 	rejectedReport,
 	resumePlan,
 	WORKER_BUSY,
@@ -724,13 +726,6 @@ export function checkRunError(r: RunResult): string | null {
 	return null;
 }
 
-/** True when the run stopped at the provider's usage limit: a retry before the reset fails the same way. */
-export function hitUsageLimit(r: RunResult): boolean {
-	return /usage_limit_reached|usage limit/i.test(
-		`${r.stderrTail}\n${r.providerError ?? ""}`,
-	);
-}
-
 /** The queued write that holds a check run until its provider's usage limit resets. */
 interface UsageHold {
 	holdUntil: number;
@@ -902,8 +897,7 @@ export function createTurnLoop(
 	const running = new Map<string, RunEntry>();
 	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
 	async function usageHold(model: string | null): Promise<UsageHold | null> {
-		const q = await ops.quota?.().catch(() => null);
-		const hit = q ? usageReset(q.limits, model, Date.now()) : null;
+		const hit = await usageResetFor(model);
 		if (hit === null) return null;
 		const at = new Date(hit.resetsAt)
 			.toISOString()
@@ -914,6 +908,14 @@ export function createTurnLoop(
 			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
 			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
 		};
+	}
+	/** The dispatched model's provider's exhausted-window reset from the board's quota state
+	 * (ops.quota is optional and may be absent in tests): null when nothing is known. */
+	async function usageResetFor(
+		model: string | null,
+	): Promise<{ provider: string; resetsAt: number } | null> {
+		const q = await ops.quota?.().catch(() => null);
+		return q ? usageReset(q.limits, model, Date.now()) : null;
 	}
 	/** The write that holds card `id`, or null when the card is no longer this run's: a cancel or
 	 * kept-worktree cancel may land during the quota await and owns the state then. Text the user
@@ -2329,6 +2331,34 @@ export function createTurnLoop(
 						: `- model ${runModel}: the board's default role replaces the session's model`,
 				);
 
+			// Start gate: the dispatched model's provider is out of quota with a known reset.
+			// Starting now would die at the provider's first answer, so requeue with the reset
+			// as holdUntil — the scheduler starts the card when the limit resets. A reply or
+			// steer queued meanwhile stays pending: this start consumed nothing. A cancel
+			// landing during the quota await owns the card; only a still-claimed card requeues.
+			const startHold = await usageResetFor(
+				runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
+			);
+			if (startHold !== null) {
+				const at = new Date(startHold.resetsAt)
+					.toISOString()
+					.slice(0, 16)
+					.replace("T", " ");
+				log(
+					`- ${kind} turn held until ${at} UTC: ${startHold.provider} usage limit`,
+				);
+				const cur = store.getTask(id);
+				if (cur && cur.cancelledAt === null && cur.state === "preparing")
+					store.updateTask(id, {
+						state: "queued",
+						queuedAt: Date.now(),
+						holdUntil: startHold.resetsAt,
+						needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
+					});
+				ops.publishSoon();
+				return;
+			}
+
 			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
 			const runStartedAt = Date.now();
 			const handle = ops.startRun({
@@ -3273,6 +3303,29 @@ export function createTurnLoop(
 			// The PR-mode ship step owns the card's next state: it never lands, so the done
 			// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 			if (prNext !== null) next = prNext;
+			// A run the provider stopped at its usage limit continues automatically (classify's
+			// queued continue): stamp the provider's reset as the hold, so the continue fires
+			// after the reset instead of against the still-exhausted window. Without a known
+			// reset the retry starts at once; classify's streak rule parks the next identical
+			// death for a human.
+			if (
+				next.state === "queued" &&
+				next.pendingPrompt !== undefined &&
+				hitUsageLimit(result)
+			) {
+				const hit = await usageResetFor(result.model ?? runModel ?? null);
+				if (hit !== null) {
+					const at = new Date(hit.resetsAt)
+						.toISOString()
+						.slice(0, 16)
+						.replace("T", " ");
+					next = {
+						...next,
+						holdUntil: hit.resetsAt,
+						needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
+					};
+				}
+			}
 			// A failed server push keeps the card at merging with git's reason: the worktree stays.
 			// OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
 			// server fetches origin with its own credentials, then — OTTR-510 — rebases the
@@ -3863,6 +3916,10 @@ export function createTurnLoop(
 							state: next.state,
 							needsReason: next.needsReason,
 							queuedAt: next.state === "queued" ? now : task.queuedAt,
+							// A usage-limit continue's reset hold; undefined keeps the column.
+							...(next.holdUntil !== undefined
+								? { holdUntil: next.holdUntil }
+								: {}),
 						}),
 				shots,
 				pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it

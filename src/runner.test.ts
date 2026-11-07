@@ -29,8 +29,10 @@ import {
 	classify,
 	createRunSink,
 	findHttp400Rejection,
+	hitUsageLimit,
 	NO_DISCOVERY_CONFIG,
 	newEventState,
+	QUOTA_LIMIT,
 	rejectedReport,
 	renderEvent,
 	resumePlan,
@@ -858,6 +860,47 @@ describe("findHttp400Rejection", () => {
 	});
 });
 
+describe("hitUsageLimit", () => {
+	test("matches the providers' quota wordings on stderr or the structured error", () => {
+		expect(
+			hitUsageLimit(result({ stderrTail: "error: usage_limit_reached\n" })),
+		).toBe(true);
+		expect(
+			hitUsageLimit(
+				result({ providerError: "The usage limit has been reached" }),
+			),
+		).toBe(true);
+		expect(
+			hitUsageLimit(result({ providerError: "429 quota exhausted" })),
+		).toBe(true);
+		expect(
+			hitUsageLimit(result({ stderrTail: "gateway status 502: no quota\n" })),
+		).toBe(true);
+		expect(
+			hitUsageLimit(
+				result({
+					providerError: "insufficient_quota: You exceeded your current quota",
+				}),
+			),
+		).toBe(true);
+		expect(
+			hitUsageLimit(
+				result({ providerError: "quota exceeded for this project" }),
+			),
+		).toBe(true);
+	});
+
+	test("leaves rate limits and ordinary deaths to the generic rules", () => {
+		expect(hitUsageLimit(result({ stderrTail: "boom\n" }))).toBe(false);
+		expect(
+			hitUsageLimit(
+				result({ stderrTail: "error: rate limit (429), retry in 2s\n" }),
+			),
+		).toBe(false);
+		expect(hitUsageLimit(result({}))).toBe(false);
+	});
+});
+
 describe("classify", () => {
 	const run = (
 		kind: TurnKind,
@@ -1148,6 +1191,65 @@ describe("classify", () => {
 			state: "needs_you",
 			needsReason:
 				"This board cannot load the session's model, and the retry with the board's default model role failed too: No API key found for anthropic. Sign in to a provider under Settings, set a default model role, or switch the card's model, then reply.",
+		});
+	});
+
+	test("2i. a usage-limit death continues once, then parks", () => {
+		// The z.ai gateway shape: the provider's structured error, no stderr line.
+		const gateway = run(
+			"work",
+			result({ exitCode: 1, providerError: "429 quota exhausted" }),
+		);
+		expect(gateway).toEqual({
+			stage: "in_progress",
+			state: "queued",
+			needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+			pendingPrompt: ".",
+		});
+		// omp's own wording on stderr, on a merge turn.
+		expect(
+			run(
+				"merge",
+				result({
+					exitCode: 1,
+					stderrTail:
+						"error: The usage limit has been reached (code=usage_limit_reached)\n",
+				}),
+			),
+		).toEqual({
+			stage: "merging",
+			state: "queued",
+			needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+			pendingPrompt: ".",
+		});
+		// The continue fired once already and the provider still refuses: a human decides.
+		expect(
+			run(
+				"work",
+				result({ exitCode: 1, providerError: "429 quota exhausted" }),
+				git(),
+				"origin/main",
+				gateway.needsReason ?? null,
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `${QUOTA_LIMIT} again after the automatic continue: 429 quota exhausted. Reply after the limit resets, or switch the card's model, then reply.`,
+		});
+		// A rate limit is not a quota: it clears in seconds, so the generic death park stays.
+		expect(
+			run(
+				"work",
+				result({
+					exitCode: 1,
+					stderrTail: "error: rate limit exceeded (429), retrying in 2s\n",
+				}),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason:
+				"omp exited with code 1 before finishing: rate limit exceeded (429), retrying in 2s.",
 		});
 	});
 
