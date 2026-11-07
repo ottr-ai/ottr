@@ -140,6 +140,7 @@ import {
 	type AlertPayload,
 	ackKeys,
 	type ClassPrefs,
+	type ClearBound,
 	type ClearPayload,
 	clearedAlerts,
 	deliverable,
@@ -286,9 +287,7 @@ import {
 	loadSkips,
 	mapRepo,
 	migratePendingToSkips,
-	planUpdatesPush,
 	removePrompt,
-	type UpdatesPushState,
 	updatePrompt,
 	validateUpdates,
 } from "./updates.ts";
@@ -978,16 +977,32 @@ export function createApp(deps: AppDeps) {
 	 * Persisted (GlobalStore `notify_live_alerts`) so a restart can still retract what the
 	 * devices show; the first frame after boot clears what resolved while the board was down. */
 	const ALERT_STATE_KEY = "notify_live_alerts";
-	/** Apple endpoint → class tags whose retraction waits for the next alert push to that device:
+	/** Apple endpoint → retraction bounds that wait for the next alert push to that device:
 	 * Apple never receives a data-only clear (see isApplePush). Persisted with the registry. */
-	let appleClear = new Map<string, Set<AlertClass>>();
+	let appleClear = new Map<string, ClearBound>();
+	/** Endpoint → per-class sequence number of the last alert payload sent to that device. A
+	 * retraction carries the number current when it was decided, so it can only ever close
+	 * notifications shown before it, never a later alert that overtook it. Persisted. */
+	let alertSeqs = new Map<string, Record<AlertClass, number>>();
 	let liveAlerts: LiveAlert[] = [];
 	{
 		const raw: unknown = deps.gstore.get<unknown>(ALERT_STATE_KEY);
 		const isClass = (c: unknown): c is AlertClass =>
 			typeof c === "string" && (ALERT_CLASSES as readonly string[]).includes(c);
+		/** A {class: number} object with only valid entries. */
+		const bounds = (v: unknown): ClearBound => {
+			const out: ClearBound = {};
+			if (typeof v === "object" && v !== null)
+				for (const [c, n] of Object.entries(v))
+					if (isClass(c) && typeof n === "number") out[c] = n;
+			return out;
+		};
 		if (typeof raw === "object" && raw !== null) {
-			const r = raw as { alerts?: unknown; appleClear?: unknown };
+			const r = raw as {
+				alerts?: unknown;
+				appleClear?: unknown;
+				seqs?: unknown;
+			};
 			if (Array.isArray(r.alerts))
 				liveAlerts = r.alerts.flatMap((a: unknown): LiveAlert[] => {
 					if (typeof a !== "object" || a === null) return [];
@@ -1011,23 +1026,34 @@ export function createApp(deps: AppDeps) {
 						: [];
 				});
 			if (typeof r.appleClear === "object" && r.appleClear !== null)
-				for (const [endpoint, tags] of Object.entries(r.appleClear)) {
-					const set = new Set(Array.isArray(tags) ? tags.filter(isClass) : []);
-					if (set.size > 0) appleClear.set(endpoint, set);
+				for (const [endpoint, b] of Object.entries(r.appleClear)) {
+					const parsed = bounds(b);
+					if (Object.keys(parsed).length > 0) appleClear.set(endpoint, parsed);
 				}
+			if (typeof r.seqs === "object" && r.seqs !== null)
+				for (const [endpoint, s] of Object.entries(r.seqs))
+					alertSeqs.set(endpoint, {
+						request: 0,
+						error: 0,
+						complete: 0,
+						...bounds(s),
+					});
 		}
 	}
-	/** Writes the registry and the pending Apple clears; drops pending clears of gone devices. */
+	/** Writes the registry, the pending Apple clears and the sequence numbers; drops entries of
+	 * gone devices. */
 	function saveAlertState(): void {
 		const endpoints = new Set(loadSubs(deps.gstore).map((s) => s.endpoint));
 		appleClear = new Map(
-			[...appleClear].filter(([e, t]) => endpoints.has(e) && t.size > 0),
+			[...appleClear].filter(
+				([e, b]) => endpoints.has(e) && Object.keys(b).length > 0,
+			),
 		);
+		alertSeqs = new Map([...alertSeqs].filter(([e]) => endpoints.has(e)));
 		deps.gstore.set(ALERT_STATE_KEY, {
 			alerts: liveAlerts,
-			appleClear: Object.fromEntries(
-				[...appleClear].map(([e, t]) => [e, [...t]]),
-			),
+			appleClear: Object.fromEntries(appleClear),
+			seqs: Object.fromEntries(alertSeqs),
 		});
 	}
 	/** Board tab id → epoch ms of its last focus heartbeat (POST /api/presence). Map order is
@@ -1048,11 +1074,12 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** The card's newest settled turn as Error facts: one indexed row per card and frame, so a
-	 * turn that starts and fails between two frames is never missed. Only a turn that ended
-	 * without a reported outcome failed: a reported turn (ready, answered, needs_you) stores its
-	 * hold reason in turns.error too (turn.ts finishTurn), and that hold is a Request, not an
-	 * Error. A deliberate cancel (error "cancelled", see ProjectStore.finishTurn) is no failure
-	 * either. A sick store keeps `fallback`. */
+	 * turn that starts and fails between two frames is never missed. A turn failed by the
+	 * runner's own rule (runner.ts classify): a bad exit, unless the run reported a terminal
+	 * outcome (ready, answered, integrated) — a needs_you report followed by a crash still
+	 * failed. A clean reported hold stores its reason in turns.error too (turn.ts finishTurn);
+	 * that is a Request, not an Error. A deliberate cancel (error "cancelled", see
+	 * ProjectStore.finishTurn) is no failure either. A sick store keeps `fallback`. */
 	function latestTurnError(
 		project: string,
 		id: string,
@@ -1063,12 +1090,15 @@ export function createApp(deps: AppDeps) {
 		if (e === undefined) return none;
 		try {
 			const turn = e.store.lastSettledTurn(id);
-			return turn === null ||
-				turn.outcome !== null ||
-				turn.error === null ||
-				turn.error === "cancelled"
-				? none
-				: { errorTurn: String(turn.id), errorText: turn.error };
+			const failed =
+				turn !== null &&
+				turn.error !== null &&
+				turn.error !== "cancelled" &&
+				turn.exitCode !== 0 &&
+				(turn.outcome === null || turn.outcome === "needs_you");
+			return failed
+				? { errorTurn: String(turn.id), errorText: turn.error }
+				: none;
 		} catch (err) {
 			logStoreError(e.store.name, err);
 			return fallback ?? none;
@@ -1140,37 +1170,42 @@ export function createApp(deps: AppDeps) {
 		return removed;
 	}
 
-	/** One device's payloads for a pass: its alerts (each carrying `clear`), else a data-only
-	 * retraction. Apple's push service never gets a data-only push, so its retraction waits in
-	 * `appleClear` and rides on the next alert sent to that device. A class this batch alerts
-	 * replaces its own tag on the device, so its clear tag is dropped from every payload: carried
-	 * on another class's payload it could land after the new alert and close it. The alert of
-	 * that class gets `replace` instead, so the service worker still closes the stale
-	 * notification when it shows nothing (every key already acknowledged). */
+	/** One device's payloads for a pass: its alerts (each numbered and carrying the
+	 * retraction), else a data-only retraction. Each retracted class is bounded by the device's
+	 * sequence number at decision time, so the service worker closes only notifications shown
+	 * before it: a retraction riding on a delayed payload never closes a newer alert. Apple's
+	 * push service never gets a data-only push, so its bounds wait in `appleClear` (merged by
+	 * maximum) and ride on the next alert sent to that device. */
 	function batchFor(
 		sub: PushSub,
 		alerts: readonly AlertPayload[],
 		clear: readonly AlertClass[],
 	): Array<AlertPayload | ClearPayload> {
 		const apple = isApplePush(sub.endpoint);
-		const pending = new Set([
-			...(apple ? (appleClear.get(sub.endpoint) ?? []) : []),
-			...clear,
-		]);
+		const seqs = alertSeqs.get(sub.endpoint) ?? {
+			request: 0,
+			error: 0,
+			complete: 0,
+		};
+		const upTo: ClearBound = apple
+			? { ...(appleClear.get(sub.endpoint) ?? {}) }
+			: {};
+		for (const c of clear) upTo[c] = Math.max(upTo[c] ?? 0, seqs[c]);
+		const tags = ALERT_CLASSES.filter((c) => upTo[c] !== undefined);
 		if (alerts.length === 0) {
-			if (pending.size === 0) return [];
-			if (!apple) return [{ type: "clear", tags: [...pending] }];
-			appleClear.set(sub.endpoint, pending);
+			if (tags.length === 0) return [];
+			if (!apple) return [{ type: "clear", tags, upTo }];
+			appleClear.set(sub.endpoint, upTo);
 			return [];
 		}
 		if (apple) appleClear.delete(sub.endpoint);
-		const shown = new Set(alerts.map((a) => a.tag));
-		const tags = [...pending].filter((t) => !shown.has(t));
-		return alerts.map((a) => ({
-			...a,
-			clear: tags,
-			replace: pending.has(a.tag as AlertClass),
-		}));
+		const out = alerts.map((a) => {
+			const cls = a.tag as AlertClass;
+			seqs[cls]++;
+			return { ...a, seq: seqs[cls], clear: tags, upTo };
+		});
+		alertSeqs.set(sub.endpoint, seqs);
+		return out;
 	}
 
 	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
@@ -1263,7 +1298,6 @@ export function createApp(deps: AppDeps) {
 					payloadsFor(
 						sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
 						liveKeys,
-						clear,
 					),
 					clear,
 				),
@@ -1579,42 +1613,6 @@ export function createApp(deps: AppDeps) {
 		};
 	}
 
-	/** Daily-throttled push: only ids a previous push did not name fire one (U5). */
-	async function pushUpdates(): Promise<void> {
-		if (updates === null || loadSubs(deps.gstore).length === 0) return;
-		const today = new Date().toISOString().slice(0, 10);
-		const hidden = new Set(loadSkips(deps.gstore));
-		const qualifiedIds = updates.updates
-			.filter((r) => r.target !== null && !hidden.has(r.id))
-			.map((r) => r.id);
-		const plan = planUpdatesPush(
-			deps.gstore.get<UpdatesPushState>("updatesPush"),
-			qualifiedIds,
-			today,
-		);
-		if (plan === null) return;
-		try {
-			const gone = new Set<string>();
-			const report = await sendAll(
-				loadSubs(deps.gstore),
-				JSON.stringify({
-					title: "Upstream updates",
-					body: `${plan.length} upstream update(s) ready`,
-					tag: "updates",
-					url: "/",
-				}),
-				(sub, p) => sendNotification(sub, p),
-			);
-			for (const g of report.gone) gone.add(g);
-			pruneSubs(deps.gstore, gone);
-		} catch (err) {
-			logError("updates push failed", err);
-		} finally {
-			// The attempt names the ids even when some sends failed: no retry storm.
-			deps.gstore.set("updatesPush", { date: today, ids: qualifiedIds });
-		}
-	}
-
 	// Fork research watcher: Entry already exposes
 	// {name, path, store, github}; the factory re-iterates the live Map on every tick.
 	const forkWatcher = createForkWatcher({
@@ -1844,7 +1842,6 @@ export function createApp(deps: AppDeps) {
 					console.log(
 						`updates: dropped ${good.dropped} invalid record(s) from alate`,
 					);
-				await pushUpdates();
 				publishSoon();
 			} finally {
 				updatesInFlight = null;

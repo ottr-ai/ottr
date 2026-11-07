@@ -265,22 +265,37 @@ export function deliverable(
 	return classes[e.class] && !mutedProjects.has(e.project);
 }
 
+/** Per class, the highest notification sequence number a retraction covers: the service worker
+ * closes a notification of that tag only when the payload that showed it had a sequence number
+ * at or below this bound. A notification shown later (a higher number) never closes, however
+ * late the retraction arrives. */
+export type ClearBound = Partial<Record<AlertClass, number>>;
+
+/** Most keys a payload names on the wire; past it the payload is `partial`. Keys are short
+ * (hashed ask rounds, `error:<id>:<turn>`, `done:<id>`), so this keeps every payload far
+ * below Web Push's ~4 KB plaintext budget (RFC 8291 §4). */
+export const PAYLOAD_KEYS_MAX = 20;
+
 export interface AlertPayload {
 	type: "alert";
 	title: string;
 	body: string;
 	tag: string;
 	url: string;
+	/** The alerts this notification stands for, capped at PAYLOAD_KEYS_MAX. */
 	keys: string[];
+	/** More alerts than `keys` names: the service worker never treats it as fully read. */
+	partial: boolean;
+	/** Per-device, per-class sequence number; app.ts batchFor assigns it (0 until then). */
+	seq: number;
+	/** Classes to retract before this alert, each up to its bound. */
 	clear: AlertClass[];
-	/** This class's own tag was due for retraction before the pass: when the service worker
-	 * does not show the alert (every key acknowledged), it closes the tag instead of leaving
-	 * the stale notification that the new one would have replaced. */
-	replace: boolean;
+	upTo: ClearBound;
 }
 export interface ClearPayload {
 	type: "clear";
 	tags: AlertClass[];
+	upTo: ClearBound;
 }
 
 const GROUP_BODY: Record<AlertClass, (n: number) => string> = {
@@ -292,42 +307,45 @@ const GROUP_BODY: Record<AlertClass, (n: number) => string> = {
 /** One payload per class among `events` (already filtered for ONE device). Same-class pushes
  * share a tag, so the device replaces that class's notification instead of stacking one per
  * task. The payload stands for every live alert of the class on this device (`liveKeys`, which
- * include this pass's), so its `keys` name exactly what its notification represents: one key →
- * the card's own title/body/url; more → a grouped count of them, url "/". */
+ * include this pass's): one → the card's own title/body/url; more → a grouped count of all of
+ * them, url "/". The wire names at most PAYLOAD_KEYS_MAX of them, this pass's first, and
+ * marks the rest with `partial`. */
 export function payloadsFor(
 	events: readonly AlertEvent[],
 	liveKeys: Readonly<Record<AlertClass, readonly string[]>>,
-	clear: readonly AlertClass[],
 ): AlertPayload[] {
 	const out: AlertPayload[] = [];
 	for (const cls of ALERT_CLASSES) {
 		const of = events.filter((e) => e.class === cls);
 		const first = of[0];
 		if (first === undefined) continue;
-		const keys = [...new Set([...liveKeys[cls], ...of.map((e) => e.key)])];
-		if (keys.length === 1) {
-			out.push({
-				type: "alert",
-				title: first.title,
-				body: first.body,
-				tag: cls,
-				url: first.url,
-				keys,
-				clear: [...clear],
-				replace: false,
-			});
-			continue;
-		}
-		out.push({
-			type: "alert",
-			title: "Ottr",
-			body: GROUP_BODY[cls](keys.length),
-			tag: cls,
-			url: "/",
-			keys,
-			clear: [...clear],
-			replace: false,
-		});
+		const all = [...new Set([...of.map((e) => e.key), ...liveKeys[cls]])];
+		const wire = {
+			keys: all.slice(0, PAYLOAD_KEYS_MAX),
+			partial: all.length > PAYLOAD_KEYS_MAX,
+			seq: 0,
+			clear: [],
+			upTo: {},
+		};
+		out.push(
+			all.length === 1
+				? {
+						type: "alert",
+						title: first.title,
+						body: first.body,
+						tag: cls,
+						url: first.url,
+						...wire,
+					}
+				: {
+						type: "alert",
+						title: "Ottr",
+						body: GROUP_BODY[cls](all.length),
+						tag: cls,
+						url: "/",
+						...wire,
+					},
+		);
 	}
 	return out;
 }

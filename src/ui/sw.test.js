@@ -126,7 +126,7 @@ test("push shows a notification built from the payload", async () => {
 				tag: "t1",
 				renotify: true,
 				icon: "/icon-192.png",
-				data: { url: "/tasks/1", keys: [] },
+				data: { url: "/tasks/1", keys: [], partial: false, seq: 0 },
 			},
 		},
 	]);
@@ -142,7 +142,7 @@ test("push falls back to defaults for missing payload fields", async () => {
 				tag: undefined,
 				renotify: false,
 				icon: "/icon-192.png",
-				data: { url: "/", keys: [] },
+				data: { url: "/", keys: [], partial: false, seq: 0 },
 			},
 		},
 	]);
@@ -197,25 +197,54 @@ const alert = {
 	tag: "request",
 	url: "/projects/p/tasks/1",
 	keys: ["task:1:needs"],
+	partial: false,
+	seq: 5,
 	clear: [],
+	upTo: {},
 };
 
-test("clear push closes matching notifications and shows nothing", async () => {
+test("clear push closes notifications up to each class's bound and shows nothing", async () => {
 	tray.push(
-		{ tag: "request", title: "a" },
-		{ tag: "error", title: "b" },
+		{ tag: "request", title: "a", data: { seq: 3 } },
+		{ tag: "error", title: "b", data: { seq: 1 } },
 		{ tag: "complete", title: "c" },
 	);
-	await push({ type: "clear", tags: ["request", "complete"] });
+	await push({
+		type: "clear",
+		tags: ["request", "complete"],
+		upTo: { request: 3, complete: 0 },
+	});
 	expect(calls.notifications).toEqual([]);
 	expect(calls.trayClosed.sort()).toEqual(["a", "c"]);
 	expect(tray.map((n) => n.title)).toEqual(["b"]);
 	expect(calls.fetches).toEqual([]);
 });
 
-test("alert push closes its clear tags first, then shows", async () => {
-	tray.push({ tag: "error", title: "old error" });
-	await push({ ...alert, clear: ["error"] });
+test("a late retraction never closes a notification shown after it was decided", async () => {
+	tray.push({ tag: "request", title: "newer", data: { seq: 4 } });
+	await push({ type: "clear", tags: ["request"], upTo: { request: 3 } });
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
+	// The same bound riding on a delayed alert of another class leaves it open too.
+	await push({
+		...alert,
+		tag: "error",
+		seq: 1,
+		clear: ["request"],
+		upTo: { request: 3 },
+	});
+	expect(tray.map((n) => n.title).sort()).toEqual(["newer", "p: card"]);
+});
+
+test("a delayed older alert never replaces a newer one of its class", async () => {
+	tray.push({ tag: "request", title: "newer", data: { seq: 6, keys: ["x"] } });
+	await push(alert); // seq 5
+	expect(calls.notifications).toEqual([]);
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("alert push runs its bounded retraction first, then shows", async () => {
+	tray.push({ tag: "error", title: "old error", data: { seq: 2 } });
+	await push({ ...alert, clear: ["error"], upTo: { error: 2 } });
 	expect(calls.trayClosed).toEqual(["old error"]);
 	expect(calls.fetches).toEqual([
 		{ url: "/api/inbox/seen", credentials: "same-origin" },
@@ -228,7 +257,12 @@ test("alert push closes its clear tags first, then shows", async () => {
 				tag: "request",
 				renotify: true,
 				icon: "/icon-192.png",
-				data: { url: "/projects/p/tasks/1", keys: ["task:1:needs"] },
+				data: {
+					url: "/projects/p/tasks/1",
+					keys: ["task:1:needs"],
+					partial: false,
+					seq: 5,
+				},
 			},
 		},
 	]);
@@ -242,27 +276,34 @@ test("alert push whose keys are all acknowledged shows nothing", async () => {
 	expect(tray).toEqual([]);
 });
 
-test("acknowledged alert closes same-tag notifications that are all acknowledged, keeps unread ones", async () => {
+test("a partial alert never counts as read: it shows even when its named keys are", async () => {
+	seenResponse = ["task:1:needs"];
+	await push({ ...alert, partial: true });
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+});
+
+test("acknowledged alert closes older same-tag notifications that are fully read, keeps unread and partial ones", async () => {
 	seenResponse = ["task:1:needs", "task:0:needs"];
 	tray.push(
-		{ tag: "request", title: "stale", data: { keys: ["task:0:needs"] } },
-		{ tag: "request", title: "unread", data: { keys: ["task:9:needs"] } },
+		{
+			tag: "request",
+			title: "stale",
+			data: { seq: 1, keys: ["task:0:needs"] },
+		},
+		{
+			tag: "request",
+			title: "unread",
+			data: { seq: 2, keys: ["task:9:needs"] },
+		},
+		{
+			tag: "request",
+			title: "group",
+			data: { seq: 3, keys: ["task:0:needs"], partial: true },
+		},
 	);
 	await push(alert);
 	expect(calls.notifications).toEqual([]);
-	expect(tray.map((n) => n.title)).toEqual(["unread"]);
-});
-
-test("acknowledged alert with replace closes its class tag (the retraction it stood in for)", async () => {
-	seenResponse = ["task:1:needs"];
-	tray.push({
-		tag: "request",
-		title: "resolved",
-		data: { keys: ["task:7:needs"] },
-	});
-	await push({ ...alert, replace: true });
-	expect(calls.notifications).toEqual([]);
-	expect(tray).toEqual([]);
+	expect(tray.map((n) => n.title)).toEqual(["unread", "group"]);
 });
 
 test("alert push with some keys unacknowledged stays shown", async () => {

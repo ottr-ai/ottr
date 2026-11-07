@@ -9,7 +9,6 @@ import {
 	loadSkips,
 	mapRepo,
 	migratePendingToSkips,
-	planUpdatesPush,
 	removePrompt,
 	updatePrompt,
 	validateUpdates,
@@ -201,21 +200,6 @@ describe("update decisions", () => {
 		migratePendingToSkips(a);
 		expect(loadSkips(a)).toEqual(["legacy@1", "rtk@v1.2.3", "skills@abc"]);
 		a.close();
-	});
-});
-
-describe("planUpdatesPush", () => {
-	const ids = ["a@1", "b@2"];
-	test("pushes every qualified id the first time", () => {
-		expect(planUpdatesPush(null, ids, "2026-10-13")).toEqual(ids);
-	});
-	test("at most once a day, then only for unnamed ids", () => {
-		const state = { date: "2026-10-13", ids };
-		expect(planUpdatesPush(state, ids, "2026-10-13")).toBeNull();
-		expect(planUpdatesPush(state, ids, "2026-10-14")).toBeNull(); // nothing new
-		expect(planUpdatesPush(state, ["a@1", "b@2", "c@3"], "2026-10-14")).toEqual(
-			["c@3"],
-		);
 	});
 });
 

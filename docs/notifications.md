@@ -5,14 +5,14 @@ The server decides which events reach the operating system. Web Push is the only
 ## Event classes
 
 - **Request**: a card enters needs you, or asks a new round of questions.
-- **Error**: a turn fails: it ends with an error and without a reported outcome. A turn that reported needs you stores its hold reason in the same field, and that hold is a Request. A turn ended by a deliberate cancel is no error. If the card then needs you on that same failed turn, in the same frame or a later one, the Error is the only alert; once the card waits, the Error takes the needs-you entry's key, so acknowledging or answering that entry retracts it. Acknowledging that entry also acknowledges the Error's original key, so a delayed copy of the Error push never shows.
+- **Error**: a turn fails, by the runner's own rule: it exits badly, unless it reported a finished outcome (ready, answered, integrated). A needs-you report followed by a crash still fails. A clean needs-you report stores its hold reason in the same field, and that hold is a Request. A turn ended by a deliberate cancel is no error. If the card then needs you on that same failed turn, in the same frame or a later one, the Error is the only alert; once the card waits, the Error takes the needs-you entry's key, so acknowledging or answering that entry retracts it. Acknowledging that entry also acknowledges the Error's original key, so a delayed copy of the Error push never shows.
 - **Complete**: a card enters Done, or a question-only card reports its answer.
 
-A card produces at most one event per state frame. Error wins over Request, and Request wins over Complete. A new card only alerts when it arrives in needs you or with a failed turn. A class has one notification per device: when it stands for more than one unread alert, it shows a count ("3 tasks need your attention") and its keys list every alert it counts.
+A card produces at most one event per state frame. Error wins over Request, and Request wins over Complete. A new card only alerts when it arrives in needs you or with a failed turn. A class has one notification per device: when it stands for more than one unread alert, it shows the count of them all ("3 tasks need your attention"). The payload names at most 20 of their keys and marks a larger group `partial`, so a push stays far below Web Push's ~4 KB budget.
 
 ## What never pushes
 
-- Notices: updates, drain, behind, orphans, kept, alate pending, sign-in advisories. They stay in the bell.
+- Notices: updates, drain, behind, orphans, kept, alate pending, sign-in advisories. They stay in the bell; upstream updates no longer push.
 - The browser-local critical entry.
 - Retro cards and cancelled cards. Cancelling a card retracts its live alerts.
 - The first frame after the server starts.
@@ -50,9 +50,9 @@ Each board tab sends a heartbeat every 20 s while it is visible and focused, and
 
 ## Retraction
 
-When an alert's cause clears, or you acknowledge it, the server sends a data-only `clear` push with the class tags that device has no live alert left in. Retraction is per device: an alert a device never got (class off, project muted) neither keeps nor clears its tags. The service worker closes matching notifications. Every alert push also carries the tags to close first, minus the classes that same pass alerts (a new alert replaces its class's notification itself); an alert whose own class was due for retraction carries `replace`. Before it shows an alert, the service worker checks `/api/inbox/seen`. If every key is already acknowledged it shows nothing and tidies the class instead: with `replace` it closes the tag, otherwise it closes each same-tag notification whose keys are all acknowledged.
+When an alert's cause clears, or you acknowledge it, the server retracts the class tags that device has no live alert left in. Retraction is per device: an alert a device never got (class off, project muted) neither keeps nor clears its tags. Every retraction is bounded by sequence number: the server numbers each alert payload per device and class, and a retraction carries the number current when it was decided. The service worker closes a notification only if the payload that showed it had a number at or below that bound, so a retraction that arrives late (a data-only `clear` push, or the bounds an alert payload carries) never closes an alert sent after it. An alert also never shows over a newer one of its class. Before it shows an alert, the service worker checks `/api/inbox/seen`. If every key is already acknowledged (and the payload is not `partial`) it shows nothing and closes older same-tag notifications whose own keys are all acknowledged.
 
 Platform caveats:
 
-- Apple push (Safari, iOS) revokes subscriptions that receive pushes without a visible notification, so clear pushes skip Apple endpoints. The server keeps the pending tags per Apple device and sends them with the next alert push to that device, which closes the stale notifications before it shows the new one. Until that next alert, the old notification stays.
+- Apple push (Safari, iOS) revokes subscriptions that receive pushes without a visible notification, so clear pushes skip Apple endpoints. The server keeps the pending bounds per Apple device and sends them with the next alert push to that device, which closes the stale notifications before it shows the new one. Until that next alert, the old notification stays.
 - Chrome may show a generic "site updated in the background" notice for a silent push. Retraction on Chrome is best-effort too.

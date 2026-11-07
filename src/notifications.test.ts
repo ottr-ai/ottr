@@ -9,6 +9,7 @@ import {
 	isApplePush,
 	type LiveAlert,
 	normalizeSeen,
+	PAYLOAD_KEYS_MAX,
 	PRESENCE_WINDOW_MS,
 	payloadsFor,
 	presenceHolds,
@@ -201,23 +202,25 @@ const ev = (cls: AlertEvent["class"], id: string): AlertEvent => ({
 
 describe("payloadsFor", () => {
 	test("two requests group into one payload", () => {
-		expect(
-			payloadsFor([ev("request", "A"), ev("request", "B")], zero, []),
-		).toEqual([
-			{
-				type: "alert",
-				title: "Ottr",
-				body: "2 tasks need your attention",
-				tag: "request",
-				url: "/",
-				keys: ["request:A", "request:B"],
-				clear: [],
-				replace: false,
-			},
-		]);
+		expect(payloadsFor([ev("request", "A"), ev("request", "B")], zero)).toEqual(
+			[
+				{
+					type: "alert",
+					title: "Ottr",
+					body: "2 tasks need your attention",
+					tag: "request",
+					url: "/",
+					keys: ["request:A", "request:B"],
+					partial: false,
+					seq: 0,
+					clear: [],
+					upTo: {},
+				},
+			],
+		);
 	});
 	test("one request keeps the card's own payload", () => {
-		expect(payloadsFor([ev("request", "A")], zero, ["complete"])).toEqual([
+		expect(payloadsFor([ev("request", "A")], zero)).toEqual([
 			{
 				type: "alert",
 				title: "t A",
@@ -225,12 +228,14 @@ describe("payloadsFor", () => {
 				tag: "request",
 				url: "/projects/my%20proj/tasks/A",
 				keys: ["request:A"],
-				clear: ["complete"],
-				replace: false,
+				partial: false,
+				seq: 0,
+				clear: [],
+				upTo: {},
 			},
 		]);
 	});
-	test("the payload stands for every live alert of its class: keys and count cover them all", () => {
+	test("the payload stands for every live alert of its class: count covers them all", () => {
 		const out = payloadsFor(
 			[
 				ev("error", "A"),
@@ -239,22 +244,36 @@ describe("payloadsFor", () => {
 				ev("complete", "D"),
 			],
 			{ request: [], error: ["error:U", "error:A"], complete: [] },
-			[],
 		);
 		expect(out.map((p) => [p.tag, p.body, p.keys])).toEqual([
-			["error", "3 tasks failed", ["error:U", "error:A", "error:B"]],
+			["error", "3 tasks failed", ["error:A", "error:B", "error:U"]],
 			["complete", "2 tasks finished", ["complete:C", "complete:D"]],
 		]);
 		// One new alert beside an unread one groups too, so the unread one stays represented.
-		const [lone] = payloadsFor(
-			[ev("request", "B")],
-			{ request: ["request:A"], error: [], complete: [] },
-			[],
-		);
+		const [lone] = payloadsFor([ev("request", "B")], {
+			request: ["request:A"],
+			error: [],
+			complete: [],
+		});
 		expect([lone?.body, lone?.keys]).toEqual([
 			"2 tasks need your attention",
-			["request:A", "request:B"],
+			["request:B", "request:A"],
 		]);
+	});
+	test("the wire stays bounded: keys cap at PAYLOAD_KEYS_MAX and the rest is marked partial", () => {
+		const many = Array.from({ length: 500 }, (_, i) => `done:card-${i}`);
+		const [p] = payloadsFor([ev("complete", "N")], {
+			request: [],
+			error: [],
+			complete: many,
+		});
+		expect(p?.body).toBe("501 tasks finished");
+		expect(p?.keys.length).toBe(PAYLOAD_KEYS_MAX);
+		expect(p?.keys[0]).toBe("complete:N");
+		expect(p?.partial).toBe(true);
+		expect(new TextEncoder().encode(JSON.stringify(p)).length).toBeLessThan(
+			3993,
+		);
 	});
 });
 

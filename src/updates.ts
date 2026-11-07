@@ -203,27 +203,6 @@ export function migratePendingToSkips(store: GlobalStore): void {
 	store.set("updateDecisionsPending", []);
 }
 
-/** Push throttle state: the last day a push went out and the qualified ids it named. */
-export interface UpdatesPushState {
-	date: string;
-	ids: string[];
-}
-
-/**
- * Ids to push now, or null: at most one push per day, and only when a qualified row id appears
- * that no earlier push named. A send consumes the day and names every currently qualified id.
- */
-export function planUpdatesPush(
-	state: UpdatesPushState | null,
-	qualifiedIds: string[],
-	today: string,
-): string[] | null {
-	if (state !== null && state.date === today) return null;
-	const named = new Set(state?.ids ?? []);
-	const fresh = qualifiedIds.filter((id) => !named.has(id));
-	return fresh.length === 0 ? null : fresh;
-}
-
 /**
  * Prompt for an update card (U6): only validated record fields are interpolated, plus the
  * fixed instruction lines. `propose` marks a younger-than-qualify-age pick (a G21 exception).

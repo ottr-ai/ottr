@@ -2416,7 +2416,6 @@ describe("alate routes", () => {
 		afterAll(() => {
 			// Leave the shared store and closure clean for later describes.
 			gstore.set("updateSkips", []);
-			gstore.set("updatesPush", null);
 			gstore.set("updates", null);
 			saveSubs(gstore, []);
 			alateBody = {
@@ -2536,9 +2535,8 @@ describe("alate routes", () => {
 			expect(state.updates!.rows.map((r) => r.id)).toEqual([goodRec.id]);
 		});
 
-		test("push fires once per day; a skipped qualified id does not count", async () => {
+		test("updates stay in the bell: a refresh with qualified ids never pushes", async () => {
 			pushSends.length = 0;
-			gstore.set("updatesPush", { date: "2000-01-01", ids: [] });
 			saveSubs(gstore, [
 				{
 					endpoint: "https://push.test/ep1",
@@ -2549,27 +2547,7 @@ describe("alate routes", () => {
 			]);
 			alateBody = envelope([goodRec, otherRec]);
 			await post("/api/updates/refresh", {});
-			expect(pushSends.length).toBe(1);
-			expect(JSON.parse(pushSends[0]!.payload)).toEqual({
-				title: "Upstream updates",
-				body: "1 upstream update(s) ready",
-				tag: "updates",
-				url: "/",
-			});
-			// Same day, a new qualified id: the day is already consumed.
-			alateBody = envelope([
-				goodRec,
-				otherRec,
-				{ ...goodRec, id: "octo/repo@v4", latest: "v4", target: "v4" },
-			]);
-			await post("/api/updates/refresh", {});
-			expect(pushSends.length).toBe(1);
-			// Next day, only a skipped id is left: no push.
-			gstore.set("updatesPush", { date: "2000-01-01", ids: [goodRec.id] });
-			await post("/api/updates/skip", { id: goodRec.id });
-			alateBody = envelope([goodRec]);
-			await post("/api/updates/refresh", {});
-			expect(pushSends.length).toBe(1);
+			expect(pushSends).toEqual([]);
 		});
 
 		// U6/U7: POST /api/updates/allow files update cards; the merge hold approves via reply.
@@ -7455,7 +7433,10 @@ describe("web push (R1-1, R2-3)", () => {
 		const res = await b.m.call("/api/inbox/seen", { taskIds: [t.id] });
 		expect(res.status).toBe(200);
 		expect(b.sentSince(from)).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
+			},
 		]);
 		expect(await (await b.m.call("/api/inbox/seen")).json()).toEqual({
 			keys: [taskEntryKey(b.s.getTask(t.id)!)],
@@ -7551,7 +7532,10 @@ describe("web push (R1-1, R2-3)", () => {
 			keys: [taskEntryKey(b.s.getTask(t.id)!)],
 		});
 		expect(b.sentSince(from)).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["error"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["error"], upTo: { error: 1 } },
+			},
 		]);
 		// The pushed payload's own key is acknowledged too, so a delayed copy of that push
 		// finds itself read in the service worker and never shows.
@@ -7584,6 +7568,28 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(b.sentSince(from).map((x) => x.payload.tag)).toEqual(["request"]);
 	});
 
+	test("a needs_you report followed by a crash (bad exit) is an Error, as the runner classifies it", async () => {
+		const b = alertBoard("alert-hold-crash");
+		await b.subscribe("https://push.example/hold-crash");
+		const t = b.s.createTask("reports then dies");
+		b.m.app.publishState();
+		const from = pushSends.length;
+		b.s.updateTask(t.id, { state: "running" });
+		const turn = b.s.startTurn(t.id, "work", ".", null);
+		b.s.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			exitCode: 1,
+			outcome: "needs_you",
+			error: "omp exited with code 1 before finishing.",
+		});
+		b.s.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "omp exited with code 1 before finishing.",
+		});
+		b.m.app.publishState();
+		expect(b.sentSince(from).map((x) => x.payload.tag)).toEqual(["error"]);
+	});
+
 	test("an alert no device got (muted) never keeps a delivered one's tag open", async () => {
 		const b = alertBoard("alert-muted-tag");
 		const fcm = "https://push.example/muted-tag";
@@ -7601,7 +7607,10 @@ describe("web push (R1-1, R2-3)", () => {
 		const from = pushSends.length;
 		await b.m.call("/api/inbox/seen", { taskIds: [first.id] });
 		expect(b.sentSince(from)).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
+			},
 		]);
 	});
 
@@ -7630,7 +7639,10 @@ describe("web push (R1-1, R2-3)", () => {
 			keys: [key],
 		});
 		expect(b.sentSince(from)).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
+			},
 		]);
 		const tooLong = await b.m.call("/api/inbox/seen", {
 			keys: [`notice:${"n".repeat(2001)}`],
@@ -7655,7 +7667,11 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(b.sentSince(from)).toEqual([
 			{
 				endpoint: fcm,
-				payload: { type: "clear", tags: ["error", "complete"] },
+				payload: {
+					type: "clear",
+					tags: ["error", "complete"],
+					upTo: { error: 1, complete: 1 },
+				},
 			},
 		]);
 	});
@@ -7680,7 +7696,7 @@ describe("web push (R1-1, R2-3)", () => {
 		for (const p of sent) expect(p.clear).toEqual([]);
 	});
 
-	test("Apple: a pending clear of a class this batch alerts is dropped, never closes the new alert", async () => {
+	test("Apple: a pending retraction rides on the next alerts, bounded below the new alert's number", async () => {
 		const b = alertBoard("alert-apple-race");
 		await b.subscribe("https://web.push.apple.com/race");
 		const old = b.s.createTask("old ask");
@@ -7688,15 +7704,20 @@ describe("web push (R1-1, R2-3)", () => {
 		const fin = b.s.createTask("finish");
 		b.m.app.publishState();
 		b.needsYou(old.id);
-		b.m.app.publishState();
-		await b.m.call("/api/inbox/seen", { taskIds: [old.id] }); // pending: request
+		b.m.app.publishState(); // request #1
+		await b.m.call("/api/inbox/seen", { taskIds: [old.id] }); // pending: request ≤ 1
 		const from = pushSends.length;
 		b.needsYou(fresh.id);
 		b.s.updateTask(fin.id, { stage: "done", state: "idle" });
 		b.m.app.publishState();
 		const sent = b.sentSince(from).map((x) => x.payload);
-		expect(sent.map((p) => p.tag).sort()).toEqual(["complete", "request"]);
-		for (const p of sent) expect(p.clear).toEqual([]);
+		expect(sent.map((p) => [p.tag, p.seq])).toEqual([
+			["request", 2],
+			["complete", 1],
+		]);
+		// Both carry the old request's retraction, bounded at #1: whichever lands last, the
+		// service worker never closes request #2 with it.
+		for (const p of sent) expect(p.upTo).toEqual({ request: 1 });
 	});
 
 	test("without any push device or socket, publishes still prune acknowledged task keys", async () => {
@@ -7731,7 +7752,10 @@ describe("web push (R1-1, R2-3)", () => {
 		const from = pushSends.length;
 		r.app.publishState(); // first frame after boot: retracts what resolved meanwhile
 		expect(b.sentSince(from)).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["complete"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["complete"], upTo: { complete: 1 } },
+			},
 		]);
 		// The pre-restart board object stays alive in this process (a real restart has none),
 		// so count only the request retraction, which only the rebooted board can send.
@@ -7745,7 +7769,10 @@ describe("web push (R1-1, R2-3)", () => {
 				.slice(before)
 				.filter((x) => JSON.stringify(x.payload.tags) === '["request"]'),
 		).toEqual([
-			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
+			},
 		]);
 	});
 

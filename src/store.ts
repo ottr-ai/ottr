@@ -2602,18 +2602,26 @@ export class ProjectStore {
 		);
 	}
 
-	/** The task's newest settled turn (id, error, reported outcome), or null; one indexed row for
-	 * the alert diff. */
-	lastSettledTurn(
-		taskId: string,
-	): { id: number; error: string | null; outcome: string | null } | null {
+	/** The task's newest settled turn (id, error, reported outcome, exit code), or null; one
+	 * indexed row for the alert diff. */
+	lastSettledTurn(taskId: string): {
+		id: number;
+		error: string | null;
+		outcome: string | null;
+		exitCode: number | null;
+	} | null {
 		return (
 			this.db
 				.query<
-					{ id: number; error: string | null; outcome: string | null },
+					{
+						id: number;
+						error: string | null;
+						outcome: string | null;
+						exitCode: number | null;
+					},
 					[string]
 				>(
-					"SELECT id, error, outcome FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+					"SELECT id, error, outcome, exit_code AS exitCode FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
 				)
 				.get(taskId) ?? null
 		);
