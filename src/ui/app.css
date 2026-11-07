@@ -4353,11 +4353,14 @@ dialog.confirm-dialog {
 .attach-error .icon {
 	flex: none;
 }
+/* The footer is its own group: it sits farther from the fields above it (their gap
+   plus this margin) than the fields sit from each other. */
 .dialog-actions {
 	display: flex;
 	flex-wrap: wrap; /* phone width: the primary drops to a second row instead of wrapping its label */
 	justify-content: flex-end;
 	gap: 8px;
+	margin-top: 8px;
 }
 .dialog-actions > button {
 	white-space: nowrap;
