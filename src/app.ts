@@ -157,10 +157,10 @@ import {
 } from "./notifications.ts";
 import {
 	buildOmpStatsReport,
-	fetchWorkerOmpStats,
+	type OmpStatsAnswer,
 	type OmpStatsReport,
 	type OmpStatsSource,
-	runOmpStats,
+	scanSessionUsage,
 } from "./ompStats.ts";
 import {
 	type OrphanProject,
@@ -465,8 +465,9 @@ interface AppDeps {
 	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
-	/** Only for tests: the binary GET /api/settings/omp-stats runs instead of omp on PATH. */
-	ompStatsBin?: string;
+	/** Only for tests: the transcript usage scan GET /api/settings/omp-stats runs instead of
+	 * scanSessionUsage, so a test can count reads and serve fixture stores. */
+	scanSessionUsage?: (sessionsDir: string) => OmpStatsAnswer;
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -3924,45 +3925,42 @@ export function createApp(deps: AppDeps) {
 		system.record([{ name: "server", reading }, ...workers], readVm());
 	}
 
-	// The Settings -> omp usage report: the board store's own `omp stats --json` plus every
-	// worker's GET /omp-stats, merged over the distinct stores (workers share one home, so
-	// identical answers count once; each source keeps its own answer for the breakdown).
+	// The Settings -> omp usage report. omp's own `stats` command only syncs the default
+	// session store, while tracker turns write their transcripts to each project's
+	// sessions dir (--session-dir) — on the shared volume the server mounts — so the
+	// board sums the transcripts itself: every project's dir plus both default stores.
 	let ompStatsCache: { at: number; report: OmpStatsReport } | null = null;
 	let ompStatsRead: Promise<OmpStatsReport> | null = null;
-	/** One report on demand. The 30 s cache + single-flight exist so concurrent Settings
-	 *  tabs never run concurrent `omp stats` syncs against one sqlite store. */
+	/** One report on demand. The 30 s cache + single-flight keep concurrent Settings
+	 *  tabs from re-walking every transcript at once. */
 	async function ompStatsReportNow(): Promise<OmpStatsReport> {
 		if (ompStatsRead !== null) return ompStatsRead;
 		if (ompStatsCache !== null && Date.now() - ompStatsCache.at < 30_000)
 			return ompStatsCache.report;
-		ompStatsRead = (async () => {
-			const target = deps.workerTarget;
-			const workers = await Promise.all(
-				(target?.urls ?? []).flatMap((url) => {
-					let name: string;
-					try {
-						name = new URL(url).hostname;
-					} catch {
-						return []; // A malformed url names no source.
-					}
-					return [
-						fetchWorkerOmpStats(url, target?.token).then(
-							(answer): OmpStatsSource => ({ name, board: false, answer }),
-						),
-					];
-				}),
-			);
-			const answer = await runOmpStats({
-				bin: deps.ompStatsBin,
-				env: boardOmpEnv(),
-			});
-			const report = buildOmpStatsReport(
-				[{ name: "server", board: true, answer }, ...workers],
-				Date.now(),
-			);
-			ompStatsCache = { at: Date.now(), report };
+		const build = (async () => {
+			const scan = deps.scanSessionUsage ?? scanSessionUsage;
+			const sources: OmpStatsSource[] = [
+				{
+					name: "board store",
+					answer: scan(join(boardOmpHome(), ".omp", "agent", "sessions")),
+				},
+			];
+			// The workers' shared home default store, when it is another directory (compose:
+			// home:/root is shared, the board home is server-only). Its sessions are the
+			// manual and stray runs; turn usage lives in the project dirs below.
+			const workerStore = join(homedir(), ".omp", "agent", "sessions");
+			if (
+				resolve(workerStore) !==
+				resolve(boardOmpHome(), ".omp", "agent", "sessions")
+			)
+				sources.push({ name: "workers' store", answer: scan(workerStore) });
+			for (const [name, e] of deps.projects)
+				sources.push({ name, answer: scan(e.store.sessionsDir) });
+			const report = buildOmpStatsReport(sources, Date.now());
+			ompStatsCache = { at: report.at, report };
 			return report;
-		})().finally(() => {
+		})();
+		ompStatsRead = build.finally(() => {
 			ompStatsRead = null;
 		});
 		return ompStatsRead;

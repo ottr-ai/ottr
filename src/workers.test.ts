@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -882,84 +881,6 @@ describe("GET /stats", () => {
 			memoryEvents: { max: 7, oom: 2, oomKill: 1 },
 			lock: { exists: true, pid: process.pid, alive: true },
 		});
-	});
-});
-
-describe("GET /omp-stats", () => {
-	test("unauthenticated /omp-stats answers 401 like /stats", async () => {
-		const url = start({ token: "tok" });
-		expect((await fetch(`${url}/omp-stats`)).status).toBe(401);
-	});
-
-	test("GET /omp-stats returns the fixture script's JSON answer", async () => {
-		const bin = join(dir, "fake-omp");
-		writeFileSync(
-			bin,
-			'#!/bin/sh\necho \'{"overall":{"totalRequests":5,"totalCost":0.25},"byModel":[]}\'\n',
-		);
-		chmodSync(bin, 0o755);
-		const url = start({ token: "tok", ompStatsPath: bin });
-		const res = await fetch(`${url}/omp-stats`, {
-			headers: { "x-otwr-token": "tok" },
-		});
-		expect(res.status).toBe(200);
-		// The worker answers parseOmpStats' full shape: absent counts fill 0, absent
-		// rates fill null, so the board can merge without re-guarding.
-		expect(await res.json()).toEqual({
-			stats: {
-				overall: {
-					totalRequests: 5,
-					successfulRequests: 0,
-					failedRequests: 0,
-					errorRate: null,
-					totalInputTokens: 0,
-					totalOutputTokens: 0,
-					totalCacheReadTokens: 0,
-					totalCacheWriteTokens: 0,
-					cacheRate: null,
-					cacheSavings: null,
-					totalCost: 0.25,
-					unpricedRequests: 0,
-					totalPremiumRequests: 0,
-					avgDuration: null,
-					avgTtft: null,
-					avgTokensPerSecond: null,
-					firstTimestamp: null,
-					lastTimestamp: null,
-				},
-				byModel: [],
-			},
-			error: null,
-		});
-	});
-
-	test("a failing binary still answers 200 with stats: null and the cause", async () => {
-		const bin = join(dir, "boom-omp");
-		writeFileSync(bin, "#!/bin/sh\necho boom >&2\nexit 3\n");
-		chmodSync(bin, 0o755);
-		const url = start({ token: "tok", ompStatsPath: bin });
-		const res = await fetch(`${url}/omp-stats`, {
-			headers: { "x-otwr-token": "tok" },
-		});
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { stats: null; error: string };
-		expect(body.stats).toBeNull();
-		expect(body.error).toContain("exited with code 3");
-		expect(body.error).toContain("boom");
-	});
-
-	test("a missing binary answers stats: null with a failed-to-start cause", async () => {
-		const url = start({
-			token: "tok",
-			ompStatsPath: join(dir, "no-such-bin"),
-		});
-		const res = await fetch(`${url}/omp-stats`, {
-			headers: { "x-otwr-token": "tok" },
-		});
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { stats: null; error: string };
-		expect(body.stats).toBeNull();
-		expect(body.error).toContain("failed to start");
 	});
 });
 

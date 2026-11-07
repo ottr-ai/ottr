@@ -1023,7 +1023,7 @@ export function OmpStatsSection() {
 		<SettingsCard
 			id="omp-stats-section"
 			title="omp usage"
-			hint="Live omp stats from the board's own store and every worker's shared store, fetched when this page opens. A store that answers an error still lists below with its error."
+			hint="Turn usage summed from the session transcripts this board can read: each project's sessions dir, plus the board's and the workers' default omp stores, fetched when this page opens. omp's own stats command misses tracker turns (they run with --session-dir), so the board sums the usage records itself. A store that answers an error still lists below with its error."
 		>
 			{loadFailed ? (
 				<p className="hint" role="alert">
@@ -1077,7 +1077,7 @@ export function OmpStatsSection() {
 						<tbody>
 							{report.sources.map((s) => (
 								<tr key={s.name}>
-									<th scope="row">{s.board ? "Board" : s.name}</th>
+									<th scope="row">{s.name}</th>
 									<td>
 										{s.answer.stats === null
 											? "—"
@@ -1102,7 +1102,6 @@ export function OmpStatsSection() {
 						<thead>
 							<tr>
 								<th scope="col">Model</th>
-								<th scope="col">Provider</th>
 								<th scope="col">Requests</th>
 								<th scope="col">Tokens in / out</th>
 								<th scope="col">Cost</th>
@@ -1110,9 +1109,8 @@ export function OmpStatsSection() {
 						</thead>
 						<tbody>
 							{report.byModel.map((m) => (
-								<tr key={`${m.provider ?? ""}/${m.model}`}>
+								<tr key={m.model}>
 									<th scope="row">{m.model}</th>
-									<td>{m.provider ?? "—"}</td>
 									<td>{fmtCount(m.totalRequests)}</td>
 									<td>
 										{`${fmtCount(m.totalInputTokens)} / ${fmtCount(m.totalOutputTokens)}`}

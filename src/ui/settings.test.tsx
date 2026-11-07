@@ -984,18 +984,16 @@ describe("OmpStatsSection", () => {
 					at: Date.now() - 60_000,
 					sources: [
 						{
-							name: "board",
-							board: true,
+							name: "board store",
 							answer: { stats: { overall: totals, byModel: [] }, error: null },
 						},
 						{
-							name: "worker-1",
-							board: false,
+							name: "lumen",
 							answer: { stats: null, error: "exited with code 3: boom" },
 						},
 					],
 					overall: totals,
-					byModel: [{ ...totals, model: "glm-5.3-flash", provider: "zai" }],
+					byModel: [{ ...totals, model: "glm-5.3-flash" }],
 				}),
 			)) as unknown as typeof fetch;
 		const { container, unmount } = await mountOmpStats(fetchMock);
@@ -1006,16 +1004,15 @@ describe("OmpStatsSection", () => {
 			expect(card?.textContent).toContain("120");
 			expect(card?.textContent).toContain("$12.50");
 			expect(card?.textContent).toContain("50.0%");
-			// Per-source table: the board row is named Board, the worker keeps its
-			// hostname, and the errored source still lists with its error.
+			// Per-source table: each row names its store, and the errored source
+			// still lists with its error.
 			const rows = card?.querySelectorAll("tbody tr") ?? [];
 			const firstTable = [...(rows ?? [])].slice(0, 2);
-			expect(firstTable[0]?.textContent).toContain("Board");
-			expect(firstTable[1]?.textContent).toContain("worker-1");
+			expect(firstTable[0]?.textContent).toContain("board store");
+			expect(firstTable[1]?.textContent).toContain("lumen");
 			expect(firstTable[1]?.textContent).toContain("exited with code 3: boom");
-			// By-model table: model plus provider, requests, cost.
+			// By-model table: model, requests, cost.
 			expect(container.textContent).toContain("glm-5.3-flash");
-			expect(container.textContent).toContain("zai");
 		} finally {
 			await unmount();
 		}

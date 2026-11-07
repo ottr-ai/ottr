@@ -10,7 +10,6 @@ import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { ensureProjectPackages } from "./apt.ts";
 import { type SignIn, signIns } from "./login.ts";
-import { runOmpStats } from "./ompStats.ts";
 import { platform } from "./platform/index.ts";
 import { redirectProxyHint } from "./proxyHint.ts";
 import { ensureProjectPython } from "./python.ts";
@@ -145,8 +144,6 @@ export function serveWorker(opts: {
 	cgroupRoot?: string;
 	/** Only for tests: the mutation lock file GET /stats reads instead of tmpdir()/ott-stryker.lock. */
 	lockPath?: string;
-	/** Only for tests: the binary GET /omp-stats runs instead of omp on PATH. */
-	ompStatsPath?: string;
 }): Bun.Server<never> {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
@@ -207,13 +204,6 @@ export function serveWorker(opts: {
 				return Response.json(
 					readCgroup({ root: opts.cgroupRoot, lockPath: opts.lockPath }),
 				);
-			}
-			// The worker runs omp in its own container home, so this answer is that
-			// store's usage; the board merges it into Settings -> omp usage.
-			if (request.method === "GET" && url.pathname === "/omp-stats") {
-				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-					return new Response("unauthorized", { status: 401 });
-				return Response.json(await runOmpStats({ bin: opts.ompStatsPath }));
 			}
 			if (request.method === "POST" && url.pathname === "/sweep") {
 				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)

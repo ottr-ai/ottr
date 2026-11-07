@@ -1,28 +1,31 @@
-// omp stats: reads and aggregation for Settings -> omp usage. The worker answers
-// GET /omp-stats with its own `omp stats --json` (its container's omp store); the board
-// runs the same command for its own board store (boardOmpEnv home) and fetches every
-// worker's answer, then renders totals + per-model rows over the distinct stores.
-// Pure module: no store state; the spawn is injectable for tests (bin).
-import { type ChildProcess, spawn } from "node:child_process";
+// omp usage: the board sums the usage records of omp session transcripts itself. omp's
+// `stats` command only syncs the default session store under ~/.omp/agent/sessions, while
+// tracker turns write their transcripts to each project's sessions dir (--session-dir), so
+// the CLI sees almost none of the fleet's usage. The board scans every project dir it
+// mounts plus the default stores and aggregates the same per-message records omp's rollups
+// use: assistant messages carrying usage (input/output/cacheRead/cacheWrite/cost/model).
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 
-/** One omp stats total block: omp's `overall` field and each byModel row share this shape.
- *  Rates and averages are null when omp has no basis for them (no requests yet). Durations
- *  are milliseconds; timestamps are epoch ms. */
+/** One omp usage total block: the rollup fields the Settings card shows. Rates and
+ *  averages that transcripts cannot prove (request failures, durations, omp's cost-model
+ *  savings) stay null — a null is "no basis", never a fabricated zero. Durations would be
+ *  milliseconds; timestamps are epoch ms. */
 export interface OmpUsageTotals {
 	totalRequests: number;
 	successfulRequests: number;
 	failedRequests: number;
-	/** failedRequests / totalRequests, null when omp reports no total. */
 	errorRate: number | null;
 	totalInputTokens: number;
 	totalOutputTokens: number;
 	totalCacheReadTokens: number;
 	totalCacheWriteTokens: number;
-	/** cacheRead / (input + cacheRead), null without a denominator. */
+	/** cacheRead / (input + cacheRead), omp's own formula; null without a denominator. */
 	cacheRate: number | null;
-	/** omp's cost-based estimate; request-weighted when sources merge. */
+	/** Not derivable from transcripts: null. */
 	cacheSavings: number | null;
 	totalCost: number;
+	/** Requests whose model priced nothing while tokens moved. */
 	unpricedRequests: number;
 	totalPremiumRequests: number;
 	avgDuration: number | null;
@@ -32,35 +35,33 @@ export interface OmpUsageTotals {
 	lastTimestamp: number | null;
 }
 
-/** One model's totals in omp's `byModel` list. */
+/** One model's totals in the report's byModel list. */
 export interface OmpModelUsage extends OmpUsageTotals {
 	model: string;
-	provider: string | null;
 }
 
-/** The parsed `omp stats --json` payload: overall totals plus one row per model. */
+/** The aggregated usage of one store: overall totals plus one row per model. */
 export interface OmpStats {
 	overall: OmpUsageTotals;
 	byModel: OmpModelUsage[];
 }
 
-/** What a stats read answers: parsed numbers, or the reason there are none. Always a
+/** What one store's scan answers: parsed numbers, or the reason there are none. Always a
  *  200-shaped answer — a failed read is data, not a failed request. */
 export interface OmpStatsAnswer {
 	stats: OmpStats | null;
 	error: string | null;
 }
 
-/** One container's answer for the report: the board store ("server", board: true) or a
- *  worker's store (name = the worker hostname). */
+/** One scanned store for the report: the board's or the workers' default omp store, or a
+ *  project's turn-session dir (name = the project). */
 export interface OmpStatsSource {
 	name: string;
-	board: boolean;
 	answer: OmpStatsAnswer;
 }
 
 /** The Settings card payload: every source's answer plus totals + per-model rows merged
- *  over the distinct stores (workers share one home, so identical answers count once). */
+ *  across the stores. */
 export interface OmpStatsReport {
 	at: number;
 	sources: OmpStatsSource[];
@@ -68,67 +69,17 @@ export interface OmpStatsReport {
 	byModel: OmpModelUsage[];
 }
 
-type Unchecked<T> = { [K in keyof T]?: unknown };
-
 const isCount = (v: unknown): v is number =>
 	typeof v === "number" && Number.isFinite(v) && v >= 0;
 
-/** A number omp fills when it has a basis for it; absent or null means "no basis". */
 const isRate = (v: unknown): v is number =>
 	typeof v === "number" && Number.isFinite(v);
 
-/** Reads one totals block: counts default to 0 when absent (older omp), rates and
- *  averages to null. Not a validator of everything omp may add — extra keys pass through
- *  untouched, and unknown future fields never block a read. */
-function readTotals(b: Unchecked<OmpUsageTotals>): OmpUsageTotals {
-	const count = (v: unknown): number => (isCount(v) ? v : 0);
-	const rate = (v: unknown): number | null => (isRate(v) ? v : null);
-	return {
-		totalRequests: count(b.totalRequests),
-		successfulRequests: count(b.successfulRequests),
-		failedRequests: count(b.failedRequests),
-		errorRate: rate(b.errorRate),
-		totalInputTokens: count(b.totalInputTokens),
-		totalOutputTokens: count(b.totalOutputTokens),
-		totalCacheReadTokens: count(b.totalCacheReadTokens),
-		totalCacheWriteTokens: count(b.totalCacheWriteTokens),
-		cacheRate: rate(b.cacheRate),
-		cacheSavings: rate(b.cacheSavings),
-		totalCost: count(b.totalCost),
-		unpricedRequests: count(b.unpricedRequests),
-		totalPremiumRequests: count(b.totalPremiumRequests),
-		avgDuration: rate(b.avgDuration),
-		avgTtft: rate(b.avgTtft),
-		avgTokensPerSecond: rate(b.avgTokensPerSecond),
-		firstTimestamp: rate(b.firstTimestamp),
-		lastTimestamp: rate(b.lastTimestamp),
-	};
-}
-
-/** Parses an `omp stats --json` body; null when it names no overall block (not omp's
- *  shape, an error page, or an empty body). byModel may be absent on a fresh store. */
-export function parseOmpStats(body: unknown): OmpStats | null {
-	if (typeof body !== "object" || body === null) return null;
-	const b = body as Unchecked<OmpStats>;
-	const overall = b.overall;
-	if (typeof overall !== "object" || overall === null) return null;
-	if (!isCount((overall as Unchecked<OmpUsageTotals>).totalRequests))
-		return null;
-	const byModel: OmpModelUsage[] = Array.isArray(b.byModel)
-		? b.byModel.flatMap((row): OmpModelUsage[] => {
-				if (typeof row !== "object" || row === null) return [];
-				const r = row as Unchecked<OmpModelUsage>;
-				if (typeof r.model !== "string" || r.model.length === 0) return [];
-				return [
-					{
-						...readTotals(r),
-						model: r.model,
-						provider: typeof r.provider === "string" ? r.provider : null,
-					},
-				];
-			})
-		: [];
-	return { overall: readTotals(overall as Unchecked<OmpUsageTotals>), byModel };
+/** Epoch ms of an ISO timestamp; null when the record carries none omp would window by. */
+function ts(v: unknown): number | null {
+	if (typeof v !== "string") return null;
+	const at = Date.parse(v);
+	return Number.isNaN(at) ? null : at;
 }
 
 const ZEROS: OmpUsageTotals = {
@@ -153,8 +104,8 @@ const ZEROS: OmpUsageTotals = {
 };
 
 /** Merges totals blocks: counts and cost sum; errorRate and cacheRate recompute from the
- *  summed counts (omp's cacheRate is cacheRead / (input + cacheRead), measured on omp
- *  18.14.0); the request-weighted averages and savings carry over; timestamps span. */
+ *  summed counts (cacheRate = cacheRead / (input + cacheRead), omp's formula on 18.14.0);
+ *  the request-weighted averages carry over; timestamps span. */
 function mergeTotals(rows: OmpUsageTotals[]): OmpUsageTotals {
 	if (rows.length === 0) return { ...ZEROS };
 	const sum = (pick: (r: OmpUsageTotals) => number): number =>
@@ -206,26 +157,21 @@ function mergeTotals(rows: OmpUsageTotals[]): OmpUsageTotals {
 	};
 }
 
-/** Merges parsed stats blocks into one: totals sum, byModel rows fold by model+provider
- *  with the same merge rules. Empty input answers the zero totals with no rows. */
+/** Folds parsed stats blocks into one: totals sum, byModel rows fold by model with the
+ *  same merge rules. Empty input answers the zero totals with no rows. */
 export function mergeOmpStats(stats: OmpStats[]): OmpStats {
 	const rows = new Map<string, OmpUsageTotals[]>();
 	for (const s of stats) {
 		for (const m of s.byModel) {
-			const key = `${m.provider ?? ""}|${m.model}`;
-			const list = rows.get(key) ?? [];
+			const list = rows.get(m.model) ?? [];
 			list.push(m);
-			rows.set(key, list);
+			rows.set(m.model, list);
 		}
 	}
 	return {
 		overall: mergeTotals(stats.map((s) => s.overall)),
 		byModel: [...rows.entries()]
-			.map(([key, list]) => {
-				const model = key.slice(key.indexOf("|") + 1);
-				const provider = key.slice(0, key.indexOf("|")) || null;
-				return { ...mergeTotals(list), model, provider };
-			})
+			.map(([model, list]) => ({ ...mergeTotals(list), model }))
 			.sort((a, b) =>
 				b.totalCost !== a.totalCost
 					? b.totalCost - a.totalCost
@@ -234,152 +180,192 @@ export function mergeOmpStats(stats: OmpStats[]): OmpStats {
 	};
 }
 
-/** Drops stats blocks whose whole payload matches an earlier one byte for byte: the
- *  stack's workers share one omp home (docker-compose home:/root), so every worker's
- *  answer repeats the same store and a naive sum would multiply it by the worker count. */
-export function distinctOmpStats(stats: OmpStats[]): OmpStats[] {
-	const seen = new Set<string>();
-	return stats.filter((s) => {
-		const key = JSON.stringify(s);
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
-}
-
-/** Builds the report: totals and per-model rows merged over the distinct stores; every
- *  source keeps its own answer either way, so the breakdown shows what each reported. */
+/** Builds the report: totals and per-model rows merged across the stores; every source
+ *  keeps its own answer either way, so the breakdown shows what each store reported. */
 export function buildOmpStatsReport(
 	sources: OmpStatsSource[],
 	at: number,
 ): OmpStatsReport {
 	const merged = mergeOmpStats(
-		distinctOmpStats(
-			sources.flatMap((s) => (s.answer.stats === null ? [] : [s.answer.stats])),
-		),
+		sources.flatMap((s) => (s.answer.stats === null ? [] : [s.answer.stats])),
 	);
 	return { at, sources, overall: merged.overall, byModel: merged.byModel };
 }
 
-const STDERR_TAIL = 4000;
-
-/** Runs `omp stats --json` and parses stdout. The sync progress goes to stderr; stdout
- *  must be pure JSON. A spawn failure, non-zero exit, timeout, or non-JSON stdout answers
- *  { stats: null, error } naming the cause (with the stderr tail when omp wrote one). */
-export function runOmpStats(opts: {
-	/** Test injection: the binary to run instead of `omp` on PATH. */
-	bin?: string;
-	/** Wall-clock cap; the child is SIGKILLed past it. Default 15 s: the first run syncs
-	 *  every session file into the store. */
-	timeoutMs?: number;
-	/** Env for the child; the board passes boardOmpEnv() to read its own store. */
-	env?: NodeJS.ProcessEnv;
-	cwd?: string;
-}): Promise<OmpStatsAnswer> {
-	const bin = opts.bin ?? "omp";
-	const timeoutMs = opts.timeoutMs ?? 15_000;
-	const { promise, resolve } = Promise.withResolvers<OmpStatsAnswer>();
-	let out = "";
-	let errTail = "";
-	let child: ChildProcess;
-	try {
-		child = spawn(bin, ["stats", "--json"], {
-			env: opts.env,
-			cwd: opts.cwd,
-			timeout: timeoutMs,
-			killSignal: "SIGKILL",
-			// A stats read needs no stdin; a pipe stops a stray read from hanging.
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-	} catch (err) {
-		resolve({
-			stats: null,
-			error: `omp stats failed to start: ${err instanceof Error ? err.message : String(err)}`,
-		});
-		return promise;
-	}
-	child.stdout?.on("data", (chunk: Buffer) => {
-		// 16 MiB is far past any real stats payload; the cap keeps a broken omp from
-		// ballooning the board's memory.
-		if (out.length < 16 * 1024 * 1024) out += String(chunk);
-	});
-	child.stderr?.on("data", (chunk: Buffer) => {
-		errTail = `${errTail}${String(chunk)}`.slice(-STDERR_TAIL);
-	});
-	child.on("error", (err) => {
-		resolve({
-			stats: null,
-			error: `omp stats failed to start: ${err.message}`,
-		});
-	});
-	child.on("close", (code, signal) => {
-		if (signal !== null) {
-			resolve({
-				stats: null,
-				error: `omp stats timed out after ${timeoutMs} ms and was killed`,
-			});
-			return;
-		}
-		if (code !== 0) {
-			resolve({
-				stats: null,
-				error: `omp stats exited with code ${code}${errTail ? `: ${errTail.trim()}` : ""}`,
-			});
-			return;
-		}
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(out);
-		} catch {
-			resolve({
-				stats: null,
-				error: `omp stats printed no valid JSON${errTail ? `: ${errTail.trim()}` : ""}`,
-			});
-			return;
-		}
-		const stats = parseOmpStats(parsed);
-		resolve(
-			stats !== null
-				? { stats, error: null }
-				: {
-						stats: null,
-						error: "omp stats printed JSON without an overall block",
-					},
-		);
-	});
-	return promise;
+/** One usage record: an assistant message's usage (retro.ts reads the same shape). */
+interface UsageRecord {
+	model: string;
+	timestamp: number | null;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
 }
 
-/** GET `${url}/omp-stats` with x-otwr-token. Any failure (network, non-200, bad body)
- *  answers { stats: null, error } — the report shows the source as failed, not the card. */
-export async function fetchWorkerOmpStats(
-	url: string,
-	token: string | undefined,
-	timeoutMs = 20_000,
-): Promise<OmpStatsAnswer> {
-	try {
-		const res = await fetch(`${url}/omp-stats`, {
-			headers: token ? { "x-otwr-token": token } : {},
-			// redirect: "manual": the worker token must never follow a redirect off-host.
-			redirect: "manual",
-			signal: AbortSignal.timeout(timeoutMs),
+/** Collects the usage records of one transcript text. Null when a non-blank line is not a
+ *  JSON object: a skipped record could hide usage, so one malformed line voids the file
+ *  (the same strictness the turn-cost backfill applies). */
+function readUsageRecords(text: string): UsageRecord[] | null {
+	const out: UsageRecord[] = [];
+	for (const line of text.split("\n")) {
+		if (line.trim() === "") continue;
+		let d: unknown;
+		try {
+			d = JSON.parse(line);
+		} catch {
+			return null;
+		}
+		if (typeof d !== "object" || d === null) return null;
+		if (!("type" in d) || d.type !== "message") continue;
+		if (
+			!("message" in d) ||
+			typeof d.message !== "object" ||
+			d.message === null
+		)
+			continue;
+		const m: object = d.message;
+		if (!("role" in m) || m.role !== "assistant") continue;
+		if (!("usage" in m) || typeof m.usage !== "object" || m.usage === null)
+			continue;
+		const u: object = m.usage;
+		const count = (v: unknown): number => (isCount(v) ? v : 0);
+		const model =
+			"model" in m && typeof m.model === "string" && m.model.length > 0
+				? m.model
+				: "unknown";
+		let cost = 0;
+		if ("cost" in u && typeof u.cost === "object" && u.cost !== null) {
+			const c: object = u.cost;
+			if ("total" in c && isRate(c.total)) cost = c.total;
+		}
+		out.push({
+			model,
+			timestamp: ts("timestamp" in d ? d.timestamp : undefined),
+			input: count("input" in u ? u.input : undefined),
+			output: count("output" in u ? u.output : undefined),
+			cacheRead: count("cacheRead" in u ? u.cacheRead : undefined),
+			cacheWrite: count("cacheWrite" in u ? u.cacheWrite : undefined),
+			cost,
 		});
-		if (res.status !== 200)
-			return {
-				stats: null,
-				error: `GET /omp-stats answered HTTP ${res.status}`,
-			};
-		const body = (await res.json()) as Unchecked<OmpStatsAnswer>;
-		if (typeof body.error === "string" && body.stats === null)
-			return { stats: null, error: body.error };
-		const stats = parseOmpStats(body.stats);
-		return stats !== null
-			? { stats, error: null }
-			: { stats: null, error: "worker answered no usable omp stats" };
+	}
+	return out;
+}
+
+/** Aggregates usage records into one store's stats. Each record is one request; failures
+ *  leave no assistant message, so they are invisible here and the rates that need them
+ *  stay null. */
+function aggregate(records: UsageRecord[]): OmpStats {
+	const totals = (rows: UsageRecord[]): OmpUsageTotals => {
+		if (rows.length === 0) return { ...ZEROS };
+		const sum = (pick: (r: UsageRecord) => number): number =>
+			rows.reduce((n, r) => n + pick(r), 0);
+		const input = sum((r) => r.input);
+		const cacheRead = sum((r) => r.cacheRead);
+		const first = rows.flatMap((r) =>
+			r.timestamp === null ? [] : [r.timestamp],
+		);
+		const last = rows.flatMap((r) =>
+			r.timestamp === null ? [] : [r.timestamp],
+		);
+		return {
+			totalRequests: rows.length,
+			successfulRequests: rows.length,
+			failedRequests: 0,
+			errorRate: null,
+			totalInputTokens: input,
+			totalOutputTokens: sum((r) => r.output),
+			totalCacheReadTokens: cacheRead,
+			totalCacheWriteTokens: sum((r) => r.cacheWrite),
+			cacheRate: input + cacheRead > 0 ? cacheRead / (input + cacheRead) : null,
+			cacheSavings: null,
+			totalCost: sum((r) => r.cost),
+			unpricedRequests: rows.filter(
+				(r) =>
+					r.cost === 0 && r.input + r.output + r.cacheRead + r.cacheWrite > 0,
+			).length,
+			totalPremiumRequests: 0,
+			avgDuration: null,
+			avgTtft: null,
+			avgTokensPerSecond: null,
+			firstTimestamp: first.length > 0 ? Math.min(...first) : null,
+			lastTimestamp: last.length > 0 ? Math.max(...last) : null,
+		};
+	};
+	const byModelRows = new Map<string, UsageRecord[]>();
+	for (const r of records) {
+		const list = byModelRows.get(r.model) ?? [];
+		list.push(r);
+		byModelRows.set(r.model, list);
+	}
+	return {
+		overall: totals(records),
+		byModel: [...byModelRows.entries()]
+			.map(([model, rows]) => ({ ...totals(rows), model }))
+			.sort((a, b) =>
+				b.totalCost !== a.totalCost
+					? b.totalCost - a.totalCost
+					: a.model.localeCompare(b.model),
+			),
+	};
+}
+
+/** Every transcript file under a sessions dir: `<ts>_<id>.jsonl` mains plus the sibling
+ *  `<ts>_<id>/` dirs of subagent transcripts, recursively. */
+function walkJsonl(dir: string): string[] {
+	const out: string[] = [];
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch (err) {
+		// Only a dir that does not exist means "no sessions yet" (a fresh project).
+		const absent =
+			err instanceof Error && "code" in err && err.code === "ENOENT";
+		if (absent) return out;
+		throw err;
+	}
+	for (const name of names) {
+		const path = join(dir, name);
+		if (statSync(path).isDirectory()) {
+			out.push(...walkJsonl(path));
+			continue;
+		}
+		if (name.endsWith(".jsonl")) out.push(path);
+	}
+	return out;
+}
+
+/** Scans one store's sessions dir and sums its usage records. A missing dir answers the
+ *  zero totals (a fresh project); an unreadable dir or file, or a malformed record in one,
+ *  answers { stats: null, error } naming the cause — a partial sum would under-report. */
+export function scanSessionUsage(sessionsDir: string): OmpStatsAnswer {
+	let files: string[];
+	try {
+		files = walkJsonl(sessionsDir);
 	} catch (err) {
 		return {
 			stats: null,
-			error: `GET /omp-stats failed: ${err instanceof Error ? err.message : String(err)}`,
+			error: `${sessionsDir}: ${err instanceof Error ? err.message : String(err)}`,
 		};
 	}
+	const records: UsageRecord[] = [];
+	for (const file of files) {
+		let text: string;
+		try {
+			text = readFileSync(file, "utf8");
+		} catch (err) {
+			return {
+				stats: null,
+				error: `${file}: ${err instanceof Error ? err.message : String(err)}`,
+			};
+		}
+		const read = readUsageRecords(text);
+		if (read === null)
+			return {
+				stats: null,
+				error: `${file}: a record is not a JSON object`,
+			};
+		records.push(...read);
+	}
+	return { stats: aggregate(records), error: null };
 }
