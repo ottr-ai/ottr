@@ -4091,8 +4091,17 @@ describe("empty origin", () => {
 	/** The reported state: main's upstream already names origin/main (the ref does not exist). */
 	let tracked = "";
 	let tip = "";
+	// The tests compare tips across fixtures (repo's against tracked's and solo's),
+	// and must() pins the identity but not the dates, so the seed commits only hashed
+	// identically when they landed in the same wall-clock second — under full-suite
+	// load a tick between seedings diverged the shas and failed the assertions
+	// (observed 2026-11-07). The pinned dates keep every seed commit one git object;
+	// afterAll restores the environment.
+	const pinnedDate = "@1577836800 +0000"; // 2020-01-01T00:00:00Z
 	beforeAll(async () => {
 		sweepStaleFixtures("ott-worktree-empty-origin-");
+		process.env.GIT_AUTHOR_DATE = pinnedDate;
+		process.env.GIT_COMMITTER_DATE = pinnedDate;
 		root = mkdtempSync(join(tmpdir(), "ott-worktree-empty-origin-"));
 		origin = join(root, "origin.git");
 		repo = join(root, "repo");
@@ -4107,10 +4116,11 @@ describe("empty origin", () => {
 		await must(tracked, "config", "branch.main.merge", "refs/heads/main");
 		tip = await must(repo, "rev-parse", "HEAD");
 	}, 60_000);
-	afterAll(
-		() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }),
-		60_000,
-	);
+	afterAll(() => {
+		delete process.env.GIT_AUTHOR_DATE;
+		delete process.env.GIT_COMMITTER_DATE;
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	}, 60_000);
 
 	test("resolveTarget resolves origin/<branch> aspirationally without a fetch", async () => {
 		for (const dir of [repo, tracked]) {
