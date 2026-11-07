@@ -10717,6 +10717,38 @@ describe("review findings check", () => {
 			);
 		});
 
+		test("a user message combined under the resume marker overrides the gate too", async () => {
+			const resetsAt = Date.now() + 3_600_000;
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 100, resetsAt),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			// The death-continue's park: the tracker's "." resume, held until the reset.
+			store.updateTask(task.id, {
+				state: "queued",
+				pendingPrompt: ".",
+				pendingBy: "supervisor",
+				holdUntil: resetsAt,
+			});
+			// The steer route's write on that held card: the message combines under the
+			// marker, the hold clears, and authorship records the user (the run-now signal).
+			store.updateTask(task.id, {
+				pendingPrompt: ".\n\nrun it now",
+				pendingBy: "user",
+				holdUntil: null,
+			});
+			await loop.runTurn(store.name, task.id);
+
+			expect(record.runs).toHaveLength(1);
+			expect(record.runs[0]!.prompt).toContain("run it now");
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(resetsAt);
+			expect(after.pendingPrompt).toBe(".");
+		});
+
 		test("supervisor-parked pending text does not override the start gate", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();

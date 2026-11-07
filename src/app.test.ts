@@ -4461,6 +4461,24 @@ describe("steer cancel route", () => {
 		const after = store.getTask(t.id)!;
 		expect(after.holdUntil).toBeNull();
 		expect(after.pendingPrompt).toBe("hold prompt\n\nrun now");
+		// The run-now signal the turn loop's start gate reads: a message that clears a
+		// hold is the user's, even when it combines under a supervisor park's text.
+		expect(after.pendingBy).toBe("user");
+	});
+
+	test("a steer under a supervisor park without a hold keeps supervisor authorship", async () => {
+		const t = store.createTask("running with a park");
+		store.updateTask(t.id, {
+			state: "running",
+			pendingPrompt: "the merge is held: resolve the conflict",
+			pendingBy: "supervisor",
+		});
+		await post(`/api/projects/p1/tasks/${t.id}/steer`, { text: "take theirs" });
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt).toBe(
+			"the merge is held: resolve the conflict\n\ntake theirs",
+		);
+		expect(after.pendingBy).toBe("supervisor");
 	});
 
 	test("nothing queued, or an automatic resume, is 409", async () => {

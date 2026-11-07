@@ -7295,11 +7295,17 @@ export function createApp(deps: AppDeps) {
 							task.pendingPrompt === null
 								? prompt
 								: `${task.pendingPrompt}\n\n${prompt}`,
-						// ponytail: user text appended under supervisor text keeps "supervisor" —
-						// a combined park is never titled as the human's words alone.
-						pendingBy: task.pendingBy === "supervisor" ? "supervisor" : "user",
+						// A message on a card held for a usage limit runs it now: user authorship
+						// plus the cleared holdUntil is the run-now signal the turn loop's start
+						// gate reads. A combined park is only titled as supervisor when no hold
+						// was involved (the tracker's own "." resume under it stays tracker text).
+						pendingBy:
+							task.holdUntil !== null
+								? "user"
+								: task.pendingBy === "supervisor"
+									? "supervisor"
+									: "user",
 						pendingImages: [...task.pendingImages, ...names],
-						// A message on a card held for a usage limit runs it now.
 						holdUntil: null,
 					});
 					deps.schedule();
