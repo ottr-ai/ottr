@@ -6132,6 +6132,70 @@ describe("Optimistic taps (client)", () => {
 		}
 	});
 
+	test("the model picker shows labelled skeleton rows while the catalog loads", async () => {
+		resetCatalogCache();
+		const { promise: pending, resolve: resolveModels } =
+			Promise.withResolvers<Response>();
+		const models = new Response(
+			JSON.stringify({
+				models: [
+					{
+						id: "anthropic/claude-opus-5-5",
+						selector: "anthropic/claude-opus-5-5",
+						name: "Claude Opus 5.5",
+						contextWindow: null,
+					},
+				],
+				roles: {},
+			}),
+			{ status: 200 },
+		);
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/models")) return pending;
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={modelTask()} />);
+			});
+			await act(async () => {});
+			// In flight: a named, list-shaped placeholder, never a silent empty list.
+			const skeleton = container.querySelector(".model-list .skeleton");
+			expect(skeleton).not.toBeNull();
+			expect(skeleton!.getAttribute("role")).toBe("status");
+			expect(skeleton!.getAttribute("aria-label")).toBe(
+				"Loading the model list",
+			);
+			expect(
+				container.querySelector(".model-list button.model-option"),
+			).toBeNull();
+			await act(async () => {
+				resolveModels(models);
+			});
+			// Landed: the skeleton leaves, the options arrive.
+			expect(container.querySelector(".model-list .skeleton")).toBeNull();
+			const option = [
+				...container.querySelectorAll("button.model-option"),
+			].find((b) => b.textContent?.includes("Claude Opus 5.5"));
+			expect(option).toBeDefined();
+		} finally {
+			resolveModels(models);
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			resetCatalogCache();
+		}
+	});
+
 	const laneBase = {
 		projectTasks: [] as TaskCard[],
 		groups: null,

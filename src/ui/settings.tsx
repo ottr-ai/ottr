@@ -39,6 +39,7 @@ import {
 	post,
 	projectLabel,
 	QuotaRow,
+	Skeleton,
 	unwrap,
 	useBusy,
 	useFlash,
@@ -344,10 +345,7 @@ export function ProjectSetupSteps({
 								</span>
 							</label>
 							{facts === null ? (
-								<p className="hint loading wait">
-									<span className="spinner" aria-hidden="true" />
-									Loading GitHub facts
-								</p>
+								<Skeleton shape="stats" rows={2} label="Loading GitHub facts" />
 							) : facts.kind === "error" ? (
 								<p className="hint" role="alert">
 									GitHub facts unavailable: {facts.message}
@@ -3156,10 +3154,7 @@ function ModelRolesSection() {
 					</button>
 				</p>
 			) : state === null || catalog === null ? (
-				<p className="hint wait" role="status">
-					<span className="spinner" aria-hidden="true" />
-					Loading the model roles…
-				</p>
+				<Skeleton shape="rows" rows={4} label="Loading the model roles" />
 			) : (
 				<>
 					<div className="alate-def-rows">

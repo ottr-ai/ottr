@@ -97,6 +97,7 @@ import {
 	ProjectTag,
 	post,
 	projectLabel,
+	Skeleton,
 	unwrap,
 	useBusy,
 	useDelayedState,
@@ -1873,7 +1874,7 @@ function DiffModal({
 				<CloseButton />
 			</div>
 			{result === null ? (
-				<p className="hint diff-empty wait">Loading…</p>
+				<Skeleton shape="lines" rows={4} label="Loading the diff" />
 			) : "failed" in result ? (
 				<p className="hint diff-empty">Diff unavailable.</p>
 			) : sections.length === 0 ? (
@@ -2182,22 +2183,26 @@ function ModelField({
 					</span>
 				)}
 				<div className="model-list">
-					{modelRows(models, catalog?.roles ?? null, model, modelQuery).map(
-						(r) => (
-							<Fragment key={r.key}>
-								{r.divider && <hr className="model-divider" />}
-								<button
-									type="button"
-									className="model-option"
-									aria-pressed={r.pressed}
-									onClick={() => pickModel(r.selector)}
-									onKeyDown={popKeys}
-								>
-									<span>{r.label}</span>
-									{r.pressed && <Icon name="check" size={14} />}
-								</button>
-							</Fragment>
-						),
+					{catalog === null ? (
+						<Skeleton shape="list" rows={5} label="Loading the model list" />
+					) : (
+						modelRows(models, catalog.roles ?? null, model, modelQuery).map(
+							(r) => (
+								<Fragment key={r.key}>
+									{r.divider && <hr className="model-divider" />}
+									<button
+										type="button"
+										className="model-option"
+										aria-pressed={r.pressed}
+										onClick={() => pickModel(r.selector)}
+										onKeyDown={popKeys}
+									>
+										<span>{r.label}</span>
+										{r.pressed && <Icon name="check" size={14} />}
+									</button>
+								</Fragment>
+							),
+						)
 					)}
 				</div>
 				<hr className="model-divider" />
@@ -2978,10 +2983,7 @@ function ReleaseDialog({
 					<CloseButton />
 				</div>
 				{loading && (
-					<p className="hint wait" role="status">
-						<span className="spinner" aria-hidden="true" />
-						Reading the target…
-					</p>
+					<Skeleton shape="lines" rows={3} label="Reading the target" />
 				)}
 				{loadError !== null && (
 					<p className="advisory">
@@ -4520,10 +4522,7 @@ function Provisioning({
 				</p>
 			)}
 			{data === null && err === null && (
-				<p className="loading wait" role="status">
-					<span className="spinner" aria-hidden="true" />
-					Loading provisioning…
-				</p>
+				<Skeleton shape="rows" rows={4} label="Loading provisioning" />
 			)}
 			{data !== null && (
 				// One row per project, one column per list alate provisions; a check marks a list.

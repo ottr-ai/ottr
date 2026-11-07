@@ -636,6 +636,48 @@ const MARK_SHAPES: Record<MarkKind, ReactNode> = {
 	),
 };
 
+/** Skeleton: neutral grey blocks in the rough shape of content still loading, for
+ *  remote loads that can outlast 1s (model list, provisioning, fork facts). The block
+ *  holds opacity 0 through the shared wait-show delay, so a fast load shows nothing.
+ *  role="status" plus a label: grey blocks say nothing to a screen reader. The bones
+ *  shimmer gently; reduced motion collapses the shimmer to a static fill. */
+export function Skeleton({
+	rows = 3,
+	shape = "lines",
+	label,
+}: {
+	/** How many blocks to draw: lines, list rows, label/field pairs, or stat cells. */
+	rows?: number;
+	/** Rough shape of the incoming content. */
+	shape?: "lines" | "list" | "rows" | "stats";
+	/** Accessible name announced while the blocks show. */
+	label: string;
+}) {
+	return (
+		<div
+			className="skeleton"
+			data-shape={shape}
+			role="status"
+			aria-label={label}
+		>
+			{Array.from({ length: rows }, (_, i) =>
+				shape === "rows" || shape === "stats" ? (
+					<span
+						key={i}
+						className={shape === "rows" ? "skeleton-row" : "skeleton-stat"}
+						aria-hidden="true"
+					>
+						<span className="skeleton-bone" />
+						<span className="skeleton-bone" />
+					</span>
+				) : (
+					<span key={i} className="skeleton-bone" aria-hidden="true" />
+				),
+			)}
+		</div>
+	);
+}
+
 export function Mark({ kind }: { kind: MarkKind }) {
 	return (
 		<svg className={`mark mark-${kind}`} viewBox="0 0 16 16" aria-hidden="true">

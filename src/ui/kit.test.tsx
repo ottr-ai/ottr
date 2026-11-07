@@ -3,7 +3,8 @@ import fc from "fast-check";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { clampPan, ZoomableImage, zoomAt } from "./kit.tsx";
+import { renderToStaticMarkup } from "react-dom/server";
+import { clampPan, Skeleton, ZoomableImage, zoomAt } from "./kit.tsx";
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -229,4 +230,20 @@ describe("ZoomableImage", () => {
 		act(() => root.unmount());
 		container.remove();
 	});
+});
+
+test("Skeleton renders a labelled status region in the asked shape", () => {
+	const html = renderToStaticMarkup(
+		<Skeleton rows={2} shape="list" label="Loading the model list" />,
+	);
+	expect(html).toContain('role="status"');
+	expect(html).toContain('aria-label="Loading the model list"');
+	expect(html).toContain('data-shape="list"');
+	// Two list rows: two bones, no label/field pairs.
+	expect(html.match(/skeleton-bone/g)).toHaveLength(2);
+	const pairs = renderToStaticMarkup(
+		<Skeleton rows={2} shape="rows" label="Loading the model roles" />,
+	);
+	// Each definition row is a label stub plus a field stub.
+	expect(pairs.match(/skeleton-bone/g)).toHaveLength(4);
 });

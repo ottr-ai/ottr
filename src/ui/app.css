@@ -392,6 +392,85 @@ button > .spinner {
 	}
 }
 
+/* Skeleton: neutral grey blocks in the rough shape of incoming content, for remote
+   loads that can outlast 1s. The block fades in after the shared wait-show delay,
+   exactly like .wait, so a sub-second load never flashes one; the bones shimmer
+   until the content lands. */
+.skeleton {
+	display: grid;
+	gap: 8px;
+	opacity: 0;
+	animation: wait-show 0s 1s forwards;
+}
+.skeleton-bone {
+	height: 12px;
+	border-radius: 4px;
+	background-color: var(--card-hover);
+	background-image: linear-gradient(
+		90deg,
+		var(--card-hover) 0%,
+		var(--line) 50%,
+		var(--card-hover) 100%
+	);
+	background-size: 200% 100%;
+	background-repeat: no-repeat;
+	animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+	from {
+		background-position: 100% 0;
+	}
+	to {
+		background-position: 0% 0;
+	}
+}
+.skeleton[data-shape="lines"] > .skeleton-bone:nth-child(3n + 1) {
+	width: 84%;
+}
+.skeleton[data-shape="lines"] > .skeleton-bone:nth-child(3n + 2) {
+	width: 100%;
+}
+.skeleton[data-shape="lines"] > .skeleton-bone:nth-child(3n) {
+	width: 62%;
+}
+.skeleton[data-shape="list"] {
+	gap: 2px;
+}
+.skeleton[data-shape="list"] > .skeleton-bone {
+	height: 28px;
+	border-radius: 3px;
+}
+.skeleton[data-shape="rows"] > .skeleton-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+.skeleton[data-shape="rows"] > .skeleton-row > .skeleton-bone:first-child {
+	flex: none;
+	width: 120px;
+	height: 20px;
+}
+.skeleton[data-shape="rows"] > .skeleton-row > .skeleton-bone:last-child {
+	flex: 1;
+	height: 20px;
+}
+.skeleton[data-shape="stats"] {
+	grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+.skeleton[data-shape="stats"] > .skeleton-stat {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.skeleton[data-shape="stats"] > .skeleton-stat > .skeleton-bone:first-child {
+	width: 48px;
+	height: 20px;
+}
+.skeleton[data-shape="stats"] > .skeleton-stat > .skeleton-bone:last-child {
+	width: 88px;
+	height: 12px;
+}
+
 /* Spinner inside a text line (hints, loading/dim status lines) instead of a flex button. */
 .hint .spinner,
 .loading .spinner,
@@ -7322,6 +7401,9 @@ button.log-mode[aria-pressed="true"] {
 	.spinner {
 		animation-duration: 0.7s, 0.01ms !important;
 		animation-iteration-count: infinite, 1 !important;
+	}
+	.skeleton-bone {
+		animation: none; /* the shimmer collapses to a static fill */
 	}
 }
 
