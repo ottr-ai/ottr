@@ -267,6 +267,17 @@ export function createTrendingScanner(deps: {
 		return new Error(`GitHub API ${path} returned HTTP ${res.status}${why}`);
 	}
 
+	/** Reads an API body; a timeout, network error or malformed JSON mid-body fails the scan. */
+	async function readBody(path: string, res: Response, as: "json" | "text") {
+		try {
+			return as === "json" ? ((await res.json()) as unknown) : await res.text();
+		} catch (e) {
+			throw new Error(
+				`GitHub API ${path}: reading the body failed: ${errText(e)}`,
+			);
+		}
+	}
+
 	async function lookup(repo: string): Promise<RepoLookup> {
 		const base = `/repos/${repo}`;
 		const meta = await api(base, "application/vnd.github+json");
@@ -274,7 +285,7 @@ export function createTrendingScanner(deps: {
 		if (meta.status >= 300 && meta.status < 400)
 			return { skip: `moved (HTTP ${meta.status})` };
 		if (!meta.ok) throw apiFailure(base, meta);
-		const body = (await meta.json().catch(() => null)) as Record<
+		const body = (await readBody(base, meta, "json")) as Record<
 			string,
 			unknown
 		> | null;
@@ -288,7 +299,7 @@ export function createTrendingScanner(deps: {
 		let readme: string | null = null;
 		let readmeTruncated = false;
 		if (rd.ok) {
-			const text = await rd.text();
+			const text = (await readBody(readmePath, rd, "text")) as string;
 			readmeTruncated = text.length > README_MAX;
 			readme = text.slice(0, README_MAX);
 		} else if (rd.status !== 404) throw apiFailure(readmePath, rd);
@@ -299,7 +310,7 @@ export function createTrendingScanner(deps: {
 		let tree: string[] = [];
 		let treeTruncated = false;
 		if (tr.ok) {
-			const t = (await tr.json().catch(() => null)) as {
+			const t = (await readBody(treePath, tr, "json")) as {
 				tree?: unknown;
 				truncated?: unknown;
 			} | null;

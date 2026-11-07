@@ -310,6 +310,44 @@ describe("scanNow", () => {
 		expect(scouts(a)).toHaveLength(0);
 	});
 
+	// The headers arrived, then the body timed out: no optional-field fallback may hide it.
+	for (const [part, match] of [
+		["metadata", (u: string) => /\/repos\/[^/]+\/[^/]+$/.test(u)],
+		["readme", (u: string) => u.endsWith("/readme")],
+		["tree", (u: string) => u.includes("/git/trees/")],
+	] as const)
+		test(`a ${part} body that times out fails the scan`, async () => {
+			const a = project();
+			const h = harness({
+				projects: [a],
+				fake: {
+					respond: (url) =>
+						url.startsWith(`${API}/repos/`) && match(url)
+							? new Response(
+									new ReadableStream({
+										start(c) {
+											c.error(
+												new DOMException("body timed out", "TimeoutError"),
+											);
+										},
+									}),
+									{ status: 200 },
+								)
+							: undefined,
+				},
+			});
+			const r = await h.scanner.scanNow();
+			expect(r.ok).toBe(false);
+			if (!r.ok) {
+				expect(r.status).toBe(502);
+				expect(r.error).toContain("reading the body failed: timed out");
+			}
+			expect(h.scanner.status().lastError?.reason).toContain(
+				"reading the body failed: timed out",
+			);
+			expect(scouts(a)).toHaveLength(0);
+		});
+
 	test("an open scout card or a scan in flight answers 409", async () => {
 		const a = project();
 		const h = harness({ projects: [a] });
