@@ -78,7 +78,9 @@ export function doneReadable(
 	return (
 		t.stage === "done" &&
 		t.cancelledAt === null &&
-		onBoard(t) &&
+		// Retro cards never count, even the on-board kinds (running, needs_you): the
+		// unread-done dot is for work cards only, so the retro check stays direct.
+		t.kind !== "retro" &&
 		t.doneAt !== null &&
 		t.doneAt > since
 	);
@@ -146,10 +148,16 @@ export function laneStage(
 	return t.stage === "backlog" && t.state !== "idle" ? "todo" : t.stage;
 }
 
-/** A card the board lanes list. A retro card shows only inside its source card's Work steps,
- * except while it needs the user: a hidden question would hide waiting work. */
-export function onBoard(t: Pick<TaskCard, "kind" | "state">): boolean {
-	return t.kind !== "retro" || t.state === "needs_you";
+/** A card the board lanes list. A retro card runs visibly in its lane (Todo, In progress,
+ * Merging) and hides only in Done, where its source card's Work steps already carry it; a
+ * cancelled retro settles in Done too, so it hides as well. A retro that needs the user stays
+ * visible in every lane: a hidden question would hide waiting work. */
+export function onBoard(
+	t: Pick<TaskCard, "kind" | "state" | "cancelledAt" | "stage">,
+): boolean {
+	return (
+		t.kind !== "retro" || t.state === "needs_you" || laneStage(t) !== "done"
+	);
 }
 
 /** The board's search filter plus per-stage counts: the shown list for the lanes, counts for tab strip and lane heads.

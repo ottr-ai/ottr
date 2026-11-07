@@ -334,26 +334,49 @@ test("laneCounts counts a started backlog card with the todo flow", () => {
 	});
 });
 
-test("laneCounts keeps a done or running retro off the board and out of every count", () => {
+test("laneCounts shows a retro in every lane except Done", () => {
 	const tasks = [
-		card("w", "done", "idle"),
-		card("r1", "done", "idle", { kind: "retro" }),
-		card("r2", "in_progress", "running", { kind: "retro" }),
+		card("r-queued", "todo", "queued", { kind: "retro" }),
+		card("r-running", "in_progress", "running", { kind: "retro" }),
+		card("r-done", "done", "idle", { kind: "retro" }),
+		card("r-cancelled", "merging", "idle", { kind: "retro", cancelledAt: 5 }),
 	];
 	const { shown, counts } = laneCounts(tasks, "", new Set());
-	expect(shown.map((t) => t.id)).toEqual(["w"]);
-	expect(counts.done).toEqual({
+	// The queued and running retros sit in their lanes; a cancelled retro settles
+	// in Done and hides like the done one.
+	expect(shown.map((t) => t.id)).toEqual(["r-queued", "r-running"]);
+	expect(counts.todo.total).toBe(1);
+	expect(counts.merging.total).toBe(0);
+	expect(counts.done.total).toBe(0);
+	expect(counts.in_progress).toEqual({
 		shown: 1,
 		total: 1,
 		fresh: 0,
 		waiting: 0,
 		alarm: null,
 	});
-	expect(counts.in_progress.total).toBe(0);
-	// A search that matches the retro still finds no card for it.
-	const filtered = laneCounts(tasks, "r2", new Set());
-	expect(filtered.shown).toHaveLength(0);
-	expect(filtered.counts.in_progress.total).toBe(0);
+	// A search that matches the running retro finds its card.
+	const filtered = laneCounts(tasks, "r-running", new Set());
+	expect(filtered.shown.map((t) => t.id)).toEqual(["r-running"]);
+	expect(filtered.counts.in_progress.total).toBe(1);
+});
+
+test("laneCounts shows a retro that needs the user even in Done", () => {
+	const tasks = [
+		card("r", "done", "needs_you", {
+			kind: "retro",
+			asked: [{ question: "q", options: [], multi: false, recommended: null }],
+		}),
+	];
+	const { shown, counts } = laneCounts(tasks, "", new Set());
+	expect(shown.map((t) => t.id)).toEqual(["r"]);
+	expect(counts.done).toEqual({
+		shown: 1,
+		total: 1,
+		fresh: 0,
+		waiting: 1,
+		alarm: "asked",
+	});
 });
 
 test("laneCounts shows a retro that needs the user and counts it as waiting", () => {
