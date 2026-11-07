@@ -387,7 +387,7 @@ For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no
 
 A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board.
 
-1. Create the shots folder and start the demo board from inside the shot script — never as a named background service held across tool calls (registered boards die between calls and the proof phase burns restart loops). Give every run a fresh port and its own state directory so parallel boards never collide, and wrap the board in `timeout` so the script's own child exits on its own — the standing no-kill rule stays intact:
+1. Create the shots folder and start the demo board from inside the shot script — never as a named background service held across tool calls (registered boards die between calls and the proof phase burns restart loops). Bind every run to a fresh port — pick a new port number, or bind port 0 and read the printed URL — and give the run its own `mktemp -d` state directory and its own puppeteer profile (`--user-data-dir`), so parallel boards never collide. Keep `timeout` on the board command, but never trust it to free the port: `timeout` signals `bun run`, and the server child survives it, so `timeout N bun run dev` can outlive N with the board still holding its port — the standing no-kill rule stays intact:
 
    ```sh
    mkdir -p shots
@@ -396,7 +396,7 @@ A UI change needs a picture of the new surface. `bun run dev` serves the demo bo
    PORT=$port OTTR_STATE_DIR="$state" timeout 900 bun run dev &
    ```
 
-Never wait for a leftover board to expire: with this step's fresh port and state directory a leftover board cannot block the run, so start the new board at once and let the tracker expire the old one.
+Never wait for a leftover board to expire, and never reuse a port while any board still holds it: with this step's fresh port and state directory a leftover board cannot block the run, so switch to a new port and start the new board at once — let the tracker expire the old one.
 
 2. Wait for readiness by polling the port with a bounded loop, not a fixed sleep, and fail the script when the board never comes up:
 
