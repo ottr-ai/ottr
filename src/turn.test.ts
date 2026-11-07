@@ -10684,6 +10684,63 @@ describe("review findings check", () => {
 			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
 		});
 
+		test("a queued user message overrides the start gate and runs now", async () => {
+			const resetsAt = Date.now() + 3_600_000;
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 100, resetsAt),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+			expect(store.getTask(task.id)!.holdUntil).toBe(resetsAt);
+
+			// The steer route's write: a message on a held card clears the hold and runs it now,
+			// even though the quota state still reports the provider as exhausted.
+			store.updateTask(task.id, {
+				pendingPrompt: "run it now",
+				pendingBy: "user",
+				holdUntil: null,
+			});
+			await loop.runTurn(store.name, task.id);
+
+			expect(record.runs).toHaveLength(1);
+			expect(record.runs[0]!.prompt).toContain("run it now");
+			// The user text is consumed; the run dies at the limit anyway and the death's
+			// continue takes over, holding until the same reset.
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(resetsAt);
+			expect(after.pendingPrompt).toBe(".");
+			expect(after.needsReason).toStartWith(
+				"The run stopped at the provider's usage limit",
+			);
+		});
+
+		test("supervisor-parked pending text does not override the start gate", async () => {
+			const resetsAt = Date.now() + 3_600_000;
+			const record = baseRecord();
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 100, resetsAt),
+				startRun: dyingRun(record),
+			});
+			const task = store.createTask("work please");
+			store.updateTask(task.id, {
+				pendingPrompt: "Report the same outcome again after the reset.",
+				pendingBy: "supervisor",
+			});
+			await loop.runTurn(store.name, task.id);
+
+			// The park's own instruction waits like the card it parked: no run until the reset.
+			expect(record.runs).toHaveLength(0);
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(resetsAt);
+			expect(after.pendingPrompt).toBe(
+				"Report the same outcome again after the reset.",
+			);
+		});
+
 		test("a run the provider stops mid-turn continues automatically until its reset", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();

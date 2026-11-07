@@ -2336,9 +2336,19 @@ export function createTurnLoop(
 			// as holdUntil — the scheduler starts the card when the limit resets. A reply or
 			// steer queued meanwhile stays pending: this start consumed nothing. A cancel
 			// landing during the quota await owns the card; only a still-claimed card requeues.
-			const startHold = await usageResetFor(
-				runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
-			);
+			// A queued user message is the override the hold's text promises ("Send a message
+			// to run it now"): the steer and reply routes cleared holdUntil, so only this gate
+			// would re-hold — stale quota data must not trap the user's message until the
+			// reset. Supervisor-authored pending text (a park's own instruction) waits.
+			const userOverride =
+				live.pendingPrompt !== null && live.pendingBy !== "supervisor";
+			const startHold = userOverride
+				? null
+				: await usageResetFor(
+						runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
+					);
+			if (userOverride)
+				log("- user message queued: the usage-limit start gate does not hold");
 			if (startHold !== null) {
 				const at = new Date(startHold.resetsAt)
 					.toISOString()
