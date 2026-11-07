@@ -15,7 +15,7 @@
     "test:mutation:delta": "bun scripts/mutation-delta.ts"
   },
   "dependencies": {
-    "mermaid": "11.17.2",
+    "mermaid": "12.2.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "web-push": "3.6.7"
