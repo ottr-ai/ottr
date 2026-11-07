@@ -3626,12 +3626,22 @@ export function createApp(deps: AppDeps) {
 		return { p: dest };
 	}
 
-	/** git-init with an initial commit (Ottr identity fallback); an error string for a 400, or null. */
+	/** git-init with an initial commit (Ottr identity fallback); an error string for a 400, or null.
+	 * The commit doubles as the arch-review watermark (docs/ARCH-REVIEWS.md "Baseline"): a repo
+	 * Ottr itself created starts reviewed at that head with delta 0, so it never shows
+	 * "Un-reviewed — review due" before any work exists; commits after it count toward the cap.
+	 * An imported repo keeps its history and stays un-reviewed until a real review. */
 	async function gitInitWithCommit(p: string): Promise<string | null> {
 		const r = await git(["init", "-q", "-b", "main"], p);
 		if (r.code !== 0) return `git init failed: ${r.stderr.trim()}`;
 		let c = await git(
-			["commit", "-q", "--allow-empty", "-m", "Initial commit"],
+			[
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				"docs(arch-review): initial commit",
+			],
 			p,
 		);
 		if (c.code !== 0)
@@ -3646,7 +3656,7 @@ export function createApp(deps: AppDeps) {
 					"-q",
 					"--allow-empty",
 					"-m",
-					"Initial commit",
+					"docs(arch-review): initial commit",
 				],
 				p,
 			);

@@ -91,4 +91,9 @@ work and the fixes its review asked for.
 
 To start counting from a chosen point without a full review first, commit
 `docs(arch-review): baseline`. The first real review then covers everything
-after that commit.
+after that commit. A repo Ottr itself creates (the New tab, or the init route
+on an empty folder) gets this watermark baked in: its initial commit is
+`docs(arch-review): initial commit`, so the project starts reviewed with
+delta 0 instead of showing "Un-reviewed — review due" on an empty repo. An
+imported repo keeps today's rule: no watermark in its history means the whole
+history counts and a review is due.

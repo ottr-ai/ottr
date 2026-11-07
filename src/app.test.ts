@@ -62,6 +62,7 @@ import {
 import { PR_GATES } from "./prs.ts";
 import { createRunSink } from "./runner.ts";
 import {
+	archReviewDue,
 	PROMPT_EDIT_HELD,
 	pickRunnable,
 	type ReviewTask,
@@ -90,7 +91,12 @@ import { loadSkips } from "./updates.ts";
 import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
-import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
+import {
+	archReviewDelta,
+	git,
+	gitSecrets,
+	networkGitAuth,
+} from "./worktree.ts";
 
 // The push tests observe sends and VAPID details (R1-1, R2-3). The mock must be registered
 // before app.ts evaluates — mock.module cannot intercept a static import — so app.ts loads
@@ -1789,6 +1795,78 @@ describe("settings routes", () => {
 
 		const rm2 = await post("/api/projects/gitless-proj/remove", {});
 		expect(rm2.status).toBe(200);
+	});
+
+	// OTTR-624: a repo Ottr itself creates starts at its own watermark. The init commit is
+	// docs(arch-review): initial commit, so the project counts as reviewed with delta 0 and
+	// the header never shows "Un-reviewed — review due" on an empty repo (ottr-cloud report,
+	// 2026-11-07). Commits after the init commit count toward the cap as usual.
+	test("an Ottr-created repo starts reviewed at its init commit", async () => {
+		makeFixture("watermark-proj", true);
+		const dir = join(root, "watermark-proj");
+		const add = await post("/api/projects", {
+			url: "https://github.com/octo/watermark-proj",
+		});
+		expect(add.status).toBe(200);
+		const init = await post("/api/projects/watermark-proj/init", {});
+		expect(init.status).toBe(200);
+		// The init commit itself is the watermark: reviewed from birth, delta 0.
+		const base = execSync("git rev-parse HEAD", {
+			cwd: dir,
+			encoding: "utf8",
+		}).trim();
+		expect(await archReviewDelta(dir, "main", null)).toEqual({
+			delta: 0,
+			reviewed: true,
+			anchor: base,
+		});
+		// The rules interview's AGENTS.md commit is the first commit toward the cap: not due.
+		execSync("git config user.email t@t && git config user.name t", {
+			cwd: dir,
+			stdio: "ignore",
+		});
+		writeFileSync(join(dir, "AGENTS.md"), "rules");
+		execSync(
+			"git add AGENTS.md && git commit -qm 'docs(rules): add AGENTS.md'",
+			{ cwd: dir, stdio: "ignore" },
+		);
+		const d = await archReviewDelta(dir, "main", null);
+		expect(d).toEqual({ delta: 1, reviewed: true, anchor: base });
+		expect(archReviewDue(d!.delta, 150, d!.reviewed)).toBe(false);
+
+		// Settle the interview the init queued, so remove's active-task guard passes.
+		const ws = projects.get("watermark-proj")!.store;
+		const interviewTask = ws.listTasks().at(-1);
+		expect(interviewTask?.prompt.startsWith(RULES_INTERVIEW_MARKER)).toBe(true);
+		ws.updateTask(interviewTask!.id, {
+			cancelledAt: Date.now(),
+			state: "idle",
+			stage: "done",
+		});
+		const rm = await post("/api/projects/watermark-proj/remove", {});
+		expect(rm.status).toBe(200);
+	});
+
+	// An imported repo with history and no watermark keeps today's rule: the whole history
+	// counts and the project shows "Un-reviewed — review due" until a real review runs.
+	test("an imported repo with history stays un-reviewed and due", async () => {
+		const p = makeFixture("imported-proj");
+		writeFileSync(join(p, "AGENTS.md"), "rules");
+		execSync("git add AGENTS.md && git commit -qm rules", {
+			cwd: p,
+			stdio: "ignore",
+		});
+		const add = await post("/api/projects", {
+			url: "https://github.com/octo/imported-proj",
+		});
+		expect(add.status).toBe(200);
+		const d = await archReviewDelta(join(root, "imported-proj"), "main", null);
+		expect(d).toEqual({ delta: 2, reviewed: false, anchor: "" });
+		expect(archReviewDue(d!.delta, 150, d!.reviewed)).toBe(true);
+		// The fixture carries a committed AGENTS.md, so no rules interview queues and remove
+		// passes its active-task guard.
+		const rm = await post("/api/projects/imported-proj/remove", {});
+		expect(rm.status).toBe(200);
 	});
 
 	test("adding a new project creates the folder under the default dir and registers it", async () => {
@@ -3576,7 +3654,9 @@ describe("idle auto review tick", () => {
 	});
 
 	/** A fresh app (own shared state, own remembered card) with one due project: target
-	 * main and archReview.due, like a refresh left it. */
+	 * main and archReview.due, like a refresh left it. The New-tab repo's init commit is
+	 * the arch-review watermark (OTTR-624), so due-ness needs a commit past it: cap 1 and
+	 * one commit make the fresh recompute in fileArchReview agree with the cached badge. */
 	async function idleMount() {
 		const name = `idle-${opened.length}-${Math.random()
 			.toString(36)
@@ -3593,17 +3673,27 @@ describe("idle auto review tick", () => {
 		expect(add.status).toBe(200);
 		const e = projects.get(name)!;
 		e.target = "main";
+		const dir = join(root, name);
+		execSync("git config user.email t@t && git config user.name t", {
+			cwd: dir,
+			stdio: "ignore",
+		});
+		execSync("git commit -q --allow-empty -m work", {
+			cwd: dir,
+			stdio: "ignore",
+		});
+		e.store.setSettings({ archReviewCap: 1 });
 		e.archReview = {
-			delta: 150,
+			delta: 1,
 			reviewed: true,
 			base: null,
 			reviewCardId: null,
-			cap: 150,
+			cap: 1,
 			due: true,
 			running: false,
 		};
 		opened.push(e);
-		return { m, e, dir: join(root, name), projects };
+		return { m, e, dir, projects };
 	}
 
 	const reviewCards = (e: Entry): Task[] =>
