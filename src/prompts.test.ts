@@ -568,11 +568,26 @@ describe("workCheckSendBack", () => {
 			attempt: 1,
 			max: 2,
 		});
-		expect(text).toContain("Send-back 1 of 2");
+		expect(text).toContain(
+			"Send-back 1 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again; after 2 of them, the tracker asks the user before another send-back.",
+		);
+		expect(text).not.toContain("goes to needs_you");
 		expect(text).toContain("1. The test asserts nothing");
 		expect(text).toContain("quote: expect(x);");
 		expect(text).toContain("2. Hardcoded output");
 		expect(text).toContain("Do not weaken, delete or special-case tests");
+	});
+
+	test("a send-back past the cap keeps the cap as denominator and names the ask", () => {
+		const text = workCheckSendBack({
+			blockers: [{ finding: "still open", quote: "q" }],
+			attempt: 3,
+			max: 2,
+		});
+		expect(text).toContain(
+			"Send-back 3 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again; after 2 of them, the tracker asks the user before another send-back.",
+		);
+		expect(text).not.toContain("goes to needs_you");
 	});
 
 	test("prefixes a blocker with its bug class when the check named one", () => {

@@ -43,6 +43,7 @@ import {
 	restartResumePrompt,
 	retroReplyPrompt,
 	reviewCheckPrompt,
+	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
 	workCheckPrompt,
 	workCheckSendBack,
@@ -3913,17 +3914,17 @@ export function createTurnLoop(
 								!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
 						)
 						.map((t) => t.input as string);
-					// Send the blockers back to the work agent, or park on the third block:
-					// shared by the re-ready resend and a fresh verdict below; a resend counts
-					// as an attempt against the same cap of 2.
+					// Send the blockers back to the work agent, or ask the user once the cap is
+					// spent: shared by the re-ready resend and a fresh verdict below; a resend
+					// counts as an attempt against the same WORK_CHECK_MAX_SENDBACKS cap.
 					const sendBack = (
 						blockers: WorkCheckBlocker[],
 						runs: WorkCheckRun[],
 					) => {
 						const sendbacks = cur.workCheckSendbacks;
-						// The third block asks the user: the reply route turns a click into the
+						// A block after the cap asks the user: the reply route turns a click into the
 						// send-back or the merge (no board check skill needed to unstick it).
-						if (sendbacks >= 2)
+						if (sendbacks >= WORK_CHECK_MAX_SENDBACKS)
 							store.updateTask(id, {
 								stage: "in_progress",
 								state: "needs_you",
@@ -3944,7 +3945,7 @@ export function createTurnLoop(
 								pendingPrompt: workCheckSendBack({
 									blockers,
 									attempt: sendbacks + 1,
-									max: 2,
+									max: WORK_CHECK_MAX_SENDBACKS,
 								}),
 								pendingBy: "supervisor",
 								needsReason: null,
@@ -3953,7 +3954,7 @@ export function createTurnLoop(
 								workCheckSendbacks: sendbacks + 1,
 							});
 							log(
-								`- work check: sent back to the work agent (${sendbacks + 1} of 2)`,
+								`- work check: sent back to the work agent (${sendbacks + 1} of ${WORK_CHECK_MAX_SENDBACKS})`,
 							);
 						}
 					};

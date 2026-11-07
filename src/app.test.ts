@@ -5974,6 +5974,11 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.workCheckSendbacks).toBe(3);
 		// A tracker send-back, so the next check does not count it as a human reply.
 		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		// The denominator stays the tracker's cap, and the contract names the ask, not a park.
+		expect(row.pendingPrompt).toContain(
+			"Send-back 3 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again; after 2 of them, the tracker asks the user before another send-back.",
+		);
+		expect(row.pendingPrompt).not.toContain("goes to needs_you");
 		expect(row.pendingPrompt).toContain("still open");
 		expect(row.pendingPrompt).not.toContain("already fixed");
 	});

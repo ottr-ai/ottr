@@ -16211,7 +16211,9 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 		const after = store.getTask(task.id)!;
 		expect(after.workCheckSendbacks).toBe(1);
-		expect(after.pendingPrompt).toContain("Send-back 1 of 2");
+		expect(after.pendingPrompt).toContain(
+			"Send-back 1 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again",
+		);
 		expect(logText(store, task.id)).toContain(
 			"sent back to the work agent (1 of 2)",
 		);

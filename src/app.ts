@@ -147,6 +147,7 @@ import {
 	releasePrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
+	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
@@ -6357,7 +6358,7 @@ export function createApp(deps: AppDeps) {
 									workCheckSendBack({
 										blockers: open,
 										attempt: n,
-										max: n,
+										max: WORK_CHECK_MAX_SENDBACKS,
 									}),
 								),
 								pendingBy: "supervisor",

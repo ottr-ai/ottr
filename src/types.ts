@@ -427,7 +427,7 @@ export interface Task {
 	uncommittedFiles: string[];
 	/** Second-model checks of this work card, oldest first, capped at the newest 20 runs. */
 	workCheckLog: WorkCheckRun[];
-	/** Work-check send-backs to the work agent so far; the third failing check parks the card on needs_you. */
+	/** Work-check send-backs to the work agent so far; once WORK_CHECK_MAX_SENDBACKS have run, every failing check asks the user (send it back, merge anyway, or cancel) before another send-back. */
 	workCheckSendbacks: number;
 	/** Branch head the last completed check saw; a ready report at the same head does not re-check. */
 	workCheckHead: string | null;
