@@ -1677,6 +1677,8 @@ describe("RestartWaitLine", () => {
 		commits: 116,
 		since: 1730990000000,
 		turns: ["ottr-448", "ottr-454"],
+		command:
+			"docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server",
 	};
 
 	test("the wait names both shas, the turn holds, and the host command in a code span", () => {
@@ -1695,7 +1697,13 @@ describe("RestartWaitLine", () => {
 		);
 		expect(html).toContain("The restart waits for: ottr-448, ottr-454.");
 		expect(html).toContain("Restarting now stops those turns.");
-		expect(html).toContain("<code>bun scripts/update-image.ts</code>");
+		// The recreate the update script's server step runs — never the deferring
+		// script invocation, which would only defer again.
+		expect(html).toContain(
+			"<code>docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server</code>",
+		);
+		// renderToStaticMarkup escapes the apostrophe, so assert the fragment.
+		expect(html).toContain("from the stack");
 		expect(html).toContain('class="new-tag"');
 	});
 
@@ -1709,7 +1717,9 @@ describe("RestartWaitLine", () => {
 		);
 		expect(html).not.toContain("waits for");
 		expect(html).toContain("Restarting now stops the running turns.");
-		expect(html).toContain("<code>bun scripts/update-image.ts</code>");
+		expect(html).toContain(
+			"<code>docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server</code>",
+		);
 		expect(html).not.toContain("new-tag");
 	});
 

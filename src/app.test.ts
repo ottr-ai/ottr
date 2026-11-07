@@ -12786,13 +12786,20 @@ describe("restart wait notice", () => {
 	const write = (name: string, content: string) =>
 		writeFileSync(join(home, name), content);
 	const wait = (
-		over: Partial<{ since: number; commit: string; turns: string[] }>,
+		over: Partial<{
+			since: number;
+			commit: string;
+			turns: string[];
+			command: string;
+		}>,
 	) =>
 		JSON.stringify({
 			commit: NEW,
 			since: Date.now() - 7 * 60 * 60_000,
 			commits: 3,
 			turns: ["ottr-1", "ottr-2"],
+			command:
+				"docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server",
 			...over,
 		});
 
@@ -12813,6 +12820,7 @@ describe("restart wait notice", () => {
 				commits: number;
 				since: number;
 				turns: string[];
+				command: string;
 			} | null;
 		};
 
@@ -12822,7 +12830,7 @@ describe("restart wait notice", () => {
 		expect((await state()).restartWait).toBeNull();
 	});
 
-	test("the notice after the threshold, all five fields intact", async () => {
+	test("the notice after the threshold, all six fields intact", async () => {
 		write("build-commit", `${RUN}\n`);
 		write("restart-wait", wait({}));
 		const view = (await state()).restartWait;
@@ -12832,6 +12840,8 @@ describe("restart wait notice", () => {
 			commits: 3,
 			since: expect.any(Number) as number,
 			turns: ["ottr-1", "ottr-2"],
+			command:
+				"docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server",
 		});
 	});
 
@@ -12846,7 +12856,28 @@ describe("restart wait notice", () => {
 			commits: 3,
 			since: expect.any(Number) as number,
 			turns: ["ottr-1", "ottr-2"],
+			command:
+				"docker compose -f docker-compose.yml --env-file .env up -d --no-deps --wait server",
 		});
+	});
+
+	test("a missing, malformed, or oversized command falls back to the plain recreate", async () => {
+		write("build-commit", `${RUN}\n`);
+		const plain = "docker compose up -d --no-deps --wait server";
+		const view = async (over: object) => {
+			write("restart-wait", wait(over));
+			return (await state()).restartWait?.command;
+		};
+		expect(await view({ command: undefined })).toBe(plain);
+		expect(await view({ command: "   " })).toBe(plain);
+		expect(await view({ command: "docker compose up\t--wait server" })).toBe(
+			plain,
+		); // a control character never reaches the UI
+		expect(await view({ command: "x".repeat(301) })).toBe(plain);
+		// Exactly 300 rides; the boundary is the recorded command's own cap.
+		expect(await view({ command: `${"x".repeat(293)} --wait` })).toBe(
+			`${"x".repeat(293)} --wait`,
+		);
 	});
 
 	test("cleared once the server runs the image commit", async () => {

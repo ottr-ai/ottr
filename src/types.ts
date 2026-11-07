@@ -1074,6 +1074,10 @@ export interface RestartWaitView {
 	since: number;
 	/** Card ids that held the restart at the last deferral. */
 	turns: string[];
+	/** The exact command that restarts the server now (the recreate the update
+	 *  script's server step runs, with the deployment's own compose arguments);
+	 *  the canonical plain form when the record names none. */
+	command: string;
 }
 
 /** One provider usage window, e.g. Anthropic's 5-hour or 7-day limit. */

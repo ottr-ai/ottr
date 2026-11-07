@@ -157,8 +157,10 @@ turns and work turns all get the new omp. Two parts do the work:
      that cannot detach), the run skips the final whole-stack up, leaves the
      seed record unwritten, and a later run seeds and records again. A deferred
      restart also surfaces on the board: after 6 h of waiting the bell shows a
-     notice with both commits, the waiting cards, and the restart command
-     (`bun scripts/update-image.ts`), and it clears once the server runs the
+     notice with both commits, the waiting cards, and the exact restart
+     command — the recreate the server step itself runs,
+     `docker compose <your compose arguments> up -d --no-deps --wait server`,
+     which stops the named turns; the notice clears once the server runs the
      image commit.
 
    The last step runs `up -d --wait` for the whole stack: it starts a service

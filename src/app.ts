@@ -2026,7 +2026,18 @@ export function createApp(deps: AppDeps) {
 		}
 		if (build === commit) return null;
 		if (Date.now() - since < RESTART_WAIT_NOTICE_MS) return null;
-		return { running: build, commit, commits, since, turns };
+		// The command the notice names: the recorded recreate when the record
+		// carries one, else the plain form (a checkout with the default compose
+		// file and .env). Host-written file content, so it never reaches the UI
+		// with control characters or an unbounded length.
+		const rawCommand = typeof r.command === "string" ? r.command.trim() : "";
+		const command =
+			rawCommand !== "" &&
+			rawCommand.length <= 300 &&
+			!/[\p{Cc}]/u.test(rawCommand)
+				? rawCommand
+				: "docker compose up -d --no-deps --wait server";
+		return { running: build, commit, commits, since, turns, command };
 	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
 	async function layout422(fn: () => Promise<Response>): Promise<Response> {

@@ -1577,8 +1577,17 @@ async function reportRestartWait(
 		.split(/\s+/)
 		.filter((id) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(id))
 		.slice(0, 20);
+	// The exact command that restarts the server now, with this run's own compose
+	// arguments: the same recreate the server step runs. Re-running this script
+	// would only defer again, so the notice must name the recreate instead. A
+	// compose argument with a quote cannot ride the printf; the record then omits
+	// the command and the board falls back to the plain form.
+	const command = `docker compose ${compose.join(" ")} up -d --no-deps --wait server`;
+	const record = command.includes("'")
+		? { commit: head, since: first, commits, turns }
+		: { commit: head, since: first, commits, turns, command };
 	const w = await exec(
-		`printf %s '${JSON.stringify({ commit: head, since: first, commits, turns })}' > /etc/ottr/restart-wait`,
+		`printf %s '${JSON.stringify(record)}' > /etc/ottr/restart-wait`,
 	);
 	if (w.code !== 0)
 		d.log("the restart-wait record failed: the board cannot show a notice");

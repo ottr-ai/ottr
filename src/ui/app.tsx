@@ -10942,7 +10942,7 @@ export function RestartWaitLine({
 				{wait.turns.length > 0
 					? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
 					: "Restarting now stops the running turns."}{" "}
-				On the host, run <code>bun scripts/update-image.ts</code>.
+				On the host, run <code>{wait.command}</code> from the stack's checkout.
 			</span>
 			{fresh && <span className="new-tag">New</span>}
 		</p>

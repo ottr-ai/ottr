@@ -500,6 +500,7 @@ function waitRecord(
 	since: number;
 	commits: number;
 	turns: string[];
+	command?: string;
 } {
 	const m = /printf %s '(.*)' > \/etc\/ottr\/restart-wait$/.exec(
 		f.restartWaits[n] ?? "",
@@ -1763,6 +1764,9 @@ describe("rolling restart", () => {
 			since: Date.UTC(2026, 9, 16) + 60 * 60_000,
 			commits: 1,
 			turns: ["OTTR-9", "ALAT-87"],
+			// The exact recreate the server step runs, with the run's own compose
+			// arguments — not the deferring script invocation.
+			command: "docker compose -f c.yml up -d --no-deps --wait server",
 		});
 		// The wait clock write still happened.
 		expect(f.seedWrites).toEqual([
@@ -1789,6 +1793,7 @@ describe("rolling restart", () => {
 			since,
 			commits: 0,
 			turns: [],
+			command: "docker compose -f c.yml up -d --no-deps --wait server",
 		});
 		expect(f.logs.join("\n")).toContain(
 			"warning: the server restart still waits, and its turns cannot be read",
