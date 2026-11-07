@@ -2826,26 +2826,35 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 		linear-gradient(var(--text-strong), var(--text-strong)) 1px 0 / 1px 100%
 		no-repeat;
 	pointer-events: none;
+	/* Size container: the end dot rides the rail's height through cqh units. */
+	container-type: size;
 }
 .mutation-rail > i {
 	position: absolute;
+	top: 0;
 	bottom: 0;
 	left: 0;
 	width: 3px;
 	background: var(--text-strong);
 	border-bottom-left-radius: 3px;
-	transition: height 0.4s var(--ease);
+	/* The fill scales up from the bottom instead of growing its height (a layout
+	   transition); the rail's --p drives it and the end dot alike. */
+	transform: scaleY(var(--p, 0));
+	transform-origin: bottom;
+	transition: transform 0.4s var(--ease);
 }
-/* The head: the twin bar's 6px end dot, centred on the 3px fill. */
-.mutation-rail > i::before {
-	content: "";
+/* The head: the twin bar's 6px end dot, centred on the 3px fill. A sibling of the fill,
+   not its ::before, so the fill's scaleY cannot stretch it; it rides the same --p. */
+.mutation-rail > b {
 	position: absolute;
-	top: -3px;
+	bottom: -3px;
 	left: -1.5px;
 	width: 6px;
 	height: 6px;
 	border-radius: 50%;
 	background: var(--text-strong);
+	transform: translateY(calc(var(--p, 0) * -100cqh));
+	transition: transform 0.4s var(--ease);
 }
 /* Arrival: when a card lands in a column its status mark traces itself once and the meta line follows;
    nothing loops. Cards cascade by position up to the eighth. Reduced motion skips it entirely. */
