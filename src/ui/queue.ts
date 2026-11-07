@@ -123,7 +123,7 @@ const STAGES = [
 	"backlog",
 ] as const satisfies readonly Stage[];
 
-/** Per-stage board numbers: the tab-strip counts and the lane-head badges. */
+/** Per-stage board numbers: the lane-head badges and the non-done tab badges. */
 export type LaneCount = {
 	/** Cards matching the search filter. */
 	shown: number;

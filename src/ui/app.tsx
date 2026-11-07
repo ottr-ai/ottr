@@ -3405,7 +3405,6 @@ export function ProjectBoard({
 		});
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
 	const { shown, counts } = laneCounts(tasks, applied, seenAnswers);
-	const perStage = COLUMNS.map((c) => ({ ...c, ...counts[c.key] }));
 	// The search count matches the lanes: a retro off the board is no task to count.
 	const boardTotal = tasks.filter(onBoard).length;
 	return (
@@ -3720,49 +3719,55 @@ export function ProjectBoard({
 				/>
 			)}
 			{/* Mobile stage tabs: CSS shows this strip and hides the inactive columns only in
-			    the single-column tier (container ≤440px); the desktop grid never sees either. */}
+			    the single-column tier (container ≤440px); the desktop grid never sees either.
+			    Done carries no number anywhere: its tab read the whole landed history, and the
+			    lane head repeated the tab's name and count. The other tabs keep theirs as bare
+			    digits, and the alarm shows as a mark only — the strip then fits a 320px phone
+			    without a scrollbar. */}
 			<div className="stage-tabs" role="tablist" aria-label="Board stages">
-				{perStage.map((c) => (
-					<button
-						key={c.key}
-						type="button"
-						role="tab"
-						id={`stage-tab-${c.key}`}
-						data-tab={c.key}
-						aria-selected={stage === c.key}
-						aria-controls={`stage-${c.key}`}
-						tabIndex={stage === c.key ? 0 : -1}
-						onClick={() => setStage(c.key)}
-						onKeyDown={(e) => switchTab(e, STAGE_KEYS, setStage)}
-					>
-						{c.label}
-						<span className={q === "" ? "count" : "count filtered"}>
-							{q === "" ? c.shown : `${c.shown}/${c.total}`}
-						</span>
-						{c.fresh > 0 && (
-							<span className="count fresh" title="Answered, not opened yet">
-								{c.fresh} new
-							</span>
-						)}
-						{c.alarm !== null && (
-							<span
-								role="img"
-								className={
-									"count needs" + (c.alarm === "asked" ? " asked" : "")
-								}
-								title={c.alarm === "asked" ? "Question asked" : "Needs action"}
-								aria-label={
-									c.waiting === 1
-										? "1 task needs action"
-										: `${c.waiting} tasks need action`
-								}
-							>
-								<Mark kind={c.alarm} />
-								{c.waiting}
-							</span>
-						)}
-					</button>
-				))}
+				{COLUMNS.map((c) => {
+					const count = counts[c.key];
+					return (
+						<button
+							key={c.key}
+							type="button"
+							role="tab"
+							id={`stage-tab-${c.key}`}
+							data-tab={c.key}
+							aria-selected={stage === c.key}
+							aria-controls={`stage-${c.key}`}
+							tabIndex={stage === c.key ? 0 : -1}
+							onClick={() => setStage(c.key)}
+							onKeyDown={(e) => switchTab(e, STAGE_KEYS, setStage)}
+						>
+							{c.label}
+							{c.key !== "done" && (
+								<>
+									<span className="tabs-digits">
+										{q === "" ? count.shown : `${count.shown}/${count.total}`}
+									</span>
+									{count.alarm !== null && (
+										<span
+											role="img"
+											title={
+												count.alarm === "asked"
+													? "Question asked"
+													: "Needs action"
+											}
+											aria-label={
+												count.waiting === 1
+													? "1 task needs action"
+													: `${count.waiting} tasks need action`
+											}
+										>
+											<Mark kind={count.alarm} />
+										</span>
+									)}
+								</>
+							)}
+						</button>
+					);
+				})}
 			</div>
 			<div
 				className="flow"
@@ -3845,7 +3850,7 @@ export function ProjectBoard({
 							data-active={stage === c.key}
 						>
 							<h2 id={`stage-${c.key}`} className="stage-head">
-								{c.label}
+								<span className="stage-name">{c.label}</span>
 								{c.key === "done" && q === "" && (
 									<span className="lane-tools">
 										<button

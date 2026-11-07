@@ -2542,7 +2542,7 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
    Kept ahead of the container block below so its display flip wins the cascade. */
 .stage-tabs {
 	display: none;
-	overflow-x: auto; /* four labels plus counts can pass 320px; scroll, never wrap */
+	overflow-x: auto; /* bare digits fit 320px; the scroll stays as the escape hatch */
 	margin-bottom: 10px;
 }
 @container (max-width: 440px) {
@@ -2558,6 +2558,18 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 		display: flex;
 	}
 	.stage:not([data-active="true"]) {
+		display: none;
+	}
+	/* The active tab right above already names the lane and carries its count: the head
+	   would repeat both. Mobile keeps only what the tab cannot show — the done lane's
+	   grouping tools — and drops the head entirely when it would be empty. */
+	.stage-name {
+		display: none;
+	}
+	.stage-head > .count {
+		display: none;
+	}
+	.stage-head:not(:has(.lane-tools)) {
 		display: none;
 	}
 }
@@ -3198,36 +3210,6 @@ a.release:hover {
 	margin-left: auto;
 	border-color: var(--accent-line);
 	color: var(--accent);
-}
-/* The alarm chip on a stage tab: solid fill in the alarm's hue, ink on it, the inverted
-   mark and the count — the lit-bell language. The fill pins the chip to its own tab, so a
-   squeezed strip cannot leave it adrift between neighbours. Ask rounds fill the grey
-   status colour — input requested, not a stall, and steel stays clickable-only (One-Edge
-   Rule). Same tokens as the card alarm coding, so the tab echoes the card it points at. */
-.count.needs {
-	display: inline-flex;
-	align-items: center;
-	gap: 4px;
-	padding: 0 7px;
-	color: var(--on-alarm);
-	background: var(--alarm);
-	border-color: var(--alarm);
-}
-.count.needs .mark {
-	width: 11px;
-	height: 11px;
-	fill: currentColor;
-}
-.count.needs .mark-ink {
-	stroke: var(--alarm); /* inverted mark, so it reads on the solid fill */
-}
-.count.needs.asked {
-	color: var(--on-grey);
-	background: var(--normal-fill);
-	border-color: var(--normal-fill);
-}
-.count.needs.asked .mark-ink {
-	stroke: var(--normal-fill);
 }
 /* Landed work recedes: recessed stock, lighter title weight. A review parked at merging is
    idle too but not landed; it waits like a queued card (see cardMark in status.ts). */
@@ -5331,6 +5313,20 @@ dialog.confirm-dialog {
 	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
 	gap: 6px;
 	white-space: nowrap;
+}
+.stage-tabs .tabs-digits {
+	/* Bare digits, not chips: they read as part of the label and keep the strip inside
+	   a 320px phone even with an alarm mark riding along. */
+	font-size: 13px;
+	font-weight: 500;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.stage-tabs .mark {
+	/* The alarm rides its tab as a bare mark (see .mark-needs / .mark-asked); the
+	   overview tabs' 12px precedent keeps it level with the 13px digits. */
+	width: 12px;
+	height: 12px;
 }
 @media (prefers-reduced-motion: reduce) {
 	.add-tabs button,
