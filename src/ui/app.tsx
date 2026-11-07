@@ -7120,6 +7120,17 @@ const IMPLEMENT_RECOMMENDATIONS =
  * steps report's Inbox pin (OTTR-488: only the drawer buttons clear it) and hands the new
  * card to the board. Marking waits for the follow-up: a failed post keeps the pin up.
  * Exported for tests. */
+/** First GitHub Actions run URL in the text, canonical form; null when the text links none. */
+export function ciRunUrl(text: string): string | null {
+	const m =
+		/https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)\/actions\/runs\/(\d+)/.exec(
+			text,
+		);
+	return m === null
+		? null
+		: `https://github.com/${m[1]}/${m[2]}/actions/runs/${m[3]}`;
+}
+
 export async function implementSteps(o: {
 	task: Pick<TaskView, "project" | "id">;
 	onMarkSeen: () => void;
@@ -8136,6 +8147,39 @@ export function Drawer({
 	const [triageReason, setTriageReason] = useState("");
 	const [triageError, setTriageError] = useState<string | null>(null);
 	const triageSave = useBusy();
+	// OTTR-604 re-run failed jobs: the action exists only while the card's text
+	// links a GitHub Actions run; a cancelled card's drawer is read-only, so no
+	// action there either. The server's error string names the missing scope.
+	const rerunUrl = ciRunUrl(
+		[
+			task.prompt,
+			task.needsReason ?? "",
+			task.summary ?? "",
+			detail?.details ?? "",
+		].join("\n"),
+	);
+	const [rerunError, setRerunError] = useState<string | null>(null);
+	const [rerunDone, setRerunDone] = useState(false);
+	// A new card's drawer starts without the previous card's re-run status or error.
+	const rerunTaskId = task.id;
+	useEffect(() => {
+		setRerunError(null);
+		setRerunDone(false);
+	}, [rerunTaskId]);
+	const rerunFailedJobs = async (): Promise<boolean> => {
+		setRerunError(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/rerun-failed-jobs`,
+				{},
+			);
+			setRerunDone(true);
+			return true;
+		} catch (e) {
+			setRerunError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
 	// The rank select leads: the picked value shows at once, the triage POST follows,
 	// a failure rolls the select back and lands in the inline alert (onError).
 	const rank = useOptimisticValue(task.priority ?? "", act);
@@ -10138,6 +10182,11 @@ export function Drawer({
 									Merge anyway
 								</button>
 							)}
+						{/* OTTR-604: cards whose text links a GitHub Actions run offer a
+						    re-run of that run's failed jobs; errors surface inline. */}
+						{rerunUrl !== null && !cancelled && (
+							<BusyButton run={rerunFailedJobs}>Re-run failed jobs</BusyButton>
+						)}
 						{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
 						{!cancelled && (
@@ -10147,6 +10196,22 @@ export function Drawer({
 							</BusyButton>
 						)}
 					</div>
+					{/* OTTR-604: the re-run error and confirmation render as full-width
+					    lines below the actions row, not as flex items inside it, so they
+					    align with the drawer's content margin and keep their spacing. */}
+					{rerunUrl !== null && !cancelled && rerunError !== null && (
+						<p className="auth-error" role="alert">
+							{rerunError}
+						</p>
+					)}
+					{rerunUrl !== null &&
+						!cancelled &&
+						rerunDone &&
+						rerunError === null && (
+							<p className="hint" role="status">
+								Re-run requested.
+							</p>
+						)}
 
 					{/* The meta section is the drawer's last element: it sits below everything else. */}
 					<details className="meta-block">

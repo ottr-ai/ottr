@@ -390,6 +390,8 @@ function mount(
 		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
 		/** Fetch seam for the weekly trending scan; passed through to createApp. */
 		trendingFetch?: typeof fetch;
+		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
+		rerunFetch?: typeof fetch;
 	} = {},
 ) {
 	const g =
@@ -443,6 +445,7 @@ function mount(
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		prReviewSpawn: input.prReviewSpawn,
 		trendingFetch: input.trendingFetch,
+		rerunFetch: input.rerunFetch,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -9945,6 +9948,162 @@ describe("git-hosts view github host", () => {
 			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = savedHost;
 		}
+	});
+});
+
+describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
+	const savedGhToken = process.env.GH_TOKEN;
+	afterAll(() => {
+		if (savedGhToken === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = savedGhToken;
+	});
+
+	const opened: ProjectStore[] = [];
+	afterAll(() => {
+		for (const s of opened) s.close();
+	});
+
+	const TOKEN = `ghp_${"x".repeat(36)}`;
+	const RUN_URL = "https://github.com/ottr-ai/ottr/actions/runs/42313545100";
+
+	/** A fresh app with one project "ci" and a task whose text links a run; saves the
+	 * board token through the settings route (the probe stub keeps it off the network). */
+	const setup = async (
+		fetchStub?: typeof fetch,
+		prompt = `Fix CI\n${RUN_URL}`,
+		saveToken = true,
+	) => {
+		const dir = mkdtempSync(join(root, "rerun-"));
+		const store = ProjectStore.open(dir);
+		opened.push(store);
+		const entry: Entry = {
+			path: dir,
+			name: "ci",
+			store,
+			target: null,
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		const m = mount({
+			projects: new Map([["ci", entry]]),
+			rerunFetch: fetchStub,
+		});
+		const task = store.createTask(prompt);
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.github.com/repos/ottr-ai/ottr")
+				return new Response(null, { status: 200 });
+			return realFetch(input, init);
+		}) as unknown as typeof fetch;
+		try {
+			if (saveToken)
+				await m.call("/api/settings/github-token", { token: TOKEN });
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+		return { m, task };
+	};
+
+	test("re-runs the linked run with the board token", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(
+				JSON.stringify({ message: "Requested", url: RUN_URL }),
+				{ status: 201 },
+			);
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(stub);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true, url: RUN_URL });
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toBe(
+			"https://api.github.com/repos/ottr-ai/ottr/actions/runs/42313545100/rerun-failed-jobs",
+		);
+		expect(calls[0]!.init?.method).toBe("POST");
+		const headers = new Headers(calls[0]!.init?.headers);
+		expect(headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
+		expect(headers.get("accept")).toBe("application/vnd.github+json");
+	});
+
+	test("a 403 from GitHub names the missing scope", async () => {
+		const stub = (async () =>
+			new Response(JSON.stringify({ message: "Forbidden" }), {
+				status: 403,
+			})) as unknown as typeof fetch;
+		const { m, task } = await setup(stub);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(403);
+		const error = await errorOf(res);
+		expect(error).toContain("actions:write");
+		expect(error).toContain("ottr-ai/ottr");
+	});
+
+	test("a 404 from GitHub names the missing scope too", async () => {
+		const stub = (async () =>
+			new Response(JSON.stringify({ message: "Not Found" }), {
+				status: 404,
+			})) as unknown as typeof fetch;
+		const { m, task } = await setup(stub);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(404);
+		const error = await errorOf(res);
+		expect(error).toContain("actions:write");
+		expect(error).toContain("ottr-ai/ottr");
+	});
+
+	test("a card with no run link is a 400", async () => {
+		const stub = (async () =>
+			new Response(null, { status: 201 })) as unknown as typeof fetch;
+		const { m, task } = await setup(stub, "Just a plain prompt, no links");
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("no GitHub Actions run link on this card");
+	});
+
+	test("no board token at all is a 400", async () => {
+		delete process.env.GH_TOKEN;
+		const stub = (async () =>
+			new Response(null, { status: 201 })) as unknown as typeof fetch;
+		// No token saved through settings either; setup would otherwise re-apply GH_TOKEN.
+		const { m, task } = await setup(stub, undefined, false);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"the board has no GitHub token to re-run with",
+		);
 	});
 });
 

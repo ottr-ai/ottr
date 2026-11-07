@@ -6591,3 +6591,231 @@ describe("Optimistic taps (client)", () => {
 		});
 	});
 });
+
+describe("Drawer re-run failed jobs action", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the setup mirrors the steering
+	// describes above: happy-dom registers them for this describe, and afterAll
+	// puts the originals back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	// happy-dom's dispatched clicks never reach React's event plugin (same
+	// upstream gap as settings.test.tsx's onChangeOf): call the production
+	// onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records the
+	 * rerun POSTs and answers them with `rerun`, everything else with 404. */
+	const withRoot = async (
+		card: TaskCard,
+		rerun: { status: number; body: unknown },
+		run: (args: {
+			posts: { url: string; body: unknown }[];
+			container: HTMLDivElement;
+			root: ReturnType<typeof createRoot>;
+		}) => Promise<void>,
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/rerun-failed-jobs")) {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response(JSON.stringify(rerun.body), {
+					status: rerun.status,
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={card} />);
+			});
+			await run({ posts, container, root });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	const rerunButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll(".drawer-actions button"))
+			if (node.textContent?.includes("Re-run failed jobs")) return node;
+		throw new Error("no Re-run failed jobs button");
+	};
+
+	test("a card whose text links a run renders the Re-run failed jobs button", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"Fix the CI failure in https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(rerunButton(container)).not.toBeNull();
+			},
+		);
+	});
+
+	test("clicking it POSTs to the rerun route; a 403 naming actions:write surfaces as an alert", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"Fix the CI failure in https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{
+				status: 403,
+				body: {
+					error:
+						"GitHub refused the re-run (HTTP 403): the board's token lacks the actions:write scope for ottr/ottr",
+				},
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(rerunButton(container))({});
+				});
+				await act(async () => {});
+				const post = posts.at(-1);
+				expect(post?.url.endsWith("/rerun-failed-jobs")).toBe(true);
+				expect(post?.body).toEqual({});
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) => a.textContent?.includes("actions:write")),
+				).toBe(true);
+			},
+		);
+	});
+
+	test("an ok:true response surfaces the Re-run requested status line", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"Fix the CI failure in https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{
+				status: 200,
+				body: {
+					ok: true,
+					url: "https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+				},
+			},
+			async ({ container }) => {
+				await act(async () => {
+					onClickOf(rerunButton(container))({});
+				});
+				await act(async () => {});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) => s.textContent?.includes("Re-run requested.")),
+				).toBe(true);
+			},
+		);
+	});
+
+	test("a card without a run link renders no Re-run failed jobs button", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt: "Fix the flaky test in src/quota.ts",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Re-run failed jobs");
+			},
+		);
+	});
+});

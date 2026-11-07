@@ -42,7 +42,7 @@ A **research** task answers a question instead of changing code: the agent write
 
 A **backlog** card holds a feature idea that is not thought through yet. Park a draft with **Add draft** in the backlog row of the todo lane, or press **B**; a draft runs no agent and picks no model. Open the card and pick **Plan with agent** — or **Move to todo** — and you pick the model at that moment, or leave it empty to use the project's role model: the agent asks rounds of questions, you answer with a click, and the refined task text lands in the report. Until a parked card starts, **Edit task** rewrites its text; the title follows the new text. When the item is ready, pick **Move to todo**; Ottr appends the grilled definition to the prompt and the card enters the normal queue.
 
-For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card with the failed steps' log when a run fails. Once an hour it turns each open Dependabot pull request into a card that runs like any task.
+For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card with the failed steps' log when a run fails. When a card's text links a run (`https://github.com/<owner>/<repo>/actions/runs/<run_id>`), its drawer offers **Re-run failed jobs**: the board calls the rerun-failed-jobs API with its stored token, so a one-off flake never leaves the board. On a 403 or 404 the drawer shows an error naming the missing `actions:write` scope. Once an hour it turns each open Dependabot pull request into a card that runs like any task.
 
 A card with **!** needs you. Reply in its drawer and the agent continues in the same session. A todo card whose text is too vague to build without guessing (say, "add a password-forgotten feature") parks here before the agent changes any file: it asks you rounds of questions with clickable options, like a backlog grill, and builds once your answers settle the intent. The composer's **Deepen** rewrite never guesses those choices for you: it lists them under **Open questions**, and the agent asks them first. You can also steer a running task, edit a queued steer before the agent gets it, stop its current turn, cancel any card, paste images, and start follow-ups from Done cards; the follow-up dialog's **Project** picker files the follow-up into another project's board, linked back to the done card. The bell in the header collects everything that needs you; desktop and phone push notifications are optional. Cards can carry a **triage rank** (P0-P3, set in the drawer): the Overview triage ranks them ahead of wait time, and a close-candidate badge marks cards you plan to cancel.
 
@@ -332,7 +332,7 @@ Use a fine-grained personal access token:
 | Contents: Read and write | clone, fetch, merge pushes, releases, and the Alate data-repo `config.yml` commit |
 | Pull requests: Read and write | Dependabot/PR watch cards, posting PR reviews |
 | Issues: Read and write | Issue watch: reading new issues and adding the `ottr-tracked` label |
-| Actions: Read | CI watch after merges |
+| Actions: Read and write | CI watch after merges; **Re-run failed jobs** on a card whose text links a run |
 | Workflows: Read and write | only if tasks may change `.github/workflows` files; without it, a push that touches a workflow file fails |
 | Administration: Read and write | only for **Add project → New** with a GitHub repo (`gh repo create`); the repo is created under your user account, not an org |
 

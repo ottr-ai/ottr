@@ -294,6 +294,8 @@ import {
 } from "./worktree.ts";
 
 const MAX_BODY_BYTES = 65536;
+/** Timeout for the re-run-failed-jobs GitHub API call, mirroring the trending scan. */
+const RERUN_TIMEOUT_MS = 20_000;
 
 const ICON_EXTS = ["png", "jpg", "gif", "webp"] as const;
 
@@ -457,6 +459,8 @@ interface AppDeps {
 	prReviewSpawn?: SpawnFn;
 	/** Fetch seam for the weekly trending scan (GitHub pages and REST API); defaults to fetch. Tests inject a stub. */
 	trendingFetch?: typeof fetch;
+	/** Fetch seam for the re-run-failed-jobs GitHub API call; defaults to fetch. Tests inject a stub. */
+	rerunFetch?: typeof fetch;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -807,6 +811,8 @@ export function createApp(deps: AppDeps) {
 	const latestReleaseOf = deps.latestRelease ?? cachedLatestGhRelease;
 	// GitHub App mint and review post; the seam keeps both off the real network in tests.
 	const githubAppFetch = deps.githubAppFetch ?? noRedirectFetch;
+	// Re-run-failed-jobs GitHub API call; the seam keeps tests off the real network.
+	const rerunFetch = deps.rerunFetch ?? fetch;
 	// Idle clock (docs/specs/mutation-delta.md §7): only the idle-review logic reads it,
 	// and tests inject a fixed clock. It initializes at createApp, so a board restart
 	// counts as input and never starts a review right after boot.
@@ -6449,6 +6455,69 @@ export function createApp(deps: AppDeps) {
 					e.store.updateTask(task.id, mergeAnywayPatch(task, trimmed));
 					deps.schedule();
 					return taskResponse(e, task.id);
+				}),
+		},
+		"/api/projects/:project/tasks/:id/rerun-failed-jobs": {
+			POST: (req) =>
+				api(req, async () => {
+					const found = resolveTask(req.params.project, req.params.id);
+					if (found instanceof Response) return found;
+					const { task } = found;
+					const token = process.env.GH_TOKEN;
+					if (!token)
+						return json(
+							{ error: "the board has no GitHub token to re-run with" },
+							400,
+						);
+					const text = [
+						task.prompt,
+						task.needsReason ?? "",
+						task.summary ?? "",
+						task.details ?? "",
+						task.report ?? "",
+					].join("\n");
+					const match = text.match(
+						/https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)\/actions\/runs\/(\d+)/,
+					);
+					if (!match)
+						return json(
+							{ error: "no GitHub Actions run link on this card" },
+							400,
+						);
+					const url = `https://github.com/${match[1]}/${match[2]}/actions/runs/${match[3]}`;
+					const base = githubHost().apiBase.replace(/\/+$/, "");
+					const headers: Record<string, string> = {
+						accept: "application/vnd.github+json",
+						"user-agent": "ottr",
+						authorization: `Bearer ${token}`,
+					};
+					let res: Response;
+					try {
+						res = await rerunFetch(
+							`${base}/repos/${match[1]}/${match[2]}/actions/runs/${match[3]}/rerun-failed-jobs`,
+							{
+								method: "POST",
+								headers,
+								redirect: "manual",
+								signal: AbortSignal.timeout(RERUN_TIMEOUT_MS),
+							},
+						);
+					} catch (err) {
+						return json(
+							{
+								error: `GitHub API unreachable: ${err instanceof Error ? err.message : String(err)}`,
+							},
+							502,
+						);
+					}
+					if (!res.ok) {
+						const error =
+							res.status === 403 || res.status === 404
+								? `GitHub refused the re-run (HTTP ${res.status}): the board's token lacks the actions:write scope for ${match[1]}/${match[2]}`
+								: `GitHub returned HTTP ${res.status} for the re-run`;
+						return json({ error }, res.status);
+					}
+					return json({ ok: true, url }, 200);
 				}),
 		},
 		"/api/projects/:project/tasks/:id/follow-up": {
