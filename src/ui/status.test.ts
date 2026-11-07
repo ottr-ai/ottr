@@ -344,6 +344,17 @@ test("statusLine queued with a future holdUntil counts down instead of the raw s
 			true,
 		),
 	).toBe("held · 13m left");
+	// The last minute reads "<1m", not until()'s "now".
+	expect(
+		statusLine(
+			t({
+				stage: "in_progress",
+				needsReason: reason,
+				holdUntil: Date.now() + 30_000,
+			}),
+			true,
+		),
+	).toBe("held · <1m left");
 	expect(
 		statusLine(
 			t({ stage: "in_progress", needsReason: reason, holdUntil: 1 }),
@@ -356,6 +367,10 @@ test("holdLeft counts down in the shared until format, null once due", () => {
 	const now = 1_790_683_200_000;
 	expect(holdLeft(now + 12 * 60_000 + 30_000, now)).toBe("held · 12m left");
 	expect(holdLeft(now + 90 * 60_000, now)).toBe("held · 1h 30m left");
+	// The last minute: until() floors to "now", which reads wrong while held.
+	expect(holdLeft(now + 30_000, now)).toBe("held · <1m left");
+	expect(holdLeft(now + 59_999, now)).toBe("held · <1m left");
+	expect(holdLeft(now + 60_000, now)).toBe("held · 1m left");
 	expect(holdLeft(now, now)).toBeNull();
 	expect(holdLeft(now - 1, now)).toBeNull();
 });

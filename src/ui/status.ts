@@ -96,13 +96,16 @@ export function queuePosition(
 }
 
 /** "held · 12m left" for a card the tracker parked until a future holdUntil (a usage
- * limit): the countdown replaces the raw reset stamp the reason names. null once past. */
+ * limit): the countdown replaces the raw reset stamp the reason names. The last minute
+ * reads "<1m", since until() floors and would say "now" while the hold still stands.
+ * null once past. */
 export function holdLeft(
 	holdUntil: number,
 	now: number = Date.now(),
 ): string | null {
-	if (holdUntil <= now) return null;
-	return `held · ${until(holdUntil, now)} left`;
+	const left = holdUntil - now;
+	if (left <= 0) return null;
+	return `held · ${left < 60_000 ? "<1m" : until(holdUntil, now)} left`;
 }
 
 export function statusLine(
