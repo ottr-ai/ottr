@@ -3396,6 +3396,47 @@ describe("startRun agent layer pinning", () => {
 		}
 	});
 
+	test("stripGithubToken: a local child runs without GH_TOKEN and GITHUB_TOKEN; other local runs keep GH_TOKEN", async () => {
+		const saved = saveEnv();
+		const savedGithub = process.env.GITHUB_TOKEN;
+		const dir = mkdtempSync(join(tmpdir(), "ottr-strip-gh-"));
+		try {
+			process.env.GH_TOKEN = "ghp_board_token";
+			process.env.GITHUB_TOKEN = "ghp_other";
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const run = (stripGithubToken: boolean) =>
+				startRun({
+					cwd: dir,
+					prompt: "do it",
+					sessionDir: join(dir, "sessions"),
+					extensionPath: null,
+					resumeId: null,
+					logPath: join(dir, `run-${stripGithubToken}.log`),
+					dataRoot: dir,
+					launcher,
+					stripGithubToken,
+				}).done;
+			await run(true);
+			await run(false);
+			expect(seen).toHaveLength(2);
+			expect(seen[0]?.env).not.toHaveProperty("GH_TOKEN");
+			expect(seen[0]?.env).not.toHaveProperty("GITHUB_TOKEN");
+			// A merge turn runs locally too and needs the token for its push.
+			expect(seen[1]?.env?.GH_TOKEN).toBe("ghp_board_token");
+		} finally {
+			restoreEnv(saved);
+			if (savedGithub === undefined) delete process.env.GITHUB_TOKEN;
+			else process.env.GITHUB_TOKEN = savedGithub;
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
 	test("no layer: the env stays exactly as today and no warning is logged", async () => {
 		const saved = saveEnv();
 		const board = mkdtempSync(join(tmpdir(), "ottr-layer-flat-"));

@@ -1682,17 +1682,12 @@ export function createTurnLoop(
 		// the same ones the worker decision below makes.
 		const preRetro = isRetro(task);
 		const preBoardCheck = store.boardCheckId() === id;
-		const preScout = task.kind === "trending";
 		const target = ops.workerTarget ?? null;
 		// ponytail: `target !== null` appears here and in the ternary below; either
 		// `true`-replacement alone cannot change the branch (the other check re-derives
 		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
 		const toWorker =
-			kind !== "merge" &&
-			!preRetro &&
-			!preBoardCheck &&
-			!preScout &&
-			target !== null;
+			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
 		const runnerDrained =
 			toWorker && target !== null
 				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
@@ -1736,8 +1731,10 @@ export function createTurnLoop(
 			const interview = task.kind === "interview";
 			// A backlog card only ever runs grill turns: worktree-less, in the main checkout.
 			const grill = task.stage === "backlog";
-			// The weekly trending scout: read-only in the main checkout, local, with only the
-			// read tools and its two verdict tools (propose_repo, judge_repo) on the board env.
+			// The weekly trending scout: read-only in the main checkout, with only the read tools
+			// and its two verdict tools (propose_repo, judge_repo) on the board env. It reads
+			// third-party text, so it runs on a worker when one exists (D6) and never holds the
+			// board's GitHub token, also on a local run.
 			const scout = task.kind === "trending";
 			// Review sessions get one fixed name, applied by the extension before the agent runs,
 			// so the board never depends on the agent inventing a title.
@@ -2062,7 +2059,7 @@ export function createTurnLoop(
 			// OTTR-454: drop workers under a per-runner drain so the round-robin only
 			// sees live workers; the empty-list guard sits after stopBeforeRun below.
 			const worker =
-				retroCard || boardCheck || scout || kind === "merge"
+				retroCard || boardCheck || kind === "merge"
 					? null
 					: (ops.workerTarget ?? null);
 			// A worker installs the project's packages into its own container; a local run does it here.
@@ -2210,6 +2207,7 @@ export function createTurnLoop(
 					// pushes non-GitHub merges itself after the turn.
 				},
 				stripBoard: retroCard,
+				stripGithubToken: scout,
 				tools: retroCard
 					? "read,grep,glob,report_outcome,propose_task"
 					: scout

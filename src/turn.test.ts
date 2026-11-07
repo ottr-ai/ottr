@@ -103,6 +103,7 @@ interface Recorded {
 		env?: Record<string, string>;
 		secrets?: readonly string[];
 		stripBoard?: boolean;
+		stripGithubToken?: boolean;
 		tools?: string | null;
 		config?: string | null;
 		skills?: string | null;
@@ -245,6 +246,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			prompt: string;
 			env?: Record<string, string>;
 			stripBoard?: boolean;
+			stripGithubToken?: boolean;
 			tools?: string | null;
 			config?: string | null;
 			skills?: string | null;
@@ -565,10 +567,10 @@ describe("turn loop", () => {
 		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
-	test("a trending scout runs local and read-only in the main checkout with only its tools, and settles done", async () => {
+	test("a trending scout runs on a worker, read-only in the main checkout with only its tools, and settles done", async () => {
 		const unsaved: string[] = [];
 		const { store, record, loop } = setup({
-			// A worker pool is configured, but the scout's bundle sits on the server: it stays local.
+			// The scout reads third-party text: with a worker pool it never runs on the server (D6).
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			// commitsAhead keeps its default 1: the main checkout's own commits are never the scout's.
 			unsavedWork: async (wt: string) => {
@@ -586,7 +588,9 @@ describe("turn loop", () => {
 
 		const run = record.runs[0]!;
 		expect(run.cwd).toBe(store.path);
-		expect(run.worker).toBeNull();
+		expect(run.worker).toEqual({ urls: ["http://worker-a:8787"] });
+		// A local fallback spawn runs without the board's GitHub token too.
+		expect(run.stripGithubToken).toBe(true);
 		expect(run.prompt).toBe(task.prompt);
 		expect(run.env).toEqual({ OTTR_TRENDING: "1" });
 		expect(run.tools).toBe(

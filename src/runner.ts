@@ -1098,6 +1098,9 @@ export function startRun(o: {
 	secrets?: readonly string[];
 	/** Set: strip the board coordinates from the child env (a retro run). */
 	stripBoard?: boolean;
+	/** Set: a local child runs without the board's GitHub token (GH_TOKEN, GITHUB_TOKEN), as a
+	 * worker child always does. A run that reads third-party text (the trending scout) sets it. */
+	stripGithubToken?: boolean;
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
 	tools?: string | null;
 	config?: string | null;
@@ -1150,7 +1153,15 @@ export function startRun(o: {
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const startLocal = (): RunHandle => {
 		const launch: RunLauncher = o.launcher ?? spawn;
-		const base = boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env }));
+		const base = boardOmpEnv(
+			withoutGitAuth({
+				...process.env,
+				...o.env,
+				...(o.stripGithubToken
+					? { GH_TOKEN: undefined, GITHUB_TOKEN: undefined }
+					: {}),
+			}),
+		);
 		if (layerEnv !== null) Object.assign(base, layerEnv);
 		const child = launch("omp", args, {
 			cwd: o.cwd,

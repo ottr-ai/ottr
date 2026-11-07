@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { writeBelow } from "./confine.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
 import type { Task, TrendingStatus } from "./types.ts";
@@ -427,10 +427,15 @@ export function createTrendingScanner(deps: {
 				deps.log(`trending: ${project.name}: no new candidates, no card`);
 				continue;
 			}
-			const dir = join(project.store.serverDir, "trending");
-			mkdirSync(dir, { recursive: true });
-			const bundlePath = join(dir, `${startedAt}.json`);
-			writeFileSync(
+			// The task data dir, not serverDir: a worker runs the scout (D6), and only the data dir
+			// is mounted there. writeBelow follows no symlink a worker planted under the data root.
+			const bundlePath = join(
+				project.store.tasksDir,
+				"trending",
+				`${startedAt}.json`,
+			);
+			writeBelow(
+				project.store.dataRoot,
 				bundlePath,
 				JSON.stringify(
 					{

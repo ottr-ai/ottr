@@ -473,7 +473,9 @@ processes only. Push credentials never leave the server:
 - The `x-worker` anchor in `docker-compose.yml` sets no GitHub token.
 
 A local turn (in the server container) keeps `GH_TOKEN`. A merge turn needs it for
-its push.
+its push. The trending scout reads third-party text, so it runs on a worker when one
+exists. Its local run (no worker, or a worker fallback) also runs without `GH_TOKEN`
+and `GITHUB_TOKEN`.
 
 ### Non-GitHub hosts
 

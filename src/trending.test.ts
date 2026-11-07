@@ -152,7 +152,7 @@ function bundle(p: TrendingProject): {
 	}[];
 	hints: { repo: string; reason: string }[];
 } {
-	const dir = join(p.store.serverDir, "trending");
+	const dir = join(p.store.tasksDir, "trending");
 	const files = readdirSync(dir);
 	expect(files).toHaveLength(1);
 	return JSON.parse(readFileSync(join(dir, files[0] as string), "utf8"));
