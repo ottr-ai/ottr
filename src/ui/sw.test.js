@@ -49,6 +49,23 @@ const liveOf = (tag, live, seq) => ({
 	[tag]: { live, seq },
 });
 
+// Cache API stand-in: the worker's persisted history lives here, across worker restarts.
+const cacheStore = new Map();
+const previousCaches = globalThis.caches;
+afterAll(() => {
+	globalThis.caches = previousCaches;
+});
+globalThis.caches = {
+	open: async () => ({
+		match: async (url) =>
+			cacheStore.has(url) ? new Response(cacheStore.get(url)) : undefined,
+		put: async (url, res) => {
+			cacheStore.set(url, await res.text());
+		},
+	}),
+};
+let endpoint = "https://push.example/me";
+
 globalThis.self = {
 	addEventListener: (type, handler) => {
 		listeners[type] = handler;
@@ -63,7 +80,7 @@ globalThis.self = {
 			tray.push({ tag: options.tag, title, data: options.data });
 		},
 		pushManager: {
-			getSubscription: async () => ({ endpoint: "https://push.example/me" }),
+			getSubscription: async () => ({ endpoint }),
 		},
 		getNotifications: async ({ tag }) =>
 			tray
@@ -105,6 +122,8 @@ beforeEach(() => {
 	tray.length = 0;
 	liveResponse = "fail";
 	liveGate = null;
+	cacheStore.clear();
+	endpoint = "https://push.example/me";
 	controlled.length = 0;
 	uncontrolled.length = 0;
 });
@@ -331,6 +350,42 @@ test("offline fallback: an older alert never replaces a newer one; a newest one 
 	expect(calls.notifications).toEqual([]);
 	await push({ ...alert, seq: 7, title: "newest" });
 	expect(tray.map((n) => n.title)).toEqual(["newest"]);
+});
+
+test("offline: a clear's bound outlives the empty tray, so a delayed resolved alert stays hidden", async () => {
+	// Online clear first, then the board becomes unreachable and the delayed alert lands.
+	liveResponse = liveOf("request", 0, 5);
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	liveResponse = "fail";
+	await push(alert); // #5, empty upTo, empty tray
+	expect(calls.notifications).toEqual([]);
+	// Offline throughout: the clear's own bound is remembered just the same.
+	cacheStore.clear();
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	await push(alert);
+	expect(calls.notifications).toEqual([]);
+	// A newer alert still shows.
+	await push({ ...alert, seq: 6, title: "newer" });
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("offline: an alert older than one already shown stays hidden after the newer was dismissed", async () => {
+	await push({ ...alert, seq: 6, title: "newer" });
+	tray.length = 0; // the user swiped it away
+	await push(alert); // #5 arrives late
+	expect(calls.notifications.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("the history survives a worker restart; a new subscription starts fresh", async () => {
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	// A fresh module instance stands for a restarted worker; only the Cache API remains.
+	await import("./sw.js?ottr-test-restart");
+	await push(alert);
+	expect(calls.notifications).toEqual([]);
+	// After a re-subscribe the server numbers from 1 again: old history must not hide it.
+	endpoint = "https://push.example/resubscribed";
+	await push({ ...alert, seq: 1, title: "fresh" });
+	expect(tray.map((n) => n.title)).toEqual(["fresh"]);
 });
 
 test("untyped push shows without consulting the server", async () => {

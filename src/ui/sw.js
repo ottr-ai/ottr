@@ -14,15 +14,61 @@
 //   sends these to Apple endpoints; there the next alert does the retraction.
 // - untyped (the /api/push/test payload): shown as is.
 // Each push also closes every class the server reports with no live alert. When the server
-// cannot be reached (offline, signed out), the worker falls back to the payload: `upTo`
-// closes notifications whose own number is at or below the bound, and an alert shows unless
-// a newer one of its class is up.
+// cannot be reached (offline, signed out), the worker falls back to its own history: every
+// retraction bound it ever got (`upTo` of any payload, or a class the server reported dead)
+// and the newest number it showed, per class, persisted in the Cache API so a worker restart
+// keeps them. Offline, an alert shows only when its number is above both; `upTo` closes
+// notifications whose own number is at or below the bound.
 const LIVE_TIMEOUT_MS = 3000;
 
 const seqOf = (n) => n.data?.seq ?? 0;
 
+const HISTORY_CACHE = "ottr-notify";
+const HISTORY_URL = "/__ottr/notify-history";
+
+/** This device's push endpoint, or null. */
+async function endpointOf() {
+	try {
+		return (
+			(await self.registration.pushManager.getSubscription())?.endpoint ?? null
+		);
+	} catch {
+		return null;
+	}
+}
+
+/** Persisted per-class history for `endpoint`: `retracted` (highest bound retracted) and
+ * `shown` (newest number shown). The server numbers alerts per subscription, so history of
+ * another endpoint (a re-subscribe) reads as empty, as does a missing or unreadable entry. */
+async function loadHistory(endpoint) {
+	const empty = { endpoint, retracted: {}, shown: {} };
+	try {
+		const res = await (await caches.open(HISTORY_CACHE)).match(HISTORY_URL);
+		const h = res === undefined ? null : await res.json();
+		return h?.endpoint === endpoint
+			? { endpoint, retracted: h.retracted ?? {}, shown: h.shown ?? {} }
+			: empty;
+	} catch {
+		return empty;
+	}
+}
+
+async function saveHistory(h) {
+	try {
+		await (await caches.open(HISTORY_CACHE)).put(
+			HISTORY_URL,
+			new Response(JSON.stringify(h)),
+		);
+	} catch {}
+}
+
+/** Raises `map[tag]` to `n`. */
+function raise(map, tag, n) {
+	if (!(map[tag] >= n)) map[tag] = n;
+}
+
 let chain = Promise.resolve();
-/** Runs push handlers one at a time, in arrival order. */
+/** Runs push handlers one at a time, in arrival order (the history read-modify-write too). */
 function serial(fn) {
 	const run = chain.then(fn, fn);
 	chain = run.catch(() => {});
@@ -49,14 +95,13 @@ function show(data) {
 }
 
 /** This device's live state per class from the server; null when it cannot be read. */
-async function fetchLive() {
+async function fetchLive(endpoint) {
+	if (endpoint === null) return null;
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), LIVE_TIMEOUT_MS);
 	try {
-		const sub = await self.registration.pushManager.getSubscription();
-		if (sub === null) return null;
 		const res = await fetch(
-			`/api/notifications/live?endpoint=${encodeURIComponent(sub.endpoint)}`,
+			`/api/notifications/live?endpoint=${encodeURIComponent(endpoint)}`,
 			{ credentials: "same-origin", signal: ctrl.signal },
 		);
 		if (!res.ok) return null;
@@ -68,35 +113,56 @@ async function fetchLive() {
 	}
 }
 
-/** Closes every class the server reports with no live alert on this device. */
-async function closeDead(live) {
+/** Closes every class the server reports with no live alert on this device, and records the
+ * class as retracted up to its last sent number. */
+async function closeDead(live, history) {
 	for (const [tag, state] of Object.entries(live)) {
 		if (state?.live !== 0) continue;
+		raise(history.retracted, tag, state.seq ?? 0);
 		const list = await self.registration.getNotifications({ tag });
 		for (const n of list) n.close();
 	}
 }
 
+function remember(history, upTo) {
+	for (const [tag, bound] of Object.entries(upTo ?? {}))
+		raise(history.retracted, tag, bound);
+}
+
 async function handleAlert(data) {
 	const seq = data.seq ?? 0;
-	const live = await fetchLive();
+	const endpoint = await endpointOf();
+	const history = await loadHistory(endpoint);
+	remember(history, data.upTo);
+	const live = await fetchLive(endpoint);
+	let visible;
 	if (live !== null) {
-		await closeDead(live);
+		await closeDead(live, history);
 		const state = live[data.tag];
-		if (state !== undefined && state.live > 0 && seq >= state.seq)
-			await show(data);
-		return;
+		visible = state !== undefined && state.live > 0 && seq >= state.seq;
+	} else {
+		await closeUpTo(data.upTo);
+		const current = await self.registration.getNotifications({ tag: data.tag });
+		visible =
+			seq > (history.retracted[data.tag] ?? 0) &&
+			seq >= (history.shown[data.tag] ?? 0) &&
+			!current.some((n) => seqOf(n) > seq);
 	}
-	await closeUpTo(data.upTo);
-	const current = await self.registration.getNotifications({ tag: data.tag });
-	if (current.some((n) => seqOf(n) > seq)) return;
-	await show(data);
+	if (visible) {
+		raise(history.shown, data.tag, seq);
+		await show(data);
+	}
+	await saveHistory(history);
 }
 
 async function handleClear(data) {
-	const live = await fetchLive();
-	if (live !== null) await closeDead(live);
+	const endpoint = await endpointOf();
+	const history = await loadHistory(endpoint);
+	remember(history, data.upTo);
+	const live = await fetchLive(endpoint);
+	if (live !== null) await closeDead(live, history);
 	else await closeUpTo(data.upTo);
+	await saveHistory(history);
 }
 
 self.addEventListener("push", (event) => {
