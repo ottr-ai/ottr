@@ -1,45 +1,45 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.6.3/schema.json",
-  "files": {
-    "includes": [
-      "src/**",
-      "scripts/**",
-      "extension/**",
-      "!!**/.worktrees",
-      "!!**/.dev",
-      "!!src/fixtures"
-    ]
-  },
-  "linter": {
-    "rules": {
-      "complexity": {
-        "noExcessiveCognitiveComplexity": "info"
-      },
-      "suspicious": {
-        "noImportCycles": "error"
-      },
-      "nursery": {
-        "noFloatingPromises": "error",
-        "noMisusedPromises": "error"
-      },
-      "correctness": {
-        "noUnusedImports": "error",
-        "noUnusedVariables": "error",
-        "noUnusedFunctionParameters": "error",
-        "useHookAtTopLevel": "error"
-      }
-    }
-  },
-  "overrides": [
-    {
-      "includes": ["**/*.test.ts", "**/*.test.tsx", "**/*.test.js"],
-      "linter": {
-        "rules": {
-          "style": {
-            "noNonNullAssertion": "off"
-          }
-        }
-      }
-    }
-  ]
+	"$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
+	"files": {
+		"includes": [
+			"src/**",
+			"scripts/**",
+			"extension/**",
+			"!!**/.worktrees",
+			"!!**/.dev",
+			"!!src/fixtures"
+		]
+	},
+	"linter": {
+		"rules": {
+			"complexity": {
+				"noExcessiveCognitiveComplexity": "info"
+			},
+			"suspicious": {
+				"noImportCycles": "error"
+			},
+			"nursery": {
+				"noFloatingPromises": "error",
+				"noMisusedPromises": "error"
+			},
+			"correctness": {
+				"noUnusedImports": "error",
+				"noUnusedVariables": "error",
+				"noUnusedFunctionParameters": "error",
+				"useHookAtTopLevel": "error"
+			}
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["**/*.test.ts", "**/*.test.tsx", "**/*.test.js"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noNonNullAssertion": "off"
+					}
+				}
+			}
+		}
+	]
 }
