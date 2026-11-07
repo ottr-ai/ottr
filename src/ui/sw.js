@@ -2,8 +2,10 @@
 // Push payloads come in three kinds:
 // - {type:"alert"}: retract the `clear` class tags, then show unless every key was
 //   already acknowledged elsewhere: an acknowledged alert never reaches the screen.
-//   (Chrome may then show its own "updated in the background" notice once its
-//   silent-push allowance runs out; that is the browser's, not an Ottr alert.)
+//   It still tidies its class: with `replace` (the class's tag was due for retraction)
+//   the tag closes; otherwise each same-tag notification whose keys are all
+//   acknowledged closes. (Chrome may show its own "updated in the background" notice
+//   once its silent-push allowance runs out; that is the browser's, not an Ottr alert.)
 // - {type:"clear", tags}: retract notifications whose cause cleared; shows nothing.
 //   Apple's push service revokes subscriptions that get pushes without a visible
 //   notification, so the server never sends these to Apple endpoints; there the next
@@ -25,12 +27,14 @@ function show(data) {
 		// Same tag replaces the tray entry; renotify makes the replacement alert again.
 		renotify: data.tag !== undefined,
 		icon: "/icon-192.png",
-		data: { url: data.url ?? "/" },
+		// keys: which alerts this notification stands for, so a later acknowledged push can
+		// tell whether it is stale.
+		data: { url: data.url ?? "/", keys: data.keys ?? [] },
 	});
 }
 
-/** True when the server reports every key acknowledged; false on any fetch failure. */
-async function allSeen(keys) {
+/** The server's acknowledged keys; null on any fetch failure (then the alert shows). */
+async function fetchSeen() {
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), SEEN_TIMEOUT_MS);
 	try {
@@ -38,12 +42,11 @@ async function allSeen(keys) {
 			credentials: "same-origin",
 			signal: ctrl.signal,
 		});
-		if (!res.ok) return false;
+		if (!res.ok) return null;
 		const body = await res.json();
-		const seen = new Set(Array.isArray(body?.keys) ? body.keys : []);
-		return (keys ?? []).every((k) => seen.has(k));
+		return new Set(Array.isArray(body?.keys) ? body.keys : []);
 	} catch {
-		return false;
+		return null;
 	} finally {
 		clearTimeout(timer);
 	}
@@ -51,8 +54,21 @@ async function allSeen(keys) {
 
 async function handleAlert(data) {
 	await closeTags(data.clear);
-	if (await allSeen(data.keys)) return;
-	await show(data);
+	const seen = await fetchSeen();
+	const keys = data.keys ?? [];
+	if (seen === null || !keys.every((k) => seen.has(k))) {
+		await show(data);
+		return;
+	}
+	if (data.replace) {
+		await closeTags([data.tag]);
+		return;
+	}
+	const list = await self.registration.getNotifications({ tag: data.tag });
+	for (const n of list) {
+		const shown = n.data?.keys ?? [];
+		if (shown.length > 0 && shown.every((k) => seen.has(k))) n.close();
+	}
 }
 
 self.addEventListener("push", (event) => {

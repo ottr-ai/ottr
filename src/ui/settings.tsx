@@ -764,6 +764,8 @@ export function NotificationsSection({
 				if (!live) return;
 				classesRef.current = p.classes;
 				mutedRef.current = p.mutedProjects;
+				savedClassesRef.current = p.classes;
+				savedMutedRef.current = p.mutedProjects;
 				setClasses(p.classes);
 				setMuted(p.mutedProjects);
 			})
@@ -847,9 +849,13 @@ export function NotificationsSection({
 			<Icon name={icon} />
 		);
 	// Saves run one at a time and each sends the latest wanted set, so two switches flipped
-	// before the first answer both land: the second POST carries the first change too.
+	// before the first answer both land: the second POST carries the first change too. A
+	// failed save falls back to the last set the server confirmed (a load or a successful
+	// POST), never to an assumed inverse: an earlier POST may already hold the change.
 	const classesRef = useRef<ClassPrefs | null>(null);
 	const mutedRef = useRef<string[]>([]);
+	const savedClassesRef = useRef<ClassPrefs | null>(null);
+	const savedMutedRef = useRef<string[]>([]);
 	const queue = useRef<Promise<unknown>>(Promise.resolve());
 	const serial = (fn: () => Promise<unknown>): Promise<unknown> => {
 		const p = queue.current.then(fn, fn);
@@ -862,33 +868,30 @@ export function NotificationsSection({
 		classesRef.current = { ...current, [cls]: v };
 		setClasses(classesRef.current);
 		try {
-			await serial(() =>
-				post("/api/notifications/prefs", {
-					endpoint,
-					classes: classesRef.current,
-				}),
-			);
+			await serial(async () => {
+				const sent = classesRef.current;
+				await post("/api/notifications/prefs", { endpoint, classes: sent });
+				savedClassesRef.current = sent;
+			});
 		} catch (err) {
-			// Revert only this switch; a concurrent change of another one stays.
-			if (classesRef.current !== null)
-				classesRef.current = { ...classesRef.current, [cls]: !v };
+			classesRef.current = savedClassesRef.current;
 			setClasses(classesRef.current);
 			throw err;
 		}
 	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
-		const toggle = (list: string[], on: boolean): string[] =>
-			on
-				? [...list.filter((m) => m !== name), name]
-				: list.filter((m) => m !== name);
-		mutedRef.current = toggle(mutedRef.current, v);
+		mutedRef.current = v
+			? [...mutedRef.current.filter((m) => m !== name), name]
+			: mutedRef.current.filter((m) => m !== name);
 		setMuted(mutedRef.current);
 		try {
-			await serial(() =>
-				post("/api/notifications/prefs", { mutedProjects: mutedRef.current }),
-			);
+			await serial(async () => {
+				const sent = mutedRef.current;
+				await post("/api/notifications/prefs", { mutedProjects: sent });
+				savedMutedRef.current = sent;
+			});
 		} catch (err) {
-			mutedRef.current = toggle(mutedRef.current, !v);
+			mutedRef.current = savedMutedRef.current;
 			setMuted(mutedRef.current);
 			throw err;
 		}

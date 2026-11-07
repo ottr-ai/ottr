@@ -12,6 +12,7 @@ import {
 	PRESENCE_WINDOW_MS,
 	payloadsFor,
 	presenceHolds,
+	rekeyErrorAlerts,
 	tagsToClear,
 	taskEntryKey,
 } from "./notifications.ts";
@@ -33,6 +34,7 @@ const card = (
 	summary: null,
 	errorTurn: null,
 	errorText: null,
+	cancelled: false,
 	...over,
 });
 
@@ -46,8 +48,8 @@ describe("taskEntryKey", () => {
 	test("needs vs asked rounds", () => {
 		expect(taskEntryKey({ id: "A", asked: null })).toBe("task:A:needs");
 		const q = ask("which?");
-		expect(taskEntryKey({ id: "A", asked: q })).toBe(
-			`task:A:${JSON.stringify(q)}`,
+		expect(taskEntryKey({ id: "A", asked: q })).toMatch(
+			/^task:A:ask-[0-9a-z]+$/,
 		);
 	});
 });
@@ -209,6 +211,7 @@ describe("payloadsFor", () => {
 				url: "/",
 				keys: ["request:A", "request:B"],
 				clear: [],
+				replace: false,
 			},
 		]);
 	});
@@ -222,6 +225,7 @@ describe("payloadsFor", () => {
 				url: "/projects/my%20proj/tasks/A",
 				keys: ["request:A"],
 				clear: ["complete"],
+				replace: false,
 			},
 		]);
 	});
@@ -274,11 +278,13 @@ const live = (
 	key: string,
 	cls: LiveAlert["class"],
 	taskId: string,
+	to: string[] = ["dev"],
 ): LiveAlert => ({
 	key,
 	class: cls,
 	taskId,
 	project: "ottr",
+	to,
 });
 
 describe("clearedAlerts", () => {
@@ -336,9 +342,53 @@ describe("tagsToClear", () => {
 		const r1 = live("task:A:needs", "request", "A");
 		const r2 = live("task:B:needs", "request", "B");
 		const c = live("done:C", "complete", "C");
-		expect(tagsToClear([r1, c], [r2])).toEqual(["complete"]);
-		expect(tagsToClear([r1], [])).toEqual(["request"]);
-		expect(tagsToClear([], [])).toEqual([]);
+		expect(tagsToClear([r1, c], [r2], "dev")).toEqual(["complete"]);
+		expect(tagsToClear([r1], [], "dev")).toEqual(["request"]);
+		expect(tagsToClear([], [], "dev")).toEqual([]);
+	});
+	test("per device: an alert the device never got neither clears nor keeps its tag", () => {
+		const delivered = live("task:A:needs", "request", "A", ["phone"]);
+		const muted = live("task:B:needs", "request", "B", []);
+		expect(tagsToClear([delivered], [muted], "phone")).toEqual(["request"]);
+		expect(tagsToClear([muted], [], "phone")).toEqual([]);
+	});
+});
+
+describe("cancellation and error rekey", () => {
+	test("a cancelled card alerts nothing and retracts its Error and Complete alerts", () => {
+		const t = card("A", { state: "needs_you", cancelled: true });
+		expect(diffEvents([card("A")], [t])).toEqual([]);
+		const err = live("error:A:t1", "error", "A");
+		const done = live("done:A", "complete", "A");
+		const cancelledDone = card("A", {
+			stage: "done",
+			errorTurn: "t1",
+			cancelled: true,
+		});
+		expect(clearedAlerts([err, done], [cancelledDone], new Set())).toEqual([
+			err,
+			done,
+		]);
+	});
+	test("an Error that led to needs_you takes the entry key, so acking the entry retracts it", () => {
+		const err = live("error:A:t1", "error", "A");
+		const needs = card("A", { state: "needs_you", errorTurn: "t1" });
+		const rekeyed = rekeyErrorAlerts([err], [needs])[0]!;
+		expect(rekeyed.key).toBe(taskEntryKey(needs));
+		expect(
+			clearedAlerts([rekeyed], [needs], new Set([taskEntryKey(needs)])),
+		).toEqual([rekeyed]);
+		// Answering the entry (card leaves needs_you on the same turn) retracts it too.
+		expect(
+			clearedAlerts([rekeyed], [{ ...needs, state: "queued" }], new Set()),
+		).toEqual([rekeyed]);
+	});
+	test("task keys hash the ask: short and distinct per round", () => {
+		const long = ask("q".repeat(5000));
+		const key = taskEntryKey({ id: "A", asked: long });
+		expect(key.length).toBeLessThan(40);
+		expect(key).not.toBe(taskEntryKey({ id: "A", asked: ask("other") }));
+		expect(key).toBe(taskEntryKey({ id: "A", asked: ask("q".repeat(5000)) }));
 	});
 });
 

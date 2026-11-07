@@ -2276,7 +2276,12 @@ describe("GitHostsSection board GitHub token reuse", () => {
 });
 
 describe("NotificationsSection", () => {
-	test("two mute switches flipped before the first answer both persist", async () => {
+	/** Mounts the section with two projects; each POST waits until the test answers it. */
+	async function mountMutes(): Promise<{
+		boxes: () => HTMLInputElement[];
+		posts: Array<{ body: unknown; ok: () => void; fail: () => void }>;
+		unmount: () => Promise<void>;
+	}> {
 		const projects = ["alpha", "beta"].map(
 			(name) =>
 				({
@@ -2285,15 +2290,19 @@ describe("NotificationsSection", () => {
 					settings: { displayName: null, iconText: null },
 				}) as unknown as ProjectView,
 		);
-		const posts: Array<{ body: unknown; done: () => void }> = [];
+		const posts: Array<{ body: unknown; ok: () => void; fail: () => void }> =
+			[];
 		const fetchMock = (async (url: string | URL, init?: RequestInit) => {
-			if (init?.method === "POST")
-				return new Promise<Response>((resolve) =>
-					posts.push({
-						body: JSON.parse(String(init.body)),
-						done: () => resolve(Response.json({ ok: true })),
-					}),
-				);
+			if (init?.method === "POST") {
+				const { promise, resolve } = Promise.withResolvers<Response>();
+				posts.push({
+					body: JSON.parse(String(init.body)),
+					ok: () => resolve(Response.json({ ok: true })),
+					fail: () =>
+						resolve(Response.json({ error: "down" }, { status: 500 })),
+				});
+				return promise;
+			}
 			expect(String(url)).toBe("/api/notifications/prefs");
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
@@ -2304,44 +2313,74 @@ describe("NotificationsSection", () => {
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
-		try {
-			await act(async () => {
-				root.render(
-					<NotificationsSection
-						projects={projects}
-						act={async (fn) => {
-							try {
-								await fn();
-								return true;
-							} catch {
-								return false;
-							}
-						}}
-					/>,
-				);
-			});
-			const boxes = container.querySelectorAll<HTMLInputElement>(
-				'.notify-group input[type="checkbox"]',
+		await act(async () => {
+			root.render(
+				<NotificationsSection
+					projects={projects}
+					act={async (fn) => {
+						try {
+							await fn();
+							return true;
+						} catch {
+							return false;
+						}
+					}}
+				/>,
 			);
-			expect(boxes.length).toBe(2);
+		});
+		return {
+			boxes: () => [
+				...container.querySelectorAll<HTMLInputElement>(
+					'.notify-group input[type="checkbox"]',
+				),
+			],
+			posts,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("two mute switches flipped before the first answer both persist", async () => {
+		const m = await mountMutes();
+		try {
+			const [a, b] = m.boxes();
 			await act(async () => {
-				onChangeOf(boxes[0]!)({ target: { checked: true } });
-				onChangeOf(boxes[1]!)({ target: { checked: true } });
+				onChangeOf(a!)({ target: { checked: true } });
+				onChangeOf(b!)({ target: { checked: true } });
 			});
 			// One save in flight at a time; each sends the latest wanted list, so no POST
 			// can drop the other switch's change.
-			expect(posts.length).toBe(1);
-			await act(async () => posts[0]!.done());
-			expect(posts.length).toBe(2);
-			await act(async () => posts[1]!.done());
-			for (const p of posts)
+			expect(m.posts.length).toBe(1);
+			await act(async () => m.posts[0]!.ok());
+			expect(m.posts.length).toBe(2);
+			await act(async () => m.posts[1]!.ok());
+			for (const p of m.posts)
 				expect(p.body).toEqual({ mutedProjects: ["alpha", "beta"] });
 		} finally {
+			await m.unmount();
+		}
+	});
+
+	test("a failed later save shows what the server holds, not an assumed inverse", async () => {
+		const m = await mountMutes();
+		try {
+			const [a, b] = m.boxes();
 			await act(async () => {
-				root.unmount();
+				onChangeOf(a!)({ target: { checked: true } });
+				onChangeOf(b!)({ target: { checked: true } });
 			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			// The first POST already carries both mutes and succeeds; the second fails.
+			await act(async () => m.posts[0]!.ok());
+			await act(async () => m.posts[1]!.fail());
+			expect(m.posts[0]!.body).toEqual({ mutedProjects: ["alpha", "beta"] });
+			expect(m.boxes().map((x) => x.checked)).toEqual([true, true]);
+		} finally {
+			await m.unmount();
 		}
 	});
 });

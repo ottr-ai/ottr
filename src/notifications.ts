@@ -15,12 +15,31 @@ export const ALL_CLASSES_ON: ClassPrefs = Object.freeze({
 	complete: true,
 });
 
+/** Short stable hash (cyrb53, base 36) of an ask round: entry keys stay small however long the
+ * questions are, so the shared seen set never has to cut or drop one. */
+function askHash(text: string): string {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let i = 0; i < text.length; i++) {
+		const c = text.charCodeAt(i);
+		h1 = Math.imul(h1 ^ c, 2654435761);
+		h2 = Math.imul(h2 ^ c, 1597334677);
+	}
+	h1 =
+		Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+		Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 =
+		Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+		Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
 /** Occurrence key of a needs_you card's inbox entry: a new ask round is a new entry. */
 export function taskEntryKey(t: {
 	id: string;
 	asked: AskQuestion[] | null;
 }): string {
-	return `task:${t.id}:${t.asked === null ? "needs" : JSON.stringify(t.asked)}`;
+	return `task:${t.id}:${t.asked === null ? "needs" : `ask-${askHash(JSON.stringify(t.asked))}`}`;
 }
 
 /** Card facts the event diff reads. Built by the server from TaskCard + its latest turn. */
@@ -40,6 +59,8 @@ export interface AlertCardInput {
 	errorTurn: string | null;
 	/** That turn's error text (redacted as stored); null when errorTurn is null. */
 	errorText: string | null;
+	/** The card was cancelled: it alerts nothing more and its live alerts retract. */
+	cancelled: boolean;
 }
 
 export interface AlertEvent {
@@ -74,7 +95,7 @@ export function diffEvents(
 	const before = new Map(prev.map((t) => [t.id, t]));
 	const out: AlertEvent[] = [];
 	for (const t of next) {
-		if (t.kind === "retro") continue;
+		if (t.kind === "retro" || t.cancelled) continue;
 		const old = before.get(t.id);
 		const ev = (cls: AlertClass, key: string, body: string): AlertEvent => ({
 			key,
@@ -134,9 +155,30 @@ export interface LiveAlert {
 	class: AlertClass;
 	taskId: string;
 	project: string;
+	/** Endpoints the alert was pushed to: retraction is per device, so an alert a device never
+	 * got (class off, project muted) never keeps that device's class notification open. */
+	to: string[];
 }
 
-/** Keys of live alerts whose cause cleared (card gone; task: key no longer the card's current needs_you entry key; done: card not in stage done; error:<id>:<turn> card's errorTurn differs) or whose key is in `seen`. */
+/** An Error pushed before its card reached needs_you carries `error:<id>:<turn>`; once the card
+ * waits for the user on that same failed turn, the bell shows the needs_you entry instead. The
+ * alert takes that entry's key, so acknowledging or answering the entry retracts it. */
+export function rekeyErrorAlerts(
+	live: readonly LiveAlert[],
+	next: readonly AlertCardInput[],
+): LiveAlert[] {
+	const cards = new Map(next.map((t) => [t.id, t]));
+	return live.map((a) => {
+		const t = cards.get(a.taskId);
+		return t !== undefined &&
+			t.state === "needs_you" &&
+			a.key === `error:${t.id}:${t.errorTurn}`
+			? { ...a, key: taskEntryKey(t) }
+			: a;
+	});
+}
+
+/** Keys of live alerts whose cause cleared (card gone or cancelled; task: key no longer the card's current needs_you entry key; done: card neither in done nor answered; error:<id>:<turn> card's errorTurn differs) or whose key is in `seen`. */
 export function clearedAlerts(
 	live: readonly LiveAlert[],
 	next: readonly AlertCardInput[],
@@ -146,7 +188,7 @@ export function clearedAlerts(
 	return live.filter((a) => {
 		if (seen.has(a.key)) return true;
 		const t = cards.get(a.taskId);
-		if (t === undefined) return true;
+		if (t === undefined || t.cancelled) return true;
 		if (a.key.startsWith("task:"))
 			return t.state !== "needs_you" || taskEntryKey(t) !== a.key;
 		if (a.key.startsWith("done:")) {
@@ -159,13 +201,19 @@ export function clearedAlerts(
 	});
 }
 
-/** Class tags to retract: classes that lost at least one alert and have none left in `remaining`. */
+/** Class tags one device must retract: classes that lost an alert pushed to `endpoint` and have
+ * no alert pushed to it left in `remaining`. */
 export function tagsToClear(
 	removed: readonly LiveAlert[],
 	remaining: readonly LiveAlert[],
+	endpoint: string,
 ): AlertClass[] {
-	const lost = new Set(removed.map((a) => a.class));
-	const left = new Set(remaining.map((a) => a.class));
+	const lost = new Set(
+		removed.filter((a) => a.to.includes(endpoint)).map((a) => a.class),
+	);
+	const left = new Set(
+		remaining.filter((a) => a.to.includes(endpoint)).map((a) => a.class),
+	);
 	return ALERT_CLASSES.filter((c) => lost.has(c) && !left.has(c));
 }
 
@@ -197,6 +245,10 @@ export interface AlertPayload {
 	url: string;
 	keys: string[];
 	clear: AlertClass[];
+	/** This class's own tag was due for retraction before the pass: when the service worker
+	 * does not show the alert (every key acknowledged), it closes the tag instead of leaving
+	 * the stale notification that the new one would have replaced. */
+	replace: boolean;
 }
 export interface ClearPayload {
 	type: "clear";
@@ -230,6 +282,7 @@ export function payloadsFor(
 				url: first.url,
 				keys,
 				clear: [...clear],
+				replace: false,
 			});
 			continue;
 		}
@@ -241,6 +294,7 @@ export function payloadsFor(
 			url: "/",
 			keys,
 			clear: [...clear],
+			replace: false,
 		});
 	}
 	return out;
@@ -255,10 +309,12 @@ export function isApplePush(endpoint: string): boolean {
 	}
 }
 
-const SEEN_KEY_MAX = 2000;
+/** Longest acknowledged key the server stores; the seen route refuses longer ones (400) instead
+ * of dropping them. Task keys hash their ask, so real keys stay far below it. */
+export const SEEN_KEY_MAX = 2000;
 const SEEN_MAX = 5000;
 
-/** Normalizes a stored/posted seen list: strings only, deduped, each ≤ 2000 chars, at most the last 5000 kept. */
+/** Normalizes a stored/posted seen list: strings only, deduped, each ≤ SEEN_KEY_MAX chars, at most the last 5000 kept. */
 export function normalizeSeen(raw: unknown): string[] {
 	if (!Array.isArray(raw)) return [];
 	const seen = new Set<string>();

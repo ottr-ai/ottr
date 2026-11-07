@@ -7497,6 +7497,140 @@ describe("web push (R1-1, R2-3)", () => {
 		});
 	});
 
+	/** Starts and settles one turn on the card with `error`; the card ends in `state`. */
+	const failTurn = (
+		b: ReturnType<typeof alertBoard>,
+		id: string,
+		error: string,
+		state: "queued" | "needs_you",
+	) => {
+		b.s.updateTask(id, { state: "running" });
+		const turn = b.s.startTurn(id, "work", ".", null);
+		b.s.finishTurn(turn.id, { endedAt: Date.now(), exitCode: 1, error });
+		b.s.updateTask(id, { state });
+		return turn;
+	};
+
+	test("a turn that starts and fails between two frames still pushes its Error", async () => {
+		const b = alertBoard("alert-fast-fail");
+		await b.subscribe("https://push.example/fast");
+		const t = b.s.createTask("fails fast");
+		b.m.app.publishState();
+		const from = pushSends.length;
+		const turn = failTurn(b, t.id, "boom", "queued"); // same state and stage as before
+		b.m.app.publishState();
+		expect(b.sentSince(from).map((x) => x.payload.keys)).toEqual([
+			[`error:${t.id}:${turn.id}`],
+		]);
+	});
+
+	test("a cancelled turn is no failure: no Error push", async () => {
+		const b = alertBoard("alert-cancel-turn");
+		await b.subscribe("https://push.example/cancel-turn");
+		const t = b.s.createTask("stopped");
+		b.m.app.publishState();
+		const from = pushSends.length;
+		failTurn(b, t.id, "cancelled", "queued");
+		b.m.app.publishState();
+		expect(b.sentSince(from)).toEqual([]);
+	});
+
+	test("an Error pushed before needs_you is retracted by acknowledging the needs_you entry", async () => {
+		const b = alertBoard("alert-error-ack");
+		const fcm = "https://push.example/error-ack";
+		await b.subscribe(fcm);
+		const t = b.s.createTask("fails then waits");
+		b.m.app.publishState();
+		failTurn(b, t.id, "boom", "queued");
+		b.m.app.publishState(); // Error as error:<id>:<turn>
+		b.needsYou(t.id);
+		b.m.app.publishState(); // same failed turn: no Request
+		const from = pushSends.length;
+		// "Mark all as read" acknowledges the bell's entry key, not the error key.
+		await b.m.call("/api/inbox/seen", {
+			keys: [taskEntryKey(b.s.getTask(t.id)!)],
+		});
+		expect(b.sentSince(from)).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["error"] } },
+		]);
+	});
+
+	test("an alert no device got (muted) never keeps a delivered one's tag open", async () => {
+		const b = alertBoard("alert-muted-tag");
+		const fcm = "https://push.example/muted-tag";
+		await b.subscribe(fcm);
+		const first = b.s.createTask("delivered");
+		const second = b.s.createTask("muted later");
+		b.m.app.publishState();
+		b.needsYou(first.id);
+		b.m.app.publishState();
+		await b.m.call("/api/notifications/prefs", {
+			mutedProjects: ["alert-muted-tag"],
+		});
+		b.needsYou(second.id);
+		b.m.app.publishState();
+		const from = pushSends.length;
+		await b.m.call("/api/inbox/seen", { taskIds: [first.id] });
+		expect(b.sentSince(from)).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+		]);
+	});
+
+	test("a long multi-question ask acks and retracts; over-long keys are refused, not dropped", async () => {
+		const b = alertBoard("alert-long-ask");
+		const fcm = "https://push.example/long";
+		await b.subscribe(fcm);
+		const t = b.s.createTask("long ask");
+		b.m.app.publishState();
+		const asked = Array.from({ length: 6 }, (_, i) => ({
+			question: `${"Which option fits the rollout plan best? ".repeat(8)}${i}`,
+			options: [{ label: "x".repeat(60) }, { label: "y".repeat(60) }],
+		}));
+		b.s.updateTask(t.id, {
+			state: "needs_you",
+			asked,
+		} as Parameters<typeof b.s.updateTask>[1]);
+		b.m.app.publishState();
+		const key = taskEntryKey(b.s.getTask(t.id)!);
+		expect(JSON.stringify(asked).length).toBeGreaterThan(2000);
+		const from = pushSends.length;
+		expect((await b.m.call("/api/inbox/seen", { keys: [key] })).status).toBe(
+			200,
+		);
+		expect(await (await b.m.call("/api/inbox/seen")).json()).toEqual({
+			keys: [key],
+		});
+		expect(b.sentSince(from)).toEqual([
+			{ endpoint: fcm, payload: { type: "clear", tags: ["request"] } },
+		]);
+		const tooLong = await b.m.call("/api/inbox/seen", {
+			keys: [`notice:${"n".repeat(2001)}`],
+		});
+		expect(tooLong.status).toBe(400);
+	});
+
+	test("cancelling a card retracts its Error and Complete alerts", async () => {
+		const b = alertBoard("alert-cancel-card");
+		const fcm = "https://push.example/cancel-card";
+		await b.subscribe(fcm);
+		const failed = b.s.createTask("failed");
+		const done = b.s.createTask("done");
+		b.m.app.publishState();
+		failTurn(b, failed.id, "boom", "queued");
+		b.s.updateTask(done.id, { stage: "done", state: "idle" });
+		b.m.app.publishState();
+		const from = pushSends.length;
+		b.s.updateTask(failed.id, { cancelledAt: Date.now() });
+		b.s.updateTask(done.id, { cancelledAt: Date.now() });
+		b.m.app.publishState();
+		expect(b.sentSince(from)).toEqual([
+			{
+				endpoint: fcm,
+				payload: { type: "clear", tags: ["error", "complete"] },
+			},
+		]);
+	});
+
 	test("a frame's own alert classes never ride as clear tags on its other payloads", async () => {
 		const b = alertBoard("alert-race");
 		await b.subscribe("https://push.example/race");

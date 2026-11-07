@@ -148,6 +148,8 @@ import {
 	normalizeSeen,
 	payloadsFor,
 	presenceHolds,
+	rekeyErrorAlerts,
+	SEEN_KEY_MAX,
 	tagsToClear,
 	taskEntryKey,
 } from "./notifications.ts";
@@ -999,6 +1001,9 @@ export function createApp(deps: AppDeps) {
 									class: x.class,
 									taskId: x.taskId,
 									project: x.project,
+									to: Array.isArray(x.to)
+										? x.to.filter((e): e is string => typeof e === "string")
+										: [],
 								},
 							]
 						: [];
@@ -1040,8 +1045,10 @@ export function createApp(deps: AppDeps) {
 		return [...new Set(raw.filter((s): s is string => typeof s === "string"))];
 	}
 
-	/** The error of the card's latest settled turn. Reads the card's turns, so callers ask only for
-	 * cards whose state or stage moved (a turn settling always moves one); a sick store keeps `fallback`. */
+	/** The card's newest settled turn as Error facts: one indexed row per card and frame, so a
+	 * turn that starts and fails between two frames is never missed. A turn ended by a
+	 * deliberate cancel (error "cancelled", see ProjectStore.finishTurn) is no failure. A sick
+	 * store keeps `fallback`. */
 	function latestTurnError(
 		project: string,
 		id: string,
@@ -1051,34 +1058,24 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(project);
 		if (e === undefined) return none;
 		try {
-			const turns = e.store.listTurns(id);
-			for (let i = turns.length - 1; i >= 0; i--) {
-				const turn = turns[i]!;
-				if (turn.endedAt === null) continue;
-				return turn.error === null
-					? none
-					: { errorTurn: String(turn.id), errorText: turn.error };
-			}
-			return none;
+			const turn = e.store.lastSettledTurn(id);
+			return turn === null || turn.error === null || turn.error === "cancelled"
+				? none
+				: { errorTurn: String(turn.id), errorText: turn.error };
 		} catch (err) {
 			logStoreError(e.store.name, err);
 			return fallback ?? none;
 		}
 	}
 
-	/** The event diff's view of the frame's cards. Error facts carry over from the previous frame
-	 * unless the card's state or stage changed, so a publish never lists every card's turns. */
+	/** The event diff's view of the frame's cards. */
 	function alertInputs(
 		tasks: readonly TaskCard[],
 		prev: readonly AlertCardInput[] | null,
 	): AlertCardInput[] {
 		const before = new Map((prev ?? []).map((p) => [p.id, p]));
 		return tasks.map((t) => {
-			const old = before.get(t.id);
-			const err =
-				old !== undefined && old.state === t.state && old.stage === t.stage
-					? old
-					: latestTurnError(t.project, t.id, old);
+			const err = latestTurnError(t.project, t.id, before.get(t.id));
 			return {
 				id: t.id,
 				project: t.project,
@@ -1093,6 +1090,7 @@ export function createApp(deps: AppDeps) {
 				summary: t.summary,
 				errorTurn: err.errorTurn,
 				errorText: err.errorText,
+				cancelled: t.cancelledAt !== null,
 			};
 		});
 	}
@@ -1126,19 +1124,22 @@ export function createApp(deps: AppDeps) {
 		});
 	}
 
-	/** Takes `removed` out of the live registry; returns the class tags the devices must close. */
-	function retire(removed: readonly LiveAlert[]): AlertClass[] {
-		if (removed.length === 0) return [];
+	/** Takes `removed` out of the live registry and returns it; tagsToClear turns it into each
+	 * device's class tags. */
+	function retire(removed: readonly LiveAlert[]): readonly LiveAlert[] {
+		if (removed.length === 0) return removed;
 		const keys = new Set(removed.map((a) => a.key));
 		liveAlerts = liveAlerts.filter((a) => !keys.has(a.key));
-		return tagsToClear(removed, liveAlerts);
+		return removed;
 	}
 
 	/** One device's payloads for a pass: its alerts (each carrying `clear`), else a data-only
 	 * retraction. Apple's push service never gets a data-only push, so its retraction waits in
 	 * `appleClear` and rides on the next alert sent to that device. A class this batch alerts
-	 * replaces its own tag on the device, so its clear tag is dropped: carried on another
-	 * class's payload it could land after the new alert and close it. */
+	 * replaces its own tag on the device, so its clear tag is dropped from every payload: carried
+	 * on another class's payload it could land after the new alert and close it. The alert of
+	 * that class gets `replace` instead, so the service worker still closes the stale
+	 * notification when it shows nothing (every key already acknowledged). */
 	function batchFor(
 		sub: PushSub,
 		alerts: readonly AlertPayload[],
@@ -1158,7 +1159,11 @@ export function createApp(deps: AppDeps) {
 		if (apple) appleClear.delete(sub.endpoint);
 		const shown = new Set(alerts.map((a) => a.tag));
 		const tags = [...pending].filter((t) => !shown.has(t));
-		return alerts.map((a) => ({ ...a, clear: tags }));
+		return alerts.map((a) => ({
+			...a,
+			clear: tags,
+			replace: pending.has(a.tag as AlertClass),
+		}));
 	}
 
 	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
@@ -1198,59 +1203,94 @@ export function createApp(deps: AppDeps) {
 		events: readonly AlertEvent[],
 		seen: ReadonlySet<string>,
 	): void {
-		const clear = retire(clearedAlerts(liveAlerts, inputs, seen));
+		const rekeyed = rekeyAlerts(inputs);
+		const removed = retire(clearedAlerts(liveAlerts, inputs, seen));
 		const fresh = presenceHolds(focusAt, now())
 			? []
 			: events.filter((e) => !seen.has(e.key));
-		if (fresh.length > 0) {
-			const keys = new Set(fresh.map((e) => e.key));
+		if (fresh.length === 0 && removed.length === 0) {
+			if (rekeyed) saveAlertState();
+			return;
+		}
+		const subs = loadSubs(deps.gstore);
+		const muted = new Set(loadMuted());
+		const toOf = new Map(
+			fresh.map((e) => [
+				e.key,
+				subs
+					.filter((s) => deliverable(s.classes, muted, e))
+					.map((s) => s.endpoint),
+			]),
+		);
+		// An alert no device got needs no retraction, so it never enters the registry.
+		const sent = fresh.filter((e) => (toOf.get(e.key)?.length ?? 0) > 0);
+		if (sent.length > 0) {
+			const keys = new Set(sent.map((e) => e.key));
 			liveAlerts = [
 				...liveAlerts.filter((a) => !keys.has(a.key)),
-				...fresh.map((e) => ({
+				...sent.map((e) => ({
 					key: e.key,
 					class: e.class,
 					taskId: e.taskId,
 					project: e.project,
+					to: toOf.get(e.key) ?? [],
 				})),
 			];
 		}
-		if (fresh.length === 0 && clear.length === 0) return;
-		const subs = loadSubs(deps.gstore);
-		const muted = new Set(loadMuted());
-		// Grouped bodies count what is still unanswered, not just this frame's arrivals.
-		const liveCount: Record<AlertClass, number> = {
-			request: 0,
-			error: 0,
-			complete: 0,
-		};
-		for (const a of liveAlerts) if (!muted.has(a.project)) liveCount[a.class]++;
-		const batches = subs.map((sub) => ({
-			sub,
-			payloads: batchFor(
+		const batches = subs.map((sub) => {
+			const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
+			// Grouped bodies count what this device still shows unanswered, not just this frame.
+			const liveCount: Record<AlertClass, number> = {
+				request: 0,
+				error: 0,
+				complete: 0,
+			};
+			for (const a of mine) liveCount[a.class]++;
+			const clear = tagsToClear(removed, mine, sub.endpoint);
+			return {
 				sub,
-				payloadsFor(
-					fresh.filter((e) => deliverable(sub.classes, muted, e)),
-					liveCount,
+				payloads: batchFor(
+					sub,
+					payloadsFor(
+						sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
+						liveCount,
+						clear,
+					),
 					clear,
 				),
-				clear,
-			),
-		}));
+			};
+		});
 		saveAlertState();
 		sendPushes(batches);
+	}
+
+	/** Applies rekeyErrorAlerts to the registry; true when a key changed. */
+	function rekeyAlerts(inputs: readonly AlertCardInput[]): boolean {
+		const next = rekeyErrorAlerts(liveAlerts, inputs);
+		const changed = next.some((a, i) => a.key !== liveAlerts[i]?.key);
+		liveAlerts = next;
+		return changed;
 	}
 
 	/** Retraction right after an ack (POST /api/inbox/seen), so the devices close the acked alerts
 	 * at once instead of at the next card change. */
 	function retractAcked(): void {
 		if (lastAlertInputs === null || liveAlerts.length === 0) return;
-		const tags = retire(
+		const rekeyed = rekeyAlerts(lastAlertInputs);
+		const removed = retire(
 			clearedAlerts(liveAlerts, lastAlertInputs, new Set(loadInboxSeen())),
 		);
-		if (tags.length === 0) return;
+		if (removed.length === 0) {
+			if (rekeyed) saveAlertState();
+			return;
+		}
 		const batches = loadSubs(deps.gstore).map((sub) => ({
 			sub,
-			payloads: batchFor(sub, [], tags),
+			payloads: batchFor(
+				sub,
+				[],
+				tagsToClear(removed, liveAlerts, sub.endpoint),
+			),
 		}));
 		saveAlertState();
 		sendPushes(batches);
@@ -4860,7 +4900,13 @@ export function createApp(deps: AppDeps) {
 					const { keys, taskIds, drop } = r.body;
 					const given = [keys, taskIds, drop].filter((v) => v !== undefined);
 					const list = given[0];
-					if (given.length !== 1 || !isStringList(list, 5000))
+					// An over-long key is refused, never stored short or dropped: a silent drop
+					// would answer 200 and leave the entry unread.
+					if (
+						given.length !== 1 ||
+						!isStringList(list, 5000) ||
+						list.some((k) => k.length > SEEN_KEY_MAX)
+					)
 						return json({ error: "invalid seen list" }, 400);
 					const before = loadInboxSeen();
 					let next: string[];
