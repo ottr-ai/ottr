@@ -19,7 +19,7 @@ import { createRoot } from "react-dom/client";
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
-import { taskEntryKey } from "../notifications.ts";
+import { shortKey, taskEntryKey } from "../notifications.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
@@ -130,10 +130,10 @@ import {
 	loadComposeDraft,
 	loadSeenAnswers,
 	pruneAskDrafts,
-	pruneSeen,
 	SEEN_KEY,
 	saveAskDraft,
 	saveComposeDraft,
+	seenToDrop,
 } from "./notify.ts";
 import {
 	autoMarkOnOpen,
@@ -11500,17 +11500,19 @@ export function App() {
 	const orphanList = state?.orphans ?? [];
 	const orphansError = state?.orphansError ?? null;
 	const keptCount = state?.keptWorktrees ?? { held: 0, stale: 0 };
-	// Occurrence keys of the inbox entries; null when the source is absent.
-	const critKey = error !== null ? `crit:${error}` : null;
-	const noticeKey = notice !== null ? `notice:${notice}` : null;
+	// Occurrence keys of the inbox entries; null when the source is absent. shortKey hashes a
+	// long body (an error text, an id list), so no key outgrows the seen route's limit.
+	const critKey = error !== null ? shortKey("crit", error) : null;
+	const noticeKey = notice !== null ? shortKey("notice", notice) : null;
 	const drainKey = draining ? `drain:${state?.drainUntil}` : null;
 	const behindKey = behind > 0 ? `behind:${behind}` : null;
-	const updatesKey = updateCount > 0 ? `updates:${updateIds.join(",")}` : null;
+	const updatesKey =
+		updateCount > 0 ? shortKey("updates", updateIds.join(",")) : null;
 	const orphansErrorKey =
-		orphansError !== null ? `orphans-error:${orphansError}` : null;
+		orphansError !== null ? shortKey("orphans-error", orphansError) : null;
 	const orphansKey =
 		orphanList.length > 0
-			? `orphans:${orphanList.map((o) => o.pid).join(",")}`
+			? shortKey("orphans", orphanList.map((o) => o.pid).join(","))
 			: null;
 	const keptKey =
 		keptCount.held > 0 ? `kept:${keptCount.held}:${keptCount.stale}` : null;
@@ -11792,27 +11794,25 @@ export function App() {
 			: "Notifications, all clear";
 	const updateLoaded = update !== null;
 
-	// The server prunes task-derived keys (task:, done:, error:) itself; notice and crit keys
-	// only this client can judge, so a cleared one is dropped here and a recurrence counts as
-	// new. Runs once per entry signature, not on every seen-list frame.
+	// The server prunes task-derived keys (task:, done:, error:) itself; the client drops the
+	// rest once their cause cleared, so a recurrence counts as new. crit: and notice: entries
+	// live in one tab only: another tab's absence proves nothing, so a tab drops only the
+	// browser-local keys it showed itself and then lost. Runs once per entry signature.
 	const serverSeen = state?.inboxSeen;
 	const prunedSig = useRef<string | null>(null);
+	const localShown = useRef(new Set<string>());
 	useEffect(() => {
 		if (serverSeen === undefined) return;
 		const sig = `${updateLoaded}:${inboxSig}`;
 		if (prunedSig.current === sig) return;
 		prunedSig.current = sig;
-		const seen = new Set(serverSeen);
-		const kept = pruneSeen(
-			seen,
+		const drop = seenToDrop(
+			serverSeen,
 			new Set(JSON.parse(inboxSig) as string[]),
-			(k) =>
-				/^(task|done|error):/.test(k) ||
-				(!updateLoaded && k.startsWith("behind:")),
+			localShown.current,
+			updateLoaded,
 		);
-		if (kept === seen) return;
-		const drop = serverSeen.filter((k) => !kept.has(k));
-		void post("/api/inbox/seen", { drop }).catch(() => {});
+		if (drop.length > 0) void post("/api/inbox/seen", { drop }).catch(() => {});
 	}, [inboxSig, serverSeen, updateLoaded]);
 
 	// N opens New task for the open project; inert while typing or any modal is up.

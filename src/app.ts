@@ -138,6 +138,7 @@ import {
 	type AlertClass,
 	type AlertEvent,
 	type AlertPayload,
+	ackKeys,
 	type ClassPrefs,
 	type ClearPayload,
 	clearedAlerts,
@@ -998,6 +999,7 @@ export function createApp(deps: AppDeps) {
 						? [
 								{
 									key: x.key,
+									sent: typeof x.sent === "string" ? x.sent : x.key,
 									class: x.class,
 									taskId: x.taskId,
 									project: x.project,
@@ -1046,9 +1048,11 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** The card's newest settled turn as Error facts: one indexed row per card and frame, so a
-	 * turn that starts and fails between two frames is never missed. A turn ended by a
-	 * deliberate cancel (error "cancelled", see ProjectStore.finishTurn) is no failure. A sick
-	 * store keeps `fallback`. */
+	 * turn that starts and fails between two frames is never missed. Only a turn that ended
+	 * without a reported outcome failed: a reported turn (ready, answered, needs_you) stores its
+	 * hold reason in turns.error too (turn.ts finishTurn), and that hold is a Request, not an
+	 * Error. A deliberate cancel (error "cancelled", see ProjectStore.finishTurn) is no failure
+	 * either. A sick store keeps `fallback`. */
 	function latestTurnError(
 		project: string,
 		id: string,
@@ -1059,7 +1063,10 @@ export function createApp(deps: AppDeps) {
 		if (e === undefined) return none;
 		try {
 			const turn = e.store.lastSettledTurn(id);
-			return turn === null || turn.error === null || turn.error === "cancelled"
+			return turn === null ||
+				turn.outcome !== null ||
+				turn.error === null ||
+				turn.error === "cancelled"
 				? none
 				: { errorTurn: String(turn.id), errorText: turn.error };
 		} catch (err) {
@@ -1230,6 +1237,7 @@ export function createApp(deps: AppDeps) {
 				...liveAlerts.filter((a) => !keys.has(a.key)),
 				...sent.map((e) => ({
 					key: e.key,
+					sent: e.key,
 					class: e.class,
 					taskId: e.taskId,
 					project: e.project,
@@ -1239,13 +1247,14 @@ export function createApp(deps: AppDeps) {
 		}
 		const batches = subs.map((sub) => {
 			const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
-			// Grouped bodies count what this device still shows unanswered, not just this frame.
-			const liveCount: Record<AlertClass, number> = {
-				request: 0,
-				error: 0,
-				complete: 0,
+			// The class notification stands for every alert of the class this device still
+			// shows, so its keys (and a grouped count) cover all of them, not just this frame.
+			const liveKeys: Record<AlertClass, string[]> = {
+				request: [],
+				error: [],
+				complete: [],
 			};
-			for (const a of mine) liveCount[a.class]++;
+			for (const a of mine) liveKeys[a.class].push(a.key);
 			const clear = tagsToClear(removed, mine, sub.endpoint);
 			return {
 				sub,
@@ -1253,7 +1262,7 @@ export function createApp(deps: AppDeps) {
 					sub,
 					payloadsFor(
 						sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
-						liveCount,
+						liveKeys,
 						clear,
 					),
 					clear,
@@ -4910,7 +4919,8 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "invalid seen list" }, 400);
 					const before = loadInboxSeen();
 					let next: string[];
-					if (keys !== undefined) next = [...before, ...list];
+					if (keys !== undefined)
+						next = [...before, ...ackKeys(list, liveAlerts)];
 					else if (drop !== undefined) {
 						const gone = new Set(list);
 						next = before.filter((k) => !gone.has(k));
@@ -4930,7 +4940,7 @@ export function createApp(deps: AppDeps) {
 								}
 							}
 						}
-						next = [...before, ...added];
+						next = [...before, ...ackKeys(added, liveAlerts)];
 					}
 					const after = normalizeSeen(next);
 					if (

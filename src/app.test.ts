@@ -7541,7 +7541,7 @@ describe("web push (R1-1, R2-3)", () => {
 		await b.subscribe(fcm);
 		const t = b.s.createTask("fails then waits");
 		b.m.app.publishState();
-		failTurn(b, t.id, "boom", "queued");
+		const turn = failTurn(b, t.id, "boom", "queued");
 		b.m.app.publishState(); // Error as error:<id>:<turn>
 		b.needsYou(t.id);
 		b.m.app.publishState(); // same failed turn: no Request
@@ -7553,6 +7553,35 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(b.sentSince(from)).toEqual([
 			{ endpoint: fcm, payload: { type: "clear", tags: ["error"] } },
 		]);
+		// The pushed payload's own key is acknowledged too, so a delayed copy of that push
+		// finds itself read in the service worker and never shows.
+		const { keys } = (await (await b.m.call("/api/inbox/seen")).json()) as {
+			keys: string[];
+		};
+		expect(keys).toContain(`error:${t.id}:${turn.id}`);
+	});
+
+	test("a reported needs_you hold is a Request, not an Error", async () => {
+		const b = alertBoard("alert-hold");
+		await b.subscribe("https://push.example/hold");
+		const t = b.s.createTask("holds for the user");
+		b.m.app.publishState();
+		const from = pushSends.length;
+		b.s.updateTask(t.id, { state: "running" });
+		const turn = b.s.startTurn(t.id, "merge", ".", null);
+		// A successful turn that reported needs_you stores its hold reason in turns.error.
+		b.s.finishTurn(turn.id, {
+			endedAt: Date.now(),
+			exitCode: 0,
+			outcome: "needs_you",
+			error: "Rebase onto origin/main first",
+		});
+		b.s.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Rebase onto origin/main first",
+		});
+		b.m.app.publishState();
+		expect(b.sentSince(from).map((x) => x.payload.tag)).toEqual(["request"]);
 	});
 
 	test("an alert no device got (muted) never keeps a delivered one's tag open", async () => {

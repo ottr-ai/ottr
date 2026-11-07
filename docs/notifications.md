@@ -5,10 +5,10 @@ The server decides which events reach the operating system. Web Push is the only
 ## Event classes
 
 - **Request**: a card enters needs you, or asks a new round of questions.
-- **Error**: a turn ends with an error. A turn ended by a deliberate cancel is no error. If the card then needs you on that same failed turn, in the same frame or a later one, the Error is the only alert; once the card waits, the Error takes the needs-you entry's key, so acknowledging or answering that entry retracts it.
+- **Error**: a turn fails: it ends with an error and without a reported outcome. A turn that reported needs you stores its hold reason in the same field, and that hold is a Request. A turn ended by a deliberate cancel is no error. If the card then needs you on that same failed turn, in the same frame or a later one, the Error is the only alert; once the card waits, the Error takes the needs-you entry's key, so acknowledging or answering that entry retracts it. Acknowledging that entry also acknowledges the Error's original key, so a delayed copy of the Error push never shows.
 - **Complete**: a card enters Done, or a question-only card reports its answer.
 
-A card produces at most one event per state frame. Error wins over Request, and Request wins over Complete. A new card only alerts when it arrives in needs you or with a failed turn. Several events of one class go out as one summary push ("3 tasks need your attention").
+A card produces at most one event per state frame. Error wins over Request, and Request wins over Complete. A new card only alerts when it arrives in needs you or with a failed turn. A class has one notification per device: when it stands for more than one unread alert, it shows a count ("3 tasks need your attention") and its keys list every alert it counts.
 
 ## What never pushes
 
@@ -42,7 +42,7 @@ Set them under **Settings → Notifications**. OS notifications need HTTPS, for 
 
 ## Acknowledgement
 
-Opening the bell panel acknowledges nothing. An entry is acknowledged when you click its row or link, open its card, or press "Mark all as read". The server prunes task keys whose cause has cleared, so a recurrence lights the bell again. A needs-you key names its ask round by a short hash of the questions, so keys stay small however long the ask is; the seen route refuses a key over 2000 characters with 400 instead of dropping it.
+Opening the bell panel acknowledges nothing. An entry is acknowledged when you click its row or link, open its card, or press "Mark all as read". The server prunes task keys whose cause has cleared, so a recurrence lights the bell again. The board drops other cleared keys; browser-local entries (an error or notice in one tab) are dropped only by the tab that showed them. Keys stay short: a needs-you key names its ask round by a hash, and a long notice body (an error text, an id list) is hashed too. The seen route refuses a key over 2000 characters with 400.
 
 ## Presence
 

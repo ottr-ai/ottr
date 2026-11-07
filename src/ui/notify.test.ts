@@ -14,6 +14,7 @@ import {
 	pruneSeen,
 	saveAskDraft,
 	saveComposeDraft,
+	seenToDrop,
 } from "./notify.ts";
 
 // bun:test has no DOM; the pure tests only need a localStorage stand-in.
@@ -169,4 +170,28 @@ describe("alatePendingEntry", () => {
 			`alate-pending:${EPISODE + 1}`,
 		);
 	});
+});
+
+test("seenToDrop: another tab's browser-local acknowledgement survives; this tab's own cleared one drops", () => {
+	const shownHere = new Set<string>();
+	// Tab B never showed tab A's crit entry: it keeps the acknowledgement.
+	expect(
+		seenToDrop(["crit:boom", "notice:hi"], new Set(), shownHere, true),
+	).toEqual([]);
+	// This tab showed the crit entry, then it cleared: now it drops.
+	expect(
+		seenToDrop(["crit:mine"], new Set(["crit:mine"]), shownHere, true),
+	).toEqual([]);
+	expect(seenToDrop(["crit:mine"], new Set(), shownHere, true)).toEqual([
+		"crit:mine",
+	]);
+	// Shared notice keys drop when cleared; task keys and unloaded behind keys stay.
+	expect(
+		seenToDrop(
+			["drain:1", "task:A:needs", "behind:2"],
+			new Set(),
+			new Set(),
+			false,
+		),
+	).toEqual(["drain:1"]);
 });

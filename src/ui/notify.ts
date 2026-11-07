@@ -166,3 +166,30 @@ export function pruneSeen(
 	const kept = [...seen].filter((k) => live.has(k) || pending(k));
 	return kept.length === seen.size ? seen : new Set(kept);
 }
+
+/** Keys this tab asks the server to drop from the shared seen set: acknowledgements whose
+ *  entry cleared, so a recurrence counts as new. The server prunes task:, done: and error:
+ *  keys itself. crit: and notice: entries live in one tab only, so another tab's absence
+ *  proves nothing: a tab drops such a key only when it showed the entry itself and lost it.
+ *  `localShown` is this tab's memory of the browser-local keys it showed; it is updated here.
+ *  behind: keys wait until the update data loaded. */
+export function seenToDrop(
+	serverSeen: readonly string[],
+	current: ReadonlySet<string>,
+	localShown: Set<string>,
+	updateLoaded: boolean,
+): string[] {
+	const local = (k: string) => /^(crit|notice):/.test(k);
+	for (const k of current) if (local(k)) localShown.add(k);
+	const seen = new Set(serverSeen);
+	const kept = pruneSeen(
+		seen,
+		current,
+		(k) =>
+			/^(task|done|error):/.test(k) ||
+			(local(k) && !localShown.has(k)) ||
+			(!updateLoaded && k.startsWith("behind:")),
+	);
+	for (const k of localShown) if (!current.has(k)) localShown.delete(k);
+	return kept === seen ? [] : serverSeen.filter((k) => !kept.has(k));
+}

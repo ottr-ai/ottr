@@ -152,6 +152,10 @@ export function diffEvents(
 
 export interface LiveAlert {
 	key: string;
+	/** The key the pushed payload carried. It differs from `key` once an Error is rekeyed to its
+	 * needs_you entry; acknowledging `key` acknowledges `sent` too, so a push still in flight
+	 * finds its own key acknowledged and never shows. */
+	sent: string;
 	class: AlertClass;
 	taskId: string;
 	project: string;
@@ -162,7 +166,8 @@ export interface LiveAlert {
 
 /** An Error pushed before its card reached needs_you carries `error:<id>:<turn>`; once the card
  * waits for the user on that same failed turn, the bell shows the needs_you entry instead. The
- * alert takes that entry's key, so acknowledging or answering the entry retracts it. */
+ * alert takes that entry's key (keeping `sent`), so acknowledging or answering the entry
+ * retracts it. */
 export function rekeyErrorAlerts(
 	live: readonly LiveAlert[],
 	next: readonly AlertCardInput[],
@@ -176,6 +181,29 @@ export function rekeyErrorAlerts(
 			? { ...a, key: taskEntryKey(t) }
 			: a;
 	});
+}
+
+/** Keys an acknowledgement of `keys` adds: the keys themselves plus the payload keys (`sent`)
+ * of live alerts they name. */
+export function ackKeys(
+	keys: readonly string[],
+	live: readonly LiveAlert[],
+): string[] {
+	const named = new Set(keys);
+	return [
+		...keys,
+		...live
+			.filter((a) => named.has(a.key) && a.sent !== a.key)
+			.map((a) => a.sent),
+	];
+}
+
+/** A bell entry key `<prefix>:<body>` that stays short: a body over 200 characters (an error
+ * text, an id list) becomes a hash, so no key ever outgrows SEEN_KEY_MAX. */
+export function shortKey(prefix: string, body: string): string {
+	return body.length <= 200
+		? `${prefix}:${body}`
+		: `${prefix}:#${askHash(body)}`;
 }
 
 /** Keys of live alerts whose cause cleared (card gone or cancelled; task: key no longer the card's current needs_you entry key; done: card neither in done nor answered; error:<id>:<turn> card's errorTurn differs) or whose key is in `seen`. */
@@ -261,10 +289,14 @@ const GROUP_BODY: Record<AlertClass, (n: number) => string> = {
 	complete: (n) => `${n} tasks finished`,
 };
 
-/** One payload per class among `events` (already filtered for ONE device). Same-class pushes share a tag, so the device replaces that class's notification instead of stacking one per task. One event → its own title/body/url; n>1 → grouped count, url "/", count = max(n, liveCount[class]). */
+/** One payload per class among `events` (already filtered for ONE device). Same-class pushes
+ * share a tag, so the device replaces that class's notification instead of stacking one per
+ * task. The payload stands for every live alert of the class on this device (`liveKeys`, which
+ * include this pass's), so its `keys` name exactly what its notification represents: one key →
+ * the card's own title/body/url; more → a grouped count of them, url "/". */
 export function payloadsFor(
 	events: readonly AlertEvent[],
-	liveCount: Readonly<Record<AlertClass, number>>,
+	liveKeys: Readonly<Record<AlertClass, readonly string[]>>,
 	clear: readonly AlertClass[],
 ): AlertPayload[] {
 	const out: AlertPayload[] = [];
@@ -272,8 +304,8 @@ export function payloadsFor(
 		const of = events.filter((e) => e.class === cls);
 		const first = of[0];
 		if (first === undefined) continue;
-		const keys = of.map((e) => e.key);
-		if (of.length === 1) {
+		const keys = [...new Set([...liveKeys[cls], ...of.map((e) => e.key)])];
+		if (keys.length === 1) {
 			out.push({
 				type: "alert",
 				title: first.title,
@@ -289,7 +321,7 @@ export function payloadsFor(
 		out.push({
 			type: "alert",
 			title: "Ottr",
-			body: GROUP_BODY[cls](Math.max(of.length, liveCount[cls])),
+			body: GROUP_BODY[cls](keys.length),
 			tag: cls,
 			url: "/",
 			keys,

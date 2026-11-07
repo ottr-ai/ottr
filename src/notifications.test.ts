@@ -13,6 +13,7 @@ import {
 	payloadsFor,
 	presenceHolds,
 	rekeyErrorAlerts,
+	shortKey,
 	tagsToClear,
 	taskEntryKey,
 } from "./notifications.ts";
@@ -42,7 +43,7 @@ const ask = (question: string): AskQuestion[] => [
 	{ question, options: [], multi: false } as unknown as AskQuestion,
 ];
 
-const zero = { request: 0, error: 0, complete: 0 };
+const zero = { request: [], error: [], complete: [] };
 
 describe("taskEntryKey", () => {
 	test("needs vs asked rounds", () => {
@@ -229,7 +230,7 @@ describe("payloadsFor", () => {
 			},
 		]);
 	});
-	test("liveCount raises the grouped count; one payload per class", () => {
+	test("the payload stands for every live alert of its class: keys and count cover them all", () => {
 		const out = payloadsFor(
 			[
 				ev("error", "A"),
@@ -237,12 +238,22 @@ describe("payloadsFor", () => {
 				ev("complete", "C"),
 				ev("complete", "D"),
 			],
-			{ request: 0, error: 7, complete: 1 },
+			{ request: [], error: ["error:U", "error:A"], complete: [] },
 			[],
 		);
-		expect(out.map((p) => [p.tag, p.body])).toEqual([
-			["error", "7 tasks failed"],
-			["complete", "2 tasks finished"],
+		expect(out.map((p) => [p.tag, p.body, p.keys])).toEqual([
+			["error", "3 tasks failed", ["error:U", "error:A", "error:B"]],
+			["complete", "2 tasks finished", ["complete:C", "complete:D"]],
+		]);
+		// One new alert beside an unread one groups too, so the unread one stays represented.
+		const [lone] = payloadsFor(
+			[ev("request", "B")],
+			{ request: ["request:A"], error: [], complete: [] },
+			[],
+		);
+		expect([lone?.body, lone?.keys]).toEqual([
+			"2 tasks need your attention",
+			["request:A", "request:B"],
 		]);
 	});
 });
@@ -281,6 +292,7 @@ const live = (
 	to: string[] = ["dev"],
 ): LiveAlert => ({
 	key,
+	sent: key,
 	class: cls,
 	taskId,
 	project: "ottr",
@@ -412,5 +424,15 @@ describe("normalizeSeen", () => {
 		expect(out).toHaveLength(5000);
 		expect(out[0]).toBe("k2");
 		expect(out.at(-1)).toBe("k5001");
+	});
+});
+
+describe("shortKey", () => {
+	test("short bodies stay readable; long ones hash under the seen limit, stable per body", () => {
+		expect(shortKey("crit", "boom")).toBe("crit:boom");
+		const long = shortKey("crit", "e".repeat(5000));
+		expect(long.length).toBeLessThan(40);
+		expect(long).toBe(shortKey("crit", "e".repeat(5000)));
+		expect(long).not.toBe(shortKey("crit", "f".repeat(5000)));
 	});
 });
