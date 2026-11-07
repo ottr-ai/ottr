@@ -418,6 +418,25 @@ describe("reviewPrompt", () => {
 		expect(release).not.toContain(fullRun);
 	});
 
+	test("both review kinds name the ui-ux-check skill", () => {
+		const review = reviewPrompt({
+			target: "main",
+			sha: "abc1234",
+			from: "def5678",
+			commits: 3,
+		});
+		const release = releasePrompt({
+			version: "v1.2.3",
+			from: "v1.2.2",
+			sha: "abc1234",
+			commits: 3,
+			notes: "- fix",
+		});
+		// Contract check: every review kind runs the UI/UX check; the wording stays unpinned.
+		expect(review).toContain("ui-ux-check skill");
+		expect(release).toContain("ui-ux-check skill");
+	});
+
 	test("the review records ranked findings instead of filing cards", () => {
 		const prompt = reviewPrompt({
 			target: "main",

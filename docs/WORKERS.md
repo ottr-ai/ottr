@@ -13,8 +13,8 @@ layers under `/root/.alate` ([The agent layers](#the-agent-layers)), and runs
 chrome-devtools there headless, isolated and without Chrome's sandbox (workers run as
 root). Skill folders are statically scanned for prompt injection, exfiltration,
 credential harvesting, and supply-chain risk (NVIDIA SkillSpector, static mode) before
-Alate provisions them from your data repo. Release reviews need the `security-audit` skill of this layer. On a runner without
-the skill, the review stops with needs_you. curl serves the impeccable skill of this layer:
+Alate provisions them from your data repo. Release reviews need the `security-audit` and `ui-ux-check` skills of this layer. On a runner without
+a skill, the review stops with needs_you. curl serves the impeccable skill of this layer:
 its launcher downloads the engine that a skill update needs. Every Node process preloads
 `src/stryker-tap.cjs` (`NODE_OPTIONS`): in a `stryker run`, it copies the output to
 `/tmp/ottr-stryker-<pid>.log`, so the running card shows the progress of a mutation run
