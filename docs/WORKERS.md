@@ -418,6 +418,12 @@ the classic workers. The decision and the comparison with Kata Containers and gV
 in [ADR 0009](adr/0009-microvm-workers.md). The classic pool stays the default, and every
 project without the setting keeps it.
 
+**Experimental.** No Firecracker boot has run yet on a Linux host with `/dev/kvm`: the
+guest kernel, the overlay root, the iptables rules, the OOM behaviour, session resume and
+the restart re-bind are covered only by unit tests with a fake launcher. Treat the mode as
+experimental until the KVM acceptance runs and the performance numbers are recorded in
+ADR 0009.
+
 Only work turns whose cwd is the card's own worktree go to a VM. Interview, grill and
 trending turns of the same project run in the main checkout and stay on the classic pool.
 Merge, retro, board check, work and review checks, release publish and fork analysis stay

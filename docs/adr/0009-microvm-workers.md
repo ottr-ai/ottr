@@ -4,7 +4,10 @@ Date: 2026-11-07
 
 ## Status
 
-accepted
+accepted — experimental: no Firecracker boot has run yet on a Linux host with `/dev/kvm`.
+The backend stays marked experimental until the KVM acceptance runs (end-to-end turn,
+network isolation, OOM kill, session resume, restart re-bind, busy queueing, layer rebuild)
+and the performance numbers are recorded in this ADR.
 
 ## Context
 
