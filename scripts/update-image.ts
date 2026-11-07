@@ -752,6 +752,27 @@ async function buildAndSidecars(
 	return null;
 }
 
+/**
+ * The microVM runner (compose profile `vm`) builds another target of the same
+ * Dockerfile under its own image name, so the server build above leaves it on its old
+ * image, and its compare would never see a change. It builds only where it runs: a
+ * host without the profile never fetches Firecracker and the guest kernel.
+ */
+async function buildVmRunner(
+	d: Deps,
+	compose: string[],
+	services: string[],
+	stop: (why: string) => number,
+): Promise<number | null> {
+	if (!services.includes("vm-runner")) return null;
+	const build = await d.docker("compose", ...compose, "build", "vm-runner");
+	if (build.code === 0) return null;
+	d.log(build.out.trim().split("\n").slice(-10).join("\n"));
+	return stop(
+		"the vm-runner image does not build; the stack keeps the old one",
+	);
+}
+
 /** One ps of the running services; a ps that fails stops the run (fails closed). */
 async function runningServices(
 	d: Deps,
@@ -1569,6 +1590,8 @@ export async function updateImage(
 	const services = await runningServices(d, compose, stop);
 	if (typeof services === "number") return services;
 	const serverWasRunning = services.includes("server");
+	const vmBuilt = await buildVmRunner(d, compose, services, stop);
+	if (vmBuilt !== null) return vmBuilt;
 
 	const seed = await seedBoard(d, compose, repo, env, serverWasRunning);
 

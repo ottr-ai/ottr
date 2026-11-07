@@ -65,3 +65,4 @@ existing number plus one.
 | 0006 | Dependency licenses are allowlisted | accepted |
 | 0007 | The merge target is a project setting | accepted |
 | 0008 | PR mode is a per-project choice | accepted |
+| 0009 | Work turns can run in a Firecracker microVM per turn | accepted |

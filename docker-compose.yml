@@ -22,7 +22,7 @@ x-worker: &worker
   init: true
   # `up -d --wait <worker>` (the rolling update) waits for this: the worker answers its
   # own GET /healthz, so a recreated worker counts as done only when it is connected.
-  healthcheck:
+  healthcheck: &worker-healthcheck
     test:
       - CMD
       - bun
@@ -149,6 +149,11 @@ services:
       # volume, which no worker mounts. /data and /root are worker-mounted, so never there.
       OTTR_SSH_DIR: /app/.tasks/ssh
       OTTR_WORKER_URLS: http://worker-a:8787,http://worker-b:8787
+      # The microVM runner (the `vm` profile below): empty keeps every turn on the classic
+      # workers, and the board holds the work turns of a project with microVMs on (the
+      # card waits) instead of running them in a shared container. Set it to
+      # http://vm-runner:8787 when the profile runs (COMPOSE_PROFILES=vm in the env file).
+      OTTR_VM_RUNNER_URL: ${OTTR_VM_RUNNER_URL:-}
       OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
       PORT: ${OTTR_PORT:-8080}
       # Where turns file cards (create_task). Loopback in a worker is the worker itself; the
@@ -220,6 +225,61 @@ services:
     # Copy-paste this block for worker-c..h and add each to OTTR_WORKER_URLS.
     # Do NOT use `compose --scale`: round-robin DNS breaks cancel routing —
     # per-run addressability requires stable per-worker names.
+
+  # The microVM runner (OTTR-532): runs every work turn of a project with microVMs on
+  # (Settings) in its own Firecracker microVM, so a turn sees its own clone and nothing of
+  # the other projects, the shared home or the credentials. It speaks the worker protocol
+  # to the board at http://vm-runner:8787 (server env OTTR_VM_RUNNER_URL). Off unless the
+  # env file sets COMPOSE_PROFILES=vm (also what scripts/update-image.ts needs to build and
+  # roll it); the host needs /dev/kvm (bare metal, a KVM VM with nested virtualisation, or
+  # WSL2 with nestedVirtualization). Its image is the worker image plus Firecracker and the
+  # guest kernel (Dockerfile.worker, target vm-runner), and the guests boot from its root.
+  vm-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      target: vm-runner
+      args:
+        OTTR_VERSION: ${OTTR_VERSION:-}
+    image: ${OTTR_VM_IMAGE:-ottr-vm-runner:local}
+    profiles: [vm]
+    restart: always
+    init: true # reaps the firecracker processes and the image tools it runs, as on the workers
+    logging: *logging
+    healthcheck: *worker-healthcheck
+    # Guest memory is firecracker's own memory, counted in this container: the limit must
+    # cover OTTR_VM_MAX x OTTR_VM_MEM (2 x 8g by default) plus the runner and its disk
+    # builds, or the kernel kills a VM mid-turn. Raise it with either value.
+    mem_limit: ${OTTR_VM_RUNNER_MEM_LIMIT:-20g}
+    # The only privileges it gets, no `privileged`:
+    devices:
+      - /dev/kvm # firecracker runs each guest on KVM
+      - /dev/net/tun # one tap device per VM, its only network link
+    cap_add:
+      # Creates the taps and their addresses, and the iptables rules that let a VM reach
+      # the board and the internet but no other compose service, VM or this runner's API.
+      - NET_ADMIN
+    sysctls:
+      # Routes VM traffic out through this container. A per-container (netns) setting:
+      # the host's own forwarding stays as it is. /proc/sys is read-only in here.
+      net.ipv4.ip_forward: "1"
+    # No workspace, no credential mounts: a VM clones its branch from the board's git
+    # endpoint and reaches providers through the board's /llm proxy.
+    volumes:
+      - ottr-data:/data # copies a turn's task data in and its new files back out
+      - home:/root:ro # project package and tool lists, the pinned agent layer (read only)
+      - vm-state:/var/lib/ottr-vm # base rootfs, project layers, scratch disks: large
+    environment:
+      # The same server-to-worker auth as the workers (x-otwr-token on every call).
+      OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
+      # VMs at once; one more /run answers 503 busy, and the card waits for a free slot.
+      OTTR_VM_MAX: ${OTTR_VM_MAX:-2}
+      OTTR_VM_VCPUS: ${OTTR_VM_VCPUS:-2}
+      OTTR_VM_MEM: ${OTTR_VM_MEM:-8g} # per VM: 8g, 8192m or bytes
+      OTTR_VM_DISK: ${OTTR_VM_DISK:-20g} # per VM scratch disk (sparse)
+      # The board's compose name: the VM's /etc/hosts maps it to the board's address, so
+      # OTTR_BOARD_URL (http://ottr:<port>) works unchanged inside the VM.
+      OTTR_VM_BOARD_HOST: ottr
 
   # R5-1 trusted seed of the board-config volume: a one-off of the Alate image. It restores
   # the user layer from the data repo with the same SkillSpector scan as worker provisioning
@@ -311,3 +371,4 @@ volumes:
   ottr-data:
   board-config:
   alate-state:
+  vm-state:

@@ -5361,6 +5361,14 @@ export function ProjectSettingsForm({
 							act={act}
 						/>
 						<CheckRow
+							name="Run work turns in microVMs"
+							desc={`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${st.microVm ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`}
+							checked={st.microVm}
+							disabled={!project.vmRunner.ok && !st.microVm}
+							save={(v) => send({ microVm: v })}
+							act={act}
+						/>
+						<CheckRow
 							name="Push sync commits"
 							desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
 							checked={st.pushSyncCommits}

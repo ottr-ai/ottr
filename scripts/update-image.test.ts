@@ -90,6 +90,8 @@ function fakes(
 		sidecarBuild?: number;
 		/** Exit code of the sidecar's own restart (`up --no-deps`). */
 		sidecarUp?: number;
+		/** Exit code of the vm-runner's own build (`build vm-runner`). */
+		vmBuild?: number;
 		/** Exit code of `compose images` (the image comparison's first step). */
 		imagesCode?: number;
 		/** The seed commit the server volume records (the `cat` exec's output). */
@@ -265,8 +267,13 @@ function fakes(
 					code:
 						args.at(-1) === o.sidecar?.name
 							? (o.sidecarBuild ?? 0)
-							: (o.build ?? 0),
-					out: "",
+							: args.at(-1) === "vm-runner"
+								? (o.vmBuild ?? 0)
+								: (o.build ?? 0),
+					out:
+						args.at(-1) === "vm-runner" && o.vmBuild
+							? "kvm build failed\n"
+							: "",
 				};
 			}
 			if (args.includes("ps"))
@@ -2573,6 +2580,74 @@ describe("rolling restart", () => {
 		// skips the wait instead of stopping on a probe that cannot succeed.
 		expect(f.calls).not.toContain(HEALTH);
 		expect(f.calls).toContain(UP_SVC("worker-a"));
+	}, 60_000);
+
+	/** A GET /api/drain answer with the microVM runner and its turn count. */
+	const vmBoard = (turns: number) =>
+		JSON.stringify({
+			drainUntil: null,
+			drainCommits: null,
+			preparing: 0,
+			runners: [
+				{ id: "vm-runner", url: "http://vm-runner:8787", until: null, turns },
+				{ id: "local", url: null, until: null, turns: 0 },
+			],
+		});
+	const VM_BUILD = "compose -f c.yml build vm-runner";
+
+	test("a running vm-runner builds its own target before the compare, rolls like a worker, and detaches in its own container", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// Idle when it rolls; a VM turn starts before the server step's fresh read.
+		const f = fakes({
+			newImage: true,
+			running: "server\nvm-runner",
+			gets: [vmBoard(0), vmBoard(1)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			BUILD,
+			CFGJSON,
+			PS,
+			// The server build leaves the vm-runner image untouched: without its own
+			// build the compare below reads its old image and it never rolls.
+			VM_BUILD,
+			GET,
+			...COMPARE_SVC("vm-runner"),
+			HOLD,
+			DETACHED_SVC("vm-runner"),
+			UP_SVC("vm-runner"),
+			HEALTH,
+			FREE,
+			...COMPARE_SVC("server"),
+			HOLD,
+			GET,
+			HOLD,
+			DETACH_SVC("vm-runner"),
+			UP_SVC("server"),
+			UP,
+			DEPLOYED(main),
+			PRUNE,
+		]);
+		expect(postBody(f, 0)).toEqual({ runner: "vm-runner" });
+		expect(postBody(f, 2)).toEqual({ runner: "vm-runner" });
+	}, 60_000);
+
+	test("a vm-runner image that does not build stops the run before any hold or recreate", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({
+			newImage: true,
+			running: "server\nvm-runner",
+			vmBuild: 1,
+			gets: [vmBoard(0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
+		expect(f.calls).toEqual([BUILD, CFGJSON, PS, VM_BUILD]);
+		expect(f.logs).toContain("kvm build failed");
+		expect(f.logs).toContain(
+			"stopped: the vm-runner image does not build; the stack keeps the old one",
+		);
 	}, 60_000);
 
 	test("a failed seed-only restart stops the run", async () => {

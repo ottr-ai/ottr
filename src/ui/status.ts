@@ -198,6 +198,7 @@ export function holdFor(
 		"id" | "stage" | "state" | "dependsOn" | "pushRetries" | "pendingBy"
 	> & {
 		pushHold?: boolean;
+		vmHold?: string;
 	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
 ): string | null {
@@ -207,7 +208,9 @@ export function holdFor(
 			mergeHold(tasks, t) ?? (t.pushHold === true ? PUSH_HOLD : null);
 		if (held !== null) return held;
 	}
-	return depHold(tasks, t);
+	// A card waiting on its dependencies would not dispatch even with a free microVM, so the
+	// dependency hold names the real blocker first; the server stamps vmHold on queued cards.
+	return depHold(tasks, t) ?? t.vmHold ?? null;
 }
 
 /** The release card's re-release view, else null: parked for the user (needs_you or idle, not

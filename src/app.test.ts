@@ -86,6 +86,8 @@ import {
 	type Task,
 } from "./types.ts";
 import { loadSkips } from "./updates.ts";
+import { vmState } from "./vmState.ts";
+import { VmTokens } from "./vmTokens.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import { git, gitSecrets, networkGitAuth } from "./worktree.ts";
 
@@ -222,6 +224,8 @@ const shared = {
 };
 // Compose turns reach the board at OTTR_BOARD_URL, a host no allowlist covers ("turns' own host").
 const BOARD_TOKEN = "boot-token-test";
+// One VM token store for the app under test, as server.ts creates it (OTTR-532).
+const vmTokens = new VmTokens({ file: null });
 type CancelOutcome = { kept: string } | { removed: true };
 type FinishKeptOutcome =
 	| { ok: true }
@@ -276,6 +280,7 @@ const app = createApp({
 	shared,
 	serverRef: { current: undefined },
 	board: { url: "http://ottr:4852", token: BOARD_TOKEN },
+	vmTokens,
 });
 const server = Bun.serve({ port: 0, ...app.serveOptions });
 app.serverRef.current = server;
@@ -5683,6 +5688,43 @@ describe("turns' own host", () => {
 		expect(store.getTrendingVerdict("turn/host")?.verdict).toBe("deferred");
 		store.updateTask(scout.id, { cancelledAt: Date.now() });
 	});
+
+	test("a microVM turn's token files cards in its own project only, and opens its proxies", async () => {
+		const grant = {
+			project: "p1",
+			taskId: "P1-9",
+			branch: "ott/p1-9",
+			repoPath: projectDir,
+			worktree: join(projectDir, ".worktrees", "P1-9"),
+		};
+		const vm = vmTokens.issue(grant);
+		const other = vmTokens.issue({ ...grant, project: "p2" });
+		const card = { prompt: "found inside a VM" };
+		const file = (token: string) =>
+			post("/api/projects/p1/tasks", card, asTurn(token));
+		expect((await file(vm)).status).toBe(200);
+		// Another project's token, a trending verdict and any other route stay shut.
+		expect((await file(other)).status).toBe(403);
+		expect(
+			(await post("/api/projects/p1/trending/verdicts", {}, asTurn(vm))).status,
+		).toBe(403);
+		expect((await post("/api/settings/api-key", {}, asTurn(vm))).status).toBe(
+			403,
+		);
+		// The VM routes sit outside api(): the token, not a session, opens them.
+		const llm = (headers: Record<string, string>) =>
+			fetch(new URL("/llm/v1/models", server.url), { headers });
+		expect((await llm({})).status).toBe(401);
+		// No gateway in this app: a live token reaches the 503, not the auth wall.
+		expect((await llm({ authorization: `Bearer ${vm}` })).status).toBe(503);
+		const refs = await fetch(
+			new URL("/git/p1.git/info/refs?service=git-upload-pack", server.url),
+		);
+		expect(refs.status).toBe(401);
+		vmTokens.revoke(vm);
+		expect((await file(vm)).status).toBe(401);
+		vmTokens.revoke(other);
+	});
 });
 
 describe("readJson bounds untrusted bodies (R1-2)", () => {
@@ -8815,6 +8857,40 @@ describe("PR review routes", () => {
 		expect(store.getSettings().issueWatchSince ?? 0).toBeGreaterThanOrEqual(
 			again,
 		);
+	});
+
+	test("project settings route turns microVm on only with a reachable vm-runner", async () => {
+		const saved = vmState.health;
+		try {
+			const bad = await post("/api/projects/p1/settings", { microVm: 1 });
+			expect(bad.status).toBe(400);
+			expect(await errorOf(bad)).toBe("microVm must be a boolean");
+			vmState.health = {
+				configured: true,
+				ok: false,
+				reason: "healthz answered 502",
+			};
+			const down = await post("/api/projects/p1/settings", { microVm: true });
+			expect(down.status).toBe(400);
+			expect(await errorOf(down)).toBe(
+				"microVm needs a reachable vm-runner: healthz answered 502",
+			);
+			expect(store.getSettings().microVm).toBe(false);
+			vmState.health = { configured: true, ok: true, reason: null };
+			const ok = await post("/api/projects/p1/settings", { microVm: true });
+			expect(ok.status).toBe(200);
+			expect(store.getSettings().microVm).toBe(true);
+			// The view carries the probe so the form can disable the toggle.
+			const view = (await ok.json()) as { vmRunner: { ok: boolean } };
+			expect(view.vmRunner.ok).toBe(true);
+			// Turning it off always saves, even with the runner down.
+			vmState.health = saved;
+			const off = await post("/api/projects/p1/settings", { microVm: false });
+			expect(off.status).toBe(200);
+			expect(store.getSettings().microVm).toBe(false);
+		} finally {
+			vmState.health = saved;
+		}
 	});
 
 	test("prs/check refuses an unknown project and one without a GitHub remote", async () => {

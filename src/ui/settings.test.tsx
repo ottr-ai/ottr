@@ -457,6 +457,11 @@ describe("ProjectSettingsForm target branch", () => {
 		icon: null,
 		remote: null,
 		github: null,
+		vmRunner: {
+			configured: false,
+			ok: false,
+			reason: "OTTR_VM_RUNNER_URL is not set",
+		},
 		hasRules: true,
 		gitless: false,
 		settings: {
@@ -476,6 +481,7 @@ describe("ProjectSettingsForm target branch", () => {
 			forkResearch: false,
 			prReviews: false,
 			prMode: false,
+			microVm: false,
 			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
@@ -692,6 +698,11 @@ describe("ProjectSettingsForm icon text marker", () => {
 		icon: null,
 		remote: "https://github.com/octo/repo",
 		github: "https://github.com/octo/repo",
+		vmRunner: {
+			configured: false,
+			ok: false,
+			reason: "OTTR_VM_RUNNER_URL is not set",
+		},
 		hasRules: true,
 		gitless: false,
 		settings: {
@@ -712,6 +723,7 @@ describe("ProjectSettingsForm icon text marker", () => {
 			forkResearch: false,
 			prReviews: false,
 			prMode: false,
+			microVm: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -1063,6 +1075,11 @@ describe("ProjectSettingsForm review counter", () => {
 			icon: null,
 			remote: null,
 			github,
+			vmRunner: {
+				configured: false,
+				ok: false,
+				reason: "OTTR_VM_RUNNER_URL is not set",
+			},
 			hasRules: true,
 			gitless: false,
 			archReview,
@@ -1083,6 +1100,7 @@ describe("ProjectSettingsForm review counter", () => {
 				forkResearch: false,
 				prReviews: false,
 				prMode: false,
+				microVm: false,
 				setupChecklist: false,
 				targetBranch: null,
 				originUrl: null,
@@ -1870,12 +1888,22 @@ describe("GitHostsSection board GitHub token reuse", () => {
 	});
 	describe("ProjectSettingsForm PR mode", () => {
 		/** A project fixture with a settable GitHub remote and PR mode state. */
-		const projectWith = (github: string | null, prMode: boolean): ProjectView =>
+		const projectWith = (
+			github: string | null,
+			prMode: boolean,
+			microVm = false,
+			vmRunner: ProjectView["vmRunner"] = {
+				configured: true,
+				ok: true,
+				reason: null,
+			},
+		): ProjectView =>
 			({
 				name: "proj",
 				icon: null,
 				remote: github,
 				github,
+				vmRunner,
 				hasRules: true,
 				gitless: false,
 				archReviewCap: 30,
@@ -1896,6 +1924,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 					forkResearch: false,
 					prReviews: false,
 					prMode,
+					microVm,
 					setupChecklist: false,
 					targetBranch: null,
 					originUrl: null,
@@ -2033,6 +2062,103 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				expect(input.disabled).toBe(false);
 			} finally {
 				await unmount();
+			}
+		});
+
+		/** The microVM checkbox, through its row label (htmlFor), like prModeRow. */
+		const microVmRow = (container: HTMLDivElement) => {
+			const label = [...container.querySelectorAll("label")].find((l) =>
+				l.textContent?.includes("Run work turns in microVMs"),
+			);
+			if (label === undefined) throw new Error("microVM row missing");
+			const input = container.querySelector<HTMLInputElement>(
+				`input[id="${label.htmlFor}"]`,
+			);
+			if (input === null) throw new Error("microVM checkbox did not render");
+			return input;
+		};
+
+		test("microVM row toggles post microVm true and false while vm-runner is up", async () => {
+			const posts: (Record<string, unknown> | undefined)[] = [];
+			const project = projectWith(null, false);
+			const { container, unmount } = await mount(
+				project,
+				fetchMockFor(project, (body) => posts.push(body)),
+			);
+			try {
+				const input = microVmRow(container);
+				expect(input.checked).toBe(false);
+				expect(input.disabled).toBe(false);
+				expect(container.textContent).not.toContain("vm-runner is not ready");
+				await act(async () => {
+					onChangeOf(input)({
+						target: { checked: true },
+						currentTarget: input,
+					});
+				});
+				expect(posts[0]).toEqual({ microVm: true });
+				await act(async () => {
+					onChangeOf(input)({
+						target: { checked: false },
+						currentTarget: input,
+					});
+				});
+				expect(posts[1]).toEqual({ microVm: false });
+			} finally {
+				await unmount();
+			}
+		});
+		test("an unreachable vm-runner disables the off row and names the reason", async () => {
+			const project = projectWith(null, false, false, {
+				configured: true,
+				ok: false,
+				reason: "healthz answered 502",
+			});
+			const { container, unmount } = await mount(
+				project,
+				fetchMockFor(project, () => {}),
+			);
+			try {
+				const input = microVmRow(container);
+				expect(input.disabled).toBe(true);
+				expect(container.textContent).toContain(
+					"vm-runner is not ready (healthz answered 502). Each work turn runs",
+				);
+			} finally {
+				await unmount();
+			}
+		});
+		test("an unconfigured vm-runner names the env var; saved on keeps the row enabled", async () => {
+			const down = {
+				configured: false,
+				ok: false,
+				reason: "OTTR_VM_RUNNER_URL is not set",
+			};
+			const off = projectWith(null, false, false, down);
+			const first = await mount(
+				off,
+				fetchMockFor(off, () => {}),
+			);
+			try {
+				expect(microVmRow(first.container).disabled).toBe(true);
+				expect(first.container.textContent).toContain(
+					"Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). ",
+				);
+			} finally {
+				await first.unmount();
+			}
+			// Already on: the row stays enabled so the user can turn it off.
+			const on = projectWith(null, false, true, down);
+			const second = await mount(
+				on,
+				fetchMockFor(on, () => {}),
+			);
+			try {
+				const input = microVmRow(second.container);
+				expect(input.checked).toBe(true);
+				expect(input.disabled).toBe(false);
+			} finally {
+				await second.unmount();
 			}
 		});
 	});

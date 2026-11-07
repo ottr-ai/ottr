@@ -533,6 +533,27 @@ test("holdFor names the stamped push hold, only on the held card", () => {
 	).toBeNull();
 });
 
+test("holdFor shows the stamped microVM hold, after an unfinished dependency", () => {
+	const queued = card({
+		id: "c1",
+		stage: "todo",
+		state: "queued",
+		needsReason: null,
+		pendingPrompt: null,
+		vmHold: "waiting for a free microVM",
+	});
+	expect(holdFor(queued, [])).toBe("waiting for a free microVM");
+	expect(statusLine(queued, true, holdFor(queued, []))).toBe(
+		"waiting for a free microVM",
+	);
+	// The dependency is the real blocker: a free microVM would not start the card.
+	const dep = card({ id: "d1", title: "schema", stage: "todo" });
+	const blocked = { ...queued, dependsOn: ["d1"] };
+	expect(holdFor(blocked, [dep, blocked])).toBe("waiting for #d1 schema");
+	// A done card is never held, stamp or not.
+	expect(holdFor({ ...queued, stage: "done" }, [])).toBeNull();
+});
+
 test("etaLeft gives the mutation-run style estimate until the median is used up", () => {
 	const started = 1790683200000;
 	// 4 minutes of median, 1 minute in: about 3m left.

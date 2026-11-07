@@ -61,6 +61,7 @@ import {
 	MODEL_RESTORE,
 	rejectedReport,
 	resumePlan,
+	WORKER_BUSY,
 } from "./runner.ts";
 import {
 	applyCheckVerdicts,
@@ -115,6 +116,8 @@ import {
 	recommendsSteps,
 	UPDATE_HOLD_REASON,
 } from "./types.ts";
+import { vmState } from "./vmState.ts";
+import type { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun } from "./workers.ts";
 
 import type {
@@ -158,6 +161,34 @@ import {
 
 /** Park reasons the approving reply recognizes and the drawer's hold action bar keys on. */
 export { FORK_HOLD_REASON, MERGE_HOLD_MISMATCH_REASON, UPDATE_HOLD_REASON };
+
+/** How long a card whose dispatch vm-runner refused as busy waits before the next try: the
+ * busy settle's own schedule() call would otherwise re-dispatch in a tight loop. */
+export const VM_BUSY_RETRY_MS = 10_000;
+
+/**
+ * OTTR-532: true when the turn runs in a microVM. Only a project with microVM mode on, and
+ * only a turn that would reach a worker by today's rules (no merge, retro or board check)
+ * whose cwd is the card's own worktree: interview, grill (backlog) and trending turns run in
+ * the main checkout, which no VM holds, so they keep the classic pool.
+ */
+export function microVmTurn(o: {
+	microVm: boolean;
+	kind: TurnKind;
+	retro: boolean;
+	boardCheck: boolean;
+	task: Pick<Task, "kind" | "stage">;
+}): boolean {
+	return (
+		o.microVm &&
+		o.kind !== "merge" &&
+		!o.retro &&
+		!o.boardCheck &&
+		o.task.kind !== "interview" &&
+		o.task.kind !== "trending" &&
+		o.task.stage !== "backlog"
+	);
+}
 
 /** Deadline for the prepare-phase titler; surfaced verbatim as the failure cause. */
 const TITLE_TIMEOUT_MS = 30_000;
@@ -565,6 +596,13 @@ export interface TurnOps {
 	pidAlive: typeof pidAlive;
 	/** Parsed once at boot from OTTR_WORKER_URLS; null = local spawn. Merge turns never use it (D6). */
 	workerTarget?: WorkerTarget | null;
+	/** OTTR-532: parsed once at boot from OTTR_VM_RUNNER_URL; null = no microVM runner. A
+	 * microVM project's eligible turns go here only, never to workerTarget or the server. */
+	vmTarget?: WorkerTarget | null;
+	/** OTTR-532: the board's one per-turn VM token store; startRun issues, settle revokes. */
+	vmTokens?: VmTokens;
+	/** OTTR-532: resets the server worktree to the head a microVM pushed (src/gitHttp.ts). */
+	syncWorktreeTo?: (worktree: string, sha: string) => Promise<void>;
 	/** OTTR-454: asks a worker for the runs its restart detached; absent (tests, local spawn) keeps the re-bind off. */
 	detachedRuns?: (url: string, token: string) => Promise<DetachedRun[]>;
 	/** OTTR-454: kills a detached run on its worker (/detach/kill). */
@@ -628,6 +666,39 @@ function signInNeedsReason(
 // ponytail: module-level notify hook so exported appendLog keeps its 3-arg
 // signature for server.ts call sites; one loop per process sets it.
 let notifyHook: (project: string, id: string) => void = () => {};
+
+/**
+ * OTTR-532: writes a microVM turn's handed-back files into the server worktree. Only
+ * `research-report.md` and paths under `shots/` are accepted: relative, no `..` segment, and
+ * written through writeBelow, which refuses a symlink at the file or any parent. Anything else
+ * is skipped and logged.
+ */
+export function writeVmFiles(
+	worktree: string,
+	files: readonly { path: string; b64: string }[],
+	log: (line: string) => void,
+): void {
+	for (const f of files) {
+		const segs = f.path.split("/");
+		const allowed =
+			!f.path.includes("\\") &&
+			!segs.some((s) => s === ".." || s === "." || s === "") &&
+			(f.path === RESEARCH_REPORT || (segs[0] === "shots" && segs.length > 1));
+		if (!allowed) {
+			log(`! microVM: refusing handed-back file ${JSON.stringify(f.path)}`);
+			continue;
+		}
+		try {
+			writeBelow(
+				worktree,
+				join(worktree, ...segs),
+				Buffer.from(f.b64, "base64"),
+			);
+		} catch (err) {
+			log(`! microVM: writing ${f.path} failed: ${errmsg(err)}`);
+		}
+	}
+}
 
 export function appendLog(store: ProjectStore, id: string, line: string): void {
 	writeBelow(store.dataRoot, store.logPath(id), `${line}\n`, "append");
@@ -873,22 +944,40 @@ export function createTurnLoop(
 	 * one and cancel kills it; nothing persists, so a server restart re-registers them from the
 	 * workers' answers in recoverRestarted. */
 	const detached = new Map<string, { url: string; runId: string }>();
+	/** OTTR-532: "project/id" → when vm-runner last refused the card's dispatch as busy; the
+	 * pre-claim gate waits VM_BUSY_RETRY_MS before the next try. Cleared by the next dispatch
+	 * vm-runner takes (with the card's vmState.busy mark). */
+	const vmBusyAt = new Map<string, number>();
 
-	/** Asks every configured worker for its detached runs and returns the one whose cwd matches
-	 * the card's worktree, or null: no ops wiring, no worktree, no match anywhere, or a worker
-	 * that cannot be reached (a probe failure is swallowed per worker). */
+	/** The worker token for a runner url: vm-runner's own target when the url is the microVM
+	 * runner's, else the worker pool's (compose shares one OTTR_WORKER_TOKEN, but a board with
+	 * only a microVM runner has no worker pool to read it from). */
+	function runnerToken(url: string): string | undefined {
+		return ops.vmTarget?.urls.includes(url)
+			? ops.vmTarget.token
+			: ops.workerTarget?.token;
+	}
+
+	/** Asks every configured worker (and the microVM runner, whose VM turns detach the same way)
+	 * for its detached runs and returns the one whose cwd matches the card's worktree, or null:
+	 * no ops wiring, no worktree, no match anywhere, or a runner that cannot be reached (a probe
+	 * failure is swallowed per runner). */
 	async function matchDetached(
 		worktree: string | null,
 	): Promise<{ run: DetachedRun; url: string } | null> {
 		// ponytail: recoverRestarted re-checks ops.detachedRuns before calling, so mutants
 		// firing only while the op is absent cannot change the outcome here.
-		if (!ops.detachedRuns || !ops.workerTarget || worktree === null)
+		const urls = [
+			...(ops.workerTarget?.urls ?? []),
+			...(ops.vmTarget?.urls ?? []),
+		];
+		if (!ops.detachedRuns || urls.length === 0 || worktree === null)
 			return null;
-		for (const url of ops.workerTarget.urls) {
+		for (const url of urls) {
 			// ponytail: token is string|undefined so ?? equals ||, and the catch's []
 			// contents carry no cwd — neither mutant can change which run matches.
 			const runs = await ops
-				.detachedRuns(url, ops.workerTarget.token ?? "")
+				.detachedRuns(url, runnerToken(url) ?? "")
 				.catch(() => []);
 			const run = runs.find((r) => r.cwd === worktree);
 			if (run) return { run, url };
@@ -938,6 +1027,10 @@ export function createTurnLoop(
 				exitCode: null,
 				error,
 			});
+		// The settle ends the card's microVM turn (lost, or a re-bound detached run that
+		// finished): its VM must not push or reach /llm any more. Before the requeue below, so
+		// the next turn's fresh token is never caught by this sweep.
+		ops.vmTokens?.revokeTask(e.name, t.id);
 		// A cancel that landed while the run hung already owns the card's state.
 		const cur = store.getTask(t.id);
 		if (!cur || cur.cancelledAt !== null) return;
@@ -1129,7 +1222,7 @@ export function createTurnLoop(
 			// ponytail: a watcher exists only because workerTarget answered at recovery, so
 			// the optional chain cannot see null, and ?? equals || for string|undefined.
 			const runs = await ops
-				.detachedRuns(watch.url, ops.workerTarget?.token ?? "")
+				.detachedRuns(watch.url, runnerToken(watch.url) ?? "")
 				.catch(() => null);
 			// Probe failure is not proof of a loss: leave the row open and retry next tick.
 			if (runs === null) continue;
@@ -1687,13 +1780,34 @@ export function createTurnLoop(
 		// ponytail: `target !== null` appears here and in the ternary below; either
 		// `true`-replacement alone cannot change the branch (the other check re-derives
 		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
-		const toWorker =
-			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
-		const runnerDrained =
-			toWorker && target !== null
-				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
-				: ops.drainedRunner("local");
-		if (runnerDrained) return;
+		// OTTR-532: an eligible turn of a microVM project goes to vm-runner only. A runner
+		// that is down, unconfigured or drained, or a card whose last dispatch it refused as
+		// busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
+		// it never falls back to the classic pool or the server.
+		const preVm = microVmTurn({
+			microVm: getSettingsLogged(e).microVm === true,
+			kind,
+			retro: preRetro,
+			boardCheck: preBoardCheck,
+			task,
+		});
+		if (preVm) {
+			const vmTarget = ops.vmTarget ?? null;
+			if (vmTarget === null || !vmState.health.ok) return;
+			if (vmTarget.urls.every((u) => ops.drainedRunner(new URL(u).hostname)))
+				return;
+			const busyAt = vmBusyAt.get(key);
+			if (busyAt !== undefined && Date.now() - busyAt < VM_BUSY_RETRY_MS)
+				return;
+		} else {
+			const toWorker =
+				kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+			const runnerDrained =
+				toWorker && target !== null
+					? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
+					: ops.drainedRunner("local");
+			if (runnerDrained) return;
+		}
 		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
 		store.updateTask(id, {
 			state: "preparing",
@@ -2059,14 +2173,29 @@ export function createTurnLoop(
 			// the whole board API, and the turns' host on a worker only files cards.
 			// OTTR-454: drop workers under a per-runner drain so the round-robin only
 			// sees live workers; the empty-list guard sits after stopBeforeRun below.
-			const worker =
-				retroCard || boardCheck || kind === "merge"
+			// OTTR-532: a microVM project's eligible turn (its cwd is the card worktree) goes to
+			// vm-runner and nowhere else; everything else keeps today's routing.
+			const vmTurn =
+				wt !== e.path &&
+				branch !== null &&
+				microVmTurn({
+					microVm: settings.microVm === true,
+					kind,
+					retro: retroCard,
+					boardCheck,
+					task,
+				});
+			const worker = vmTurn
+				? (ops.vmTarget ?? null)
+				: retroCard || boardCheck || kind === "merge"
 					? null
 					: (ops.workerTarget ?? null);
-			// A worker installs the project's packages into its own container; a local run does it here.
-			if (!worker) for (const line of await ops.ensurePackages(name)) log(line);
+			// A worker installs the project's packages into its own container (vm-runner bakes them
+			// into the project layer); a local run does it here.
+			const local = !worker && !vmTurn;
+			if (local) for (const line of await ops.ensurePackages(name)) log(line);
 			const prep =
-				!worker && ops.prepareTurn ? await ops.prepareTurn(name) : null;
+				local && ops.prepareTurn ? await ops.prepareTurn(name) : null;
 			for (const l of prep?.lines ?? []) log(l);
 			// One rule for worker turns: the board lends a token for the model omp runs, and omp runs
 			// that model through an explicit --model, also on a resume. The execution model is the
@@ -2105,9 +2234,18 @@ export function createTurnLoop(
 							),
 							token: worker.token,
 						};
+			if (vmTurn && (worker === null || ops.vmTokens === undefined)) {
+				// Fail closed: never the classic pool or the server for a microVM turn.
+				stopBeforeRun(
+					"MicroVM mode is on for this project, but the board has no microVM runner (OTTR_VM_RUNNER_URL). Set it, or turn microVM mode off, then reply to retry.",
+				);
+				return;
+			}
 			if (liveWorker !== null && liveWorker.urls.length === 0) {
 				stopBeforeRun(
-					"Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
+					vmTurn
+						? "The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry."
+						: "Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
 				);
 				return;
 			}
@@ -2120,7 +2258,12 @@ export function createTurnLoop(
 			// The env values ride the run env into a worker too (the runner forwards them with
 			// the rest of the child env), so every turn gets them and every card log names a
 			// listed name that has no value.
-			const turnEnv = (await ops.turnEnv?.(name, execModel)) ?? {
+			// A microVM turn is lent nothing: its providers go through the board's /llm proxy,
+			// so no provider token may ride its env (a null model lends none).
+			const turnEnv = (await ops.turnEnv?.(
+				name,
+				vmTurn ? null : execModel,
+			)) ?? {
 				env: {},
 				missing: [],
 			};
@@ -2185,7 +2328,23 @@ export function createTurnLoop(
 				resumeId: plan.resumeId,
 				model: runModel,
 				sessionName,
-				worker: liveWorker,
+				worker: vmTurn ? null : liveWorker,
+				vm:
+					vmTurn && liveWorker !== null && ops.vmTokens !== undefined
+						? {
+								target: liveWorker,
+								tokens: ops.vmTokens,
+								grant: {
+									project: name,
+									taskId: id,
+									branch: branch!, // vmTurn requires a branch
+									repoPath: e.path,
+									worktree: wt,
+								},
+								base,
+								boardUrl: ops.board.url,
+							}
+						: null,
 				secrets: turnEnv.secrets,
 				// Retro flags: the retro.yml config sits next to the tracker extension, the
 				// skill is pinned, and the board env is stripped (the proposal files here).
@@ -2250,6 +2409,34 @@ export function createTurnLoop(
 			});
 			entry = handle;
 			running.set(key, entry);
+			if (vmTurn && handle.accepted !== undefined) {
+				// Wait for vm-runner to take the turn before anything records it: a busy answer
+				// must leave the card exactly as it was before the claim (no turn row, the reply
+				// still pending, no lost-worker count). Any other non-start (refused, unreachable,
+				// killed) falls through and settles like today's worker dispatch.
+				const started = await handle.accepted;
+				const early = started ? null : ((await handle.done) as RunResult);
+				if (early?.workerBusy === true) {
+					running.delete(key);
+					vmState.busy.add(key);
+					vmBusyAt.set(key, Date.now());
+					log(
+						`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`,
+					);
+					const cur = store.getTask(id);
+					// A cancel or stop that landed meanwhile owns the card.
+					if (cur && cur.cancelledAt === null && cur.state === "preparing")
+						store.updateTask(id, {
+							state: "queued",
+							needsReason: task.needsReason,
+							asked: task.asked,
+						});
+					ops.publishSoon();
+					return;
+				}
+				vmState.busy.delete(key);
+				vmBusyAt.delete(key);
+			}
 			// Consume only what this turn sends; steering that landed since the build stays queued for the next one.
 			// The column holds the raw parked text (raw, e.g. the dep-hold marker); pending may be the
 			// dispatcher's swap of it, so strip by raw — a mismatched strip would re-steer forever.
@@ -2305,6 +2492,43 @@ export function createTurnLoop(
 			// sweepLostTurns proved the pid dead and settled this turn's row; a late resolution must
 			// not settle again or clobber the card the sweep requeued.
 			if (entry?.abandoned) return;
+			// OTTR-532: a microVM turn's tree lives in the VM. The server worktree follows the
+			// branch tip in the main checkout (the git endpoint already syncs every push; this
+			// covers a push whose sync failed), and the tree state comes from the VM's own report
+			// below. The head the VM reports is a claim, never a reset target: the worktree only
+			// ever moves to the real tip of the card's branch.
+			const vmOut = vmTurn ? (result0.vm ?? null) : null;
+			if (vmOut !== null) {
+				if (vmOut.pushError !== null)
+					log(`! microVM push failed: ${vmOut.pushError}`);
+				const tip =
+					branch === null
+						? null
+						: await ops
+								.targetSha(e.path, `refs/heads/${branch}`)
+								.catch(() => null);
+				if (vmOut.head !== null && tip !== null && vmOut.head !== tip)
+					log(
+						`! microVM: reported head ${vmOut.head} is not the branch tip ${tip}`,
+					);
+				if (tip === null)
+					log(
+						`! microVM: branch ${branch ?? "(none)"} does not resolve; the worktree is not synced`,
+					);
+				else if (ops.syncWorktreeTo) {
+					const syncTo = ops.syncWorktreeTo;
+					const current = await ops.targetSha(wt, "HEAD").catch(() => null);
+					if (current !== tip)
+						await syncTo(wt, tip).catch((err: unknown) =>
+							log(
+								`! microVM: syncing the worktree to ${tip} failed: ${errmsg(err)}`,
+							),
+						);
+				}
+				// Uncommitted files the turn leaves for the board (the research report, shots)
+				// never ride a push: the sentinel carries them, before the report read below.
+				if (vmOut.files) writeVmFiles(wt, vmOut.files, log);
+			}
 			// The agent self-declares research by writing the report file; its presence at settle flips the card.
 			// Sync read: settle must stay within one microtask flush (tests await runTurn or flush microtasks only).
 			// No symlink is followed: a worker could point the file at a server-only secret (OTTR-233).
@@ -2991,7 +3215,13 @@ export function createTurnLoop(
 					interview || grill || scout || fromMain
 						? 0
 						: await ops.commitsAhead(wt, base).catch(() => 0),
-				clean: fromMain ? true : await ops.isClean(wt).catch(() => false),
+				// A microVM's tree is gone with the VM: its end-of-run status report decides,
+				// and a VM that could not report (null) is never clean.
+				clean: fromMain
+					? true
+					: vmOut !== null
+						? vmOut.dirty !== null && vmOut.dirty.length === 0
+						: await ops.isClean(wt).catch(() => false),
 				integrated: fromMain
 					? await ops
 							.branchMergedOrGone(e.path, task.branch ?? "", target)
@@ -3018,6 +3248,7 @@ export function createTurnLoop(
 				grill,
 				target,
 				previousError: store.listTurns(id).at(-2)?.error ?? null,
+				...(vmOut !== null ? { vmDirty: vmOut.dirty } : {}),
 				images: imagePaths.length,
 				http400: () =>
 					findHttp400Rejection({
@@ -4269,6 +4500,10 @@ export function createTurnLoop(
 				state: "needs_you",
 				needsReason: `Tracker error: ${msg}`,
 			});
+			// The turn died in the tracker: no VM of this card may keep pushing on its token
+			// (startRun revokes its own token when its run settles; this covers a throw in
+			// between).
+			ops.vmTokens?.revokeTask(name, id);
 		} finally {
 			// The sweep may have replaced this entry: only drop the map slot this run still owns.
 			if (entry && running.get(key) === entry) running.delete(key);
@@ -4304,7 +4539,7 @@ export function createTurnLoop(
 				// so the optional chain on the token cannot see null here.
 				await ops.killDetached?.(
 					watch.url,
-					ops.workerTarget?.token,
+					runnerToken(watch.url),
 					watch.runId,
 				);
 			} catch (err) {
@@ -4359,7 +4594,7 @@ export function createTurnLoop(
 				// so the optional chain on the token cannot see null here.
 				await ops.killDetached?.(
 					watch.url,
-					ops.workerTarget?.token,
+					runnerToken(watch.url),
 					watch.runId,
 				);
 			} catch (err) {

@@ -42,6 +42,47 @@ export interface WorkerRequest {
 	cwd: string;
 	stdin: string;
 	env: Record<string, string>;
+	/** Set only for a vm-runner dispatch (docs/adr/0009-microvm-workers.md); classic workers
+	 * are never sent one and ignore it. */
+	vm?: VmSpec;
+}
+
+/** What vm-runner needs beyond the classic request to run the turn in a fresh microVM. */
+export interface VmSpec {
+	project: string;
+	taskId: string;
+	/** Task branch, e.g. "ott/ottr-1-x". */
+	branch: string;
+	/** task.base: the ref or sha the branch forked from. */
+	base: string;
+	/** URL the VM uses for the board, e.g. "http://ottr:8080" (OTTR_BOARD_URL). */
+	boardUrl: string;
+	/** Raw per-turn VM token (git, /llm, /hindsight, card filing). */
+	token: string;
+	/** Provider ids routed through the board's /llm proxy (pi-native). */
+	providers: string[];
+	/** true: HINDSIGHT_API_URL=<boardUrl>/hindsight, token = VM token. */
+	hindsight: boolean;
+	/** Pinned agent layer dir on the shared home, e.g. /root/.alate/layers/<id>. */
+	layerDir: string | null;
+	/** Absolute paths under /data/<project>/ (files or dirs) copied in at the same path. */
+	copyIn: string[];
+	/** Absolute dirs under /data/<project>/ whose new/changed files sync back. */
+	copyOut: string[];
+}
+
+/** The microVM's end state of the task branch, carried on the done sentinel. */
+export interface VmOutcome {
+	/** Sha of refs/heads/<branch> the VM last pushed; null = never pushed. */
+	head: string | null;
+	/** Last push failure text. */
+	pushError: string | null;
+	/** `git status --porcelain --untracked-files=all` lines at the end; null = the VM could not report. */
+	dirty: string[] | null;
+	/** Uncommitted files the turn leaves for the board (`research-report.md`, `shots/**`),
+	 * worktree-relative, base64 bytes; absent when there are none. The board writes only those
+	 * two paths into the server worktree. */
+	files?: { path: string; b64: string }[];
 }
 
 /**
@@ -69,7 +110,7 @@ export interface DetachedRun {
 	pid: number | null;
 	running: boolean;
 	startedAt: number;
-	result?: { exitCode: number | null; stderrTail: string };
+	result?: { exitCode: number | null; stderrTail: string; vm?: VmOutcome };
 	killed?: boolean;
 }
 
@@ -439,9 +480,18 @@ export function serveWorker(opts: {
 /** Thrown when the worker is unreachable or answers non-200; the caller settles the run as a lost worker. */
 export class WorkerConnectError extends Error {}
 
-function parseSentinel(
-	line: string,
-): { exitCode: number | null; stderrTail: string; host?: string } | null {
+/**
+ * Thrown when vm-runner answers /run with 503 + `x-ottr-busy: 1` (every OTTR_VM_MAX microVM
+ * taken). Not a WorkerConnectError: nothing ran and nothing is lost, the card just waits.
+ */
+export class WorkerBusyError extends Error {}
+
+function parseSentinel(line: string): {
+	exitCode: number | null;
+	stderrTail: string;
+	host?: string;
+	vm?: VmOutcome;
+} | null {
 	try {
 		const v = JSON.parse(line) as Record<string, unknown>;
 		const done = v[WORKER_DONE] as Record<string, unknown> | undefined;
@@ -457,11 +507,38 @@ function parseSentinel(
 				...(typeof done.host === "string" && done.host !== ""
 					? { host: done.host }
 					: {}),
+				...(isVmOutcome(done.vm) ? { vm: vmOutcome(done.vm) } : {}),
 			};
 	} catch {
 		// not JSON, not the sentinel
 	}
 	return null;
+}
+
+function isVmOutcome(v: unknown): v is VmOutcome {
+	if (typeof v !== "object" || v === null) return false;
+	const o = v as Record<string, unknown>;
+	return (
+		(o.head === null || typeof o.head === "string") &&
+		(o.pushError === null || typeof o.pushError === "string") &&
+		(o.dirty === null ||
+			(Array.isArray(o.dirty) && o.dirty.every((l) => typeof l === "string")))
+	);
+}
+
+/** The outcome with `files` kept only when every entry has a string path and b64. */
+function vmOutcome(v: VmOutcome): VmOutcome {
+	const { files, ...rest } = v as VmOutcome & { files?: unknown };
+	return Array.isArray(files) &&
+		files.every(
+			(f) =>
+				typeof f === "object" &&
+				f !== null &&
+				typeof (f as Record<string, unknown>).path === "string" &&
+				typeof (f as Record<string, unknown>).b64 === "string",
+		)
+		? { ...rest, files: files as { path: string; b64: string }[] }
+		: rest;
 }
 
 /** Round-robin over the target's urls; shared by runWorker and the dispatch log line. */
@@ -474,7 +551,15 @@ export function runWorker(
 	req: WorkerRequest,
 	target: WorkerTarget,
 	sink: RunSink,
-): { url: string; pid: null; done: Promise<RunResult>; kill(): void } {
+): {
+	url: string;
+	pid: null;
+	done: Promise<RunResult>;
+	/** true once the runner answered /run with 200 (the turn started); false when the
+	 * dispatch never started (busy, refused, unreachable, killed first). Never rejects. */
+	accepted: Promise<boolean>;
+	kill(): void;
+} {
 	const url = nextUrl(target);
 	sink.logMark(`worker: dispatching to ${url}\n`);
 	const controller = new AbortController();
@@ -484,12 +569,16 @@ export function runWorker(
 		resolve: resolveDone,
 		reject: rejectDone,
 	} = Promise.withResolvers<RunResult>();
+	const { promise: accepted, resolve: resolveAccepted } =
+		Promise.withResolvers<boolean>();
 	const finish = (r: RunResult): void => {
+		resolveAccepted(false); // no-op once the 200 resolved it true
 		if (settled) return;
 		settled = true;
 		resolveDone(r);
 	};
 	const fail = (e: unknown): void => {
+		resolveAccepted(false);
 		if (settled) return;
 		settled = true;
 		rejectDone(e);
@@ -513,6 +602,10 @@ export function runWorker(
 				// hidden reasoning) must not trip Bun's default 5-minute client idle timer.
 				timeout: false,
 			});
+			if (res.status === 503 && res.headers.get("x-ottr-busy") === "1") {
+				await res.body?.cancel();
+				throw new WorkerBusyError(`worker ${url} is busy`);
+			}
 			if (res.status !== 200) {
 				// The daemon's 500 body ("spawn failed: ...") is the real cause; surface it
 				// instead of only the status. ponytail: capped, the body is one error line.
@@ -525,12 +618,13 @@ export function runWorker(
 		} catch (err) {
 			if (controller.signal.aborted) return; // kill() already settled
 			fail(
-				err instanceof WorkerConnectError
+				err instanceof WorkerConnectError || err instanceof WorkerBusyError
 					? err
 					: new WorkerConnectError(String(err)),
 			);
 			return;
 		}
+		resolveAccepted(true);
 
 		const reader = res.body!.getReader();
 		const dec = new TextDecoder();
@@ -559,6 +653,7 @@ export function runWorker(
 											ranOn: `worker ${new URL(url).hostname} (${sentinel.host})`,
 										}
 									: {}),
+								...(sentinel.vm ? { vm: sentinel.vm } : {}),
 							}),
 						);
 						return;
@@ -591,6 +686,7 @@ export function runWorker(
 		// pid lives in the worker container's namespace; the tracker never sees it.
 		pid: null,
 		done,
+		accepted,
 		kill: () => {
 			if (settled) return;
 			// The daemon's killTree is fire-and-forget: abort and settle now, never wait.

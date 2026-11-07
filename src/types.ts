@@ -1,6 +1,8 @@
 // Shared contract for omp-task-tracker. Every module imports its types from here.
 
 import type { DeadSignIn } from "./login.ts";
+import type { VmRunnerHealth } from "./vmState.ts";
+import type { VmOutcome } from "./workers.ts";
 
 /** Board column. `backlog` parks ideas that are not refined enough to run: the board shows the
  * list under the todo lane below a divider, the scheduler never picks it, and a kicked card runs
@@ -174,6 +176,8 @@ export interface ProjectSettings {
 	prReviews: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
+	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
+	microVm: boolean;
 	/** Weekly trending scout: file a read-only scout card for this project at each GitHub trending scan (off by default). */
 	trendingScout: boolean;
 	/** Hourly issue watch: file each new open GitHub issue as a backlog card and label it ottr-tracked (off by default). */
@@ -567,6 +571,12 @@ export interface RunResult {
 	dispatch?: string;
 	/** Set by the worker client when the worker stream ended without a result and the run was not client-killed; classify turns it into an automatic resume. */
 	workerLost?: boolean;
+	/** Set when vm-runner answered the dispatch busy (all OTTR_VM_MAX microVMs taken): the turn
+	 * never started, so settle puts the card back to queued exactly as before the claim. */
+	workerBusy?: boolean;
+	/** The microVM's end state of the task branch (head it pushed, dirty files); present only
+	 * for a turn that ran in a microVM and reported its sentinel. */
+	vm?: VmOutcome;
 }
 
 /** Git checks the tracker runs in the worktree after a turn. */
@@ -750,6 +760,8 @@ export interface ProjectView {
 	mainUnpushed: boolean;
 	/** HTTPS URL of the project's GitHub remote (origin preferred); null when it has none. */
 	github: string | null;
+	/** Last vm-runner /healthz probe, so the settings form can disable the microVM toggle. */
+	vmRunner: VmRunnerHealth;
 	/** The origin remote sits on a *.ghe.com tenant the configured GitHub host does not name,
 	 * so every GitHub feature stays off: the notice names that tenant, to set under
 	 * Settings → Git hosts → GitHub host. Null when the features are on or the origin is
@@ -854,6 +866,9 @@ export type TaskCard = Omit<
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
 	 * gets no git, so the server derives the fact (pushHold) and stamps it. */
 	pushHold?: boolean;
+	/** Stamped on queued cards of a microVM-mode project while vm-runner holds them back
+	 * (unreachable or busy): the hold text from vmHoldFor. */
+	vmHold?: string;
 	/** Epoch ms the card's live turn started; present only while a turn is running (state "running"). The card ticks the elapsed time from it. */
 	runStartedAt?: number;
 	/** Median wall length (ms) of this card's completed same-project/kind/model turns; present only when at least ETA_MIN_HISTORY (src/perf.ts) completed turns back it. The client counts it down as "about X left" and falls back to elapsed only. */

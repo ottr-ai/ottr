@@ -411,6 +411,186 @@ Workers are copy-paste blocks of the `x-worker` anchor in
 addressability needs stable names. Worker containers are never port-mapped
 to the host.
 
+## microVM workers
+
+A project can run its work turns in a Firecracker microVM, one VM per turn, instead of on
+the classic workers. The decision and the comparison with Kata Containers and gVisor are
+in [ADR 0009](adr/0009-microvm-workers.md). The classic pool stays the default, and every
+project without the setting keeps it.
+
+Only work turns whose cwd is the card's own worktree go to a VM. Interview, grill and
+trending turns of the same project run in the main checkout and stay on the classic pool.
+Merge, retro, board check, work and review checks, release publish and fork analysis stay
+on the server, as for every project.
+
+### Host requirements
+
+- Linux with `/dev/kvm` (hardware virtualization on, or nested virtualization in a cloud
+  VM) and `/dev/net/tun`.
+- Docker with the compose plugin. The Firecracker binary and the guest kernel ship in the
+  image; nothing else is installed on the host.
+- WSL2 without `/dev/kvm` and Podman machines without nested virtualization cannot run
+  it; such a host keeps the classic pool.
+
+### Turn it on
+
+1. Start the runner: `docker compose --profile vm up -d` (or add `vm` to
+   `COMPOSE_PROFILES` in `.env`, so updates keep it).
+2. Set `OTTR_VM_RUNNER_URL=http://vm-runner:8787` on the server (compose env file), then
+   recreate the server. The server talks to `vm-runner` with the same
+   `OTTR_WORKER_TOKEN` as to the workers. With the URL set, the server also starts its
+   own `omp auth-broker serve` and `omp auth-gateway serve` on loopback for the `/llm`
+   proxy.
+3. In the project's **Settings**, turn on **Run work turns in microVMs**. The checkbox
+   stays disabled while `OTTR_VM_RUNNER_URL` is unset or `vm-runner` does not answer its
+   `/healthz`, and its text names the reason.
+
+Runner env (on the `vm-runner` service), with defaults:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OTTR_VM_MAX` | `2` | VMs that run at once; one more turn gets the busy answer |
+| `OTTR_VM_VCPUS` | `2` | vCPUs per VM |
+| `OTTR_VM_MEM` | `8g` | guest RAM per VM (`8g`, `8192m` or bytes) |
+| `OTTR_VM_DISK` | `20g` | size of each VM's scratch disk, the turn's whole writable space |
+| `OTTR_VM_STATE_DIR` | `/var/lib/ottr-vm` | rootfs cache, project layers and scratch disks |
+| `OTTR_VM_KERNEL` | `/opt/ottr-vm/vmlinux` | guest kernel |
+| `OTTR_VM_FIRECRACKER` | `/usr/local/bin/firecracker` | Firecracker binary |
+| `OTTR_VM_BOARD_HOST` | `ottr` | host name of the board; the runner resolves it and lets VMs reach only that address |
+
+`OTTR_WORKER_TOKEN` is required, and `WORKER_PORT` (default `8787`) sets the listen port,
+as on a worker. The limits are hard: a VM gets exactly its vCPUs and RAM, and a turn that
+fills its scratch disk gets `ENOSPC`. The defaults are not measured yet (see
+[Residuals](#microvm-residuals)).
+
+### Extra privileges
+
+`vm-runner` needs more than a classic worker, and nothing else in the stack gets it:
+
+- `/dev/kvm`: Firecracker runs each guest on KVM.
+- `/dev/net/tun`: each VM gets its own tap device (`ovm<n>`).
+- `NET_ADMIN`: the runner creates the taps and writes the iptables rules that confine
+  each VM's traffic (below).
+
+It mounts `ottr-data:/data` read-write, to copy a card's files in and out, and
+`home:/root` read-only, for the package lists and the agent layer. It never mounts
+`/workspace`, and no VM sees any of these mounts.
+
+### Isolation model
+
+- Code: the VM clones the task branch from the board's git endpoint
+  (`<board>/git/<project>.git`) into the same absolute path as the server worktree
+  (`/workspace/<project>/.worktrees/<ID>`), so the paths in the turn's arguments stay
+  valid. The clone uses a per-turn token. The token reaches only that project's repo; the
+  endpoint advertises and serves only the task branch (and the base branch when the base
+  is a branch name), and pushes only `refs/heads/<task branch>`; a push to any other ref,
+  a delete, or a compressed push body is refused. The VM pushes every 60 s while HEAD
+  moves and once at the end; after each push the board resets the server worktree to the
+  branch tip, never to a sha the VM reports.
+- Provider credentials: none enter the VM. omp in the VM sends each provider through the
+  board's `/llm` proxy (`transport: pi-native`, with the per-turn token as the key). The
+  board forwards to its own `omp auth-gateway serve`, which resolves OAuth sign-ins and
+  API keys from the board's store through `omp auth-broker serve` and refreshes them
+  there.
+- Memory: with Hindsight configured, the VM calls the board's `/hindsight` proxy with the
+  per-turn token; the board adds the Hindsight key.
+- Card filing: a turn files cards on the board with the per-turn token, only in its own
+  project.
+- Network: the runner's iptables rules let a VM reach the board's address and port, drop
+  every other private, link-local, CGNAT (100.64.0.0/10) or reserved address (other VMs,
+  the workers, compose services, `vm-runner`'s own API), and let the VM reach the internet
+  through NAT. DNS goes to public resolvers (1.1.1.1,
+  8.8.8.8); the board's name is in the VM's `/etc/hosts`.
+- Files: the card's session files and other inputs under `/data/<project>/` are copied
+  in at the same paths. At the end of the turn (also for a detached run), regular files
+  under the copy-back folders (the project's `sessions/`) that are new or changed since
+  the run started are copied back; an existing file the run did not copy in is never
+  overwritten, so a VM cannot rewrite another card's session. The pinned agent layer is
+  copied in without the shared home's credential and identity state
+  (`.omp/agent/agent.db*`, `.omp/oauth`, `.ssh`, `.config/gh`); symlinks are copied as
+  links and never followed.
+- Residual: the `/hindsight` proxy forwards the whole Hindsight API, so a VM token reaches
+  every memory bank of the tenant, as a classic worker's Hindsight key does.
+
+The per-turn token lives until the turn settles. The board keeps only its hash, in a
+server-only file, so a token survives a board restart and a re-bound turn keeps pushing.
+
+### Rootfs cache
+
+A VM boots from three disks: a read-only base root filesystem, a read-only project
+layer, and a fresh sparse scratch disk of `OTTR_VM_DISK`. The root is an overlay of the
+three, so the turn writes only to its scratch disk. Files under `OTTR_VM_STATE_DIR`:
+
+- `base/base-<key>.ext4`: the base, built by `vm-runner` from its own container root
+  (the `vm-runner` image with the worker toolchain). The build starts in the background
+  when `vm-runner` starts, and a turn waits for it. The key hashes the Ottr version,
+  `omp --version` and `package.json`, so a new image builds a new base.
+- `layers/<project>-<key>.ext4`: the project layer with the project's system packages,
+  tools and Python packages. The runner bakes it in a VM (bake mode, layer writable) from
+  the data repo lists (`workers/<project>/apt.txt`, `tools.json`, `requirements.txt`,
+  and the `_all` lists; see [System packages per project](#system-packages-per-project)).
+  The key hashes the base key and those lists. The layer is rebuilt lazily: the next
+  turn of the project after a list or the base changes bakes a new layer, and later
+  turns reuse it. Bakes of one project run one at a time. A failed bake ends that turn
+  with exit code 1 and the bake's error tail.
+- `runs/<run id>/`: the scratch disk, the Firecracker config, its socket and its log.
+  The runner removes the dir at run end.
+
+Only the current base and the current layer of each project are kept. At start,
+`vm-runner` wipes `runs/` and any leftover `ovm*` taps and iptables chains: a restart has
+killed those VMs already.
+
+### Lifecycle
+
+- Full: when `OTTR_VM_MAX` VMs run, `vm-runner` answers the dispatch with a busy `503`.
+  The board records a turn only after `vm-runner` accepts it, so a busy answer writes no
+  turn, keeps the pending reply, and counts no lost turn. The card stays queued with the
+  hold **waiting for a free microVM**, its log gets one line ("every microVM was busy;
+  the card waits in the queue for a free microVM"), and the scheduler tries again after
+  10 s.
+- Down: while `vm-runner` does not answer its health probe, the project's work cards
+  stay queued with **waiting for the microVM runner: <reason>**. They never fall back to
+  the classic pool.
+- Board restart: the runner speaks the worker protocol, so a running VM detaches like a
+  worker turn (`/detach`), keeps running, and the new server re-binds it.
+- `vm-runner` restart: its Firecracker processes die with the container, so every running
+  VM is lost. The board sees a lost worker and resumes the card once with a new turn,
+  as for a worker; session changes and files the VM had not pushed are gone.
+- Dirty tree: a VM's files die with the VM. When a turn reports ready but the VM ends
+  with uncommitted or untracked files, or cannot report its tree, the card parks at
+  needs_you with no resume turn. The reason names up to 20 `git status` lines, or says
+  that the microVM could not report its tree state. A failed push is written to the card
+  log (`! microVM push failed: ...`), and the server worktree stays at the last pushed
+  head.
+- Board files: at the end of a turn the VM sends back `research-report.md` and the files
+  under `shots/` (at most 16 MiB in all), and the board writes them into the server
+  worktree before it classifies the turn; it writes no other path the VM sends.
+
+### vm-runner in the update roll
+
+The board lists `vm-runner` as a runner on `GET /api/drain` (id: the host name of
+`OTTR_VM_RUNNER_URL`, so `vm-runner`), and its running VMs count as that runner's turns.
+`scripts/update-image.ts` therefore rolls it like a worker ([Updates](#updates)): it
+holds the runner (`POST /api/drain` with `runner: vm-runner`; the microVM cards stay
+queued and unclaimed), waits until no VM runs (at most 1 hour), recreates the service,
+waits for its `/healthz`, and releases the hold. Before a server restart, a busy
+`vm-runner` detaches its running VMs like a busy worker. A recreate of `vm-runner` with
+running VMs would lose them, which is why the roll waits.
+
+### microVM residuals
+
+- A VM crash, or a `vm-runner` restart while VMs run, loses that turn's session changes
+  and its unpushed files.
+- The project's `env.txt` values enter the VM, as they enter a classic worker turn.
+- Internet egress is open.
+- The per-turn token is a bearer secret inside the VM: until the turn settles, it can
+  push the task branch, call `/llm` and `/hindsight`, and file cards in the project.
+- Interview, grill and trending turns of a microVM project run on the classic pool, with
+  its shared volumes.
+- Turn speed inside 2 vCPUs and 8 GiB is not measured. The feature was written on a WSL2
+  host without `/dev/kvm`, so no VM booted there; measure boot time, builds and test runs
+  on a KVM host before trusting the defaults.
+
 ## Fleet memory (Hindsight)
 
 The board picks the memory backend from the deployment at every omp spawn. A non-empty

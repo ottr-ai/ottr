@@ -326,7 +326,7 @@ const PROBED_CORE =
  * `--ignore-submodules=dirty`: a submodule status runs git in the submodule's own gitdir,
  * which is planted the same way. dirtySubmodules probes each submodule through this stub.
  */
-async function sealedGit(
+export async function sealedGit(
 	args: string[],
 	worktreePath: string,
 ): Promise<GitResult> {

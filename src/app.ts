@@ -78,6 +78,7 @@ import {
 	type TrustNeeded,
 	testRemote,
 } from "./gitHosts.ts";
+import { handleGit } from "./gitHttp.ts";
 import {
 	AppTokenSource,
 	appCheckWarning,
@@ -103,6 +104,7 @@ import {
 } from "./images.ts";
 import { createIssueWatcher } from "./issues.ts";
 import { rebuildLayerUse } from "./layers.ts";
+import { handleHindsight, handleLlm } from "./llmProxy.ts";
 import {
 	agentDir,
 	boardOmpEnv,
@@ -267,6 +269,8 @@ import {
 	updatePrompt,
 	validateUpdates,
 } from "./updates.ts";
+import { vmHoldFor, vmState } from "./vmState.ts";
+import { type VmTokens, vmTokenOf } from "./vmTokens.ts";
 import {
 	diffAlerts,
 	loadSubs,
@@ -462,6 +466,10 @@ interface AppDeps {
 	trendingFetch?: typeof fetch;
 	/** Fetch seam for the re-run-failed-jobs GitHub API call; defaults to fetch. Tests inject a stub. */
 	rerunFetch?: typeof fetch;
+	/** OTTR-532: the per-turn microVM tokens (git endpoint, /llm, /hindsight, card filing); absent = no VM turns. */
+	vmTokens?: VmTokens;
+	/** OTTR-532: the local auth-gateway the /llm proxy forwards to; null while it is not running. */
+	llmGateway?: () => { url: string; token: string } | null;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -2123,19 +2131,57 @@ export function createApp(deps: AppDeps) {
 	/**
 	 * A card starts an agent run, so the turns' host files cards (and the trending scout's
 	 * verdicts, which file proposal cards) and nothing else, and only with the boot token every
-	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401.
+	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401. A
+	 * microVM turn (OTTR-532) holds no boot token: its live per-turn VM token files cards in
+	 * its own project only, and no trending verdicts.
 	 */
 	function agentRefusal(req: Request): Response | null {
 		const token = req.headers.get("x-board-token");
-		if (agent === null || token === null || !secretsEqual(token, agent.token))
-			return json({ error: "unauthorized" }, 401);
+		const boot =
+			agent !== null && token !== null && secretsEqual(token, agent.token);
+		const vm = boot ? null : (deps.vmTokens?.check(token) ?? null);
+		if (!boot && vm === null) return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
-		if (
-			req.method !== "POST" ||
-			!/^\/api\/projects\/[^/]+\/(tasks|trending\/verdicts)$/.test(path)
-		)
+		const m = /^\/api\/projects\/([^/]+)\/(tasks|trending\/verdicts)$/.exec(
+			path,
+		);
+		if (req.method !== "POST" || m === null)
 			return json({ error: "this host only files cards" }, 403);
+		if (vm !== null) {
+			let project: string | null = null;
+			try {
+				project = decodeURIComponent(m[1] ?? "");
+			} catch {
+				// a malformed escape names no project
+			}
+			if (m[2] !== "tasks" || project !== vm.project)
+				return json(
+					{ error: "this token files cards only in its own project" },
+					403,
+				);
+		}
 		return null;
+	}
+
+	/**
+	 * OTTR-532: microVM turns reach git, their provider gateway and memory with their per-turn
+	 * VM token, outside api() (no session, no host allowlist): each handler refuses any other
+	 * caller. A live token lifts Bun's idle cut for its request, since clones, pushes and model
+	 * streams can stay quiet past 120 s.
+	 */
+	function vmRoute(
+		req: Request,
+		server: Server<undefined>,
+		fn: (tokens: VmTokens) => Promise<Response>,
+	): Promise<Response> {
+		const tokens = deps.vmTokens;
+		if (tokens === undefined)
+			return Promise.resolve(json({ error: "not found" }, 404));
+		if (tokens.check(vmTokenOf(req)) !== null) server.timeout(req, 0);
+		return fn(tokens).catch((err) => {
+			logError(`vm ${req.method} ${new URL(req.url).pathname}`, err);
+			return json({ error: "internal error" }, 500);
+		});
 	}
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
@@ -2340,6 +2386,7 @@ export function createApp(deps: AppDeps) {
 			mainBranch: e.mainBranch,
 			mainUnpushed: e.mainUnpushed,
 			github: e.github,
+			vmRunner: vmState.health,
 			githubHostNotice: gheNoticeHost(e.remote, configuredGithubHostname()),
 			remote: e.remote,
 			latestRelease: e.latestRelease,
@@ -2501,6 +2548,14 @@ export function createApp(deps: AppDeps) {
 						if (card.cancelledAt === null && pushHold(true, card) !== null)
 							card.pushHold = true;
 					}
+				}
+				// A microVM-mode project's queued cards wait on vm-runner (unreachable or busy);
+				// stamp the reason so the board names the hold instead of a silent queue.
+				const microVm = e.store.getSettings().microVm;
+				for (const card of cards) {
+					if (card.state !== "queued" || card.cancelledAt !== null) continue;
+					const held = vmHoldFor(microVm, e.store.name, card.id);
+					if (held !== null) card.vmHold = held;
 				}
 				tasks.push(...cards);
 			} catch (err) {
@@ -2897,6 +2952,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof iw !== "boolean")
 				return json({ error: "issueWatch must be a boolean" }, 400);
 			patch.issueWatch = iw;
+		}
+		const mv = body.microVm;
+		if (mv !== undefined) {
+			if (typeof mv !== "boolean")
+				return json({ error: "microVm must be a boolean" }, 400);
+			patch.microVm = mv;
 		}
 		const psc = body.pushSyncCommits;
 		if (psc !== undefined) {
@@ -3730,6 +3791,23 @@ export function createApp(deps: AppDeps) {
 		"/workflow-release.svg": {
 			GET: () => workflowFile("/workflow-release.svg"),
 		},
+		"/git/*": (req, server) =>
+			vmRoute(req, server, (tokens) =>
+				handleGit(req, { tokens, log: (l) => console.log(`[vm-git] ${l}`) }),
+			),
+		"/llm/*": (req, server) =>
+			vmRoute(req, server, (tokens) =>
+				handleLlm(req, { tokens, gateway: deps.llmGateway?.() ?? null }),
+			),
+		// Read per request: Settings can change the Hindsight URL and key while the board runs.
+		"/hindsight/*": (req, server) =>
+			vmRoute(req, server, (tokens) =>
+				handleHindsight(req, {
+					tokens,
+					url: process.env.HINDSIGHT_API_URL?.trim(),
+					token: process.env.HINDSIGHT_API_TOKEN,
+				}),
+			),
 		// The Diagrams modal loads mermaid's prebuilt bundle (3.5 MB) on first open, so the board's
 		// own bundle stays small: Bun's HTML bundler does not split a dynamic import into a chunk.
 		"/mermaid.min.js": {
@@ -5297,6 +5375,15 @@ export function createApp(deps: AppDeps) {
 					if (patch.prMode === true && e.github === null)
 						return json(
 							{ error: "prMode needs a GitHub remote on the configured host" },
+							400,
+						);
+					// microVM mode dispatches every work turn to vm-runner: turning it on while
+					// the runner is unreachable would park every queued card. Off always saves.
+					if (patch.microVm === true && !vmState.health.ok)
+						return json(
+							{
+								error: `microVm needs a reachable vm-runner: ${vmState.health.reason ?? "not reachable"}`,
+							},
 							400,
 						);
 					// retro -> retroSince: on keeps the existing mark (a re-save must not move

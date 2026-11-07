@@ -3,7 +3,7 @@
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
 import { constants, homedir } from "node:os";
-import { delimiter, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
 import { createApp, storedProjectPaths } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
@@ -11,9 +11,11 @@ import { newSecret } from "./auth.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { defaultSshDir } from "./gitHosts.ts";
+import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { boardOmpEnv, boardOmpHome } from "./login.ts";
+import { startLlmGateway } from "./llmGateway.ts";
+import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
 import { openPullRequest } from "./prs.ts";
@@ -28,7 +30,7 @@ import {
 	runReleaseCommand,
 } from "./release.ts";
 import { publicHosts } from "./requestGuards.ts";
-import { startRun, workerFromEnv } from "./runner.ts";
+import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
 import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
 import {
 	type AdoptResult,
@@ -48,6 +50,8 @@ import {
 	type TurnLoop,
 } from "./turn.ts";
 import type { LatestImage } from "./types.ts";
+import { VM_UNCONFIGURED, vmState } from "./vmState.ts";
+import { VmTokens } from "./vmTokens.ts";
 import {
 	detachedRuns as detachedRunsRequest,
 	killDetached as killDetachedRequest,
@@ -414,6 +418,74 @@ const board = {
 // off the real home.
 const workersHome = process.env.OTTR_WORKERS_HOME;
 const workerTarget = workerFromEnv();
+// OTTR-532: the microVM runner (vm-runner) is no member of the worker pool: only microVM
+// projects' eligible turns reach it, and the worker sign-in, /stats and /sweep loops (which
+// walk workerTarget) never call it.
+const vmTarget = vmRunnerFromEnv();
+// One token store for the whole board: the turn loop issues and revokes, the /git, /llm and
+// /hindsight routes check. Server-only dir, never the worker-shared data dir: the file lets
+// a re-bound VM turn keep pushing after a board restart. No server dir = memory only.
+const vmTokens = new VmTokens({
+	file: process.env.OTTR_SERVER_DATA_DIR
+		? join(resolve(process.env.OTTR_SERVER_DATA_DIR), "vm-tokens.json")
+		: null,
+});
+/** The board's provider gateway for VM turns' /llm proxy; null until it started. */
+let llmGateway: { url: string; token: string; stop(): void } | null = null;
+if (vmTarget !== null)
+	startLlmGateway({
+		agentDir: agentDir(),
+		home: boardOmpHome(),
+		log: (l) => console.log(l),
+	})
+		.then((g) => {
+			llmGateway = g;
+			// Its auth-broker and auth-gateway children must not outlive the board.
+			process.on("exit", () => g.stop());
+		})
+		.catch((err) =>
+			logError("the microVM provider gateway did not start", err),
+		);
+
+/** One GET /healthz of the microVM runner into vmState.health; unconfigured stays unconfigured. */
+async function probeVmRunner(): Promise<void> {
+	if (vmTarget === null) {
+		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
+		return;
+	}
+	const url = vmTarget.urls[0]!;
+	try {
+		const res = await fetch(`${url}/healthz`, {
+			headers: vmTarget.token ? { "x-otwr-token": vmTarget.token } : {},
+			// The worker token never follows a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(5000),
+		});
+		// vm-runner's 503 body is its own one-line reason ("vm-runner: /dev/kvm is missing");
+		// the UI already names vm-runner, so the prefix and the URL stay out of the text.
+		const body = (await res.text())
+			.trim()
+			.replace(/^vm-runner:\s*/, "")
+			.slice(0, 300);
+		vmState.health =
+			res.status === 200
+				? { configured: true, ok: true, reason: null }
+				: {
+						configured: true,
+						ok: false,
+						reason: body || `/healthz answered HTTP ${res.status}`,
+					};
+	} catch (err) {
+		vmState.health = {
+			configured: true,
+			ok: false,
+			reason: `no answer from ${url} (${err instanceof Error ? err.message : String(err)})`,
+		};
+	}
+}
+// Boot probe without blocking boot: until it answers, microVM cards wait unclaimed.
+void probeVmRunner();
+setInterval(() => void probeVmRunner(), 30_000);
 // Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
 // because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
 // take loop.running only. The import is dynamic: the image ships src/ only, never scripts/,
@@ -480,6 +552,10 @@ const loop = createTurnLoop(projects, {
 	// OTTR_WORKER_URLS selects worker dispatch for work turns; unset (the default) and any
 	// connect failure fall back to the local spawn. Merge turns never dispatch (D6).
 	workerTarget,
+	// OTTR-532: microVM projects' eligible turns, their token store and the worktree sync.
+	vmTarget,
+	vmTokens,
+	syncWorktreeTo,
 	startRun,
 	// OTTR-454: the restart re-bind asks the workers for their detached runs and kills one on
 	// cancel; with no workerTarget configured the loop never probes.
@@ -548,6 +624,11 @@ const app = createApp({
 			id: new URL(u).hostname,
 			url: u,
 		})),
+		// OTTR-532: the update script holds, waits for and rolls vm-runner like a worker.
+		...(vmTarget?.urls ?? []).map((u) => ({
+			id: new URL(u).hostname,
+			url: u,
+		})),
 		{ id: "local", url: null },
 	],
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
@@ -584,6 +665,8 @@ const app = createApp({
 	serverRef,
 	prod: PROD,
 	board,
+	vmTokens,
+	llmGateway: () => llmGateway,
 });
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing

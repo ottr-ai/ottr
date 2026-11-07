@@ -5,7 +5,7 @@
 # Digest-pinned 2026-10-22: a moved tag would silently change the worker image on the
 # next build. To upgrade bun, read the new tag's digest with
 # `docker buildx imagetools inspect oven/bun:<tag>` and move tag and digest together.
-FROM oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e
+FROM oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS worker
 # scripts/update-image.ts prunes superseded builds of this image by this label.
 LABEL ottr.image=worker
 
@@ -184,3 +184,72 @@ RUN chmod +x /ottr-entry.sh
 
 EXPOSE 4747 8787
 ENTRYPOINT ["/ottr-entry.sh"]
+
+# The microVM runner (compose service vm-runner, profile vm; OTTR-532): runs each work turn
+# of an opted-in project in its own Firecracker microVM. Built only with `--target
+# vm-runner`; the guest's base rootfs is built from this container's own root, so the
+# guest gets the worker's tools, omp and /app unchanged. It inherits LABEL ottr.image=worker
+# on purpose: scripts/update-image.ts prunes its superseded builds with the worker's.
+FROM worker AS vm-runner
+# Firecracker (VMM) static musl binary from the official release. Host-independent: it
+# needs only /dev/kvm. A wrong pin 404s the download (fails the build loudly).
+ARG FIRECRACKER_VERSION=1.17.0
+# sha256 of firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz from the release's
+# firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt (equal to the asset's GitHub digest).
+ARG FIRECRACKER_SHA256=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+# Guest kernel: the Firecracker CI's uncompressed x86_64 vmlinux 6.1 from the firecracker-ci
+# bucket that the release's docs/getting-started.md downloads from (the dated prefix is the
+# CI artifact build of firecracker commit 6ea6634994fa, 2026-11-05). Checked when pinned,
+# in the artifact's own vmlinux-6.1.188.config and in the source config
+# resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config at that commit: OVERLAY_FS,
+# EXT4_FS, VIRTIO_BLK, VIRTIO_NET, VIRTIO_MMIO + ACPI (device discovery), IP_PNP (the
+# cmdline's ip=), DEVTMPFS + DEVTMPFS_MOUNT, MAGIC_SYSRQ (power off), SERIO_I8042 (reboot=k
+# ends the VMM), SERIAL_8250_CONSOLE (ttyS0), all =y; MODULES is off, so nothing loads later.
+# A wrong URL 404s the download (fails the build loudly).
+ARG VM_KERNEL_URL=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261105-6ea6634994fa-0/x86_64/vmlinux-6.1.188
+# sha256 of vmlinux-6.1.188, computed when pinned: the bucket publishes no checksums.
+ARG VM_KERNEL_SHA256=31fe88d6c72b93d5c9c63cca599ccadec49fd35673bbfd04850d6c00ff27f032
+# Debian trixie versions; a wrong pin fails the build loudly (D1). iptables: the per-VM
+# egress rules and NAT; iproute2: the per-VM tap devices; e2fsprogs: mkfs.ext4 -d builds
+# the rootfs, layer and scratch disks without a loop mount.
+ARG IPTABLES_VERSION=1.8.11-2
+ARG IPROUTE2_VERSION=6.15.0-1
+ARG E2FSPROGS_VERSION=1.47.2-3+b12
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      "iptables=${IPTABLES_VERSION}" \
+      "iproute2=${IPROUTE2_VERSION}" \
+      "e2fsprogs=${E2FSPROGS_VERSION}" \
+    && rm -rf /var/lib/apt/lists \
+    && iptables --version \
+    && ip -V \
+    && mkfs.ext4 -V
+
+# firecracker on PATH (pinned, checksum-verified).
+RUN bun -e "await Bun.write('/tmp/firecracker.tgz', await (await fetch('https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz')).bytes())" \
+    && echo "${FIRECRACKER_SHA256}  /tmp/firecracker.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/firecracker.tgz -C /tmp "release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64" \
+    && install -m 0755 "/tmp/release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker \
+    && rm -rf /tmp/firecracker.tgz "/tmp/release-v${FIRECRACKER_VERSION}-x86_64" \
+    && firecracker --version
+
+# The guest kernel where vm-runner looks for it (OTTR_VM_KERNEL; pinned, checksum-verified).
+RUN mkdir -p /opt/ottr-vm \
+    && bun -e "await Bun.write('/opt/ottr-vm/vmlinux', await (await fetch('${VM_KERNEL_URL}')).bytes())" \
+    && echo "${VM_KERNEL_SHA256}  /opt/ottr-vm/vmlinux" | sha256sum -c -
+
+# The guest's PID 1 (kernel cmdline init=): mounts the drives, builds the overlay root and
+# runs the guest agent (src/vmGuest.ts). It ships in the rootfs because the rootfs is this root.
+COPY docker/ottr-vm-init /usr/local/bin/ottr-vm-init
+RUN chmod 0755 /usr/local/bin/ottr-vm-init
+
+# No /ottr-entry.sh here: its credential checks refuse a container without agent.db and the
+# oauth dir, and vm-runner mounts neither by design (no provider secret reaches a VM). The
+# Podman proxy fix still applies: the runner's own calls must not go to a host proxy.
+ENTRYPOINT ["/bin/sh", "-c", ". /no-proxy.sh && exec \"$@\"", "ottr-vm-runner"]
+CMD ["bun", "/app/src/vmRunnerMain.ts"]
+
+# The default (untargeted) build stays the classic worker image the server and the workers
+# run: the last stage is the build's result, and BuildKit skips vm-runner unless targeted.
+FROM worker

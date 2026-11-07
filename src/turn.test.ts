@@ -40,6 +40,7 @@ import {
 	replyPrompt,
 	restartResumePrompt,
 } from "./prompts.ts";
+import { WORKER_LOST } from "./runner.ts";
 import {
 	FINDINGS_HOLD,
 	isRetro,
@@ -71,6 +72,8 @@ import {
 	UI_SHOT_WARNING,
 	UPDATE_HOLD_REASON,
 	uiFiles,
+	VM_BUSY_RETRY_MS,
+	writeVmFiles,
 } from "./turn.ts";
 import type {
 	Outcome,
@@ -79,6 +82,8 @@ import type {
 	RunResult,
 	WorkCheckRun,
 } from "./types.ts";
+import { vmState } from "./vmState.ts";
+import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun } from "./workers.ts";
 import {
 	isClean as gitIsClean,
@@ -18162,5 +18167,410 @@ describe("turn PR-mode merge settle", () => {
 		await flushPromises();
 		expect(record.runs).toHaveLength(1);
 		expect(record.runs[0]!.prompt).toContain("opens the pull request");
+	});
+});
+
+describe("microVM dispatch (OTTR-532)", () => {
+	const VM_URL = "http://vm-runner:8787";
+	const savedHealth = vmState.health;
+	afterEach(() => {
+		vmState.health = savedHealth;
+		vmState.busy.clear();
+		setSystemTime();
+	});
+
+	type RunOpts = Parameters<TurnOps["startRun"]>[0];
+
+	/** A microVM project whose fake vm-runner answers with `answer` (mutable per test). */
+	function vmSetup(overrides: Partial<TurnOps> = {}, microVm = true) {
+		vmState.health = { configured: true, ok: true, reason: null };
+		const calls: RunOpts[] = [];
+		const envModels: (string | null)[] = [];
+		const synced: [string, string][] = [];
+		const tokens = new VmTokens({ file: null });
+		const answer = {
+			accepted: true,
+			result: runResult({
+				outcome: { status: "answered", summary: "done" },
+			}),
+		};
+		const s = setup({
+			// Cap 0: the settle's own schedule() starts no follow-up turn behind the test.
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
+			vmTarget: { urls: [VM_URL], token: "tok" },
+			vmTokens: tokens,
+			syncWorktreeTo: async (wt, sha) => {
+				synced.push([wt, sha]);
+			},
+			turnEnv: async (_project, model) => {
+				envModels.push(model);
+				return { env: {}, missing: [] };
+			},
+			startRun: (o: RunOpts) => {
+				calls.push(o);
+				if (answer.accepted) o.onSession?.("sess-1");
+				const target = o.vm?.target ?? o.worker ?? null;
+				return {
+					pid: target === null ? 4242 : null,
+					...(target === null ? {} : { url: target.urls[0]! }),
+					done: Promise.resolve(answer.result),
+					...(o.vm ? { accepted: Promise.resolve(answer.accepted) } : {}),
+					kill: async () => {},
+				};
+			},
+			...overrides,
+		});
+		s.store.setSettings({ microVm });
+		return { ...s, calls, envModels, synced, tokens, answer };
+	}
+
+	test("an eligible work turn goes to vm-runner only, lent nothing", async () => {
+		const { store, loop, calls, envModels } = vmSetup();
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm?.target.urls).toEqual([VM_URL]);
+		expect(calls[0]!.worker ?? null).toBeNull();
+		const card = store.getTask(task.id)!;
+		expect(calls[0]!.vm?.grant).toEqual({
+			project: store.name,
+			taskId: task.id,
+			branch: card.branch!,
+			repoPath: store.path,
+			worktree: card.worktree!,
+		});
+		expect(calls[0]!.cwd).toBe(card.worktree!);
+		// No provider token is lent to a microVM turn: turnEnv gets no model.
+		expect(envModels).toEqual([null]);
+	});
+
+	test("microVM mode off keeps the classic worker pool", async () => {
+		const { store, loop, calls, envModels } = vmSetup({}, false);
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm ?? null).toBeNull();
+		expect(calls[0]!.worker?.urls).toEqual(["http://worker-a:8787"]);
+		expect(envModels).toEqual(["fake/default-model"]);
+	});
+
+	test("a merge turn of a microVM project stays on the server", async () => {
+		const { store, loop, calls } = vmSetup({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+		});
+		const merge = store.createTask("merge please");
+		store.updateTask(merge.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, merge.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm ?? null).toBeNull();
+		expect(calls[0]!.worker ?? null).toBeNull();
+	});
+
+	test("a grill turn (main checkout) of a microVM project keeps the classic pool", async () => {
+		const { store, loop, calls } = vmSetup();
+		const idea = store.createTask("an idea");
+		store.updateTask(idea.id, { stage: "backlog" });
+		await loop.runTurn(store.name, idea.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm ?? null).toBeNull();
+		expect(calls[0]!.cwd).toBe(store.path);
+		expect(calls[0]!.worker?.urls).toEqual(["http://worker-a:8787"]);
+	});
+
+	test("a runner that is down leaves the card queued and unclaimed, with no fallback", async () => {
+		const { store, loop, calls } = vmSetup();
+		vmState.health = {
+			configured: true,
+			ok: false,
+			reason: "connection refused",
+		};
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(0);
+		const card = store.getTask(task.id)!;
+		expect(card.state).toBe("queued");
+		expect(card.worktree).toBeNull();
+		expect(store.listTurns(task.id)).toHaveLength(0);
+	});
+
+	test("a drained vm-runner defers the turn while the classic pool stays untouched", async () => {
+		const { store, loop, calls } = vmSetup({
+			drainedRunner: (id) => id === "vm-runner",
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(0);
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("busy requeues the card as it was, outside the lost streak; the next dispatch clears the mark", async () => {
+		const { store, loop, calls, answer } = vmSetup();
+		const task = store.createTask("queued work");
+		store.updateTask(task.id, {
+			pendingPrompt: "also fix the docs",
+			pendingBy: "user",
+		});
+		answer.accepted = false;
+		answer.result = runResult({
+			exitCode: null,
+			sessionId: null,
+			workerBusy: true,
+		});
+		const key = `${store.name}/${task.id}`;
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		let card = store.getTask(task.id)!;
+		expect(card.state).toBe("queued");
+		expect(card.needsReason).toBeNull();
+		expect(card.pendingPrompt).toBe("also fix the docs");
+		expect(card.pendingBy).toBe("user");
+		// Nothing ran: no turn row, so no lost-worker streak can count it.
+		expect(store.listTurns(task.id)).toHaveLength(0);
+		expect(vmState.busy.has(key)).toBe(true);
+
+		// Inside the backoff the card is not even claimed.
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		expect(store.getTask(task.id)!.state).toBe("queued");
+
+		setSystemTime(new Date(Date.now() + VM_BUSY_RETRY_MS + 1));
+		answer.accepted = true;
+		answer.result = runResult({
+			outcome: { status: "answered", summary: "done" },
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(2);
+		expect(calls[1]!.vm?.target.urls).toEqual([VM_URL]);
+		expect(vmState.busy.has(key)).toBe(false);
+		card = store.getTask(task.id)!;
+		expect(store.listTurns(task.id)).toHaveLength(1);
+		expect(store.listTurns(task.id)[0]!.input).toBe("also fix the docs");
+	});
+
+	test("a dirty VM tree refuses ready and names its files, whatever the server worktree says", async () => {
+		const { store, loop, answer, synced } = vmSetup({
+			commitsAhead: async () => 1,
+			// The server worktree looks clean; only the VM's report may decide.
+			isClean: async () => true,
+			targetSha: async (_path: string, ref: string) =>
+				ref.startsWith("refs/heads/")
+					? "b".repeat(40)
+					: ref === "HEAD"
+						? "a".repeat(40)
+						: null,
+		});
+		answer.result = runResult({
+			outcome: { status: "ready", summary: "done" },
+			vm: {
+				head: "b".repeat(40),
+				pushError: null,
+				dirty: [" M src/a.ts", "?? notes.txt"],
+			},
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		const card = store.getTask(task.id)!;
+		expect(card.state).toBe("needs_you");
+		expect(card.needsReason).toContain("M src/a.ts");
+		expect(card.needsReason).toContain("?? notes.txt");
+		expect(synced).toEqual([[card.worktree!, "b".repeat(40)]]);
+	});
+
+	test("a clean VM outcome syncs the worktree to the branch tip and goes to merging", async () => {
+		const { store, loop, answer, synced } = vmSetup({
+			commitsAhead: async () => 1,
+			// A stale server tree must not block a VM whose own tree was clean.
+			isClean: async () => false,
+			targetSha: async (_path: string, ref: string) =>
+				ref.startsWith("refs/heads/")
+					? "c".repeat(40)
+					: ref === "HEAD"
+						? "a".repeat(40)
+						: null,
+		});
+		answer.result = runResult({
+			outcome: { status: "ready", summary: "done" },
+			vm: { head: "c".repeat(40), pushError: null, dirty: [] },
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		const card = store.getTask(task.id)!;
+		expect(synced).toEqual([[card.worktree!, "c".repeat(40)]]);
+		expect(card.stage).toBe("merging");
+		expect(card.state).toBe("queued");
+	});
+
+	test("a VM that never pushed leaves a worktree already at the branch tip alone", async () => {
+		const { store, loop, answer, synced } = vmSetup({
+			targetSha: async (_path: string, ref: string) =>
+				ref.startsWith("refs/heads/") || ref === "HEAD" ? "a".repeat(40) : null,
+		});
+		answer.result = runResult({
+			outcome: { status: "answered", summary: "done" },
+			vm: { head: null, pushError: "auth failed", dirty: [] },
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(synced).toEqual([]);
+		expect(logText(store, task.id)).toContain(
+			"microVM push failed: auth failed",
+		);
+	});
+
+	test("a VM claiming a foreign head syncs to the real branch tip and logs the mismatch", async () => {
+		const tip = "d".repeat(40);
+		const foreign = "e".repeat(40);
+		const { store, loop, answer, synced } = vmSetup({
+			targetSha: async (path: string, ref: string) =>
+				path === store.path && ref.startsWith("refs/heads/")
+					? tip
+					: ref === "HEAD"
+						? "a".repeat(40)
+						: null,
+		});
+		answer.result = runResult({
+			outcome: { status: "answered", summary: "done" },
+			vm: { head: foreign, pushError: null, dirty: [] },
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		const card = store.getTask(task.id)!;
+		expect(synced).toEqual([[card.worktree!, tip]]);
+		expect(logText(store, task.id)).toContain(
+			`! microVM: reported head ${foreign} is not the branch tip ${tip}`,
+		);
+	});
+
+	test("a VM whose branch does not resolve leaves the worktree unsynced and says so", async () => {
+		const { store, loop, answer, synced } = vmSetup();
+		answer.result = runResult({
+			outcome: { status: "answered", summary: "done" },
+			vm: { head: "f".repeat(40), pushError: null, dirty: [] },
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(synced).toEqual([]);
+		expect(logText(store, task.id)).toContain(
+			"does not resolve; the worktree is not synced",
+		);
+	});
+
+	test("a lost VM settles as a lost worker", async () => {
+		const { store, loop, answer } = vmSetup();
+		answer.result = runResult({
+			exitCode: null,
+			workerLost: true,
+			stderrTail: "worker connection lost",
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		const card = store.getTask(task.id)!;
+		expect(card.state).toBe("queued");
+		expect(card.needsReason).toContain(WORKER_LOST);
+		expect(card.pendingPrompt).toBe(".");
+	});
+
+	describe("token revoke at the restart settle", () => {
+		const WT = "/srv/wt-vm";
+		function seeded(store: ProjectStore) {
+			const task = store.createTask("work please");
+			store.updateTask(task.id, {
+				state: "running",
+				stage: "in_progress",
+				sessionId: "sess-9",
+				worktree: WT,
+				branch: "ott/x",
+			});
+			store.startTurn(task.id, "work", "old prompt", null);
+			return task;
+		}
+		const grantFor = (store: ProjectStore, id: string) => ({
+			project: store.name,
+			taskId: id,
+			branch: "ott/x",
+			repoPath: store.path,
+			worktree: WT,
+		});
+
+		test("a still-running detached VM turn keeps its token across the restart", async () => {
+			const { store, loop, tokens } = vmSetup({
+				workerTarget: null,
+				detachedRuns: async (url) =>
+					url === VM_URL
+						? [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }]
+						: [],
+			});
+			const task = seeded(store);
+			const raw = tokens.issue(grantFor(store, task.id));
+			await loop.recoverRestarted();
+			expect(store.getTask(task.id)!.state).toBe("running");
+			expect(tokens.check(raw)).not.toBeNull();
+		});
+
+		test("a finished detached VM turn settles and its token dies", async () => {
+			const runs: DetachedRun[] = [
+				{
+					id: "run-1",
+					cwd: WT,
+					pid: null,
+					running: false,
+					startedAt: 1,
+					result: { exitCode: 0, stderrTail: "" },
+				},
+			];
+			const { store, loop, tokens } = vmSetup({
+				workerTarget: null,
+				targetSha: async () => "abc123def",
+				detachedRuns: async (url) => (url === VM_URL ? runs : []),
+			});
+			const task = seeded(store);
+			const raw = tokens.issue(grantFor(store, task.id));
+			await loop.recoverRestarted();
+			expect(store.getTask(task.id)!.state).toBe("queued");
+			expect(tokens.check(raw)).toBeNull();
+		});
+	});
+});
+
+describe("writeVmFiles", () => {
+	test("writes the report and shots/ into the worktree; refuses every other path", () => {
+		const wt = mkdtempSync(join(tmpdir(), "ottr-vmfiles-"));
+		const outside = mkdtempSync(join(tmpdir(), "ottr-vmfiles-out-"));
+		mkdirSync(join(wt, "src"));
+		mkdirSync(join(wt, "shots"));
+		symlinkSync(outside, join(wt, "shots", "link"));
+		const b64 = (s: string) => Buffer.from(s).toString("base64");
+		const logs: string[] = [];
+		writeVmFiles(
+			wt,
+			[
+				{ path: "research-report.md", b64: b64("# Report\n") },
+				{ path: "shots/sub/a.png", b64: b64("png") },
+				{ path: "../x", b64: b64("x") },
+				{ path: "/etc/x", b64: b64("x") },
+				{ path: "src/x.ts", b64: b64("x") },
+				{ path: "shots/../src/y.ts", b64: b64("x") },
+				{ path: "shots/link/evil.png", b64: b64("x") },
+			],
+			(l) => logs.push(l),
+		);
+		expect(readFileSync(join(wt, "research-report.md"), "utf8")).toBe(
+			"# Report\n",
+		);
+		expect(readFileSync(join(wt, "shots", "sub", "a.png"), "utf8")).toBe("png");
+		expect(existsSync(join(dirname(wt), "x"))).toBe(false);
+		expect(existsSync(join(wt, "src", "x.ts"))).toBe(false);
+		expect(existsSync(join(wt, "src", "y.ts"))).toBe(false);
+		expect(readdirSync(outside)).toEqual([]);
+		expect(logs).toHaveLength(5);
+		rmSync(wt, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
 	});
 });

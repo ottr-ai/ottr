@@ -13,8 +13,14 @@ import {
 	removeLayerUse,
 	resolveAgentLayer,
 } from "./layers.ts";
-import { boardOmpEnv, boardOmpHome } from "./login.ts";
-import { ensureMemoryOverlay } from "./memory.ts";
+import {
+	agentDir,
+	boardOmpEnv,
+	boardOmpHome,
+	LENT_ENV,
+	signIns,
+} from "./login.ts";
+import { ensureMemoryOverlay, memoryBackendFromEnv } from "./memory.ts";
 import { platform } from "./platform/index.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
@@ -29,8 +35,9 @@ import type {
 	TurnKind,
 } from "./types.ts";
 import { askQuestions, OUTCOME_STATUSES } from "./types.ts";
-import type { WorkerTarget } from "./workers.ts";
-import { runWorker, WorkerConnectError } from "./workers.ts";
+import type { VmGrant, VmTokens } from "./vmTokens.ts";
+import type { VmSpec, WorkerTarget } from "./workers.ts";
+import { runWorker, WorkerBusyError, WorkerConnectError } from "./workers.ts";
 import {
 	GIT_AUTH_ENV_NAME,
 	gitSecrets,
@@ -437,6 +444,9 @@ export function classify(o: {
 	/** Reads omp's HTTP-400 request log for this turn's window; only called when the turn
 	 * died before any output. Null/undefined when there is no entry. */
 	http400?: () => string | null;
+	/** A microVM turn's end-of-run `git status --porcelain` lines (VmOutcome.dirty); null when
+	 * the VM could not report. Undefined for every other run. Only the ready refusal reads it. */
+	vmDirty?: string[] | null;
 }): Next {
 	const { kind, result, git, target } = o;
 	const stage: Next["stage"] =
@@ -613,7 +623,7 @@ export function classify(o: {
 			if (git.commitsAhead === 0 && git.integrated)
 				return { stage: "done", state: "idle", needsReason: null };
 			return needs(
-				`Reported ready, but git shows ${git.commitsAhead} commit(s) ahead of the base${git.clean ? "" : " and uncommitted changes"}.`,
+				`Reported ready, but git shows ${git.commitsAhead} commit(s) ahead of the base${git.clean ? "" : vmDirtyText(o.vmDirty)}.`,
 			);
 		}
 		if (oc.status === "answered") {
@@ -631,6 +641,16 @@ export function classify(o: {
 		return needs(`Unexpected outcome "${oc.status}" in a merge turn.`);
 
 	return needs(oc.question?.trim() ? oc.question.trim() : oc.summary);
+}
+
+/** The ready refusal's tail for an unclean tree: a microVM's tree is gone after the run, so
+ * the reason names its files (the first 20) instead of pointing at a worktree to inspect. */
+function vmDirtyText(dirty: string[] | null | undefined): string {
+	if (dirty === undefined || (dirty !== null && dirty.length === 0))
+		return " and uncommitted changes";
+	if (dirty === null)
+		return " and uncommitted changes (the microVM could not report its tree state)";
+	return ` and uncommitted changes in the microVM: ${dirty.slice(0, 20).join(", ")}${dirty.length > 20 ? ` (+${dirty.length - 20} more)` : ""}`;
 }
 
 function isOutcome(v: unknown): v is Outcome {
@@ -874,6 +894,10 @@ interface RunHandle {
 	kill(): Promise<void>;
 	/** Id of the agent layer the run pinned at start; null when it ran the flat home. */
 	layerId?: string | null;
+	/** A microVM run only: true once vm-runner took the dispatch, false when it never started
+	 * (busy, refused, unreachable). runTurn waits for it before it records the turn, so a busy
+	 * answer leaves no turn row and no consumed reply behind. */
+	accepted?: Promise<boolean>;
 }
 
 /** Narrow seam for tests: anything that can launch a piped child process. */
@@ -1067,6 +1091,90 @@ function withoutGitAuth(
 	return out;
 }
 
+/** Opens the busy reason; classify never sees it (runTurn requeues a busy dispatch first). */
+export const WORKER_BUSY = "every microVM was busy";
+
+/**
+ * Env names no microVM turn may carry (docs/adr/0009-microvm-workers.md): provider keys and
+ * lent OAuth tokens (providers go through the board's /llm proxy), GitHub tokens, and the
+ * memory backend's credentials (memory goes through the board's /hindsight proxy).
+ */
+const VM_DENIED_ENV = /^(ANTHROPIC_|OPENAI_|GH_|GITHUB_|HINDSIGHT_)/;
+
+/**
+ * The microVM turn's env, built as an allowlist instead of from process.env: the run's own
+ * values (env.txt values, the retro/review/trending flags) minus every denied name and every
+ * redacted secret, then the board coordinates with the per-turn VM token (never the boot
+ * token) and the shared-home layer pin. Nothing of the board process's env rides along.
+ */
+export function vmEnv(o: {
+	env?: Record<string, string>;
+	secrets?: readonly string[];
+	sessionName?: string | null;
+	board?: BoardEnv | null;
+	stripBoard?: boolean;
+	boardUrl: string;
+	token: string;
+	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
+}): Record<string, string> {
+	const secrets = new Set(o.secrets ?? []);
+	const lent = new Set(Object.values(LENT_ENV));
+	const env: Record<string, string> = {};
+	for (const [k, v] of Object.entries(o.env ?? {})) {
+		if (typeof v !== "string") continue;
+		if (VM_DENIED_ENV.test(k) || lent.has(k) || GIT_AUTH_ENV_NAME.test(k))
+			continue;
+		if (secrets.has(v)) continue;
+		// The guest owns its PATH, home and agent dir; the board's are meaningless inside.
+		if (k === "PATH" || k === "HOME" || k === "PI_CODING_AGENT_DIR") continue;
+		if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
+			continue;
+		env[k] = v;
+	}
+	if (o.sessionName) env.OTTR_SESSION_NAME = o.sessionName;
+	if (o.board && !o.stripBoard) {
+		env.OTTR_BOARD_URL = o.boardUrl;
+		env.OTTR_BOARD_TOKEN = o.token;
+		env.OTTR_PROJECT = o.board.project;
+		env.OTTR_TASK_ID = o.board.taskId;
+	}
+	if (o.layerEnv !== null) Object.assign(env, o.layerEnv);
+	return env;
+}
+
+/**
+ * Provider ids a microVM turn routes through the board's /llm proxy: the board store's active
+ * sign-ins, the providers of the board's env API keys, and always the turn model's provider.
+ * An unreadable store (null) still yields the env keys and the model's provider.
+ */
+export function vmProviders(
+	model: string | null | undefined,
+	stored: readonly { provider: string; active: boolean }[] | null,
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	const out = new Set<string>();
+	for (const s of stored ?? []) if (s.active) out.add(s.provider);
+	if (env.ANTHROPIC_API_KEY) out.add("anthropic");
+	if (env.OPENAI_API_KEY) out.add("openai");
+	const slash = model?.indexOf("/") ?? -1;
+	if (model && slash > 0) out.add(model.slice(0, slash));
+	return [...out].sort();
+}
+
+/** The saved session's files (`<ts>_<id>.jsonl` and its artifact dir) a microVM resume needs. */
+function sessionPaths(sessionDir: string, resumeId: string | null): string[] {
+	if (resumeId === null) return [];
+	try {
+		return readdirSync(sessionDir)
+			.filter(
+				(n) => n.endsWith(`_${resumeId}.jsonl`) || n.endsWith(`_${resumeId}`),
+			)
+			.map((n) => join(sessionDir, n));
+	} catch {
+		return []; // no sessions dir yet: a fresh session
+	}
+}
+
 export function startRun(o: {
 	cwd: string;
 	prompt: string;
@@ -1092,6 +1200,22 @@ export function startRun(o: {
 	launcher?: RunLauncher;
 	/** Set: run the turn in a worker container, falling back to a local spawn on connect failure. */
 	worker?: WorkerTarget | null;
+	/** Set: run the turn in a fresh microVM on vm-runner (docs/adr/0009-microvm-workers.md);
+	 * wins over `worker`. The run issues the card's VM token at dispatch and revokes it when
+	 * `done` settles. A busy vm-runner settles `workerBusy`, never a lost worker. */
+	vm?: {
+		target: WorkerTarget;
+		tokens: VmTokens;
+		grant: VmGrant;
+		/** task.base: the ref or sha the branch forked from. */
+		base: string;
+		/** The board URL the VM reaches (OTTR_BOARD_URL). */
+		boardUrl: string;
+		/** Tests only; default vmProviders over the board store, env keys and the model. */
+		providers?: string[];
+		/** Tests only; default: the deployment's memory backend is hindsight. */
+		hindsight?: boolean;
+	} | null;
 	/** Extra env merged into the child's base (a retro run's OTTR_RETRO=1). */
 	env?: Record<string, string>;
 	/** Values redacted from the log, stderr tail and provider error (the lent provider token). */
@@ -1111,13 +1235,18 @@ export function startRun(o: {
 	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — tests only). */
 	memoryConfigPath?: string | null;
 }): RunHandle {
+	// Issued before the sink exists so the log redacts the raw token like any other secret.
+	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
+	const vmToken = o.vm
+		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
+		: null;
 	const sink = createRunSink({
 		logPath: o.logPath,
 		dataRoot: o.dataRoot,
 		onLog: o.onLog,
 		onSession: o.onSession,
 		onProgress: o.onProgress,
-		secrets: o.secrets,
+		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
 	});
 
 	// Context a no-stderr death reports (classify folds it into the failure reason): how the
@@ -1125,14 +1254,21 @@ export function startRun(o: {
 	const memoryConfig =
 		o.memoryConfigPath !== undefined
 			? o.memoryConfigPath
-			: ensureMemoryOverlay();
+			: o.vm
+				? // vm-runner copies in only paths under /data/<project>/ (the dir holding the
+					// sessions dir), so a VM turn's overlay lives there, not at the shared root.
+					ensureMemoryOverlay({
+						...process.env,
+						OTTR_DATA_DIR: dirname(o.sessionDir),
+					})
+				: ensureMemoryOverlay();
 	const args = buildOmpArgs({ ...o, memoryConfig });
 	const startedAt = Date.now();
 
 	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
 	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
 	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
-	const layerHome = o.worker ? homedir() : boardOmpHome();
+	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
 	const pin = pinnedAgentLayer(layerHome);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
@@ -1234,6 +1370,106 @@ export function startRun(o: {
 		};
 	};
 
+	if (o.vm && vmToken !== null) {
+		const vm = o.vm;
+		const token = vmToken;
+		let stored: { provider: string; active: boolean }[] | null = null;
+		if (vm.providers === undefined)
+			try {
+				stored = signIns(join(agentDir(), "agent.db"));
+			} catch (err) {
+				// An unreadable store still routes the turn model's provider and the env keys.
+				sink.logMark(
+					`! microVM: cannot read the board's sign-ins (${err instanceof Error ? err.message : err})\n`,
+				);
+			}
+		const spec: VmSpec = {
+			project: vm.grant.project,
+			taskId: vm.grant.taskId,
+			branch: vm.grant.branch,
+			base: vm.base,
+			boardUrl: vm.boardUrl,
+			token,
+			providers: vm.providers ?? vmProviders(o.model, stored),
+			hindsight:
+				vm.hindsight ??
+				memoryBackendFromEnv(process.env).backend === "hindsight",
+			layerDir: pin.ok ? pin.layer.dir : null,
+			copyIn: [
+				...sessionPaths(o.sessionDir, o.resumeId),
+				...(o.images ?? []),
+				...(memoryConfig ? [memoryConfig] : []),
+			],
+			copyOut: [o.sessionDir],
+		};
+		const vmHandle = runWorker(
+			{
+				id: crypto.randomUUID(),
+				argv: args,
+				cwd: o.cwd,
+				stdin: o.prompt,
+				env: vmEnv({
+					env: o.env,
+					secrets: o.secrets,
+					sessionName: o.sessionName,
+					board: o.board ?? null,
+					stripBoard: o.stripBoard,
+					boardUrl: vm.boardUrl,
+					token,
+					layerEnv,
+				}),
+				vm: spec,
+			},
+			vm.target,
+			sink,
+		);
+		const vmDispatch = (): string =>
+			`vm ${vmHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`;
+		const settle = (): void => {
+			unregisterLayer();
+			// The run is over (any outcome): the VM must not push or reach /llm any more. A
+			// board restart never gets here, so a detached run keeps its token for the re-bind.
+			vm.tokens.revoke(token);
+		};
+		return {
+			pid: null,
+			url: vmHandle.url,
+			done: vmHandle.done
+				.then((r) => {
+					settle();
+					return { ...r, dispatch: vmDispatch() };
+				})
+				.catch((err) => {
+					settle();
+					if (err instanceof WorkerBusyError) {
+						// Nothing ran: runTurn puts the card back to queued as it was.
+						sink.logMark(`- ${WORKER_BUSY}: ${err.message}\n`);
+						return sink.result({
+							exitCode: null,
+							killed: false,
+							stderrTail: sink.tail(),
+							workerBusy: true,
+							dispatch: vmDispatch(),
+						});
+					}
+					if (!(err instanceof WorkerConnectError)) throw err;
+					// Same fail-closed rule as a classic worker: never the classic pool, never
+					// the server. Classify requeues a lost VM once, then parks it.
+					sink.logMark(`! microVM dispatch failed: ${err.message}\n`);
+					return sink.result({
+						exitCode: null,
+						killed: false,
+						stderrTail: `${sink.tail()}\nworker dispatch failed: ${err.message}`,
+						workerLost: true,
+						dispatch: vmDispatch(),
+					});
+				}),
+			kill: async () => vmHandle.kill(),
+			accepted: vmHandle.accepted,
+			layerId: pin.ok ? pin.layer.id : null,
+		};
+	}
+
 	if (!o.worker) return startLocal();
 
 	// The worker runs omp itself; the tracker env is forwarded so a pinned session
@@ -1323,4 +1559,19 @@ export function workerFromEnv(
 			"OTTR_WORKER_URLS is set but OTTR_WORKER_TOKEN is unset; workers require a token",
 		);
 	return { urls, token };
+}
+
+/** The microVM runner from the tracker env (OTTR_VM_RUNNER_URL, one url); null when unset. */
+export function vmRunnerFromEnv(
+	env: Record<string, string | undefined> = process.env,
+): WorkerTarget | null {
+	const url = env.OTTR_VM_RUNNER_URL?.trim().replace(/\/+$/, "");
+	if (!url) return null;
+	// Same fail-closed rule as the worker pool: vm-runner speaks the worker protocol.
+	const token = env.OTTR_WORKER_TOKEN;
+	if (!token)
+		throw new Error(
+			"OTTR_VM_RUNNER_URL is set but OTTR_WORKER_TOKEN is unset; the microVM runner requires a token",
+		);
+	return { urls: [url], token };
 }

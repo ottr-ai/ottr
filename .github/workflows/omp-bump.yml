@@ -56,7 +56,8 @@ jobs:
         env:
           VERSION: ${{ steps.pin.outputs.version }}
         run: |
-          base=$(sed -n 's/^FROM //p' Dockerfile.worker)
+          # The base of the `worker` stage; the later FROM lines name build stages, not images.
+          base=$(sed -n 's/^FROM \([^ ]*\) AS worker$/\1/p' Dockerfile.worker)
           docker run --rm "$base" sh -c 'bun install -g "@oh-my-pi/pi-coding-agent@$1" && omp --version' _ "$VERSION"
       - name: Push the bump
         if: steps.pin.outputs.version

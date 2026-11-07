@@ -35,11 +35,20 @@ import {
 	renderEvent,
 	resumePlan,
 	startRun,
+	vmEnv,
+	vmProviders,
+	vmRunnerFromEnv,
 	WORKER_LOST,
 	workerFromEnv,
 } from "./runner.ts";
 import type { GitFacts, Next, Outcome, RunResult, TurnKind } from "./types.ts";
-import { serveWorker, WORKER_DONE } from "./workers.ts";
+import { VmTokens } from "./vmTokens.ts";
+import {
+	serveWorker,
+	type VmOutcome,
+	WORKER_DONE,
+	type WorkerRequest,
+} from "./workers.ts";
 import { setGitSecrets } from "./worktree.ts";
 
 const result = (over: Partial<RunResult> = {}): RunResult => ({
@@ -3580,6 +3589,343 @@ describe("startRun agent layer pinning", () => {
 			testHome = null;
 			rmSync(shared, { recursive: true, force: true, maxRetries: 5 });
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+});
+
+describe("vmRunnerFromEnv", () => {
+	test("unset or blank is null", () => {
+		expect(vmRunnerFromEnv({})).toBeNull();
+		expect(vmRunnerFromEnv({ OTTR_VM_RUNNER_URL: "  " })).toBeNull();
+	});
+
+	test("a url without the worker token fails closed; with it one url, no trailing slash", () => {
+		expect(() =>
+			vmRunnerFromEnv({ OTTR_VM_RUNNER_URL: "http://vm-runner:8787" }),
+		).toThrow("OTTR_WORKER_TOKEN");
+		expect(
+			vmRunnerFromEnv({
+				OTTR_VM_RUNNER_URL: " http://vm-runner:8787/ ",
+				OTTR_WORKER_TOKEN: "t",
+			}),
+		).toEqual({ urls: ["http://vm-runner:8787"], token: "t" });
+	});
+});
+
+describe("vmProviders", () => {
+	test("active sign-ins, env API keys and the model's provider, deduplicated and sorted", () => {
+		expect(
+			vmProviders(
+				"zai/glm-5",
+				[
+					{ provider: "openai-codex", active: true },
+					{ provider: "anthropic", active: true },
+					// A disabled sign-in has no credential the gateway could use.
+					{ provider: "google", active: false },
+				],
+				{ OPENAI_API_KEY: "sk", ANTHROPIC_API_KEY: "" },
+			),
+		).toEqual(["anthropic", "openai", "openai-codex", "zai"]);
+	});
+
+	test("an unreadable store still routes the turn model's provider", () => {
+		expect(vmProviders("anthropic/claude", null, {})).toEqual(["anthropic"]);
+		// A model without a provider prefix adds nothing.
+		expect(vmProviders("bare-model", null, {})).toEqual([]);
+	});
+});
+
+describe("vmEnv", () => {
+	const board = {
+		url: "http://127.0.0.1:4747",
+		token: "boot-token",
+		project: "p",
+		taskId: "P-1",
+	};
+
+	test("an allowlist: env.txt values and run flags pass, credentials and board-process names never", () => {
+		const env = vmEnv({
+			env: {
+				FOO: "bar",
+				OTTR_REVIEW: "1",
+				ANTHROPIC_API_KEY: "sk-ant",
+				ANTHROPIC_OAUTH_TOKEN: "lent-oauth",
+				ZAI_API_KEY: "zai-lent",
+				OPENAI_API_KEY: "sk-oai",
+				GH_TOKEN: "ghp",
+				GITHUB_TOKEN: "ghp2",
+				HINDSIGHT_API_TOKEN: "hs",
+				OTTR_WORKER_TOKEN: "wt",
+				SOME_NAME: "lent-elsewhere",
+				PATH: "/board/bin",
+			},
+			secrets: ["lent-elsewhere"],
+			sessionName: "Fix it",
+			board,
+			boardUrl: "http://ottr:8080",
+			token: "vm-token",
+			layerEnv: {
+				HOME: "/root/.alate/layers/l1",
+				PI_CODING_AGENT_DIR: "/root/.alate/layers/l1/.omp/agent",
+			},
+		});
+		expect(env).toEqual({
+			FOO: "bar",
+			OTTR_REVIEW: "1",
+			OTTR_SESSION_NAME: "Fix it",
+			OTTR_BOARD_URL: "http://ottr:8080",
+			OTTR_BOARD_TOKEN: "vm-token",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "P-1",
+			HOME: "/root/.alate/layers/l1",
+			PI_CODING_AGENT_DIR: "/root/.alate/layers/l1/.omp/agent",
+		});
+	});
+
+	test("stripBoard drops the board coordinates and the VM token", () => {
+		const env = vmEnv({
+			env: { OTTR_RETRO: "1" },
+			board,
+			stripBoard: true,
+			boardUrl: "http://ottr:8080",
+			token: "vm-token",
+			layerEnv: null,
+		});
+		expect(env).toEqual({ OTTR_RETRO: "1" });
+	});
+});
+
+describe("classify microVM dirty tree", () => {
+	const ready = (vmDirty: string[] | null) =>
+		classify({
+			kind: "work",
+			result: result({ outcome: outcome() }),
+			git: git({ clean: false }),
+			target: null,
+			previousError: null,
+			vmDirty,
+		});
+
+	test("a ready report over a dirty VM tree parks and names the first 20 files", () => {
+		const files = Array.from({ length: 23 }, (_, i) => `?? f${i}.txt`);
+		const next = ready(files);
+		expect(next.state).toBe("needs_you");
+		expect(next.needsReason).toContain("?? f0.txt, ?? f1.txt");
+		expect(next.needsReason).toContain("?? f19.txt");
+		expect(next.needsReason).not.toContain("?? f20.txt");
+		expect(next.needsReason).toContain("(+3 more)");
+	});
+
+	test("a VM that could not report its tree says so", () => {
+		const next = ready(null);
+		expect(next.state).toBe("needs_you");
+		expect(next.needsReason).toContain("could not report");
+	});
+
+	test("a classic run keeps today's reason", () => {
+		const next = classify({
+			kind: "work",
+			result: result({ outcome: outcome() }),
+			git: git({ clean: false }),
+			target: null,
+			previousError: null,
+		});
+		expect(next.needsReason).toBe(
+			"Reported ready, but git shows 1 commit(s) ahead of the base and uncommitted changes.",
+		);
+	});
+});
+
+describe("startRun microVM dispatch", () => {
+	const grant = {
+		project: "p",
+		taskId: "P-1",
+		branch: "ott/p-1-x",
+		repoPath: "/workspace/p",
+		worktree: "/workspace/p/.worktrees/P-1",
+	};
+	const vmOut: VmOutcome = {
+		head: "a".repeat(40),
+		pushError: null,
+		dirty: [],
+	};
+
+	/** A fake vm-runner: records each /run body and the token's grant at dispatch time. */
+	function fakeRunner(tokens: VmTokens, answer: "run" | "busy" | "plain503") {
+		const seen: { body: WorkerRequest; grantAtDispatch: unknown }[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				const body = (await req.json()) as WorkerRequest;
+				seen.push({ body, grantAtDispatch: tokens.check(body.vm?.token) });
+				if (answer === "busy")
+					return new Response("busy", {
+						status: 503,
+						headers: { "x-ottr-busy": "1" },
+					});
+				if (answer === "plain503") return new Response("down", { status: 503 });
+				return new Response(
+					[
+						JSON.stringify({ type: "session", id: "sess-vm" }),
+						JSON.stringify({ type: "agent_end", isTerminal: true }),
+						JSON.stringify({
+							[WORKER_DONE]: {
+								exitCode: 0,
+								stderrTail: "",
+								host: "vm",
+								vm: vmOut,
+							},
+						}),
+						"",
+					].join("\n"),
+				);
+			},
+		});
+		return { server, seen, url: `http://127.0.0.1:${server.port}` };
+	}
+
+	function vmOpts(dir: string, tokens: VmTokens, url: string) {
+		const sessionDir = join(dir, "sessions");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(sessionDir, "1_sess-old.jsonl"), "{}\n");
+		writeFileSync(join(sessionDir, "2_other.jsonl"), "{}\n");
+		return {
+			cwd: dir,
+			prompt: "do it",
+			sessionDir,
+			extensionPath: join(dir, "ext.ts"),
+			resumeId: "sess-old",
+			images: [join(dir, "img.png")],
+			model: "anthropic/claude-x",
+			logPath: join(dir, "run.log"),
+			dataRoot: dir,
+			memoryConfigPath: join(dir, "omp-memory.yml"),
+			board: {
+				url: "http://127.0.0.1:4747",
+				token: "boot-token",
+				project: "p",
+				taskId: "P-1",
+			},
+			env: { FOO: "bar", ANTHROPIC_OAUTH_TOKEN: "lent-tok" },
+			secrets: ["lent-tok"],
+			launcher: (() => {
+				throw new Error("a microVM turn must never spawn locally");
+			}) as RunLauncher,
+			vm: {
+				target: { urls: [url], token: "wtok" },
+				tokens,
+				grant,
+				base: "sha-base",
+				boardUrl: "http://ottr:8080",
+				providers: ["anthropic"],
+				hindsight: false,
+			},
+		};
+	}
+
+	test("the VM gets its own token, never the boot token or a lent or board credential; the token dies at settle", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		const saved = process.env.ANTHROPIC_API_KEY;
+		process.env.ANTHROPIC_API_KEY = "sk-board-key";
+		try {
+			const run = startRun(vmOpts(dir, tokens, url));
+			expect(run.url).toBe(url);
+			const r = await run.done;
+			expect(await run.accepted).toBe(true);
+			expect(r.exitCode).toBe(0);
+			expect(r.vm).toEqual(vmOut);
+			expect(r.workerBusy).toBeUndefined();
+			const { body, grantAtDispatch } = seen[0]!;
+			const token = body.vm!.token;
+			// Live while the VM ran, revoked once the run settled.
+			expect(grantAtDispatch).toEqual({ ...grant, base: "sha-base" });
+			expect(tokens.check(token)).toBeNull();
+			expect(body.env.OTTR_BOARD_TOKEN).toBe(token);
+			expect(body.env.FOO).toBe("bar");
+			const values = Object.values(body.env);
+			for (const leaked of ["boot-token", "lent-tok", "sk-board-key"])
+				expect(values).not.toContain(leaked);
+			expect(
+				Object.keys(body.env).filter((k) =>
+					/^(ANTHROPIC|OPENAI|GH|HINDSIGHT)_/.test(k),
+				),
+			).toEqual([]);
+			expect(body.vm).toMatchObject({
+				project: "p",
+				taskId: "P-1",
+				branch: "ott/p-1-x",
+				base: "sha-base",
+				boardUrl: "http://ottr:8080",
+				providers: ["anthropic"],
+				hindsight: false,
+				copyOut: [join(dir, "sessions")],
+			});
+			// Only the resumed session's file, the turn's images and the memory overlay go in.
+			expect(body.vm!.copyIn).toEqual([
+				join(dir, "sessions", "1_sess-old.jsonl"),
+				join(dir, "img.png"),
+				join(dir, "omp-memory.yml"),
+			]);
+			// The raw VM token never reaches the task log.
+			expect(readFileSync(join(dir, "run.log"), "utf8")).not.toContain(token);
+		} finally {
+			if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = saved;
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a busy runner settles workerBusy, not a lost worker, and the token is revoked", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-busy-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "busy");
+		try {
+			const run = startRun(vmOpts(dir, tokens, url));
+			expect(await run.accepted).toBe(false);
+			const r = await run.done;
+			expect(r.workerBusy).toBe(true);
+			expect(r.workerLost).toBeUndefined();
+			expect(r.exitCode).toBeNull();
+			expect(tokens.check(seen[0]!.body.vm!.token)).toBeNull();
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the memory overlay of a VM turn lives in the project's data dir, which vm-runner copies in", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-mem-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		try {
+			const { memoryConfigPath: _omit, ...opts } = vmOpts(dir, tokens, url);
+			await startRun(opts).done;
+			const overlay = join(dir, "omp-memory.yml");
+			const { body } = seen[0]!;
+			expect(existsSync(overlay)).toBe(true);
+			expect(body.vm!.copyIn).toContain(overlay);
+			const at = body.argv.lastIndexOf("--config");
+			expect(body.argv[at + 1]).toBe(overlay);
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a 503 without the busy header is a lost dispatch", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-503-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, url } = fakeRunner(tokens, "plain503");
+		try {
+			const r = await startRun(vmOpts(dir, tokens, url)).done;
+			expect(r.workerLost).toBe(true);
+			expect(r.workerBusy).toBeUndefined();
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

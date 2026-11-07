@@ -1,0 +1,157 @@
+#!/bin/sh
+# Guest init of an Ottr microVM (OTTR-532): PID 1 by the kernel cmdline's init=, inside the
+# guest. The vm-runner image (Dockerfile.worker, stage vm-runner) ships it, and the guest's
+# base rootfs is that image's own root. Boot contract (vm-runner <-> init):
+#   vda: base rootfs ext4, the kernel's root (root=/dev/vda ro), mounted read-only;
+#   vdb: the project layer ext4 with upper/ and work/ (read-only in run mode, written in bake);
+#   vdc: the scratch ext4 the turn writes to (run mode only);
+#   cmdline: ottr.mode=run|bake ottr.token=<hex> ottr.board=<board ip> ottr.boardhost=<name>;
+#   eth0 is already up: the kernel configures it from the cmdline's ip= (IP_PNP).
+# It builds a writable overlay root over vda (run: lower vdb's upper over vda, upper on vdc;
+# bake: lower vda, upper on vdb, so the bake's changes become the layer), chroots into it,
+# runs the guest agent (src/vmGuest.ts, port 7070) and ends the VM when the agent exits.
+# POSIX sh (dash) with coreutils, util-linux and iproute2 only: no busybox in the image.
+# No `set -e`: every failure must still end the VM, or vm-runner waits on a VM that idles.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# The cmdline is split on blanks below; a stray glob character must stay literal.
+set -f
+
+# Ends the VM. Firecracker implements no ACPI power-off, so a guest power-off (sysrq o)
+# halts the vCPUs and leaves the firecracker process running, while a reboot is the
+# i8042 reset (reboot=k on the cmdline), which makes firecracker exit: that exit is how
+# vm-runner learns the VM is done. sysrq b is `reboot -f` without an init system (the
+# image has no systemd). Without /proc it cannot write the trigger: PID 1 exiting panics
+# the kernel, and panic=1 reboots it the same way a second later.
+power_off() {
+	sync
+	echo b >/proc/sysrq-trigger 2>/dev/null
+	exit 1
+}
+
+die() {
+	echo "ottr-vm-init: $*; powering off" >&2
+	power_off
+}
+
+mount -t proc proc /proc || die "cannot mount /proc"
+mount -t sysfs sysfs /sys || die "cannot mount /sys"
+# DEVTMPFS_MOUNT mounts /dev before init in the pinned kernel; a kernel without it does not.
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev || die "cannot mount /dev"
+# The serial console (ttyS0) is the VM's log, which firecracker passes to vm-runner.
+if [ -c /dev/console ]; then
+	exec </dev/null >/dev/console 2>&1
+fi
+
+mode=
+token=
+board=
+boardhost=
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	ottr.mode=*) mode="${arg#ottr.mode=}" ;;
+	ottr.token=*) token="${arg#ottr.token=}" ;;
+	ottr.board=*) board="${arg#ottr.board=}" ;;
+	ottr.boardhost=*) boardhost="${arg#ottr.boardhost=}" ;;
+	esac
+done
+# The values land in /etc/hosts and the agent's env: refuse anything but their plain shapes.
+case "$mode" in
+run | bake) ;;
+*) die "ottr.mode must be run or bake, not '$mode'" ;;
+esac
+case "$token" in
+"" | *[!0-9a-f]*) die "ottr.token is missing or not lowercase hex" ;;
+esac
+case "$board" in
+"" | *[!0-9.]*) die "ottr.board must be an IPv4 address, not '$board'" ;;
+esac
+case "$boardhost" in
+"" | -* | *[!A-Za-z0-9.-]*) die "ottr.boardhost must be a host name, not '$boardhost'" ;;
+esac
+# The token never reaches the log.
+echo "ottr-vm-init: mode $mode, board $boardhost at $board"
+
+# vda is read-only, so the mount points live on a small tmpfs. /tmp is in every Debian
+# root; the overlay root below has its own /tmp, so this one stays private to init.
+m=/tmp
+mount -t tmpfs -o mode=0700,size=1m ottr-vm-init "$m" || die "cannot mount the init tmpfs"
+mkdir "$m/base" "$m/layer" "$m/scratch" "$m/root" || die "cannot create the mount points"
+# The overlay's lowest layer is vda's own tree. A plain (non-recursive) bind carries none
+# of the mounts above (/proc, /sys, /dev, this tmpfs), so the new root sees vda only.
+mount --bind / "$m/base" || die "cannot bind the base rootfs"
+
+if [ "$mode" = run ]; then
+	mount -t ext4 -o ro /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
+	mount -t ext4 /dev/vdc "$m/scratch" || die "cannot mount the scratch disk (vdc)"
+	mkdir -p "$m/scratch/upper" "$m/scratch/work" || die "cannot prepare the scratch disk"
+	# A project that never baked has an empty layer: then vda is the only lower layer.
+	lower="$m/base"
+	if [ -d "$m/layer/upper" ]; then
+		lower="$m/layer/upper:$m/base"
+	fi
+	upper="$m/scratch/upper"
+	work="$m/scratch/work"
+else
+	mount -t ext4 /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
+	mkdir -p "$m/layer/upper" "$m/layer/work" || die "cannot prepare the project layer"
+	lower="$m/base"
+	upper="$m/layer/upper"
+	work="$m/layer/work"
+fi
+r="$m/root"
+mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$r" ||
+	die "cannot mount the overlay root"
+
+# The kernel filesystems the agent and its tools expect, mounted fresh into the new root
+# (proc, sysfs and devtmpfs are the same kernel instances as init's own).
+mkdir -p "$r/proc" "$r/sys" "$r/dev" "$r/run" "$r/tmp" || die "cannot create the root's mount points"
+chmod 1777 "$r/tmp"
+mount -t proc proc "$r/proc" || die "cannot mount the root's /proc"
+mount -t sysfs sysfs "$r/sys" || die "cannot mount the root's /sys"
+mount -t devtmpfs devtmpfs "$r/dev" || die "cannot mount the root's /dev"
+mkdir -p "$r/dev/pts" "$r/dev/shm"
+# Terminals for the tools a turn runs (ssh, script, test runners that want a pty).
+mount -t devpts -o gid=5,mode=0620,ptmxmode=0666 devpts "$r/dev/pts" || die "cannot mount /dev/pts"
+mount -t tmpfs -o mode=1777 shm "$r/dev/shm" || die "cannot mount /dev/shm"
+mount -t tmpfs -o mode=0755 run "$r/run" || die "cannot mount /run"
+
+# Name resolution: the board by the name turns use for it (OTTR_BOARD_URL), everything else
+# through public resolvers. The VM reaches no compose DNS: vm-runner's rules drop it.
+# rm first: the rootfs may carry them as links to files outside the guest's control.
+rm -f "$r/etc/hosts" "$r/etc/resolv.conf"
+printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n%s\t%s\n' \
+	"$board" "$boardhost" >"$r/etc/hosts" || die "cannot write /etc/hosts"
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$r/etc/resolv.conf" ||
+	die "cannot write /etc/resolv.conf"
+# The kernel's ip= autoconfig brings up eth0; loopback is set up here in case it did not.
+ip link set lo up 2>/dev/null
+
+# The guest agent with the worker image's env (the rootfs is a plain tree: the image's ENV
+# lines do not come with it) and nothing else: env -i keeps the kernel's init env out.
+# In the background so PID 1 stays this shell: dash's wait reaps every child, so the
+# orphans omp and its tools leave behind reparent here and are reaped, not left as zombies.
+chroot "$r" /usr/bin/env -i \
+	HOME=/root \
+	PATH=/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+	BUN_INSTALL=/usr/local/bun \
+	NODE_OPTIONS=--require=/app/src/stryker-tap.cjs \
+	LANG=C.UTF-8 \
+	OTTR_VM_GUEST_TOKEN="$token" \
+	bun /app/src/vmGuest.ts &
+agent=$!
+wait "$agent"
+echo "ottr-vm-init: the guest agent exited with status $?"
+
+# Everything still running would keep files open on the overlay: a bake's layer must
+# unmount clean, because a run mounts it read-only and cannot replay a journal. kill -1
+# from PID 1 signals every process but init.
+kill -TERM -1 2>/dev/null
+sleep 2
+kill -KILL -1 2>/dev/null
+sleep 1
+sync
+umount -R "$r" 2>/dev/null || umount -l "$r" 2>/dev/null
+umount "$m/scratch" 2>/dev/null
+umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null
+power_off
