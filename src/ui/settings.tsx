@@ -29,6 +29,7 @@ import {
 	Help,
 	Icon,
 	type IconName,
+	type InstantSave,
 	interviewMsg,
 	logOut,
 	Mark,
@@ -41,6 +42,8 @@ import {
 	unwrap,
 	useBusy,
 	useFlash,
+	useInstantSave,
+	useOptimisticValue,
 	useQuota,
 } from "./kit.tsx";
 import {
@@ -4021,31 +4024,6 @@ function SaveTick({
 	);
 }
 
-/** State of one save that runs on its own; `run` sends, `onFail` rolls an optimistic value back. */
-type InstantSave = {
-	run: (send: () => Promise<unknown>, onFail?: () => void) => void;
-	busy: boolean;
-	failed: boolean;
-	saved: boolean;
-};
-
-/** One save that runs on its own (a toggle, an upload, a card's Save): busy while it runs,
- *  then a short "saved" flash. */
-function useInstantSave(act: Act): InstantSave {
-	const busy = useBusy();
-	const [saved, flash] = useFlash(1600);
-	const run = (send: () => Promise<unknown>, onFail?: () => void): void =>
-		busy.start(async () => {
-			const ok = await act(async () => {
-				await send();
-			});
-			if (ok) flash();
-			else onFail?.();
-			return ok;
-		});
-	return { run, busy: busy.busy, failed: busy.failed, saved };
-}
-
 /** One on/off setting, GitHub style: the checkbox leads, the bold name and the description
  *  sit to its right. A change saves at once; the box shows the new value until the board
  *  state catches up, and rolls back if the save fails. `sub` indents a dependent option. */
@@ -4068,11 +4046,7 @@ function CheckRow({
 	act: Act;
 }) {
 	const id = useId();
-	const s = useInstantSave(act);
-	const [local, setLocal] = useState<boolean | null>(null);
-	useEffect(() => {
-		if (local === checked) setLocal(null);
-	}, [local, checked]);
+	const s = useOptimisticValue(checked, act);
 	return (
 		<div
 			className={`alate-def-row check-row${sub === true ? " check-sub" : ""}`}
@@ -4080,15 +4054,12 @@ function CheckRow({
 			<input
 				id={id}
 				type="checkbox"
-				checked={local ?? checked}
+				checked={s.value}
 				disabled={disabled || s.busy}
 				onChange={(e) => {
 					const v = e.target.checked;
-					setLocal(v);
-					s.run(
-						() => save(v),
-						() => setLocal(null),
-					);
+					s.set(v);
+					s.run(() => save(v));
 				}}
 				aria-describedby={`${id}-desc`}
 			/>

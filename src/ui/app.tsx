@@ -101,6 +101,8 @@ import {
 	useBusy,
 	useDelayedState,
 	useFlash,
+	useInstantSave,
+	useOptimisticValue,
 	useQuota,
 	windowGone,
 	ZoomableImage,
@@ -3832,14 +3834,14 @@ export function ProjectBoard({
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
-					): Promise<void> => {
+					): Promise<boolean> => {
 						const order = reorderIds(tasks, c.key, dragId, beforeId);
-						if (order === null) return Promise.resolve();
+						if (order === null) return Promise.resolve(true);
 						return act(() =>
 							post(`/api/projects/${encodeURIComponent(project.name)}/queue`, {
 								order,
 							}).then(() => undefined),
-						).then(() => undefined);
+						);
 					};
 					return (
 						<section
@@ -5061,18 +5063,22 @@ export function LaneCol({
 	deltas: Map<string, number>;
 	open: (id: string) => void;
 	unread: (t: TaskCard) => boolean;
-	onReorder: (dragId: string, beforeId: string | null) => Promise<void>;
+	onReorder: (dragId: string, beforeId: string | null) => Promise<boolean>;
 	filtering: boolean;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 }) {
 	const boxRef = useRef<HTMLDivElement | null>(null);
 	const uid = useId();
+	// Optimistic overlay: the queued-id order the client adopted on a reorder tap, before the
+	// server frame confirms it. null = render the server order; a failed POST clears it and
+	// the FLIP effect slides the cards back.
+	const [localOrder, setLocalOrder] = useState<string[] | null>(null);
 	const [dragId, setDragId] = useState<string | null>(null);
 	// undefined = old place/no slot, null = end, string = insert before that card.
 	const [drop, setDrop] = useState<string | null | undefined>(undefined);
-	// A reorder request in flight: the slot stays at the drop point with a spinner, the source
-	// card dims, and every reorder path (drag, drop, keyboard) is blocked until it settles.
+	// A reorder request in flight: the moved card dims, and every reorder path (drag, drop,
+	// keyboard) is blocked until it settles. The new order shows at once via localOrder.
 	const [pending, setPending] = useState<{
 		id: string;
 		before: string | null;
@@ -5131,6 +5137,16 @@ export function LaneCol({
 		moreFocus.current = null;
 		f.scope.querySelectorAll<HTMLElement>(".card-open")[f.index]?.focus();
 	});
+	// Settle: once a server frame's queued order matches the overlay, the overlay is
+	// redundant and clears (any later change re-renders from the server order).
+	useEffect(() => {
+		if (localOrder === null) return;
+		const serverQueued = tasks
+			.filter((t) => t.state === "queued")
+			.map((t) => t.id)
+			.join(" ");
+		if (serverQueued === localOrder.join(" ")) setLocalOrder(null);
+	}, [tasks, localOrder]);
 
 	if (!hasTasks && !showBacklogRow)
 		return (
@@ -5144,6 +5160,17 @@ export function LaneCol({
 	// targets, so a queued card can never land above a running/needs_you card.
 	const queued = tasks.filter((t) => t.state === "queued");
 	const dnd = queued.length >= 2;
+	// The rendered list: with an overlay held, non-queued cards keep their positions first
+	// and the queued block follows the client's order (the partition laneOrder draws).
+	const view =
+		localOrder === null
+			? tasks
+			: [
+					...tasks.filter((t) => t.state !== "queued"),
+					...localOrder
+						.map((id) => tasks.find((t) => t.id === id))
+						.filter((t) => t !== undefined),
+				];
 	const clear = (): void => {
 		setDragId(null);
 		setDrop(undefined);
@@ -5151,17 +5178,18 @@ export function LaneCol({
 	// One reorder at a time: a second request would be computed from the pre-reorder order and
 	// overwrite the first on the server (last write wins). Every reorder path routes through here.
 	const sendReorder = (id: string, before: string | null): void => {
+		// `tasks` is this column's laneOrder-ed list; reorderIds over it yields the column's
+		// queued-id order, which the server's queuedAt rewrite reproduces exactly.
+		const next = reorderIds(tasks, stage, id, before);
 		setPending({ id, before });
-		void onReorder(id, before).finally(() => setPending(null));
+		if (next !== null) setLocalOrder(next);
+		void onReorder(id, before)
+			.then((ok) => {
+				if (!ok) setLocalOrder(null);
+			})
+			.finally(() => setPending(null));
 	};
 	const busy = pending !== null;
-	// The in-flight drop slot: dashed placeholder with a spinner, standing where the card will land.
-	const slot = busy ? (
-		<div key="reorder-slot" className="drop-slot" role="status">
-			<span className="spinner" aria-hidden="true" />
-			reordering…
-		</div>
-	) : null;
 	// ponytail: read live card midpoints during drag; cache only if columns reach hundreds of cards.
 	const dropAt = (y: number): string | null | undefined => {
 		const box = boxRef.current;
@@ -5292,7 +5320,7 @@ export function LaneCol({
 							}
 							// Clearing here, not in onDragEnd: setPending re-renders before the browser
 							// dispatches dragend, which detaches the drag prop and its handler, so a
-							// stale drop would repaint the placeholder after the order confirms.
+							// stale drop would re-send the reorder after the order confirms.
 							clear();
 							sendReorder(dragId, before);
 						}
@@ -5425,13 +5453,9 @@ export function LaneCol({
 							</section>
 						);
 					})
-				: tasks
+				: view
 						.filter((t) => t.cancelledAt !== null || (!unread(t) && !t.starred))
-						.flatMap((t) => [
-							// The spinner slot stands in for the card while its reorder request is in flight.
-							pending?.before === t.id ? slot : null,
-							card(t),
-						])}
+						.map(card)}
 			{more > 0 && onMore && (
 				<button
 					type="button"
@@ -5468,7 +5492,6 @@ export function LaneCol({
 				</>
 			)}
 			{parked?.map(card)}
-			{groups === null && pending?.before === null && slot}
 		</div>
 	);
 }
@@ -5697,7 +5720,8 @@ export function coveredUpdateIds(tasks: TaskCard[]): Map<string, TaskCard> {
 }
 
 /** Upstream updates from the Alate provider (U5): rows grouped by repo, optional Skip per row.
- * The WS state frame owns the data; the panel only fires a refresh and skip POSTs. */
+ * The WS state frame owns the data; the panel fires a refresh, optimistic Allow/Skip taps
+ * (clear-or-hide first, rollback on a failed POST), and skip POSTs. */
 function UpdatesPanel({
 	updates,
 	tasks,
@@ -5737,7 +5761,7 @@ function UpdatesPanel({
 		(r) => selected.has(r.id) && r.target !== null,
 	);
 	const noTarget = rows.filter((r) => selected.has(r.id) && r.target === null);
-	const allow = useBusy();
+	const allow = useInstantSave(act);
 	const toggle = (id: string): void =>
 		setSelected((s) => {
 			const next = new Set(s);
@@ -5775,15 +5799,13 @@ function UpdatesPanel({
 						className="primary"
 						disabled={allow.busy || withTarget.length === 0}
 						onClick={() => {
-							// The WS state frame re-renders the panel, so the whole selection clears on success.
-							void allow.start(() =>
-								act(async () => {
-									await post("/api/updates/allow", {
-										ids: withTarget.map((r) => r.id),
-										propose: false,
-									});
-									setSelected(new Set());
-								}),
+							// Optimistic: the selection clears the moment the request goes out; a
+							// failed allow restores exactly the ids that were being sent.
+							const ids = withTarget.map((r) => r.id);
+							setSelected(new Set());
+							allow.run(
+								() => post("/api/updates/allow", { ids, propose: false }),
+								() => setSelected(new Set(ids)),
 							);
 						}}
 					>
@@ -5793,14 +5815,11 @@ function UpdatesPanel({
 						type="button"
 						disabled={allow.busy || noTarget.length === 0}
 						onClick={() => {
-							void allow.start(() =>
-								act(async () => {
-									await post("/api/updates/allow", {
-										ids: noTarget.map((r) => r.id),
-										propose: true,
-									});
-									setSelected(new Set());
-								}),
+							const ids = noTarget.map((r) => r.id);
+							setSelected(new Set());
+							allow.run(
+								() => post("/api/updates/allow", { ids, propose: true }),
+								() => setSelected(new Set(ids)),
 							);
 						}}
 					>
@@ -5899,6 +5918,11 @@ export function UpdateRowLine({
 }) {
 	// managedBy rows offer no actions (U5); removed rows are not selectable but
 	// do offer Skip below (keep the local copy, hide the row).
+	// Optimistic Skip: the row hides the moment the tap lands, the skip POST rolls it
+	// back on failure, and the WS state frame removes it for good. The server marks a
+	// skipped row without creating ids, so the tap is reversible and safe to lead with.
+	const skip = useInstantSave(act);
+	const [hidden, setHidden] = useState(false);
 	const actionable =
 		row.project !== null &&
 		row.managedBy === undefined &&
@@ -5909,14 +5933,19 @@ export function UpdateRowLine({
 		<button
 			type="button"
 			className="updates-skip ghost"
+			disabled={skip.busy}
 			onClick={() => {
-				// The WS state frame removes the row; no local optimistic delete.
-				void act(() => post("/api/updates/skip", { id: row.id }));
+				setHidden(true);
+				skip.run(
+					() => post("/api/updates/skip", { id: row.id }),
+					() => setHidden(false),
+				);
 			}}
 		>
 			Skip
 		</button>
 	);
+	if (hidden) return null;
 	// Explicit association: the input sits inside a fragment variable the
 	// noLabelWithoutControl rule cannot see through.
 	const pickId = `updates-pick-${row.id}`;
@@ -7791,6 +7820,41 @@ function ProposalPanel({
 	);
 }
 
+/** The drawer head's optimistic star: the icon flips before the POST lands, a failed
+ * POST rolls it back (The Optimistic-Tap Rule). `disabled` while the save is in
+ * flight keeps one request at a time. */
+export function StarToggle({
+	act,
+	task,
+}: {
+	act: Act;
+	task: Pick<TaskCard, "project" | "id" | "starred">;
+}) {
+	const star = useOptimisticValue(task.starred, act);
+	const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`;
+	return (
+		<button
+			type="button"
+			className="icon"
+			aria-pressed={star.value}
+			aria-label={star.value ? "Starred" : "Star"}
+			title={
+				star.value
+					? "Removes this report from the Starred section"
+					: "Pins this report in the Starred section of the done lane"
+			}
+			disabled={star.busy}
+			aria-busy={star.busy || undefined}
+			onClick={() => {
+				star.set(!star.value);
+				star.run(() => post(url, { starred: !star.value }));
+			}}
+		>
+			<Icon name="star" />
+		</button>
+	);
+}
+
 /** Where the card ran, for the Meta row: the newest work turn that recorded it, else the newest
  * turn of any kind (a merge-only history), else null — the row shows "-". The string names the
  * worker or the board plus the docker container hostname the run executed in. */
@@ -8028,13 +8092,16 @@ export function Drawer({
 	const [triageReason, setTriageReason] = useState("");
 	const [triageError, setTriageError] = useState<string | null>(null);
 	const triageSave = useBusy();
+	// The rank select leads: the picked value shows at once, the triage POST follows,
+	// a failure rolls the select back and lands in the inline alert (onError).
+	const rank = useOptimisticValue(task.priority ?? "", act);
 	const triageUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/triage`;
 	const setRank = (p: string): void => {
-		void act(
-			async () => {
-				await post(triageUrl, { priority: p === "" ? null : p });
-			},
-			(message) => setTriageError(message),
+		rank.set(p);
+		rank.run(
+			() => post(triageUrl, { priority: p === "" ? null : p }),
+			undefined,
+			setTriageError,
 		);
 	};
 	const nominateCandidate = (): void => {
@@ -8188,6 +8255,13 @@ export function Drawer({
 	 * (Resume, ask answers) pass draft=false: the user's typed reply and its images stay. */
 	const sendReply = (text: string, draft = false): Promise<boolean> => {
 		if (text.trim().length === 0) return Promise.resolve(true);
+		// Optimistic Queued bubble: mirror the server's prompt (`text.trim() || "."`) and
+		// show it at once; a failed POST rolls it back (The Optimistic-Tap Rule).
+		const prompt = text.trim() || ".";
+		setLocalPending({
+			text: prompt,
+			images: draft ? replyImages.images.length : 0,
+		});
 		return act(async () => {
 			const images = draft ? replyImages.images.map((i) => i.data) : [];
 			await post(
@@ -8198,6 +8272,9 @@ export function Drawer({
 				setReply("");
 				replyImages.clear();
 			}
+		}).then((ok) => {
+			if (!ok) setLocalPending(null);
+			return ok;
 		});
 	};
 
@@ -8255,6 +8332,9 @@ export function Drawer({
 	const sendSteer = (text: string): Promise<boolean> => {
 		if (text.trim().length === 0 && steerImages.images.length === 0)
 			return Promise.resolve(true);
+		// Optimistic Queued bubble, as in sendReply: show it at once, roll back on failure.
+		const prompt = text.trim() || ".";
+		setLocalPending({ text: prompt, images: steerImages.images.length });
 		return act(async () => {
 			const images = steerImages.images.map((i) => i.data);
 			await post(
@@ -8263,6 +8343,9 @@ export function Drawer({
 			);
 			setSteer("");
 			steerImages.clear();
+		}).then((ok) => {
+			if (!ok) setLocalPending(null);
+			return ok;
 		});
 	};
 	/** Withdraws the queued steering before the agent's next turn delivers it. */
@@ -8282,19 +8365,39 @@ export function Drawer({
 			);
 			setSteerEdit(null);
 		});
-	/** Switches the model the agent's next turn runs with; lands in-between turns like a steer. */
+	/** Switches the model the agent's next turn runs with; lands in-between turns like a steer.
+	 *  The picker leads: the picked name shows at once, the POST follows, a failure rolls back. */
+	const modelUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`;
+	const model = useOptimisticValue(task.model ?? "", act);
 	const switchModel = (m: string): void => {
-		void act(async () => {
-			await post(
-				`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
-				{ model: m },
-			);
-		});
+		model.set(m);
+		model.run(() => post(modelUrl, { model: m }));
 	};
 	const editSave = useBusy();
 	const steerEditSave = useBusy();
 	const replySend = useBusy();
 	const steerSend = useBusy();
+	// The optimistic Queued bubble: what this client just sent, before the server's
+	// pendingPrompt frame lands. null = render the server's pendingPrompt as before.
+	const [localPending, setLocalPending] = useState<{
+		text: string;
+		images: number;
+	} | null>(null);
+	// Settle: once the server's pendingPrompt carries the sent text (it appends with
+	// "\n\n" when one was already parked) the overlay is redundant. If the prompt is
+	// gone again and no send is in flight, the bubble was consumed mid-run — clear too.
+	// busy is true synchronously in the same handler that sets localPending, so this
+	// effect cannot clear the overlay in the tick it is set.
+	useEffect(() => {
+		if (localPending === null) return;
+		const server = task.pendingPrompt;
+		const settled =
+			(server !== null &&
+				(server === localPending.text ||
+					server.endsWith(`\n\n${localPending.text}`))) ||
+			(server === null && !steerSend.busy && !replySend.busy);
+		if (settled) setLocalPending(null);
+	}, [task.pendingPrompt, localPending, steerSend.busy, replySend.busy]);
 
 	return (
 		<>
@@ -8310,27 +8413,9 @@ export function Drawer({
 							<h2>{task.sessionTitle ?? task.title}</h2>
 							<div className="drawer-head-actions">
 								{task.stage === "done" && task.research && !cancelled && (
-									<button
-										type="button"
-										className="icon"
-										aria-pressed={task.starred}
-										aria-label={task.starred ? "Starred" : "Star"}
-										title={
-											task.starred
-												? "Removes this report from the Starred section"
-												: "Pins this report in the Starred section of the done lane"
-										}
-										onClick={() =>
-											void act(async () => {
-												await post(
-													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/star`,
-													{ starred: !task.starred },
-												);
-											})
-										}
-									>
-										<Icon name="star" />
-									</button>
+									// Optimistic tap: the star flips at once, the POST follows, a
+									// failure rolls it back (The Optimistic-Tap Rule).
+									<StarToggle act={act} task={task} />
 								)}
 								<button
 									type="button"
@@ -9400,7 +9485,7 @@ export function Drawer({
 							{/* A queued steer speaks in the timeline under the last turn: it is the
 						    next input the agent will get, not part of the composer below.
 						    Same visibility as before (running/queued): other states never showed it. */}
-							{task.pendingPrompt !== null &&
+							{(localPending !== null || task.pendingPrompt !== null) &&
 								(task.state === "running" || task.state === "queued") && (
 									<li className="turn">
 										<span className="turn-node">
@@ -9409,42 +9494,57 @@ export function Drawer({
 										<div className="you">
 											<span className="you-head">
 												Queued
-												{task.pendingPrompt.trim() !== "." && (
-													<>
-														<BusyButton
-															className="ghost"
-															ariaLabel="Edit the queued steering"
-															run={() => {
-																setSteerEdit(task.pendingPrompt);
-																return Promise.resolve(true);
-															}}
-														>
-															Edit
-														</BusyButton>
-														<BusyButton
-															className="ghost"
-															ariaLabel="Cancel the queued steering"
-															run={async () =>
-																(await confirmDialog(
-																	"Discard the queued steering?",
-																	{ ok: "Discard", danger: true },
-																))
-																	? cancelSteer()
-																	: Promise.resolve(true)
-															}
-														>
-															Cancel
-														</BusyButton>
-													</>
-												)}
+												{/* Edit/Cancel act on the server's queued prompt: they
+												    wait for the server frame, so they hide while the
+												    optimistic bubble from this client's own send is
+												    still unconfirmed. */}
+												{localPending === null &&
+													task.pendingPrompt !== null &&
+													task.pendingPrompt.trim() !== "." && (
+														<>
+															<BusyButton
+																className="ghost"
+																ariaLabel="Edit the queued steering"
+																run={() => {
+																	setSteerEdit(task.pendingPrompt);
+																	return Promise.resolve(true);
+																}}
+															>
+																Edit
+															</BusyButton>
+															<BusyButton
+																className="ghost"
+																ariaLabel="Cancel the queued steering"
+																run={async () =>
+																	(await confirmDialog(
+																		"Discard the queued steering?",
+																		{ ok: "Discard", danger: true },
+																	))
+																		? cancelSteer()
+																		: Promise.resolve(true)
+																}
+															>
+																Cancel
+															</BusyButton>
+														</>
+													)}
 											</span>
 											<div className="you-bubble">
 												{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-												{task.pendingPrompt.trim() === "." ? (
+												{(localPending !== null
+													? localPending.text
+													: (task.pendingPrompt ?? "")
+												).trim() === "." ? (
 													<span className="you-chip">Resume</span>
-												) : steerEdit === null ? (
+												) : steerEdit === null || localPending !== null ? (
 													<div className="you-msg">
-														<Markdown text={task.pendingPrompt} />
+														<Markdown
+															text={
+																localPending !== null
+																	? localPending.text
+																	: (task.pendingPrompt ?? "")
+															}
+														/>
 													</div>
 												) : (
 													<form
@@ -9495,10 +9595,20 @@ export function Drawer({
 														</div>
 													</form>
 												)}
-												{task.pendingImages.length > 0 && (
+												{(localPending !== null
+													? localPending.images > 0
+													: task.pendingImages.length > 0) && (
 													<p className="you-msg dim">
-														+{task.pendingImages.length} image
-														{task.pendingImages.length === 1 ? "" : "s"}
+														+
+														{localPending !== null
+															? localPending.images
+															: task.pendingImages.length}{" "}
+														image
+														{(localPending !== null
+															? localPending.images
+															: task.pendingImages.length) === 1
+															? ""
+															: "s"}
 													</p>
 												)}
 												{task.state === "queued" && (
@@ -9524,8 +9634,8 @@ export function Drawer({
 								<label className="triage-rank">
 									<span>Rank</span>
 									<select
-										value={task.priority ?? ""}
-										disabled={triageSave.busy}
+										value={rank.value}
+										disabled={triageSave.busy || rank.busy}
 										onChange={(e) => setRank(e.target.value)}
 									>
 										<option value="">Default</option>
@@ -9709,7 +9819,7 @@ export function Drawer({
 								<ComposerActions
 									onAddImages={replyImages.addFiles}
 									catalog={catalog}
-									model={task.model ?? ""}
+									model={model.value}
 									setModel={switchModel}
 									modelQuery={modelQuery}
 									setModelQuery={setModelQuery}
@@ -9808,7 +9918,7 @@ export function Drawer({
 								attachIcon="plus"
 								onAddImages={steerImages.addFiles}
 								catalog={catalog}
-								model={task.model ?? ""}
+								model={model.value}
 								setModel={switchModel}
 								modelQuery={modelQuery}
 								setModelQuery={setModelQuery}
@@ -10664,6 +10774,8 @@ export function App() {
 	);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
+	/** Done-read keys whose auto-mark POST failed; the read-mark effect must not re-post them in a loop. */
+	const failedDoneReads = useRef<ReadonlySet<string>>(new Set());
 	/** OTTR-566: the server's baseline; done cards with doneAt at or before it count as read. Infinity until the first frame so nothing flashes unread. */
 	const [seenDoneSince, setSeenDoneSince] = useState(Number.POSITIVE_INFINITY);
 	/** One-shot localStorage → server migration of seen answers, run after the first state load. */
@@ -10683,24 +10795,50 @@ export function App() {
 	const markSeen = useCallback((t: TaskCard | null | undefined) => {
 		if (t == null || !seenable(t)) return;
 		setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
-		void post("/api/seen", { ids: [t.id] }).catch(() =>
+		void post("/api/seen", { ids: [t.id] }).catch(() => {
+			// Roll the optimistic mark back: the card reads as unread again here too.
+			setSeenAnswers((s) => {
+				if (!s.has(t.id)) return s;
+				const next = new Set(s);
+				next.delete(t.id);
+				return next;
+			});
 			setNotice(
 				"Saving the read state failed; this card may show as unread on your other devices.",
-			),
-		);
+			);
+		});
 	}, []);
 	/** OTTR-566: marks this completion of a done card read for the rail's dot. The key carries
-	 * doneAt, so a card that returns to Done later is unread again. */
+	 * doneAt, so a card that returns to Done later is unread again. A failed auto-mark records
+	 * the key as failed: the read-mark effect does not re-post it until something clears it. */
 	const markDoneRead = useCallback(
 		(t: TaskCard) => {
 			if (!doneReadable(t, seenDoneSince) || t.doneAt === null) return;
 			const key = doneReadKey({ id: t.id, doneAt: t.doneAt });
+			if (failedDoneReads.current.has(key)) return;
 			setSeenAnswers((s) => (s.has(key) ? s : new Set(s).add(key)));
-			void post("/api/seen", { ids: [key] }).catch(() =>
-				setNotice(
-					"Saving the read state failed; this card may show as unread on your other devices.",
-				),
-			);
+			void post("/api/seen", { ids: [key] })
+				.then(() => {
+					failedDoneReads.current = ((prev) => {
+						if (!prev.has(key)) return prev;
+						const next = new Set(prev);
+						next.delete(key);
+						return next;
+					})(failedDoneReads.current);
+				})
+				.catch(() => {
+					// Roll the optimistic mark back: the done dot returns to unread.
+					failedDoneReads.current = new Set(failedDoneReads.current).add(key);
+					setSeenAnswers((s) => {
+						if (!s.has(key)) return s;
+						const next = new Set(s);
+						next.delete(key);
+						return next;
+					});
+					setNotice(
+						"Saving the read state failed; this card may show as unread on your other devices.",
+					);
+				});
 		},
 		[seenDoneSince],
 	);
@@ -10713,11 +10851,13 @@ export function App() {
 			next.delete(t.id);
 			return next;
 		});
-		void post("/api/seen", { ids: [t.id], unread: true }).catch(() =>
+		void post("/api/seen", { ids: [t.id], unread: true }).catch(() => {
+			// Roll the optimistic unmark back: the answer reads as read again.
+			setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
 			setNotice(
 				"Saving the read state failed; this card may show as read on your other devices.",
-			),
-		);
+			);
+		});
 	}, []);
 	const openTask = useCallback(
 		(id: string) => {

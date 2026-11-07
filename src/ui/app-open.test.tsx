@@ -380,3 +380,97 @@ test("opening a card of the current project keeps the mounted lanes", async () =
 		await unmountApp();
 	}
 });
+
+// --- optimistic read marks ---------------------------------------------------
+// The read mark leads: seenAnswers gains the id at once, the POST follows, and a
+// failed POST rolls the mark back (The Optimistic-Tap Rule).
+
+test("a failed read mark rolls back: the card counts as unread again", async () => {
+	const answered = card({
+		id: "AL-9",
+		title: "Alpha answered",
+		sessionTitle: "Alpha answered",
+		stage: "done",
+		state: "idle",
+		doneAt: 1000,
+		answered: true,
+	});
+	state.tasks.push(answered);
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/seen")
+			return new Response("{}", { status: 500 });
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountAt("/projects/alpha");
+		const el = cardEl("AL-9");
+		expect(el).not.toBeNull();
+		expect(el!.hasAttribute("data-unread")).toBe(true);
+		await click(el!.querySelector("a.card-open")!);
+		await waitFor(drawerOpen);
+		// The optimistic mark went out and the POST failed: the card keeps its
+		// unread badge and the failure surfaces in the usual notice.
+		expect(el!.hasAttribute("data-unread")).toBe(true);
+		expect(document.body.textContent).toContain("Saving the read state failed");
+	} finally {
+		state.tasks.pop();
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("a failed mark-unread rolls back: the card counts as read again", async () => {
+	const answered = card({
+		id: "AL-10",
+		title: "Alpha done answer",
+		sessionTitle: "Alpha done answer",
+		stage: "done",
+		state: "idle",
+		doneAt: 1000,
+		answered: true,
+	});
+	state.tasks.push(answered);
+	// The server frame confirms the read, so the local mark is not the only
+	// thing keeping the badge off.
+	state.seenAnswers = ["AL-10"];
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = String(input);
+		if (url === "/api/seen") {
+			// Plain read marks succeed; only the unread flag fails.
+			const body = JSON.parse(String(init?.body ?? "{}")) as {
+				unread?: boolean;
+			};
+			if (body.unread === true) return new Response("{}", { status: 500 });
+			return new Response("{}", { status: 200 });
+		}
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as unknown as typeof fetch;
+	try {
+		await mountAt("/projects/alpha/tasks/AL-10");
+		await waitFor(drawerOpen);
+		// The server frame says read: no unread badge.
+		expect(cardEl("AL-10")!.hasAttribute("data-unread")).toBe(false);
+		const unmark = document.querySelector<HTMLButtonElement>(
+			'dialog.drawer button[title^="Puts the new badge back"]',
+		);
+		expect(unmark).not.toBeNull();
+		await click(unmark!);
+		// The failed POST rolls the optimistic unmark back, so the card counts as
+		// read again (badge off) and the failure surfaces as the usual notice.
+		await waitFor(() =>
+			document.body.textContent!.includes("may show as read"),
+		);
+		expect(cardEl("AL-10")!.hasAttribute("data-unread")).toBe(false);
+	} finally {
+		state.tasks.pop();
+		state.seenAnswers = [];
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});

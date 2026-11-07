@@ -447,6 +447,86 @@ export function useFlash(ms: number): [boolean, () => void] {
 	return [on, flash];
 }
 
+/** State of one save that runs on its own; `run` sends, `onFail` rolls an optimistic value back. */
+export type InstantSave = {
+	run: (
+		send: () => Promise<unknown>,
+		onFail?: () => void,
+		onError?: (message: string) => void,
+	) => void;
+	busy: boolean;
+	failed: boolean;
+	saved: boolean;
+};
+
+/** One save that runs on its own (a toggle, an upload, a card's Save): busy while it runs,
+ *  then a short "saved" flash. */
+export function useInstantSave(act: Act): InstantSave {
+	const busy = useBusy();
+	const [saved, flash] = useFlash(1600);
+	const run = (
+		send: () => Promise<unknown>,
+		onFail?: () => void,
+		onError?: (message: string) => void,
+	): void =>
+		busy.start(async () => {
+			const ok = await act(async () => {
+				await send();
+			}, onError);
+			if (ok) flash();
+			else onFail?.();
+			return ok;
+		});
+	return { run, busy: busy.busy, failed: busy.failed, saved };
+}
+
+/** The optimistic-value pattern: a row's checkbox (or similar) leads, the server state trails.
+ *  `set` adopts the new value at once so the UI responds before anything is sent; `run` then
+ *  sends it, rolling the shown value back if the save fails, and the local value clears itself
+ *  once the server state catches up and matches. */
+export interface OptimisticValue<T> {
+	/** The shown value: the optimistic value while one is held, else the server's. */
+	value: T;
+	/** Adopts v at once; a server frame settles it or a failed run rolls it back. */
+	set: (v: T) => void;
+	run: (
+		send: () => Promise<unknown>,
+		onFail?: () => void,
+		onError?: (message: string) => void,
+	) => void;
+	busy: boolean;
+	failed: boolean;
+	saved: boolean;
+}
+
+export function useOptimisticValue<T>(
+	server: T,
+	act: Act,
+	eq: (a: T, b: T) => boolean = Object.is,
+): OptimisticValue<T> {
+	const s = useInstantSave(act);
+	const [local, setLocal] = useState<T | undefined>(undefined);
+	useEffect(() => {
+		if (local !== undefined && eq(local, server)) setLocal(undefined);
+	}, [local, server, eq]);
+	return {
+		value: local === undefined ? server : local,
+		set: setLocal,
+		run: (send, onFail, onError): void =>
+			s.run(
+				send,
+				() => {
+					setLocal(undefined);
+					onFail?.();
+				},
+				onError,
+			),
+		busy: s.busy,
+		failed: s.failed,
+		saved: s.saved,
+	};
+}
+
 /** State that trails its setter by `ms`: each call resets the wait, the value lands
  *  once the calls pause. Backs the board search: the box takes every keystroke, the
  *  lanes re-filter after the pause, so swift typing on a big board renders once. */

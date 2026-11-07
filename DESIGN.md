@@ -193,6 +193,8 @@ A rounded child inside a rounded parent never has a radius ≥ the parent's; wit
 
 **The Settings-Row Rule.** A typed field explains itself in its "?" badge. A checkbox or a read-only fact explains itself in visible text. No setting does both. Buttons sit at the right, and only typed fields wait for a Save.
 
+**The Optimistic-Tap Rule.** A cheap, reversible card action updates the UI first and syncs with the server after: star, triage rank, model switch, queue reorder, the queued steer bubble, Updates Skip/Allow and the read marks. A failed sync rolls the visible state back and reports through the usual error surfaces. Actions that create ids or validate input server-side — add project, sign-in, merge anyway, cancel/delete, create task, start release, start review — wait for the server. Motion rides state arrival: an optimistic reorder slides with the FLIP rules, a rollback slides back; nothing animates on the tap itself.
+
 **The Optional-Field Rule.** The board never marks required fields — no asterisks anywhere. An optional field says so instead: in dialogs, "(optional)" follows the label in dim text (the `.opt-mark` span); in settings, the mono shape line under the name already says what an empty value does (`empty = no cap`, `empty = from folder name`) and no "(optional)" is added to those rows.
 
 **The Verb-Label Rule.** Every button label is a verb in sentence case, with an object when the verb alone is unclear. One label means one action across the whole board, and an icon never stands in for a label it cannot carry on its own.

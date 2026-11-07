@@ -2574,20 +2574,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .stage-cards.drop-end::after {
 	align-self: stretch;
 }
-/* While a reorder request is in flight, the slot stays at the drop point with a spinner and
-   a status label; the dimmed source card cannot start another drag until the order confirms. */
-.drop-slot {
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	gap: 8px;
-	align-self: stretch;
-	min-height: var(--drag-h, 36px);
-	border: 1px dashed var(--accent);
-	border-radius: 4px;
-	font-size: 12px;
-	color: var(--dim);
-}
 .card.reorder-lock {
 	opacity: 0.55;
 }

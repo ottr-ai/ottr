@@ -449,7 +449,7 @@ describe("LaneCol backlog divider", () => {
 		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
-		onReorder: async () => {},
+		onReorder: async () => true,
 		filtering: false,
 		draining: false,
 	} as const;
@@ -799,7 +799,7 @@ describe("done lane star section", () => {
 		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
-		onReorder: async () => {},
+		onReorder: async () => true,
 		filtering: false,
 		draining: false,
 	} as const;
@@ -3186,7 +3186,7 @@ describe("cancelled cards on the board", () => {
 		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
-		onReorder: async () => {},
+		onReorder: async () => true,
 		filtering: false,
 		draining: false,
 	} as const;
@@ -3783,7 +3783,7 @@ describe("LaneCol release hold", () => {
 		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
-		onReorder: async () => {},
+		onReorder: async () => true,
 		filtering: false,
 		draining: false,
 		onRerelease: () => {},
@@ -4180,7 +4180,7 @@ describe("path URL card links", () => {
 				deltas={new Map()}
 				open={() => {}}
 				unread={() => false}
-				onReorder={async () => {}}
+				onReorder={async () => true}
 				filtering={false}
 				draining={false}
 			/>,
@@ -4947,7 +4947,7 @@ describe("Drawer proposal decision panel", () => {
 			deltas: new Map<string, number>(),
 			open: () => {},
 			unread: () => false,
-			onReorder: async () => {},
+			onReorder: async () => true,
 			filtering: false,
 			draining: false,
 		} as const;
@@ -5789,5 +5789,511 @@ describe("Drawer PR link", () => {
 		expect(html).toContain("<dt>PR</dt>");
 		expect(html).toContain("PR #14");
 		expect(html).not.toMatch(/<dt>PR<\/dt><dd><a/);
+	});
+});
+
+describe("Optimistic taps (client)", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLSelectElement: window.HTMLSelectElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+		// LaneCol's FLIP effect animates committed order changes; happy-dom has no WAAPI.
+		const proto = window.HTMLElement.prototype as unknown as Record<
+			string,
+			unknown
+		>;
+		proto.animate ??= () => ({ finished: Promise.resolve() });
+		proto.showPopover ??= () => {};
+		proto.hidePopover ??= () => {};
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		act: async (fn: () => Promise<void>) => {
+			try {
+				await fn();
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: false,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+		tasks: [] as TaskCard[],
+	};
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+
+	// happy-dom's dispatched events never reach React's event plugin; call the
+	// production prop React rendered onto the node instead (same as above).
+	const propHandler = (
+		node: object,
+		key: "onClick" | "onChange" | "onSubmit" | "onKeyDown",
+	): ((e: unknown) => void) => {
+		const propsKey = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (propsKey === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[
+			propsKey
+		] as Record<string, ((e: unknown) => void) | undefined>;
+		const handler = props[key];
+		if (handler === undefined) throw new Error(`node has no ${key}`);
+		return handler;
+	};
+	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
+	const submitEvent = (): InstanceType<typeof window.Event> =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		});
+	// Per-URL fetch stub: gated URLs hold until their gate resolves with a status,
+	// everything else degrades to 404 (the drawer's failed detail fetch).
+	const stubFetch = (
+		gates: { url: string; resolve: (status: number) => void }[],
+	): (() => void) => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			const g = gates.find((x) => url.endsWith(x.url));
+			if (g !== undefined) {
+				const status = await new Promise<number>((r) => (g.resolve = r));
+				return new Response("{}", { status });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		return () => {
+			globalThis.fetch = realFetch;
+		};
+	};
+	/** Mounts the Drawer with `task` under act(), runs `body`, unmounts. */
+	const withDrawer = async (
+		task: TaskCard,
+		gates: Parameters<typeof stubFetch>[0],
+		body: () => Promise<void>,
+	): Promise<void> => {
+		const restore = stubFetch(gates);
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={task} />);
+			});
+			await act(async () => {});
+			await body();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	};
+
+	const starTask = (starred = false) =>
+		cardFixture({
+			...drawerFields,
+			research: true,
+			stage: "done",
+			state: "idle",
+			starred,
+		});
+	const starButton = () =>
+		window.document.querySelector(
+			'button[aria-label="Star"], button[aria-label="Starred"]',
+		)!;
+
+	test("star shows the flip before the server answers and rolls it back on failure", async () => {
+		const g = { url: "/star" } as Parameters<typeof stubFetch>[0][number];
+		await withDrawer(starTask(), [g], async () => {
+			const btn = starButton();
+			expect(btn.getAttribute("aria-pressed")).toBe("false");
+			await act(async () => {
+				propHandler(btn, "onClick")({} as unknown);
+			});
+			// In flight: the star shows the new value before any server frame.
+			expect(starButton().getAttribute("aria-pressed")).toBe("true");
+			expect(starButton().getAttribute("aria-label")).toBe("Starred");
+			await act(async () => {});
+			g.resolve(500);
+			await act(async () => {});
+			// Failed sync: the visible state rolls back.
+			expect(starButton().getAttribute("aria-pressed")).toBe("false");
+			expect(starButton().getAttribute("aria-label")).toBe("Star");
+		});
+	});
+
+	test("star keeps the flip after the server confirms", async () => {
+		const g = { url: "/star" } as Parameters<typeof stubFetch>[0][number];
+		await withDrawer(starTask(), [g], async () => {
+			await act(async () => {
+				propHandler(starButton(), "onClick")({} as unknown);
+			});
+			expect(starButton().getAttribute("aria-pressed")).toBe("true");
+			await act(async () => {});
+			g.resolve(200);
+			await act(async () => {});
+			expect(starButton().getAttribute("aria-pressed")).toBe("true");
+		});
+	});
+
+	const rankTask = () =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "pick a rank",
+			priority: null,
+		});
+
+	test("triage rank shows the pick before the server answers and rolls it back on failure", async () => {
+		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
+		await withDrawer(rankTask(), [g], async () => {
+			const select = window.document.querySelector(
+				".triage-rank select",
+			) as unknown as HTMLSelectElement | null;
+			expect(select).not.toBeNull();
+			expect(select!.value).toBe("");
+			await act(async () => {
+				select!.value = "P1";
+				select!.dispatchEvent(
+					new window.Event("change", {
+						bubbles: true,
+					}) as unknown as Event,
+				);
+			});
+			// In flight: the select leads, the POST follows.
+			expect(select!.value).toBe("P1");
+			g.resolve(500);
+			await act(async () => {});
+			expect(select!.value).toBe("");
+		});
+	});
+
+	test("triage rank keeps the pick after the server confirms", async () => {
+		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
+		await withDrawer(rankTask(), [g], async () => {
+			const select = window.document.querySelector(
+				".triage-rank select",
+			)! as unknown as HTMLSelectElement;
+			await act(async () => {
+				select.value = "P1";
+				select.dispatchEvent(
+					new window.Event("change", {
+						bubbles: true,
+					}) as unknown as Event,
+				);
+			});
+			expect(select.value).toBe("P1");
+			g.resolve(200);
+			await act(async () => {});
+			expect(select.value).toBe("P1");
+		});
+	});
+
+	const modelTask = () =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+			model: "zai/glm-5.3-flash",
+		});
+	test("model pick shows before the server answers and rolls back on failure", async () => {
+		resetCatalogCache();
+		const g = { url: "/model" } as Parameters<typeof stubFetch>[0][number];
+		const models = new Response(
+			JSON.stringify({
+				models: [
+					{
+						id: "anthropic/claude-opus-5-5",
+						selector: "anthropic/claude-opus-5-5",
+						name: "Claude Opus 5.5",
+						contextWindow: null,
+					},
+					{
+						id: "zai/glm-5.3-flash",
+						selector: "zai/glm-5.3-flash",
+						name: "GLM 5.3 Flash",
+						contextWindow: null,
+					},
+				],
+				roles: { default: "zai/glm-5.3-flash" },
+			}),
+			{ status: 200 },
+		);
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/models")) return models.clone();
+			const gateHit = url.endsWith(g.url);
+			if (gateHit) {
+				const status = await new Promise<number>((r) => (g.resolve = r));
+				return new Response("{}", { status });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={modelTask()} />);
+			});
+			await act(async () => {});
+			const trigger = container.querySelector("button.model-trigger");
+			expect(trigger).not.toBeNull();
+			expect(trigger!.getAttribute("aria-label")).toBe(
+				"Model: zai/glm-5.3-flash",
+			);
+			// happy-dom has no popover: the options sit in the DOM unshown, so pick
+			// one directly through its rendered onClick.
+			const option = [
+				...container.querySelectorAll("button.model-option"),
+			].find((b) => b.textContent?.includes("Claude Opus 5.5"));
+			expect(option).toBeDefined();
+			await act(async () => {
+				propHandler(option!, "onClick")({} as unknown);
+			});
+			// In flight: the pick leads, the POST follows.
+			expect(trigger!.getAttribute("aria-label")).toBe(
+				"Model: anthropic/claude-opus-5-5",
+			);
+			await act(async () => {});
+			g.resolve(500);
+			await act(async () => {});
+			expect(trigger!.getAttribute("aria-label")).toBe(
+				"Model: zai/glm-5.3-flash",
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			resetCatalogCache();
+		}
+	});
+
+	const laneBase = {
+		projectTasks: [] as TaskCard[],
+		groups: null,
+		collapsed: {},
+		onToggle: () => {},
+		hasRules: true,
+		github: null,
+		deltas: new Map<string, number>(),
+		open: () => {},
+		unread: () => false,
+		filtering: false,
+		draining: false,
+	};
+	const laneTasks = () => [
+		cardFixture({ id: "a", stage: "todo", state: "queued" }),
+		cardFixture({ id: "b", stage: "todo", state: "queued" }),
+		cardFixture({ id: "c", stage: "todo", state: "idle" }),
+	];
+	test("queue reorder applies the new order at once and rolls it back on failure", async () => {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		let resolveReorder!: (ok: boolean) => void;
+		const onReorder = ((): Promise<boolean> => {
+			return new Promise<boolean>((r) => {
+				resolveReorder = r;
+			});
+		})();
+		const order = (): (string | null)[] =>
+			[...container.querySelectorAll(".card[data-task-id]")].map((el) =>
+				el.getAttribute("data-task-id"),
+			);
+		try {
+			await act(async () => {
+				root.render(
+					<LaneCol
+						{...laneBase}
+						stage="todo"
+						tasks={laneTasks()}
+						onReorder={() => onReorder}
+					/>,
+				);
+			});
+			expect(order()).toEqual(["a", "b", "c"]);
+			const b = container.querySelector('.card[data-task-id="b"]')!;
+			// Keyboard reorder (the pointer-free path): Alt+ArrowUp moves b above a.
+			await act(async () => {
+				propHandler(
+					container.querySelector(".stage-cards")!,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: b,
+					preventDefault: () => {},
+				} as unknown);
+			});
+			// In flight: the overlay shows the new order at once, no spinner slot.
+			expect(order()).toEqual(["c", "b", "a"]);
+			expect(container.querySelector(".drop-slot")).toBeNull();
+			resolveReorder(false);
+			await act(async () => {});
+			// Failed sync: the FLIP slide-back restores the server order.
+			expect(order()).toEqual(["a", "b", "c"]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("queue reorder keeps the overlay after the server confirms", async () => {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		let resolveReorder!: (ok: boolean) => void;
+		const onReorder = new Promise<boolean>((r) => {
+			resolveReorder = r;
+		});
+		const order = (): (string | null)[] =>
+			[...container.querySelectorAll(".card[data-task-id]")].map((el) =>
+				el.getAttribute("data-task-id"),
+			);
+		try {
+			await act(async () => {
+				root.render(
+					<LaneCol
+						{...laneBase}
+						stage="todo"
+						tasks={laneTasks()}
+						onReorder={() => onReorder}
+					/>,
+				);
+			});
+			const b = container.querySelector('.card[data-task-id="b"]')!;
+			await act(async () => {
+				propHandler(
+					container.querySelector(".stage-cards")!,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: b,
+					preventDefault: () => {},
+				} as unknown);
+			});
+			expect(order()).toEqual(["c", "b", "a"]);
+			resolveReorder(true);
+			await act(async () => {});
+			// Confirmed: the overlay holds until a server frame settles it (none
+			// arrives in this fixture, so the client's order stays shown).
+			expect(order()).toEqual(["c", "b", "a"]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	const steerTask = () =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+			pendingPrompt: null,
+		});
+
+	test("the queued steer bubble renders from the local send at once and rolls back on failure", async () => {
+		const g = { url: "/steer" } as Parameters<typeof stubFetch>[0][number];
+		await withDrawer(steerTask(), [g], async () => {
+			expect(window.document.querySelector(".you-bubble")).toBeNull();
+			const form = window.document.querySelector("form.steer-form")!;
+			const textarea = form.querySelector("textarea")!;
+			await act(async () => {
+				propHandler(
+					textarea,
+					"onChange",
+				)({ target: { value: "try the red path" } });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// In flight, no server frame yet: the bubble shows the local text and
+			// no Edit/Cancel buttons (those wait for the server-confirmed prompt).
+			const bubble = window.document.querySelector(".you-bubble");
+			expect(bubble).not.toBeNull();
+			expect(bubble!.textContent).toContain("try the red path");
+			expect(
+				window.document.querySelector(
+					'button[aria-label="Edit the queued steering"]',
+				),
+			).toBeNull();
+			g.resolve(500);
+			await act(async () => {});
+			// Failed sync: the bubble rolls back (the task had no pendingPrompt).
+			expect(window.document.querySelector(".you-bubble")).toBeNull();
+		});
 	});
 });
