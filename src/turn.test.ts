@@ -66,6 +66,7 @@ import {
 	keptReason,
 	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
+	modelSwap,
 	parseReleaseVersion,
 	parseTopicReport,
 	turnModel,
@@ -1487,6 +1488,19 @@ describe("turn helpers", () => {
 		// Missing sides pass through.
 		expect(turnModel(null, "zai/glm-5.3-flash:max")).toBe(null);
 		expect(turnModel("zai/glm-5.3-flash", null)).toBe("zai/glm-5.3-flash");
+	});
+
+	test("modelSwap: names the dispatched selector only when the served base differs", () => {
+		// The provider-error fallback: the run served another model than dispatched.
+		expect(modelSwap("zai/glm-5.3", "anthropic/claude-opus-5-5:medium")).toBe(
+			"anthropic/claude-opus-5-5:medium",
+		);
+		// A thinking-level difference alone is not a swap: the transcript records the bare model.
+		expect(modelSwap("zai/glm-5.3-flash", "zai/glm-5.3-flash:max")).toBe(null);
+		expect(modelSwap("zai/glm-5.3-flash", "zai/glm-5.3-flash")).toBe(null);
+		// An unknown side proves nothing.
+		expect(modelSwap(null, "zai/glm-5.3-flash:max")).toBe(null);
+		expect(modelSwap("zai/glm-5.3-flash", null)).toBe(null);
 	});
 
 	test("logStoreError: once per window per project", () => {

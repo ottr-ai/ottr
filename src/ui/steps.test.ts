@@ -24,6 +24,7 @@ const turn = (id: number, kind: TurnKind, startedAt: number): TurnView => ({
 	question: null,
 	error: null,
 	model: null,
+	dispatchedModel: null,
 	layer: null,
 	ranOn: null,
 });

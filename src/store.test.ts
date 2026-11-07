@@ -1494,6 +1494,87 @@ describe("turn cost capture", () => {
 	});
 });
 
+describe("turn dispatched model (provider fallback)", () => {
+	test("a settled swap keeps the served model and the dispatched selector", () => {
+		const store = open(join(root, "turn-swap-settled"));
+		const task = store.createTask("fallback pick");
+		// startTurn snapshots the dispatch: the --model this run starts with.
+		const turn = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			"anthropic/claude-opus-5-5:medium",
+		);
+		expect(turn.model).toBe("anthropic/claude-opus-5-5:medium");
+		expect(turn.dispatchedModel).toBeNull();
+		store.finishTurn(turn.id, {
+			endedAt: turn.startedAt + 1000,
+			// The stream served another model: omp's retry chain fell back.
+			model: "zai/glm-5.3",
+			dispatchedModel: "anthropic/claude-opus-5-5:medium",
+		});
+		const [settled] = store.listTurns(task.id);
+		expect(settled?.model).toBe("zai/glm-5.3");
+		expect(settled?.dispatchedModel).toBe("anthropic/claude-opus-5-5:medium");
+		store.close();
+	});
+
+	test("a settle without a swap leaves the dispatched selector null", () => {
+		const store = open(join(root, "turn-swap-clean"));
+		const task = store.createTask("steady pick");
+		const turn = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			"zai/glm-5.3-flash:max",
+		);
+		store.finishTurn(turn.id, {
+			endedAt: turn.startedAt + 1000,
+			model: "zai/glm-5.3-flash",
+		});
+		const [settled] = store.listTurns(task.id);
+		expect(settled?.model).toBe("zai/glm-5.3-flash");
+		expect(settled?.dispatchedModel).toBeNull();
+		store.close();
+	});
+
+	test("open adds dispatched_model to a database created before it", () => {
+		const dir = join(root, "swap-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
+			create: true,
+		});
+		// The turns schema as it was before the fallback note existed.
+		legacy.exec(
+			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT, model TEXT)",
+		);
+		legacy.close();
+		const store = open(dir);
+		const task = store.createTask("legacy swap");
+		const turn = store.startTurn(task.id, "work", "p", null);
+		// The swap path runs against the freshly added column without throwing.
+		store.finishTurn(turn.id, {
+			endedAt: turn.startedAt + 1000,
+			dispatchedModel: "anthropic/claude-opus-5-5:medium",
+		});
+		expect(store.listTurns(task.id)[0]?.dispatchedModel).toBe(
+			"anthropic/claude-opus-5-5:medium",
+		);
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const cols = raw
+			.query<{ name: string }, []>("PRAGMA table_info(turns)")
+			.all()
+			.map((c) => c.name);
+		raw.close();
+		expect(cols).toContain("dispatched_model");
+	});
+});
+
 describe("turn layer", () => {
 	test("startTurn persists and returns the layer; the default stays null", () => {
 		const store = open(join(root, "turn-layer-basic"));

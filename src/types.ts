@@ -508,6 +508,10 @@ export interface Turn {
 	error: string | null;
 	/** Model that served the run's assistant messages, e.g. "zai/glm-5.3-flash"; null when unseen. */
 	model: string | null;
+	/** The --model selector the run was dispatched with, stored only when the run served a
+	 *  different model: the provider errored and omp's retry chain fell back (the timeline
+	 *  notes the swap on the turn). Null when dispatch and served model agree. */
+	dispatchedModel: string | null;
 	/** Agent layer id (the `.alate/layers/<id>` folder name) this turn's omp run pinned; null when the run stayed on the flat home or the row predates the field. */
 	layer: string | null;
 	/** Where the run executed, recorded at settle: `worker <url hostname> (<container hostname>)`

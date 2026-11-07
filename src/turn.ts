@@ -826,6 +826,19 @@ export function turnModel(
 		: model;
 }
 
+/** The dispatched selector when the run served a different model's base — the provider-error
+ * fallback omp's retry chain performs. A thinking-level difference alone is not a swap (the
+ * transcript records the bare model), and an unknown side proves nothing. Null = no swap. */
+export function modelSwap(
+	served: string | null,
+	dispatched: string | null,
+): string | null {
+	if (served === null || dispatched === null) return null;
+	return splitLevel(served)[0] === splitLevel(dispatched)[0]
+		? null
+		: dispatched;
+}
+
 /** Logs a project store's failure at most once per 10 minutes per project: diagnosable, not spam. */
 const lastStoreErrorAt = new Map<string, number>();
 export function logStoreError(name: string, err: unknown): void {
@@ -3781,12 +3794,23 @@ export function createTurnLoop(
 				});
 				return;
 			}
+			// The model the stream served, with the dispatch's thinking level re-attached when the
+			// bases match; and the dispatched selector when the run fell back to another model.
+			const served = turnModel(result.model, runModel);
+			const swap = modelSwap(result.model, runModel);
+			if (swap !== null)
+				log(
+					`! model swap: dispatched ${swap} but the run served ${served}${result.providerError ? ` (${result.providerError})` : ""} — the card keeps ${swap} for its next turn`,
+				);
 			store.finishTurn(turn.id, {
 				endedAt: now,
 				exitCode: result.exitCode,
 				// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
 				// Without a served model (a crash before message_start) the dispatch snapshot stands.
-				model: turnModel(result.model, runModel) ?? turn.model,
+				model: served ?? turn.model,
+				// The fallback proof: the selector the run was dispatched with, kept only when the
+				// run served another model's base, so the timeline can name the swap.
+				dispatchedModel: swap,
 				ranOn: result.ranOn ?? null,
 				outcome: result.outcome?.status ?? null,
 				summary: result.outcome?.summary ?? null,

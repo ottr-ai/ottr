@@ -9537,6 +9537,22 @@ export function Drawer({
 											{t.summary !== null && (
 												<div className="dim turn-sum">{t.summary}</div>
 											)}
+											{/* The run fell back to another model than dispatched (provider error,
+											omp's retry chain): name both, so a steered model pick that did not
+											run is legible instead of silent. The card keeps the pick. */}
+											{t.dispatchedModel !== null && t.model !== null && (
+												<div
+													className="dim turn-sum"
+													title={`Dispatched ${t.dispatchedModel}, but the run served ${t.model}: the provider errored and omp's retry chain fell back. The card keeps ${t.dispatchedModel} for its next turn.`}
+												>
+													<Mark kind="warn" /> dispatched{" "}
+													{displayModel(
+														catalog?.models ?? [],
+														t.dispatchedModel,
+													)}
+													, ran {displayModel(catalog?.models ?? [], t.model)}
+												</div>
+											)}
 											{/* The retro card's own drawer keeps reply and cancel for a retro that waits. */}
 											{s.kind === "retro" && s === lastRetro && (
 												<a

@@ -3783,6 +3783,92 @@ describe("Drawer research report button", () => {
 		await unmount();
 	});
 
+	test("a turn that served another model than dispatched names the swap", async () => {
+		// The provider-error fallback: the timeline row says what was dispatched and
+		// what ran, so a steered model pick that did not run is legible, not silent.
+		const swapped = {
+			id: 1,
+			taskId: "R-1",
+			kind: "work",
+			input: null,
+			inputBy: null,
+			startedAt: Date.now() - 65_000,
+			endedAt: Date.now() - 5_000,
+			pid: null,
+			exitCode: 0,
+			outcome: "ready",
+			summary: null,
+			details: null,
+			question: null,
+			error: null,
+			model: "zai/glm-5.3",
+			dispatchedModel: "anthropic/claude-opus-5-5:medium",
+		};
+		detailBody.turns = [swapped] as unknown as typeof detailBody.turns;
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		try {
+			const note = container.querySelector(".turn-sum")?.textContent ?? "";
+			expect(note).toContain("dispatched");
+			expect(note).toContain("claude-opus-5-5:medium");
+			expect(note).toContain("ran");
+			expect(note).toContain("glm-5.3");
+		} finally {
+			await act(async () => {
+				detailBody.turns = [];
+			});
+			await unmount();
+		}
+	});
+
+	test("a turn without a dispatched selector renders no swap note", async () => {
+		const steady = {
+			id: 2,
+			taskId: "R-1",
+			kind: "work",
+			input: null,
+			inputBy: null,
+			startedAt: Date.now() - 65_000,
+			endedAt: Date.now() - 5_000,
+			pid: null,
+			exitCode: 0,
+			outcome: "ready",
+			summary: null,
+			details: null,
+			question: null,
+			error: null,
+			model: "zai/glm-5.3",
+			dispatchedModel: null,
+		};
+		detailBody.turns = [steady] as unknown as typeof detailBody.turns;
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		try {
+			const head = container.querySelector(".turn-head")?.textContent ?? "";
+			expect(head).toContain("glm-5.3");
+			expect(container.textContent).not.toContain("dispatched");
+		} finally {
+			await act(async () => {
+				detailBody.turns = [];
+			});
+			await unmount();
+		}
+	});
+
 	test("a done research card whose report recommends steps shows Implement steps", async () => {
 		const row = cardFixture({
 			id: "R-1",

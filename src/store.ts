@@ -159,6 +159,9 @@ CREATE TABLE IF NOT EXISTS turns (
   question TEXT,
   error TEXT,
   model TEXT,
+  -- The --model selector the run was dispatched with, stored only when the run served a
+  -- different model (the provider-error fallback); null when dispatch and served agree.
+  dispatched_model TEXT,
   layer TEXT,
   ran_on TEXT,
   tokens_in INTEGER,
@@ -378,6 +381,7 @@ interface TurnRow {
 	question: string | null;
 	error: string | null;
 	model: string | null;
+	dispatched_model: string | null;
 	layer: string | null;
 	ran_on: string | null;
 }
@@ -607,6 +611,7 @@ function toTurn(r: TurnRow): Turn {
 		question: r.question,
 		error: r.error,
 		model: r.model,
+		dispatchedModel: r.dispatched_model,
 		layer: r.layer,
 		ranOn: r.ran_on,
 	};
@@ -687,6 +692,7 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	question: "question",
 	error: "error",
 	model: "model",
+	dispatchedModel: "dispatched_model",
 	input: "input",
 	inputBy: "input_by",
 	layer: "layer",
@@ -1339,6 +1345,10 @@ export class ProjectStore {
 			.map((c) => c.name);
 		if (!turnCols.includes("model"))
 			db.exec("ALTER TABLE turns ADD COLUMN model TEXT");
+		// The --model selector a swapped run was dispatched with; null when none served a
+		// different model than dispatched. Nullable, so plain ADD COLUMN converges.
+		if (!turnCols.includes("dispatched_model"))
+			db.exec("ALTER TABLE turns ADD COLUMN dispatched_model TEXT");
 		// Where the turn's run executed; null for turns recorded before OTTR-503.
 		if (!turnCols.includes("ran_on"))
 			db.exec("ALTER TABLE turns ADD COLUMN ran_on TEXT");
