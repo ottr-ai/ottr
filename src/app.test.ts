@@ -62,6 +62,7 @@ import { PR_GATES } from "./prs.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	PROMPT_EDIT_HELD,
+	pickRunnable,
 	type ReviewTask,
 	SILENT_LOG_MS,
 	WORK_CHECK_THIRD_BLOCK,
@@ -6257,6 +6258,113 @@ describe("push-main route (OTTR-531)", () => {
 			expect(run(s.origin, "git rev-parse main")).toBe(
 				run(s.dir, "git rev-parse HEAD~1"),
 			);
+		} finally {
+			s.cleanup();
+		}
+	});
+});
+
+// OTTR-605: a project whose origin exists but has no branch for the local main yet (the
+// new-project wizard pointed at an empty repo, the local Initial commit never pushed).
+// The board must show the aspirational origin/main target with mainUnpushed, the button
+// must create the branch (and set the upstream), and the merge hold must lift after.
+describe("push-main on an empty origin (OTTR-605)", () => {
+	const run = (dir: string, cmd: string): string =>
+		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+
+	const setup = (name: string) => {
+		const origin = join(root, `${name}-origin`);
+		const dir = join(root, name);
+		run(root, `git init -q --bare -b main ${origin}`);
+		run(root, `git init -q -b main ${dir}`);
+		run(dir, "git config user.email t@t && git config user.name t");
+		writeFileSync(join(dir, "seed.txt"), "x");
+		run(dir, "git add seed.txt && git commit -qm seed");
+		run(dir, `git remote add origin ${origin}`);
+		const store = ProjectStore.open(dir);
+		store.setSettings({ originUrl: origin });
+		const entry: Entry = {
+			path: dir,
+			name,
+			store,
+			// The evidence's broken state: the target never resolved, so the UI offered no fix.
+			target: null,
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: "main",
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return {
+			origin,
+			dir,
+			store,
+			entry,
+			projects: new Map([[name, entry]]),
+			cleanup: () => {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(origin, { recursive: true, force: true });
+			},
+		};
+	};
+
+	test("the view resolves origin/main with mainUnpushed, the push creates the branch and lifts the hold", async () => {
+		const s = setup("p-emptyorigin");
+		try {
+			// The card that started before the push: a queued merge the hold must gate.
+			const card = s.store.createTask("merge please");
+			s.store.updateTask(card.id, { stage: "merging" });
+			const m = mount({ projects: s.projects });
+			const gate = (unpushed: boolean): string[] =>
+				pickRunnable(s.store.listTasks(), {
+					maxParallel: 1,
+					hasRules: true,
+					mainUnpushed: unpushed,
+				}).map((t) => t.id);
+
+			// The settings route re-reads the folder's git state (refreshRemote): the target
+			// resolves aspirationally and the advisory fact flips at once.
+			const res = await m.call("/api/projects/p-emptyorigin/settings", {
+				targetBranch: null,
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				target: string | null;
+				mainUnpushed: boolean;
+			};
+			expect(b.target).toBe("origin/main");
+			expect(b.mainUnpushed).toBe(true);
+			// Exactly schedule()'s gate: the queued merge waits for main to reach origin.
+			expect(gate(true)).toEqual([]);
+
+			const push = await m.call("/api/projects/p-emptyorigin/push-main", {});
+			expect(push.status).toBe(200);
+			// Test-boundary shape: the route returns { status, ... } verbatim from serverMergePush.
+			const pushed = (await push.json()) as { status: string };
+			expect(pushed.status).toBe("pushed");
+			// The bare origin's branch now equals the local main tip (a first push, no force).
+			expect(run(s.origin, "git rev-parse main")).toBe(
+				run(s.dir, "git rev-parse refs/heads/main"),
+			);
+			// The push set main's upstream, so the target derivation stays canonical.
+			expect(run(s.dir, "git config branch.main.remote")).toBe("origin");
+			expect(run(s.dir, "git config branch.main.merge")).toBe(
+				"refs/heads/main",
+			);
+			expect(s.entry.mainUnpushed).toBe(false);
+			// The refreshed view keeps origin/main and clears the advisory.
+			const after = await m.call("/api/projects/p-emptyorigin/settings", {
+				targetBranch: null,
+			});
+			const vb = (await after.json()) as typeof b;
+			expect(vb.target).toBe("origin/main");
+			expect(vb.mainUnpushed).toBe(false);
+			// The hold lifted: the card starts.
+			expect(gate(false)).toEqual([card.id]);
 		} finally {
 			s.cleanup();
 		}

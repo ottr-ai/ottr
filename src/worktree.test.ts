@@ -1902,14 +1902,21 @@ describe("against real repos", () => {
 				sha: headSha,
 				warning: null,
 			});
-			// Without origin/HEAD (a solo repo, a stripped clone) the old derivation holds:
-			// the upstreamless checked-out branch is the target.
+			// Without origin/HEAD (a solo repo, a stripped clone) the derivation follows the
+			// checked-out branch. Origin exists but has no solo branch: the board resolves
+			// origin/solo aspirationally (OTTR-605) instead of silently targeting the bare
+			// local branch it would never push, and a merge turn parks naming the button.
 			await must(main, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
-			expect(await resolveTarget(main, true)).toEqual({
-				target: "solo",
-				sha: a,
-				warning: null,
+			const soloSha = await must(main, "rev-parse", "solo");
+			expect(await resolveTarget(main)).toEqual({
+				target: "origin/solo",
+				sha: soloSha,
+				warning: expect.stringContaining("origin has no solo branch yet"),
+				unpushed: true,
 			});
+			await expect(resolveTarget(main, true)).rejects.toThrow(
+				'origin has no solo branch yet, so origin/solo cannot resolve. Push the local solo with the board\'s "Push to origin" button',
+			);
 			await must(main, "checkout", "-q", "--detach");
 			await expect(resolveTarget(main)).rejects.toThrow("detached HEAD");
 		} finally {
@@ -4072,4 +4079,118 @@ describe("worktree helper matrices", () => {
 		expect(githubRepoName("not a url")).toBeNull();
 		expect(githubRepoName("https://github.com/o")).toBeNull();
 	});
+});
+
+// OTTR-605: a project whose origin exists but has no branch for the local main yet (the
+// new-project wizard pointed at an empty repo, the local Initial commit never pushed).
+describe("empty origin", () => {
+	let root = "";
+	let origin = "";
+	/** The wizard's state: origin set, no upstream configured, main holds the Initial commit. */
+	let repo = "";
+	/** The reported state: main's upstream already names origin/main (the ref does not exist). */
+	let tracked = "";
+	let tip = "";
+	beforeAll(async () => {
+		sweepStaleFixtures("ott-worktree-empty-origin-");
+		root = mkdtempSync(join(tmpdir(), "ott-worktree-empty-origin-"));
+		origin = join(root, "origin.git");
+		repo = join(root, "repo");
+		tracked = join(root, "tracked");
+		await must(root, "init", "-q", "--bare", "-b", "main", origin);
+		for (const dir of [repo, tracked]) {
+			await must(root, "init", "-q", "-b", "main", dir);
+			await must(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+			await must(dir, "remote", "add", "origin", origin);
+		}
+		await must(tracked, "config", "branch.main.remote", "origin");
+		await must(tracked, "config", "branch.main.merge", "refs/heads/main");
+		tip = await must(repo, "rev-parse", "HEAD");
+	}, 60_000);
+	afterAll(
+		() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }),
+		60_000,
+	);
+
+	test("resolveTarget resolves origin/<branch> aspirationally without a fetch", async () => {
+		for (const dir of [repo, tracked]) {
+			const r = await resolveTarget(dir);
+			expect(r.target).toBe("origin/main");
+			// origin has no head; the local tip stands in until the first push.
+			expect(r.sha).toBe(tip);
+			expect(r.unpushed).toBe(true);
+			expect(r.warning).toContain("origin has no main branch yet");
+		}
+	}, 60_000);
+
+	test("resolveTarget fetch=true fails naming the Push to origin button", async () => {
+		// The pinned fetch proves the branch is missing ("couldn't find remote ref"),
+		// so a merge turn parks with the reason instead of basing work on a sha origin
+		// does not have.
+		await expect(resolveTarget(tracked, true, origin)).rejects.toThrow(
+			'origin has no main branch yet, so origin/main cannot resolve. Push the local main with the board\'s "Push to origin" button',
+		);
+	}, 60_000);
+
+	test("a fetch that cannot prove the branch missing keeps the loud upstream error", async () => {
+		// A pin whose fetch fails for another reason (a missing repo here; a network or
+		// auth outage in the field) must not pose as an empty origin.
+		await expect(
+			resolveTarget(tracked, true, join(root, "missing.git")),
+		).rejects.toThrow("upstream origin/main of main not found");
+	}, 60_000);
+
+	test("an unborn local branch and a missing origin keep today's derivations", async () => {
+		// No commit yet: the local branch does not exist, so nothing aspirational.
+		const unborn = join(root, "unborn");
+		await must(root, "init", "-q", "-b", "main", unborn);
+		await must(unborn, "remote", "add", "origin", origin);
+		await expect(resolveTarget(unborn)).rejects.toThrow("cannot resolve main");
+		// No origin remote: the fallback target stays the checked-out branch.
+		const solo = join(root, "solo");
+		await must(root, "init", "-q", "-b", "main", solo);
+		await must(solo, "commit", "-q", "--allow-empty", "-m", "seed");
+		expect(await resolveTarget(solo)).toEqual({
+			target: "main",
+			sha: tip,
+			warning: null,
+		});
+	}, 60_000);
+
+	test("branchUnpushed counts a branchless origin with local commits as unpushed", async () => {
+		expect(await branchUnpushed(repo, "main")).toBe(true);
+		// A branch with neither side (or no local branch) stays pushed/nothing-to-push.
+		expect(await branchUnpushed(repo, "ghost")).toBe(false);
+		// Once origin's ref is known locally (a fetch or the push's recorded tip), the
+		// tips match and the flag clears.
+		await must(repo, "update-ref", "refs/remotes/origin/main", tip);
+		expect(await branchUnpushed(repo, "main")).toBe(false);
+		// Restore the branchless state the next test's first push starts from.
+		await must(repo, "update-ref", "-d", "refs/remotes/origin/main");
+	}, 60_000);
+
+	test("serverMergePush creates the branch on an empty origin and sets the upstream", async () => {
+		const r = await serverMergePush(
+			repo,
+			repo,
+			"origin/main",
+			"",
+			null,
+			origin,
+		);
+		expect(r.status).toBe("pushed");
+		expect(await must(origin, "rev-parse", "main")).toBe(
+			await must(repo, "rev-parse", "refs/heads/main"),
+		);
+		// The first push leaves main tracking origin/main, so the next target derivation
+		// stays canonical and the aspirational flag is gone.
+		expect(await must(repo, "config", "branch.main.remote")).toBe("origin");
+		expect(await must(repo, "config", "branch.main.merge")).toBe(
+			"refs/heads/main",
+		);
+		const after = await resolveTarget(repo);
+		expect(after).toMatchObject({ target: "origin/main", warning: null });
+		expect(after.unpushed).toBeUndefined();
+		expect(await branchUnpushed(repo, "main")).toBe(false);
+	}, 60_000);
 });

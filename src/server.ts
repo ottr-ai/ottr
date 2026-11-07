@@ -349,6 +349,10 @@ for (const p of discoverProjects(
 	resolveTarget(p, false, null, store.getSettings().targetBranch)
 		.then((r) => {
 			e.target = r.target;
+			// OTTR-605: a repo whose origin has no branch for the local branch yet (awaiting
+			// its first push) resolves aspirationally; show the "Push to origin" advisory
+			// from boot, before the first tick's branchUnpushed refresh confirms it.
+			if (r.unpushed === true) e.mainUnpushed = true;
 		})
 		.catch(() => {});
 	githubUrl(p)

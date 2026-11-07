@@ -3458,14 +3458,18 @@ export function createApp(deps: AppDeps) {
 	/** Re-reads the integration target and the origin remotes after the folder's git state changed. */
 	async function refreshRemote(e: Entry): Promise<void> {
 		try {
-			e.target = (
-				await resolveTarget(
-					e.path,
-					false,
-					null,
-					e.store.getSettings().targetBranch,
-				)
-			).target;
+			const r = await resolveTarget(
+				e.path,
+				false,
+				null,
+				e.store.getSettings().targetBranch,
+			);
+			e.target = r.target;
+			// OTTR-605: an origin that has no branch for the local branch yet (a repo awaiting
+			// its first push) resolves aspirationally; the board must show the target and the
+			// "Push to origin" advisory at once, not after the next tick's branchUnpushed
+			// refresh (which keeps the flag true from here on).
+			if (r.unpushed === true) e.mainUnpushed = true;
 		} catch {
 			// The target is unknowable now: report none, never a stale one.
 			e.target = null;
@@ -5348,7 +5352,13 @@ export function createApp(deps: AppDeps) {
 						null,
 						e.store.getSettings().originUrl,
 					).catch((err) => ({ status: "failed" as const, error: errmsg(err) }));
-					if (result.status === "pushed") e.mainUnpushed = false;
+					if (result.status === "pushed") {
+						e.mainUnpushed = false;
+						// OTTR-605: the first push (plus the upstream serverMergePush set) turns
+						// the aspirational origin/<branch> into a resolved one; re-read so the
+						// view carries the canonical target and the advisory is gone at once.
+						await refreshRemote(e);
+					}
 					return json(result);
 				}),
 		},

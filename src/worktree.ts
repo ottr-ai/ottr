@@ -780,12 +780,25 @@ export async function archReviewDelta(
  * pin does not cover (a fork remote, a merge ref outside refs/heads) — skips the fetch with
  * a warning, the same degraded state as a failed fetch.
  */
+/** git's word for a fetch of a ref the remote does not have (OTTR-605): the only fetch
+ * failure that proves the remote branch is absent, so a network or auth outage never
+ * poses as an empty origin. */
+const REMOTE_REF_MISSING = /couldn't find remote ref refs\/heads\//;
 export async function resolveTarget(
 	mainPath: string,
 	fetch = false,
 	originUrl: string | null = null,
 	targetBranch: string | null = null,
-): Promise<{ target: string; sha: string; warning: string | null }> {
+): Promise<{
+	target: string;
+	sha: string;
+	warning: string | null;
+	/** OTTR-605: set on the aspirational resolution of an origin that has no branch for
+	 * the local branch yet — `target` is origin/<branch>, `sha` is the local branch's tip
+	 * (origin has none). The board lifts mainUnpushed from it (refreshRemote) so the
+	 * "Push to origin" advisory shows before the first tick. */
+	unpushed?: true;
+}> {
 	const head = await git(
 		["symbolic-ref", "--quiet", "--short", "HEAD"],
 		mainPath,
@@ -873,8 +886,16 @@ async function resolveLadderTarget(
 		/** Loud error when the target does not resolve and no upstream message applies. */
 		fetchErrorNote: string | null;
 	},
-): Promise<{ target: string; sha: string; warning: string | null }> {
-	const target = o.target;
+): Promise<{
+	target: string;
+	sha: string;
+	warning: string | null;
+	/** OTTR-605: set on the aspirational resolution of an origin that has no branch for
+	 * the local branch yet; resolveTarget passes it through (see the type there). */
+	unpushed?: true;
+}> {
+	// OTTR-605 may re-aim this at origin/<branch> before the rev-parse (see below).
+	let target = o.target;
 	let fetchError: string | null = null;
 	if (fetch && o.remote !== "") {
 		// ponytail: a remote branch deleted since the last fetch only warns (its stale ref still resolves); add `git ls-remote --exit-code` if that bites
@@ -911,11 +932,96 @@ async function resolveLadderTarget(
 			fetchError = `not fetching ${o.upstream || o.remote}: the board fetches only the pinned origin`;
 		}
 	}
+	// OTTR-605, derivation half: with no upstream and no origin/HEAD the ladder falls back
+	// to the bare local branch — a target the board never pushes. When origin exists but
+	// has no branch for the local branch yet (the new-project wizard pointed at an empty
+	// repo), aim the target at origin/<branch> instead, so the empty-origin resolution in
+	// the failure half below applies. Probed only on this rare fallback shape: a healthy
+	// clone has origin/HEAD or an upstream and never pays for the three local git reads.
+	let emptyOriginAim = false;
+	if (
+		o.fetchErrorNote === null &&
+		o.remote === "" &&
+		o.upstream === "" &&
+		target === o.branch
+	) {
+		const [local, tracking, originGet] = await Promise.all([
+			git(
+				["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
+				mainPath,
+			),
+			git(
+				["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${o.branch}`],
+				mainPath,
+			),
+			git(["remote", "get-url", "origin"], mainPath),
+		]);
+		if (local.code === 0 && tracking.code !== 0 && originGet.code === 0) {
+			target = `origin/${o.branch}`;
+			emptyOriginAim = true;
+		}
+	}
 	const sha = await git(
 		["rev-parse", "--verify", "--quiet", `${target}^{commit}`],
 		mainPath,
 	);
 	if (sha.code !== 0) {
+		// OTTR-605, failure half: an origin that exists but has no branch for the local
+		// branch yet. When the derivation names the checked-out branch and the local
+		// branch holds a commit, resolve origin/<branch> aspirationally: fetch=false
+		// callers (refreshRemote, boot) get the target plus the unpushed flag, so the
+		// project view shows the target and the "Push to origin" advisory at once, and the
+		// tick's branchUnpushed keeps the flag true. A fetch=true caller (merge turn,
+		// release, review) must not base work on a commit origin does not have, so it
+		// still fails — but with a reason that names the button instead of a manual git
+		// command, and only when the missing branch is proven (a fetch that failed naming
+		// the remote ref, or no fetch being possible at all), so a network outage or auth
+		// failure never poses as an empty origin.
+		const aimsAtLocalBranch =
+			emptyOriginAim || (o.remote === "origin" && o.short === o.branch);
+		if (o.fetchErrorNote === null && aimsAtLocalBranch) {
+			const [local, tracking, originGet] = await Promise.all([
+				git(
+					["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
+					mainPath,
+				),
+				git(
+					[
+						"rev-parse",
+						"--verify",
+						"--quiet",
+						`refs/remotes/origin/${o.branch}`,
+					],
+					mainPath,
+				),
+				o.remote === "origin"
+					? Promise.resolve({ code: 0, stdout: "", stderr: "" })
+					: git(["remote", "get-url", "origin"], mainPath),
+			]);
+			const emptyOrigin =
+				local.code === 0 && tracking.code !== 0 && originGet.code === 0;
+			// fetch=true with an origin upstream runs the pinned fetch above, so a null
+			// fetchError cannot coexist with an unresolvable ref there; the no-fetch forms
+			// (fetch=false, or the derivation never names a fetchable remote) rest on the
+			// same local knowledge the board's fetch=false paths use.
+			const proven =
+				!fetch ||
+				o.remote === "" ||
+				(fetchError !== null && REMOTE_REF_MISSING.test(fetchError));
+			if (emptyOrigin && proven) {
+				if (fetch) {
+					throw new Error(
+						`origin has no ${o.branch} branch yet, so ${target} cannot resolve. Push the local ${o.branch} with the board's "Push to origin" button, then reply to this card.`,
+					);
+				}
+				return {
+					target,
+					sha: local.stdout.trim(),
+					warning: `origin has no ${o.branch} branch yet; the board targets origin/${o.branch} and treats the local ${o.branch} as unpushed until it is pushed`,
+					unpushed: true,
+				};
+			}
+		}
 		if (o.fetchErrorNote !== null) throw new Error(o.fetchErrorNote);
 		if (!o.upstream) throw new Error(`cannot resolve ${target}`);
 		throw new Error(
@@ -1355,6 +1461,13 @@ export async function serverMergePush(
 		// it anywhere), so record the tip this push landed: the next merge's skip check and
 		// the gate's `refs/remotes/origin/<branch>` compare stay exact (R5-1).
 		await git(["update-ref", `refs/remotes/origin/${branch}`, local], mainPath);
+		// OTTR-605: a first push to an origin that lacked the branch leaves no upstream, and
+		// the next target derivation would fall back to the bare local branch — a target the
+		// board never pushes. Track the branch this push just created on origin (best
+		// effort: the tracking ref above already carries the push's state; a project whose
+		// derivation came from origin/HEAD loses nothing), so origin/<branch> stays the
+		// resolved target after "Push to origin".
+		await git(["branch", "-u", `origin/${branch}`, branch], mainPath);
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
 	}
 	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
@@ -1813,8 +1926,11 @@ export async function prIntegrated(
 /** OTTR-506: true while the local `branch` in the main checkout holds commits the fetched
  * `origin/<branch>` lacks — the state a rejected server push leaves the target in. The
  * scheduler holds every queued merge but the rejected card's rebase retry while this is true,
- * so one rejection cannot pile merges onto an unpushed main. Missing refs (no local branch,
- * no origin branch yet) count as pushed: there is nothing to reconcile. A git failure counts
+ * so one rejection cannot pile merges onto an unpushed main. Missing refs: no local branch
+ * counts as pushed (nothing to push); a missing origin branch while the local branch has
+ * commits counts as unpushed since OTTR-605 — the local commits cannot reach origin until
+ * the first push (an empty origin, the new-project wizard's state), so the merge hold and
+ * the "Push to origin" advisory apply. A git failure counts
  * as unpushed: the hold errs conservative and the next refresh re-checks. */
 export async function branchUnpushed(
 	mainPath: string,
@@ -1832,7 +1948,8 @@ export async function branchUnpushed(
 		tip(`refs/heads/${branch}`),
 		tip(origin),
 	]);
-	if (local === null || pushed === null || local === pushed) return false;
+	if (local === null || local === pushed) return false;
+	if (pushed === null) return true;
 	// is-ancestor answers 0 when local is contained in origin (behind is fine: a merge may
 	// fast-forward); anything else holds commits origin lacks.
 	const r = await git(

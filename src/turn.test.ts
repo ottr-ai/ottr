@@ -82,6 +82,7 @@ import type {
 import type { DetachedRun } from "./workers.ts";
 import {
 	isClean as gitIsClean,
+	resolveTarget as realResolveTarget,
 	statusFiles as realStatusFiles,
 	trackedFiles as realTrackedFiles,
 	unsavedWork as realUnsavedWork,
@@ -1306,6 +1307,37 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 	} finally {
 		setNetworkGitAuth(() => ({}));
 	}
+});
+
+// OTTR-605: a card that starts before the first push (the board added the project, origin
+// is still an empty repo) must park needs_you with a reason that names the "Push to
+// origin" button — the real resolveTarget runs against real git here.
+test("a merge turn on an origin without the target branch parks naming Push to origin", async () => {
+	const run = (cwd: string, ...args: string[]): void => {
+		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore" });
+	};
+	const { store, loop } = setup({ resolveTarget: realResolveTarget });
+	// The main checkout holds a commit; origin is an empty bare repo.
+	const dir = store.path;
+	const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+	dirs.push(origin);
+	run(origin, "init", "-q", "--bare", "-b", "main");
+	run(dir, "init", "-q", "-b", "main");
+	run(dir, "config", "user.email", "t@t");
+	run(dir, "config", "user.name", "t");
+	run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+	run(dir, "remote", "add", "origin", origin);
+	store.setSettings({ originUrl: origin });
+	const task = store.createTask("merge please");
+	store.updateTask(task.id, { stage: "merging" });
+
+	await loop.runTurn(store.name, task.id);
+
+	const parked = store.getTask(task.id)!;
+	expect(parked.state).toBe("needs_you");
+	expect(parked.needsReason).toContain(
+		'origin has no main branch yet, so origin/main cannot resolve. Push the local main with the board\'s "Push to origin" button',
+	);
 });
 
 function baseRecord(): Recorded {
