@@ -160,7 +160,9 @@ import {
 	navClick,
 	projectPath,
 	readPath,
+	SETTINGS_HASH,
 	SYSTEM_VIEW,
+	settingsNavigate,
 	settingsPath,
 	settingsSub,
 	taskPath,
@@ -3518,6 +3520,21 @@ export function ProjectBoard({
 							Start review
 						</button>
 					)}
+					{/* Settings shortcut: a real link, so a middle click opens the project's
+					    settings page in a new tab; a plain click walks the popstate path. */}
+					<a
+						className="project-settings"
+						href={settingsPath(project.name)}
+						aria-label="Project settings"
+						title="Project settings"
+						onClick={(e) =>
+							navClick(e, () =>
+								settingsNavigate(`${SETTINGS_HASH}/${project.name}`),
+							)
+						}
+					>
+						<Icon name="gear" size={14} />
+					</a>
 					{(project.hasRules || !project.gitless) && (
 						<>
 							<button

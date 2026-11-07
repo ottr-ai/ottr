@@ -2282,10 +2282,38 @@ button.notif-link {
 	color: var(--dim);
 	font-weight: 600;
 }
+/* The settings shortcut: the header's square control look on a link, so the
+   project's settings page also opens from a middle click or a new tab. */
+a.project-settings {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	aspect-ratio: 1;
+	padding: 0;
+	font: inherit;
+	color: var(--text-strong);
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	cursor: pointer;
+	transition:
+		background-color 0.12s var(--ease),
+		border-color 0.12s var(--ease),
+		transform 0.12s var(--ease);
+}
+a.project-settings:hover {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+a.project-settings:active {
+	background: var(--card-active);
+	transform: scale(0.97);
+}
 /* Header actions: one square "more" button opens a menu of the project's actions, so
-   the bar holds only the search, the menu and New task. An overdue review stays out
-   as the one nudge; the status span next to the name carries the words. The button
-   keeps grey stock: a review due is a nudge, not an alarm (Grey-Is-Normal). */
+   the bar holds only the search, the settings link, the menu and New task. An overdue
+   review stays out as the one nudge; the status span next to the name carries the
+   words. The button keeps grey stock: a review due is a nudge, not an alarm
+   (Grey-Is-Normal). */
 .project-more {
 	anchor-name: --project-more;
 	aspect-ratio: 1;

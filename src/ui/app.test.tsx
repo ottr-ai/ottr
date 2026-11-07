@@ -4746,6 +4746,150 @@ describe("ProjectBoard search delay", () => {
 	});
 });
 
+describe("ProjectBoard settings shortcut", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the search
+	// delay tests above, plus the history/location pair settingsNavigate() drives.
+	const window = new Window({ url: "http://localhost/projects/proj" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+		history: window.history,
+		location: window.location,
+		PopStateEvent: window.PopStateEvent,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The production onClick React rendered onto the node; a dispatched click never
+	 *  reaches React's event plugin under happy-dom (see the search delay tests). */
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	/** The board with one card; the header's actions row is what the shortcut lives in. */
+	async function mountBoard(): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const tasks = [cardFixture({ id: "t1", title: "Fix bug" })];
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		await act(async () => {
+			root.render(
+				<ProjectBoard
+					project={project}
+					tasks={tasks}
+					deltas={new Map()}
+					open={() => {}}
+					seenAnswers={new Set()}
+					compose={() => {}}
+					composeDraft={() => {}}
+					act={async () => true}
+					onNotice={() => {}}
+					draining={false}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+			},
+		};
+	}
+
+	test("the header links to the project's settings page", async () => {
+		const { container, unmount } = await mountBoard();
+		try {
+			const link = container.querySelector("a.project-settings");
+			expect(link?.getAttribute("href")).toBe("/settings/proj");
+			expect(link?.getAttribute("aria-label")).toBe("Project settings");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a plain click walks the project's settings view", async () => {
+		const { container, unmount } = await mountBoard();
+		try {
+			const link = container.querySelector("a.project-settings");
+			if (link === null) throw new Error("settings shortcut missing");
+			let popped = 0;
+			window.addEventListener("popstate", () => {
+				popped += 1;
+			});
+			let prevented = false;
+			await act(async () => {
+				onClickOf(link)({
+					button: 0,
+					metaKey: false,
+					ctrlKey: false,
+					shiftKey: false,
+					altKey: false,
+					preventDefault: () => {
+						prevented = true;
+					},
+					currentTarget: { pathname: "/settings/proj" },
+				});
+			});
+			// The default navigation is suppressed and the settings view's URL is the
+			// pushed history entry, announced with the popstate the App listens on.
+			expect(prevented).toBe(true);
+			expect(popped).toBe(1);
+			expect(window.location.pathname).toBe("/settings/proj");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
 /** Minimal ComposeDialog props: the copy the three callers pin, with a no-op send and act. */
 const compose = (extra?: Partial<Parameters<typeof ComposeDialog>[0]>) => ({
 	open: true,
