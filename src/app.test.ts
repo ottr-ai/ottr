@@ -7696,6 +7696,38 @@ describe("web push (R1-1, R2-3)", () => {
 		for (const p of sent) expect(p.clear).toEqual([]);
 	});
 
+	test("/api/notifications/live reports per device: live alerts and the last sequence sent; an ack empties it", async () => {
+		const b = alertBoard("alert-live");
+		const phone = "https://push.example/live-phone";
+		const quiet = "https://push.example/live-quiet";
+		await b.subscribe(phone);
+		await b.subscribe(quiet);
+		await b.m.call("/api/notifications/prefs", {
+			endpoint: quiet,
+			classes: { request: false, error: true, complete: true },
+		});
+		const liveOf = async (endpoint: string) => {
+			const res = await b.m.call(
+				`/api/notifications/live?endpoint=${encodeURIComponent(endpoint)}`,
+			);
+			return { status: res.status, body: await res.json() };
+		};
+		const ids = Array.from(
+			{ length: 21 },
+			(_, i) => b.s.createTask(`ask ${i}`).id,
+		);
+		b.m.app.publishState();
+		for (const id of ids) b.needsYou(id);
+		b.m.app.publishState();
+		expect((await liveOf(phone)).body.request).toEqual({ live: 21, seq: 1 });
+		// The device with Request off got nothing: nothing live there.
+		expect((await liveOf(quiet)).body.request).toEqual({ live: 0, seq: 0 });
+		// Acknowledging every entry empties the class, so a delayed group push reads dead.
+		await b.m.call("/api/inbox/seen", { taskIds: ids });
+		expect((await liveOf(phone)).body.request).toEqual({ live: 0, seq: 1 });
+		expect((await liveOf("https://push.example/nobody")).status).toBe(404);
+	});
+
 	test("Apple: a pending retraction rides on the next alerts, bounded below the new alert's number", async () => {
 		const b = alertBoard("alert-apple-race");
 		await b.subscribe("https://web.push.apple.com/race");

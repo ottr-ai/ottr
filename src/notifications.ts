@@ -284,7 +284,8 @@ export interface AlertPayload {
 	url: string;
 	/** The alerts this notification stands for, capped at PAYLOAD_KEYS_MAX. */
 	keys: string[];
-	/** More alerts than `keys` names: the service worker never treats it as fully read. */
+	/** More alerts than `keys` names. Informational: the service worker decides read/unread
+	 * from the server's live state (GET /api/notifications/live), never from the keys. */
 	partial: boolean;
 	/** Per-device, per-class sequence number; app.ts batchFor assigns it (0 until then). */
 	seq: number;

@@ -4817,6 +4817,30 @@ export function createApp(deps: AppDeps) {
 				}),
 		},
 		// --- Web Push (end) ---
+		// The service worker's authority before it shows or keeps a notification: per class,
+		// how many alerts this device still has live (unanswered, unacknowledged) and the
+		// sequence number of the last alert sent to it. A delayed, resolved or superseded
+		// payload reads as stale here, however the pushes were ordered.
+		"/api/notifications/live": {
+			GET: (req) =>
+				api(req, async () => {
+					const endpoint = new URL(req.url).searchParams.get("endpoint");
+					if (
+						endpoint === null ||
+						!loadSubs(deps.gstore).some((s) => s.endpoint === endpoint)
+					)
+						return json({ error: "unknown endpoint" }, 404);
+					const seqs = alertSeqs.get(endpoint);
+					const live: Record<AlertClass, { live: number; seq: number }> = {
+						request: { live: 0, seq: seqs?.request ?? 0 },
+						error: { live: 0, seq: seqs?.error ?? 0 },
+						complete: { live: 0, seq: seqs?.complete ?? 0 },
+					};
+					for (const a of liveAlerts)
+						if (a.to.includes(endpoint)) live[a.class].live++;
+					return json(live);
+				}),
+		},
 		"/api/notifications/prefs": {
 			GET: (req) =>
 				api(req, async () => {

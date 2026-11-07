@@ -16,8 +16,10 @@ const calls = {
 };
 // Notifications currently shown, as { tag, title, data }.
 const tray = [];
-// What the fake fetch of /api/inbox/seen does: a keys array, or "fail".
-let seenResponse = [];
+// What the fake /api/notifications/live answers: a per-class state object, or "fail".
+let liveResponse = "fail";
+// When set, the live fetch waits for this promise first (to interleave two handlers).
+let liveGate = null;
 const listeners = {};
 
 const previousSelf = globalThis.self;
@@ -31,9 +33,21 @@ afterAll(() => {
 });
 globalThis.fetch = async (url, init) => {
 	calls.fetches.push({ url, credentials: init?.credentials });
-	if (seenResponse === "fail") throw new Error("offline");
-	return { ok: true, json: async () => ({ keys: seenResponse }) };
+	// Captured per call, so two interleaved handlers can see different answers and gates.
+	const answer = liveResponse;
+	const gate = liveGate;
+	if (gate !== null) await gate;
+	if (answer === "fail") throw new Error("offline");
+	return { ok: true, json: async () => answer };
 };
+
+/** Live state where `tag` has `live` alerts and its last sent alert is #`seq`. */
+const liveOf = (tag, live, seq) => ({
+	request: { live: 0, seq: 0 },
+	error: { live: 0, seq: 0 },
+	complete: { live: 0, seq: 0 },
+	[tag]: { live, seq },
+});
 
 globalThis.self = {
 	addEventListener: (type, handler) => {
@@ -42,7 +56,14 @@ globalThis.self = {
 	registration: {
 		showNotification: async (title, options) => {
 			calls.notifications.push({ title, options });
+			// Same tag replaces, as in browsers.
+			if (options.tag !== undefined)
+				for (let i = tray.length - 1; i >= 0; i--)
+					if (tray[i].tag === options.tag) tray.splice(i, 1);
 			tray.push({ tag: options.tag, title, data: options.data });
+		},
+		pushManager: {
+			getSubscription: async () => ({ endpoint: "https://push.example/me" }),
 		},
 		getNotifications: async ({ tag }) =>
 			tray
@@ -82,7 +103,8 @@ beforeEach(() => {
 	calls.trayClosed.length = 0;
 	calls.fetches.length = 0;
 	tray.length = 0;
-	seenResponse = [];
+	liveResponse = "fail";
+	liveGate = null;
 	controlled.length = 0;
 	uncontrolled.length = 0;
 });
@@ -126,7 +148,7 @@ test("push shows a notification built from the payload", async () => {
 				tag: "t1",
 				renotify: true,
 				icon: "/icon-192.png",
-				data: { url: "/tasks/1", keys: [], partial: false, seq: 0 },
+				data: { url: "/tasks/1", seq: 0 },
 			},
 		},
 	]);
@@ -142,7 +164,7 @@ test("push falls back to defaults for missing payload fields", async () => {
 				tag: undefined,
 				renotify: false,
 				icon: "/icon-192.png",
-				data: { url: "/", keys: [], partial: false, seq: 0 },
+				data: { url: "/", seq: 0 },
 			},
 		},
 	]);
@@ -203,7 +225,77 @@ const alert = {
 	upTo: {},
 };
 
-test("clear push closes notifications up to each class's bound and shows nothing", async () => {
+test("alert push asks the server for this device's live state, then shows the newest live alert", async () => {
+	liveResponse = liveOf("request", 1, 5);
+	await push(alert);
+	expect(calls.fetches).toEqual([
+		{
+			url: `/api/notifications/live?endpoint=${encodeURIComponent("https://push.example/me")}`,
+			credentials: "same-origin",
+		},
+	]);
+	expect(calls.notifications).toEqual([
+		{
+			title: "p: card",
+			options: {
+				body: "needs you",
+				tag: "request",
+				renotify: true,
+				icon: "/icon-192.png",
+				data: { url: "/projects/p/tasks/1", seq: 5 },
+			},
+		},
+	]);
+});
+
+test("a resolved or acknowledged alert never shows, a partial group included", async () => {
+	// Clear first, the delayed alert after: the server reports the class dead.
+	liveResponse = liveOf("request", 0, 5);
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	await push({ ...alert, partial: true });
+	expect(calls.notifications).toEqual([]);
+	expect(tray).toEqual([]);
+});
+
+test("a superseded alert never shows: an older payload arriving late stays hidden", async () => {
+	liveResponse = liveOf("request", 2, 6);
+	await push({ ...alert, seq: 6, title: "newer" });
+	await push(alert); // seq 5, arrives after #6
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("concurrent handlers run in order: a slow older alert cannot overwrite a newer one", async () => {
+	// #5 reads a state where it is still the newest, but its answer is slow; #6 is sent
+	// meanwhile. Run in parallel, #6 would show first and #5 would then replace it.
+	liveResponse = liveOf("request", 1, 5);
+	const gate = Promise.withResolvers();
+	liveGate = gate.promise;
+	const older = push(alert);
+	await Promise.resolve();
+	liveResponse = liveOf("request", 2, 6);
+	liveGate = null;
+	const newer = push({ ...alert, seq: 6, title: "newer" });
+	await new Promise((r) => setTimeout(r, 5));
+	gate.resolve();
+	await Promise.all([older, newer]);
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("every push closes classes the server reports with no live alert", async () => {
+	tray.push(
+		{ tag: "error", title: "dead error", data: { seq: 9 } },
+		{ tag: "complete", title: "dead done", data: { seq: 1 } },
+	);
+	liveResponse = liveOf("request", 1, 5);
+	await push(alert);
+	expect(calls.trayClosed.sort()).toEqual(["dead done", "dead error"]);
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+	// A clear push with live state keeps a class that still has a live alert.
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+});
+
+test("offline fallback: a clear closes notifications up to each class's bound", async () => {
 	tray.push(
 		{ tag: "request", title: "a", data: { seq: 3 } },
 		{ tag: "error", title: "b", data: { seq: 1 } },
@@ -217,14 +309,12 @@ test("clear push closes notifications up to each class's bound and shows nothing
 	expect(calls.notifications).toEqual([]);
 	expect(calls.trayClosed.sort()).toEqual(["a", "c"]);
 	expect(tray.map((n) => n.title)).toEqual(["b"]);
-	expect(calls.fetches).toEqual([]);
 });
 
-test("a late retraction never closes a notification shown after it was decided", async () => {
+test("offline fallback: a late retraction never closes a notification shown after it was decided", async () => {
 	tray.push({ tag: "request", title: "newer", data: { seq: 4 } });
 	await push({ type: "clear", tags: ["request"], upTo: { request: 3 } });
 	expect(tray.map((n) => n.title)).toEqual(["newer"]);
-	// The same bound riding on a delayed alert of another class leaves it open too.
 	await push({
 		...alert,
 		tag: "error",
@@ -235,89 +325,12 @@ test("a late retraction never closes a notification shown after it was decided",
 	expect(tray.map((n) => n.title).sort()).toEqual(["newer", "p: card"]);
 });
 
-test("a delayed older alert never replaces a newer one of its class", async () => {
-	tray.push({ tag: "request", title: "newer", data: { seq: 6, keys: ["x"] } });
+test("offline fallback: an older alert never replaces a newer one; a newest one shows", async () => {
+	tray.push({ tag: "request", title: "newer", data: { seq: 6 } });
 	await push(alert); // seq 5
 	expect(calls.notifications).toEqual([]);
-	expect(tray.map((n) => n.title)).toEqual(["newer"]);
-});
-
-test("alert push runs its bounded retraction first, then shows", async () => {
-	tray.push({ tag: "error", title: "old error", data: { seq: 2 } });
-	await push({ ...alert, clear: ["error"], upTo: { error: 2 } });
-	expect(calls.trayClosed).toEqual(["old error"]);
-	expect(calls.fetches).toEqual([
-		{ url: "/api/inbox/seen", credentials: "same-origin" },
-	]);
-	expect(calls.notifications).toEqual([
-		{
-			title: "p: card",
-			options: {
-				body: "needs you",
-				tag: "request",
-				renotify: true,
-				icon: "/icon-192.png",
-				data: {
-					url: "/projects/p/tasks/1",
-					keys: ["task:1:needs"],
-					partial: false,
-					seq: 5,
-				},
-			},
-		},
-	]);
-	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
-});
-
-test("alert push whose keys are all acknowledged shows nothing", async () => {
-	seenResponse = ["task:1:needs", "other"];
-	await push(alert);
-	expect(calls.notifications).toEqual([]);
-	expect(tray).toEqual([]);
-});
-
-test("a partial alert never counts as read: it shows even when its named keys are", async () => {
-	seenResponse = ["task:1:needs"];
-	await push({ ...alert, partial: true });
-	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
-});
-
-test("acknowledged alert closes older same-tag notifications that are fully read, keeps unread and partial ones", async () => {
-	seenResponse = ["task:1:needs", "task:0:needs"];
-	tray.push(
-		{
-			tag: "request",
-			title: "stale",
-			data: { seq: 1, keys: ["task:0:needs"] },
-		},
-		{
-			tag: "request",
-			title: "unread",
-			data: { seq: 2, keys: ["task:9:needs"] },
-		},
-		{
-			tag: "request",
-			title: "group",
-			data: { seq: 3, keys: ["task:0:needs"], partial: true },
-		},
-	);
-	await push(alert);
-	expect(calls.notifications).toEqual([]);
-	expect(tray.map((n) => n.title)).toEqual(["unread", "group"]);
-});
-
-test("alert push with some keys unacknowledged stays shown", async () => {
-	seenResponse = ["task:1:needs"];
-	await push({ ...alert, keys: ["task:1:needs", "task:2:needs"] });
-	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
-});
-
-test("alert push still shows when the seen fetch fails", async () => {
-	seenResponse = "fail";
-	await push(alert);
-	expect(calls.notifications.length).toBe(1);
-	expect(calls.trayClosed).toEqual([]);
-	expect(tray.map((n) => n.title)).toEqual(["p: card"]);
+	await push({ ...alert, seq: 7, title: "newest" });
+	expect(tray.map((n) => n.title)).toEqual(["newest"]);
 });
 
 test("untyped push shows without consulting the server", async () => {
