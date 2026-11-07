@@ -11,9 +11,13 @@ import type {
 } from "../types.ts";
 import {
 	AppCheckLines,
+	fmtCost,
+	fmtCount,
+	fmtPct,
 	GitHostsSection,
 	HindsightSection,
 	NotificationsSection,
+	OmpStatsSection,
 	openSettingsSection,
 	ProjectSettingsForm,
 	ProjectsOrderSection,
@@ -922,6 +926,123 @@ describe("SessionSection", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+/** Mounts OmpStatsSection against `fetchMock`, same cleanup as mountSessions. */
+async function mountOmpStats(fetchMock: typeof fetch): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchMock;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(<OmpStatsSection />);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		},
+	};
+}
+
+describe("OmpStatsSection", () => {
+	test("the report renders totals, both sources, and the by-model rows", async () => {
+		const totals = {
+			totalRequests: 120,
+			successfulRequests: 118,
+			failedRequests: 2,
+			errorRate: 2 / 120,
+			totalInputTokens: 24_000,
+			totalOutputTokens: 6_400,
+			totalCacheReadTokens: 12_000,
+			totalCacheWriteTokens: 800,
+			cacheRate: 0.5,
+			cacheSavings: 0.4,
+			totalCost: 12.5,
+			unpricedRequests: 0,
+			totalPremiumRequests: 3,
+			avgDuration: 4_200,
+			avgTtft: 300,
+			avgTokensPerSecond: 42,
+			firstTimestamp: null,
+			lastTimestamp: null,
+		};
+		const fetchMock = (async (): Promise<Response> =>
+			new Response(
+				JSON.stringify({
+					at: Date.now() - 60_000,
+					sources: [
+						{
+							name: "board",
+							board: true,
+							answer: { stats: { overall: totals, byModel: [] }, error: null },
+						},
+						{
+							name: "worker-1",
+							board: false,
+							answer: { stats: null, error: "exited with code 3: boom" },
+						},
+					],
+					overall: totals,
+					byModel: [{ ...totals, model: "glm-5.3-flash", provider: "zai" }],
+				}),
+			)) as unknown as typeof fetch;
+		const { container, unmount } = await mountOmpStats(fetchMock);
+		try {
+			const card = container.querySelector("#omp-stats-section");
+			expect(card).not.toBeNull();
+			// Totals readout: the fixture's numbers, formatted.
+			expect(card?.textContent).toContain("120");
+			expect(card?.textContent).toContain("$12.50");
+			expect(card?.textContent).toContain("50.0%");
+			// Per-source table: the board row is named Board, the worker keeps its
+			// hostname, and the errored source still lists with its error.
+			const rows = card?.querySelectorAll("tbody tr") ?? [];
+			const firstTable = [...(rows ?? [])].slice(0, 2);
+			expect(firstTable[0]?.textContent).toContain("Board");
+			expect(firstTable[1]?.textContent).toContain("worker-1");
+			expect(firstTable[1]?.textContent).toContain("exited with code 3: boom");
+			// By-model table: model plus provider, requests, cost.
+			expect(container.textContent).toContain("glm-5.3-flash");
+			expect(container.textContent).toContain("zai");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed report fetch shows the failure alert", async () => {
+		const fetchMock = (async (): Promise<Response> =>
+			new Response(JSON.stringify({ error: "boom" }), {
+				status: 500,
+			})) as unknown as typeof fetch;
+		const { container, unmount } = await mountOmpStats(fetchMock);
+		try {
+			const alert = container.querySelector('p[role="alert"]');
+			expect(alert).not.toBeNull();
+			expect(alert?.textContent).toContain("omp usage could not be loaded.");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the formatters keep the readout compact and priced", () => {
+		expect(fmtCount(999)).toBe("999");
+		expect(fmtCount(12_300)).toBe("12.3k");
+		expect(fmtCount(2_100_000)).toBe("2.1M");
+		expect(fmtCost(0.25)).toBe("$0.25");
+		expect(fmtPct(0.5)).toBe("50.0%");
+		expect(fmtPct(null)).toBe("—");
 	});
 });
 

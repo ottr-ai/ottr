@@ -16,6 +16,7 @@ import { execSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -11933,6 +11934,182 @@ describe("worker sign-in warnings", () => {
 			if (savedKey === undefined) delete process.env.ZAI_API_KEY;
 			else process.env.ZAI_API_KEY = savedKey;
 			rmSync(agentTmp, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("GET /api/settings/omp-stats", () => {
+	// Executable stand-in for omp: prints one fixed stats payload and appends a line to the
+	// counter file per run, so tests can prove how many times the binary ran.
+	const makeOmp = (dir: string, counter: string, totalRequests: number) => {
+		const bin = join(dir, "fake-omp");
+		const payload = JSON.stringify({
+			overall: { totalRequests, totalCost: totalRequests },
+			byModel: [],
+		});
+		writeFileSync(
+			bin,
+			`#!/bin/sh\necho run >> ${JSON.stringify(counter)}\necho '${payload}'\n`,
+		);
+		chmodSync(bin, 0o755);
+		return bin;
+	};
+
+	/** One fresh app + server whose worker answers /omp-stats with 7 requests. */
+	function boot(opts: { urls: string[]; bin: string }) {
+		let workerHits = 0;
+		const fakeWorker = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				if (new URL(req.url).pathname !== "/omp-stats")
+					return new Response("not found", { status: 404 });
+				if (req.headers.get("x-otwr-token") !== "tok")
+					return new Response("unauthorized", { status: 401 });
+				workerHits++;
+				return Response.json({
+					stats: {
+						overall: { totalRequests: 7, totalCost: 7 },
+						byModel: [
+							{
+								model: "zai/glm-5",
+								provider: "zai",
+								totalRequests: 7,
+								totalCost: 7,
+							},
+						],
+					},
+					error: null,
+				});
+			},
+		});
+		const ompApp = createApp({
+			gstore,
+			defaultDir: root,
+			projects: new Map(),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				idleReviews: true,
+				trendingScan: true,
+				removedPaths: [],
+				envValues: {},
+				projectPaths: [],
+				projectOrder: [],
+			},
+			serverRef: { current: undefined },
+			ompStatsBin: opts.bin,
+			// The fake worker always answers alongside whatever extra urls the test lists:
+			// a test opts out only by pointing an extra url at a dead port.
+			workerTarget: {
+				urls: [...opts.urls, `http://127.0.0.1:${fakeWorker.port}`],
+				token: "tok",
+			},
+		});
+		const srv = Bun.serve({ port: 0, ...ompApp.serveOptions });
+		ompApp.serverRef.current = srv;
+		mounted.push(srv);
+		const get = () =>
+			fetch(new URL("/api/settings/omp-stats", srv.url), {
+				headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+			});
+		return {
+			get,
+			hits: () => workerHits,
+			stop: () => fakeWorker.stop(true),
+		};
+	}
+
+	type Body = {
+		at: number;
+		sources: {
+			name: string;
+			board: boolean;
+			answer: {
+				stats: { overall: { totalRequests: number } } | null;
+				error: string | null;
+			};
+		}[];
+		overall: { totalRequests: number; totalCost: number };
+		byModel: {
+			model: string;
+			provider: string | null;
+			totalRequests: number;
+		}[];
+	};
+
+	test("merges the board store with every worker's answer over distinct sources", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-omp-stats"));
+		const b = boot({ urls: [], bin: makeOmp(dir, join(dir, "runs"), 3) });
+		try {
+			const res = await b.get();
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as Body;
+			expect(body.sources).toHaveLength(2);
+			expect(body.sources[0]?.name).toBe("server");
+			expect(body.sources[0]?.board).toBe(true);
+			expect(body.sources[0]?.answer.stats?.overall.totalRequests).toBe(3);
+			expect(body.sources[0]?.answer.error).toBeNull();
+			expect(body.sources[1]?.name).toBe("127.0.0.1");
+			expect(body.sources[1]?.board).toBe(false);
+			expect(body.sources[1]?.answer.stats?.overall.totalRequests).toBe(7);
+			// Totals merge over the distinct stores; the merged byModel row names the model.
+			expect(body.overall.totalRequests).toBe(10);
+			expect(body.overall.totalCost).toBe(10);
+			expect(body.byModel).toHaveLength(1);
+			expect(body.byModel[0]?.model).toBe("zai/glm-5");
+			expect(body.byModel[0]?.provider).toBe("zai");
+			expect(body.byModel[0]?.totalRequests).toBe(7);
+		} finally {
+			b.stop();
+		}
+	});
+
+	test("two back-to-back GETs share one read: one omp run, one worker hit, one report", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-omp-stats"));
+		const counter = join(dir, "runs");
+		const b = boot({ urls: [], bin: makeOmp(dir, counter, 3) });
+		try {
+			const [one, two] = await Promise.all([b.get(), b.get()]);
+			expect(one.status).toBe(200);
+			expect(two.status).toBe(200);
+			const a = (await one.json()) as Body;
+			const c = (await two.json()) as Body;
+			expect(a.at).toBe(c.at);
+			expect(
+				readFileSync(counter, "utf8")
+					.split("\n")
+					.filter((l) => l !== ""),
+			).toHaveLength(1);
+			expect(b.hits()).toBe(1);
+		} finally {
+			b.stop();
+		}
+	});
+
+	test("a dead worker port answers 200 with a failed source; healthy sources still merge", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-omp-stats"));
+		const b = boot({
+			urls: ["http://127.0.0.1:1"],
+			bin: makeOmp(dir, join(dir, "runs"), 3),
+		});
+		try {
+			const res = await b.get();
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as Body;
+			// Server + the dead port + the fake worker, which boot always lists.
+			expect(body.sources).toHaveLength(3);
+			const dead = body.sources.find((s) => s.answer.stats === null);
+			expect(dead?.name).toBe("127.0.0.1");
+			expect(dead?.answer.error).toContain("failed");
+			expect(body.overall.totalRequests).toBe(10);
+		} finally {
+			b.stop();
 		}
 	});
 });

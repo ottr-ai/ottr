@@ -10,6 +10,7 @@ import {
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { AlertClass, ClassPrefs } from "../notifications.ts";
+import type { OmpStatsReport } from "../ompStats.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
 import type {
@@ -983,6 +984,145 @@ export function NotificationsSection({
 				<p className="auth-error" role="alert">
 					{error}
 				</p>
+			)}
+		</SettingsCard>
+	);
+}
+
+/** Compact count: 12.3k / 2.1M; whole numbers stay whole. */
+export const fmtCount = (n: number): string => {
+	if (n < 10_000) return String(n);
+	if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+	return `${(n / 1_000_000).toFixed(1)}M`;
+};
+
+/** USD cost, always two decimals (omp's own precision). */
+export const fmtCost = (usd: number): string => `$${usd.toFixed(2)}`;
+
+/** One-decimal percent of a 0..1 rate; an em dash when omp has no basis for it. */
+export const fmtPct = (rate: number | null): string =>
+	rate === null ? "—" : `${(rate * 100).toFixed(1)}%`;
+
+/** Settings -> omp usage: live `omp stats --json` numbers for the board's own store and
+ *  every worker's shared store, fetched when the Settings page opens; a source that
+ *  answers an error still lists with its error. */
+export function OmpStatsSection() {
+	const [report, setReport] = useState<OmpStatsReport | null>(null);
+	const [loadFailed, setLoadFailed] = useState(false);
+	const load = useCallback(async (): Promise<void> => {
+		const r = await unwrap<OmpStatsReport>(
+			await fetch("/api/settings/omp-stats"),
+		);
+		setLoadFailed(false);
+		setReport(r);
+	}, []);
+	useEffect(() => {
+		load().catch(() => setLoadFailed(true));
+	}, [load]);
+	return (
+		<SettingsCard
+			id="omp-stats-section"
+			title="omp usage"
+			hint="Live omp stats from the board's own store and every worker's shared store, fetched when this page opens. A store that answers an error still lists below with its error."
+		>
+			{loadFailed ? (
+				<p className="hint" role="alert">
+					omp usage could not be loaded.
+				</p>
+			) : report === null ? (
+				<Skeleton shape="stats" rows={3} label="Loading omp usage" />
+			) : (
+				<>
+					<div className="setup-facts">
+						<div>
+							<b>{fmtCount(report.overall.totalRequests)}</b>
+							<span>requests</span>
+						</div>
+						<div>
+							<b>{fmtCount(report.overall.failedRequests)}</b>
+							<span>failed</span>
+						</div>
+						<div>
+							<b>{fmtCount(report.overall.totalInputTokens)}</b>
+							<span>tokens in</span>
+						</div>
+						<div>
+							<b>{fmtCount(report.overall.totalOutputTokens)}</b>
+							<span>tokens out</span>
+						</div>
+						<div>
+							<b>
+								{fmtCount(
+									report.overall.totalCacheReadTokens +
+										report.overall.totalCacheWriteTokens,
+								)}
+							</b>
+							<span>cached ({fmtPct(report.overall.cacheRate)})</span>
+						</div>
+						<div>
+							<b>{fmtCost(report.overall.totalCost)}</b>
+							<span>cost</span>
+						</div>
+					</div>
+					<table className="ov">
+						<thead>
+							<tr>
+								<th scope="col">Store</th>
+								<th scope="col">Requests</th>
+								<th scope="col">Tokens in / out</th>
+								<th scope="col">Cost</th>
+								<th scope="col">Status</th>
+							</tr>
+						</thead>
+						<tbody>
+							{report.sources.map((s) => (
+								<tr key={s.name}>
+									<th scope="row">{s.board ? "Board" : s.name}</th>
+									<td>
+										{s.answer.stats === null
+											? "—"
+											: fmtCount(s.answer.stats.overall.totalRequests)}
+									</td>
+									<td>
+										{s.answer.stats === null
+											? "—"
+											: `${fmtCount(s.answer.stats.overall.totalInputTokens)} / ${fmtCount(s.answer.stats.overall.totalOutputTokens)}`}
+									</td>
+									<td>
+										{s.answer.stats === null
+											? "—"
+											: fmtCost(s.answer.stats.overall.totalCost)}
+									</td>
+									<td>{s.answer.error ?? "ok"}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+					<table className="ov">
+						<thead>
+							<tr>
+								<th scope="col">Model</th>
+								<th scope="col">Provider</th>
+								<th scope="col">Requests</th>
+								<th scope="col">Tokens in / out</th>
+								<th scope="col">Cost</th>
+							</tr>
+						</thead>
+						<tbody>
+							{report.byModel.map((m) => (
+								<tr key={`${m.provider ?? ""}/${m.model}`}>
+									<th scope="row">{m.model}</th>
+									<td>{m.provider ?? "—"}</td>
+									<td>{fmtCount(m.totalRequests)}</td>
+									<td>
+										{`${fmtCount(m.totalInputTokens)} / ${fmtCount(m.totalOutputTokens)}`}
+									</td>
+									<td>{fmtCost(m.totalCost)}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</>
 			)}
 		</SettingsCard>
 	);
@@ -4409,6 +4549,7 @@ export const SETTINGS_TOC = [
 		sections: [
 			{ id: "api-key-section", label: "API key" },
 			{ id: "session-section", label: "Session" },
+			{ id: "omp-stats-section", label: "omp usage" },
 		],
 	},
 	{
@@ -4813,6 +4954,7 @@ export function SettingsPage({
 							</h2>
 							<ApiKeySection />
 							<SessionSection />
+							<OmpStatsSection />
 						</section>
 						<section
 							className="settings-group"

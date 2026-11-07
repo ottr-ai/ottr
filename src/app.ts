@@ -156,6 +156,13 @@ import {
 	taskEntryKey,
 } from "./notifications.ts";
 import {
+	buildOmpStatsReport,
+	fetchWorkerOmpStats,
+	type OmpStatsReport,
+	type OmpStatsSource,
+	runOmpStats,
+} from "./ompStats.ts";
+import {
 	type OrphanProject,
 	orphanCache,
 	orphanView,
@@ -458,6 +465,8 @@ interface AppDeps {
 	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
+	/** Only for tests: the binary GET /api/settings/omp-stats runs instead of omp on PATH. */
+	ompStatsBin?: string;
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -3914,6 +3923,50 @@ export function createApp(deps: AppDeps) {
 		);
 		system.record([{ name: "server", reading }, ...workers], readVm());
 	}
+
+	// The Settings -> omp usage report: the board store's own `omp stats --json` plus every
+	// worker's GET /omp-stats, merged over the distinct stores (workers share one home, so
+	// identical answers count once; each source keeps its own answer for the breakdown).
+	let ompStatsCache: { at: number; report: OmpStatsReport } | null = null;
+	let ompStatsRead: Promise<OmpStatsReport> | null = null;
+	/** One report on demand. The 30 s cache + single-flight exist so concurrent Settings
+	 *  tabs never run concurrent `omp stats` syncs against one sqlite store. */
+	async function ompStatsReportNow(): Promise<OmpStatsReport> {
+		if (ompStatsRead !== null) return ompStatsRead;
+		if (ompStatsCache !== null && Date.now() - ompStatsCache.at < 30_000)
+			return ompStatsCache.report;
+		ompStatsRead = (async () => {
+			const target = deps.workerTarget;
+			const workers = await Promise.all(
+				(target?.urls ?? []).flatMap((url) => {
+					let name: string;
+					try {
+						name = new URL(url).hostname;
+					} catch {
+						return []; // A malformed url names no source.
+					}
+					return [
+						fetchWorkerOmpStats(url, target?.token).then(
+							(answer): OmpStatsSource => ({ name, board: false, answer }),
+						),
+					];
+				}),
+			);
+			const answer = await runOmpStats({
+				bin: deps.ompStatsBin,
+				env: boardOmpEnv(),
+			});
+			const report = buildOmpStatsReport(
+				[{ name: "server", board: true, answer }, ...workers],
+				Date.now(),
+			);
+			ompStatsCache = { at: Date.now(), report };
+			return report;
+		})().finally(() => {
+			ompStatsRead = null;
+		});
+		return ompStatsRead;
+	}
 	let behind = 0;
 	let behindCommits: string[] = [];
 	let behindAt = 0;
@@ -4652,6 +4705,9 @@ export function createApp(deps: AppDeps) {
 					if (f !== "") removeKey(f);
 					return json({ own: null });
 				}),
+		},
+		"/api/settings/omp-stats": {
+			GET: (req) => api(req, async () => json(await ompStatsReportNow())),
 		},
 		"/api/settings/hindsight": {
 			GET: (req) => api(req, async () => json(hindsightView())),
