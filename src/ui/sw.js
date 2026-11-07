@@ -16,8 +16,9 @@
 // Each push also closes every class the server reports with no live alert. When the server
 // cannot be reached (offline, signed out), the worker falls back to its own history: every
 // retraction bound it ever got (`upTo` of any payload, or a class the server reported dead)
-// and the newest number it showed, per class, persisted in the Cache API so a worker restart
-// keeps them. Offline, an alert shows only when its number is above both; `upTo` closes
+// and the newest number it knows of (shown, or reported by the server as last sent), per
+// class, persisted in the Cache API so a worker restart keeps them. Offline, an alert shows
+// only when its number is above the bound and not below the newest; `upTo` closes
 // notifications whose own number is at or below the bound.
 const LIVE_TIMEOUT_MS = 3000;
 
@@ -113,10 +114,13 @@ async function fetchLive(endpoint) {
 	}
 }
 
-/** Closes every class the server reports with no live alert on this device, and records the
- * class as retracted up to its last sent number. */
+/** Records the server's state in the history and closes every class with no live alert.
+ * Every class's last sent number is remembered as the newest (`shown`), live or not: an
+ * older payload is superseded even when it arrives offline later. A dead class is also
+ * retracted up to that number. */
 async function closeDead(live, history) {
 	for (const [tag, state] of Object.entries(live)) {
+		raise(history.shown, tag, state?.seq ?? 0);
 		if (state?.live !== 0) continue;
 		raise(history.retracted, tag, state.seq ?? 0);
 		const list = await self.registration.getNotifications({ tag });

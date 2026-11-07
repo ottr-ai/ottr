@@ -388,6 +388,20 @@ test("the history survives a worker restart; a new subscription starts fresh", a
 	expect(tray.map((n) => n.title)).toEqual(["fresh"]);
 });
 
+test("offline: the server's last sent number outlives a rejected online alert, so a superseded round stays hidden", async () => {
+	// Ask rounds #5, #6, #7; only #7 is current. #5 lands online and is rejected.
+	liveResponse = liveOf("request", 1, 7);
+	await push(alert); // #5
+	expect(calls.notifications).toEqual([]);
+	// #6 lands after the board became unreachable, with no bounds of its own.
+	liveResponse = "fail";
+	await push({ ...alert, seq: 6, title: "cleared round" });
+	expect(calls.notifications).toEqual([]);
+	// The current round still shows offline.
+	await push({ ...alert, seq: 7, title: "current round" });
+	expect(tray.map((n) => n.title)).toEqual(["current round"]);
+});
+
 test("untyped push shows without consulting the server", async () => {
 	await push({ title: "Test", body: "hi" });
 	expect(calls.notifications[0].title).toBe("Test");
