@@ -2542,7 +2542,7 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
    Kept ahead of the container block below so its display flip wins the cascade. */
 .stage-tabs {
 	display: none;
-	overflow-x: auto; /* bare digits fit 320px; the scroll stays as the escape hatch */
+	overflow-x: auto; /* wider fallback fonts can still push the strip past 320px: scroll, never wrap */
 	margin-bottom: 10px;
 }
 @container (max-width: 440px) {

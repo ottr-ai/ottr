@@ -3722,8 +3722,9 @@ export function ProjectBoard({
 			    the single-column tier (container ≤440px); the desktop grid never sees either.
 			    Done carries no number anywhere: its tab read the whole landed history, and the
 			    lane head repeated the tab's name and count. The other tabs keep theirs as bare
-			    digits, and the alarm shows as a mark only — the strip then fits a 320px phone
-			    without a scrollbar. */}
+			    digits, and the alarm shows as a mark only — the chip boxes pushed the strip
+			    past a 320px phone; bare digits fit common phone fonts, and where wider
+			    fallback fonts still overflow, .stage-tabs scrolls (never the page). */}
 			<div className="stage-tabs" role="tablist" aria-label="Board stages">
 				{COLUMNS.map((c) => {
 					const count = counts[c.key];
