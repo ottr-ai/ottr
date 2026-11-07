@@ -1691,6 +1691,8 @@ describe("settings TOC", () => {
 				reviewCheck={false}
 				workCheck={false}
 				idleReviews={true}
+				trendingScan={true}
+				trendingStatus={{ lastRunAt: null, lastError: null, running: false }}
 				act={async () => true}
 				view="settings"
 				openTask={() => {}}

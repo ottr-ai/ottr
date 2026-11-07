@@ -3,7 +3,12 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { AppCheck, ProjectView, TaskCard } from "../types.ts";
+import type {
+	AppCheck,
+	ProjectView,
+	TaskCard,
+	TrendingStatus,
+} from "../types.ts";
 import {
 	AppCheckLines,
 	GitHostsSection,
@@ -1562,8 +1567,14 @@ async function mountHindsight(view: HindsightView) {
 
 /** Mounts the full General settings page; the fetch stub never resolves, so the
  *  sections stay idle and the test stays deterministic. Cleanup unmounts and
- *  puts fetch back. */
-async function mountPage(): Promise<{
+ *  puts fetch back. `trendingStatus` defaults to a board that never scanned. */
+async function mountPage(
+	trendingStatus: TrendingStatus = {
+		lastRunAt: null,
+		lastError: null,
+		running: false,
+	},
+): Promise<{
 	container: HTMLDivElement;
 	unmount: () => Promise<void>;
 }> {
@@ -1584,6 +1595,8 @@ async function mountPage(): Promise<{
 				reviewCheck={false}
 				workCheck={false}
 				idleReviews={false}
+				trendingScan={true}
+				trendingStatus={trendingStatus}
 				act={async () => true}
 				view="settings"
 				openTask={() => {}}
@@ -1686,6 +1699,41 @@ describe("settings deep links", () => {
 		} finally {
 			await unmount();
 			window.location.hash = "";
+		}
+	});
+});
+
+describe("General settings trending scan", () => {
+	test("a failed scan shows its reason and time; a running scan disables Scan trending now", async () => {
+		const at = 1_730_634_000_000;
+		const { container, unmount } = await mountPage({
+			lastRunAt: at - 7 * 86_400_000,
+			lastError: { reason: "GitHub answered 502", at },
+			running: true,
+		});
+		try {
+			const text = container.textContent ?? "";
+			expect(text).toContain(
+				`Last trending scan failed: GitHub answered 502 (${stamp(at)})`,
+			);
+			// The failure replaces the last-run line until a scan succeeds.
+			expect(text).not.toContain("Last scan:");
+			expect(text).toContain("A scan is running.");
+			const button = Array.from(container.querySelectorAll("button")).find(
+				(b) => b.textContent?.trim() === "Scan trending now",
+			);
+			expect(button?.disabled).toBe(true);
+			// The weekly switch is a labelled checkbox in the same card.
+			const label = Array.from(container.querySelectorAll("label")).find(
+				(l) => l.textContent === "Weekly trending scan",
+			);
+			const box = container.querySelector<HTMLInputElement>(
+				`[id="${label?.htmlFor}"]`,
+			);
+			expect(box?.type).toBe("checkbox");
+			expect(box?.checked).toBe(true);
+		} finally {
+			await unmount();
 		}
 	});
 });

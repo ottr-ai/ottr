@@ -18,6 +18,7 @@ import type {
 	GithubFacts,
 	ProjectView,
 	TaskCard,
+	TrendingStatus,
 } from "../types.ts";
 import {
 	type Act,
@@ -539,6 +540,8 @@ function TotalRunnersForm({
 	reviewCheck,
 	workCheck,
 	idleReviews,
+	trendingScan,
+	trendingStatus,
 	allocated,
 	act,
 }: {
@@ -546,6 +549,8 @@ function TotalRunnersForm({
 	reviewCheck: boolean;
 	workCheck: boolean;
 	idleReviews: boolean;
+	trendingScan: boolean;
+	trendingStatus: TrendingStatus;
 	allocated: number;
 	act: Act;
 }) {
@@ -561,6 +566,30 @@ function TotalRunnersForm({
 	const dirty = capEdited && next !== maxTotal;
 	const send = (body: Record<string, unknown>): Promise<unknown> =>
 		post("/api/settings", body);
+	// Scan trending now: the reply lands inline, the server's error text as is.
+	const [scanResult, setScanResult] = useState<
+		{ ok: true } | { ok: false; error: string } | null
+	>(null);
+	const scanNow = async (): Promise<boolean> => {
+		setScanResult(null);
+		try {
+			await post("/api/trending/scan", {});
+			setScanResult({ ok: true });
+			return true;
+		} catch (err) {
+			setScanResult({
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	};
+	const lastScan =
+		trendingStatus.lastError !== null
+			? `Last trending scan failed: ${trendingStatus.lastError.reason} (${stamp(trendingStatus.lastError.at)})`
+			: trendingStatus.lastRunAt !== null
+				? `Last scan: ${stamp(trendingStatus.lastRunAt)}`
+				: "No scan yet";
 	return (
 		<SettingsCard
 			id="runners-section"
@@ -629,7 +658,34 @@ function TotalRunnersForm({
 					save={(v) => send({ idleReviews: v })}
 					act={act}
 				/>
+				<CheckRow
+					name="Weekly trending scan"
+					desc="Every Monday at 06:00 (server time), scan GitHub trending and file up to 3 backlog proposals per project with Trending scout on"
+					checked={trendingScan}
+					save={(v) => send({ trendingScan: v })}
+					act={act}
+				/>
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>Trending scan</b>
+						<span>{lastScan}</span>
+						{trendingStatus.running && <span>A scan is running.</span>}
+						<span role="status">
+							{scanResult?.ok === true ? "Scan started" : ""}
+						</span>
+					</div>
+					<div className="alate-def-actions">
+						<BusyButton run={scanNow} disabled={trendingStatus.running}>
+							Scan trending now
+						</BusyButton>
+					</div>
+				</div>
 			</form>
+			{scanResult?.ok === false && (
+				<p className="auth-error" role="alert">
+					{scanResult.error}
+				</p>
+			)}
 			{/* ponytail: configured slots is informational, so the meter stays grey even when over cap — the cap binds, it is not an alarm */}
 			<Meter
 				label="Configured"
@@ -4120,7 +4176,7 @@ function SaveCard({
 	);
 }
 
-/** Updates chip: how many of the project's four automations are on (saved values, not the draft). */
+/** Updates chip: how many of the project's five automations are on (saved values, not the draft). */
 function updatesChip(s: ProjectView["settings"]): {
 	label: string;
 	tone: ChipTone;
@@ -4130,8 +4186,9 @@ function updatesChip(s: ProjectView["settings"]): {
 		s.retroSince !== null,
 		s.forkResearch,
 		s.prReviews,
+		s.trendingScout,
 	].filter(Boolean).length;
-	return { label: `${on} of 4 on`, tone: on > 0 ? "ok" : "off" };
+	return { label: `${on} of 5 on`, tone: on > 0 ? "ok" : "off" };
 }
 
 type SettingsCardProps = {
@@ -4399,6 +4456,8 @@ export function SettingsPage({
 	reviewCheck,
 	workCheck,
 	idleReviews,
+	trendingScan,
+	trendingStatus,
 	act,
 	view,
 	openTask,
@@ -4409,6 +4468,8 @@ export function SettingsPage({
 	reviewCheck: boolean;
 	workCheck: boolean;
 	idleReviews: boolean;
+	trendingScan: boolean;
+	trendingStatus: TrendingStatus;
 	act: Act;
 	view: string;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
@@ -4583,6 +4644,8 @@ export function SettingsPage({
 								reviewCheck={reviewCheck}
 								workCheck={workCheck}
 								idleReviews={idleReviews}
+								trendingScan={trendingScan}
+								trendingStatus={trendingStatus}
 								allocated={allocated}
 								act={act}
 							/>
@@ -5263,6 +5326,13 @@ export function ProjectSettingsForm({
 							desc="Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval"
 							checked={st.forkResearch}
 							save={(v) => send({ forkResearch: v })}
+							act={act}
+						/>
+						<CheckRow
+							name="Trending scout"
+							desc="Weekly: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+							checked={st.trendingScout}
+							save={(v) => send({ trendingScout: v })}
 							act={act}
 						/>
 						<CheckRow

@@ -880,7 +880,9 @@ export function createSupervisor(
 			isReview(t) ||
 			t.kind === "interview" ||
 			// A PR review card is a server-written draft: no agent turn to learn from.
-			t.kind === "pr_review"
+			t.kind === "pr_review" ||
+			// A trending scout is weekly read-only housekeeping: nothing for a retro to learn from.
+			t.kind === "trending"
 		)
 			return;
 		// A cancelled retro child counts: cancelling the retro of a card is final.

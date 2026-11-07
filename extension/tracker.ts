@@ -48,6 +48,13 @@ interface CreateTaskParams {
 	risk?: unknown;
 	check?: unknown;
 }
+interface TrendingParams {
+	repo?: unknown;
+	title?: unknown;
+	prompt?: unknown;
+	verdict?: unknown;
+	reason?: unknown;
+}
 interface Pi {
 	zod: ZodBuilder;
 	registerTool(def: Record<string, unknown>): void;
@@ -225,20 +232,81 @@ export function redactText(text: string, secrets: readonly string[]): string {
 
 const trimmed = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
-function requireBoardEnv():
-	| { error: string }
-	| { base: string; project: string; parent: string; token: string } {
+// The board coordinates and token the runner injects into every task session.
+interface BoardEnv {
+	base: string;
+	project: string;
+	parent: string;
+	token: string;
+}
+
+function requireBoardEnv(tool = "create_task"): { error: string } | BoardEnv {
 	const base = (process.env.OTTR_BOARD_URL ?? "").trim();
 	const project = (process.env.OTTR_PROJECT ?? "").trim();
 	const parent = (process.env.OTTR_TASK_ID ?? "").trim();
 	const token = (process.env.OTTR_BOARD_TOKEN ?? "").trim();
 	if (base === "" || project === "" || parent === "") {
 		return {
-			error:
-				"Error: create_task is unavailable — the tracker did not inject OTTR_BOARD_URL/OTTR_PROJECT/OTTR_TASK_ID into this session. File no cards; finish the turn and report the blocker.",
+			error: `Error: ${tool} is unavailable — the tracker did not inject OTTR_BOARD_URL/OTTR_PROJECT/OTTR_TASK_ID into this session. File no cards; finish the turn and report the blocker.`,
 		};
 	}
 	return { base, project, parent, token };
+}
+
+// A GitHub `owner/repo`: the trending scout's tools name repos this way.
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+// POST one trending verdict to the board (src/app.ts /trending/verdicts, the board token like
+// create_task) with this run's card as the scout. Returns the filed proposal's id (null for
+// no_fit and deferred) or a ready-to-show error text; the tool's own validation runs first.
+async function postVerdict(
+	tool: string,
+	body: {
+		repo: string;
+		verdict: "filed" | "no_fit" | "deferred";
+		reason: string;
+		prompt?: string;
+		title?: string;
+	},
+): Promise<{ ok: true; id: string | null } | { ok: false; text: string }> {
+	const env = requireBoardEnv(tool);
+	if ("error" in env) return { ok: false, text: env.error };
+	const { base, project, parent, token } = env;
+	let res: Response;
+	try {
+		res = await fetch(
+			`${base}/api/projects/${encodeURIComponent(project)}/trending/verdicts`,
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					origin: base,
+					...(token !== "" ? { "x-board-token": token } : {}),
+				},
+				body: JSON.stringify({ scoutId: parent, ...body }),
+			},
+		);
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		return {
+			ok: false,
+			text: `Error: the board at ${base} is unreachable (${why}). Record no more verdicts; report the blocker.`,
+		};
+	}
+	const out = (await res.json().catch(() => null)) as {
+		ok?: unknown;
+		id?: unknown;
+		error?: unknown;
+	} | null;
+	if (!res.ok || out === null || out.ok !== true) {
+		const why =
+			out !== null && typeof out.error === "string" ? ` — ${out.error}` : "";
+		return {
+			ok: false,
+			text: `Error: ${body.verdict === "filed" ? "proposal not filed" : "verdict not recorded"} (HTTP ${res.status}${why}).`,
+		};
+	}
+	return { ok: true, id: typeof out.id === "string" ? out.id : null };
 }
 
 export default function (pi: Pi) {
@@ -341,9 +409,14 @@ export default function (pi: Pi) {
 			// name (OTTR_SESSION_NAME) applies that name here instead of refusing, so the
 			// outcome records at once. Without a pin, refuse once and send the agent to
 			// rename; the next call records even when the name is still missing, so an agent
-			// that ignores the hint keeps its outcome. Retro runs have no rename tool, so they
-			// never refuse; a getSessionName failure records rather than blocks the outcome.
-			if (!refusedOnce && process.env.OTTR_RETRO !== "1") {
+			// that ignores the hint keeps its outcome. Retro and trending scout runs have no
+			// rename tool, so they never refuse; a getSessionName failure records rather than
+			// blocks the outcome.
+			if (
+				!refusedOnce &&
+				process.env.OTTR_RETRO !== "1" &&
+				process.env.OTTR_TRENDING !== "1"
+			) {
 				let unnamed = true;
 				try {
 					const name = await pi.getSessionName();
@@ -666,6 +739,96 @@ export default function (pi: Pi) {
 						? "Recorded. Ottr files it as a held card when this retro ends."
 						: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
 				);
+			},
+		});
+	}
+
+	// The weekly trending scout (OTTR_TRENDING=1): its two verdict tools post straight to the
+	// board, which files the proposal card, caps the proposals per scan and stores every
+	// verdict. A refusal comes back as an Error: text, never a throw.
+	if (process.env.OTTR_TRENDING === "1") {
+		pi.registerTool({
+			name: "propose_repo",
+			label: "Propose repo",
+			description:
+				"File one trending repo as a backlog proposal card for this project; call it once per proposal, best first. " +
+				"The board caps the proposals per scan and refuses the rest: record those with judge_repo as deferred. " +
+				"repo: the trending repo as owner/repo. title: optional card title. " +
+				"prompt: the whole proposal (header with repo link, license, stars and last push; fit category and concrete use; risks and cost; a self-contained draft task prompt).",
+			parameters: z.object({
+				repo: z.string().describe("The trending repo as owner/repo"),
+				title: z
+					.string()
+					.optional()
+					.describe(
+						"Card title, at most 200 characters; omit to use the prompt's first line",
+					),
+				prompt: z
+					.string()
+					.describe("The whole proposal text, 1-20000 characters"),
+			}),
+			loadMode: "essential",
+			approval: "read",
+			async execute(_toolCallId: string, params: TrendingParams) {
+				const repo = trimmed(params.repo);
+				if (!REPO_RE.test(repo))
+					return textResult("Error: repo must be owner/repo.");
+				const title = trimmed(params.title);
+				if (params.title !== undefined && (title === "" || title.length > 200))
+					return textResult(
+						"Error: title must be a string of 1-200 characters (trimmed) when given.",
+					);
+				const prompt = trimmed(params.prompt);
+				if (prompt === "" || prompt.length > 20000)
+					return textResult(
+						"Error: prompt must be a string of 1-20000 characters (trimmed).",
+					);
+				// The board stores a one-line reason with every verdict: a filed repo's is its
+				// proposal's headline.
+				const headline = title !== "" ? title : prompt.split("\n")[0]!.trim();
+				const out = await postVerdict("propose_repo", {
+					repo,
+					verdict: "filed",
+					reason: headline.slice(0, 500),
+					prompt,
+					...(title !== "" ? { title } : {}),
+				});
+				if (!out.ok) return textResult(out.text);
+				return textResult(`Proposal ${out.id ?? "?"} filed for ${repo}.`);
+			},
+		});
+		pi.registerTool({
+			name: "judge_repo",
+			label: "Judge repo",
+			description:
+				"Record your verdict on one trending repo you do not propose; call it once per such repo. " +
+				"no_fit: it does not fit this project (final, later scans skip it). " +
+				"deferred: it fits, but the proposals for this scan are used up (offered again next scan). " +
+				"reason: one line.",
+			parameters: z.object({
+				repo: z.string().describe("The trending repo as owner/repo"),
+				verdict: z
+					.enum(["no_fit", "deferred"])
+					.describe("no_fit (final) or deferred (offered again next scan)"),
+				reason: z.string().describe("One-line reason, 1-500 characters"),
+			}),
+			loadMode: "essential",
+			approval: "read",
+			async execute(_toolCallId: string, params: TrendingParams) {
+				const repo = trimmed(params.repo);
+				if (!REPO_RE.test(repo))
+					return textResult("Error: repo must be owner/repo.");
+				const verdict = params.verdict;
+				if (verdict !== "no_fit" && verdict !== "deferred")
+					return textResult("Error: verdict must be no_fit or deferred.");
+				const reason = trimmed(params.reason);
+				if (reason === "" || reason.length > 500)
+					return textResult(
+						"Error: reason must be a string of 1-500 characters (trimmed).",
+					);
+				const out = await postVerdict("judge_repo", { repo, verdict, reason });
+				if (!out.ok) return textResult(out.text);
+				return textResult(`Recorded ${verdict} for ${repo}.`);
 			},
 		});
 	}

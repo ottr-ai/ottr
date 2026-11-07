@@ -76,6 +76,7 @@ import {
 	openWorkBlockers,
 	parseCheckVerdicts,
 	parseWorkCheck,
+	pickLowPriority,
 	pickRunnable,
 	reviewFindings,
 	selectFindings,
@@ -1408,6 +1409,35 @@ export function createTurnLoop(
 				logStoreError(e.store.name, err);
 			}
 		}
+		// The low-priority slot: a trending scout starts only after every project's picks above
+		// left a free slot, in project order, at most one per call and one running board-wide.
+		if (cap !== null && active() >= cap) return;
+		let scout: { name: string; id: string } | null = null;
+		for (const e of projects.values()) {
+			try {
+				const tasks = e.store.listTasks();
+				if (
+					tasks.some(
+						(t) =>
+							t.kind === "trending" &&
+							t.cancelledAt === null &&
+							(t.state === "running" || t.state === "preparing"),
+					)
+				)
+					return;
+				if (scout !== null) continue;
+				const t = pickLowPriority(tasks, {
+					maxParallel: getSettingsLogged(e).maxParallel,
+					hasRules: ops.hasRules(e.path),
+					only: drained ? e.store.boardCheckId() : undefined,
+					mainUnpushed: e.mainUnpushed === true,
+				});
+				if (t !== null) scout = { name: e.store.name, id: t.id };
+			} catch (err) {
+				logStoreError(e.store.name, err);
+			}
+		}
+		if (scout !== null) void runTurn(scout.name, scout.id);
 	}
 
 	/** Publish one approved release card: Ottr's tag/push/GitHub release, or the project's release
@@ -1652,12 +1682,17 @@ export function createTurnLoop(
 		// the same ones the worker decision below makes.
 		const preRetro = isRetro(task);
 		const preBoardCheck = store.boardCheckId() === id;
+		const preScout = task.kind === "trending";
 		const target = ops.workerTarget ?? null;
 		// ponytail: `target !== null` appears here and in the ternary below; either
 		// `true`-replacement alone cannot change the branch (the other check re-derives
 		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
 		const toWorker =
-			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+			kind !== "merge" &&
+			!preRetro &&
+			!preBoardCheck &&
+			!preScout &&
+			target !== null;
 		const runnerDrained =
 			toWorker && target !== null
 				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
@@ -1701,6 +1736,9 @@ export function createTurnLoop(
 			const interview = task.kind === "interview";
 			// A backlog card only ever runs grill turns: worktree-less, in the main checkout.
 			const grill = task.stage === "backlog";
+			// The weekly trending scout: read-only in the main checkout, local, with only the
+			// read tools and its two verdict tools (propose_repo, judge_repo) on the board env.
+			const scout = task.kind === "trending";
 			// Review sessions get one fixed name, applied by the extension before the agent runs,
 			// so the board never depends on the agent inventing a title.
 			let sessionName = releaseCard
@@ -1749,7 +1787,7 @@ export function createTurnLoop(
 			// A review card reviews the frozen sha it was created with, not the current target head.
 			// A review card's base is always its frozen sha, so `?? sha` only fires for normal tasks.
 			const base = task.base ?? sha;
-			if (interview || grill) {
+			if (interview || grill || scout) {
 				wt = e.path;
 			} else if (!wt || !branch) {
 				branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
@@ -1795,6 +1833,7 @@ export function createTurnLoop(
 			if (
 				!interview &&
 				!grill &&
+				!scout &&
 				wt !== null &&
 				branch !== null &&
 				wt === task.worktree &&
@@ -1975,7 +2014,12 @@ export function createTurnLoop(
 								release: releaseCard,
 								rejected: replyRejected,
 							})
-					: releaseCard || interview || retroCard || boardCheck || grill
+					: releaseCard ||
+							interview ||
+							retroCard ||
+							boardCheck ||
+							grill ||
+							scout
 						? withNote(grill ? grillPrompt(task.prompt) : task.prompt)
 						: kind === "work"
 							? workPrompt({
@@ -2018,7 +2062,7 @@ export function createTurnLoop(
 			// OTTR-454: drop workers under a per-runner drain so the round-robin only
 			// sees live workers; the empty-list guard sits after stopBeforeRun below.
 			const worker =
-				retroCard || boardCheck || kind === "merge"
+				retroCard || boardCheck || scout || kind === "merge"
 					? null
 					: (ops.workerTarget ?? null);
 			// A worker installs the project's packages into its own container; a local run does it here.
@@ -2155,7 +2199,9 @@ export function createTurnLoop(
 						? { OTTR_RETRO: "1" }
 						: reviewCard
 							? { OTTR_REVIEW: "1" }
-							: {}),
+							: scout
+								? { OTTR_TRENDING: "1" }
+								: {}),
 					// PATH last, so an env.txt value can never shadow the tools link dir.
 					...(prep?.pathDir
 						? { PATH: `${prep.pathDir}:${process.env.PATH ?? ""}` }
@@ -2166,10 +2212,14 @@ export function createTurnLoop(
 				stripBoard: retroCard,
 				tools: retroCard
 					? "read,grep,glob,report_outcome,propose_task"
-					: undefined,
+					: scout
+						? "read,grep,glob,report_outcome,propose_repo,judge_repo"
+						: undefined,
 				config: retroCard
 					? join(dirname(ops.extensionPath), "retro.yml")
-					: undefined,
+					: scout
+						? join(dirname(ops.extensionPath), "trending.yml")
+						: undefined,
 				skills: retroCard ? "retro" : undefined,
 				dataRoot: store.dataRoot,
 				logPath: store.logPath(id),
@@ -2262,7 +2312,7 @@ export function createTurnLoop(
 			let reportText: string | null = null;
 			// A refused report (symlink, not a file, too big) holds the card: no quarantine, no removal.
 			let reportError: string | null = null;
-			if (kind === "work" && !interview && !grill) {
+			if (kind === "work" && !interview && !grill && !scout) {
 				try {
 					reportText =
 						readBelow(
@@ -2290,10 +2340,11 @@ export function createTurnLoop(
 				reportText === null &&
 				reportError === null &&
 				result0.outcome?.status === "ready";
-			// An interview card has nothing to integrate, and agents mix up statuses: a ready outcome settles done.
+			// An interview or trending scout card has nothing to integrate, and agents mix up
+			// statuses: a ready outcome settles done.
 			// A research card has nothing to integrate either: its deliverable is the report file.
 			let result =
-				(interview || wasResearch) &&
+				(interview || scout || wasResearch) &&
 				!demoteCandidate &&
 				result0.outcome?.status === "ready"
 					? {
@@ -2330,7 +2381,7 @@ export function createTurnLoop(
 			// A husk (unlinked, no checkout) cannot speak for HEAD at all: when the branch is also gone or
 			// already contained in the target, "integrated" is provable from the main repo alone.
 			const husk =
-				interview || grill
+				interview || grill || scout
 					? false
 					: await ops.worktreeHusk(wt).catch(() => false);
 			// A deregistered worktree can lose its `.git` file while keeping the checkout: then neither
@@ -2340,6 +2391,7 @@ export function createTurnLoop(
 			const unlinked =
 				!interview &&
 				!grill &&
+				!scout &&
 				!husk &&
 				!(await ops.worktreeLinked(wt).catch(() => false));
 			const fromMain = husk || unlinked;
@@ -2391,6 +2443,7 @@ export function createTurnLoop(
 					kind === "work" &&
 					!interview &&
 					!grill &&
+					!scout &&
 					!wasResearch &&
 					!releaseCard &&
 					existsSync(join(wt, "shots"))
@@ -2479,6 +2532,7 @@ export function createTurnLoop(
 				kind === "work" &&
 				!interview &&
 				!grill &&
+				!scout &&
 				!wasResearch &&
 				!releaseCard &&
 				finishedCleanly &&
@@ -2931,10 +2985,11 @@ export function createTurnLoop(
 			const facts: GitFacts = {
 				// An interview card runs in the main checkout with no base branch: the commits-ahead
 				// gate would count its own AGENTS.md commit and trap the card, so it stays exempt.
+				// A trending scout runs there too: the checkout's own commits are never its work.
 				// A husk or unlinked dir would make git speak for the enclosing checkout instead,
 				// so the main-repo proof stands in for all three facts there.
 				commitsAhead:
-					interview || grill || fromMain
+					interview || grill || scout || fromMain
 						? 0
 						: await ops.commitsAhead(wt, base).catch(() => 0),
 				clean: fromMain ? true : await ops.isClean(wt).catch(() => false),
@@ -3263,6 +3318,14 @@ export function createTurnLoop(
 						? "A release review must not commit. Cancel this release, or reply to continue."
 						: "A review must not commit. Cancel this review, or reply to continue.",
 				};
+			// A trending scout is read-only: it reads the main checkout and files cards through
+			// the board, so nothing of it may ever reach a merge turn.
+			if (scout && next.stage === "merging")
+				next = {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: "A trending scout must not commit.",
+				};
 			if (reviewCard && next.stage === "done") {
 				// Findings recorded this run hold the card at merging/idle with FINDINGS_HOLD;
 				// the check below files the kept ones while the card is still in_progress/running,
@@ -3296,6 +3359,7 @@ export function createTurnLoop(
 				kind === "work" &&
 				!interview &&
 				!grill &&
+				!scout &&
 				!research &&
 				!releaseCard &&
 				// This turn's copies count, and so do shots an earlier turn on this card attached:
@@ -3341,8 +3405,13 @@ export function createTurnLoop(
 			// A review card's worktree is disposable (mutation runs leave report files, and a review
 			// must not commit), so it skips the check.
 			// A research card's worktree is disposable like a review card's: the report is already harvested.
+			// A trending scout's cwd is the main checkout: what it holds is the user's, never the card's.
 			const unsaved =
-				next.stage === "done" && !reviewCard && !interview && !research
+				next.stage === "done" &&
+				!reviewCard &&
+				!interview &&
+				!scout &&
+				!research
 					? await ops.unsavedWork(wt, target)
 					: null;
 			// A research card's deliverable is the report file: archive it before the worktree goes.
@@ -3510,6 +3579,7 @@ export function createTurnLoop(
 				!releaseCard &&
 				!interview &&
 				!grill &&
+				!scout &&
 				!retroCard;
 			// A review that parked needs_you still files its findings (OTTR-322): a failed
 			// gate must not hide them. A later turn of the same review re-records its
@@ -4169,8 +4239,9 @@ export function createTurnLoop(
 					if (onOrigin) store.updateTask(id, { pushSha: pushed });
 					else log("- CI watch skipped: merge push not on origin");
 				}
-				// An interview or grill card runs in the main checkout: its wt must never be removed.
-				if (!interview && !grill) {
+				// An interview, grill or trending scout card runs in the main checkout: its wt must
+				// never be removed.
+				if (!interview && !grill && !scout) {
 					// The done drawer keeps naming what the run left uncommitted after the
 					// worktree is gone: capture the list before removeWorktree deletes it.
 					// statusFiles never rejects (an unreadable tree reads as []).

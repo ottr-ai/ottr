@@ -48,6 +48,8 @@ import type {
 	Stage,
 	Task,
 	TaskKind,
+	TrendingVerdict,
+	TrendingVerdictKind,
 	Turn,
 	TurnKind,
 	WorkCheckBlocker,
@@ -71,6 +73,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	retroSince: null,
 	retroFilter: true,
 	forkResearch: false,
+	trendingScout: false,
 	prReviews: false,
 	prMode: false,
 	setupChecklist: false,
@@ -206,6 +209,16 @@ CREATE TABLE IF NOT EXISTS pr_review (
 );
 ${PR_REVIEW_RUNS_DDL};
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
+CREATE TABLE IF NOT EXISTS trending_verdict (
+  repo TEXT PRIMARY KEY,
+  verdict TEXT NOT NULL CHECK (verdict IN ('filed','no_fit','deferred')),
+  reason TEXT NOT NULL,
+  rejected_by_user INTEGER NOT NULL DEFAULT 0,
+  first_seen_at INTEGER NOT NULL,
+  judged_at INTEGER NOT NULL,
+  scout_card_id TEXT,
+  proposal_card_id TEXT
+);
 -- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -884,6 +897,7 @@ const SETTINGS_SHAPES = {
 	retroSince: "number",
 	retroFilter: "boolean",
 	forkResearch: "boolean",
+	trendingScout: "boolean",
 	prReviews: "boolean",
 	prMode: "boolean",
 	setupChecklist: "boolean",
@@ -987,6 +1001,33 @@ function backfillDoneContext(db: Database, sessionsDir: string): void {
 				task.id,
 			]);
 	}
+}
+
+/** A trending verdict's repo: lowercase `owner/repo`. */
+const TRENDING_REPO_RE = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
+
+interface TrendingVerdictRow {
+	repo: string;
+	verdict: TrendingVerdictKind;
+	reason: string;
+	rejected_by_user: number;
+	first_seen_at: number;
+	judged_at: number;
+	scout_card_id: string | null;
+	proposal_card_id: string | null;
+}
+
+function rowToTrendingVerdict(r: TrendingVerdictRow): TrendingVerdict {
+	return {
+		repo: r.repo,
+		verdict: r.verdict,
+		reason: r.reason,
+		rejectedByUser: r.rejected_by_user === 1,
+		firstSeenAt: r.first_seen_at,
+		judgedAt: r.judged_at,
+		scoutCardId: r.scout_card_id,
+		proposalCardId: r.proposal_card_id,
+	};
 }
 
 export class ProjectStore {
@@ -1790,6 +1831,189 @@ export class ProjectStore {
 		const card = this.getTask(cardId);
 		if (!card) throw new Error(`fork result card vanished: ${cardId}`);
 		return card;
+	}
+
+	// ---- Trending scout verdicts ----
+	// A repo's verdict row is created on first judgement; `filed` and `no_fit` are final,
+	// `deferred` is offered to the scout again next scan. The table is created by SCHEMA
+	// at open, so existing databases gain it without a migration step.
+
+	listTrendingVerdicts(): TrendingVerdict[] {
+		return this.db
+			.query<TrendingVerdictRow, []>(
+				"SELECT * FROM trending_verdict ORDER BY judged_at DESC, repo",
+			)
+			.all()
+			.map(rowToTrendingVerdict);
+	}
+
+	getTrendingVerdict(repo: string): TrendingVerdict | null {
+		const row = this.db
+			.query<TrendingVerdictRow, [string]>(
+				"SELECT * FROM trending_verdict WHERE repo = ?",
+			)
+			.get(repo.trim().toLowerCase());
+		return row ? rowToTrendingVerdict(row) : null;
+	}
+
+	/** Upserts by lowercase repo; an existing row keeps its firstSeenAt. */
+	saveTrendingVerdict(v: TrendingVerdict): void {
+		this.db.run(
+			`INSERT INTO trending_verdict (repo, verdict, reason, rejected_by_user, first_seen_at, judged_at, scout_card_id, proposal_card_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(repo) DO UPDATE SET verdict = excluded.verdict, reason = excluded.reason,
+			   rejected_by_user = excluded.rejected_by_user, judged_at = excluded.judged_at,
+			   scout_card_id = excluded.scout_card_id, proposal_card_id = excluded.proposal_card_id`,
+			[
+				v.repo.trim().toLowerCase(),
+				v.verdict,
+				v.reason,
+				v.rejectedByUser ? 1 : 0,
+				v.firstSeenAt,
+				v.judgedAt,
+				v.scoutCardId,
+				v.proposalCardId,
+			],
+		);
+	}
+
+	trendingVerdictByProposal(cardId: string): TrendingVerdict | null {
+		const row = this.db
+			.query<TrendingVerdictRow, [string]>(
+				"SELECT * FROM trending_verdict WHERE proposal_card_id = ?",
+			)
+			.get(cardId);
+		return row ? rowToTrendingVerdict(row) : null;
+	}
+
+	/** Shared scout + repo checks of the agent's verdict tools; returns the error or the normalized repo. */
+	private checkTrendingJudgement(
+		scoutId: string,
+		repo: string,
+	): { ok: true; repo: string } | { ok: false; error: string } {
+		const scout = this.getTask(scoutId);
+		if (
+			!scout ||
+			scout.kind !== "trending" ||
+			scout.cancelledAt !== null ||
+			scout.stage === "done"
+		)
+			return { ok: false, error: "not an open trending scout card" };
+		const norm = repo.trim().toLowerCase();
+		if (!TRENDING_REPO_RE.test(norm))
+			return {
+				ok: false,
+				error: `invalid repo: ${repo} (expected owner/repo)`,
+			};
+		const prev = this.getTrendingVerdict(norm);
+		if (prev && prev.verdict !== "deferred")
+			return {
+				ok: false,
+				error: `${norm} already has a final verdict (${prev.verdict})`,
+			};
+		return { ok: true, repo: norm };
+	}
+
+	/** Files a backlog proposal card for `repo` under the scout card, at most `cap` per scout card. */
+	fileTrendingProposal(o: {
+		scoutId: string;
+		repo: string;
+		prompt: string;
+		title?: string;
+		cap: number;
+		now?: number;
+	}): { ok: true; task: Task } | { ok: false; error: string } {
+		const now = o.now ?? Date.now();
+		const tx = this.db.transaction(
+			(): { ok: true; id: string } | { ok: false; error: string } => {
+				const check = this.checkTrendingJudgement(o.scoutId, o.repo);
+				if (!check.ok) return check;
+				const filed =
+					this.db
+						.query<{ n: number }, [string]>(
+							"SELECT COUNT(*) AS n FROM trending_verdict WHERE scout_card_id = ? AND proposal_card_id IS NOT NULL",
+						)
+						.get(o.scoutId)?.n ?? 0;
+				if (filed >= o.cap)
+					return {
+						ok: false,
+						error: `cap of ${o.cap} proposals per scan reached: record ${check.repo} as deferred instead`,
+					};
+				const card = this.createTask(o.prompt, null);
+				const title = o.title?.trim();
+				this.updateTask(card.id, {
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+					followUpOf: o.scoutId,
+					...(title ? { title } : {}),
+				});
+				const prev = this.getTrendingVerdict(check.repo);
+				this.saveTrendingVerdict({
+					repo: check.repo,
+					verdict: "filed",
+					reason: "Filed as a proposal",
+					rejectedByUser: false,
+					firstSeenAt: prev?.firstSeenAt ?? now,
+					judgedAt: now,
+					scoutCardId: o.scoutId,
+					proposalCardId: card.id,
+				});
+				return { ok: true, id: card.id };
+			},
+		);
+		const res = tx();
+		if (!res.ok) return res;
+		const task = this.getTask(res.id);
+		if (!task) throw new Error(`trending proposal vanished: ${res.id}`);
+		return { ok: true, task };
+	}
+
+	/** Records `no_fit` (final) or `deferred` (offered again next scan) for a repo the scout judged. */
+	judgeTrendingRepo(o: {
+		scoutId: string;
+		repo: string;
+		verdict: "no_fit" | "deferred";
+		reason: string;
+		now?: number;
+	}): { ok: true } | { ok: false; error: string } {
+		const now = o.now ?? Date.now();
+		const reason = o.reason.trim().slice(0, 500);
+		const tx = this.db.transaction(
+			(): { ok: true } | { ok: false; error: string } => {
+				const check = this.checkTrendingJudgement(o.scoutId, o.repo);
+				if (!check.ok) return check;
+				if (reason === "") return { ok: false, error: "reason is required" };
+				const prev = this.getTrendingVerdict(check.repo);
+				this.saveTrendingVerdict({
+					repo: check.repo,
+					verdict: o.verdict,
+					reason,
+					rejectedByUser: false,
+					firstSeenAt: prev?.firstSeenAt ?? now,
+					judgedAt: now,
+					scoutCardId: o.scoutId,
+					proposalCardId: null,
+				});
+				return { ok: true };
+			},
+		);
+		return tx();
+	}
+
+	/** A cancelled proposal card turns its repo into a user-rejected `no_fit`; false when the card is no filed proposal. */
+	rejectTrendingProposal(
+		cardId: string,
+		reason: string | null,
+		now: number = Date.now(),
+	): boolean {
+		const note = reason?.trim() || "Rejected by the user (no reason given)";
+		const res = this.db.run(
+			`UPDATE trending_verdict SET verdict = 'no_fit', rejected_by_user = 1, reason = ?, judged_at = ?
+			 WHERE proposal_card_id = ? AND verdict = 'filed'`,
+			[note, now, cardId],
+		);
+		return res.changes > 0;
 	}
 
 	// ---- PR review watch state ----

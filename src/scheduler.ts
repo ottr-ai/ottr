@@ -387,27 +387,28 @@ export function depHold(
 		: `waiting for ${waiting.map((d) => `#${d.id} ${d.title}`).join(", ")}`;
 }
 
-/** Pick the tasks that may start an omp run right now. Pure; `tasks` is one project's tasks. */
-export function pickRunnable(
-	tasks: Task[],
-	o: {
-		/** Null = no cap: as many runs as queued cards need. */
-		maxParallel: number | null;
-		hasRules: boolean;
-		/** Set during an update's hold: only this queued card may start, and null lets none start.
-		 * The other cards still take their slots and hold their dependents. */
-		only?: string | null;
-		/** A queued card waits until its holdUntil, e.g. a check held until a usage limit resets. */
-		now?: number;
-		/** OTTR-506: true while the project's local target branch has commits origin lacks (a
-		 * rejected server push). Every queued merge but the rejected card's rebase retry waits
-		 * (pushHold); the retry runs first, and its push ends the hold. */
-		mainUnpushed?: boolean;
-		/** True while the project merges via PR: a card with an open PR is never picked for
-		 * another merge turn, and mainUnpushed's hold is inert (mergeHold). */
-		prMode?: boolean;
-	},
-): Task[] {
+/** Options of the per-project pickers (pickRunnable, pickLowPriority). */
+export interface PickOptions {
+	/** Null = no cap: as many runs as queued cards need. */
+	maxParallel: number | null;
+	hasRules: boolean;
+	/** Set during an update's hold: only this queued card may start, and null lets none start.
+	 * The other cards still take their slots and hold their dependents. */
+	only?: string | null;
+	/** A queued card waits until its holdUntil, e.g. a check held until a usage limit resets. */
+	now?: number;
+	/** OTTR-506: true while the project's local target branch has commits origin lacks (a
+	 * rejected server push). Every queued merge but the rejected card's rebase retry waits
+	 * (pushHold); the retry runs first, and its push ends the hold. */
+	mainUnpushed?: boolean;
+	/** True while the project merges via PR: a card with an open PR is never picked for
+	 * another merge turn, and mainUnpushed's hold is inert (mergeHold). */
+	prMode?: boolean;
+}
+
+/** Pick the tasks that may start an omp run right now. Pure; `tasks` is one project's tasks.
+ * A trending scout card never takes a normal slot: pickLowPriority offers it afterwards. */
+export function pickRunnable(tasks: Task[], o: PickOptions): Task[] {
 	const live = tasks.filter((t) => t.cancelledAt === null);
 	const running = live.filter(
 		(t) => t.state === "running" || t.state === "preparing",
@@ -466,6 +467,8 @@ export function pickRunnable(
 	for (const t of queued) {
 		if (picked.includes(t)) continue;
 		if (free <= 0) break;
+		// A trending scout only fills a slot nothing else wanted: pickLowPriority, after every project.
+		if (t.kind === "trending") continue;
 		// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
 		if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") continue;
 		// A queued card waits until every dependency is done (a cancelled dependency counts as
@@ -480,6 +483,29 @@ export function pickRunnable(
 		free -= 1;
 	}
 	return picked;
+}
+
+/** The low-priority slot: the oldest queued trending scout card, when the project still has
+ * a free slot. schedule() offers it only after every project's pickRunnable picks, so a scout
+ * never delays a normal card. Same holds as a work card (drain `only`, holdUntil,
+ * dependencies). Pure; `tasks` is one project's tasks. */
+export function pickLowPriority(tasks: Task[], o: PickOptions): Task | null {
+	const live = tasks.filter((t) => t.cancelledAt === null);
+	const running = live.filter(
+		(t) => t.state === "running" || t.state === "preparing",
+	);
+	if ((o.maxParallel ?? Infinity) - running.length <= 0) return null;
+	const now = o.now ?? Date.now();
+	return (
+		queueOrder(tasks).find(
+			(t) =>
+				t.kind === "trending" &&
+				(o.only === undefined || t.id === o.only) &&
+				(t.holdUntil === null || t.holdUntil <= now) &&
+				(t.stage === "todo" || t.stage === "in_progress") &&
+				depHold(live, t) === null,
+		) ?? null
+	);
 }
 
 /** The findings that go to the check run (or straight to cards with the check off): the `cap`

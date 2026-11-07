@@ -154,6 +154,8 @@ const state = {
 	reviewCheck: false,
 	workCheck: false,
 	idleReviews: false,
+	trendingScan: true,
+	trendingStatus: { lastRunAt: null, lastError: null, running: false },
 	serverVersion: "vtest",
 	quota: null,
 	onboarding: false,

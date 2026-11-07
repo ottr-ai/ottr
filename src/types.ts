@@ -174,6 +174,8 @@ export interface ProjectSettings {
 	prReviews: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
+	/** Weekly trending scout: file a read-only scout card for this project at each GitHub trending scan (off by default). */
+	trendingScout: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 	/**
@@ -206,7 +208,45 @@ export interface DiffFileStat {
 	minus: number | null;
 }
 
-export type TaskKind = "work" | "retro" | "review" | "interview" | "pr_review";
+export type TaskKind =
+	| "work"
+	| "retro"
+	| "review"
+	| "interview"
+	| "pr_review"
+	| "trending";
+
+/** A trending scout's judgement of one repo for one project: filed and no_fit are final; deferred is offered again next scan. */
+export type TrendingVerdictKind = "filed" | "no_fit" | "deferred";
+
+/** One row of a project's trending verdict store, keyed by the lowercase `owner/repo`. */
+export interface TrendingVerdict {
+	/** Lowercase `owner/repo`. */
+	repo: string;
+	verdict: TrendingVerdictKind;
+	/** One-line reason: the scout's, or the user's cancel note when rejectedByUser. */
+	reason: string;
+	/** True when the user cancelled the filed proposal; later scans get the reason as a hint. */
+	rejectedByUser: boolean;
+	/** Epoch ms the repo was first judged for this project. */
+	firstSeenAt: number;
+	/** Epoch ms of the latest verdict. */
+	judgedAt: number;
+	/** The scout card that judged it; null when unknown. */
+	scoutCardId: string | null;
+	/** The backlog proposal card filed for it (verdict filed, or no_fit after a rejection). */
+	proposalCardId: string | null;
+}
+
+/** Board-wide state of the weekly GitHub trending scan, shipped in /api/state. */
+export interface TrendingStatus {
+	/** Epoch ms of the last successful scan (weekly or manual); null before the first. */
+	lastRunAt: number | null;
+	/** Last failed scan's reason and time; cleared by a successful scan. */
+	lastError: { reason: string; at: number } | null;
+	/** True while a scan fetches GitHub or a scout card is live on any project. */
+	running: boolean;
+}
 
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
 export const UPDATE_HOLD_REASON =
@@ -730,6 +770,8 @@ export interface ProjectView {
 export interface TaskView extends Omit<Task, "diffText"> {
 	/** Turns without the prompt text (the log and the follow-up handoff read it from the DB). */
 	turns: TurnView[];
+	/** Lowercase `owner/repo` when this card is a trending scout's proposal; the cancel dialog then asks for a reason. */
+	trendingRepo?: string;
 	/** Card title: the first session title, else the short prompt line — frozenTitle never returns null. */
 	sessionTitle: string;
 	/** Repo-relative uncommitted worktree files; present on the drawer detail view only. */
@@ -812,6 +854,8 @@ export type TaskCard = Omit<
 	runStartedAt?: number;
 	/** Median wall length (ms) of this card's completed same-project/kind/model turns; present only when at least ETA_MIN_HISTORY (src/perf.ts) completed turns back it. The client counts it down as "about X left" and falls back to elapsed only. */
 	etaMs?: number;
+	/** Lowercase `owner/repo` when this card is a trending scout's proposal; the cancel dialog then asks for a reason. */
+	trendingRepo?: string;
 };
 
 /** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */
@@ -946,6 +990,10 @@ export interface StateResponse {
 	workCheck: boolean;
 	/** True when the board files a due architecture review card by itself after two hours without input. */
 	idleReviews: boolean;
+	/** True when the board scans GitHub trending weekly (Monday 06:00 server time) for projects with trendingScout on. */
+	trendingScan: boolean;
+	/** Weekly trending scan state for the Settings notice and the "Scan trending now" button. */
+	trendingStatus: TrendingStatus;
 	/** Version stamp of the running server (image stamp OTTR_VERSION, release tag `vX.Y.Z`, short sha on dev, else boot time); stale tabs reload once when it changes. */
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */

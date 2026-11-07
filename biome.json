@@ -6,7 +6,8 @@
       "scripts/**",
       "extension/**",
       "!!**/.worktrees",
-      "!!**/.dev"
+      "!!**/.dev",
+      "!!src/fixtures"
     ]
   },
   "linter": {

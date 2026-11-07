@@ -98,6 +98,7 @@ const envKeys = [
 	"OTTR_TASK_ID",
 	"OTTR_RETRO",
 	"OTTR_REVIEW",
+	"OTTR_TRENDING",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -210,6 +211,12 @@ describe("report_outcome refuses once while the session has no name", () => {
 
 	test("a retro run without a name records on the first call", async () => {
 		setEnv({ OTTR_RETRO: "1" });
+		const tools = await freshTools();
+		expect(text(await call(tools))).toBe("Outcome recorded: ready");
+	});
+
+	test("a trending scout run without a name records on the first call", async () => {
+		setEnv({ OTTR_TRENDING: "1" });
 		const tools = await freshTools();
 		expect(text(await call(tools))).toBe("Outcome recorded: ready");
 	});
@@ -449,6 +456,148 @@ describe("create_task tool", () => {
 		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
 		expect(text(out)).toContain("unreachable");
 		expect(text(out)).toContain("connection refused");
+	});
+});
+
+describe("trending scout tools", () => {
+	const scoutEnv = {
+		OTTR_BOARD_URL: "http://127.0.0.1:4747",
+		OTTR_BOARD_TOKEN: "boot-token",
+		OTTR_PROJECT: "ottr",
+		OTTR_TASK_ID: "scout1",
+		OTTR_TRENDING: "1",
+	};
+
+	test("absent without OTTR_TRENDING so other runs never see them", () => {
+		const tools = fakePi();
+		expect(tools.propose_repo).toBeUndefined();
+		expect(tools.judge_repo).toBeUndefined();
+	});
+
+	test("present with OTTR_TRENDING and headless-safe like the other board tools", () => {
+		setEnv({ OTTR_TRENDING: "1" });
+		const tools = fakePi();
+		for (const name of ["propose_repo", "judge_repo"]) {
+			expect(tools[name]?.approval).toBe("read");
+			expect(tools[name]?.loadMode).toBe("essential");
+		}
+		expect(Object.keys(tools.propose_repo?.parameters ?? {})).toEqual([
+			"repo",
+			"title",
+			"prompt",
+		]);
+		expect(Object.keys(tools.judge_repo?.parameters ?? {})).toEqual([
+			"repo",
+			"verdict",
+			"reason",
+		]);
+	});
+
+	test("propose_repo posts a filed verdict for this scout with the board token", async () => {
+		setEnv(scoutEnv);
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify({ ok: true, id: "OTTR-9" }), {
+				status: 200,
+			});
+		}) as unknown as typeof fetch;
+		const out = await fakePi().propose_repo!.execute("t1", {
+			repo: " acme/widget ",
+			title: " Adopt widget for the board ",
+			prompt: "  Header\nFit\nRisks\nDraft  ",
+		});
+		expect(seen!.url).toBe(
+			"http://127.0.0.1:4747/api/projects/ottr/trending/verdicts",
+		);
+		expect(seen!.init.method).toBe("POST");
+		expect(seen!.init.headers).toMatchObject({
+			"content-type": "application/json",
+			origin: "http://127.0.0.1:4747",
+			"x-board-token": "boot-token",
+		});
+		expect(JSON.parse(String(seen!.init.body))).toEqual({
+			scoutId: "scout1",
+			repo: "acme/widget",
+			verdict: "filed",
+			reason: "Adopt widget for the board",
+			prompt: "Header\nFit\nRisks\nDraft",
+			title: "Adopt widget for the board",
+		});
+		expect(text(out)).toBe("Proposal OTTR-9 filed for acme/widget.");
+	});
+
+	test("judge_repo posts its verdict and reason", async () => {
+		setEnv(scoutEnv);
+		let body: unknown = null;
+		globalThis.fetch = (async (_url: string | URL, init: RequestInit) => {
+			body = JSON.parse(String(init.body));
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().judge_repo!.execute("t1", {
+			repo: "acme/widget",
+			verdict: "deferred",
+			reason: " fits, but the cap is used up ",
+		});
+		expect(body).toEqual({
+			scoutId: "scout1",
+			repo: "acme/widget",
+			verdict: "deferred",
+			reason: "fits, but the cap is used up",
+		});
+		expect(text(out)).toBe("Recorded deferred for acme/widget.");
+	});
+
+	test("the board's refusal and an unreachable board come back as Error text, never a throw", async () => {
+		setEnv(scoutEnv);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ error: "proposal cap reached" }), {
+				status: 409,
+			})) as unknown as typeof fetch;
+		const refused = await fakePi().propose_repo!.execute("t1", {
+			repo: "acme/widget",
+			prompt: "p",
+		});
+		expect(text(refused)).toStartWith("Error: ");
+		expect(text(refused)).toContain("HTTP 409");
+		expect(text(refused)).toContain("proposal cap reached");
+		globalThis.fetch = (async () => {
+			throw new Error("connection refused");
+		}) as unknown as typeof fetch;
+		const down = await fakePi().judge_repo!.execute("t1", {
+			repo: "acme/widget",
+			verdict: "no_fit",
+			reason: "r",
+		});
+		expect(text(down)).toContain("unreachable");
+		expect(text(down)).toContain("connection refused");
+	});
+
+	test("bad params refuse before any HTTP call", async () => {
+		setEnv(scoutEnv);
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		const tools = fakePi();
+		for (const params of [
+			{ repo: "widget", prompt: "p" },
+			{ repo: "acme/widget", prompt: "   " },
+			{ repo: "acme/widget", prompt: "p", title: "x".repeat(201) },
+		])
+			expect(text(await tools.propose_repo!.execute("t1", params))).toStartWith(
+				"Error: ",
+			);
+		for (const params of [
+			{ repo: "acme/widget", verdict: "filed", reason: "r" },
+			{ repo: "acme/widget", verdict: "no_fit", reason: "  " },
+			{ repo: "acme/widget", verdict: "no_fit", reason: "x".repeat(501) },
+		])
+			expect(text(await tools.judge_repo!.execute("t1", params))).toStartWith(
+				"Error: ",
+			);
+		expect(called).toBe(false);
 	});
 });
 

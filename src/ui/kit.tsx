@@ -930,7 +930,8 @@ export function CloseButton() {
  * rest the detail (line breaks kept). Resolves true only on the confirm button; Cancel, Esc,
  * the close button and the backdrop all resolve false. A danger confirm starts on Cancel.
  * `cancel` renames the safe button when "Cancel" would collide with the action itself
- * (for example "Cancel task" pairs with "Keep task").
+ * (for example "Cancel task" pairs with "Keep task"). `field` adds one optional labelled
+ * text box above the buttons; each keystroke reaches `onInput`, the caller reads it on yes.
  */
 export function confirmDialog(
 	message: string,
@@ -938,7 +939,18 @@ export function confirmDialog(
 		ok = "Confirm",
 		cancel = "Cancel",
 		danger = false,
-	}: { ok?: string; cancel?: string; danger?: boolean } = {},
+		field,
+	}: {
+		ok?: string;
+		cancel?: string;
+		danger?: boolean;
+		field?: {
+			label: string;
+			help: string;
+			maxLength: number;
+			onInput: (value: string) => void;
+		};
+	} = {},
 ): Promise<boolean> {
 	const cut = message.search(/\?(\s|$)/);
 	const title = cut < 0 ? message : message.slice(0, cut + 1);
@@ -965,6 +977,21 @@ export function confirmDialog(
 					<CloseButton />
 				</div>
 				{detail !== "" && <p className="confirm-detail">{detail}</p>}
+				{field !== undefined && (
+					<div className="field">
+						<label htmlFor="confirm-field">{field.label}</label>
+						<textarea
+							id="confirm-field"
+							rows={3}
+							maxLength={field.maxLength}
+							aria-describedby="confirm-field-help"
+							onChange={(e) => field.onInput(e.target.value)}
+						/>
+						<p id="confirm-field-help" className="hint">
+							{field.help}
+						</p>
+					</div>
+				)}
 				<div className="dialog-actions">
 					<button
 						type="button"

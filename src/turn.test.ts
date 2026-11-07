@@ -565,6 +565,54 @@ describe("turn loop", () => {
 		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 
+	test("a trending scout runs local and read-only in the main checkout with only its tools, and settles done", async () => {
+		const unsaved: string[] = [];
+		const { store, record, loop } = setup({
+			// A worker pool is configured, but the scout's bundle sits on the server: it stays local.
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			// commitsAhead keeps its default 1: the main checkout's own commits are never the scout's.
+			unsavedWork: async (wt: string) => {
+				unsaved.push(wt);
+				return null;
+			},
+		});
+		const task = store.createTask(
+			"Trending scout for demo\nread the bundle",
+			null,
+			"trending",
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const run = record.runs[0]!;
+		expect(run.cwd).toBe(store.path);
+		expect(run.worker).toBeNull();
+		expect(run.prompt).toBe(task.prompt);
+		expect(run.env).toEqual({ OTTR_TRENDING: "1" });
+		expect(run.tools).toBe(
+			"read,grep,glob,report_outcome,propose_repo,judge_repo",
+		);
+		// The overlay turns autolearn off, so omp adds no learn/manage_skill tools.
+		expect(run.config).toBe("trending.yml");
+		// Its two tools call the board, so the board env stays.
+		expect(run.stripBoard).toBe(false);
+		expect(run.board).toEqual({
+			url: "http://127.0.0.1:4747",
+			token: "boot-token",
+			project: store.name,
+			taskId: task.id,
+		});
+		// No worktree, no quarantine, no unsaved-work gate: the main checkout stays untouched.
+		expect(record.createWorktree).toHaveLength(0);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(record.quarantine).toHaveLength(0);
+		expect(unsaved).toEqual([]);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.branch).toBeNull();
+	});
+
 	test("a retro proposal names its source card once by id and title", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
 		const source = store.createTask(
@@ -1672,6 +1720,47 @@ describe("turn schedule", () => {
 		loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(3);
+	});
+
+	test("a trending scout takes only a slot the normal picks left, one scout at a time", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => null,
+			// The runs hang, so the starts this test expects stay the only ones.
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o as never);
+				return {
+					pid: 4242,
+					done: Promise.withResolvers<RunResult>().promise,
+					kill: async () => {},
+				};
+			},
+		});
+		store.setSettings({ maxParallel: 2 });
+		const first = store.createTask("scout one", null, "trending");
+		const second = store.createTask("scout two", null, "trending");
+		store.updateTask(first.id, { queuedAt: 1 });
+		store.updateTask(second.id, { queuedAt: 2 });
+		store.createTask("work one");
+		store.createTask("work two");
+		loop.schedule();
+		await flushPromises();
+		// Both slots went to the normal cards, although the scouts queued first.
+		expect(record.runs).toHaveLength(2);
+		expect(store.getTask(first.id)!.state).toBe("queued");
+		expect(store.getTask(second.id)!.state).toBe("queued");
+
+		// Free slots: the oldest scout starts; the other waits while one scout runs.
+		store.setSettings({ maxParallel: 4 });
+		loop.schedule();
+		await flushPromises();
+		expect(record.runs).toHaveLength(3);
+		expect(record.runs[2]!.prompt).toBe("scout one");
+		expect(record.runs[2]!.cwd).toBe(store.path);
+		expect(store.getTask(second.id)!.state).toBe("queued");
+		loop.schedule();
+		await flushPromises();
+		expect(record.runs).toHaveLength(3);
+		expect(store.getTask(second.id)!.state).toBe("queued");
 	});
 
 	test("a prompt-edit hold starts no turn until it clears", async () => {
@@ -3466,6 +3555,7 @@ describe("turn release cards", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

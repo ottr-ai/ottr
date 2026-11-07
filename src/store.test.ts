@@ -319,6 +319,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			prMode: false,
+			trendingScout: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -344,6 +345,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			prMode: false,
+			trendingScout: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -3061,6 +3063,212 @@ describe("fork research store methods", () => {
 		expect(branch.lastRunAt).toBe(42);
 		expect(branch.lastError).toBeNull();
 		expect(branch.retries).toBe(0);
+	});
+});
+
+describe("trending verdicts", () => {
+	const scoutOf = (store: ProjectStore) =>
+		store.createTask("scan trending", null, "trending");
+
+	test("a proposal lands in backlog, idle, under the scout; the 4th filing hits the cap", () => {
+		const store = open(join(root, "trending-cap"));
+		const scout = scoutOf(store);
+		for (const repo of ["a/one", "B/Two", "c/three"]) {
+			const res = store.fileTrendingProposal({
+				scoutId: scout.id,
+				repo,
+				prompt: `adopt ${repo}`,
+				cap: 3,
+				now: 10,
+			});
+			if (!res.ok) throw new Error(res.error);
+			expect(res.task.stage).toBe("backlog");
+			expect(res.task.state).toBe("idle");
+			expect(res.task.queuedAt).toBeNull();
+			expect(res.task.followUpOf).toBe(scout.id);
+			const v = store.trendingVerdictByProposal(res.task.id);
+			expect(v?.repo).toBe(repo.toLowerCase());
+			expect(v?.verdict).toBe("filed");
+			expect(v?.scoutCardId).toBe(scout.id);
+		}
+		expect(
+			store.fileTrendingProposal({
+				scoutId: scout.id,
+				repo: "d/four",
+				prompt: "adopt d/four",
+				cap: 3,
+			}),
+		).toEqual({
+			ok: false,
+			error:
+				"cap of 3 proposals per scan reached: record d/four as deferred instead",
+		});
+		expect(store.getTrendingVerdict("d/four")).toBeNull();
+	});
+
+	test("final verdicts are never overwritten; deferred can be re-judged and keeps firstSeenAt", () => {
+		const store = open(join(root, "trending-final"));
+		const scout = scoutOf(store);
+		const id = scout.id;
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "x/no",
+				verdict: "no_fit",
+				reason: "unrelated",
+			}),
+		).toEqual({ ok: true });
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "X/No",
+				verdict: "deferred",
+				reason: "maybe",
+			}),
+		).toEqual({
+			ok: false,
+			error: "x/no already has a final verdict (no_fit)",
+		});
+		expect(
+			store.fileTrendingProposal({
+				scoutId: id,
+				repo: "x/no",
+				prompt: "p",
+				cap: 3,
+			}),
+		).toEqual({
+			ok: false,
+			error: "x/no already has a final verdict (no_fit)",
+		});
+		const filed = store.fileTrendingProposal({
+			scoutId: id,
+			repo: "x/yes",
+			prompt: "p",
+			cap: 3,
+		});
+		expect(filed.ok).toBe(true);
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "x/yes",
+				verdict: "no_fit",
+				reason: "r",
+			}),
+		).toEqual({
+			ok: false,
+			error: "x/yes already has a final verdict (filed)",
+		});
+
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "x/later",
+				verdict: "deferred",
+				reason: "next week",
+				now: 5,
+			}),
+		).toEqual({ ok: true });
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "x/later",
+				verdict: "no_fit",
+				reason: "decided",
+				now: 9,
+			}),
+		).toEqual({ ok: true });
+		const v = store.getTrendingVerdict("x/later");
+		expect(v?.verdict).toBe("no_fit");
+		expect(v?.firstSeenAt).toBe(5);
+		expect(v?.judgedAt).toBe(9);
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: id,
+				repo: "x/blank",
+				verdict: "deferred",
+				reason: "  ",
+			}).ok,
+		).toBe(false);
+	});
+
+	test("reject turns a filed proposal into a user no_fit, once", () => {
+		const store = open(join(root, "trending-reject"));
+		const scout = scoutOf(store);
+		const res = store.fileTrendingProposal({
+			scoutId: scout.id,
+			repo: "o/r",
+			prompt: "p",
+			cap: 3,
+		});
+		if (!res.ok) throw new Error(res.error);
+		expect(store.rejectTrendingProposal(res.task.id, "  too heavy  ", 77)).toBe(
+			true,
+		);
+		const v = store.getTrendingVerdict("o/r");
+		expect(v?.verdict).toBe("no_fit");
+		expect(v?.rejectedByUser).toBe(true);
+		expect(v?.reason).toBe("too heavy");
+		expect(v?.judgedAt).toBe(77);
+		expect(store.rejectTrendingProposal(res.task.id, "other", 99)).toBe(false);
+		expect(store.getTrendingVerdict("o/r")).toEqual(v);
+		expect(store.rejectTrendingProposal("nope-1", null)).toBe(false);
+
+		const res2 = store.fileTrendingProposal({
+			scoutId: scout.id,
+			repo: "o/s",
+			prompt: "p",
+			cap: 3,
+		});
+		if (!res2.ok) throw new Error(res2.error);
+		expect(store.rejectTrendingProposal(res2.task.id, null)).toBe(true);
+		expect(store.getTrendingVerdict("o/s")?.reason).toBe(
+			"Rejected by the user (no reason given)",
+		);
+	});
+
+	test("a non-trending or cancelled scout card is refused", () => {
+		const store = open(join(root, "trending-scout"));
+		const work = store.createTask("plain work");
+		const err = {
+			ok: false as const,
+			error: "not an open trending scout card",
+		};
+		expect(
+			store.fileTrendingProposal({
+				scoutId: work.id,
+				repo: "a/b",
+				prompt: "p",
+				cap: 3,
+			}),
+		).toEqual(err);
+		const scout = scoutOf(store);
+		store.updateTask(scout.id, { cancelledAt: 1 });
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: scout.id,
+				repo: "a/b",
+				verdict: "deferred",
+				reason: "r",
+			}),
+		).toEqual(err);
+		expect(
+			store.fileTrendingProposal({
+				scoutId: "missing-1",
+				repo: "a/b",
+				prompt: "p",
+				cap: 3,
+			}),
+		).toEqual(err);
+		const live = scoutOf(store);
+		expect(
+			store.judgeTrendingRepo({
+				scoutId: live.id,
+				repo: "not a repo",
+				verdict: "deferred",
+				reason: "r",
+			}).ok,
+		).toBe(false);
+		expect(store.listTrendingVerdicts()).toEqual([]);
 	});
 });
 

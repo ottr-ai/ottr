@@ -32,6 +32,7 @@ import {
 	PUSH_HOLD,
 	parseCheckVerdicts,
 	parseWorkCheck,
+	pickLowPriority,
 	pickRunnable,
 	pushHold,
 	queueOrder,
@@ -449,6 +450,15 @@ describe("pickRunnable", () => {
 		).toEqual([interview]);
 		// With rules present both run as usual.
 		expect(pickRunnable([interview, todo], opts)).toEqual([interview, todo]);
+	});
+
+	test("a queued trending scout never takes a normal slot, however old", () => {
+		const scout = task({ kind: "trending", queuedAt: 1 });
+		const todo = task({ queuedAt: 200 });
+		expect(pickRunnable([scout, todo], opts)).toEqual([todo]);
+		expect(pickRunnable([scout], { ...opts, maxParallel: null })).toEqual([]);
+		const reply = task({ kind: "trending", stage: "in_progress" });
+		expect(pickRunnable([reply], opts)).toEqual([]);
 	});
 
 	test("cancelled tasks ignored entirely", () => {
@@ -904,6 +914,45 @@ describe("pickRunnable", () => {
 		expect(pickRunnable([done, reply], { ...opts, hasRules: false })).toEqual([
 			reply,
 		]);
+	});
+});
+
+describe("pickLowPriority", () => {
+	test("returns the oldest queued trending scout while the project has a free slot", () => {
+		const newer = task({ kind: "trending", queuedAt: 300 });
+		const older = task({ kind: "trending", queuedAt: 100 });
+		const todo = task({ queuedAt: 50 });
+		expect(pickLowPriority([newer, older, todo], opts)).toBe(older);
+		// A reply to a scout requeues it in_progress: still the low-priority slot.
+		const reply = task({ kind: "trending", stage: "in_progress" });
+		expect(pickLowPriority([reply], opts)).toBe(reply);
+		// No scout queued: nothing.
+		expect(pickLowPriority([todo], opts)).toBeNull();
+	});
+
+	test("returns null when every slot is taken", () => {
+		const scout = task({ kind: "trending" });
+		const r1 = task({ state: "running" });
+		const r2 = task({ state: "preparing" });
+		expect(pickLowPriority([r1, r2, scout], opts)).toBeNull();
+		expect(pickLowPriority([r1, scout], opts)).toBe(scout);
+		// A null maxParallel never runs out of slots.
+		expect(
+			pickLowPriority([r1, r2, scout], { ...opts, maxParallel: null }),
+		).toBe(scout);
+	});
+
+	test("skips cancelled, held and non-queued scouts; a drain lets none start", () => {
+		const cancelled = task({ kind: "trending", cancelledAt: 500 });
+		const idle = task({ kind: "trending", state: "needs_you" });
+		const held = task({ kind: "trending", holdUntil: 5_000 });
+		expect(
+			pickLowPriority([cancelled, idle, held], { ...opts, now: 4_999 }),
+		).toBeNull();
+		expect(pickLowPriority([held], { ...opts, now: 5_000 })).toBe(held);
+		const scout = task({ kind: "trending" });
+		expect(pickLowPriority([scout], { ...opts, only: null })).toBeNull();
+		expect(pickLowPriority([scout], { ...opts, only: scout.id })).toBe(scout);
 	});
 });
 

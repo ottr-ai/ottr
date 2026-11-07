@@ -8318,9 +8318,12 @@ export function Drawer({
 
 	/** The confirm + cancel flow of the drawer-actions row: a fork or mismatch hold
 	 * message names cancelling the card as an action, so the row's Cancel task is the
-	 * hold's decline path too. */
-	const runCancel = async (): Promise<boolean> =>
-		(
+	 * hold's decline path too. A trending proposal asks why not: the scout never proposes
+	 * the repo again, and the reason rides the cancel POST to guide its later scans. */
+	const runCancel = async (): Promise<boolean> => {
+		let reason = "";
+		const repo = task.trendingRepo;
+		const yes =
 			task.stage === "done"
 				? // A done task has no run, worktree or branch left; this only removes the card from the board.
 					await confirmDialog("Delete this done task from the board?", {
@@ -8333,26 +8336,39 @@ export function Drawer({
 							ok: "Cancel task",
 							cancel: "Keep task",
 							danger: true,
+							field:
+								repo === undefined
+									? undefined
+									: {
+											label: "Why not? (optional)",
+											help: `The scout won't propose ${repo} again; your reason guides later scans.`,
+											maxLength: 1000,
+											onInput: (v) => {
+												reason = v;
+											},
+										},
 						},
-					)
-		)
-			? act(async () => {
-					const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
-					const r = await post<{ kept?: string }>(url, {});
-					// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
-					if (r.kept !== undefined) {
-						if (
-							!(await confirmDialog(
-								`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
-								{ ok: "Delete", danger: true },
-							))
-						)
-							return;
-						await post(url, { force: true });
-					}
-					onClose();
-				})
-			: Promise.resolve(true);
+					);
+		if (!yes) return true;
+		const why = reason.trim();
+		const body = why === "" ? {} : { reason: why };
+		return act(async () => {
+			const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/cancel`;
+			const r = await post<{ kept?: string }>(url, body);
+			// The server kept work that isn't merged and flagged the card; deleting it takes a second yes.
+			if (r.kept !== undefined) {
+				if (
+					!(await confirmDialog(
+						`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+						{ ok: "Delete", danger: true },
+					))
+				)
+					return;
+				await post(url, { ...body, force: true });
+			}
+			onClose();
+		});
+	};
 
 	/** Posts the Merge-anyway reason past an unresolved work-check block; act shows a thrown
 	 * error through setMergeError inside the modal, and the ok path closes it. */
@@ -12081,6 +12097,8 @@ export function App() {
 							reviewCheck={state.reviewCheck}
 							workCheck={state.workCheck}
 							idleReviews={state.idleReviews}
+							trendingScan={state.trendingScan}
+							trendingStatus={state.trendingStatus}
 							act={act}
 							view={view}
 							openTask={openTask}

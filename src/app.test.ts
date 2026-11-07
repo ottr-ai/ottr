@@ -213,6 +213,7 @@ const shared = {
 	reviewCheck: true,
 	workCheck: true,
 	idleReviews: true,
+	trendingScan: true,
 	removedPaths: [] as string[],
 	projectPaths: [] as string[],
 	projectOrder: [] as string[],
@@ -387,6 +388,8 @@ function mount(
 		>[0]["releaseSummarySpawn"];
 		/** Gateway spawn seam for the PR-review model call; defaults to the real spawn. */
 		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
+		/** Fetch seam for the weekly trending scan; passed through to createApp. */
+		trendingFetch?: typeof fetch;
 	} = {},
 ) {
 	const g =
@@ -423,6 +426,7 @@ function mount(
 			reviewCheck: true,
 			workCheck: true,
 			idleReviews: true,
+			trendingScan: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -438,6 +442,7 @@ function mount(
 		latestRelease: input.latestRelease,
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		prReviewSpawn: input.prReviewSpawn,
+		trendingFetch: input.trendingFetch,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -1426,6 +1431,7 @@ describe("settings routes", () => {
 			reviewCheck: false,
 			workCheck: shared.workCheck,
 			idleReviews: shared.idleReviews,
+			trendingScan: shared.trendingScan,
 		});
 		expect(shared.reviewCheck).toBe(false);
 	});
@@ -1436,6 +1442,7 @@ describe("settings routes", () => {
 			reviewCheck: shared.reviewCheck,
 			workCheck: shared.workCheck,
 			idleReviews: shared.idleReviews,
+			trendingScan: shared.trendingScan,
 		};
 		const ok = await post("/api/settings", {});
 		expect(ok.status).toBe(200);
@@ -1456,6 +1463,7 @@ describe("settings routes", () => {
 			reviewCheck: false,
 			workCheck: false,
 			idleReviews: shared.idleReviews,
+			trendingScan: shared.trendingScan,
 		});
 		expect(shared.workCheck).toBe(false);
 	});
@@ -1472,6 +1480,7 @@ describe("settings routes", () => {
 			reviewCheck: true,
 			workCheck: true,
 			idleReviews: false,
+			trendingScan: true,
 		});
 		// The state payload exposes it for the Settings switch.
 		const state = (await (await m.call("/api/state")).json()) as {
@@ -1489,6 +1498,78 @@ describe("settings routes", () => {
 			idleReviews: boolean;
 		};
 		expect(state.idleReviews).toBe(true);
+	});
+
+	test("trendingScan must be a boolean, lands in shared, and persists", async () => {
+		const m = mount({ projects: new Map() });
+		const bad = await m.call("/api/settings", { trendingScan: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("trendingScan must be a boolean");
+		const off = await m.call("/api/settings", { trendingScan: false });
+		expect(off.status).toBe(200);
+		expect(await off.json()).toEqual({
+			maxTotal: 3,
+			reviewCheck: true,
+			workCheck: true,
+			idleReviews: true,
+			trendingScan: false,
+		});
+		// The state payload exposes it, with the scan status, for the Settings switch.
+		const state = (await (await m.call("/api/state")).json()) as {
+			trendingScan: boolean;
+			trendingStatus: unknown;
+		};
+		expect(state.trendingScan).toBe(false);
+		expect(state.trendingStatus).toEqual({
+			lastRunAt: null,
+			lastError: null,
+			running: false,
+		});
+		// saveConfig persists it in the gstore config blob, and a restart reads it back.
+		const cfg = m.g.get<{ trendingScan?: unknown }>("config");
+		expect(cfg?.trendingScan).toBe(false);
+		const again = mount({ gstore: m.g, projects: new Map() });
+		const restored = (await (await again.call("/api/state")).json()) as {
+			trendingScan: boolean;
+		};
+		expect(restored.trendingScan).toBe(false);
+	});
+
+	test("trendingScan defaults to true on a fresh app", async () => {
+		const m = mount({ projects: new Map() });
+		const state = (await (await m.call("/api/state")).json()) as {
+			trendingScan: boolean;
+		};
+		expect(state.trendingScan).toBe(true);
+	});
+
+	test("trendingStatus reads the stored scan state; a malformed one reads as empty", async () => {
+		const g = GlobalStore.open(join(root, "g-trending-state"));
+		mountStores.push(g);
+		g.set("trending", {
+			lastWeek: "2026-W45",
+			lastRunAt: 1234,
+			lastError: { reason: "trending page failed", at: 99 },
+			firstFailAt: null,
+		});
+		const m = mount({ gstore: g, projects: new Map() });
+		const state = (await (await m.call("/api/state")).json()) as {
+			trendingStatus: unknown;
+		};
+		expect(state.trendingStatus).toEqual({
+			lastRunAt: 1234,
+			lastError: { reason: "trending page failed", at: 99 },
+			running: false,
+		});
+		g.set("trending", "garbage");
+		const empty = (await (await m.call("/api/state")).json()) as {
+			trendingStatus: unknown;
+		};
+		expect(empty.trendingStatus).toEqual({
+			lastRunAt: null,
+			lastError: null,
+			running: false,
+		});
 	});
 
 	test("maxParallel: a positive integer or null persists", async () => {
@@ -1749,6 +1830,181 @@ describe("settings routes", () => {
 		const res = await m.call("/api/projects", { name: "x" });
 		expect(res.status).toBe(400);
 		expect(await errorOf(res)).toBe("projects directory does not exist");
+	});
+});
+
+describe("trending scout routes", () => {
+	const opened: ProjectStore[] = [];
+	afterAll(() => {
+		for (const s of opened) s.close();
+	});
+	/** A fresh app with one project "tr" and a trending scout card on it. */
+	const setup = (fetchStub?: typeof fetch) => {
+		const dir = mkdtempSync(join(root, "trending-"));
+		const tstore = ProjectStore.open(dir);
+		opened.push(tstore);
+		const entry: Entry = {
+			path: dir,
+			name: "tr",
+			store: tstore,
+			target: null,
+			gitless: false,
+			github: null,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		const m = mount({
+			projects: new Map([["tr", entry]]),
+			trendingFetch: fetchStub,
+		});
+		const scout = tstore.createTask("scan trending", null, "trending");
+		const verdict = (body: Record<string, unknown>) =>
+			m.call("/api/projects/tr/trending/verdicts", {
+				scoutId: scout.id,
+				reason: "fits the board",
+				...body,
+			});
+		const fileRepo = async (repo: string): Promise<string> => {
+			const res = await verdict({
+				repo,
+				verdict: "filed",
+				prompt: `Adopt ${repo}`,
+				title: `Try ${repo}`,
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { ok: boolean; id: string };
+			expect(b.ok).toBe(true);
+			return b.id;
+		};
+		return { m, tstore, scout, verdict, fileRepo };
+	};
+
+	test("filed verdicts land as backlog cards; the 4th of one scan is a 409", async () => {
+		const { m, tstore, verdict, fileRepo } = setup();
+		for (const repo of ["a/one", "b/two", "c/three"]) {
+			const id = await fileRepo(repo);
+			expect(tstore.getTask(id)?.stage).toBe("backlog");
+			const v = tstore.getTrendingVerdict(repo);
+			expect(v?.verdict).toBe("filed");
+			expect(v?.proposalCardId).toBe(id);
+		}
+		const fourth = await verdict({
+			repo: "d/four",
+			verdict: "filed",
+			prompt: "Adopt d/four",
+		});
+		expect(fourth.status).toBe(409);
+		expect(tstore.getTrendingVerdict("d/four")).toBeNull();
+		// The board marks the proposals so the cancel dialog asks for a reason.
+		const state = (await (await m.call("/api/state")).json()) as {
+			tasks: { trendingRepo?: string }[];
+		};
+		expect(
+			state.tasks
+				.flatMap((t) => (t.trendingRepo === undefined ? [] : [t.trendingRepo]))
+				.sort(),
+		).toEqual(["a/one", "b/two", "c/three"]);
+	});
+
+	test("the verdicts route validates its body", async () => {
+		const { m, verdict } = setup();
+		const noPrompt = await verdict({ repo: "a/b", verdict: "filed" });
+		expect(noPrompt.status).toBe(400);
+		expect(await errorOf(noPrompt)).toBe("prompt must be a string");
+		const badKind = await verdict({ repo: "a/b", verdict: "maybe" });
+		expect(badKind.status).toBe(400);
+		expect(await errorOf(badKind)).toBe(
+			"verdict must be filed, no_fit or deferred",
+		);
+		const noReason = await verdict({
+			repo: "a/b",
+			verdict: "no_fit",
+			reason: " ",
+		});
+		expect(noReason.status).toBe(400);
+		expect(await errorOf(noReason)).toBe("reason must be 1-500 characters");
+		const longTitle = await verdict({
+			repo: "a/b",
+			verdict: "filed",
+			prompt: "p",
+			title: "x".repeat(201),
+		});
+		expect(longTitle.status).toBe(400);
+		const unknown = await m.call("/api/projects/nope/trending/verdicts", {
+			scoutId: "x",
+			repo: "a/b",
+			verdict: "no_fit",
+			reason: "r",
+		});
+		expect(unknown.status).toBe(404);
+	});
+
+	test("no_fit records a final verdict; a second verdict on the repo is a 409", async () => {
+		const { tstore, verdict } = setup();
+		const res = await verdict({
+			repo: "Owner/Repo",
+			verdict: "no_fit",
+			reason: "unrelated to the board",
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		const v = tstore.getTrendingVerdict("owner/repo");
+		expect(v?.verdict).toBe("no_fit");
+		expect(v?.reason).toBe("unrelated to the board");
+		expect(v?.rejectedByUser).toBe(false);
+		expect(v?.proposalCardId).toBeNull();
+		const again = await verdict({ repo: "owner/repo", verdict: "deferred" });
+		expect(again.status).toBe(409);
+		expect(tstore.getTrendingVerdict("owner/repo")?.verdict).toBe("no_fit");
+	});
+
+	test("cancelling a proposal with a reason turns its repo into a user-rejected no_fit", async () => {
+		const { m, tstore, fileRepo } = setup();
+		const id = await fileRepo("o/r");
+		const bad = await m.call(`/api/projects/tr/tasks/${id}/cancel`, {
+			reason: 7,
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("reason must be a string");
+		expect(tstore.getTrendingVerdict("o/r")?.verdict).toBe("filed");
+		const res = await m.call(`/api/projects/tr/tasks/${id}/cancel`, {
+			reason: "  too heavy for us  ",
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		const v = tstore.getTrendingVerdict("o/r");
+		expect(v?.verdict).toBe("no_fit");
+		expect(v?.rejectedByUser).toBe(true);
+		expect(v?.reason).toBe("too heavy for us");
+	});
+
+	test("project settings route accepts trendingScout and rejects non-boolean", async () => {
+		const ok = await post("/api/projects/p1/settings", { trendingScout: true });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().trendingScout).toBe(true);
+		const bad = await post("/api/projects/p1/settings", { trendingScout: 1 });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("trendingScout must be a boolean");
+		await post("/api/projects/p1/settings", { trendingScout: false });
+		expect(store.getSettings().trendingScout).toBe(false);
+	});
+
+	test("a manual scan with no project opted in is a 409 and fetches nothing", async () => {
+		const fetched: string[] = [];
+		const stub = (async (input: string | URL | Request) => {
+			fetched.push(String(input));
+			return new Response("", { status: 500 });
+		}) as typeof fetch;
+		const { m } = setup(stub);
+		const res = await m.call("/api/trending/scan", {});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no project has the trending scout on");
+		expect(fetched).toEqual([]);
 	});
 });
 
@@ -4890,6 +5146,7 @@ describe("github token", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -5078,6 +5335,7 @@ describe("hindsight settings", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -5404,6 +5662,23 @@ describe("turns' own host", () => {
 		).toBe(403);
 		expect(store.boardCheckId()).toBe(checkBefore);
 	});
+
+	test("the trending scout's verdicts pass with the boot token only", async () => {
+		const scout = store.createTask("scan trending", null, "trending");
+		const body = {
+			scoutId: scout.id,
+			repo: "turn/host",
+			verdict: "deferred",
+			reason: "revisit next week",
+		};
+		const send = (headers: Record<string, string>) =>
+			post("/api/projects/p1/trending/verdicts", body, headers);
+		expect((await send(asTurn(null))).status).toBe(401);
+		const ok = await send(asTurn(BOARD_TOKEN));
+		expect(ok.status).toBe(200);
+		expect(store.getTrendingVerdict("turn/host")?.verdict).toBe("deferred");
+		store.updateTask(scout.id, { cancelledAt: Date.now() });
+	});
 });
 
 describe("readJson bounds untrusted bodies (R1-2)", () => {
@@ -5466,6 +5741,7 @@ describe("loopback Host from another machine or container", () => {
 			reviewCheck: true,
 			workCheck: true,
 			idleReviews: true,
+			trendingScan: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -7525,6 +7801,7 @@ describe("sign out everywhere", () => {
 			reviewCheck: true,
 			workCheck: true,
 			idleReviews: true,
+			trendingScan: true,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -7646,6 +7923,7 @@ describe("session registry (OTTR-387)", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -10437,6 +10715,7 @@ describe("worker sign-in warnings", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -10519,6 +10798,7 @@ describe("token expiry reminders", () => {
 				reviewCheck: true,
 				workCheck: true,
 				idleReviews: true,
+				trendingScan: true,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

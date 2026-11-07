@@ -127,6 +127,8 @@ const shared: {
 	workCheck: boolean;
 	/** Default on; POST /api/settings writes it, the idle review tick reads it. */
 	idleReviews: boolean;
+	/** Default on; POST /api/settings writes it, the weekly trending tick reads it. */
+	trendingScan: boolean;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 	/** Project names in board order, persisted via /api/projects/order. */
@@ -142,6 +144,7 @@ const shared: {
 	reviewCheck: true,
 	workCheck: true,
 	idleReviews: true,
+	trendingScan: true,
 	envValues: {},
 	...storedProjectPaths(gstore),
 };
@@ -621,6 +624,11 @@ setInterval(() => void app.alateProvisionTick(), 5 * 60_000);
 // Idle auto-start (docs/specs/mutation-delta.md §7): with the setting on, a board quiet for
 // two hours files the first due project's architecture-review card by itself.
 setInterval(() => void app.idleReviewTick(), 5 * 60_000);
+
+// Weekly GitHub trending scan (Monday 06:00 server time): the boot call lets a board that
+// was down at the slot catch up; the 5-min tick finds the slot.
+void app.trendingTick();
+setInterval(() => void app.trendingTick(), 5 * 60_000);
 
 // Memory health: boot + interval, never per turn (docs/specs/memory-backend.md).
 setInterval(() => void app.memoryHealthTick(), 60_000);

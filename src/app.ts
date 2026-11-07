@@ -210,6 +210,12 @@ import {
 	toolsListPath,
 } from "./tools.ts";
 import {
+	createTrendingScanner,
+	EMPTY_TRENDING_STATE,
+	TRENDING_CAP,
+	type TrendingState,
+} from "./trending.ts";
+import {
 	type CancelOutcome,
 	type FinishKeptOutcome,
 	FORK_HOLD_REASON,
@@ -378,6 +384,8 @@ interface AppDeps {
 		workCheck: boolean;
 		/** Default on; POST /api/settings writes it, the idle review tick reads it. */
 		idleReviews: boolean;
+		/** Default on; POST /api/settings writes it, the weekly trending tick reads it. */
+		trendingScan: boolean;
 		removedPaths: string[];
 		projectPaths: string[];
 		/** Project names in board order; names not listed keep discovery order after them. */
@@ -446,6 +454,8 @@ interface AppDeps {
 	releaseSummarySpawn?: SpawnFn;
 	/** Gateway spawn seam for the PR-review model call; defaults to the real spawn. Tests inject a stub. */
 	prReviewSpawn?: SpawnFn;
+	/** Fetch seam for the weekly trending scan (GitHub pages and REST API); defaults to fetch. Tests inject a stub. */
+	trendingFetch?: typeof fetch;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -1277,6 +1287,44 @@ export function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[fork] ${msg}`),
 	});
 
+	// Weekly GitHub trending scanner: same live project Map as the fork watcher; its weekly
+	// slot and last outcome persist under the gstore key "trending", apart from the config.
+	const trendingScanner = createTrendingScanner({
+		projects: () => deps.projects.values(),
+		enabled: () => deps.shared.trendingScan,
+		load: loadTrendingState,
+		save: (s: TrendingState) => deps.gstore.set("trending", s),
+		token: () => process.env.GH_TOKEN,
+		apiBase: () => githubHost().apiBase,
+		fetch: deps.trendingFetch,
+		now,
+		log: (msg: string) => console.log(`[trending] ${msg}`),
+		schedule: deps.schedule,
+	});
+
+	/** The stored TrendingState; missing or malformed = EMPTY_TRENDING_STATE (a malformed
+	 * field alone falls back to its empty value). */
+	function loadTrendingState(): TrendingState {
+		const s = deps.gstore.get<Record<string, unknown>>("trending");
+		if (typeof s !== "object" || s === null || Array.isArray(s))
+			return { ...EMPTY_TRENDING_STATE };
+		const num = (v: unknown): number | null =>
+			typeof v === "number" && Number.isFinite(v) ? v : null;
+		const err = s.lastError as { reason?: unknown; at?: unknown } | null;
+		return {
+			lastWeek: typeof s.lastWeek === "string" ? s.lastWeek : null,
+			lastRunAt: num(s.lastRunAt),
+			lastError:
+				typeof err === "object" &&
+				err !== null &&
+				typeof err.reason === "string" &&
+				num(err.at) !== null
+					? { reason: err.reason, at: err.at as number }
+					: null,
+			firstFailAt: num(s.firstFailAt),
+		};
+	}
+
 	// PR review watcher: same live project Map as the fork watcher; tests fake `gh`.
 	const prWatcher = createPrWatcher({
 		projects: () => deps.projects.values(),
@@ -1755,6 +1803,7 @@ export function createApp(deps: AppDeps) {
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
 			idleReviews: deps.shared.idleReviews,
+			trendingScan: deps.shared.trendingScan,
 			removed: deps.shared.removedPaths,
 			projects: deps.shared.projectPaths,
 			projectOrder: deps.shared.projectOrder,
@@ -1779,6 +1828,7 @@ export function createApp(deps: AppDeps) {
 		reviewCheck?: unknown;
 		workCheck?: unknown;
 		idleReviews?: unknown;
+		trendingScan?: unknown;
 		removed?: unknown;
 		projects?: unknown;
 		admin?: unknown;
@@ -1813,6 +1863,9 @@ export function createApp(deps: AppDeps) {
 		}
 		if (typeof parsed.idleReviews === "boolean") {
 			deps.shared.idleReviews = parsed.idleReviews;
+		}
+		if (typeof parsed.trendingScan === "boolean") {
+			deps.shared.trendingScan = parsed.trendingScan;
 		}
 		if (
 			typeof parsed.admin === "object" &&
@@ -2053,16 +2106,19 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/**
-	 * A card starts an agent run, so the turns' host files cards and nothing else, and only with
-	 * the boot token every task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the
-	 * port gets 401.
+	 * A card starts an agent run, so the turns' host files cards (and the trending scout's
+	 * verdicts, which file proposal cards) and nothing else, and only with the boot token every
+	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401.
 	 */
 	function agentRefusal(req: Request): Response | null {
 		const token = req.headers.get("x-board-token");
 		if (agent === null || token === null || !secretsEqual(token, agent.token))
 			return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
-		if (req.method !== "POST" || !/^\/api\/projects\/[^/]+\/tasks$/.test(path))
+		if (
+			req.method !== "POST" ||
+			!/^\/api\/projects\/[^/]+\/(tasks|trending\/verdicts)$/.test(path)
+		)
 			return json({ error: "this host only files cards" }, 403);
 		return null;
 	}
@@ -2348,6 +2404,11 @@ export function createApp(deps: AppDeps) {
 				const days = e.store.getSettings().keptWorktreeDays;
 				const cards: TaskCard[] = [];
 				const medians = turnMedians(e.store.turnDurations());
+				// The trending scout's open proposals: one map per project, not a lookup per card.
+				const trendingRepos = new Map<string, string>();
+				for (const v of e.store.listTrendingVerdicts())
+					if (v.verdict === "filed" && v.proposalCardId !== null)
+						trendingRepos.set(v.proposalCardId, v.repo);
 				for (const t of e.store.listTasks()) {
 					if (
 						t.state === "needs_you" &&
@@ -2404,6 +2465,9 @@ export function createApp(deps: AppDeps) {
 						...(progress ? { progress: progress.text } : {}),
 						...(silent !== null ? { silentSince: silent } : {}),
 						...extra,
+						...(trendingRepos.has(t.id)
+							? { trendingRepo: trendingRepos.get(t.id) }
+							: {}),
 					});
 				}
 				// Name the queued merges each open release holds on the release card, so the board
@@ -2484,6 +2548,8 @@ export function createApp(deps: AppDeps) {
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
 			idleReviews: deps.shared.idleReviews,
+			trendingScan: deps.shared.trendingScan,
+			trendingStatus: trendingScanner.status(),
 			serverVersion: deps.serverVersion,
 			quota,
 			onboarding: admin === null,
@@ -2529,6 +2595,7 @@ export function createApp(deps: AppDeps) {
 								c.followUpOf === t.id &&
 								c.followUpOfProject === null,
 						);
+		const proposal = e.store.trendingVerdictByProposal(t.id);
 		return {
 			...task,
 			steps: viewSteps(t),
@@ -2536,6 +2603,7 @@ export function createApp(deps: AppDeps) {
 				.listTurns(t.id)
 				.map(({ prompt: _prompt, ...turn }) => turn),
 			sessionTitle: e.store.frozenTitle(t),
+			...(proposal?.verdict === "filed" ? { trendingRepo: proposal.repo } : {}),
 			...(pr !== null && e.github !== null
 				? {
 						prReview: {
@@ -2790,6 +2858,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof fr !== "boolean")
 				return json({ error: "forkResearch must be a boolean" }, 400);
 			patch.forkResearch = fr;
+		}
+		const ts = body.trendingScout;
+		if (ts !== undefined) {
+			if (typeof ts !== "boolean")
+				return json({ error: "trendingScout must be a boolean" }, 400);
+			patch.trendingScout = ts;
 		}
 		const pr = body.prReviews;
 		if (pr !== undefined) {
@@ -4543,6 +4617,7 @@ export function createApp(deps: AppDeps) {
 						reviewCheck?: unknown;
 						workCheck?: unknown;
 						idleReviews?: unknown;
+						trendingScan?: unknown;
 					};
 					const maxTotal = body.maxTotal;
 					if (maxTotal !== undefined) {
@@ -4580,6 +4655,13 @@ export function createApp(deps: AppDeps) {
 						}
 						deps.shared.idleReviews = idleReviews;
 					}
+					const trendingScan = body.trendingScan;
+					if (trendingScan !== undefined) {
+						if (typeof trendingScan !== "boolean") {
+							return json({ error: "trendingScan must be a boolean" }, 400);
+						}
+						deps.shared.trendingScan = trendingScan;
+					}
 					saveConfig();
 					deps.schedule();
 					return json({
@@ -4587,7 +4669,18 @@ export function createApp(deps: AppDeps) {
 						reviewCheck: deps.shared.reviewCheck,
 						workCheck: deps.shared.workCheck,
 						idleReviews: deps.shared.idleReviews,
+						trendingScan: deps.shared.trendingScan,
 					});
+				}),
+		},
+		// Settings → "Scan trending now": the weekly trending scan, run at once. Body optional.
+		"/api/trending/scan": {
+			POST: (req) =>
+				api(req, async () => {
+					const out = await trendingScanner.scanNow();
+					return out.ok
+						? json({ ok: true, filed: out.filed })
+						: json({ error: out.error }, out.status);
 				}),
 		},
 		// The update script holds new turns here while a new image waits, so the running turns
@@ -5706,6 +5799,74 @@ export function createApp(deps: AppDeps) {
 					return taskResponse(e, t.id);
 				}),
 		},
+		// The trending scout's two tools (extension/tracker.ts): "filed" files a backlog proposal
+		// card (at most TRENDING_CAP per scan, the store enforces it), no_fit and deferred record
+		// the verdict. The turns' host reaches it with the board token like card filing (agentRefusal).
+		"/api/projects/:project/trending/verdicts": {
+			POST: (req) =>
+				api(req, async () => {
+					const r = await readJson(req);
+					if ("error" in r) return r.error;
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					const { scoutId, repo, verdict, reason, prompt, title } = r.body;
+					if (typeof scoutId !== "string" || scoutId === "")
+						return json({ error: "scoutId must be a task id" }, 400);
+					if (typeof repo !== "string" || repo.trim() === "")
+						return json({ error: "repo must be owner/repo" }, 400);
+					if (
+						verdict !== "filed" &&
+						verdict !== "no_fit" &&
+						verdict !== "deferred"
+					)
+						return json(
+							{ error: "verdict must be filed, no_fit or deferred" },
+							400,
+						);
+					if (typeof reason !== "string")
+						return json({ error: "reason must be a string" }, 400);
+					const why = reason.trim();
+					if (!why || why.length > 500)
+						return json({ error: "reason must be 1-500 characters" }, 400);
+					if (verdict !== "filed") {
+						const out = e.store.judgeTrendingRepo({
+							scoutId,
+							repo: repo.trim(),
+							verdict,
+							reason: why,
+						});
+						return out.ok
+							? json({ ok: true })
+							: json({ error: out.error }, 409);
+					}
+					if (typeof prompt !== "string")
+						return json({ error: "prompt must be a string" }, 400);
+					const text = prompt.trim();
+					if (!text || text.length > 20000)
+						return json({ error: "prompt must be 1-20000 characters" }, 400);
+					if (
+						title !== undefined &&
+						title !== null &&
+						typeof title !== "string"
+					)
+						return json({ error: "title must be a string" }, 400);
+					const name = typeof title === "string" ? title.trim() : "";
+					if (name.length > 200)
+						return json({ error: "title must be at most 200 characters" }, 400);
+					if (e.gitless)
+						return json({ error: "init a git repository first" }, 409);
+					const out = e.store.fileTrendingProposal({
+						scoutId,
+						repo: repo.trim(),
+						prompt: text,
+						...(name !== "" ? { title: name } : {}),
+						cap: TRENDING_CAP,
+					});
+					return out.ok
+						? json({ ok: true, id: out.task.id })
+						: json({ error: out.error }, 409);
+				}),
+		},
 		"/api/projects/:project/tasks/:id": {
 			GET: (req) =>
 				api(req, async () => {
@@ -6710,6 +6871,16 @@ export function createApp(deps: AppDeps) {
 				api(req, async () => {
 					const r = await readJson(req);
 					if ("error" in r) return r.error;
+					// Optional: why the user turned the card down; a trending proposal keeps it.
+					const rawReason = r.body.reason;
+					if (rawReason !== undefined && typeof rawReason !== "string")
+						return json({ error: "reason must be a string" }, 400);
+					const reason = rawReason?.trim() || null;
+					if (reason !== null && reason.length > 1000)
+						return json(
+							{ error: "reason must be at most 1000 characters" },
+							400,
+						);
 					const found = resolveTask(req.params.project, req.params.id);
 					if (found instanceof Response) return found;
 					const out = await deps.cancel(
@@ -6718,9 +6889,11 @@ export function createApp(deps: AppDeps) {
 						r.body.force === true,
 					);
 					if ("error" in out) return json({ error: out.error }, out.status);
-					return "kept" in out
-						? json({ ok: false, kept: out.kept })
-						: json({ ok: true });
+					if ("kept" in out) return json({ ok: false, kept: out.kept });
+					// A cancelled trending proposal turns its repo into a user-rejected no_fit;
+					// any other card is a no-op here.
+					found.e.store.rejectTrendingProposal(found.task.id, reason);
+					return json({ ok: true });
 				}),
 		},
 		"/api/projects/:project/tasks/:id/stop": {
@@ -7088,6 +7261,7 @@ export function createApp(deps: AppDeps) {
 		sampleStats,
 		alateProvisionTick,
 		idleReviewTick,
+		trendingTick: () => trendingScanner.tick(),
 		memoryHealthTick,
 		workerSignInTick,
 		refreshUpdates,
