@@ -111,10 +111,20 @@ async function listIssues(
 	return issues;
 }
 
-/** Untrusted text through clean(); a redaction pause withholds the text instead of failing. */
+/** The DATA fence markers; issue text must never carry one, or it could close its block early. */
+const FENCE_RE = /<<<DATA|DATA>>>/g;
+
+/**
+ * Untrusted text through clean(), with every DATA fence marker removed so the text cannot
+ * end its block and pose as trusted prompt text; a redaction pause withholds the text instead
+ * of failing.
+ */
 function cleanOrWithheld(raw: string): { text: string; withheld: boolean } {
 	try {
-		return { text: clean(raw), withheld: false };
+		return {
+			text: clean(raw).replace(FENCE_RE, "[fence marker removed]"),
+			withheld: false,
+		};
 	} catch (err) {
 		// clean throws only its own pause Error.
 		return {
