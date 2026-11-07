@@ -3535,7 +3535,8 @@ export function ProjectBoard({
 					>
 						<Icon name="gear" size={14} />
 					</a>
-					{(project.hasRules || !project.gitless) && (
+					{/* Rules alignment lives in project settings only; the menu lists the remaining actions. */}
+					{(project.archReview !== null || !project.gitless) && (
 						<>
 							<button
 								type="button"
@@ -3553,22 +3554,6 @@ export function ProjectBoard({
 								className="project-menu"
 								onClick={(e) => e.currentTarget.hidePopover()}
 							>
-								{project.hasRules && (
-									<button
-										type="button"
-										className="ghost"
-										onClick={async () =>
-											(await confirmDialog(
-												"Align rules? This creates a task that fixes AGENTS.md rules that contradict the tracker's pipeline.",
-												{ ok: "Create task" },
-											)) && interview("/interview", { fix: true })
-										}
-										title="Fix AGENTS.md rules that contradict the tracker's pipeline (release-after-commit and the like)"
-									>
-										<Icon name="scale" />
-										Align rules
-									</button>
-								)}
 								{project.archReview !== null &&
 									!(project.archReview.due && !project.archReview.running) &&
 									(project.archReview.running ||
