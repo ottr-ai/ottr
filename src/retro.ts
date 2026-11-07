@@ -1,10 +1,27 @@
+import { stripInvisible } from "./forkAnalysis.ts";
 import { isRetroProposalReason } from "./prompts.ts";
 import type { TranscriptTexts } from "./session.ts";
 import type { Task, Turn } from "./types.ts";
 
+/** One open or declined retro proposal in the handoff. Card fields only, never tool
+ * output text: the target project, the proposal prompt's first plain-sentence line
+ * (what propose_task requires on line 1) and the summary's whatChanges. The lead is
+ * invisible-char stripped and cut at 200 chars. */
+export interface RetroProposalFact {
+	id: string;
+	title: string;
+	/** The board the proposal card lives on. */
+	project: string;
+	/** First non-empty prompt line, invisible chars stripped, cut at 200 chars. */
+	lead: string;
+	/** The proposal summary's whatChanges when the card carries one; null otherwise. */
+	whatChanges: string | null;
+}
+
 /** Facts the retro card's handoff carries. Pure data: no tool output text, only
- * names, counts, isError flags, seconds, cost/token numbers and the agent's own
- * intent strings. Turn input text is cut at 300 chars. */
+ * names, counts, isError flags, seconds, cost/token numbers, the agent's own
+ * intent strings and proposal card fields. Turn input text is cut at 300 chars,
+ * proposal prompt lines at 200. */
 export interface RetroFacts {
 	turns: {
 		kind: string;
@@ -34,14 +51,16 @@ export interface RetroFacts {
 		/** cacheRead / total tokens, or null when no tokens. */
 		cacheReadShare: number | null;
 	};
-	openProposals: { id: string; title: string }[];
-	declinedProposals: { id: string; title: string }[];
+	openProposals: RetroProposalFact[];
+	declinedProposals: RetroProposalFact[];
 	/** "Lessons queued" sections of the last 20 retro reports of the project. */
 	lessons: string[];
 }
 
 const INPUT_CUT = 300;
 const SLOWEST_KEEP = 5;
+/** Handoff cut for a proposal's first prompt line (the propose_task plain sentence). */
+const PROPOSAL_LEAD_CUT = 200;
 
 interface Usage {
 	model: string;
@@ -352,6 +371,9 @@ type RetroTask = Pick<
 	Task,
 	| "id"
 	| "title"
+	| "project"
+	| "prompt"
+	| "proposalSummary"
 	| "state"
 	| "stage"
 	| "cancelledAt"
@@ -383,7 +405,25 @@ export function collectRetroFacts(o: {
 			.at(-1)
 			?.trim() ?? null;
 
-	const pick = (t: RetroTask) => ({ id: t.id, title: t.title });
+	const pick = (t: RetroTask): RetroProposalFact => {
+		// The plain sentence propose_task requires on line 1: the first non-empty line of
+		// the card's prompt (followUpPrompt keeps the proposal text ahead of its wrapper).
+		const lead =
+			t.prompt
+				.split("\n")
+				.map((line) => line.trim())
+				.find((line) => line !== "") ?? "";
+		return {
+			id: t.id,
+			title: t.title,
+			project: t.project,
+			lead: stripInvisible(lead).text.trim().slice(0, PROPOSAL_LEAD_CUT),
+			whatChanges:
+				t.proposalSummary === null
+					? null
+					: stripInvisible(t.proposalSummary.whatChanges).text,
+		};
+	};
 
 	return {
 		turns: o.turns.map((t) => ({
@@ -467,6 +507,27 @@ export function factsMarkdown(f: RetroFacts): string {
 	const byModel = Object.entries(f.cost.byModel)
 		.map(([m, c]) => `${m}: $${c.toFixed(4)}`)
 		.join(", ");
+	const proposals = (
+		[
+			["- open proposals", f.openProposals],
+			["- declined proposals", f.declinedProposals],
+		] as [string, RetroProposalFact[]][]
+	)
+		.map(([label, ps]) =>
+			ps.length
+				? `${label}:\n${ps
+						.map(
+							(p) =>
+								`  - ${p.id} — project ${p.project} — ${p.lead}${
+									p.whatChanges === null
+										? ""
+										: `\n    Changes: ${p.whatChanges}`
+								}`,
+						)
+						.join("\n")}`
+				: `${label}: none`,
+		)
+		.join("\n");
 	const lines = [
 		"## Facts (computed by Ottr)",
 		"",
@@ -484,8 +545,7 @@ export function factsMarkdown(f: RetroFacts): string {
 				? ""
 				: ` (${(f.subagents.costShare * 100).toFixed(1)}% of cost)`
 		}`,
-		`- open proposals: ${f.openProposals.length ? f.openProposals.map((p) => `${p.id} (${p.title})`).join(", ") : "none"}`,
-		`- declined proposals: ${f.declinedProposals.length ? f.declinedProposals.map((p) => `${p.id} (${p.title})`).join(", ") : "none"}`,
+		proposals,
 		"",
 		"### Turns",
 		turns,

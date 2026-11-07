@@ -213,16 +213,31 @@ function fixtureTasks(): Task[] {
 			id: "prop1",
 			title: "proposal open",
 			state: "needs_you",
+			project: "ottr",
+			prompt:
+				"Name the live board store in the retro handoff.\n\nWhy: the retro searched a stale db.",
 			needsReason:
 				"Proposed by the retro of parent. Accept to start it, edit the prompt first, or cancel to decline.",
+			proposalSummary: {
+				whatChanges:
+					"collectRetroFacts carries the proposal prompt's first line",
+				why: "the handoff showed only a cut title",
+				gain: "about 25 tool calls per retro",
+				risk: "none found",
+				check: "bun test src/retro.test.ts",
+			},
 		}),
 		retroTask({
 			id: "prop2",
 			title: "proposal declined",
 			state: "idle",
+			project: "agent-data",
 			cancelledAt: 2,
+			prompt:
+				"   \nPin the retro skill's proposal cap in one place.\n\nWhy: drift.",
 			needsReason:
 				"Proposed by the retro of parent. Accept to start it, edit the prompt first, or cancel to decline.",
+			proposalSummary: null,
 		}),
 		retroTask({
 			id: "old1",
@@ -321,16 +336,72 @@ describe("collectRetroFacts", () => {
 		expect(facts({ log: "nothing here" }).ciVerdict).toBeNull();
 	});
 
-	test("open and declined proposals, lessons from the last 20 retros", () => {
+	test("open and declined proposals name project, first prompt line and whatChanges", () => {
 		const f = facts();
-		expect(f.openProposals).toEqual([{ id: "prop1", title: "proposal open" }]);
+		expect(f.openProposals).toEqual([
+			{
+				id: "prop1",
+				title: "proposal open",
+				project: "ottr",
+				lead: "Name the live board store in the retro handoff.",
+				whatChanges:
+					"collectRetroFacts carries the proposal prompt's first line",
+			},
+		]);
 		expect(f.declinedProposals).toEqual([
-			{ id: "prop2", title: "proposal declined" },
+			{
+				id: "prop2",
+				title: "proposal declined",
+				project: "agent-data",
+				lead: "Pin the retro skill's proposal cap in one place.",
+				whatChanges: null,
+			},
 		]);
 		expect(f.lessons).toEqual([
 			"Lessons queued\n1. lesson one",
 			"Lessons queued\n2. lesson two",
 		]);
+	});
+
+	test("factsMarkdown lists each proposal with its project and first prompt line", () => {
+		const md = factsMarkdown(facts());
+		expect(md).toContain(
+			"- open proposals:\n  - prop1 — project ottr — Name the live board store in the retro handoff.\n    Changes: collectRetroFacts carries the proposal prompt's first line",
+		);
+		expect(md).toContain(
+			"  - prop2 — project agent-data — Pin the retro skill's proposal cap in one place.",
+		);
+	});
+
+	test("proposal lead strips invisible characters and cuts at 200 chars", () => {
+		const f = facts({
+			tasks: [
+				retroTask({
+					id: "p1",
+					state: "needs_you",
+					prompt: `a\u00ADb\u200Bc ${"x".repeat(400)}`,
+					needsReason:
+						"Proposed by the retro of parent. Accept to start it, edit the prompt first, or cancel to decline.",
+				}),
+				retroTask({
+					id: "p2",
+					state: "idle",
+					cancelledAt: 2,
+					prompt: "second",
+					needsReason:
+						"Proposed by the retro of parent. Accept to start it, edit the prompt first, or cancel to decline.",
+					proposalSummary: {
+						whatChanges: "one\uFE0Ftwo",
+						why: "w",
+						gain: "g",
+						risk: "none found",
+						check: "c",
+					},
+				}),
+			],
+		});
+		expect(f.openProposals[0]!.lead).toBe(`abc ${"x".repeat(196)}`);
+		expect(f.declinedProposals[0]!.whatChanges).toBe("onetwo");
 	});
 });
 

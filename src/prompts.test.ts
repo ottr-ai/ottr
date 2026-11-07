@@ -659,6 +659,19 @@ describe("retro prompts", () => {
 		);
 	});
 
+	test("retroPrompt restricts the retro to the handoff and the transcript", () => {
+		const p = retroPrompt({ title: "t", model: null, handoff: "h" });
+		const rule =
+			"Use only the handoff and the transcript: never search for the board database, other cards, or other files.";
+		const at = p.indexOf(rule);
+		expect(at).toBeGreaterThan(-1);
+		expect(
+			p.indexOf(
+				"Do not change files, run commands, browse, or start subagents.",
+			),
+		).toBeLessThan(at);
+	});
+
 	test("retroReplyPrompt with and without rejected", () => {
 		const oneShot =
 			"This run is one-shot: nothing wakes you after your turn ends. Never finish with a pending wait or background job; if a slow gate is force-backgrounded, block on it in the foreground, or call report_outcome needs_you instead of ending the turn.";
