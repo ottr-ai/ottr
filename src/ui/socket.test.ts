@@ -44,6 +44,7 @@ describe("parseServerMessage", () => {
 						updates: null,
 						alatePendingSince: null,
 						deadSignIns: [],
+						restartWait: null,
 					},
 				}),
 			),
@@ -74,6 +75,7 @@ describe("parseServerMessage", () => {
 				updates: null,
 				alatePendingSince: null,
 				deadSignIns: [],
+				restartWait: null,
 			},
 		});
 		const system = {

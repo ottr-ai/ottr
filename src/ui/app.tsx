@@ -45,6 +45,7 @@ import {
 	type QuotaState,
 	REVIEW_BODY_MAX,
 	type ReleasePlan,
+	type RestartWaitView,
 	recommendsSteps,
 	type Stage,
 	type StateResponse,
@@ -10917,6 +10918,37 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 	);
 }
 
+/** OTTR-625: the update task defers the restart while the board runs an older commit than
+ * the image it built. One amber line: the user can act (restart on the host), and the board
+ * cannot restart itself (no docker in the image), so the notice names the exact command —
+ * that naming is the danger confirmation, it says what dies. Null renders nothing. */
+export function RestartWaitLine({
+	wait,
+	inboxKey,
+	fresh,
+}: {
+	wait: RestartWaitView | null;
+	inboxKey?: string;
+	fresh: boolean;
+}) {
+	if (wait === null) return null;
+	return (
+		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+			<Mark kind="warn" />
+			<span>
+				The board runs {wait.running.slice(0, 7)}; the image holds{" "}
+				{wait.commit.slice(0, 7)} ({wait.commits} commit
+				{wait.commits === 1 ? "" : "s"} newer).{" "}
+				{wait.turns.length > 0
+					? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
+					: "Restarting now stops the running turns."}{" "}
+				On the host, run <code>bun scripts/update-image.ts</code>.
+			</span>
+			{fresh && <span className="new-tag">New</span>}
+		</p>
+	);
+}
+
 /** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
 export function App() {
 	// One-time client migration: an old hash URL becomes its path URL before the first
@@ -11513,6 +11545,9 @@ export function App() {
 	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
 	const draining = (state?.drainUntil ?? null) !== null;
 	const drainCommits = state?.drainCommits ?? [];
+	// OTTR-625: the update task holds the restart until the running turns finish, because
+	// the board runs an older commit than the image it built.
+	const restartWait = state?.restartWait ?? null;
 	// Advisory from the server: unseeded agent layer, provider without an active sign-in.
 	const warnings = state?.warnings ?? [];
 	const orphanList = state?.orphans ?? [];
@@ -11524,6 +11559,9 @@ export function App() {
 	const noticeKey = notice !== null ? shortKey("notice", notice) : null;
 	const drainKey = draining ? `drain:${state?.drainUntil}` : null;
 	const behindKey = behind > 0 ? `behind:${behind}` : null;
+	// `since` in the key: a new wait (a later image) counts as new again.
+	const restartWaitKey =
+		restartWait !== null ? `restart-wait:${restartWait.since}` : null;
 	const updatesKey =
 		updateCount > 0 ? shortKey("updates", updateIds.join(",")) : null;
 	const orphansErrorKey =
@@ -11601,7 +11639,7 @@ export function App() {
 					))
 			: null;
 	const infoLines =
-		notice !== null || behind > 0 || draining ? (
+		notice !== null || behind > 0 || draining || restartWait !== null ? (
 			<>
 				{notice !== null && (
 					<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
@@ -11663,6 +11701,11 @@ export function App() {
 						)}
 					</>
 				)}
+				<RestartWaitLine
+					wait={restartWait}
+					inboxKey={restartWaitKey ?? undefined}
+					fresh={restartWaitKey !== null && isNew(restartWaitKey)}
+				/>
 			</>
 		) : null;
 	// Advisory lines: orphan agent processes, the kept-worktree backlog, and an alate import
@@ -11772,6 +11815,7 @@ export function App() {
 		noticeKey,
 		drainKey,
 		behindKey,
+		restartWaitKey,
 		orphansErrorKey,
 		orphansKey,
 		keptKey,

@@ -150,6 +150,8 @@ function fakes(
 	const seedRuns: string[] = [];
 	const seedImages: (string | undefined)[] = [];
 	const seedWrites: string[] = [];
+	/** The restart-wait record writes (`printf %s '<json>' > /etc/ottr/restart-wait`), in order. */
+	const restartWaits: string[] = [];
 	const logs: string[] = [];
 	const waits: number[] = [];
 	const built: FakeRun["built"] = [];
@@ -206,7 +208,8 @@ function fakes(
 				line.includes("seed-commit") ||
 				line.includes("seed-token-expires") ||
 				line.includes("build-commit") ||
-				line.includes("restart-waiting-since")
+				line.includes("restart-waiting-since") ||
+				line.includes("restart-wait")
 			) {
 				// The read is the `cat` exec, the write is the `printf` exec.
 				calls.push(line);
@@ -217,7 +220,12 @@ function fakes(
 						return { code: 0, out: `${o.deployedRecord ?? ""}\n` };
 					return { code: 0, out: `${o.seedRecord ?? ""}\n` };
 				}
-				seedWrites.push(line);
+				const waitRecord = line.endsWith("> /etc/ottr/restart-wait");
+				if (!waitRecord) seedWrites.push(line);
+				// The restart-wait record write ends at `> /etc/ottr/restart-wait`; the
+				// wait clock's own write ends at `restart-waiting-since`, so the longer
+				// path keeps it out of this capture.
+				if (waitRecord) restartWaits.push(line);
 				return { code: 0, out: "" };
 			}
 			if (line.startsWith("ps --filter name=")) {
@@ -431,6 +439,7 @@ function fakes(
 		seedRuns,
 		seedImages,
 		seedWrites,
+		restartWaits,
 	};
 }
 
@@ -470,7 +479,7 @@ const UP = "compose -f c.yml up -d --wait";
 const PRUNE = "image prune --force --filter label=ottr.image=worker";
 /** The deploy record a settled run writes before the prune: the server's commit, and the wait clock reset. */
 const DEPLOYED = (main: string) =>
-	`compose -f c.yml exec -T server sh -c printf %s '${must(main, "log", "-1", "--format=%h")}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since`;
+	`compose -f c.yml exec -T server sh -c printf %s '${must(main, "log", "-1", "--format=%h")}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since /etc/ottr/restart-wait`;
 /** The wait report's execs, as the fake records them. */
 const CAT_BUILD =
 	"compose -f c.yml exec -T server sh -c cat /etc/ottr/build-commit";
@@ -478,6 +487,26 @@ const CAT_WAIT =
 	"compose -f c.yml exec -T server sh -c cat /etc/ottr/restart-waiting-since";
 const WAIT_WRITE = (at: number) =>
 	`compose -f c.yml exec -T server sh -c printf %s '${at}' > /etc/ottr/restart-waiting-since`;
+/** Any restart-wait record write, whatever its JSON payload. */
+const WAIT_RECORD_ANY = expect.stringMatching(
+	/printf %s '[^']*' > \/etc\/ottr\/restart-wait$/,
+);
+/** The JSON payload of the restart-wait record write, parsed. */
+function waitRecord(
+	f: FakeRun,
+	n = 0,
+): {
+	commit: string;
+	since: number;
+	commits: number;
+	turns: string[];
+} {
+	const m = /printf %s '(.*)' > \/etc\/ottr\/restart-wait$/.exec(
+		f.restartWaits[n] ?? "",
+	);
+	expect(m).toBeTruthy();
+	return JSON.parse(m![1]!);
+}
 const GET = "compose -f c.yml exec -T server bun -e <get>";
 const HEALTH = "compose -f c.yml exec -T server bun -e <health>";
 const RUNNING3 = "server\nworker-a\nworker-b";
@@ -553,6 +582,8 @@ interface FakeRun {
 	seedImages: (string | undefined)[];
 	/** The record writes (`printf %s <sha> > /etc/ottr/seed-commit`), in order. */
 	seedWrites: string[];
+	/** The restart-wait record writes (`printf %s '<json>' > /etc/ottr/restart-wait`), in order. */
+	restartWaits: string[];
 }
 
 /** The JSON body of the first hold's POST, parsed out of the embedded bun -e code. */
@@ -630,7 +661,9 @@ describe("updateImage", () => {
 			COUNT,
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run: the restart waits for a later run",
@@ -657,7 +690,9 @@ describe("updateImage", () => {
 			COUNT,
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.logs.join("\n")).toContain(
 			"2 turns run: the restart waits for a later run",
@@ -715,10 +750,12 @@ describe("updateImage", () => {
 		// 120 polls of 30 s fill the hour; one more would end past it.
 		expect(f.waits).toHaveLength(120);
 		// The deferred restart ends the run with its wait report.
-		expect(f.calls.slice(-3)).toEqual([
+		expect(f.calls.slice(-5)).toEqual([
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.calls).not.toContain(UP);
 		expect(f.logs.join("\n")).toContain(
@@ -730,8 +767,14 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ newImage: true, turns: "1", free: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls.at(-4)).toBe(FREE);
-		expect(f.calls.at(-1)).toBe(CAT_BUILD);
+		expect(f.calls.slice(-6)).toEqual([
+			FREE,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+			WAIT,
+			CAT_BUILD,
+			WAIT_RECORD_ANY,
+		]);
 		expect(f.logs.join("\n")).toContain(
 			"1 turns run after 60 min of hold, and the board cannot end the hold (HTTP 404): it lapses 30 min after the last renewal",
 		);
@@ -753,7 +796,9 @@ describe("updateImage", () => {
 			COUNT,
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16) + 30_000),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("the board cannot hold new turns: HTTP 404");
@@ -774,7 +819,9 @@ describe("updateImage", () => {
 			COUNT,
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		const log = f.logs.join("\n");
 		expect(log).toContain("the board cannot hold new turns: HTTP 404");
@@ -847,7 +894,9 @@ describe("updateImage", () => {
 			COUNT,
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.logs.join("\n")).toContain("10 turns run");
 	}, 60_000);
@@ -1515,10 +1564,12 @@ describe("rolling restart", () => {
 		expect(f.calls).not.toContain(UP_SVC("server"));
 		expect(f.calls).not.toContain(UP);
 		// The stuck roll ends with the wait report: both workers kept their hour.
-		expect(f.calls.slice(-3)).toEqual([
+		expect(f.calls.slice(-5)).toEqual([
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16) + 120 * 60_000),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.logs.join("\n")).toContain(
 			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
@@ -1619,10 +1670,12 @@ describe("rolling restart", () => {
 		expect(f.calls).toContain(UP_SVC("worker-b"));
 		expect(f.calls).not.toContain(UP);
 		// The stuck roll ends with the wait report.
-		expect(f.calls.slice(-3)).toEqual([
+		expect(f.calls.slice(-5)).toEqual([
 			CAT_WAIT,
 			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+			WAIT,
 			CAT_BUILD,
+			WAIT_RECORD_ANY,
 		]);
 		expect(f.logs.join("\n")).toContain(
 			"worker-a keeps a turn after 60 min: its hold ends, and its restart waits for a later run",
@@ -1680,6 +1733,75 @@ describe("rolling restart", () => {
 		expect(f.seedWrites).toEqual([
 			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
 		]);
+	}, 60_000);
+
+	test("a deferred server restart records the commit, the start time and the holding ids", async () => {
+		const { main, ci } = checkout();
+		// Give the record an ancestor to count: origin/main becomes a→base, local
+		// main stays fast-forwardable.
+		must(main, "commit", "-q", "--allow-empty", "-m", "base");
+		must(main, "push", "-q", "origin", "main");
+		must(ci, "pull", "-q", "origin", "main");
+		bump(ci, "1.1.0"); // origin/main = a→base→bump
+		// The server volume names the base commit: the record can count the bump.
+		const older = must(main, "rev-parse", "HEAD");
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)], // worker-a keeps its turn at every read
+			deployedRecord: older,
+			waitSince: "",
+			waitTurns: "OTTR-9 ALAT-87",
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.restartWaits).toHaveLength(1);
+		// The record names what the image holds (the run's own head, read after
+		// the preflight fast-forward), when the wait began (the same
+		// epoch the wait clock got), how far the server lags, and the ids.
+		expect(waitRecord(f)).toEqual({
+			commit: must(main, "log", "-1", "--format=%h"),
+			since: Date.UTC(2026, 9, 16) + 60 * 60_000,
+			commits: 1,
+			turns: ["OTTR-9", "ALAT-87"],
+		});
+		// The wait clock write still happened.
+		expect(f.seedWrites).toEqual([
+			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
+		]);
+	}, 60_000);
+
+	test("a failed turns read still records the wait, with no turns", async () => {
+		const { main } = checkout();
+		const short = must(main, "log", "-1", "--format=%h");
+		const since = Date.UTC(2026, 9, 16) - 7 * 60 * 60_000;
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			// 7 h before the fake clock's start; the run's own hour of polls makes 8 h.
+			waitSince: String(since),
+			waitTurns: "!fail", // the board's /api/state answers 500
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The record keeps the kept clock and drops the unreadable ids.
+		expect(waitRecord(f)).toEqual({
+			commit: short,
+			since,
+			commits: 0,
+			turns: [],
+		});
+		expect(f.logs.join("\n")).toContain(
+			"warning: the server restart still waits, and its turns cannot be read",
+		);
+	}, 60_000);
+
+	test("a settled deploy clears the restart-wait record", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		const f = fakes({ newImage: true, turns: ["1", "0"] });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The deploy record's own exec removes the wait clock and the wait record.
+		expect(f.calls).toContain(DEPLOYED(main));
 	}, 60_000);
 
 	test("a restart wait past 6 h warns and names the turns that hold it", async () => {
@@ -3635,8 +3757,15 @@ describe("helpers survivor kills", () => {
 
 	test("the board scripts count running turns and end the hold from the board's own origin", async () => {
 		const scripts = await boardScripts();
-		expect(scripts).toHaveLength(4);
-		const [, , count, free] = scripts as [string, string, string, string];
+		// The fifth script is the restart-wait record's turns read.
+		expect(scripts).toHaveLength(5);
+		const [, , count, free] = scripts as [
+			string,
+			string,
+			string,
+			string,
+			string,
+		];
 		const state = {
 			tasks: ["running", "preparing", "done", "queued"].map((state) => ({
 				state,

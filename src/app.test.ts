@@ -12775,3 +12775,114 @@ describe("git 401/403 GitHub hint", () => {
 		expect(b.error).not.toContain("ghp_candtoken123456");
 	});
 });
+
+describe("restart wait notice", () => {
+	// Pinned board home: restart-wait and build-commit land next to it, as the
+	// update script writes them (dirname of the home).
+	const home = mkdtempSync(join(tmpdir(), "ottr-restart-wait-"));
+	const savedOmp = process.env.OTTR_BOARD_OMP_HOME;
+	const RUN = "b".repeat(40);
+	const NEW = "c".repeat(40);
+	const write = (name: string, content: string) =>
+		writeFileSync(join(home, name), content);
+	const wait = (
+		over: Partial<{ since: number; commit: string; turns: string[] }>,
+	) =>
+		JSON.stringify({
+			commit: NEW,
+			since: Date.now() - 7 * 60 * 60_000,
+			commits: 3,
+			turns: ["ottr-1", "ottr-2"],
+			...over,
+		});
+
+	beforeAll(() => {
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+	});
+	afterAll(() => {
+		if (savedOmp === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+		else process.env.OTTR_BOARD_OMP_HOME = savedOmp;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	const state = async () =>
+		(await (await get("/api/state")).json()) as {
+			restartWait: {
+				running: string;
+				commit: string;
+				commits: number;
+				since: number;
+				turns: string[];
+			} | null;
+		};
+
+	test("no notice before the threshold", async () => {
+		write("build-commit", `${RUN}\n`);
+		write("restart-wait", wait({ since: Date.now() - 60_000 }));
+		expect((await state()).restartWait).toBeNull();
+	});
+
+	test("the notice after the threshold, all five fields intact", async () => {
+		write("build-commit", `${RUN}\n`);
+		write("restart-wait", wait({}));
+		const view = (await state()).restartWait;
+		expect(view).toEqual({
+			running: RUN,
+			commit: NEW,
+			commits: 3,
+			since: expect.any(Number) as number,
+			turns: ["ottr-1", "ottr-2"],
+		});
+	});
+
+	test("the short shas the script records pass (it writes %h)", async () => {
+		const run = "b".repeat(7);
+		const image = "c".repeat(7);
+		write("build-commit", `${run}\n`);
+		write("restart-wait", wait({ commit: image }));
+		expect((await state()).restartWait).toEqual({
+			running: run,
+			commit: image,
+			commits: 3,
+			since: expect.any(Number) as number,
+			turns: ["ottr-1", "ottr-2"],
+		});
+	});
+
+	test("cleared once the server runs the image commit", async () => {
+		write("build-commit", `${NEW}\n`);
+		write("restart-wait", wait({}));
+		expect((await state()).restartWait).toBeNull();
+	});
+
+	test("a missing record, malformed JSON, a bad sha, or too many turns stay null", async () => {
+		write("build-commit", `${RUN}\n`);
+		rmSync(join(home, "restart-wait"), { force: true });
+		expect((await state()).restartWait).toBeNull();
+		write("restart-wait", "{not json");
+		expect((await state()).restartWait).toBeNull();
+		write("restart-wait", wait({ commit: "zz" }));
+		expect((await state()).restartWait).toBeNull();
+		write(
+			"restart-wait",
+			wait({ turns: Array.from({ length: 21 }, (_, i) => `ottr-${i}`) }),
+		);
+		expect((await state()).restartWait).toBeNull();
+	});
+
+	test("an invalid build-commit file stays null", async () => {
+		write("build-commit", "not-a-sha\n");
+		write("restart-wait", wait({}));
+		expect((await state()).restartWait).toBeNull();
+	});
+
+	test("the state response ships the view and null without files", async () => {
+		write("build-commit", `${RUN}\n`);
+		write("restart-wait", wait({}));
+		const withNotice = await state();
+		expect(withNotice.restartWait?.commit).toBe(NEW);
+		rmSync(join(home, "restart-wait"));
+		rmSync(join(home, "build-commit"));
+		expect((await state()).restartWait).toBeNull();
+	});
+});

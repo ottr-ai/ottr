@@ -41,6 +41,7 @@ const {
 	AskBlock,
 	triageWait,
 	WarningLines,
+	RestartWaitLine,
 	doneTopicPages,
 	cancelledTopic,
 	Overview,
@@ -1666,6 +1667,69 @@ describe("WarningLines", () => {
 		expect(html).toContain(
 			"Settings - Bogus is not a card, and the word Settings alone stays text too.",
 		);
+	});
+});
+
+describe("RestartWaitLine", () => {
+	const wait = {
+		running: "a".repeat(40),
+		commit: "b".repeat(40),
+		commits: 116,
+		since: 1730990000000,
+		turns: ["ottr-448", "ottr-454"],
+	};
+
+	test("the wait names both shas, the turn holds, and the host command in a code span", () => {
+		const html = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={wait}
+				inboxKey="restart-wait:1730990000000"
+				fresh
+			/>,
+		);
+		expect(html).toContain('role="note"');
+		expect(html).toContain('data-inbox-key="restart-wait:1730990000000"');
+		expect(html).toContain("mark-warn");
+		expect(html).toContain(
+			`The board runs ${"a".repeat(7)}; the image holds ${"b".repeat(7)} (116 commits newer).`,
+		);
+		expect(html).toContain("The restart waits for: ottr-448, ottr-454.");
+		expect(html).toContain("Restarting now stops those turns.");
+		expect(html).toContain("<code>bun scripts/update-image.ts</code>");
+		expect(html).toContain('class="new-tag"');
+	});
+
+	test("with no holding turns the waits-for sentence is gone but the command stays", () => {
+		const html = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={{ ...wait, turns: [] }}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		expect(html).not.toContain("waits for");
+		expect(html).toContain("Restarting now stops the running turns.");
+		expect(html).toContain("<code>bun scripts/update-image.ts</code>");
+		expect(html).not.toContain("new-tag");
+	});
+
+	test("a singular wait still pluralizes only the commit count", () => {
+		const html = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={{ ...wait, commits: 1 }}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("(1 commit newer).");
+	});
+
+	test("a null wait renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<RestartWaitLine wait={null} inboxKey={undefined} fresh={false} />,
+			),
+		).toBe("");
 	});
 });
 

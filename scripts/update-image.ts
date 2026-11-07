@@ -1499,7 +1499,7 @@ async function recordDeployed(
 		"server",
 		"sh",
 		"-c",
-		`printf %s '${head}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since`,
+		`printf %s '${head}' > /etc/ottr/build-commit && rm -f /etc/ottr/restart-waiting-since /etc/ottr/restart-wait`,
 	);
 	if (w.code !== 0)
 		d.log(
@@ -1519,6 +1519,7 @@ async function reportRestartWait(
 	compose: string[],
 	head: string,
 	omp: string,
+	repo: string,
 ): Promise<void> {
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "sh", "-c", code);
@@ -1536,18 +1537,20 @@ async function reportRestartWait(
 			d.log("the wait record failed: a later run starts the wait clock again");
 	}
 	d.log(`the server restart has waited ${fmtWait(d.now() - first)}`);
+	// The ids run on every deferral: the warning line uses them past RESTART_WAIT_WARN_MS,
+	// and the restart-wait record names them so the board can show a bell notice.
+	const t = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		"server",
+		"bun",
+		"-e",
+		WAIT_TURNS,
+	);
+	const ids = t.code === 0 ? lastLine(t.out).trim() : null;
 	if (d.now() - first > RESTART_WAIT_WARN_MS) {
-		const t = await d.docker(
-			"compose",
-			...compose,
-			"exec",
-			"-T",
-			"server",
-			"bun",
-			"-e",
-			WAIT_TURNS,
-		);
-		const ids = t.code === 0 ? lastLine(t.out).trim() : null;
 		d.log(
 			ids === null
 				? "warning: the server restart still waits, and its turns cannot be read"
@@ -1560,6 +1563,25 @@ async function reportRestartWait(
 	// so it names the commit the running server still has.
 	const dep = await exec("cat /etc/ottr/build-commit");
 	const running = dep.code === 0 ? dep.out.trim() : "";
+	// How many commits the running server lacks. A server that has none recorded
+	// (or already runs the head) has nothing to catch up on.
+	let commits = 0;
+	if (running !== "" && running !== head) {
+		const c = await git(["rev-list", "--count", `${running}..${head}`], repo);
+		const n = Number(c.stdout.trim());
+		commits = c.code === 0 && Number.isInteger(n) && n >= 0 ? n : 0;
+	}
+	// The record the board reads to show a bell notice after 6 h of waiting. The ids
+	// are sanitized to a safe charset, so the printf never sees a quote.
+	const turns = (ids ?? "")
+		.split(/\s+/)
+		.filter((id) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(id))
+		.slice(0, 20);
+	const w = await exec(
+		`printf %s '${JSON.stringify({ commit: head, since: first, commits, turns })}' > /etc/ottr/restart-wait`,
+	);
+	if (w.code !== 0)
+		d.log("the restart-wait record failed: the board cannot show a notice");
 	d.log(
 		running !== ""
 			? `the image holds main at ${head} with omp ${omp}; the server still runs ${running} until a later run restarts it`
@@ -1610,7 +1632,7 @@ export async function updateImage(
 		// early 0 is a deferred wait (the seed is fine): the run ends with the wait
 		// report instead of a settled summary. early 1 keeps its stop line.
 		if (rolled.early === 0)
-			await reportRestartWait(d, compose, meta.head, meta.omp);
+			await reportRestartWait(d, compose, meta.head, meta.omp, repo);
 		return rolled.early;
 	}
 	// The record lands only after the board took the seed (a rolled server, a legacy
@@ -1636,7 +1658,7 @@ export async function updateImage(
 	);
 	if (rolled.settled)
 		d.log(`the stack runs main at ${meta.head} with omp ${meta.omp}`);
-	else await reportRestartWait(d, compose, meta.head, meta.omp);
+	else await reportRestartWait(d, compose, meta.head, meta.omp, repo);
 	// ponytail: a dirty ALATE_DATA checkout records HEAD, so uncommitted edits do not
 	// retrigger a seed; the next pushed commit does.
 	return seed.failed || recordFailed ? 1 : 0;

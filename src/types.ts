@@ -1056,6 +1056,24 @@ export interface StateResponse {
 	/** Advisory: providers a configured model role uses whose stored sign-in omp disabled, with the
 	 *  disabled cause and the role names; empty when none or the store is unreadable. */
 	deadSignIns: DeadSignIn[];
+	/** Advisory: the server restart waits for an image ahead of the running commit (a deferred
+	 *  update); null when nothing waits, the server already runs the image commit, or the
+	 *  wait is younger than the notice threshold. */
+	restartWait: RestartWaitView | null;
+}
+
+/** A deferred server restart the board surfaces after the notice threshold (OTTR-625). */
+export interface RestartWaitView {
+	/** The sha the running server holds (/etc/ottr/build-commit; the script records the short %h form). */
+	running: string;
+	/** The sha the built image holds (the record's commit; short %h form). */
+	commit: string;
+	/** Commits the image is ahead (running..commit on main); 0 when uncountable. */
+	commits: number;
+	/** Epoch ms when the wait began (the first deferral). */
+	since: number;
+	/** Card ids that held the restart at the last deferral. */
+	turns: string[];
 }
 
 /** One provider usage window, e.g. Anthropic's 5-hour or 7-day limit. */

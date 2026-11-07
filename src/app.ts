@@ -276,6 +276,7 @@ import {
 	type QuotaState,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
+	type RestartWaitView,
 	recommendsSteps,
 	type ServerMessage,
 	type StateResponse,
@@ -374,6 +375,9 @@ const SEEN_ID_RE =
  * while it waits, so a hold that the script stops renewing lapses on its own. DELETE ends it
  * at once: the script does that when its 1 h limit ends the wait. */
 const DRAIN_MS = 30 * 60_000;
+/** How long a deferred server restart waits before the board shows the bell notice; the
+ * update script has its own warn constant — they must not share one. */
+const RESTART_WAIT_NOTICE_MS = 6 * 60 * 60_000;
 
 /** The New tab's folder-name rule (unchanged from before git hosts), shared with the clone
  * name: one path segment, never "." or "..". A leading "-" is safe because git clone gets the
@@ -1974,6 +1978,56 @@ export function createApp(deps: AppDeps) {
 			return { needed, commit: null, roles, expiresAt };
 		}
 	}
+	/** The deferred server restart the update script records next to the board home: a notice
+	 *  only once every field sanitizes, the server runs an older commit than the image, and
+	 *  the wait passed the threshold; any read or parse failure stays advisory null. */
+	function restartWaitView(): RestartWaitView | null {
+		const read = (name: string): string | null => {
+			try {
+				return readFileSync(join(dirname(boardOmpHome()), name), "utf8").trim();
+			} catch {
+				return null;
+			}
+		};
+		const build = read("build-commit");
+		// The script records %h (the short form), like its deploy record has always done.
+		if (build === null || !/^[0-9a-f]{7,40}$/.test(build)) return null;
+		let record: unknown;
+		try {
+			record = JSON.parse(read("restart-wait") ?? "");
+		} catch {
+			return null;
+		}
+		if (record === null || typeof record !== "object") return null;
+		const r = record as Record<string, unknown>;
+		const commit = r.commit;
+		const since = r.since;
+		const commits = r.commits;
+		const rawTurns = r.turns;
+		if (
+			typeof commit !== "string" ||
+			!/^[0-9a-f]{7,40}$/.test(commit) ||
+			typeof since !== "number" ||
+			!Number.isInteger(since) ||
+			since <= 0 ||
+			typeof commits !== "number" ||
+			!Number.isInteger(commits) ||
+			commits < 0 ||
+			commits > 1_000_000 ||
+			!Array.isArray(rawTurns) ||
+			rawTurns.length > 20
+		)
+			return null;
+		const turns: string[] = [];
+		for (const t of rawTurns) {
+			if (typeof t !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(t))
+				continue;
+			turns.push(t);
+		}
+		if (build === commit) return null;
+		if (Date.now() - since < RESTART_WAIT_NOTICE_MS) return null;
+		return { running: build, commit, commits, since, turns };
+	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
 	async function layout422(fn: () => Promise<Response>): Promise<Response> {
 		try {
@@ -2972,6 +3026,7 @@ export function createApp(deps: AppDeps) {
 			updates: updatesView(),
 			alatePendingSince,
 			deadSignIns: dead,
+			restartWait: restartWaitView(),
 		};
 	}
 
