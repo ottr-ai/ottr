@@ -2544,9 +2544,9 @@ describe("Drawer file-section loading placeholders", () => {
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain('id="drawer-wt"');
 		expect(html).toContain('id="drawer-diff"');
-		expect(html).toContain('class="spinner"');
+		expect(html).toContain('class="skeleton"');
 		expect(html).toContain('role="status"');
-		expect(html).toContain("Loading…");
+		expect(html).toContain("Loading the files");
 	});
 
 	test("a card without a worktree holds only the changed-files section", () => {

@@ -1555,7 +1555,9 @@ export function SessionSection() {
 		>
 			{loadFailed ? (
 				<p className="session-failed">Sessions could not be loaded.</p>
-			) : sessions === null ? null : (
+			) : sessions === null ? (
+				<Skeleton shape="list" rows={3} label="Loading the sessions" />
+			) : (
 				<div className="session-rows">
 					{sessions.map((entry) => (
 						<div key={entry.id} className="access-row session-row">

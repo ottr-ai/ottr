@@ -1660,7 +1660,7 @@ function WorkflowModal({
 				<CloseButton />
 			</div>
 			{result === null ? (
-				<p className="hint wait">Loading…</p>
+				<Skeleton shape="lines" rows={4} label="Loading the diagram" />
 			) : "failed" in result ? (
 				<p className="hint" role="alert">
 					The diagram failed to load.
@@ -1824,7 +1824,7 @@ function HowItWorksModal({
 				</span>
 			</div>
 			{result === null ? (
-				<p className="hint wait">Loading…</p>
+				<Skeleton shape="lines" rows={6} label="Loading the workflow" />
 			) : "missing" in result ? (
 				<p className="hint">
 					The target branch has no docs/how-it-works.md yet. Use Create/update
@@ -4092,10 +4092,7 @@ export function Overview({
 				</p>
 			)}
 			{perf === null && err === null && (
-				<p className="loading wait" role="status">
-					<span className="spinner" aria-hidden="true" />
-					Loading performance…
-				</p>
+				<Skeleton shape="stats" rows={7} label="Loading the performance view" />
 			)}
 		</>
 	);
@@ -6925,14 +6922,9 @@ function DrawerSec({
 	);
 }
 
-/** The in-flight line a lazy drawer section holds its space with (Work steps, the file lists). */
-function DrawerLoading() {
-	return (
-		<p className="dim wait" role="status">
-			<span className="spinner" aria-hidden="true" />
-			Loading…
-		</p>
-	);
+/** The in-flight blocks a lazy drawer section holds its space with (Work steps, the file lists). */
+function DrawerLoading({ label }: { label: string }) {
+	return <Skeleton shape="list" rows={3} label={label} />;
 }
 
 /** The ask: a single question answers in one click; several collect answers first so one reply covers them all. */
@@ -8789,12 +8781,12 @@ export function Drawer({
 					{/* Loading placeholders in the loaded sections' slots, so the headers stay put. */}
 					{wtLoading && (
 						<DrawerSec id="drawer-wt" label="Worktree files">
-							<DrawerLoading />
+							<DrawerLoading label="Loading the files" />
 						</DrawerSec>
 					)}
 					{diffLoading && (
 						<DrawerSec id="drawer-diff" label="Changed files">
-							<DrawerLoading />
+							<DrawerLoading label="Loading the files" />
 						</DrawerSec>
 					)}
 					{(task.worktreeFiles?.length ?? 0) > 0 && (
@@ -9259,7 +9251,7 @@ export function Drawer({
 						}
 					>
 						{detail === null ? (
-							<DrawerLoading />
+							<DrawerLoading label="Loading the steps" />
 						) : (
 							steps.length === 0 && <p className="dim">No turns yet.</p>
 						)}
@@ -12183,10 +12175,7 @@ export function App() {
 
 				<main className="main">
 					{state === null ? (
-						<p className="loading wait" role="status">
-							<span className="spinner" aria-hidden="true" />
-							Loading board…
-						</p>
+						<Skeleton shape="list" rows={6} label="Loading the board" />
 					) : settingsRoute.onSettings ? (
 						<SettingsPage
 							projects={projects}

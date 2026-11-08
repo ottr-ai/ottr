@@ -399,6 +399,9 @@ button > .spinner {
    until the content lands. */
 .skeleton {
 	display: grid;
+	/* Full width: as a flex-row item (settings cards) shrink-to-fit collapses the
+	   grid tracks to the empty bones' 0px and the blocks vanish. */
+	width: 100%;
 	gap: 8px;
 	opacity: 0;
 	animation: wait-show 0s 1s forwards;
@@ -474,7 +477,6 @@ button > .spinner {
 
 /* Spinner inside a text line (hints, loading/dim status lines) instead of a flex button. */
 .hint .spinner,
-.loading .spinner,
 .dim .spinner,
 .perf-range .spinner {
 	display: inline-block;
@@ -2051,10 +2053,6 @@ button.notif-link {
 	overflow: auto;
 	padding: 18px 20px 24px;
 	container-type: inline-size;
-}
-.loading {
-	margin: 0;
-	color: var(--dim);
 }
 
 /* ---- Project view (Level 2) ---- */
