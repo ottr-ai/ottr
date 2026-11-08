@@ -4126,8 +4126,10 @@ describe("empty origin", () => {
 		for (const dir of [repo, tracked]) {
 			const r = await resolveTarget(dir);
 			expect(r.target).toBe("origin/main");
-			// origin has no head; the local tip stands in until the first push.
-			expect(r.sha).toBe(tip);
+			// origin has no head; the local tip stands in until the first push. Read the
+			// expectation from the dir's own HEAD: the two seed commits share content
+			// only while the ambient env stays steady across the whole run.
+			expect(r.sha).toBe(await must(dir, "rev-parse", "refs/heads/main"));
 			expect(r.unpushed).toBe(true);
 			expect(r.warning).toContain("origin has no main branch yet");
 		}
@@ -4160,9 +4162,12 @@ describe("empty origin", () => {
 		const solo = join(root, "solo");
 		await must(root, "init", "-q", "-b", "main", solo);
 		await must(solo, "commit", "-q", "--allow-empty", "-m", "seed");
+		// Solo's own tip, not repo's: the two seed commits share content only while
+		// the ambient env stays steady across the whole run, which no full-suite
+		// process guarantees.
 		expect(await resolveTarget(solo)).toEqual({
 			target: "main",
-			sha: tip,
+			sha: await must(solo, "rev-parse", "HEAD"),
 			warning: null,
 		});
 	}, 60_000);
