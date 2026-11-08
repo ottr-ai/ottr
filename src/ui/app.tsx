@@ -817,7 +817,8 @@ function Card({
 				)}
 				{sp !== null && (
 					<span className="card-mutation" title={task.progress ?? undefined}>
-						Mutation {sp.pct}%{spLeft !== null && ` · ${spLeft} left`}
+						Mutation <span className="card-mutation-value">{sp.pct}%</span>
+						{spLeft !== null && ` · ${spLeft} left`}
 						{/* The card's left edge is the progress: a dotted rail, filled bottom-up with the percent.
 						    One --p var drives the fill's scaleY and the end dot's translateY. */}
 						<span

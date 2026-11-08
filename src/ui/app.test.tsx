@@ -708,7 +708,9 @@ describe("LaneCol backlog divider", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
 		).replaceAll("<!-- -->", "");
-		expect(html).toContain(">Mutation 68% · ~1h 23m left<");
+		expect(html).toContain(
+			'>Mutation <span class="card-mutation-value">68%</span> · ~1h 23m left<',
+		);
 		// The left-edge rail fills to the run's percent: the rail's --p drives fill and end dot.
 		expect(html).toMatch(
 			/class="mutation-rail"[^>]* style="--p:0.68"><i><\/i><b><\/b>/,
@@ -782,7 +784,9 @@ describe("LaneCol backlog divider", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="in_progress" tasks={[run]} />,
 		).replaceAll("<!-- -->", "");
-		expect(html).toContain(">Mutation 68% · ~1h 23m left<");
+		expect(html).toContain(
+			'>Mutation <span class="card-mutation-value">68%</span> · ~1h 23m left<',
+		);
 		// The card meta still ticks elapsed, but the card's own progress is the better
 		// estimate: no median "about X left" and no duplicate status words.
 		expect(html).toMatch(/class="card-meta"[^>]*>\s*1m\s*</);

@@ -2583,9 +2583,10 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .stage[data-stage="done"] {
 	background: color-mix(in srgb, var(--field) 60%, var(--panel));
 }
-/* The column title reads first, in bright text; its count is a quiet number at the
-   right. No rule under the head: the four heads read as the card's header row, and
-   the columns' only lines are the dividers between them. */
+/* The column title reads first, in bright text; its count is the column's value and
+   reads strong beside it (Values-Read-First, DESIGN.md). No rule under the head: the
+   four heads read as the card's header row, and the columns' only lines are the
+   dividers between them. */
 .stage-head {
 	display: flex;
 	align-items: center;
@@ -2598,12 +2599,14 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	font-weight: 600;
 	color: var(--text-strong);
 }
-/* The total is a plain number; the "new" and alarm chips keep their boxes. */
+/* The total is the column's value: strong text and tabular numerals per
+   Values-Read-First (DESIGN.md); the "new" and alarm chips keep their boxes. */
 .stage-head > .count:not(.fresh) {
 	min-width: 0;
 	padding: 0;
 	font-weight: 500;
-	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+	color: var(--text-strong);
 	background: none;
 	border: 0;
 }
@@ -2843,11 +2846,12 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .card-head :is(.research, .cancelled, .rank-badges:not(:empty)) ~ .model {
 	margin-left: 0;
 }
-/* Mutation testing on a running card: one dim line (percent and time left). The card's
-   left edge is the progress, drawn like the quota twin bar's time line on its side: the
-   remaining part as a thin 1px white line, the done part as a 3px white fill from the
-   bottom, and a round head at the fill's top. Width, not colour, tells done from remaining.
-   Counts, survivors and elapsed time stay in the tooltip and the drawer. */
+/* Mutation testing on a running card: a dim caption whose percentage reads as a strong
+   value (Values-Read-First). The card's left edge is the progress, drawn like the quota
+   twin bar's time line on its side: the remaining part as a thin 1px white line, the
+   done part as a 3px white fill from the bottom, and a round head at the fill's top.
+   Width, not colour, tells done from remaining. Counts, survivors and elapsed time stay
+   in the tooltip and the drawer. */
 .card-mutation {
 	overflow: hidden;
 	font-size: 12px;
@@ -2855,6 +2859,10 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	color: var(--dim);
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+.card-mutation .card-mutation-value {
+	color: var(--text-strong);
+	font-weight: 500;
 }
 /* The rail takes the live edge's place: no solid inset edge under it (this selector
    outranks the later live-edge rule). */
