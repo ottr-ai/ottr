@@ -6395,6 +6395,7 @@ export function AddProjectModal({
 									placeholder="https://gitlab.com/group/repo.git or git@host:group/repo.git"
 									required={mode === "url"}
 								/>
+								<code>https or SSH git URL</code>
 							</label>
 							<label>
 								Name

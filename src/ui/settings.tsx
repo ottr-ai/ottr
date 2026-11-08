@@ -2413,6 +2413,7 @@ export function GitHostsSection() {
 										placeholder="123456"
 										required
 										pattern="\d+"
+										inputMode="numeric"
 										aria-label="App ID"
 									/>
 								</label>
@@ -4221,7 +4222,7 @@ function AlateSection() {
 						</div>
 						<label>
 							<input
-								type="text"
+								type="url"
 								value={url}
 								onChange={(e) => setUrl(e.target.value)}
 								spellCheck={false}
@@ -5531,6 +5532,7 @@ export function ProjectSettingsForm({
 								name="Max images"
 								action={save}
 								help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
+								shape="1 or more"
 							>
 								<label>
 									<input
