@@ -2710,6 +2710,85 @@ function BacklogModelDialog({
 	);
 }
 
+/** Model pick for a research report's "Implement steps": mounted per open on the default model,
+ * so a confirm without a change runs the default (OTTR-660). */
+function ImplementStepsDialog({
+	task,
+	onClose,
+	act,
+	onMarkSeen,
+	onFollowed,
+}: {
+	task: TaskView;
+	onClose: () => void;
+	act: Act;
+	onMarkSeen: () => void;
+	onFollowed: (id: string, from: string) => void;
+}) {
+	const [model, setModel] = useState("");
+	const [modelQuery, setModelQuery] = useState("");
+	const [err, setErr] = useState<string | null>(null);
+	const catalog = useModels();
+	const send = useBusy();
+	return (
+		<Modal open onClose={onClose} label="Implement steps" className="dialog">
+			<div className="dialog-body">
+				<div className="dialog-head">
+					<h2>
+						Implement steps
+						<span className="dialog-sub">
+							{task.sessionTitle ?? task.title}
+						</span>
+					</h2>
+					<CloseButton />
+				</div>
+				<ModelField
+					catalog={catalog}
+					model={model}
+					setModel={setModel}
+					modelQuery={modelQuery}
+					setModelQuery={setModelQuery}
+				/>
+				<p className="hint">
+					Creates a follow-up task that implements the report's recommended
+					steps. Leave the model unchanged to use the default model.
+				</p>
+				{err !== null && (
+					<p className="auth-error" role="alert">
+						{err}
+					</p>
+				)}
+				<div className="dialog-actions">
+					<button
+						type="button"
+						onClick={(e) => e.currentTarget.closest("dialog")?.close()}
+					>
+						Cancel
+					</button>
+					<button
+						type="button"
+						className={"primary" + (send.failed ? " failed" : "")}
+						disabled={send.busy}
+						aria-busy={send.busy || undefined}
+						onClick={() =>
+							send.start(() =>
+								act(async () => {
+									await implementSteps({ task, model, onMarkSeen, onFollowed });
+									onClose();
+								}, setErr),
+							)
+						}
+					>
+						{send.busy && <span className="spinner" aria-hidden="true" />}
+						<Icon name="play" />
+						Implement steps
+					</button>
+				</div>
+			</div>
+		</Modal>
+	);
+}
+
 /**
  * Follow-up on a done task: opens from the done drawer's Follow up button; creates a fresh
  * task that continues in its drawer.
@@ -7053,10 +7132,6 @@ function turnPage<T extends { list: string[]; index: number }>(
 const IMPLEMENT_RECOMMENDATIONS =
 	"Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
-/** Runs the drawer's "Implement steps" button: posts the follow-up handoff, then clears the
- * steps report's Inbox pin (OTTR-488: only the drawer buttons clear it) and hands the new
- * card to the board. Marking waits for the follow-up: a failed post keeps the pin up.
- * Exported for tests. */
 /** First GitHub Actions run URL in the text, canonical form; null when the text links none. */
 export function ciRunUrl(text: string): string | null {
 	const m =
@@ -7068,14 +7143,19 @@ export function ciRunUrl(text: string): string | null {
 		: `https://github.com/${m[1]}/${m[2]}/actions/runs/${m[3]}`;
 }
 
+/** Runs the drawer's "Implement steps" dialog: posts the follow-up handoff on the picked model
+ * ("" = the default model), then clears the steps report's Inbox pin (OTTR-488: only the drawer
+ * buttons clear it) and hands the new card to the board. Marking waits for the follow-up: a
+ * failed post keeps the pin up. Exported for tests. */
 export async function implementSteps(o: {
 	task: Pick<TaskView, "project" | "id">;
+	model: string;
 	onMarkSeen: () => void;
 	onFollowed: (id: string, from: string) => void;
 }): Promise<void> {
 	const next = await post<TaskView>(
 		`/api/projects/${encodeURIComponent(o.task.project)}/tasks/${o.task.id}/follow-up`,
-		{ text: IMPLEMENT_RECOMMENDATIONS },
+		{ text: IMPLEMENT_RECOMMENDATIONS, model: o.model || undefined },
 	);
 	o.onMarkSeen();
 	o.onFollowed(next.id, o.task.id);
@@ -7963,6 +8043,7 @@ export function Drawer({
 		return () => window.removeEventListener("keydown", onKey);
 	}, [viewing]);
 	const [followOpen, setFollowOpen] = useState(false);
+	const [stepsOpen, setStepsOpen] = useState(false);
 	const [wfOpen, setWfOpen] = useState(false);
 	// Open model pick for a parked card: which action asked for it; null while closed.
 	const [pick, setPick] = useState<"grill" | "todo" | null>(null);
@@ -9848,17 +9929,14 @@ export function Drawer({
 							</button>
 							{task.research && researchSteps(task) === "yes" && (
 								<>
-									<BusyButton
-										title="Creates a follow-up task that implements the report's recommended steps"
-										run={() =>
-											act(() =>
-												implementSteps({ task, onMarkSeen, onFollowed }),
-											)
-										}
+									<button
+										type="button"
+										title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
+										onClick={() => setStepsOpen(true)}
 									>
 										<Icon name="play" />
 										Implement steps
-									</BusyButton>
+									</button>
 									<BusyButton
 										title="Marks the report read and clears it from the Inbox"
 										run={async () => {
@@ -10377,6 +10455,16 @@ export function Drawer({
 					open={followOpen}
 					onClose={() => setFollowOpen(false)}
 					act={act}
+					onFollowed={onFollowed}
+				/>
+			)}
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			{!cancelled && stepsOpen && (
+				<ImplementStepsDialog
+					task={task}
+					onClose={() => setStepsOpen(false)}
+					act={act}
+					onMarkSeen={onMarkSeen}
 					onFollowed={onFollowed}
 				/>
 			)}

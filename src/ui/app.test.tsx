@@ -3965,6 +3965,42 @@ describe("Drawer research report button", () => {
 		}
 	});
 
+	test("Implement steps opens a model pick on the default model and posts nothing yet", async () => {
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		const realFetch = host.fetch as typeof fetch;
+		const posted: string[] = [];
+		host.fetch = ((url: unknown, init?: RequestInit) => {
+			if (init?.method === "POST") posted.push(String(url));
+			return realFetch(url as RequestInfo, init);
+		}) as typeof fetch;
+		try {
+			const button = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Implement steps",
+			);
+			expect(button).toBeDefined();
+			await act(async () => {
+				button?.click();
+			});
+			const dialog = document.querySelector(
+				'dialog[aria-label="Implement steps"]',
+			);
+			expect(dialog).not.toBeNull();
+			expect(dialog?.innerHTML).toContain("Default model");
+			expect(posted).toEqual([]);
+		} finally {
+			host.fetch = realFetch;
+			await unmount();
+		}
+	});
+
 	test("a done research card without a step section hides Implement steps", async () => {
 		detailBody.report = "## Short answer\n\nNothing to do.";
 		const row = cardFixture({
@@ -4343,30 +4379,37 @@ describe("Overview Context, max tile and column", () => {
 });
 
 describe("implementSteps", () => {
-	/** Fetch stub recording each URL; answers one JSON body. */
+	/** Fetch stub recording each URL and request body; answers one JSON body. */
 	function stubFetch(responses: Array<{ status: number; body: unknown }>) {
 		const calls: string[] = [];
+		const bodies: unknown[] = [];
 		const real = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
 			calls.push(String(input));
+			bodies.push(JSON.parse(String(init?.body)));
 			const next = responses.shift()!;
 			return new Response(JSON.stringify(next.body), { status: next.status });
 		}) as typeof fetch;
 		return {
 			calls,
+			bodies,
 			restore: () => {
 				globalThis.fetch = real;
 			},
 		};
 	}
 
-	test("clears the pin after the follow-up lands, then hands off", async () => {
+	test("clears the pin after the follow-up lands on the picked model, then hands off", async () => {
 		const stub = stubFetch([
 			{ status: 200, body: { id: "NEXT-1", project: "proj" } },
 		]);
 		try {
 			await implementSteps({
 				task: { project: "proj", id: "R-1" },
+				model: "anthropic/claude-opus:high",
 				onMarkSeen: () => stub.calls.push("markSeen"),
 				onFollowed: (id, from) => stub.calls.push(`followed:${id}:${from}`),
 			});
@@ -4378,6 +4421,26 @@ describe("implementSteps", () => {
 			"markSeen",
 			"followed:NEXT-1:R-1",
 		]);
+		expect(stub.bodies[0]).toMatchObject({
+			model: "anthropic/claude-opus:high",
+		});
+	});
+
+	test("an unchanged pick sends no model, so the server runs the default", async () => {
+		const stub = stubFetch([
+			{ status: 200, body: { id: "NEXT-1", project: "proj" } },
+		]);
+		try {
+			await implementSteps({
+				task: { project: "proj", id: "R-1" },
+				model: "",
+				onMarkSeen: () => {},
+				onFollowed: () => {},
+			});
+		} finally {
+			stub.restore();
+		}
+		expect(stub.bodies[0]).not.toHaveProperty("model");
 	});
 
 	test("a failed follow-up leaves the pin up", async () => {
@@ -4386,6 +4449,7 @@ describe("implementSteps", () => {
 			await expect(
 				implementSteps({
 					task: { project: "proj", id: "R-1" },
+					model: "",
 					onMarkSeen: () => stub.calls.push("markSeen"),
 					onFollowed: () => stub.calls.push("followed"),
 				}),
