@@ -4775,12 +4775,14 @@ dialog.confirm-dialog {
 .help-badge {
 	display: inline-grid;
 	place-items: center;
-	width: 18px;
-	height: 18px;
+	width: 24px;
+	height: 24px;
 	min-height: 0;
-	margin-left: 4px;
+	/* 24px is the WCAG 2.5.8 floor; the pulled-in margin and the deeper vertical
+	   align keep the footprint and the optical center of the old 18px badge. */
+	margin-left: -2px;
 	padding: 0;
-	vertical-align: -3px;
+	vertical-align: -6px;
 	color: var(--dim);
 	background: transparent;
 	border: none;
@@ -4795,8 +4797,9 @@ dialog.confirm-dialog {
 	outline: 2px solid var(--accent);
 	outline-offset: 1px;
 }
+/* Same pull-in as the base rule, scaled to the 24px badge so the title row does not re-wrap. */
 .sec-title .help-badge {
-	margin-left: -4px;
+	margin-left: -10px;
 }
 /* The explanation is a top-layer popover: overlay shadow per DESIGN.md. Without anchor
    positioning it keeps the popover's centered default. */
@@ -5576,8 +5579,8 @@ button.thumb-open:hover {
 	position: absolute;
 	top: -8px;
 	right: -8px;
-	min-width: 22px;
-	min-height: 22px;
+	min-width: 24px;
+	min-height: 24px;
 	padding: 0;
 	background: var(--field);
 	border-radius: 50%;
@@ -6602,7 +6605,7 @@ button.diff-path {
 }
 button.log-mode {
 	flex: 1 1 0; /* segmented control: the two modes split the log head evenly */
-	min-height: 22px;
+	min-height: 24px;
 	padding: 0 8px;
 	font-size: 12px;
 	color: var(--dim);
