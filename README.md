@@ -291,6 +291,7 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 | Port | 4747 | env `PORT` |
 | Bind address | 127.0.0.1 | env `OMP_TRACKER_HOST` |
 | Public hostnames | none | env `OMP_TRACKER_PUBLIC_HOSTS`; requests under these hosts need a login or the API key |
+| Hosted mode | off | env `OTTR_HOSTED=1` plus `OTTR_HOSTED_TENANT`, `OTTR_HOSTED_SECRET` and `OTTR_HOSTED_CONTROL_URL`; only for a board behind the ottr-cloud control plane. It replaces the login with a signed proxy header and hides host-level Settings. See `docs/specs/hosted-mode.md` |
 | Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
 | Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |

@@ -92,6 +92,119 @@ export function secretsEqual(a: string, b: string): boolean {
 	);
 }
 
+/**
+ * Hosted mode (docs/specs/hosted-mode.md): the control-plane proxy signs every request it forwards
+ * with `X-Ottr-Identity: v1.<tenant>.<role>.<ts>.<nonce>.<sig>`, sig = base64url
+ * HMAC-SHA256(secret, `ottr-identity.v1.<tenant>.<role>.<ts>.<nonce>`). No part can hold a
+ * dot, so the split is exact. `owner` is a browser request the proxy authenticated; `control`
+ * is the control plane itself (credit stop); `tenant` signs this board's own calls out.
+ */
+export const IDENTITY_HEADER = "x-ottr-identity";
+export const IDENTITY_ROLES = ["owner", "control", "tenant"] as const;
+export type IdentityRole = (typeof IDENTITY_ROLES)[number];
+/** Seconds a signed header stays valid on either side of the board's clock. */
+export const IDENTITY_WINDOW_S = 60;
+const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
+export function validTenantId(id: string): boolean {
+	return TENANT_RE.test(id);
+}
+
+function identityBase(
+	tenant: string,
+	role: IdentityRole,
+	ts: number,
+	nonce: string,
+): string {
+	return `ottr-identity.v1.${tenant}.${role}.${ts}.${nonce}`;
+}
+
+/** Mints one header value; nonce defaults to 18 random bytes. */
+export function signIdentity(
+	secret: string,
+	tenant: string,
+	role: IdentityRole,
+	nowMs = Date.now(),
+	nonce = randomBytes(18).toString("base64url"),
+): string {
+	const ts = Math.floor(nowMs / 1000);
+	const sig = mac(secret, identityBase(tenant, role, ts, nonce));
+	return `v1.${tenant}.${role}.${ts}.${nonce}.${sig}`;
+}
+
+/**
+ * Remembers every accepted nonce until its header could no longer pass the window, so a
+ * captured header replays never. Bounded: when `max` live nonces are held, new headers are
+ * refused (fail closed) instead of evicting a live entry a replay could then reuse.
+ */
+export class NonceCache {
+	#seen = new Map<string, number>();
+	constructor(readonly max = 100_000) {}
+
+	/** True and remembers the nonce when it is new; false for a replay or a full cache. */
+	claim(nonce: string, expiresAtMs: number, nowMs = Date.now()): boolean {
+		if (this.#seen.has(nonce)) {
+			if ((this.#seen.get(nonce) ?? 0) > nowMs) return false;
+			this.#seen.delete(nonce);
+		}
+		if (this.#seen.size >= this.max) this.#sweep(nowMs);
+		if (this.#seen.size >= this.max) return false;
+		this.#seen.set(nonce, expiresAtMs);
+		return true;
+	}
+
+	get size(): number {
+		return this.#seen.size;
+	}
+
+	#sweep(nowMs: number): void {
+		for (const [n, exp] of this.#seen) if (exp <= nowMs) this.#seen.delete(n);
+	}
+}
+
+export type IdentityCheck =
+	| { ok: true; role: IdentityRole }
+	| { ok: false; reason: string };
+
+/**
+ * Verifies one header value for this tenant: shape, tenant, HMAC (constant time), timestamp
+ * window, then the nonce (claimed only after the signature passed, so forged headers cannot
+ * fill the cache).
+ */
+export function verifyIdentity(
+	header: string | null,
+	opts: { secret: string; tenant: string; nonces: NonceCache },
+	nowMs = Date.now(),
+): IdentityCheck {
+	if (header === null || header === "") return { ok: false, reason: "missing" };
+	const parts = header.split(".");
+	if (parts.length !== 6 || parts[0] !== "v1")
+		return { ok: false, reason: "malformed" };
+	const [, tenant = "", role = "", tsText = "", nonce = "", sig = ""] = parts;
+	if (
+		!TENANT_RE.test(tenant) ||
+		!(IDENTITY_ROLES as readonly string[]).includes(role) ||
+		!/^[0-9]{1,12}$/.test(tsText) ||
+		!NONCE_RE.test(nonce)
+	)
+		return { ok: false, reason: "malformed" };
+	const ts = Number(tsText);
+	const expected = mac(
+		opts.secret,
+		identityBase(tenant, role as IdentityRole, ts, nonce),
+	);
+	if (!secretsEqual(sig, expected)) return { ok: false, reason: "signature" };
+	if (!secretsEqual(tenant, opts.tenant))
+		return { ok: false, reason: "tenant" };
+	const nowS = nowMs / 1000;
+	if (Math.abs(nowS - ts) > IDENTITY_WINDOW_S)
+		return { ok: false, reason: "expired" };
+	if (!opts.nonces.claim(nonce, (ts + IDENTITY_WINDOW_S + 1) * 1000, nowMs))
+		return { ok: false, reason: "replay" };
+	return { ok: true, role: role as IdentityRole };
+}
+
 export interface SessionEntry {
 	id: string;
 	label: string;

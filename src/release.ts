@@ -3,7 +3,13 @@ import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
 import { VERSION_RE } from "./types.ts";
-import { checkPinnedRemote, git, spawnPiped } from "./worktree.ts";
+import {
+	checkPinnedRemote,
+	git,
+	hostedGitAuth,
+	redact,
+	spawnPiped,
+} from "./worktree.ts";
 
 export interface ConventionalCommit {
 	type: string;
@@ -524,16 +530,58 @@ export async function runGh(
 	// release create/view calls; app.ts's repo create passes its own ceiling if it needs more.
 	timeoutMs = 2 * 60_000,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+	return spawnGh(args, timeoutMs, {
+		...process.env,
+		...ghEnvFor(githubHost(), process.env.GH_TOKEN),
+	});
+}
+
+async function spawnGh(
+	args: string[],
+	timeoutMs: number,
+	env: Record<string, string | undefined>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
 	try {
-		return await spawnPiped(["gh", ...args], undefined, timeoutMs, {
-			...process.env,
-			...ghEnvFor(githubHost(), process.env.GH_TOKEN),
-		});
+		return await spawnPiped(["gh", ...args], undefined, timeoutMs, env);
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code === "ENOENT")
 			throw new Error(GH_MISSING);
 		throw e;
 	}
+}
+
+/**
+ * Hosted mode's gh for one project (docs/specs/hosted-mode.md section 6): it authenticates
+ * with the token the control plane minted for the project that owns cwd and its remote,
+ * never the board's GH_TOKEN. No token: gh runs without one. The token never leaves raw.
+ */
+export async function hostedGh(
+	cwd: string,
+	remote: string | null,
+): Promise<typeof runGh> {
+	const auth = hostedGitAuth();
+	const token =
+		auth === null || remote === null ? null : await auth.ghToken(cwd, remote);
+	return async (args, timeoutMs = 2 * 60_000) => {
+		const env: Record<string, string | undefined> = { ...process.env };
+		for (const k of [
+			"GH_TOKEN",
+			"GITHUB_TOKEN",
+			"GH_ENTERPRISE_TOKEN",
+			"GITHUB_ENTERPRISE_TOKEN",
+		])
+			delete env[k];
+		const r = await spawnGh(args, timeoutMs, {
+			...env,
+			...ghEnvFor(githubHost(), token ?? undefined),
+		});
+		if (token === null) return r;
+		return {
+			...r,
+			stdout: redact(r.stdout, [token]),
+			stderr: redact(r.stderr, [token]),
+		};
+	};
 }
 
 /** One late commit with its full message body, the shape `lateNotes` groups into notes sections. */

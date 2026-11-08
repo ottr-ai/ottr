@@ -28,7 +28,9 @@ import {
 	clearSessionCookie,
 	dropSession,
 	hashPassword,
+	IDENTITY_HEADER,
 	LoginLimiter,
+	NonceCache,
 	newSecret,
 	newSessionId,
 	parseCookies,
@@ -40,6 +42,7 @@ import {
 	sessionLabel,
 	signSession,
 	verifyAdminLogin,
+	verifyIdentity,
 	verifySession,
 } from "./auth.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
@@ -55,6 +58,7 @@ import {
 } from "./forks.ts";
 import {
 	checkHostKey,
+	createHostedGitAuth,
 	defaultSshDir,
 	GIT_URL_ERROR,
 	type GitRemote,
@@ -96,6 +100,7 @@ import {
 	parseGithubHost,
 } from "./githubHost.ts";
 import type { GlobalStore } from "./globalStore.ts";
+import type { Hosted } from "./hosted.ts";
 import {
 	decodeImages,
 	MAX_IMAGE_BYTES,
@@ -329,6 +334,7 @@ import {
 	remoteUrl,
 	resolveTarget,
 	serverMergePush,
+	setHostedGitAuth,
 	setNetworkGitAuth,
 	statusFiles,
 	validateCopyPath,
@@ -519,6 +525,14 @@ interface AppDeps {
 	vmTokens?: VmTokens;
 	/** OTTR-532: the local auth-gateway the /llm proxy forwards to; null while it is not running. */
 	llmGateway?: () => { url: string; token: string } | null;
+	/** Hosted mode (docs/specs/hosted-mode.md); undefined on every self-hosted board, and then no hosted path runs. */
+	hosted?: Hosted;
+	/**
+	 * Hosted mode's credit stop (POST /api/hosted/stop, docs/specs/hosted-mode.md section 5): stops
+	 * every running turn as stopTurn does and parks its card with the credit reason; resolves to
+	 * the number of turns stopped.
+	 */
+	creditStop?: () => Promise<number>;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -2452,6 +2466,27 @@ export function createApp(deps: AppDeps) {
 			knownHosts: paths.knownHosts,
 		});
 	});
+	// Hosted mode (docs/specs/hosted-mode.md section 6): network git takes the token the control
+	// plane mints for the project that owns cwd, in place of the resolver above. Always set, so
+	// a self-hosted app never keeps the hosted auth of an earlier app in the same process.
+	setHostedGitAuth(
+		deps.hosted === undefined
+			? null
+			: createHostedGitAuth({
+					gitToken: deps.hosted.hooks.gitToken.bind(deps.hosted.hooks),
+					projectFor: (cwd) => {
+						for (const e of deps.projects.values())
+							if (cwd === e.path || cwd.startsWith(e.path + sep))
+								return {
+									name: e.name,
+									originUrl: e.store.getSettings().originUrl,
+								};
+						return null;
+					},
+					knownHosts: sshPaths(sshDir).knownHosts,
+					log: logError,
+				}),
+	);
 	try {
 		applyHindsight();
 	} catch (err) {
@@ -2541,12 +2576,18 @@ export function createApp(deps: AppDeps) {
 	 * verdicts, which file proposal cards) and nothing else, and only with the boot token every
 	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401. A
 	 * microVM turn (OTTR-532) holds no boot token: its live per-turn VM token files cards in
-	 * its own project only, and no trending verdicts.
+	 * its own project only, and no trending verdicts. Hosted mode passes the boot token itself:
+	 * there the token, not the Host, routes a turn here (see hostedRefusal).
 	 */
-	function agentRefusal(req: Request): Response | null {
+	function agentRefusal(
+		req: Request,
+		bootToken: string | undefined = agent?.token,
+	): Response | null {
 		const token = req.headers.get("x-board-token");
 		const boot =
-			agent !== null && token !== null && secretsEqual(token, agent.token);
+			bootToken !== undefined &&
+			token !== null &&
+			secretsEqual(token, bootToken);
 		const vm = boot ? null : (deps.vmTokens?.check(token) ?? null);
 		if (!boot && vm === null) return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
@@ -2594,6 +2635,10 @@ export function createApp(deps: AppDeps) {
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
 	function api(req: Request, fn: () => Promise<Response>): Promise<Response> {
+		if (deps.hosted !== undefined) {
+			const refused = hostedRefusal(deps.hosted, req);
+			return refused !== null ? Promise.resolve(refused) : guarded(req, fn);
+		}
 		// Mutations pass the Origin wall first (R1-2): a cross-site POST must never reach a
 		// handler, and a request that fails both checks answers "forbidden origin".
 		if (req.method !== "GET") {
@@ -2622,8 +2667,16 @@ export function createApp(deps: AppDeps) {
 					return Promise.resolve(json({ error: "unauthorized" }, 401));
 			}
 		}
+		return guarded(req, fn);
+	}
+
+	/** Runs a handler whose request passed the walls (see api()); unexpected errors become 500. */
+	function guarded(
+		req: Request,
+		fn: () => Promise<Response>,
+	): Promise<Response> {
 		// Every mutation that reaches a handler counts as input for the idle clock
-		// (docs/specs/mutation-delta.md §7): the walls above passed, so the request is real.
+		// (docs/specs/mutation-delta.md §7): the walls passed, so the request is real.
 		if (req.method !== "GET") lastInputAt = now();
 		return (
 			fn()
@@ -2636,6 +2689,47 @@ export function createApp(deps: AppDeps) {
 					if (req.method !== "GET") publishSoon();
 				})
 		);
+	}
+
+	/** Routes hosted mode answers 404 for, whoever asks (docs/specs/hosted-mode.md section 3): the
+	 *  proxy owns sign-in, so the board's own login, API key, session registry and provider
+	 *  sign-ins are off. */
+	const HOSTED_OFF_ROUTE =
+		/^\/api\/(setup|login|logout|settings\/(api-key|session-secret|sessions(\/[^/]*)?)|provider-login(\/.*)?)$/;
+
+	/** Hosted mode's one nonce cache: a replayed X-Ottr-Identity header never passes twice. */
+	const identityNonces = new NonceCache();
+
+	/**
+	 * Hosted mode's whole wall (docs/specs/hosted-mode.md section 3), in place of the host
+	 * allowlist, Origin wall and auth wall: the control-plane proxy checks Host, Origin and the
+	 * SSO session before it signs. Only a signed identity or a turn's token passes; the loopback
+	 * bypass, session cookies and X-API-Key grant nothing. null lets the request through.
+	 */
+	function hostedRefusal(hosted: Hosted, req: Request): Response | null {
+		const header = req.headers.get(IDENTITY_HEADER);
+		// A turn holds no identity, only its boot or VM token: the agent rules of today apply.
+		if (header === null && req.headers.get("x-board-token") !== null) {
+			if (req.method !== "GET") {
+				const originRefused = originWall(req);
+				if (originRefused !== null) return originRefused;
+			}
+			return agentRefusal(req, deps.board?.token);
+		}
+		const id = verifyIdentity(header, {
+			secret: hosted.config.secret,
+			tenant: hosted.config.tenant,
+			nonces: identityNonces,
+		});
+		if (!id.ok) return json({ error: "unauthorized" }, 401);
+		const path = new URL(req.url).pathname;
+		if (HOSTED_OFF_ROUTE.test(path)) return json({ error: "not found" }, 404);
+		// tenant signs this board's own calls out and is never valid inbound; control reaches
+		// only its /api/hosted/ routes, and owner everything else.
+		const control = path.startsWith("/api/hosted/");
+		if (id.role === "tenant" || (id.role === "control") !== control)
+			return json({ error: "forbidden" }, 403);
+		return null;
 	}
 
 	/** Valid session cookie or matching X-API-Key; checked only behind the auth wall (see api()). */
@@ -3030,7 +3124,10 @@ export function createApp(deps: AppDeps) {
 			trendingStatus: trendingScanner.status(),
 			serverVersion: deps.serverVersion,
 			quota,
-			onboarding: admin === null,
+			// Absent on self-hosted boards, so their payload stays as before.
+			...(deps.hosted !== undefined && { hosted: true }),
+			// Hosted mode has no admin login: the proxy authenticates, so setup never opens.
+			onboarding: deps.hosted === undefined && admin === null,
 			user: admin?.name ?? null,
 			seenAnswers: loadSeen(),
 			seenDoneSince,
@@ -4310,6 +4407,13 @@ export function createApp(deps: AppDeps) {
 					{ error: "live updates are disabled in production mode" },
 					404,
 				);
+			// Hosted mode: the same wall as api(), so only a signed owner opens the socket.
+			if (deps.hosted !== undefined) {
+				const refused = hostedRefusal(deps.hosted, req);
+				if (refused !== null) return refused;
+				if (srv.upgrade(req)) return;
+				return json({ error: "websocket upgrade required" }, 400);
+			}
 			// Same wall rule as api(): walled hosts need a live session or the API key (browsers
 			// send cookies on the handshake); direct loopback with a loopback Host stays open.
 			const refusal = upgradeRefusal(
@@ -4330,11 +4434,25 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, async () =>
 					json({
-						onboarding: admin === null,
+						onboarding: deps.hosted === undefined && admin === null,
 						version: deps.serverVersion,
 						live: !prod,
+						...(deps.hosted !== undefined && { hosted: true }),
 					}),
 				),
+		},
+		// Hosted credit stop (docs/specs/hosted-mode.md section 5): the control plane's call when the
+		// tenant runs out of credit. hostedRefusal lets only a signed control identity reach it.
+		"/api/hosted/stop": {
+			POST: (req) => {
+				if (deps.hosted === undefined)
+					return Promise.resolve(json({ error: "not found" }, 404));
+				return api(req, async () => {
+					if (deps.creditStop === undefined)
+						throw new Error("hosted mode without a creditStop");
+					return json({ stopped: await deps.creditStop() });
+				});
+			},
 		},
 		"/api/setup": {
 			POST: (req) =>
@@ -8139,25 +8257,37 @@ export function createApp(deps: AppDeps) {
 		// OTTR-465: the credential kinds the server's git can use for a push to a URL, for the
 		// card log; never a value. A missing App installation on a repo shows as a permission
 		// failure, and this line is what names the installation token the push went out with.
-		pushAuthKind: (url: string): string | null =>
-			pushAuthKind(url, {
-				tokens: gitTokens,
-				ambientHelpers,
-				key: existsSync(sshPaths(sshDir).global),
-				envToken: process.env.GH_TOKEN ?? null,
-				githubHost: githubHost().host,
-			}),
+		// Hosted mode: git goes out with the per-project token the control plane mints, never
+		// a board-global token, helper or key, so the line names that credential instead.
+		pushAuthKind: (url: string): string | null => {
+			if (deps.hosted === undefined)
+				return pushAuthKind(url, {
+					tokens: gitTokens,
+					ambientHelpers,
+					key: existsSync(sshPaths(sshDir).global),
+					envToken: process.env.GH_TOKEN ?? null,
+					githubHost: githubHost().host,
+				});
+			const remote = parseGitUrl(url);
+			if ("error" in remote) return null;
+			return remote.scheme === "https"
+				? "a GitHub App installation token from the control plane"
+				: "no credential the board knows of";
+		},
 		// The git 401/403 hint for the merge push and the origin fetches on the card: same
-		// inputs as pushAuthKind, one line under git's error, never a value.
+		// inputs as pushAuthKind, one line under git's error, never a value. Hosted mode has no
+		// board-global token to probe with, so it gives no hint and makes no request.
 		githubAuthHint: (url: string): Promise<string | null> =>
-			githubAuthHint(url, {
-				configuredHost: githubHost().host,
-				tokens: gitTokens,
-				envToken: process.env.GH_TOKEN ?? null,
-				secrets: gitSecrets(),
-				fetchImpl: deps.githubAuthProbe?.fetchImpl,
-				timeoutMs: deps.githubAuthProbe?.timeoutMs,
-			}),
+			deps.hosted !== undefined
+				? Promise.resolve(null)
+				: githubAuthHint(url, {
+						configuredHost: githubHost().host,
+						tokens: gitTokens,
+						envToken: process.env.GH_TOKEN ?? null,
+						secrets: gitSecrets(),
+						fetchImpl: deps.githubAuthProbe?.fetchImpl,
+						timeoutMs: deps.githubAuthProbe?.timeoutMs,
+					}),
 		// OTTR-454: a per-runner hold gates new turns on one runner only.
 		drainedRunner: (id: string) => Date.now() < (runnerDrains.get(id) ?? 0),
 		socketCount: () => sockets,

@@ -14,6 +14,7 @@ import { defaultSshDir } from "./gitHosts.ts";
 import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
 import { GlobalStore } from "./globalStore.ts";
+import { controlPlaneHooks, type Hosted, readHostedConfig } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
@@ -104,6 +105,15 @@ const PORT = Number(process.env.PORT ?? 4747);
 const HOST = process.env.OMP_TRACKER_HOST ?? "127.0.0.1";
 /** Parsed once at startup: env is static for the life of the process. */
 const PUBLIC_HOSTS = publicHosts();
+/**
+ * Hosted mode (docs/specs/hosted-mode.md): null on every self-hosted board, and then no hosted hook
+ * exists. A half-set hosted env throws here and stops the boot.
+ */
+const HOSTED = readHostedConfig();
+const hosted: Hosted | undefined =
+	HOSTED === null
+		? undefined
+		: { config: HOSTED, hooks: controlPlaneHooks(HOSTED) };
 /** Production mode: the board is static (no WebSocket); UI bundles/minifies via Bun. */
 const PROD = process.env.NODE_ENV === "production";
 // Refuse an invalid OTTR_GITHUB_HOST at boot: every GitHub feature would otherwise aim at
@@ -563,7 +573,11 @@ const loop = createTurnLoop(projects, {
 	killDetached: (url, token, id) => killDetachedRequest(url, token, id),
 	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
-		turnEnv(project, model, shared.envValues, { home: workersHome }),
+		turnEnv(project, model, shared.envValues, {
+			home: workersHome,
+			// Hosted model access is API keys only: no provider OAuth token is lent to turns.
+			lend: hosted === undefined,
+		}),
 	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the
 	// board's server-only home (the board-seed copy), never the shared home a worker turn can
 	// write. The project venv's bin dir joins the tools link dir on the turn PATH, so a merge
@@ -586,6 +600,7 @@ const loop = createTurnLoop(projects, {
 	publishRelease,
 	runReleaseCommand,
 	archReviewDelta,
+	hosted,
 });
 // Signals from here on sweep live runs; during boot loopRef stays undefined and
 // shutdown only releases the stores opened so far.
@@ -616,6 +631,7 @@ const app = createApp({
 	projects,
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,
+	creditStop: loop.creditStop,
 	finishKept: loop.finishKept,
 	// OTTR-454: the runners GET /api/drain lists (worker hostnames, then local) and the
 	// live per-runner counts from the turn loop.
@@ -668,6 +684,7 @@ const app = createApp({
 	board,
 	vmTokens,
 	llmGateway: () => llmGateway,
+	hosted,
 });
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing

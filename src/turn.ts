@@ -19,6 +19,12 @@ import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
 import {
+	DEFAULT_CREDIT_REASON,
+	type Hosted,
+	type MeteringRecord,
+	type TokenUsage,
+} from "./hosted.ts";
+import {
 	type DecodedImage,
 	MAX_IMAGE_BYTES,
 	pngGray16,
@@ -52,7 +58,7 @@ import {
 import type { openPullRequest } from "./prs.ts";
 import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
-import { ownerRepo } from "./release.ts";
+import { hostedGh, ownerRepo } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
 	classify,
@@ -652,6 +658,8 @@ export interface TurnOps {
 	): Promise<ArchReviewDelta | null>;
 	/** Provider usage limits (`omp usage`), so a check that hit a limit waits for its reset; absent = unknown. */
 	quota?: () => Promise<QuotaState>;
+	/** Hosted mode (docs/specs/hosted-mode.md): metering reports, the credit gate and hosted wording; undefined on every self-hosted board. */
+	hosted?: Hosted;
 }
 
 /**
@@ -748,6 +756,20 @@ const MERGE_PUSH_RETRIES = 2;
 const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 // ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
+/** The park reason of a stopped turn (the board's Esc). */
+const TURN_STOPPED_REASON =
+	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
+/** Hosted mode: how long a card waits after the control plane could not answer the credit gate. */
+export const CREDIT_RETRY_MS = 60_000;
+export const CREDIT_CHECK_FAILED =
+	"Could not check the credit balance; retrying in a minute.";
+const NO_USAGE: TokenUsage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	cost: 0,
+};
 
 export function keptReason(unsaved: string): string {
 	return `${KEPT_PREFIX}${unsaved}. Reply to continue, or Cancel to delete it.`;
@@ -876,6 +898,9 @@ export interface TurnLoop {
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
+	/** Hosted mode: stops every running turn like stopTurn, parks each card with the credit
+	 * reason, and resolves to the number stopped. */
+	creditStop(): Promise<number>;
 	finishKept(
 		e: TurnProject,
 		id: string,
@@ -946,14 +971,77 @@ export function createTurnLoop(
 			pendingBy: cur.pendingPrompt === null ? "supervisor" : cur.pendingBy,
 		};
 	}
+	/** Hosted credit gate (docs/specs/hosted-mode.md section 5). runTurn calls it right after its
+	 * synchronous claim and before anything spends a model token (title, run, check): an await
+	 * before the claim would let one schedule tick pass every queued card through the caps. True:
+	 * the turn starts. False: the card parked with the credit reason, or went back to the queue
+	 * held for CREDIT_RETRY_MS when the control plane gave no answer. A cancel that landed during
+	 * the call owns the card and gets no write. */
+	async function creditGate(
+		hosted: Hosted,
+		store: ProjectStore,
+		claimed: Task,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		let ok: boolean;
+		let failure: string | null = null;
+		try {
+			ok = await hosted.hooks.creditOk();
+		} catch (err) {
+			ok = false;
+			failure = errmsg(err);
+		}
+		if (ok) return true;
+		const cur = store.getTask(claimed.id);
+		if (cur === null || cur.cancelledAt !== null || cur.state !== "preparing")
+			return false;
+		if (failure !== null) {
+			log(`! credit check failed: ${failure}`);
+			// Back to the queue as before the claim, held so the scheduler asks again in a minute.
+			store.updateTask(claimed.id, {
+				state: "queued",
+				holdUntil: Date.now() + CREDIT_RETRY_MS,
+				needsReason: CREDIT_CHECK_FAILED,
+				asked: claimed.asked,
+			});
+		} else {
+			log("- turn not started: the board is out of credit");
+			store.updateTask(claimed.id, {
+				state: "needs_you",
+				needsReason: hosted.config.wording.creditReason,
+			});
+		}
+		return false;
+	}
+	/** Hosted metering (docs/specs/hosted-mode.md section 4): one record for each agent run of a
+	 * settled turn. reportUsage is fire-and-forget; a throw is logged and never fails the settle. */
+	function reportMetering(
+		hosted: Hosted,
+		turn: Pick<MeteringRecord, "project" | "taskId" | "turnId" | "kind">,
+		runs: readonly Pick<MeteringRecord, "role" | "model" | "usage">[],
+	): void {
+		for (const run of runs)
+			try {
+				hosted.hooks.reportUsage({
+					tenant: hosted.config.tenant,
+					...turn,
+					...run,
+				});
+			} catch (err) {
+				console.log(
+					`${turn.project}: ! metering report failed: ${errmsg(err)}`,
+				);
+			}
+	}
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
 	 * once startRun returns, so the cap counts distinct keys, never the two sets' summed sizes.
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
 	 * `running` entry gone, pid dead): sweepLostTurns leaves it to runTurn. */
 	const preparing = new Set<string>();
-	/** Keys a stop-turn request marked: runTurn consumes the mark at settle, so a kill from
-	 * stopTurn settles the card as stopped instead of leaving it to cancelTask. */
-	const stopping = new Set<string>();
+	/** Keys a stop-turn request marked, with the park reason: runTurn consumes the mark at
+	 * settle, so a kill from stopTurn settles the card as stopped instead of leaving it to
+	 * cancelTask. */
+	const stopping = new Map<string, string>();
 	/** Release cards whose irreversible publish has begun, from the fresh no-cancel check in
 	 * publishReleaseCard to the caller's final card write: cancel refuses these keys, so a
 	 * cancel can neither lose to the tag/push nor be overwritten by "Released". */
@@ -1840,7 +1928,18 @@ export function createTurnLoop(
 		/** Set when sweepLostTurns took over a hung check of this run: the finally must then
 		 * leave the preparing claim alone (it may belong to a replacement run already). */
 		let checkTakenOver = false;
+		/** Hosted metering: one entry for each agent run of this turn, reported in the finally. */
+		const metered: Pick<MeteringRecord, "role" | "model" | "usage">[] = [];
+		const meter = (role: string, r: RunResult) => {
+			if (ops.hosted !== undefined)
+				metered.push({ role, model: r.model, usage: r.usage ?? NO_USAGE });
+		};
 		try {
+			if (
+				ops.hosted !== undefined &&
+				!(await creditGate(ops.hosted, store, task, log))
+			)
+				return;
 			const settings = store.getSettings();
 			log(`== ${kind} turn ${new Date().toISOString()}`);
 			// A new worktree starts from a freshly fetched target; an existing one keeps its base.
@@ -2131,7 +2230,7 @@ export function createTurnLoop(
 				rejected === FORK_HOLD_REASON ||
 				rejected === MERGE_HOLD_MISMATCH_REASON;
 			const replyRejected = holdRejected ? null : rejected;
-			const prompt =
+			const ownPrompt =
 				pending && plan.resumeId
 					? retroCard
 						? retroReplyPrompt({
@@ -2165,6 +2264,19 @@ export function createTurnLoop(
 										pr: settings.prMode === true,
 									}),
 								);
+			// Hosted wording (docs/specs/hosted-mode.md section 1) rides after the prompt, so
+			// prompts.ts stays untouched: the resume text on a reply into a session, else by kind.
+			const wording = ops.hosted?.config.wording;
+			const hostedSuffix =
+				wording === undefined
+					? ""
+					: pending && plan.resumeId
+						? wording.resumeSuffix
+						: kind === "work"
+							? wording.workSuffix
+							: wording.mergeSuffix;
+			const prompt =
+				hostedSuffix === "" ? ownPrompt : `${ownPrompt}\n\n${hostedSuffix}`;
 			// Reply turn: only the reply's images. Work turn: original prompt is re-sent, so its images plus any
 			// not-yet-sent reply images (a reply note before the first omp session). Merge turns get none.
 			const turnImages =
@@ -2544,6 +2656,9 @@ export function createTurnLoop(
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
 			const result0 = (await handle.done) as RunResult;
+			// The work or merge run resolves its model from the default role, also when the card
+			// or session names its own model (docs/specs/hosted-mode.md section 4).
+			meter("default", result0);
 			const runEndedAt = Date.now();
 			// sweepLostTurns proved the pid dead and settled this turn's row; a late resolution must
 			// not settle again or clobber the card the sweep requeued.
@@ -2636,20 +2751,20 @@ export function createTurnLoop(
 			if (result.killed || store.getTask(id)?.cancelledAt) {
 				// A stop-turn request owns this kill: end the row as stopped and park the
 				// card like Esc — worktree, branch and session stay, the user replies.
-				const stopped = stopping.delete(key);
+				const stopReason = stopping.get(key);
+				stopping.delete(key);
 				store.finishTurn(turn.id, {
 					endedAt: Date.now(),
 					exitCode: result.exitCode,
-					error: stopped ? "stopped" : "cancelled",
+					error: stopReason !== undefined ? "stopped" : "cancelled",
 				});
 				// A cancel that landed meanwhile owns the card: cancelTask writes its kept
 				// or idle state after the kill, so only mark the card when no cancel ran.
 				const cur = store.getTask(id);
-				if (stopped && cur && cur.cancelledAt === null)
+				if (stopReason !== undefined && cur && cur.cancelledAt === null)
 					store.updateTask(id, {
 						state: "needs_you",
-						needsReason:
-							"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.",
+						needsReason: stopReason,
 					});
 				return;
 			}
@@ -3019,6 +3134,10 @@ export function createTurnLoop(
 											base: target.replace(/^origin\//, ""),
 											title: task.title,
 											body: prBody(task, result.outcome),
+											// Hosted: gh takes the project's minted token, never GH_TOKEN.
+											...(ops.hosted !== undefined && {
+												gh: await hostedGh(e.path, settings.originUrl),
+											}),
 										})
 										.catch((err: unknown) => ({
 											ok: false as const,
@@ -4082,7 +4201,8 @@ export function createTurnLoop(
 							: Promise.resolve([] as string[]),
 					]);
 					const roles = (ops.modelRoles ?? modelRoles)();
-					const selector = roles[checkRoleFor(result.model)];
+					const checkRole = checkRoleFor(result.model);
+					const selector = roles[checkRole];
 					// A missing role falls back to the board's default role (omp's default
 					// model), which is often the reviewed model itself — shown on the card.
 					checkModel = selector ?? roles.default ?? null;
@@ -4124,6 +4244,7 @@ export function createTurnLoop(
 						const checkKey = `${key}:check`;
 						running.set(checkKey, handle);
 						const checkResult = (await handle.done) as RunResult;
+						meter(selector === undefined ? "default" : checkRole, checkResult);
 						// sweepLostTurns settled a lost check: its outcome owns the card now.
 						if (running.get(checkKey) !== handle) {
 							checkTakenOver = true;
@@ -4319,7 +4440,8 @@ export function createTurnLoop(
 							// No transcript file on disk: the check works from the diff alone.
 						}
 						const roles = (ops.modelRoles ?? modelRoles)();
-						const selector = roles[checkRoleFor(result.model)];
+						const checkRole = checkRoleFor(result.model);
+						const selector = roles[checkRole];
 						// The check must not be the model it checks: a missing role falls back
 						// to the board's default role (omp's default model), often the work
 						// model itself. Same model or vendor goes on the card as a warning.
@@ -4382,6 +4504,10 @@ export function createTurnLoop(
 							const checkKey = `${key}:workcheck`;
 							running.set(checkKey, handle);
 							const checkResult = (await handle.done) as RunResult;
+							meter(
+								selector === undefined ? "default" : checkRole,
+								checkResult,
+							);
 							// sweepLostTurns settled a lost check: its outcome owns the card now.
 							if (running.get(checkKey) !== handle) {
 								checkTakenOver = true;
@@ -4608,14 +4734,25 @@ export function createTurnLoop(
 			// A taken-over check is the same case: the sweep deleted this run's claim.
 			if (!entry?.abandoned && !checkTakenOver) preparing.delete(key);
 			publishing.delete(key);
+			// Settle is done: report each run's usage, also of a stopped or failed run.
+			if (ops.hosted !== undefined && turn !== null)
+				reportMetering(
+					ops.hosted,
+					{ project: name, taskId: id, turnId: turn.id, kind },
+					metered,
+				);
 			schedule();
 		}
 	}
 
 	/** Stops the running turn without cancelling the task (the board's Esc): kills the agent
 	 * process, keeps the worktree, branch and session, and leaves the settle to runTurn, which
-	 * parks the card at needs_you. Never removes anything. */
-	async function stopTurn(e: TurnProject, id: string): Promise<StopOutcome> {
+	 * parks the card at needs_you with `reason`. Never removes anything. */
+	async function stopTurn(
+		e: TurnProject,
+		id: string,
+		reason: string = TURN_STOPPED_REASON,
+	): Promise<StopOutcome> {
 		const store = e.store;
 		const task = store.getTask(id);
 		if (task === null) return { error: "unknown task", status: 404 };
@@ -4648,20 +4785,42 @@ export function createTurnLoop(
 				});
 			store.updateTask(id, {
 				state: "needs_you",
-				needsReason:
-					"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.",
+				needsReason: reason,
 			});
 			return { ok: true };
 		}
 		// A watcher row returned above, so handle is set here; the guard keeps TS exact.
 		if (!handle) return { error: "no turn is running", status: 409 };
-		stopping.add(`${store.name}/${id}`);
+		stopping.set(`${store.name}/${id}`, reason);
 		await handle.kill();
 		await Promise.race([
 			handle.done.then(() => undefined),
 			new Promise<void>((r) => setTimeout(r, 15_000)),
 		]);
 		return { ok: true };
+	}
+
+	/** Hosted mode (docs/specs/hosted-mode.md section 5): the control plane's mid-turn stop at
+	 * zero credit. Every turn stopTurn can stop stops in parallel, and its card parks with the
+	 * credit reason. Resolves to the number stopped. */
+	async function creditStop(): Promise<number> {
+		const reason =
+			ops.hosted?.config.wording.creditReason ?? DEFAULT_CREDIT_REASON;
+		const stops: Promise<StopOutcome>[] = [];
+		for (const e of projects.values()) {
+			try {
+				for (const t of e.store.listTasks()) {
+					const key = `${e.store.name}/${t.id}`;
+					if (running.has(key) || detached.has(key))
+						stops.push(stopTurn(e, t.id, reason));
+				}
+			} catch (err) {
+				// One sick store must not keep the other projects' turns running.
+				logStoreError(e.store.name, err);
+			}
+		}
+		const outs = await Promise.all(stops);
+		return outs.filter((o) => "ok" in o).length;
 	}
 
 	/**
@@ -4874,6 +5033,7 @@ export function createTurnLoop(
 		runTurn,
 		cancel,
 		stopTurn,
+		creditStop,
 		finishKept,
 		recoverRestarted,
 		running,

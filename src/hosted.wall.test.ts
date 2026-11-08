@@ -1,0 +1,398 @@
+import { Database } from "bun:sqlite";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Server } from "bun";
+import { createApp, type Entry } from "./app.ts";
+import {
+	type IdentityRole,
+	SESSION_COOKIE,
+	SESSION_MS,
+	signIdentity,
+	signSession,
+} from "./auth.ts";
+import { GlobalStore } from "./globalStore.ts";
+import type { Hosted } from "./hosted.ts";
+import { ProjectStore } from "./store.ts";
+import { turnEnv } from "./tokens.ts";
+import { VmTokens } from "./vmTokens.ts";
+
+// Hosted mode's request wall (docs/specs/hosted-mode.md section 3), against a real Bun.serve.
+// Requests from this test arrive over direct loopback, which a self-hosted board leaves open.
+
+const root = mkdtempSync(join(tmpdir(), "hosted-wall-"));
+const SECRET = "hosted-secret-".repeat(4);
+const TENANT = "acme";
+const PUBLIC = "acme.ottr.cloud";
+const BOOT = "boot-token-hosted";
+const servers: Server<undefined>[] = [];
+const stores: { close(): void }[] = [];
+afterAll(() => {
+	for (const s of servers) s.stop(true);
+	for (const s of stores) s.close();
+	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+});
+
+const shared = () => ({
+	maxTotalRuns: 3,
+	reviewCheck: true,
+	workCheck: true,
+	idleReviews: true,
+	trendingScan: true,
+	removedPaths: [] as string[],
+	envValues: {} as Record<string, string>,
+	projectPaths: [] as string[],
+	projectOrder: [] as string[],
+});
+
+/** One board on a random port; hosted undefined mounts a self-hosted board. */
+function mount(name: string, hosted: Hosted | undefined) {
+	const g = GlobalStore.open(join(root, `g-${name}`));
+	stores.push(g);
+	// Every self-host credential is set, so a pass would show it still counts in hosted mode.
+	// No admin: a self-hosted board would be in onboarding.
+	g.set("config", { apiKey: "wall-key", sessionSecret: "wall-secret" });
+	const projectDir = join(root, `p-${name}`);
+	mkdirSync(projectDir, { recursive: true });
+	const store = ProjectStore.open(projectDir);
+	stores.push(store);
+	const projects = new Map<string, Entry>();
+	projects.set("p1", {
+		path: projectDir,
+		name: "p1",
+		store,
+		target: null,
+		gitless: false,
+		github: null,
+		remote: null,
+		dirty: false,
+		mainUnpushed: false,
+		mainBranch: null,
+		latestRelease: null,
+		latestImage: null,
+		archReview: null,
+	});
+	const stops: number[] = [];
+	const app = createApp({
+		gstore: g,
+		defaultDir: root,
+		projects,
+		cancel: async () => ({ removed: true }),
+		finishKept: async () => ({ ok: true }),
+		stopTurn: async () => ({ ok: true }),
+		claimedPids: () => new Set<number>(),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared: shared(),
+		serverRef: { current: undefined },
+		board: { url: "http://ottr:4852", token: BOOT },
+		vmTokens: new VmTokens({ file: null }),
+		hosted,
+		creditStop: async () => {
+			stops.push(Date.now());
+			return 2;
+		},
+	});
+	const srv = Bun.serve({ port: 0, ...app.serveOptions });
+	app.serverRef.current = srv;
+	servers.push(srv);
+	const call = (
+		path: string,
+		opts: {
+			method?: string;
+			headers?: Record<string, string>;
+			body?: unknown;
+		} = {},
+	) =>
+		fetch(new URL(path, srv.url), {
+			method: opts.method ?? (opts.body === undefined ? "GET" : "POST"),
+			headers: { "content-type": "application/json", ...opts.headers },
+			body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+		});
+	return { call, g, store, stops };
+}
+
+const hosted: Hosted = {
+	config: {
+		tenant: TENANT,
+		secret: SECRET,
+		controlUrl: "http://127.0.0.1:9",
+		wording: {
+			workSuffix: "",
+			mergeSuffix: "",
+			resumeSuffix: "",
+			creditReason: "out of credit",
+		},
+	},
+	hooks: {
+		reportUsage: () => {},
+		creditOk: async () => true,
+		gitToken: async () => null,
+	},
+};
+
+/** What the proxy forwards: the tenant's public Host and Origin, plus a fresh signed header. */
+const signed = (
+	role: IdentityRole,
+	header = signIdentity(SECRET, TENANT, role),
+) => ({
+	Host: PUBLIC,
+	Origin: `https://${PUBLIC}`,
+	"x-ottr-identity": header,
+});
+const loopback = { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" };
+
+describe("hosted mode request wall", () => {
+	const board = mount("hosted", hosted);
+
+	test("a signed owner header passes on a host and origin no allowlist covers", async () => {
+		const res = await board.call("/api/state", { headers: signed("owner") });
+		expect(res.status).toBe(200);
+		// No admin is stored, yet hosted mode never opens setup.
+		expect(await res.json()).toMatchObject({ hosted: true, onboarding: false });
+		const post = await board.call("/api/projects/p1/tasks", {
+			headers: signed("owner"),
+			body: { prompt: "owner card" },
+		});
+		expect(post.status).toBe(200);
+	});
+
+	test("no header is 401, also from direct loopback", async () => {
+		expect((await board.call("/api/state", { headers: loopback })).status).toBe(
+			401,
+		);
+		expect((await board.call("/api/boot", { headers: loopback })).status).toBe(
+			401,
+		);
+		const filed = await board.call("/api/projects/p1/tasks", {
+			headers: loopback,
+			body: { prompt: "anonymous" },
+		});
+		expect(filed.status).toBe(401);
+		expect(board.store.listTasks().some((t) => t.prompt === "anonymous")).toBe(
+			false,
+		);
+	});
+
+	test("a forged, other-tenant, expired or replayed header is 401", async () => {
+		const forged = signIdentity("f".repeat(40), TENANT, "owner");
+		const otherTenant = signIdentity(SECRET, "other", "owner");
+		const expired = signIdentity(SECRET, TENANT, "owner", Date.now() - 120_000);
+		const ahead = signIdentity(SECRET, TENANT, "owner", Date.now() + 120_000);
+		for (const header of [forged, otherTenant, expired, ahead, "garbage"])
+			expect(
+				(await board.call("/api/state", { headers: signed("owner", header) }))
+					.status,
+			).toBe(401);
+		const once = signIdentity(SECRET, TENANT, "owner");
+		expect(
+			(await board.call("/api/state", { headers: signed("owner", once) }))
+				.status,
+		).toBe(200);
+		expect(
+			(await board.call("/api/state", { headers: signed("owner", once) }))
+				.status,
+		).toBe(401);
+	});
+
+	test("a session cookie or X-API-Key grants nothing", async () => {
+		const cookie = `${SESSION_COOKIE}=${signSession("wall-secret", "ada", SESSION_MS)}`;
+		for (const headers of [
+			{ ...loopback, cookie },
+			{ ...loopback, "x-api-key": "wall-key" },
+			{ Host: PUBLIC, Origin: `https://${PUBLIC}`, "x-api-key": "wall-key" },
+		]) {
+			expect((await board.call("/api/state", { headers })).status).toBe(401);
+			expect((await board.call("/api/ws", { headers })).status).toBe(401);
+		}
+	});
+
+	test("the live socket needs the owner header too", async () => {
+		// Past the wall, only the missing upgrade headers stop the handshake.
+		expect(
+			(await board.call("/api/ws", { headers: signed("owner") })).status,
+		).toBe(400);
+		expect((await board.call("/api/ws", { headers: loopback })).status).toBe(
+			401,
+		);
+		expect(
+			(await board.call("/api/ws", { headers: signed("control") })).status,
+		).toBe(403);
+	});
+
+	test("POST /api/hosted/stop: control only, answers the stopped count", async () => {
+		const before = board.stops.length;
+		const owner = await board.call("/api/hosted/stop", {
+			method: "POST",
+			headers: signed("owner"),
+		});
+		expect(owner.status).toBe(403);
+		const tenant = await board.call("/api/hosted/stop", {
+			method: "POST",
+			headers: signed("tenant"),
+		});
+		expect(tenant.status).toBe(403);
+		const none = await board.call("/api/hosted/stop", {
+			method: "POST",
+			headers: loopback,
+		});
+		expect(none.status).toBe(401);
+		expect(board.stops.length).toBe(before);
+		const control = await board.call("/api/hosted/stop", {
+			method: "POST",
+			headers: signed("control"),
+		});
+		expect(control.status).toBe(200);
+		expect(await control.json()).toEqual({ stopped: 2 });
+		expect(board.stops.length).toBe(before + 1);
+	});
+
+	test("control reaches no other route, tenant no route at all", async () => {
+		expect(
+			(await board.call("/api/state", { headers: signed("control") })).status,
+		).toBe(403);
+		expect(
+			(await board.call("/api/state", { headers: signed("tenant") })).status,
+		).toBe(403);
+		const filed = await board.call("/api/projects/p1/tasks", {
+			headers: signed("control"),
+			body: { prompt: "from control" },
+		});
+		expect(filed.status).toBe(403);
+	});
+
+	test("sign-in, API key, session and provider sign-in routes are 404 with a valid header", async () => {
+		const routes: [string, string][] = [
+			["POST", "/api/setup"],
+			["POST", "/api/login"],
+			["POST", "/api/logout"],
+			["GET", "/api/settings/api-key"],
+			["POST", "/api/settings/api-key"],
+			["POST", "/api/settings/session-secret"],
+			["GET", "/api/settings/sessions"],
+			["DELETE", "/api/settings/sessions/some-id"],
+			["GET", "/api/provider-login"],
+			["POST", "/api/provider-login"],
+			["POST", "/api/provider-login/answer"],
+			["POST", "/api/provider-login/cancel"],
+			["POST", "/api/provider-login/logout"],
+		];
+		for (const [method, path] of routes) {
+			const res = await board.call(path, {
+				method,
+				headers: signed("owner"),
+				body:
+					method === "POST"
+						? { name: "ada", password: "long enough" }
+						: undefined,
+			});
+			expect({ path, method, status: res.status }).toEqual({
+				path,
+				method,
+				status: 404,
+			});
+			expect(await res.json()).toEqual({ error: "not found" });
+		}
+		// Neither the API key nor the session secret rotated, and no admin was created.
+		expect(board.g.get("config")).toMatchObject({
+			apiKey: "wall-key",
+			sessionSecret: "wall-secret",
+		});
+		expect(board.g.get("config")).not.toHaveProperty("admin");
+	});
+
+	test("the boot token still files a card, whatever the Host, and nothing else", async () => {
+		const asTurn = (host: string, origin: string, token: string) => ({
+			Host: host,
+			Origin: origin,
+			"x-board-token": token,
+		});
+		const turnsHost = asTurn("ottr:4852", "http://ottr:4852", BOOT);
+		const filed = await board.call("/api/projects/p1/tasks", {
+			headers: turnsHost,
+			body: { prompt: "filed by a turn" },
+		});
+		expect(filed.status).toBe(200);
+		const viaLoopback = await board.call("/api/projects/p1/tasks", {
+			headers: asTurn("127.0.0.1:0", "http://127.0.0.1:0", BOOT),
+			body: { prompt: "filed over loopback" },
+		});
+		expect(viaLoopback.status).toBe(200);
+		const prompts = board.store.listTasks().map((t) => t.prompt);
+		expect(prompts).toContain("filed by a turn");
+		expect(prompts).toContain("filed over loopback");
+		const guessed = await board.call("/api/projects/p1/tasks", {
+			headers: asTurn("ottr:4852", "http://ottr:4852", "guess"),
+			body: { prompt: "guessed" },
+		});
+		expect(guessed.status).toBe(401);
+		expect(
+			(await board.call("/api/state", { headers: turnsHost })).status,
+		).toBe(403);
+	});
+});
+
+describe("self-hosted board (hosted mode off)", () => {
+	const board = mount("self", undefined);
+
+	test("/api/setup stays open and /api/hosted/stop does not exist", async () => {
+		const setup = await board.call("/api/setup", {
+			headers: loopback,
+			body: {},
+		});
+		expect(setup.status).toBe(400);
+		const stop = await board.call("/api/hosted/stop", {
+			method: "POST",
+			headers: { ...loopback, ...signed("control") },
+		});
+		expect(stop.status).toBe(404);
+		expect(board.stops).toEqual([]);
+		// Direct loopback stays zero-auth, and the identity header means nothing.
+		expect(
+			(
+				await board.call("/api/state", {
+					headers: { ...signed("owner"), ...loopback },
+				})
+			).status,
+		).toBe(200);
+	});
+});
+
+describe("turnEnv lending in hosted mode", () => {
+	test("lend: false lends no provider token the board store holds", async () => {
+		const agent = join(root, "agent");
+		mkdirSync(agent, { recursive: true });
+		const dbPath = join(agent, "agent.db");
+		const db = new Database(dbPath);
+		db.exec(
+			"CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)",
+		);
+		const now = Date.now();
+		db.query(
+			"INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES ('anthropic', 'oauth', ?, 'acct-1', 1, 1)",
+		).run(
+			JSON.stringify({
+				access: "access-fake",
+				refresh: "refresh-fake",
+				expires: now + 8 * 3_600_000,
+			}),
+		);
+		db.close();
+		const home = join(root, "home");
+		const opts = { dbPath, now, home };
+		const model = "anthropic/claude-opus-5-5";
+		const self = await turnEnv("p1", model, {}, opts);
+		expect(self.env).toEqual({ ANTHROPIC_OAUTH_TOKEN: "access-fake" });
+		const off = await turnEnv("p1", model, {}, { ...opts, lend: false });
+		expect(off).toEqual({
+			env: {},
+			missing: [],
+			credentialError: null,
+			busy: undefined,
+			secrets: [],
+		});
+	});
+});

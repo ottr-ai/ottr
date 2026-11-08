@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import {
+	createContext,
 	Fragment,
 	useCallback,
 	useEffect,
@@ -4961,11 +4962,70 @@ type TocProps = {
 	onPick: (id: string) => void;
 };
 
-type TocGroup = {
+export type TocGroup = {
 	readonly id: string;
 	readonly label: string;
 	readonly sections: readonly TocSection[];
 };
+
+/** Host-level cards and blocks that hosted mode hides (docs/specs/hosted-mode.md section 7):
+ *  the control plane and the operator own them, so the tenant never sees them. */
+const HOSTED_HIDDEN: ReadonlySet<string> = new Set([
+	"runners-section",
+	"projects-section",
+	"api-key-section",
+	"session-section",
+	"omp-stats-section",
+	// Hosted git uses per-project control-plane tokens only (section 6), so no host token,
+	// GitHub setting or server SSH key on this card does anything there.
+	"git-hosts-section",
+	"signin-section",
+	"model-roles-section",
+	"alate-section",
+	"hindsight-section",
+	"project-updates-section",
+]);
+
+/** The card that holds each sub-block: a block hides with its card. */
+const BLOCK_CARD: ReadonlyMap<string, string> = new Map(
+	SETTINGS_TOC.flatMap((g): readonly TocSection[] => g.sections).flatMap((s) =>
+		(s.blocks ?? []).map((b) => [b.id, s.id] as const),
+	),
+);
+
+/** True when the page must not render the card or block with this TOC id. */
+export const hostedHidden = (hosted: boolean, id: string): boolean =>
+	hosted && HOSTED_HIDDEN.has(BLOCK_CARD.get(id) ?? id);
+
+/** Hosted mode for the board's components; App provides it, and every other render reads
+ *  false. A link to a settings card checks `hostedHidden` with it, so no link targets a
+ *  hidden card. */
+export const HostedContext = createContext(false);
+
+/** The page's TOC: the general or the one-project page. Hosted mode drops the hidden cards
+ *  and blocks, then every group left without a card, so no TOC link dangles. */
+export function pageToc(
+	general: boolean,
+	hosted: boolean,
+): readonly TocGroup[] {
+	const groups: readonly TocGroup[] = general ? SETTINGS_TOC : PROJECT_TOC;
+	if (!hosted) return groups;
+	return groups
+		.map((g) => ({
+			...g,
+			sections: g.sections
+				.filter((s) => !hostedHidden(hosted, s.id))
+				.map((s) =>
+					s.blocks === undefined
+						? s
+						: {
+								...s,
+								blocks: s.blocks.filter((b) => !hostedHidden(hosted, b.id)),
+							},
+				),
+		}))
+		.filter((g) => g.sections.length > 0);
+}
 
 /** The settings map: the page as a lineage-style tree (groups, their cards one indent in,
  *  sub-blocks one more): hollow nodes on a 1px thread, an elbow into each level, and the
@@ -5074,6 +5134,7 @@ export function SettingsPage({
 	act,
 	view,
 	openTask,
+	hosted,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
@@ -5087,6 +5148,8 @@ export function SettingsPage({
 	view: string;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
 	openTask: (id: string) => void;
+	/** Hosted mode (docs/specs/hosted-mode.md): the host-level cards are hidden. */
+	hosted?: boolean;
 }) {
 	const sub = settingsSub(view);
 	const project =
@@ -5098,6 +5161,11 @@ export function SettingsPage({
 		0,
 	);
 	const general = project === null;
+	const host = hosted === true;
+	const shown = (id: string): boolean => !hostedHidden(host, id);
+	// A group renders only while the TOC keeps it: hosted mode drops a group with no card left.
+	const groupShown = (id: string): boolean =>
+		pageToc(general, host).some((g) => g.id === id);
 	const [active, setActive] = useState<string | null>(null);
 	// The clicked entry stays current until the user scrolls, because the end of the page can show several cards.
 	const pinned = useRef<string | null>(null);
@@ -5110,9 +5178,7 @@ export function SettingsPage({
 	useEffect(() => {
 		pinned.current = null;
 		const ids = tocIds(
-			(general ? SETTINGS_TOC : PROJECT_TOC).flatMap(
-				(g): readonly TocSection[] => g.sections,
-			),
+			pageToc(general, host).flatMap((g): readonly TocSection[] => g.sections),
 		);
 		const pick = () => {
 			if (pinned.current !== null) return;
@@ -5157,7 +5223,7 @@ export function SettingsPage({
 			for (const t of ["wheel", "touchstart", "keydown"])
 				document.removeEventListener(t, unpin, { capture: true });
 		};
-	}, [general, view]);
+	}, [general, host, view]);
 	// Deep links: the URL's fragment names a TOC id of this page. Read it on mount and on
 	// Back/Forward, pin it like a TOC pick, and wait the scroll out like a TOC click. An
 	// unknown or malformed fragment opens the page normally, without scrolling.
@@ -5175,7 +5241,7 @@ export function SettingsPage({
 			}
 			if (
 				!tocIds(
-					(general ? SETTINGS_TOC : PROJECT_TOC).flatMap(
+					pageToc(general, host).flatMap(
 						(g): readonly TocSection[] => g.sections,
 					),
 				).includes(id)
@@ -5191,10 +5257,10 @@ export function SettingsPage({
 			window.removeEventListener("popstate", apply);
 			cancel?.();
 		};
-	}, [general, view]);
+	}, [general, host, view]);
 	const map = (
 		<SettingsMap
-			groups={project === null ? SETTINGS_TOC : PROJECT_TOC}
+			groups={pageToc(general, host)}
 			hash={general ? SETTINGS_HASH : view}
 			active={active}
 			onPick={onPick}
@@ -5243,67 +5309,79 @@ export function SettingsPage({
 							</summary>
 							{map}
 						</details>
-						<section
-							className="settings-group"
-							id="board-group"
-							aria-labelledby="board-group-title"
-							tabIndex={-1}
-						>
-							<h2 className="settings-group-title" id="board-group-title">
-								Board
-							</h2>
-							<TotalRunnersForm
-								maxTotal={maxTotal}
-								reviewCheck={reviewCheck}
-								workCheck={workCheck}
-								idleReviews={idleReviews}
-								trendingScan={trendingScan}
-								trendingStatus={trendingStatus}
-								allocated={allocated}
-								act={act}
-							/>
-							<ProjectsOrderSection projects={projects} act={act} />
-							<NotificationsSection projects={projects} act={act} />
-						</section>
-						<section
-							className="settings-group"
-							id="access-group"
-							aria-labelledby="access-group-title"
-							tabIndex={-1}
-						>
-							<h2 className="settings-group-title" id="access-group-title">
-								Access
-							</h2>
-							<ApiKeySection />
-							<SessionSection />
-							<OmpStatsSection />
-						</section>
-						<section
-							className="settings-group"
-							id="git-group"
-							aria-labelledby="git-group-title"
-							tabIndex={-1}
-						>
-							<h2 className="settings-group-title" id="git-group-title">
-								Git and secrets
-							</h2>
-							<GitHostsSection />
-							<EnvSection />
-						</section>
-						<section
-							className="settings-group"
-							id="agents-group"
-							aria-labelledby="agents-group-title"
-							tabIndex={-1}
-						>
-							<h2 className="settings-group-title" id="agents-group-title">
-								Agents
-							</h2>
-							<ProviderLoginSection />
-							<ModelRolesSection />
-							<AlateSection />
-							<HindsightSection />
-						</section>
+						{groupShown("board-group") && (
+							<section
+								className="settings-group"
+								id="board-group"
+								aria-labelledby="board-group-title"
+								tabIndex={-1}
+							>
+								<h2 className="settings-group-title" id="board-group-title">
+									Board
+								</h2>
+								{shown("runners-section") && (
+									<TotalRunnersForm
+										maxTotal={maxTotal}
+										reviewCheck={reviewCheck}
+										workCheck={workCheck}
+										idleReviews={idleReviews}
+										trendingScan={trendingScan}
+										trendingStatus={trendingStatus}
+										allocated={allocated}
+										act={act}
+									/>
+								)}
+								{shown("projects-section") && (
+									<ProjectsOrderSection projects={projects} act={act} />
+								)}
+								<NotificationsSection projects={projects} act={act} />
+							</section>
+						)}
+						{groupShown("access-group") && (
+							<section
+								className="settings-group"
+								id="access-group"
+								aria-labelledby="access-group-title"
+								tabIndex={-1}
+							>
+								<h2 className="settings-group-title" id="access-group-title">
+									Access
+								</h2>
+								{shown("api-key-section") && <ApiKeySection />}
+								{shown("session-section") && <SessionSection />}
+								{shown("omp-stats-section") && <OmpStatsSection />}
+							</section>
+						)}
+						{groupShown("git-group") && (
+							<section
+								className="settings-group"
+								id="git-group"
+								aria-labelledby="git-group-title"
+								tabIndex={-1}
+							>
+								<h2 className="settings-group-title" id="git-group-title">
+									Git and secrets
+								</h2>
+								{shown("git-hosts-section") && <GitHostsSection />}
+								<EnvSection />
+							</section>
+						)}
+						{groupShown("agents-group") && (
+							<section
+								className="settings-group"
+								id="agents-group"
+								aria-labelledby="agents-group-title"
+								tabIndex={-1}
+							>
+								<h2 className="settings-group-title" id="agents-group-title">
+									Agents
+								</h2>
+								{shown("signin-section") && <ProviderLoginSection />}
+								{shown("model-roles-section") && <ModelRolesSection />}
+								{shown("alate-section") && <AlateSection />}
+								{shown("hindsight-section") && <HindsightSection />}
+							</section>
+						)}
 					</>
 				) : (
 					<>
@@ -5320,6 +5398,7 @@ export function SettingsPage({
 							tasks={tasks}
 							act={act}
 							openTask={openTask}
+							hosted={host}
 						/>
 					</>
 				)}
@@ -5391,12 +5470,15 @@ export function ProjectSettingsForm({
 	tasks,
 	act,
 	openTask,
+	hosted,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
 	act: Act;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
 	openTask: (id: string) => void;
+	/** Hosted mode (docs/specs/hosted-mode.md): the Updates card is hidden. */
+	hosted?: boolean;
 }) {
 	const [mp, setMp] = useState(
 		project.settings.maxParallel === null
@@ -5941,94 +6023,96 @@ export function ProjectSettingsForm({
 						</>
 					)}
 				</SaveCard>
-				<SettingsCard
-					id="project-updates-section"
-					title="Updates"
-					status={updatesChip(project.settings)}
-				>
-					<div className="alate-def-rows">
-						{/* U7: hold update-card merges at needs_you until a reply approves them. */}
-						<CheckRow
-							name="Hold update merges"
-							desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
-							checked={st.holdUpdateMerges}
-							save={(v) => send({ holdUpdateMerges: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Retro"
-							desc="After each done task the supervisor proposes follow-up cards from its retro"
-							checked={st.retroSince !== null}
-							save={(v) => send({ retro: v })}
-							act={act}
-						/>
-						<CheckRow
-							sub
-							name="Friction filter"
-							desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
-							checked={st.retroFilter}
-							disabled={st.retroSince === null}
-							save={(v) => send({ retroFilter: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Fork research"
-							desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
-							tag={privateTag}
-							checked={st.forkResearch}
-							save={(v) => send({ forkResearch: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Trending scout"
-							desc="Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
-							checked={st.trendingScout}
-							save={(v) => send({ trendingScout: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="PR reviews"
-							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
-							tag={privateTag}
-							checked={st.prReviews}
-							disabled={project.github === null && !st.prReviews}
-							save={(v) => send({ prReviews: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="PR mode"
-							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
-							checked={st.prMode}
-							disabled={project.github === null && !st.prMode}
-							save={(v) => send({ prMode: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Issue watch"
-							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
-							tag={privateTag}
-							checked={st.issueWatch}
-							disabled={project.github === null && !st.issueWatch}
-							save={(v) => send({ issueWatch: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Run work turns in microVMs"
-							desc={`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${st.microVm ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`}
-							checked={st.microVm}
-							disabled={!project.vmRunner.ok && !st.microVm}
-							save={(v) => send({ microVm: v })}
-							act={act}
-						/>
-						<CheckRow
-							name="Push sync commits"
-							desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
-							checked={st.pushSyncCommits}
-							save={(v) => send({ pushSyncCommits: v })}
-							act={act}
-						/>
-					</div>
-				</SettingsCard>
+				{!hostedHidden(hosted === true, "project-updates-section") && (
+					<SettingsCard
+						id="project-updates-section"
+						title="Updates"
+						status={updatesChip(project.settings)}
+					>
+						<div className="alate-def-rows">
+							{/* U7: hold update-card merges at needs_you until a reply approves them. */}
+							<CheckRow
+								name="Hold update merges"
+								desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
+								checked={st.holdUpdateMerges}
+								save={(v) => send({ holdUpdateMerges: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Retro"
+								desc="After each done task the supervisor proposes follow-up cards from its retro"
+								checked={st.retroSince !== null}
+								save={(v) => send({ retro: v })}
+								act={act}
+							/>
+							<CheckRow
+								sub
+								name="Friction filter"
+								desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
+								checked={st.retroFilter}
+								disabled={st.retroSince === null}
+								save={(v) => send({ retroFilter: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Fork research"
+								desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
+								tag={privateTag}
+								checked={st.forkResearch}
+								save={(v) => send({ forkResearch: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Trending scout"
+								desc="Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+								checked={st.trendingScout}
+								save={(v) => send({ trendingScout: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="PR reviews"
+								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+								tag={privateTag}
+								checked={st.prReviews}
+								disabled={project.github === null && !st.prReviews}
+								save={(v) => send({ prReviews: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="PR mode"
+								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
+								checked={st.prMode}
+								disabled={project.github === null && !st.prMode}
+								save={(v) => send({ prMode: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Issue watch"
+								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+								tag={privateTag}
+								checked={st.issueWatch}
+								disabled={project.github === null && !st.issueWatch}
+								save={(v) => send({ issueWatch: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Run work turns in microVMs"
+								desc={`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${st.microVm ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`}
+								checked={st.microVm}
+								disabled={!project.vmRunner.ok && !st.microVm}
+								save={(v) => send({ microVm: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="Push sync commits"
+								desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
+								checked={st.pushSyncCommits}
+								save={(v) => send({ pushSyncCommits: v })}
+								act={act}
+							/>
+						</div>
+					</SettingsCard>
+				)}
 			</section>
 			{setupOpen && (
 				<SetupWizardModal

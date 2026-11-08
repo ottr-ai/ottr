@@ -1,5 +1,6 @@
 // Shared contract for omp-task-tracker. Every module imports its types from here.
 
+import type { TokenUsage } from "./hosted.ts";
 import type { DeadSignIn } from "./login.ts";
 import type { VmRunnerHealth } from "./vmState.ts";
 import type { VmOutcome } from "./workers.ts";
@@ -581,6 +582,9 @@ export interface RunResult {
 	/** The microVM's end state of the task branch (head it pushed, dirty files); present only
 	 * for a turn that ran in a microVM and reported its sentinel. */
 	vm?: VmOutcome;
+	/** Tokens and cost summed over the run's assistant messages (hosted metering); absent while
+	 * omp reported none. */
+	usage?: TokenUsage;
 }
 
 /** Git checks the tracker runs in the worktree after a turn. */
@@ -1024,6 +1028,8 @@ export interface StateResponse {
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */
 	quota: QuotaState | null;
+	/** Hosted mode (docs/specs/hosted-mode.md): the UI hides host-level panels and identity surfaces. Absent or false on every self-hosted board. */
+	hosted?: boolean;
 	/** True until the single admin exists (/api/setup); the UI shows the setup dialog then. */
 	onboarding: boolean;
 	/** Admin name for the top-bar user chip; null until /api/setup. */

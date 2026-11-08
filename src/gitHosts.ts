@@ -14,7 +14,8 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { configuredGithubHostname, defaultGitUsername } from "./githubHost.ts";
-import { git, redact } from "./worktree.ts";
+import type { HostedHooks, GitToken as MintedToken } from "./hosted.ts";
+import { git, type HostedGitAuth, redact } from "./worktree.ts";
 
 export const GIT_URL_ERROR =
 	"url must be a git repository URL (https://…, git@host:…, ssh://…)";
@@ -565,6 +566,160 @@ export function gitAuthEnv(o: {
 				? `ssh -F /dev/null ${strict}`
 				: "ssh -F /dev/null -o BatchMode=yes";
 	return env;
+}
+
+/** A minted token is fetched again this long before its expiresAt (docs/specs/hosted-mode.md section 6). */
+export const HOSTED_TOKEN_MARGIN_MS = 5 * 60_000;
+/** Minted tokens one project keeps for redaction; the oldest ones expired long ago. */
+const HOSTED_SECRETS_KEPT = 32;
+
+/**
+ * The repository a network git call names: the first git URL after the subcommand. A call
+ * without any positional argument uses the project's pinned origin. A local path or a
+ * remote name gives null: it carries no hosted credential.
+ */
+function hostedRemote(
+	args: readonly string[],
+	originUrl: string | null,
+): string | null {
+	let at = 0;
+	while (at < args.length) {
+		const a = args[at] as string;
+		if (a === "-c") {
+			at += 2;
+			continue;
+		}
+		if (!a.startsWith("-")) break;
+		at++;
+	}
+	let positional = false;
+	let dashdash = false;
+	for (const a of args.slice(at + 1)) {
+		if (!dashdash && a === "--") {
+			dashdash = true;
+			continue;
+		}
+		if (!dashdash && a.startsWith("-")) continue;
+		positional = true;
+		if (!("error" in parseGitUrl(a))) return a;
+	}
+	return positional ? null : originUrl;
+}
+
+/**
+ * Hosted mode's network git credential (docs/specs/hosted-mode.md section 6): the token the
+ * control plane mints for the project that owns cwd and the https remote the call names.
+ * Each (project, remote) token is cached until HOSTED_TOKEN_MARGIN_MS before its expiresAt,
+ * and concurrent misses share one hook call. The board-global host tokens, the server ssh
+ * key, the ambient credential helpers and GH_TOKEN never take part. A hook error or a null
+ * token runs the call without a credential, so git fails auth the normal way. The redaction
+ * list of a call holds the tokens minted for its own project only.
+ */
+export function createHostedGitAuth(o: {
+	gitToken: HostedHooks["gitToken"];
+	/** The project that owns cwd and its pinned origin; null when no project does. */
+	projectFor: (
+		cwd: string,
+	) => { name: string; originUrl: string | null } | null;
+	knownHosts: string;
+	log: (scope: string, err: unknown) => void;
+	now?: () => number;
+}): HostedGitAuth {
+	const now = o.now ?? Date.now;
+	const cache = new Map<string, MintedToken>();
+	const pending = new Map<string, Promise<string | null>>();
+	const minted = new Map<string, Set<string>>();
+	const remember = (project: string, token: string): void => {
+		let set = minted.get(project);
+		if (set === undefined) {
+			set = new Set();
+			minted.set(project, set);
+		}
+		set.delete(token);
+		set.add(token);
+		for (const old of set) {
+			if (set.size <= HOSTED_SECRETS_KEPT) break;
+			set.delete(old);
+		}
+	};
+	const mint = async (
+		project: string,
+		remote: string,
+		key: string,
+	): Promise<string | null> => {
+		try {
+			const t = await o.gitToken(project, remote);
+			if (t === null) {
+				cache.delete(key);
+				return null;
+			}
+			remember(project, t.token);
+			cache.set(key, t);
+			return t.token;
+		} catch (err) {
+			cache.delete(key);
+			o.log(`hosted git token for ${project}`, err);
+			return null;
+		}
+	};
+	const token = (project: string, remote: string): Promise<string | null> => {
+		const key = `${project}\n${remote}`;
+		const hit = cache.get(key);
+		if (hit !== undefined && now() < hit.expiresAt - HOSTED_TOKEN_MARGIN_MS)
+			return Promise.resolve(hit.token);
+		let p = pending.get(key);
+		if (p === undefined) {
+			p = mint(project, remote, key).finally(() => pending.delete(key));
+			pending.set(key, p);
+		}
+		return p;
+	};
+	const httpsHost = (remote: string): string | null => {
+		const r = parseGitUrl(remote);
+		return "error" in r || r.scheme !== "https" ? null : r.hostKey;
+	};
+	return {
+		async network(cwd, args) {
+			const p = o.projectFor(cwd);
+			const remote = p === null ? null : hostedRemote(args, p.originUrl);
+			const host = remote === null ? null : httpsHost(remote);
+			const t =
+				p === null || remote === null || host === null
+					? null
+					: await token(p.name, remote);
+			const tokens: GitToken[] =
+				t === null || host === null
+					? []
+					: [
+							{
+								host,
+								username: defaultGitUsername(host, configuredGithubHostname()),
+								token: t,
+							},
+						];
+			return {
+				env: {
+					...gitAuthEnv({
+						tokens,
+						key: null,
+						knownHosts: o.knownHosts,
+						ambientHelpers: [],
+					}),
+					// git() starts from the board's env: blank its global token names, so no
+					// helper or hook of the call can reach them.
+					GH_TOKEN: "",
+					GITHUB_TOKEN: "",
+				},
+				secrets: p === null ? [] : [...(minted.get(p.name) ?? [])],
+			};
+		},
+		async ghToken(cwd, remote) {
+			const p = o.projectFor(cwd);
+			return p === null || httpsHost(remote) === null
+				? null
+				: token(p.name, remote);
+		},
+	};
 }
 
 export const GIT_AUTH_ENV_RE =

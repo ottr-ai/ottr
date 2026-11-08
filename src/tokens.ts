@@ -241,13 +241,17 @@ export async function lentProviderEnv(
 /**
  * A turn's env: the Settings values the project lists, then the lent token on top (a lent name
  * wins over a Settings value of the same name). A lending error stops the turn (fail closed).
- * `secrets` holds the lent values, which the run redacts from its log.
+ * `secrets` holds the lent values, which the run redacts from its log. `lend: false` (hosted
+ * mode, docs/specs/hosted-mode.md section 3) lends no provider token: model access uses API keys.
  */
 export async function turnEnv(
 	project: string,
 	model: string | null | undefined,
 	envValues: Record<string, string>,
-	opts: Parameters<typeof lentProviderEnv>[1] & { home?: string } = {},
+	opts: Parameters<typeof lentProviderEnv>[1] & {
+		home?: string;
+		lend?: boolean;
+	} = {},
 ): Promise<{
 	env: Record<string, string>;
 	missing: string[];
@@ -257,7 +261,10 @@ export async function turnEnv(
 	secrets: string[];
 }> {
 	const base = turnEnvValues(project, envValues, opts.home);
-	const lent = await lentProviderEnv(model, opts);
+	const lent: Lent =
+		opts.lend === false
+			? { env: {}, error: null }
+			: await lentProviderEnv(model, opts);
 	return {
 		env: { ...base.env, ...lent.env },
 		missing: base.missing,

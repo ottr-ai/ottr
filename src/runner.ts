@@ -7,6 +7,7 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import type { TokenUsage } from "./hosted.ts";
 import {
 	addLayerUse,
 	pinnedAgentLayer,
@@ -729,6 +730,8 @@ export interface EventState {
 	} | null;
 	/** Every valid `propose_task` call, in order: a retro records at most one, a review one per finding. */
 	recorded: RecordedFinding[];
+	/** Token usage summed over the assistant message_end events; null until one carried usage. */
+	usage: TokenUsage | null;
 }
 
 export function newEventState(): EventState {
@@ -744,6 +747,7 @@ export function newEventState(): EventState {
 		asked: null,
 		proposed: null,
 		recorded: [],
+		usage: null,
 	};
 }
 
@@ -785,8 +789,10 @@ export function applyEvent(
 			typeof m === "object" &&
 			m !== null &&
 			(m as AnyRec).role === "assistant"
-		)
+		) {
 			state.providerError = providerError(m as AnyRec);
+			addUsage(state, (m as AnyRec).usage);
+		}
 		return {};
 	}
 	if (
@@ -913,6 +919,35 @@ export function applyEvent(
 		state.finalText = lastAssistant ? textParts(lastAssistant.content) : "";
 	}
 	return {};
+}
+
+/** A token count or cost omp reported; anything missing, negative or not finite counts 0. */
+function usageNumber(v: unknown): number {
+	return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+/** Adds one assistant message's omp `usage` ({input, output, cacheRead, cacheWrite, cost: {total}}). */
+function addUsage(state: EventState, raw: unknown): void {
+	if (typeof raw !== "object" || raw === null) return;
+	const u = raw as AnyRec;
+	const cost =
+		typeof u.cost === "object" && u.cost !== null
+			? usageNumber((u.cost as AnyRec).total)
+			: 0;
+	const sum = state.usage ?? {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cost: 0,
+	};
+	state.usage = {
+		input: sum.input + usageNumber(u.input),
+		output: sum.output + usageNumber(u.output),
+		cacheRead: sum.cacheRead + usageNumber(u.cacheRead),
+		cacheWrite: sum.cacheWrite + usageNumber(u.cacheWrite),
+		cost: sum.cost + cost,
+	};
 }
 
 interface RunHandle {
@@ -1103,6 +1138,8 @@ export function createRunSink(o: {
 				// Patterns miss secrets with no known shape: also strip the values Ottr holds.
 				providerError:
 					es.providerError && redact(es.providerError, liveSecrets()),
+				// Only once omp reported usage: a run without it keeps the result shape it had.
+				...(es.usage !== null ? { usage: { ...es.usage } } : {}),
 				...r,
 				// After the spread: a caller's raw tail (a worker's sentinel) is redacted too.
 				stderrTail: redact(r.stderrTail, liveSecrets()),

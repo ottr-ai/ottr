@@ -9,6 +9,7 @@ import type {
 import {
 	Fragment,
 	useCallback,
+	useContext,
 	useEffect,
 	useId,
 	useLayoutEffect,
@@ -180,6 +181,8 @@ import {
 	asTrust,
 	type GitHostsView,
 	gitReq,
+	HostedContext,
+	hostedHidden,
 	openSettingsSection,
 	type PendingKeyInfo,
 	PendingKeyRow,
@@ -934,12 +937,15 @@ function SystemBar({
 	maxTotal,
 	quota,
 	navigate,
+	hosted,
 }: {
 	tasks: TaskCard[];
 	maxTotal: number | null;
 	quota: QuotaState | null;
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
+	/** Hosted mode has no System view, so no warning link. */
+	hosted: boolean;
 }) {
 	const system = useSystem();
 	const catalog = useModels();
@@ -967,8 +973,12 @@ function SystemBar({
 				type="button"
 				className="meters"
 				popoverTarget="system-detail"
-				aria-label={`${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}. Agent and quota details`}
-				title="Agent and quota details"
+				aria-label={
+					hosted
+						? `${used} running, ${waiting} waiting. Agent details`
+						: `${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}. Agent and quota details`
+				}
+				title={hosted ? "Agent details" : "Agent and quota details"}
 			>
 				<span className="sb-grp">
 					<Mark kind="running" />
@@ -979,23 +989,29 @@ function SystemBar({
 						{waiting > 0 ? `+${waiting} waiting` : "running"}
 					</span>
 				</span>
-				<span className="sb-sep" aria-hidden="true" />
-				<span
-					className="sb-grp"
-					title={
-						tightest === null
-							? undefined
-							: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used${quotaGone === null ? "" : `, ${Math.round(quotaGone)}% of the window gone`}`
-					}
-				>
-					<span className="sb-lbl sb-hide-phone">Quota</span>
-					{tightest !== null && <QuotaTwin limit={tightest} />}
-					<span className="sb-val" data-level={quotaLevel}>
-						{quotaLevel === "high" && <Mark kind="needs" />}
-						{quotaLevel === "crit" && <Mark kind="crit" />}
-						{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
-					</span>
-				</span>
+				{/* Hosted mode: provider quota is the operator's concern, so the bar and the
+				    popover show agents only. */}
+				{!hosted && (
+					<>
+						<span className="sb-sep" aria-hidden="true" />
+						<span
+							className="sb-grp"
+							title={
+								tightest === null
+									? undefined
+									: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used${quotaGone === null ? "" : `, ${Math.round(quotaGone)}% of the window gone`}`
+							}
+						>
+							<span className="sb-lbl sb-hide-phone">Quota</span>
+							{tightest !== null && <QuotaTwin limit={tightest} />}
+							<span className="sb-val" data-level={quotaLevel}>
+								{quotaLevel === "high" && <Mark kind="needs" />}
+								{quotaLevel === "crit" && <Mark kind="crit" />}
+								{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
+							</span>
+						</span>
+					</>
+				)}
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
 				{/* Order by urgency: agents first (big figures, no table to read), quota second.
@@ -1038,103 +1054,105 @@ function SystemBar({
 						)}
 					</div>
 				</section>
-				<section>
-					<h2>Provider quota</h2>
-					{quota === null ? (
-						<p className="caption">Checking omp usage…</p>
-					) : quota.error !== null ? (
-						<p className="caption">omp usage failed: {quota.error}</p>
-					) : quota.limits.length === 0 ? (
-						<p className="caption">
-							omp reports no usage limits for your accounts.
-						</p>
-					) : (
-						<>
-							{/* One row per window: a thin time line over the quota bar, so a quota bar
-							    longer than its time line means the window burns faster than it runs. */}
-							<div className="qt">
-								<div className="qt-head" aria-hidden="true">
-									<span />
-									<span className="qt-key">
-										<span>
-											<span className="qt-time">
-												<i />
-											</span>
-											time
-										</span>
-										<span>
-											<span className="qt-used">
-												<i />
-											</span>
-											quota
-										</span>
-									</span>
-									<span className="qt-num">used</span>
-									<span className="qt-num">resets</span>
-								</div>
-								{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
-									([provider, limits]) => (
-										<Fragment key={provider}>
-											<h3>{provider}</h3>
-											{limits.map((l) => {
-												const gone = windowGone(l, Date.now());
-												return (
-													<div
-														key={l.label}
-														className="qt-row"
-														data-level={loadLevel(l.usedPct)}
-													>
-														<span className="qt-label" title={l.label}>
-															{l.label}
-														</span>
-														<span
-															className="qt-bars"
-															role="img"
-															aria-label={`${Math.round(l.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
-														>
-															{gone !== null && (
-																<span className="qt-time">
-																	<i style={{ width: `${gone}%` }} />
-																</span>
-															)}
-															<span className="qt-used">
-																<i
-																	style={{
-																		transform: `scaleX(${clamp(l.usedPct, 0, 100) / 100})`,
-																	}}
-																/>
-															</span>
-														</span>
-														<span className="qt-val">
-															{Math.round(l.usedPct)} %
-														</span>
-														<span
-															className="qt-reset"
-															title={
-																l.resetsAt === null
-																	? undefined
-																	: `Resets ${stamp(l.resetsAt)}`
-															}
-														>
-															{l.resetsAt === null ? "–" : until(l.resetsAt)}
-														</span>
-													</div>
-												);
-											})}
-										</Fragment>
-									),
-								)}
-							</div>
+				{!hosted && (
+					<section>
+						<h2>Provider quota</h2>
+						{quota === null ? (
+							<p className="caption">Checking omp usage…</p>
+						) : quota.error !== null ? (
+							<p className="caption">omp usage failed: {quota.error}</p>
+						) : quota.limits.length === 0 ? (
 							<p className="caption">
-								Checked {age(quota.at)}. Amber from {BAND_LIMIT} % used.
+								omp reports no usage limits for your accounts.
 							</p>
-						</>
-					)}
-				</section>
+						) : (
+							<>
+								{/* One row per window: a thin time line over the quota bar, so a quota bar
+							    longer than its time line means the window burns faster than it runs. */}
+								<div className="qt">
+									<div className="qt-head" aria-hidden="true">
+										<span />
+										<span className="qt-key">
+											<span>
+												<span className="qt-time">
+													<i />
+												</span>
+												time
+											</span>
+											<span>
+												<span className="qt-used">
+													<i />
+												</span>
+												quota
+											</span>
+										</span>
+										<span className="qt-num">used</span>
+										<span className="qt-num">resets</span>
+									</div>
+									{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
+										([provider, limits]) => (
+											<Fragment key={provider}>
+												<h3>{provider}</h3>
+												{limits.map((l) => {
+													const gone = windowGone(l, Date.now());
+													return (
+														<div
+															key={l.label}
+															className="qt-row"
+															data-level={loadLevel(l.usedPct)}
+														>
+															<span className="qt-label" title={l.label}>
+																{l.label}
+															</span>
+															<span
+																className="qt-bars"
+																role="img"
+																aria-label={`${Math.round(l.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
+															>
+																{gone !== null && (
+																	<span className="qt-time">
+																		<i style={{ width: `${gone}%` }} />
+																	</span>
+																)}
+																<span className="qt-used">
+																	<i
+																		style={{
+																			transform: `scaleX(${clamp(l.usedPct, 0, 100) / 100})`,
+																		}}
+																	/>
+																</span>
+															</span>
+															<span className="qt-val">
+																{Math.round(l.usedPct)} %
+															</span>
+															<span
+																className="qt-reset"
+																title={
+																	l.resetsAt === null
+																		? undefined
+																		: `Resets ${stamp(l.resetsAt)}`
+																}
+															>
+																{l.resetsAt === null ? "–" : until(l.resetsAt)}
+															</span>
+														</div>
+													);
+												})}
+											</Fragment>
+										),
+									)}
+								</div>
+								<p className="caption">
+									Checked {age(quota.at)}. Amber from {BAND_LIMIT} % used.
+								</p>
+							</>
+						)}
+					</section>
+				)}
 			</div>
 			{/* Outside the meters button: a link cannot nest in a button. Rendered only while a
 			    container warns, so the bar stays grey at rest. */}
-			{warned !== "" && (
+			{warned !== "" && !hosted && (
 				<a
 					className="sb-warn"
 					href={viewPath(SYSTEM_VIEW)}
@@ -3335,6 +3353,7 @@ export function ProjectBoard({
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 }) {
+	const hosted = useContext(HostedContext);
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
 	// A stalled release card's action: cancel the release, then open Create release so the user
@@ -3682,23 +3701,24 @@ export function ProjectBoard({
 					<BusyButton run={pushMain}>Push to origin</BusyButton>
 				</p>
 			)}
-			{project.githubHostNotice && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					<span>
-						GitHub features off: set GitHub host to{" "}
-						<code>{project.githubHostNotice}</code> under{" "}
-						<button
-							type="button"
-							className="notif-link"
-							onClick={() => openSettingsSection("github-host-block")}
-						>
-							Settings → Git hosts → GitHub host
-						</button>
-						.
-					</span>
-				</p>
-			)}
+			{project.githubHostNotice &&
+				!hostedHidden(hosted, "github-host-block") && (
+					<p className="advisory">
+						<Icon name="info" size={14} />
+						<span>
+							GitHub features off: set GitHub host to{" "}
+							<code>{project.githubHostNotice}</code> under{" "}
+							<button
+								type="button"
+								className="notif-link"
+								onClick={() => openSettingsSection("github-host-block")}
+							>
+								Settings → Git hosts → GitHub host
+							</button>
+							.
+						</span>
+					</p>
+				)}
 			{!project.hasRules && (
 				<p className="advisory">
 					<Icon name="info" size={14} />
@@ -4126,11 +4146,19 @@ export function Overview({
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 }) {
+	const hosted = useContext(HostedContext);
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
-	const prov = useProvisioning();
+	// Hosted mode: Alate, provisioning and the workers are the operator's, so the Setup tab
+	// (the Provisioning panel only) is gone, and no probe runs.
+	const prov = useProvisioning(!hosted);
 	// Tabs: Now (what waits on you, the live projects), Performance and Setup.
-	const [tab, setTab] = useState<OverviewTab>("now");
+	const [picked, setTab] = useState<OverviewTab>("now");
+	const tabs: readonly OverviewTab[] = hosted
+		? OVERVIEW_TABS.filter((t) => t !== "setup")
+		: OVERVIEW_TABS;
+	// A selection of a tab that hosted mode hides falls back to Now.
+	const tab = tabs.includes(picked) ? picked : "now";
 	if (projects.length === 0) {
 		return (
 			<section className="empty">
@@ -4333,7 +4361,8 @@ export function Overview({
 			</div>
 		</>
 	);
-	const setup = setupHints(prov.data, prov.err);
+	// Every setup row opens the Alate card, which hosted mode hides with the Setup tab.
+	const setup = hosted ? [] : setupHints(prov.data, prov.err);
 	const { needs, asks } = splitAlarms(tasks);
 	const turn = needs.length + asks.length;
 	const tabProps = (key: OverviewTab) => ({
@@ -4346,7 +4375,7 @@ export function Overview({
 		"data-tab": key,
 		onClick: () => setTab(key),
 		onKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) =>
-			switchTab(e, OVERVIEW_TABS, setTab),
+			switchTab(e, tabs, setTab),
 	});
 	const panelProps = (key: OverviewTab) => ({
 		role: "tabpanel",
@@ -4370,18 +4399,20 @@ export function Overview({
 				<button {...tabProps("perf")}>Performance</button>
 				{/* No agent server blocks every worker's provisioning: the tab says so in amber,
 				    like the Setup panel's callout; other setup hints keep the grey mark. */}
-				<button
-					{...tabProps("setup")}
-					data-alarm={prov.data?.server === null ? "" : undefined}
-				>
-					Setup
-					{setup.length > 0 && (
-						<>
-							<Mark kind={prov.data?.server === null ? "needs" : "warn"} />
-							<span className="sr"> needs attention</span>
-						</>
-					)}
-				</button>
+				{tabs.includes("setup") && (
+					<button
+						{...tabProps("setup")}
+						data-alarm={prov.data?.server === null ? "" : undefined}
+					>
+						Setup
+						{setup.length > 0 && (
+							<>
+								<Mark kind={prov.data?.server === null ? "needs" : "warn"} />
+								<span className="sr"> needs attention</span>
+							</>
+						)}
+					</button>
+				)}
 			</div>
 			<div {...panelProps("now")}>
 				<Triage
@@ -4394,9 +4425,11 @@ export function Overview({
 				{projectsNow}
 			</div>
 			<div {...panelProps("perf")}>{performance}</div>
-			<div {...panelProps("setup")}>
-				<Provisioning data={prov.data} err={prov.err} />
-			</div>
+			{tabs.includes("setup") && (
+				<div {...panelProps("setup")}>
+					<Provisioning data={prov.data} err={prov.err} />
+				</div>
+			)}
 		</section>
 	);
 }
@@ -4449,14 +4482,16 @@ export function setupHints(
 }
 
 /** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must not ride
- *  the 1 s state push). The Overview reads it once for both Your turn and the Setup section. */
-function useProvisioning(): {
+ *  the 1 s state push). The Overview reads it once for both Your turn and the Setup section.
+ *  Off while `enabled` is false: hosted mode has no Setup tab. */
+function useProvisioning(enabled: boolean): {
 	data: ProvisioningResponse | null;
 	err: string | null;
 } {
 	const [data, setData] = useState<ProvisioningResponse | null>(null);
 	const [err, setErr] = useState<string | null>(null);
 	useEffect(() => {
+		if (!enabled) return;
 		let alive = true;
 		const load = () => {
 			setErr(null); // a later successful load clears an earlier failure
@@ -4475,7 +4510,7 @@ function useProvisioning(): {
 			alive = false;
 			clearInterval(t);
 		};
-	}, []);
+	}, [enabled]);
 	return { data, err };
 }
 
@@ -6092,6 +6127,7 @@ export function AddProjectModal({
 	onClose: () => void;
 	onAdded: (interview: string) => void;
 }) {
+	const hosted = useContext(HostedContext);
 	const [mode, setMode] = useState<"url" | "new">("url");
 	const [url, setUrl] = useState("");
 	const [name, setName] = useState("");
@@ -6503,19 +6539,29 @@ export function AddProjectModal({
 									</p>
 								) : (
 									<p className="hint trust-warn" role="status">
-										No Git host is signed in, so Ottr cannot create the repo.
-										Add a token in Settings → Git hosts, or uncheck the box for
-										a local repo only.{" "}
-										<button
-											type="button"
-											className="notif-link"
-											onClick={() => {
-												onClose();
-												openSettingsSection("github-token-block");
-											}}
-										>
-											Open settings
-										</button>
+										{/* Hosted mode hides the Git hosts card: the control plane owns git credentials. */}
+										{hostedHidden(hosted, "github-token-block") ? (
+											<>
+												No Git host is signed in, so Ottr cannot create the
+												repo. Uncheck the box for a local repo only.
+											</>
+										) : (
+											<>
+												No Git host is signed in, so Ottr cannot create the
+												repo. Add a token in Settings → Git hosts, or uncheck
+												the box for a local repo only.{" "}
+												<button
+													type="button"
+													className="notif-link"
+													onClick={() => {
+														onClose();
+														openSettingsSection("github-token-block");
+													}}
+												>
+													Open settings
+												</button>
+											</>
+										)}
 									</p>
 								))}
 							{!ghRepo && gh !== null && (
@@ -10702,6 +10748,7 @@ function RailRows({
 	project,
 	overviewCurrent,
 	systemCurrent,
+	hosted,
 	version,
 	collapsed,
 	navigate,
@@ -10719,6 +10766,8 @@ function RailRows({
 	overviewCurrent: boolean;
 	/** The System view is the open page. */
 	systemCurrent: boolean;
+	/** Hosted mode: no System row (docs/specs/hosted-mode.md). */
+	hosted: boolean;
 	version: string | null;
 	/** Folded desktop rail: the rows show only their plates, so each one gets a title tooltip. */
 	collapsed: boolean;
@@ -10748,18 +10797,20 @@ function RailRows({
 				</span>
 				<span className="area-name rail-label">Overview</span>
 			</a>
-			<a
-				className="area"
-				aria-current={systemCurrent ? "page" : undefined}
-				href={viewPath(SYSTEM_VIEW)}
-				onClick={go}
-				title={collapsed ? "System" : undefined}
-			>
-				<span className="rail-plate icon">
-					<Icon name="activity" size={13} />
-				</span>
-				<span className="area-name rail-label">System</span>
-			</a>
+			{!hosted && (
+				<a
+					className="area"
+					aria-current={systemCurrent ? "page" : undefined}
+					href={viewPath(SYSTEM_VIEW)}
+					onClick={go}
+					title={collapsed ? "System" : undefined}
+				>
+					<span className="rail-plate icon">
+						<Icon name="activity" size={13} />
+					</span>
+					<span className="area-name rail-label">System</span>
+				</a>
+			)}
 			<button
 				type="button"
 				className="area area-add"
@@ -10888,8 +10939,8 @@ function settingsPhraseId(phrase: string): string {
  * `Settings <sep> <label>` phrase opens that General settings section in-tab (a
  * chain like `Settings → Git hosts → GitHub token` anchors the whole phrase to
  * the deepest step). A trailing sentence period stays outside the anchor so the
- * href stays valid. */
-export function warningLinks(text: string): ReactNode {
+ * href stays valid. In hosted mode a phrase that names a hidden card stays plain text. */
+export function warningLinks(text: string, hosted = false): ReactNode {
 	const out: ReactNode[] = [];
 	let last = 0;
 	for (const m of text.matchAll(WARNING_LINK_RE)) {
@@ -10914,19 +10965,21 @@ export function warningLinks(text: string): ReactNode {
 			);
 		} else {
 			const id = settingsPhraseId(phrase);
-			out.push(
-				<a
-					key={out.length}
-					className="notif-link"
-					href={`${settingsPath(null)}#${id}`}
-					onClick={(e) => {
-						e.preventDefault();
-						openSettingsSection(id);
-					}}
-				>
-					{phrase}
-				</a>,
-			);
+			if (hostedHidden(hosted, id)) out.push(phrase);
+			else
+				out.push(
+					<a
+						key={out.length}
+						className="notif-link"
+						href={`${settingsPath(null)}#${id}`}
+						onClick={(e) => {
+							e.preventDefault();
+							openSettingsSection(id);
+						}}
+					>
+						{phrase}
+					</a>,
+				);
 		}
 		last = index + m[0].length;
 	}
@@ -10937,13 +10990,14 @@ export function warningLinks(text: string): ReactNode {
 /** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
  * No dismiss: state recomputes per poll, so a fixed condition drops its own line. */
 export function WarningLines({ warnings }: { warnings: string[] }) {
+	const hosted = useContext(HostedContext);
 	if (warnings.length === 0) return null;
 	return (
 		<>
 			{warnings.map((w, i) => (
 				<p className="notif-line" role="note" key={`warn:${i}`}>
 					<Mark kind="warn" />
-					<span>{warningLinks(w)}</span>
+					<span>{warningLinks(w, hosted)}</span>
 				</p>
 			))}
 		</>
@@ -11142,6 +11196,8 @@ export function App() {
 	/** "setup" until the admin exists, "login" when a public host demands credentials or the user logged out; null otherwise. */
 	const [gate, setGate] = useState<"setup" | "login" | null>(null);
 	const [bootVersion, setBootVersion] = useState<string | null>(null);
+	/** Hosted mode from /api/boot, known before the first state frame (docs/specs/hosted-mode.md). */
+	const [bootHosted, setBootHosted] = useState(false);
 	// The desktop rail folds to its icons; the choice survives reloads.
 	const [railCollapsed, setRailCollapsed] = useState(
 		() => localStorage.getItem("ottr.rail.collapsed") === "1",
@@ -11174,12 +11230,15 @@ export function App() {
 						onboarding: boolean;
 						version: string;
 						live: boolean;
+						hosted?: boolean;
 					}>,
 			)
 			.then((b) => {
 				setBootVersion(b.version);
 				setLive(b.live);
-				if (b.onboarding) setGate("setup");
+				// Hosted mode: the proxy owns identity, so the board shows no setup or login page.
+				if (b.hosted === true) setBootHosted(true);
+				else if (b.onboarding) setGate("setup");
 				else if (localStorage.getItem(LOGOUT_KEY) !== null) setGate("login");
 				else
 					void fetch("/api/state").then((r) => {
@@ -11490,9 +11549,12 @@ export function App() {
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
 	// switch once Ottr ships releases.
 	const checkProject = mapRepo("ottr-ai/ottr", projects);
+	// Hosted mode (docs/specs/hosted-mode.md): the control plane owns the host, so the System
+	// view, the update notices and the identity pages stay hidden.
+	const hosted = bootHosted || state?.hosted === true;
 	// The System view's view string shares the namespace of project names, like "settings":
-	// on /system no project is current.
-	const onSystem = view === SYSTEM_VIEW;
+	// on /system no project is current. Hosted mode has no System view: /system is a plain view.
+	const onSystem = !hosted && view === SYSTEM_VIEW;
 	const project = onSystem
 		? null
 		: (projects.find((p) => p.name === view) ?? null);
@@ -11572,14 +11634,14 @@ export function App() {
 
 	// Shared notification lines: the inbox panel renders the same content the
 	// entries are keyed from, so rows and keys cannot drift apart.
-	const behind = update === null ? 0 : Math.max(update.behind, 0);
+	const behind = hosted || update === null ? 0 : Math.max(update.behind, 0);
 	const behindCommits = update === null ? [] : update.commits;
 	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
 	const draining = (state?.drainUntil ?? null) !== null;
 	const drainCommits = state?.drainCommits ?? [];
 	// OTTR-625: the update task holds the restart until the running turns finish, because
 	// the board runs an older commit than the image it built.
-	const restartWait = state?.restartWait ?? null;
+	const restartWait = hosted ? null : (state?.restartWait ?? null);
 	// Advisory from the server: unseeded agent layer, provider without an active sign-in.
 	const warnings = state?.warnings ?? [];
 	const orphanList = state?.orphans ?? [];
@@ -11589,7 +11651,9 @@ export function App() {
 	// long body (an error text, an id list), so no key outgrows the seen route's limit.
 	const critKey = error !== null ? shortKey("crit", error) : null;
 	const noticeKey = notice !== null ? shortKey("notice", notice) : null;
-	const drainKey = draining ? `drain:${state?.drainUntil}` : null;
+	// Cards still name the hold in their status line; hosted mode drops only the inbox notice.
+	const drainNotice = draining && !hosted;
+	const drainKey = drainNotice ? `drain:${state?.drainUntil}` : null;
 	const behindKey = behind > 0 ? `behind:${behind}` : null;
 	// `since` in the key: a new wait (a later image) counts as new again.
 	const restartWaitKey =
@@ -11671,7 +11735,7 @@ export function App() {
 					))
 			: null;
 	const infoLines =
-		notice !== null || behind > 0 || draining || restartWait !== null ? (
+		notice !== null || behind > 0 || drainNotice || restartWait !== null ? (
 			<>
 				{notice !== null && (
 					<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
@@ -11690,7 +11754,7 @@ export function App() {
 						</button>
 					</p>
 				)}
-				{draining && (
+				{drainNotice && (
 					<>
 						<p className="notif-line" data-inbox-key={drainKey ?? undefined}>
 							<Icon name="info" size={16} />
@@ -11744,11 +11808,11 @@ export function App() {
 	// that has waited too long. The tracker reports them; it never kills processes, deletes
 	// worktrees, or runs provisioning on its own.
 	const nowMs = Date.now();
-	const alatePendingKey = alatePendingEntry(
-		state?.alatePendingSince ?? null,
-		nowMs,
-	);
-	const signinAdvisories = state?.deadSignIns ?? [];
+	// Hosted mode: Alate and provider sign-ins are the operator's, so neither notice shows.
+	const alatePendingKey = hosted
+		? null
+		: alatePendingEntry(state?.alatePendingSince ?? null, nowMs);
+	const signinAdvisories = hosted ? [] : (state?.deadSignIns ?? []);
 	const advisoryLines =
 		state === null ||
 		(orphanList.length === 0 &&
@@ -11948,11 +12012,13 @@ export function App() {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [project, draftFor, composeFor, selectedId, showAdd]);
 
-	// The gate is a full page, not an overlay: no board renders behind it.
-	if (gate !== null) return <AuthPage mode={gate} version={bootVersion} />;
+	// The gate is a full page, not an overlay: no board renders behind it. Hosted mode has no
+	// login page: the proxy owns identity, so a lost session leaves the offline banner only.
+	if (gate !== null && !hosted)
+		return <AuthPage mode={gate} version={bootVersion} />;
 
 	return (
-		<>
+		<HostedContext.Provider value={hosted}>
 			<header className="bar">
 				<button
 					type="button"
@@ -11976,6 +12042,7 @@ export function App() {
 						project={project}
 						overviewCurrent={overviewCurrent}
 						systemCurrent={onSystem}
+						hosted={hosted}
 						version={bootVersion}
 						collapsed={false}
 						navigate={navigate}
@@ -12006,6 +12073,7 @@ export function App() {
 						maxTotal={state.maxTotal}
 						quota={state.quota}
 						navigate={navigate}
+						hosted={hosted}
 					/>
 				)}
 				{checkProject !== null && (
@@ -12188,6 +12256,7 @@ export function App() {
 						project={project}
 						overviewCurrent={overviewCurrent}
 						systemCurrent={onSystem}
+						hosted={hosted}
 						version={bootVersion}
 						collapsed={railCollapsed}
 						navigate={navigate}
@@ -12213,11 +12282,13 @@ export function App() {
 					</RailRows>
 				</nav>
 				<div id="user-menu" popover="auto" className="user-menu">
-					<p className="menu-who">
-						{state?.user == null
-							? "Local access, no login"
-							: `Signed in as ${state.user}`}
-					</p>
+					{!hosted && (
+						<p className="menu-who">
+							{state?.user == null
+								? "Local access, no login"
+								: `Signed in as ${state.user}`}
+						</p>
+					)}
 					<a
 						className="menu-row"
 						href={settingsPath(null)}
@@ -12249,7 +12320,7 @@ export function App() {
 							</button>
 						))}
 					</fieldset>
-					{state?.user != null && (
+					{state?.user != null && !hosted && (
 						<>
 							<hr />
 							<button
@@ -12281,6 +12352,7 @@ export function App() {
 							act={act}
 							view={view}
 							openTask={openTask}
+							hosted={hosted}
 						/>
 					) : onSystem ? (
 						<SystemView state={state} openTask={openTask} />
@@ -12407,7 +12479,7 @@ export function App() {
 					<span>Server connection lost. Retrying…</span>
 				</div>
 			)}
-		</>
+		</HostedContext.Provider>
 	);
 }
 

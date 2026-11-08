@@ -153,6 +153,29 @@ export function networkGitAuth(cwd: string): Record<string, string> {
 	return networkAuthResolver(cwd);
 }
 
+/** One hosted network git call's auth: the env, and the redaction list of the project that
+ * owns cwd (every token the board minted for it, docs/specs/hosted-mode.md section 6). */
+export interface HostedNetworkAuth {
+	env: Record<string, string>;
+	secrets: readonly string[];
+}
+
+/** Hosted mode's per-project git credential; createHostedGitAuth in gitHosts.ts builds it. */
+export interface HostedGitAuth {
+	network(cwd: string, args: readonly string[]): Promise<HostedNetworkAuth>;
+	/** The token for a gh call of the project that owns cwd; null when there is none. */
+	ghToken(cwd: string, remote: string): Promise<string | null>;
+}
+
+/** Set: network git asks it instead of the resolver above. null on every self-hosted board. */
+let hostedAuth: HostedGitAuth | null = null;
+export function setHostedGitAuth(a: HostedGitAuth | null): void {
+	hostedAuth = a;
+}
+export function hostedGitAuth(): HostedGitAuth | null {
+	return hostedAuth;
+}
+
 /** Deletes every git host credential name in place: GH_TOKEN, GITHUB_TOKEN and the
  * `GIT_AUTH_ENV_NAME` set. Local board git and every worker turn run without them. */
 export function stripGitAuthEnv(env: Record<string, string | undefined>): void {
@@ -236,11 +259,16 @@ export async function git(
 	}
 	const sub = at < 0 ? "" : (args[at] as string);
 	const isNetwork = NETWORK_GIT[sub] === true;
-	const auth = isNetwork ? (authEnv ?? networkGitAuth(cwd)) : {};
+	const hosted =
+		isNetwork && authEnv === undefined && hostedAuth !== null
+			? await hostedAuth.network(cwd, args)
+			: null;
+	const auth = isNetwork ? (authEnv ?? hosted?.env ?? networkGitAuth(cwd)) : {};
 	// The redaction list is fixed at spawn: the stored secrets now, plus the tokens this call
 	// itself carries. A token rotated or removed while the call runs stays redacted in its output.
 	const list = [
 		...secrets,
+		...(hosted?.secrets ?? []),
 		...Object.entries(auth)
 			.filter(([k]) => /^OTTR_GIT_TOKEN_\d+$/.test(k))
 			.map(([, v]) => v),
