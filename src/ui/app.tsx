@@ -2541,7 +2541,7 @@ function NewTaskDialog({
 			heading="New task"
 			sub={<ProjectSub project={project} />}
 			inputLabel="Task"
-			placeholder="Describe the task in plain language"
+			placeholder="Fix the login redirect on Safari"
 			hint="Enter adds the task. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
 			submitLabel="Add task"
@@ -2586,7 +2586,7 @@ function BacklogDialog({
 			heading="Add draft"
 			sub={<ProjectSub project={project} />}
 			inputLabel="Idea"
-			placeholder="Describe the idea in plain language"
+			placeholder="Batch-release on Thursdays"
 			hint="Enter parks the draft in the backlog. Shift+Enter starts a new line. Images: paste, drop or browse. No model pick: a draft runs no agent."
 			icon="send"
 			submitLabel="Add draft"
@@ -2744,8 +2744,8 @@ export function FollowUpDialog({
 			label={`Follow up on ${task.sessionTitle ?? task.title}`}
 			heading="Follow up"
 			sub={task.sessionTitle ?? task.title}
-			inputLabel="Next step"
-			placeholder="Describe the follow-up task…"
+			inputLabel="Follow-up"
+			placeholder="Re-run the failed tests"
 			hint="Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
 			icon="send"
 			submitLabel="Follow up"
@@ -6768,17 +6768,19 @@ export function AskBlock({
 						if (next) customRef.current?.focus();
 					}}
 				/>
-				<input
-					ref={customRef}
-					value={custom}
-					onChange={(e) => {
-						setCustom(e.target.value);
-						if (multi) onDraft(multiText(picked, customOn, e.target.value));
-					}}
-					placeholder="Other — type your own"
-					aria-label="Other answer"
-					disabled={busy}
-				/>
+				<label>
+					<span>Other</span>
+					<input
+						ref={customRef}
+						value={custom}
+						onChange={(e) => {
+							setCustom(e.target.value);
+							if (multi) onDraft(multiText(picked, customOn, e.target.value));
+						}}
+						placeholder="Deploy only the API"
+						disabled={busy}
+					/>
+				</label>
 				<button
 					type="submit"
 					disabled={busy || (multi ? multiRecorded : custom.trim() === "")}
@@ -9731,15 +9733,17 @@ export function Drawer({
 											if (triageReason.trim() !== "") nominateCandidate();
 										}}
 									>
-										<input
-											value={triageReason}
-											maxLength={200}
-											required
-											placeholder="Close candidate: duplicate, superseded…"
-											aria-label="Close candidate reason"
-											disabled={triageSave.busy}
-											onChange={(e) => setTriageReason(e.target.value)}
-										/>
+										<label>
+											<span>Close reason</span>
+											<input
+												value={triageReason}
+												maxLength={200}
+												required
+												placeholder="Duplicate of OTTR-640"
+												disabled={triageSave.busy}
+												onChange={(e) => setTriageReason(e.target.value)}
+											/>
+										</label>
 										<button
 											type="submit"
 											disabled={triageSave.busy || triageReason.trim() === ""}
@@ -9884,7 +9888,7 @@ export function Drawer({
 								<PromptInput
 									label="Reply"
 									value={reply}
-									placeholder="Answer the agent…"
+									placeholder="Yes, but keep the old route"
 									onChange={setReply}
 									onEnter={() => replySend.start(() => sendReply(reply, true))}
 									images={replyImages}
@@ -9982,7 +9986,7 @@ export function Drawer({
 							<PromptInput
 								label="Steer"
 								value={steer}
-								placeholder="Extra guidance the agent gets with its next turn…"
+								placeholder="Also update the changelog"
 								onChange={setSteer}
 								onEnter={() => steerSend.start(() => sendSteer(steer))}
 								images={steerImages}

@@ -3865,6 +3865,19 @@ a.release:hover {
 	flex: 1;
 	min-width: 0;
 }
+/* The visible caption in front of the field, styled like the Rank caption beside it. */
+.triage-nominate > label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+}
+.triage-nominate > label > span {
+	font-size: 13px;
+	color: var(--dim);
+	white-space: nowrap;
+}
 .triage-set {
 	display: inline-flex;
 	flex: 1;
@@ -4196,7 +4209,7 @@ dialog.diff-view {
 /* Deepen sits on the quota line, left under the card, in the row the steer form gives Stop
  turn; its ghost padding puts the pencil in line with the + above. */
 .prompt-card .compose-deepen {
-	grid-row: 4;
+	grid-row: 5;
 	grid-column: 1 / 3;
 	justify-self: start;
 	align-self: center;
@@ -6327,7 +6340,20 @@ a.lineage-row:hover .lineage-title {
 	flex: none;
 	accent-color: var(--accent);
 }
-.ask-custom > input:not(:first-child) {
+/* The visible caption in front of the free-text answer, matching the triage caption. */
+.ask-custom > label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+}
+.ask-custom > label > span {
+	font-size: 13px;
+	color: var(--dim);
+	white-space: nowrap;
+}
+.ask-custom > label > input {
 	flex: 1;
 	min-width: 0;
 }
@@ -6958,12 +6984,14 @@ button.log-mode[aria-pressed="true"] {
    Add draft, Follow up): the field and one tool row share a recessed box, with + at the left and
    the model picker next to the icon-only submit at the right, all 8px from the box walls; the
    quota sits under the box at the right. The wrappers drop out of layout so every control lands
-   on the card's grid; the box is the ::before behind the first three rows, the field goes bare,
-   and focus in it lights the box edge (One-Edge Rule). */
+   on the card's grid; the caption row sits above the box, and the box is the ::before behind
+   the field, attachment and tool rows — the field goes bare, and focus in it lights the box
+   edge (One-Edge Rule). */
 .prompt-card {
 	display: grid;
 	grid-template-columns: auto minmax(0, 1fr) minmax(0, auto) auto;
 	grid-template-areas:
+		"label label label label"
 		"field field field field"
 		"att att att att"
 		"plus . model send"
@@ -6972,7 +7000,7 @@ button.log-mode[aria-pressed="true"] {
 }
 .prompt-card::before {
 	content: "";
-	grid-area: 1 / 1 / 4 / -1;
+	grid-area: 2 / 1 / 5 / -1;
 	background: var(--well);
 	border: 1px solid var(--line);
 	border-radius: 4px;
@@ -6986,14 +7014,11 @@ button.log-mode[aria-pressed="true"] {
 .prompt-card .model-fields .field {
 	display: contents;
 }
-/* The field's caption leaves the screen, not the accessibility tree: it still names the field. */
+/* The caption sits above the box on one left edge (top-aligned labels); the shared
+   .prompt-field > label rule below gives it the small caption style. */
 .prompt-card .prompt-field > label {
-	position: absolute;
-	width: 1px;
-	height: 1px;
-	overflow: hidden;
-	clip-path: inset(50%);
-	white-space: nowrap;
+	grid-area: label;
+	padding: 0 2px 6px;
 }
 .prompt-card .prompt-field > textarea {
 	grid-area: field;
@@ -7027,7 +7052,7 @@ button.log-mode[aria-pressed="true"] {
 }
 .prompt-card > .model-fields .field-head-name {
 	grid-column: 2;
-	grid-row: 3;
+	grid-row: 4;
 	justify-self: end;
 	align-self: center;
 	margin-right: 6px;
@@ -7098,6 +7123,7 @@ button.log-mode[aria-pressed="true"] {
    composer's own grid rules (.composer-actions ...). */
 .drawer-body > .steer-form {
 	grid-template-areas:
+		"label label label label"
 		"field field field field"
 		"att att att att"
 		"plus . model send"
