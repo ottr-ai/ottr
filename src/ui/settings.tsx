@@ -9,6 +9,7 @@ import {
 } from "react";
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
+import type { ModelOption } from "../models.ts";
 import type { AlertClass, ClassPrefs } from "../notifications.ts";
 import type { OmpStatsReport } from "../ompStats.ts";
 import { orderBy } from "../projectOrder.ts";
@@ -52,9 +53,16 @@ import {
 	useQuota,
 } from "./kit.tsx";
 import {
+	ModelMenuBody,
+	ModelMenuTrigger,
+	useModelMenu,
+} from "./model-menu.tsx";
+import {
 	addRoleError,
 	classifyRolesSave,
+	type ModelRow,
 	missingCheckRoles,
+	modelMatches,
 	ownField,
 	type RolesState,
 	rolesDirty,
@@ -3295,8 +3303,73 @@ type ProvisionStep =
 
 const shortSha = (sha: string): string => sha.slice(0, 7);
 
+/** One Model roles row's model picker: the shared search popover over the catalogue.
+    The picker sets the row's base model; the row keeps its own thinking select. */
+function RoleModelPicker({
+	role,
+	base,
+	level,
+	models,
+	setValue,
+	disabled,
+	invalid,
+	describedBy,
+}: {
+	role: string;
+	base: string;
+	level: string;
+	models: readonly ModelOption[];
+	setValue: (name: string, value: string) => void;
+	disabled: boolean;
+	invalid: boolean;
+	describedBy?: string;
+}) {
+	const menu = useModelMenu();
+	const [query, setQuery] = useState("");
+	// The saved value names itself like the old select's option did; a value the
+	// catalogue does not list keeps its selector and the not-in-catalog note.
+	const known = models.find((m) => m.selector === base);
+	const label =
+		known !== undefined
+			? `${known.name} (${known.id})`
+			: `${base} (not in the catalog)`;
+	const filtered = models.filter((m) => modelMatches(m, query));
+	return (
+		<>
+			<ModelMenuTrigger
+				menu={menu}
+				label={`Model for ${role}`}
+				invalid={invalid}
+				describedBy={describedBy}
+				disabled={disabled}
+			>
+				<span className="model-name">{label}</span>
+			</ModelMenuTrigger>
+			<ModelMenuBody
+				menu={menu}
+				query={query}
+				setQuery={setQuery}
+				rows={filtered.map(
+					(m): ModelRow => ({
+						key: m.selector,
+						label: `${m.name} (${m.id})`,
+						selector: m.selector,
+						pressed: m.selector === base,
+					}),
+				)}
+				shown={filtered.length}
+				total={models.length}
+				onPick={(selector) => {
+					setValue(role, joinLevel(selector, level));
+					menu.close();
+				}}
+			/>
+		</>
+	);
+}
+
 /** Settings "Model roles" section: edits omp's modelRoles in the data repo through Alate, then provisions. */
-function ModelRolesSection() {
+export function ModelRolesSection() {
 	const catalog = useModels();
 	const [state, setState] = useState<RolesState | null>(null);
 	const [loadErr, setLoadErr] = useState<string | null>(null);
@@ -3521,25 +3594,16 @@ function ModelRolesSection() {
 							return (
 								<div className="alate-def-row role-row" key={name}>
 									<b className="role-name">{name}</b>
-									<select
-										value={base}
-										onChange={(e) =>
-											setValue(name, joinLevel(e.target.value, level))
-										}
-										aria-label={`Model for ${name}`}
-										aria-invalid={field !== undefined}
-										aria-describedby={notesId}
+									<RoleModelPicker
+										role={name}
+										base={base}
+										level={level}
+										models={models}
+										setValue={setValue}
 										disabled={save.busy || ro !== null}
-									>
-										{!models.some((m) => m.selector === base) && (
-											<option value={base}>{base} (not in the catalog)</option>
-										)}
-										{models.map((m) => (
-											<option key={m.selector} value={m.selector}>
-												{m.name} ({m.id})
-											</option>
-										))}
-									</select>
+										invalid={field !== undefined}
+										describedBy={notesId}
+									/>
 									<select
 										value={level}
 										onChange={(e) =>

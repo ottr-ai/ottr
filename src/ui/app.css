@@ -1107,13 +1107,13 @@ textarea {
 	color: var(--dim);
 }
 @supports (position-anchor: --a) {
-	.model-trigger {
-		anchor-name: --model-trigger;
-	}
-	/* Below the trigger by default; near the bottom edge (the docked drawer composer) it flips
-	   above, so the menu never runs out of the viewport. */
+	/* The anchor names themselves are per-instance, set inline by the ModelMenu
+	   components and ModelField: a page can hold several model menus (one per role
+	   row, one per dialog), and one shared anchor name would anchor every popover
+	   to the document's last trigger. Below the trigger by default; near the bottom
+	   edge (the docked drawer composer) it flips above, so the menu never runs out
+	   of the viewport. */
 	.model-pop {
-		position-anchor: --model-trigger;
 		position-area: bottom span-right;
 		position-try-fallbacks:
 			flip-block,
@@ -1121,13 +1121,9 @@ textarea {
 			flip-block flip-inline;
 		margin: 4px 0;
 	}
-	.level-row {
-		anchor-name: --level-row;
-	}
 	/* Beside the Thinking row, its top level with the row (Claude's effort submenu); without room
 	   at either side (phones) it opens above the row, over the model list. */
 	.level-pop {
-		position-anchor: --level-row;
 		position-area: right span-bottom;
 		position-try-fallbacks:
 			right span-top,
@@ -8030,7 +8026,7 @@ button.log-mode[aria-pressed="true"] {
 	}
 }
 /* Model roles: name, model, thinking and remove on one line; the notes span the row below.
-   At 480px the name and the remove button share the first line, each select takes a full line. */
+   At 480px the name and the remove button share the first line, each picker takes a full line. */
 .settings-sec.model-roles {
 	width: 100%;
 	align-items: stretch;
@@ -8083,7 +8079,8 @@ button.log-mode[aria-pressed="true"] {
 	.settings-sec .alate-def-row.role-row {
 		grid-template-columns: minmax(0, 1fr) auto;
 	}
-	.role-row select {
+	.role-row select,
+	.role-row .model-trigger {
 		grid-column: 1 / -1;
 	}
 	.role-row .role-remove {

@@ -114,12 +114,16 @@ import {
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
 import {
+	ModelMenuBody,
+	ModelMenuTrigger,
+	useModelMenu,
+} from "./model-menu.tsx";
+import {
 	displayModel,
 	type ModelCatalog,
 	modelMatches,
 	modelRows,
 	reviewModel,
-	stepIndex,
 	useModels,
 } from "./models.ts";
 import {
@@ -2013,41 +2017,15 @@ function ModelField({
 	setModelQuery: (q: string) => void;
 }) {
 	// One picker per dialog instance; several New task dialogs (one per project) stay mounted at once.
-	const popId = useId();
 	// The thinking level opens as a nested menu beside the model menu (like Claude's effort row).
+	const menu = useModelMenu();
+	// The level menu anchors the Thinking row; a fixed name would collide across dialogs.
+	const levelAnchor = `--model-level-${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
 	const levelPopId = useId();
 	const allModels = catalog?.models ?? [];
 	// model is a joined omp selector "provider/model:level"; "" level means omp default.
 	const [base, level] = splitLevel(model);
 	const models = allModels.filter((m) => modelMatches(m, modelQuery));
-	const modelSearch = useRef<HTMLInputElement | null>(null);
-	const trigger = useRef<HTMLButtonElement | null>(null);
-	// Set when the trigger opened the popover with an arrow key: the toggle then lands the
-	// focus on the first role row instead of the search box.
-	const arrowOpen = useRef(false);
-	// Native light-dismiss misses pointerdowns on the dialog backdrop / inert page behind the
-	// popover (both sit in the top layer), so some engines never close on "click somewhere else".
-	const [modelOpen, setModelOpen] = useState(false);
-	useEffect(() => {
-		if (!modelOpen) return;
-		const pop = document.getElementById(popId);
-		if (pop === null) return;
-		const onDown = (e: PointerEvent): void => {
-			if (
-				!(e.target instanceof Element) ||
-				pop.contains(e.target) ||
-				document.getElementById(levelPopId)?.contains(e.target)
-			)
-				return;
-			// The invoker's click is native toggle coordination; hiding here would make it reopen.
-			const invoker = e.target.closest("button");
-			if (invoker !== null && invoker.getAttribute("popovertarget") === popId)
-				return;
-			pop.hidePopover();
-		};
-		document.addEventListener("pointerdown", onDown);
-		return () => document.removeEventListener("pointerdown", onDown);
-	}, [modelOpen, popId, levelPopId]);
 	// Trigger: the model without its provider, then ":level" (the default model's own level when
 	// nothing is picked). The full selector stays in the tooltip and the accessible name.
 	const runModel = base === "" ? (catalog?.defaultModel ?? "") : model;
@@ -2068,7 +2046,7 @@ function ModelField({
 	const worst = tightest(limits);
 	const pickModel = (selector: string): void => {
 		setModel(selector);
-		document.getElementById(popId)?.hidePopover();
+		menu.close();
 	};
 	// On the default model a level needs an explicit anchor, so it pins the default's base
 	// ("Default" level keeps following the omp default).
@@ -2077,39 +2055,13 @@ function ModelField({
 	const pickLevel = (l: string): void => {
 		setModel(base === "" && l === "" ? "" : joinLevel(levelBase, l));
 		document.getElementById(levelPopId)?.hidePopover();
-		document.getElementById(popId)?.hidePopover();
-		trigger.current?.focus();
-	};
-	// Arrow keys walk the role/catalog rows from wherever the focus sits inside the open
-	// popover; Escape closes and hands the focus back to the trigger.
-	const popKeys = (e: React.KeyboardEvent<HTMLElement>): void => {
-		if (e.key === "Escape") {
-			// Cancel the native light dismiss: its deferred focus fixup would override the
-			// trigger focus below and drop the focus on the page behind the dialog.
-			e.preventDefault();
-			document.getElementById(popId)?.hidePopover();
-			trigger.current?.focus();
-			return;
-		}
-		if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-		const menu =
-			e.currentTarget.closest<HTMLElement>("[popover]") ??
-			document.getElementById(popId);
-		const opts = [
-			...(menu?.querySelectorAll<HTMLElement>(".model-option") ?? []),
-		];
-		const idx = stepIndex(
-			opts.length,
-			opts.indexOf(document.activeElement as HTMLElement),
-			e.key === "ArrowDown",
-		);
-		if (idx < 0) return;
-		e.preventDefault();
-		opts[idx]?.focus();
+		menu.close();
+		menu.trigger.current?.focus();
 	};
 	return (
 		<>
 			<div className="model-fields">
+				{/* biome-ignore lint/a11y/noLabelWithoutControl: the label wraps the picker's trigger button, which sits inside ModelMenuTrigger */}
 				<label className="field">
 					<span className="field-head">
 						{/* Name and mark share one flex child: the head is space-between, so a loose
@@ -2137,164 +2089,106 @@ function ModelField({
 							</span>
 						)}
 					</span>
-					<button
-						type="button"
-						className="model-trigger"
-						popoverTarget={popId}
-						ref={trigger}
-						title={fullLabel}
-						aria-label={fullLabel}
-						onKeyDown={(e) => {
-							if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-							if (modelOpen) return;
-							arrowOpen.current = true;
-							document.getElementById(popId)?.showPopover();
-						}}
-					>
+					<ModelMenuTrigger menu={menu} label={fullLabel}>
 						<span className="model-name">
 							{runBase === "" ? "Default" : displayModel(allModels, runBase)}
 							{runLevel !== "" && (
 								<span className="model-level"> {runLevel}</span>
 							)}
 						</span>
-						<Icon name="chevron-right" size={14} />
-					</button>
+					</ModelMenuTrigger>
 				</label>
 			</div>
 			{/* Sibling, not child: label click-forwarding must not fight the popover's focus. */}
-			<div
-				id={popId}
-				popover="auto"
-				className="popover model-pop"
-				onToggle={(e) => {
-					setModelOpen(e.newState === "open");
-					if (e.newState !== "open") return;
-					if (arrowOpen.current) {
-						document
-							.getElementById(popId)
-							?.querySelector<HTMLElement>(".model-option")
-							?.focus();
-					} else {
-						modelSearch.current?.focus();
-					}
-					arrowOpen.current = false;
-				}}
-			>
-				<input
-					ref={modelSearch}
-					type="search"
-					className="search"
-					placeholder="Search models"
-					aria-label="Search models"
-					value={modelQuery}
-					onKeyDown={(e) => {
-						// Enter in the search box must not submit a surrounding form (steer, New task).
-						if (e.key === "Enter") e.preventDefault();
-						popKeys(e);
-					}}
-					onChange={(e) => {
-						// Search filters the list only; clearing the pick here would silently
-						// send the default model if the user closes without re-picking.
-						setModelQuery(e.target.value);
-					}}
-				/>
-				{modelQuery !== "" && (
-					<span
-						className="filter-note"
-						role="status"
-						title="Matching of total models"
-					>
-						{models.length}/{allModels.length}
-					</span>
-				)}
-				<div className="model-list">
-					{catalog === null ? (
-						<Skeleton shape="list" rows={5} label="Loading the model list" />
-					) : (
-						modelRows(models, catalog.roles ?? null, model, modelQuery).map(
-							(r) => (
-								<Fragment key={r.key}>
-									{r.divider && <hr className="model-divider" />}
-									{r.heading && (
-										<div className="model-heading">{r.heading}</div>
-									)}
-									<button
-										type="button"
-										className="model-option"
-										aria-pressed={r.pressed}
-										onClick={() => pickModel(r.selector)}
-										onKeyDown={popKeys}
-									>
-										<span>{r.label}</span>
-										{r.pressed && <Icon name="check" size={14} />}
-									</button>
-								</Fragment>
-							),
-						)
-					)}
-				</div>
-				<hr className="model-divider" />
-				<button
-					type="button"
-					className="model-option level-row"
-					popoverTarget={levelPopId}
-					disabled={levelBase === ""}
-					title={levelBase === "" ? "Pick a model first" : undefined}
-					onKeyDown={(e) => {
-						if (e.key === "ArrowRight" || e.key === "Enter" || e.key === " ") {
-							e.preventDefault();
-							document.getElementById(levelPopId)?.showPopover();
-							document
-								.getElementById(levelPopId)
-								?.querySelector<HTMLElement>(".model-option")
-								?.focus();
-							return;
-						}
-						popKeys(e);
-					}}
-				>
-					<span>Thinking</span>
-					<span className="level-value">
-						{level === "" ? "Default" : level}
-						<Icon name="chevron-right" size={14} />
-					</span>
-				</button>
-				<div id={levelPopId} popover="auto" className="popover level-pop">
-					<p className="level-hint">
-						More thinking gives deeper answers, but turns take longer and use
-						more quota.
-					</p>
-					{["", ...THINKING_LEVELS].map((l) => (
+			<ModelMenuBody
+				menu={menu}
+				query={modelQuery}
+				setQuery={setModelQuery}
+				rows={
+					catalog === null
+						? []
+						: modelRows(models, catalog.roles ?? null, model, modelQuery)
+				}
+				shown={models.length}
+				total={allModels.length}
+				loading={catalog === null}
+				onPick={pickModel}
+				after={
+					<>
+						<hr className="model-divider" />
 						<button
-							key={l || "default"}
 							type="button"
-							className="model-option"
-							aria-pressed={level === l}
-							onClick={() => pickLevel(l)}
+							className="model-option level-row"
+							popoverTarget={levelPopId}
+							disabled={levelBase === ""}
+							title={levelBase === "" ? "Pick a model first" : undefined}
+							style={{ anchorName: levelAnchor } as React.CSSProperties}
 							onKeyDown={(e) => {
-								// ArrowLeft steps back to the Thinking row of the model menu.
-								if (e.key !== "ArrowLeft") return popKeys(e);
-								e.preventDefault();
-								document.getElementById(levelPopId)?.hidePopover();
-								document
-									.getElementById(popId)
-									?.querySelector<HTMLElement>(".level-row")
-									?.focus();
+								if (
+									e.key === "ArrowRight" ||
+									e.key === "Enter" ||
+									e.key === " "
+								) {
+									e.preventDefault();
+									document.getElementById(levelPopId)?.showPopover();
+									document
+										.getElementById(levelPopId)
+										?.querySelector<HTMLElement>(".model-option")
+										?.focus();
+									return;
+								}
+								menu.keys(e);
 							}}
 						>
-							{/* On the default model, "Default" names the level it brings (e.g. max). */}
-							<span>
-								{l !== ""
-									? l
-									: base === "" && runLevel !== ""
-										? `Default (${runLevel})`
-										: "Default"}
+							<span>Thinking</span>
+							<span className="level-value">
+								{level === "" ? "Default" : level}
+								<Icon name="chevron-right" size={14} />
 							</span>
-							{level === l && <Icon name="check" size={14} />}
 						</button>
-					))}
-				</div>
-			</div>
+						<div
+							id={levelPopId}
+							popover="auto"
+							className="popover level-pop"
+							style={{ positionAnchor: levelAnchor } as React.CSSProperties}
+						>
+							<p className="level-hint">
+								More thinking gives deeper answers, but turns take longer and
+								use more quota.
+							</p>
+							{["", ...THINKING_LEVELS].map((l) => (
+								<button
+									key={l || "default"}
+									type="button"
+									className="model-option"
+									aria-pressed={level === l}
+									onClick={() => pickLevel(l)}
+									onKeyDown={(e) => {
+										// ArrowLeft steps back to the Thinking row of the model menu.
+										if (e.key !== "ArrowLeft") return menu.keys(e);
+										e.preventDefault();
+										document.getElementById(levelPopId)?.hidePopover();
+										document
+											.getElementById(menu.popId)
+											?.querySelector<HTMLElement>(".level-row")
+											?.focus();
+									}}
+								>
+									{/* On the default model, "Default" names the level it brings (e.g. max). */}
+									<span>
+										{l !== ""
+											? l
+											: base === "" && runLevel !== ""
+												? `Default (${runLevel})`
+												: "Default"}
+									</span>
+									{level === l && <Icon name="check" size={14} />}
+								</button>
+							))}
+						</div>
+					</>
+				}
+			/>
 		</>
 	);
 }

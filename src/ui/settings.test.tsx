@@ -9,6 +9,7 @@ import type {
 	TaskCard,
 	TrendingStatus,
 } from "../types.ts";
+import { resetCatalogCache } from "./models.ts";
 import {
 	AppCheckLines,
 	fmtCost,
@@ -16,6 +17,7 @@ import {
 	fmtPct,
 	GitHostsSection,
 	HindsightSection,
+	ModelRolesSection,
 	NotificationsSection,
 	OmpStatsSection,
 	openSettingsSection,
@@ -57,6 +59,16 @@ beforeAll(() => {
 		originals.set(key, host[key]);
 		host[key] = value;
 	}
+	// happy-dom has no popover API; the model picker calls showPopover/hidePopover
+	// directly. No-op stand-ins keep those calls working here: the top-layer
+	// placement they drive in browsers is browser-only anyway. happy-dom's
+	// element classes are per-Window, so this never reaches another test file.
+	const proto = window.HTMLElement.prototype as unknown as Record<
+		string,
+		unknown
+	>;
+	for (const method of ["showPopover", "hidePopover", "togglePopover"])
+		if (proto[method] === undefined) proto[method] = () => {};
 });
 
 afterAll(() => {
@@ -2650,6 +2662,180 @@ describe("NotificationsSection", () => {
 			expect(m.boxes().map((x) => x.checked)).toEqual([true, true]);
 		} finally {
 			await m.unmount();
+		}
+	});
+});
+
+describe("ModelRolesSection model picker", () => {
+	/** Mounts the section against `fetchMock`; the cleanup puts fetch and the catalog back. */
+	async function mountRoles(fetchMock: typeof fetch): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<ModelRolesSection />);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+				resetCatalogCache();
+			},
+		};
+	}
+
+	const rolesFetch = (roles: Record<string, string>): typeof fetch =>
+		(async (input: RequestInfo | URL) => {
+			const ok = (body: unknown): Response =>
+				new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			const url = String(input);
+			if (url.endsWith("/api/model-roles"))
+				return ok({
+					base: "abc1234",
+					hash: "h1",
+					roles,
+					signIns: ["zai", "anthropic"],
+					seed: { needed: false, commit: null, roles: null, expiresAt: null },
+				});
+			if (url.endsWith("/api/models"))
+				return ok({
+					models: [
+						{
+							id: "anthropic/claude-opus-5-5",
+							selector: "anthropic/claude-opus-5-5",
+							name: "Claude Opus 5.5",
+							contextWindow: null,
+						},
+						{
+							id: "zai/glm-5.3-flash",
+							selector: "zai/glm-5.3-flash",
+							name: "GLM 5.3 Flash",
+							contextWindow: null,
+						},
+						{
+							id: "openai/gpt-5",
+							selector: "openai/gpt-5",
+							name: "GPT 5",
+							contextWindow: null,
+						},
+					],
+					roles: {},
+				});
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+
+	test("typing narrows the picker list; picking a model arms Save", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ plan: "zai/glm-5.3-flash" }),
+		);
+		try {
+			await act(async () => {});
+			const trigger = container.querySelector("button.model-trigger");
+			if (trigger === null) throw new Error("picker trigger did not render");
+			expect(trigger.getAttribute("aria-label")).toBe("Model for plan");
+			expect(trigger.textContent).toBe("GLM 5.3 Flash (zai/glm-5.3-flash)");
+			// The untouched row saves nothing: Save arms only after a pick.
+			const save = container.querySelector<HTMLButtonElement>(
+				".alate-def-actions button",
+			);
+			if (save === null) throw new Error("Save button did not render");
+			expect(save.disabled).toBe(true);
+
+			// The unfiltered list holds the whole catalogue.
+			const options = () => [
+				...container.querySelectorAll("button.model-option"),
+			];
+			expect(options().length).toBe(3);
+
+			// Typing filters; the note counts the matches over the catalogue.
+			const search = container.querySelector<HTMLInputElement>(
+				".model-pop input.search",
+			);
+			if (search === null) throw new Error("search box did not render");
+			await act(async () => {
+				typeInto(search, "opu");
+				onChangeOf(search)({ target: search });
+			});
+			expect(options().length).toBe(1);
+			expect(options()[0]!.textContent).toContain("Claude Opus 5.5");
+			const note = container.querySelector(".filter-note");
+			expect(note?.getAttribute("role")).toBe("status");
+			expect(note?.textContent).toBe("1/3");
+
+			// Clearing the input brings the full catalogue back.
+			await act(async () => {
+				typeInto(search, "");
+				onChangeOf(search)({ target: search });
+			});
+			expect(options().length).toBe(3);
+
+			// A pick rewrites the row and arms Save; the note leaves with the filter.
+			await act(async () => {
+				onClickOf(options()[0]!)({});
+			});
+			expect(trigger.textContent).toBe(
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+			);
+			expect(save.disabled).toBe(false);
+			expect(container.querySelector(".filter-note")).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a saved model outside the catalogue keeps its note; Escape refocuses the trigger", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ plan: "legacy/old-model" }),
+		);
+		try {
+			await act(async () => {});
+			const trigger = container.querySelector("button.model-trigger");
+			if (trigger === null) throw new Error("picker trigger did not render");
+			expect(trigger.textContent).toBe("legacy/old-model (not in the catalog)");
+			// Nothing in the catalogue claims the unknown value.
+			for (const o of container.querySelectorAll("button.model-option"))
+				expect(o.getAttribute("aria-pressed")).toBe("false");
+
+			const search = container.querySelector<HTMLInputElement>(
+				".model-pop input.search",
+			);
+			if (search === null) throw new Error("search box did not render");
+			await act(async () => {
+				typeInto(search, "gpt");
+				onChangeOf(search)({ target: search });
+			});
+			const options = [...container.querySelectorAll("button.model-option")];
+			expect(options.length).toBe(1);
+
+			// Escape hands the focus back to the trigger (the popover hides).
+			await act(async () => {
+				handlerOf(
+					search,
+					"onKeyDown",
+				)({
+					key: "Escape",
+					preventDefault: () => {},
+				});
+			});
+			expect(document.activeElement).toBe(trigger);
+		} finally {
+			await unmount();
 		}
 	});
 });
