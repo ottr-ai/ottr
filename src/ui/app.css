@@ -37,7 +37,7 @@
 	--font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
 	--mono: "Cascadia Code", ui-monospace, Consolas, monospace;
 	--scrim: rgba(12, 14, 16, 0.6);
-	--shadow-overlay: 0 18px 44px rgba(0, 0, 0, 0.5);
+	--shadow-overlay: 0 18px 44px rgba(1, 0, 19, 0.5);
 	--ease: cubic-bezier(0.2, 0.7, 0.3, 1);
 	--bar-h: 48px;
 }
@@ -64,16 +64,16 @@
 	--accent-bg: #e7eef5;
 	--accent-line: #b0c6dc;
 	--normal-fill: #8a929b; /* indicator fill inside the normal band; the solid fill of non-interactive status marks */
-	--alarm: #9a6a00;
+	--alarm: #8f6200;
 	--alarm-bg: #f9f0d8;
-	--alarm-line: #d8b96a;
-	--crit: #d63b32;
+	--alarm-line: #a1751a;
+	--crit: #c8231a;
 	--crit-bg: #fbeae8;
-	--crit-line: #e5a49e;
+	--crit-line: #bf6659;
 	--crit-ink: #78201b;
 	--crit-text: #b3261e;
-	--on-alarm: #ffffff;
-	--on-crit: #ffffff;
+	--on-alarm: #faf9f6;
+	--on-crit: #faf9f6;
 	--on-grey: #14181d; /* ink on a solid grey fill: status you cannot click */
 	--diff-add: #1a7f37;
 	--diff-add-bg: rgb(52 153 77 / 0.14);
@@ -112,7 +112,7 @@ body {
 }
 
 ::selection {
-	background: rgba(143, 176, 208, 0.35);
+	background: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 h1,
@@ -307,7 +307,7 @@ button.failed {
 	border-color: var(--crit);
 }
 button.primary.failed {
-	color: #1d0d0c;
+	color: var(--on-crit);
 	background: var(--crit);
 	border-color: var(--crit);
 }
@@ -4093,8 +4093,8 @@ dialog.lightbox {
 	padding: 0;
 	border: 0;
 	border-radius: 50%;
-	background: rgb(0 0 0 / 0.55);
-	color: #fff;
+	background: rgb(1 0 19 / 0.55);
+	color: #faf9f6;
 	cursor: pointer;
 }
 .lightbox .page {
@@ -4135,8 +4135,8 @@ dialog.lightbox {
 	max-width: calc(100% - 112px);
 	padding: 4px 10px;
 	border-radius: 4px;
-	background: rgb(0 0 0 / 0.7);
-	color: #fff;
+	background: rgb(1 0 19 / 0.7);
+	color: #faf9f6;
 	font-size: 13px;
 	overflow-wrap: anywhere;
 	text-align: center;
@@ -5784,7 +5784,7 @@ dialog.drawer[open]::backdrop {
 .wf-cur-in_progress #wf-st-in_progress,
 .wf-cur-merging #wf-st-merging,
 .wf-cur-done #wf-st-done {
-	stroke: #8fb0d0;
+	stroke: var(--accent);
 	stroke-width: 2.5;
 }
 .wf-here {

@@ -7413,7 +7413,7 @@ export function reportHtml(title: string, body: string): string {
 		`<title>${esc}</title>`,
 		"<style>",
 		":root{color-scheme:light dark}",
-		"body{margin:0 auto;max-width:64rem;padding:1rem 1.25rem;font:16px/1.6 system-ui,sans-serif;background:#fff;color:#1c1c1c}",
+		"body{margin:0 auto;max-width:64rem;padding:1rem 1.25rem;font:16px/1.6 system-ui,sans-serif;background:#faf9f6;color:#1c1c1c}",
 		".md img{max-width:100%;height:auto;border-radius:6px}",
 		".md table{border-collapse:collapse;margin:1rem 0}",
 		".md th,.md td{border:1px solid #d4d4d4;padding:.35rem .6rem;text-align:left;vertical-align:top}",

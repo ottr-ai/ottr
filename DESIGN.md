@@ -101,6 +101,8 @@ The palette is four neutral greys plus a recessed well, one steel interaction ac
 
 **Neutral — Field Grey** (`#c9ced4`): body text. Surfaces step darker-to-lighter: field `#2b2e32`, chrome `#24272b`, panel `#303338`, card `#3a3f45`, hover `#41464d`, recessed well `#1f2225`. Lines `#4a5057` (strong) and `#3d4248` (soft). Values read brighter at `#eceef1`; secondary text `#a8b0b9` holds at least 4.5:1 on cards. Indicator fill inside the normal band is `#8f979f` — visible, but grey. The same pair is the solid fill of non-interactive status marks: the unread badge on done cards, the bell's new-question and new-notice fill, and the stage tab's ask chip — `--on-grey` ink on `#8f979f` (dark) / `#8a929b` (light), because steel is reserved for clickable things.
 
+**Light theme** (`data-theme="light"`): the same contract on inverted neutrals. Alarm hues darken instead of pale, so ink on a solid fill holds 4.5:1. Values: field `#f1f2f4`, chrome `#e6e8eb`, panel `#e9ebee`, card `#fbfcfd`, hover `#eef1f4`, well `#e4e7ea`; lines `#c6ccd2` / `#d6dade`; text `#33383e`, bright `#1b1e22`, dim `#5d656e`. Steel `#3c6a99` (hover `#30577f`, ink `#f2f7fc`, tint `#e7eef5`, line `#b0c6dc`). Amber `#8f6200` (tint `#f9f0d8`, line `#a1751a`, on-amber ink `#faf9f6`). Red `#c8231a` (tint `#fbeae8`, line `#bf6659`, on-tint ink `#78201b`, red text `#b3261e`, on-red ink `#faf9f6`). Scrim `rgba(30,34,40,0.4)`; shadow `0 18px 44px rgba(20,30,40,0.16)`.
+
 **The Grey-Is-Normal Rule.** Colour is an alarm channel. If a state is fine, it renders in grey; amber and red are reserved for needs-you and critical, respectively. A setup problem that stops every worker counts as needs-you: a missing agent server shows an amber callout on the Overview's Setup tab, and the tab label turns amber. Other setup hints keep the grey warning mark.
 
 **The Redundant-Coding Rule.** No alarm state is carried by hue alone. Needs-you is an amber triangle "!", critical is a red square "!", normal-band exceedance is a tick on the indicator plus the amber fill. Shape and text carry the meaning first.
@@ -128,7 +130,7 @@ Spacing sits on a small rhythm: 4/8 inside components, 10–14 between them, 18�
 
 ## Elevation & Depth
 
-Flat by default. Panels, cards, and the active area are separated by 1px lines (`--line` / `--line-soft`) and surface steps — never shadows. `--shadow-overlay` (0 18px 44px rgba(0,0,0,0.5)) exists for exactly three surfaces: native `<dialog>`, the task drawer, and the bar popovers, i.e. things that occupy the top layer above the page.
+Flat by default. Panels, cards, and the active area are separated by 1px lines (`--line` / `--line-soft`) and surface steps — never shadows. `--shadow-overlay` (0 18px 44px rgba(1,0,19,0.5)) exists for exactly three surfaces: native `<dialog>`, the task drawer, and the bar popovers, i.e. things that occupy the top layer above the page.
 
 **The Shadow-Is-Overlayer Rule.** A shadow appears only where an element leaves the page layer. In-page depth is expressed by surface lightness and 1px lines.
 
@@ -209,7 +211,7 @@ A rounded child inside a rounded parent never has a radius ≥ the parent's; wit
 
 The board targets **WCAG 2.1 AA**, enforced through the design system itself, the impeccable detector scan before each commit that changes the UI, and `impeccable audit` before releases touch the UI. The ISA-101 world already carries most of it; these are the binding rules:
 
-- **Contrast (1.4.3, 1.4.11):** body text ≥ 4.5:1, text ≥ 24px (or 19px bold) ≥ 3:1, and non-text boundaries — lines, focus rings, indicator fills against their track — ≥ 3:1. The committed pairs hold this: `--text`/`--text-strong` on field, panel and card; `--dim` only at ≥ 4.5:1 on its surface; steel focus rings on every surface they cross.
+- **Contrast (1.4.3, 1.4.11):** body text ≥ 4.5:1, text ≥ 24px (or 19px bold) ≥ 3:1, and non-text boundaries — lines, focus rings, indicator fills against their track — ≥ 3:1. The committed pairs hold this: `--text`/`--text-strong` on field, panel and card; `--dim` only at ≥ 4.5:1 on its surface; steel focus rings on every surface they cross. The light pairs hold it too: `--on-crit` on `--crit` 5.37:1, `--on-alarm` on `--alarm` 5.10:1, `--crit-text` on light surfaces ≥ 5.27:1, and the crit and amber boundary lines ≥ 3.43:1 on the surfaces they cross.
 - **Use of color (1.4.1):** already law — hue never carries state alone; the redundant-coding rule is the AA mechanism.
 - **Keyboard (2.1.1, 2.1.2, 2.4.7):** every action reachable and operable by keyboard; native `<dialog>` owns focus and traps it deliberately and releases it back; focus is always visible — the steel ring is the only focus treatment and must never be removed.
 - **Names and labels (2.4.6, 3.3.2, 4.1.2):** every icon-only control carries `aria-label` (the New task buttons do); inputs have visible labels or `sr` text; state marks ship a screen-reader line (`<span class="sr">`).
