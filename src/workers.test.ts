@@ -880,8 +880,51 @@ describe("GET /stats", () => {
 			memoryMax: "max",
 			memoryEvents: { max: 7, oom: 2, oomKill: 1 },
 			lock: { exists: true, pid: process.pid, alive: true },
+			runs: [],
 		});
 	});
+
+	// The daemon reads the real /proc of its own /run child: Linux only. Reading signals
+	// nothing, and the abort below ends the child the test started.
+	test.skipIf(process.platform !== "linux")(
+		"GET /stats reports a running /run's process tree by its run id",
+		async () => {
+			const url = start({
+				token: "tok",
+				ompPath: process.execPath,
+				cgroupRoot: join(dir, "no-cgroup"),
+			});
+			const controller = new AbortController();
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-otwr-token": "tok" },
+				body: JSON.stringify({
+					id: "stats-run",
+					argv: [sleepPath],
+					cwd: dir,
+					stdin: "",
+					env: {},
+				}),
+				signal: controller.signal,
+			});
+			const reader = res.body!.getReader();
+			try {
+				// The child's first stdout line proves it spawned; no guessed delay.
+				await reader.read();
+				const stats = await fetch(`${url}/stats`, {
+					headers: { "x-otwr-token": "tok" },
+				});
+				const body = (await stats.json()) as {
+					runs: { id: string; memBytes: number; cpuUsec: number }[];
+				};
+				expect(body.runs.map((r) => r.id)).toEqual(["stats-run"]);
+				expect(body.runs[0]!.memBytes).toBeGreaterThan(0);
+			} finally {
+				controller.abort();
+			}
+		},
+		30_000,
+	);
 });
 
 describe("runWorker", () => {

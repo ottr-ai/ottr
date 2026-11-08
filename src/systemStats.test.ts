@@ -15,12 +15,18 @@ import {
 	parseCgroupReading,
 	pushRing,
 	readCgroup,
+	readRunUsage,
 	readVm,
 	rowWarnings,
 	type VmReading,
 	vmCpuPercent,
 } from "./systemStats.ts";
-import type { CgroupReading, SystemHolds, SystemPoint } from "./types.ts";
+import type {
+	CgroupReading,
+	RunUsage,
+	SystemHolds,
+	SystemPoint,
+} from "./types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "ottr-system-"));
 /** Stops the test servers: a callback, so the list holds any Bun.serve server type. */
@@ -40,6 +46,36 @@ function fakeRoot(files: Record<string, string>): string {
 	return root;
 }
 
+let procN = 0;
+/** A fake /proc: `<pid>/stat` with the comm, ppid and the utime, stime, cutime and cstime
+ *  ticks at their real field positions, plus `<pid>/smaps_rollup` unless pssKb is null. */
+function fakeProc(
+	procs: {
+		pid: number;
+		ppid: number;
+		comm?: string;
+		ticks: [number, number, number, number];
+		pssKb: number | null;
+	}[],
+): string {
+	const root = join(dir, `proc-${procN++}`);
+	for (const p of procs) {
+		const pidDir = join(root, String(p.pid));
+		mkdirSync(pidDir, { recursive: true });
+		const [utime, stime, cutime, cstime] = p.ticks;
+		writeFileSync(
+			join(pidDir, "stat"),
+			`${p.pid} (${p.comm ?? "bun"}) S ${p.ppid} 1 1 0 -1 4194560 100 0 0 0 ${utime} ${stime} ${cutime} ${cstime} 20 0 1 0 100 1000 50\n`,
+		);
+		if (p.pssKb !== null)
+			writeFileSync(
+				join(pidDir, "smaps_rollup"),
+				`55d0-7ffe ---p 00000000 00:00 0 [rollup]\nRss: ${p.pssKb * 2} kB\nPss: ${p.pssKb} kB\nPss_Anon: 7 kB\nPss_File: 9 kB\n`,
+			);
+	}
+	return root;
+}
+
 const NO_LOCK = join(dir, "no-such.lock");
 
 const reading = (over: Partial<CgroupReading> = {}): CgroupReading => ({
@@ -50,6 +86,7 @@ const reading = (over: Partial<CgroupReading> = {}): CgroupReading => ({
 	memoryMax: null,
 	memoryEvents: null,
 	lock: { exists: false, pid: null, alive: false },
+	runs: [],
 	...over,
 });
 
@@ -93,6 +130,7 @@ describe("readCgroup", () => {
 			memoryMax: 1073741824,
 			memoryEvents: { max: 12, oom: 3, oomKill: 2 },
 			lock: { exists: false, pid: null, alive: false },
+			runs: [],
 		});
 	});
 
@@ -122,6 +160,7 @@ describe("readCgroup", () => {
 			memoryMax: null,
 			memoryEvents: null,
 			lock: { exists: false, pid: null, alive: false },
+			runs: [],
 		});
 	});
 
@@ -174,6 +213,70 @@ describe("readCgroup", () => {
 
 	test("the default lock is the one scripts/stryker-load.mjs creates", () => {
 		expect(MUTATION_LOCK_PATH).toBe(join(tmpdir(), "ott-stryker.lock"));
+	});
+});
+
+describe("readRunUsage", () => {
+	// Run r1 is the tree 100 → 101 → 102; run r2 is 200 alone; 300 belongs to no run.
+	const tree = () =>
+		fakeProc([
+			// comm may hold ") (": the fields start after the last ")".
+			{ pid: 100, ppid: 1, comm: "omp) (x", ticks: [5, 3, 2, 1], pssKb: 1000 },
+			{ pid: 101, ppid: 100, ticks: [10, 0, 0, 0], pssKb: 2000 },
+			// Its smaps_rollup is unreadable: no memory, but its CPU still counts.
+			{ pid: 102, ppid: 101, ticks: [1, 1, 0, 0], pssKb: null },
+			{ pid: 200, ppid: 1, ticks: [4, 0, 0, 0], pssKb: 50 },
+			{ pid: 300, ppid: 1, ticks: [99, 99, 99, 99], pssKb: 9999 },
+		]);
+
+	test("sums each run's own tree: Pss memory and CPU with the waited-for children", () => {
+		const procRoot = tree();
+		expect(
+			readRunUsage(
+				[
+					{ id: "r1", pid: 100 },
+					{ id: "r2", pid: 200 },
+				],
+				procRoot,
+			),
+		).toEqual([
+			// (5+3+2+1) + 10 + (1+1) ticks of 10 000 µs.
+			{ id: "r1", memBytes: 3000 * 1024, cpuUsec: 230_000 },
+			{ id: "r2", memBytes: 50 * 1024, cpuUsec: 40_000 },
+		]);
+		// A subtree root counts only its own descendants.
+		expect(readRunUsage([{ id: "sub", pid: 101 }], procRoot)).toEqual([
+			{ id: "sub", memBytes: 2000 * 1024, cpuUsec: 120_000 },
+		]);
+	});
+
+	test("a run whose root pid is gone is left out; a missing /proc gives []", () => {
+		expect(
+			readRunUsage(
+				[
+					{ id: "gone", pid: 555 },
+					{ id: "r2", pid: 200 },
+				],
+				tree(),
+			),
+		).toEqual([{ id: "r2", memBytes: 50 * 1024, cpuUsec: 40_000 }]);
+		expect(
+			readRunUsage([{ id: "r1", pid: 100 }], join(dir, "no-such-proc")),
+		).toEqual([]);
+	});
+
+	test("readCgroup reports the runs it is given, and none without them", () => {
+		const procRoot = tree();
+		const root = fakeRoot({});
+		expect(
+			readCgroup({
+				root,
+				lockPath: NO_LOCK,
+				runs: [{ id: "r2", pid: 200 }],
+				procRoot,
+			}).runs,
+		).toEqual([{ id: "r2", memBytes: 50 * 1024, cpuUsec: 40_000 }]);
+		expect(readCgroup({ root, lockPath: NO_LOCK, procRoot }).runs).toEqual([]);
 	});
 });
 
@@ -232,6 +335,28 @@ describe("parseCgroupReading", () => {
 		expect(parseCgroupReading({ ...r, cpuMax: { quotaUsec: 1 } })).toBeNull();
 		expect(parseCgroupReading({ ...r, memoryEvents: { max: 1 } })).toBeNull();
 		expect(parseCgroupReading({ ...r, lock: undefined })).toBeNull();
+	});
+
+	test("runs: a missing field (an older worker) parses as none; a malformed one rejects the reading", () => {
+		const r = reading({
+			at: 1,
+			runs: [{ id: "w1", memBytes: 2048, cpuUsec: 10 }],
+		});
+		expect(parseCgroupReading(JSON.parse(JSON.stringify(r)))).toEqual(r);
+		// JSON drops an undefined field: the body has no runs key at all.
+		const old = JSON.parse(JSON.stringify({ ...r, runs: undefined }));
+		expect(parseCgroupReading(old)).toEqual({ ...r, runs: [] });
+		for (const runs of [
+			null,
+			{},
+			[null],
+			[{ memBytes: 1, cpuUsec: 1 }],
+			[{ id: 7, memBytes: 1, cpuUsec: 1 }],
+			[{ id: "w1", memBytes: -1, cpuUsec: 1 }],
+			[{ id: "w1", memBytes: 1, cpuUsec: "1" }],
+			[{ id: "w1", memBytes: 1 }],
+		])
+			expect(parseCgroupReading({ ...r, runs })).toBeNull();
 	});
 });
 
@@ -664,39 +789,44 @@ describe("createSystemSampler", () => {
 				id: "A",
 				runner: "server",
 				progress: "Stryker 40% · 4/10 · 1 survived (25.0%) · 2m elapsed",
+				runId: null,
 			},
 			{
 				project: "p",
 				id: "B",
 				runner: "server",
 				progress: "Stryker waiting for the mutation lock (pid 4242)",
+				runId: null,
 			},
-			{ project: "q", id: "C", runner: "server", progress: null },
+			{ project: "q", id: "C", runner: "server", progress: null, runId: null },
 			{
 				project: "q",
 				id: "M",
 				runner: "server",
 				progress: "mutate.py running",
+				runId: null,
 			},
 			{
 				project: "p",
 				id: "D",
 				runner: "worker-a",
 				progress: "Stryker 10% · 1/10 · 2m elapsed",
+				runId: null,
 			},
 			{
 				project: "p",
 				id: "E",
 				runner: "worker-a",
 				progress: "Stryker 20% · 2/10 · 4m elapsed",
+				runId: null,
 			},
 		];
 		const [server, worker] = sampler.snapshot(runs, HOLDS, 0).containers;
 		expect(server!.cards).toEqual([
-			{ project: "p", id: "A" },
-			{ project: "p", id: "B" },
-			{ project: "q", id: "C" },
-			{ project: "q", id: "M" },
+			{ project: "p", id: "A", usage: null },
+			{ project: "p", id: "B", usage: null },
+			{ project: "q", id: "C", usage: null },
+			{ project: "q", id: "M", usage: null },
 		]);
 		// The mutate.py run on the same container is no Stryker holder: A stays the one holder.
 		expect(server!.lock).toEqual({
@@ -710,6 +840,103 @@ describe("createSystemSampler", () => {
 			holderCard: null,
 			waiters: [],
 		});
+	});
+
+	const turn = (
+		id: string,
+		runId: string | null,
+		runner = "worker-a",
+	): LiveRun => ({ project: "p", id, runner, progress: null, runId });
+	const workerAt = (at: number, runs: RunUsage[]) => ({
+		name: "worker-a",
+		reading: reading({ at, runs }),
+	});
+
+	test("a turn's CPU % from two samples, and its peak memory across an outage", () => {
+		const sampler = createSystemSampler();
+		const live = [turn("A", "w1")];
+		const usageAt = (now: number) =>
+			sampler.snapshot(live, HOLDS, now).containers[0]!.cards[0]!.usage;
+		sampler.record(
+			[workerAt(0, [{ id: "w1", memBytes: 300, cpuUsec: 0 }])],
+			vmAt(0),
+		);
+		expect(usageAt(0)).toEqual({
+			mem: 300,
+			memPeak: 300,
+			cpuPct: null,
+			cpuSec: 0,
+		});
+		sampler.record(
+			[workerAt(TICK, [{ id: "w1", memBytes: 100, cpuUsec: 15_000_000 }])],
+			vmAt(TICK),
+		);
+		// 15 s of CPU in a 30 s tick; memory went down, the peak stays.
+		expect(usageAt(TICK)).toEqual({
+			mem: 100,
+			memPeak: 300,
+			cpuPct: 50,
+			cpuSec: 15,
+		});
+		sampler.record([{ name: "worker-a", reading: null }], vmAt(2 * TICK));
+		expect(usageAt(2 * TICK)).toBeNull();
+		sampler.record(
+			[workerAt(3 * TICK, [{ id: "w1", memBytes: 200, cpuUsec: 45_000_000 }])],
+			vmAt(3 * TICK),
+		);
+		// The sample before the outage is the CPU base (30 s over 60 s), and its peak survived.
+		expect(usageAt(3 * TICK)).toEqual({
+			mem: 200,
+			memPeak: 300,
+			cpuPct: 50,
+			cpuSec: 45,
+		});
+		// A run the worker stops reporting drops its samples: back, it starts over.
+		sampler.record([workerAt(4 * TICK, [])], vmAt(4 * TICK));
+		expect(usageAt(4 * TICK)).toBeNull();
+		sampler.record(
+			[workerAt(5 * TICK, [{ id: "w1", memBytes: 50, cpuUsec: 46_000_000 }])],
+			vmAt(5 * TICK),
+		);
+		expect(usageAt(5 * TICK)).toEqual({
+			mem: 50,
+			memPeak: 50,
+			cpuPct: null,
+			cpuSec: 46,
+		});
+	});
+
+	test("cards: the largest memory first, turns without usage last in board order", () => {
+		const sampler = createSystemSampler();
+		sampler.record(
+			[
+				// The server reports no runs of its own; its turns carry no runId.
+				{ name: "server", reading: reading({ at: 0 }) },
+				workerAt(0, [
+					{ id: "w1", memBytes: 100, cpuUsec: 0 },
+					{ id: "w2", memBytes: 500, cpuUsec: 0 },
+					{ id: "w3", memBytes: 300, cpuUsec: 0 },
+				]),
+			],
+			vmAt(0),
+		);
+		const live = [
+			turn("S", null, "server"),
+			turn("A", "w1"),
+			turn("U", "not-reported"),
+			turn("B", "w2"),
+			turn("N", null),
+			turn("C", "w3"),
+		];
+		const [server, worker] = sampler.snapshot(live, HOLDS, 0).containers;
+		expect(server!.cards).toEqual([{ project: "p", id: "S", usage: null }]);
+		expect(worker!.cards.map((c) => [c.id, c.usage?.mem ?? null])).toEqual([
+			["B", 500],
+			["C", 300],
+			["A", 100],
+			["U", null],
+			["N", null],
+		]);
 	});
 
 	test("a runner missing from the latest record loses its row", () => {

@@ -2,17 +2,20 @@
 // worker through GET /stats), and the server keeps one hour of 30 s samples per container plus
 // the Docker VM as its /proc sees it. Container numbers come from cgroups, not /proc: inside a
 // container /proc shows the whole VM, so only the cgroup says what the container itself uses.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidAlive } from "./dblock.ts";
 import type {
 	CgroupReading,
 	ContainerRow,
+	RunUsage,
 	SystemCard,
 	SystemHolds,
 	SystemPoint,
 	SystemSnapshot,
+	SystemTurn,
+	TurnUsage,
 	VmRow,
 } from "./types.ts";
 
@@ -31,6 +34,9 @@ export const CPU_WARN_SAMPLES = 10;
 const LOCK_WAIT_PREFIX = "Stryker waiting for the mutation lock";
 /** Every Stryker progress text starts with this (src/stryker.ts strykerStatus, runProgress). */
 const STRYKER_PREFIX = "Stryker ";
+/** USER_HZ, the clock tick of the CPU fields in /proc/<pid>/stat, is 100 on Linux (the
+ *  kernel fixes it for user space on every architecture), so one tick is 10 000 µs. */
+const USEC_PER_TICK = 10_000;
 
 /** File text, or null when it is missing or unreadable (cgroup v1 has none of these files). */
 function readText(path: string): string | null {
@@ -126,11 +132,92 @@ export function readLock(lockPath: string): CgroupReading["lock"] {
 	return { exists: true, pid, alive: pid !== null && pidAlive(pid) };
 }
 
-/** Reads cgroup v2 files under root (default "/sys/fs/cgroup") + the lock file. Sync, never throws; unreadable field → null. */
+/** /proc/<pid>/stat: the parent pid and the CPU ticks of utime + stime + cutime + cstime.
+ *  comm (field 2) can hold spaces and parens, so the fields start after the last ")". null
+ *  when the text is garbled. */
+function parsePidStat(text: string): { ppid: number; ticks: number } | null {
+	const close = text.lastIndexOf(")");
+	if (close < 0) return null;
+	// after[0] is the state (field 3): after[i] is field i + 3.
+	const after = text.slice(close + 2).split(" ");
+	const [ppid, utime, stime, cutime, cstime] = [1, 11, 12, 13, 14].map((i) =>
+		parseCount(after[i] ?? ""),
+	);
+	if (
+		ppid == null ||
+		utime == null ||
+		stime == null ||
+		cutime == null ||
+		cstime == null
+	)
+		return null;
+	return { ppid, ticks: utime + stime + cutime + cstime };
+}
+
+/** The `Pss:` line of /proc/<pid>/smaps_rollup in bytes; 0 when it is unreadable (the
+ *  process exited, or the reader may not see it). */
+function readPss(path: string): number {
+	const kb = readText(path)?.match(/^Pss:\s+(\d+) kB$/m)?.[1];
+	return kb === undefined ? 0 : (parseCount(kb) ?? 0) * 1024;
+}
+
+/** Each run's process tree (its root pid plus every descendant, a walk over ppid) from one read
+ *  of every /proc/<pid>/stat under procRoot. A tree member whose stat or smaps_rollup is
+ *  unreadable (it exited, or permission) adds nothing; a run whose root has no readable stat
+ *  is left out. Never throws: a missing procRoot gives []. */
+export function readRunUsage(
+	runs: readonly { id: string; pid: number }[],
+	procRoot = "/proc",
+): RunUsage[] {
+	if (runs.length === 0) return [];
+	let names: string[];
+	try {
+		names = readdirSync(procRoot);
+	} catch {
+		return [];
+	}
+	const ticks = new Map<number, number>();
+	const children = new Map<number, number[]>();
+	for (const name of names) {
+		const pid = parseCount(name);
+		if (pid === null) continue;
+		const text = readText(join(procRoot, name, "stat"));
+		const stat = text === null ? null : parsePidStat(text);
+		if (stat === null) continue;
+		ticks.set(pid, stat.ticks);
+		const siblings = children.get(stat.ppid);
+		if (siblings) siblings.push(pid);
+		else children.set(stat.ppid, [pid]);
+	}
+	const out: RunUsage[] = [];
+	for (const run of runs) {
+		if (!ticks.has(run.pid)) continue;
+		let memBytes = 0;
+		let treeTicks = 0;
+		const seen = new Set<number>();
+		const queue = [run.pid];
+		while (queue.length > 0) {
+			const pid = queue.pop()!;
+			if (seen.has(pid)) continue;
+			seen.add(pid);
+			treeTicks += ticks.get(pid) ?? 0;
+			memBytes += readPss(join(procRoot, String(pid), "smaps_rollup"));
+			queue.push(...(children.get(pid) ?? []));
+		}
+		out.push({ id: run.id, memBytes, cpuUsec: treeTicks * USEC_PER_TICK });
+	}
+	return out;
+}
+
+/** Reads cgroup v2 files under root (default "/sys/fs/cgroup") + the lock file. Sync, never throws; unreadable field → null.
+ *  `runs` are the container's live turns by worker run id; their usage comes from procRoot
+ *  (default "/proc"). Without runs, nothing under procRoot is read. */
 export function readCgroup(opts?: {
 	root?: string;
 	lockPath?: string;
 	now?: number;
+	runs?: readonly { id: string; pid: number }[];
+	procRoot?: string;
 }): CgroupReading {
 	const root = opts?.root ?? "/sys/fs/cgroup";
 	const file = (name: string): string | null => readText(join(root, name));
@@ -143,6 +230,7 @@ export function readCgroup(opts?: {
 		memoryMax: parseMemoryMax(file("memory.max")),
 		memoryEvents: parseMemoryEvents(file("memory.events")),
 		lock: readLock(opts?.lockPath ?? MUTATION_LOCK_PATH),
+		runs: opts?.runs ? readRunUsage(opts.runs, opts.procRoot) : [],
 	};
 }
 
@@ -243,6 +331,22 @@ export function parseCgroupReading(body: unknown): CgroupReading | null {
 		if (!isCount(e.max) || !isCount(e.oom) || !isCount(e.oomKill)) return null;
 		memoryEvents = { max: e.max, oom: e.oom, oomKill: e.oomKill };
 	}
+	const runs: RunUsage[] = [];
+	// A worker image older than the runs field omits it during a rolling update: no turns then.
+	if (b.runs !== undefined) {
+		if (!Array.isArray(b.runs)) return null;
+		for (const entry of b.runs as unknown[]) {
+			if (typeof entry !== "object" || entry === null) return null;
+			const u = entry as Unchecked<RunUsage>;
+			if (
+				typeof u.id !== "string" ||
+				!isCount(u.memBytes) ||
+				!isCount(u.cpuUsec)
+			)
+				return null;
+			runs.push({ id: u.id, memBytes: u.memBytes, cpuUsec: u.cpuUsec });
+		}
+	}
 	if (typeof b.lock !== "object" || b.lock === null) return null;
 	const l = b.lock as Unchecked<CgroupReading["lock"]>;
 	if (
@@ -259,6 +363,7 @@ export function parseCgroupReading(body: unknown): CgroupReading | null {
 		memoryMax: b.memoryMax,
 		memoryEvents,
 		lock: { exists: l.exists, pid: l.pid, alive: l.alive },
+		runs,
 	};
 }
 
@@ -294,6 +399,9 @@ export interface LiveRun {
 	id: string;
 	runner: string;
 	progress: string | null;
+	/** The worker run id (WorkerRequest.id) the worker's `runs` report it by; null for a
+	 * server (local or merge) run. */
+	runId: string | null;
 }
 
 export interface SystemSampler {
@@ -427,6 +535,42 @@ interface RunnerState {
 	history: SystemPoint[];
 	/** memory.events readings of the last hour, oldest first. */
 	events: { at: number; max: number; oomKill: number }[];
+	/** The latest sample of each run the worker reported, by worker run id. */
+	runs: Map<string, RunSample>;
+}
+
+/** One run's latest RunUsage plus what the next sample needs: the CPU delta base and the peak. */
+interface RunSample {
+	at: number;
+	cpuUsec: number;
+	usage: TurnUsage;
+}
+
+/** The run samples of a reachable tick: cpuPct against the same run's previous sample, the
+ *  peak the highest memory seen. Runs the reading no longer lists drop out. */
+function sampleRuns(
+	prev: ReadonlyMap<string, RunSample>,
+	reading: CgroupReading,
+): Map<string, RunSample> {
+	const out = new Map<string, RunSample>();
+	for (const u of reading.runs) {
+		const before = prev.get(u.id);
+		const cpuPct = cpuPercent(
+			before ? { at: before.at, cpuUsageUsec: before.cpuUsec } : null,
+			{ at: reading.at, cpuUsageUsec: u.cpuUsec },
+		);
+		out.set(u.id, {
+			at: reading.at,
+			cpuUsec: u.cpuUsec,
+			usage: {
+				mem: u.memBytes,
+				memPeak: Math.max(before?.usage.memPeak ?? 0, u.memBytes),
+				cpuPct,
+				cpuSec: u.cpuUsec / 1e6,
+			},
+		});
+	}
+	return out;
 }
 
 export function createSystemSampler(): SystemSampler {
@@ -444,7 +588,8 @@ export function createSystemSampler(): SystemSampler {
 		const events = keepWindow(prev?.events ?? [], tick - HOUR_MS);
 		if (reading === null) {
 			// An outage: a gap point, and no previous reading for the next CPU delta, so the
-			// first CPU after it spans one tick, not the whole outage.
+			// first CPU after it spans one tick, not the whole outage. The run samples stay, so
+			// a turn's peak survives the outage.
 			return {
 				latest: null,
 				cpuPct: null,
@@ -456,6 +601,7 @@ export function createSystemSampler(): SystemSampler {
 					mem: null,
 				}),
 				events,
+				runs: prev?.runs ?? new Map(),
 			};
 		}
 		const cpuPct = cpuPercent(prev?.latest ?? null, reading);
@@ -476,6 +622,7 @@ export function createSystemSampler(): SystemSampler {
 				mem: reading.memoryCurrent,
 			}),
 			events,
+			runs: sampleRuns(prev?.runs ?? new Map(), reading),
 		};
 	};
 
@@ -487,12 +634,25 @@ export function createSystemSampler(): SystemSampler {
 	): ContainerRow => {
 		const r = s.latest;
 		const history = s.history.filter((p) => p.at >= now - HOUR_MS);
-		const cards = runs.filter((run) => run.runner === name);
-		const lock = rowLock(r?.lock ?? null, cards);
+		const live = runs.filter((run) => run.runner === name);
+		const lock = rowLock(r?.lock ?? null, live);
+		const cards: SystemTurn[] = live
+			.map((c) => ({
+				project: c.project,
+				id: c.id,
+				// Usage only from a reachable row's own samples: a server run has no runId.
+				usage:
+					r !== null && c.runId !== null
+						? (s.runs.get(c.runId)?.usage ?? null)
+						: null,
+			}))
+			// Largest memory first; mem is never negative, so -1 sorts the turns without usage
+			// last, and the stable sort keeps them in board order.
+			.sort((a, b) => (b.usage?.mem ?? -1) - (a.usage?.mem ?? -1));
 		const base = {
 			name,
 			history,
-			cards: cards.map((c) => ({ project: c.project, id: c.id })),
+			cards,
 			lock,
 		};
 		if (r === null)

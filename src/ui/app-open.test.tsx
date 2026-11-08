@@ -2,7 +2,13 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import type { ProjectView, StateResponse, TaskCard } from "../types.ts";
+import type {
+	ContainerRow,
+	ProjectView,
+	StateResponse,
+	SystemSnapshot,
+	TaskCard,
+} from "../types.ts";
 
 // Storage must exist before the import: app.tsx reads sessionStorage at module
 // load. The DOM globals register after the import instead — app.tsx auto-renders
@@ -473,6 +479,79 @@ test("a failed mark-unread rolls back: the card counts as read again", async () 
 	} finally {
 		state.tasks.pop();
 		state.seenAnswers = [];
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+// --- System view ---------------------------------------------------------------
+
+test("the System view's Turns cell shows each worker turn's memory and CPU", async () => {
+	const worker: ContainerRow = {
+		name: "worker-a",
+		reachable: true,
+		unreachableSince: null,
+		cpuPct: 90,
+		cpuShare: 4,
+		memUsed: 4 * 1024 ** 3,
+		memLimit: 8 * 1024 ** 3,
+		memMaxHits: 0,
+		oomKills: 0,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [
+			{
+				project: "alpha",
+				id: "AL-1",
+				usage: {
+					mem: 2.5 * 1024 ** 3,
+					memPeak: 3 * 1024 ** 3,
+					cpuPct: 87.4,
+					cpuSec: 150,
+				},
+			},
+			// A run the worker did not report yet: the link alone, no usage line.
+			{ project: "beta", id: "BE-1", usage: null },
+		],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [worker] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("ul.sys-turns") !== null);
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items.map((li) => li.querySelector("a")?.textContent)).toEqual([
+			"AL-1",
+			"BE-1",
+		]);
+		expect(items[0]?.querySelector(".sys-sub")?.textContent).toBe(
+			"2.5 GiB · peak 3.0 GiB · 87 % CPU · 3 min CPU time",
+		);
+		expect(items[1]?.querySelector(".sys-sub")).toBeNull();
+	} finally {
 		host.fetch = realFetch;
 		await unmountApp();
 	}

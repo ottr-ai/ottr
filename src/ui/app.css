@@ -4515,6 +4515,22 @@ dialog.confirm-dialog {
 .sys-cards + .sys-cards {
 	margin-top: 4px;
 }
+/* The Turns cell: one turn per item, its usage line under the link; the line wraps on a
+ * narrow screen instead of widening the table. */
+.sys-turns {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.sys-turns .sys-sub {
+	display: block;
+}
+.sys-turns .sys-sub > span {
+	white-space: nowrap;
+}
 /* The VM CPU readout: the chart beside the %, inside the value cell. */
 .sys-metric-inline {
 	flex-direction: row;

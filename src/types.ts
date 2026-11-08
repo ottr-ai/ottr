@@ -1179,6 +1179,21 @@ export interface CgroupReading {
 	/** `<os.tmpdir()>/ott-stryker.lock`: exists, the pid it holds (null when unparsable), and
 	 *  whether that pid is alive (EPERM counts as alive). */
 	lock: { exists: boolean; pid: number | null; alive: boolean };
+	/** The live turns of this container by their worker run id (WorkerRequest.id), one entry per
+	 *  run whose process tree /proc could read. The server reads no turns of its own: [] there. */
+	runs: RunUsage[];
+}
+
+/** One turn's process tree (the omp process and every descendant) as /proc shows it now. */
+export interface RunUsage {
+	/** The worker run id (WorkerRequest.id). */
+	id: string;
+	/** Sum of Pss (smaps_rollup) in bytes: shared pages are split between the processes that
+	 *  map them, so the turns of one container add up instead of counting a page twice. */
+	memBytes: number;
+	/** CPU time of the tree since the turn started: utime + stime of each live process, plus
+	 *  cutime + cstime (the exited children it waited for). */
+	cpuUsec: number;
 }
 
 /** One 30 s sample of a System row's history; null fields are a gap (unreachable, unreadable). */
@@ -1193,6 +1208,24 @@ export interface SystemPoint {
 export interface SystemCard {
 	project: string;
 	id: string;
+}
+
+/** One live turn's share of its container, from RunUsage samples. */
+export interface TurnUsage {
+	/** Memory now in bytes (RunUsage.memBytes). */
+	mem: number;
+	/** Highest mem of the 30 s samples since the board first saw this turn. */
+	memPeak: number;
+	/** CPU in percent of one CPU since the previous sample; null on the first sample. */
+	cpuPct: number | null;
+	/** CPU time of the turn's process tree since it started, in seconds. */
+	cpuSec: number;
+}
+
+/** A live turn in the System view. usage null = no sample: a server turn, an unreachable
+ *  worker, or a run the worker did not report (yet). */
+export interface SystemTurn extends SystemCard {
+	usage: TurnUsage | null;
 }
 
 /** One container in the System view: the server, then each OTTR_WORKER_URLS worker. */
@@ -1218,8 +1251,9 @@ export interface ContainerRow {
 	oomKillsHour: number | null;
 	/** Last hour, oldest first, at most 120 points. */
 	history: SystemPoint[];
-	/** The board's live runs on this container (merge and local turns count as "server"). */
-	cards: SystemCard[];
+	/** The board's live runs on this container (merge and local turns count as "server"),
+	 *  the largest memory first; turns without usage last, in board order. */
+	cards: SystemTurn[];
 	/** holderPid null = free (no lock file, or its holder is dead). holderCard: the one live
 	 *  run here whose progress is Stryker running, when exactly one is. waiters: live runs
 	 *  here whose progress is "Stryker waiting for the mutation lock". */

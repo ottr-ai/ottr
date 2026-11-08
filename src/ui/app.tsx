@@ -54,6 +54,7 @@ import {
 	type SystemSnapshot,
 	type TaskCard,
 	type TaskView,
+	type TurnUsage,
 	type TurnView,
 	UPDATE_HOLD_REASON,
 	type UpdateRow,
@@ -1150,6 +1151,23 @@ function gib(bytes: number): string {
 	return (bytes / 1024 ** 3).toFixed(1);
 }
 
+/** A turn's CPU time in the largest unit that keeps it short: "42 s", "17 min", "2.5 h". */
+function cpuTime(sec: number): string {
+	if (sec < 60) return `${Math.round(sec)} s`;
+	if (sec < 3600) return `${Math.round(sec / 60)} min`;
+	return `${(sec / 3600).toFixed(1)} h`;
+}
+
+/** A turn's usage line as figures that never break inside: the line wraps only between them. */
+function turnUsageParts(u: TurnUsage): string[] {
+	return [
+		`${gib(u.mem)} GiB`,
+		`peak ${gib(u.memPeak)} GiB`,
+		`${u.cpuPct === null ? "n/a" : `${Math.round(u.cpuPct)} %`} CPU`,
+		`${cpuTime(u.cpuSec)} CPU time`,
+	];
+}
+
 /** "15:04": the time of day for the System view's since and until stamps. */
 function clockTime(ms: number): string {
 	return new Date(ms).toLocaleTimeString(undefined, {
@@ -1327,7 +1345,8 @@ function SystemView({
 							<table className="sys">
 								<caption className="sr">
 									Containers: CPU and memory now and over the last hour, memory
-									limit hits, OOM kills, live turns and the mutation lock
+									limit hits, OOM kills, live turns with each turn's memory and
+									CPU, and the mutation lock
 								</caption>
 								<thead>
 									<tr>
@@ -1425,7 +1444,31 @@ function SystemView({
 													{c.cards.length === 0 ? (
 														<span className="sys-sub">none</span>
 													) : (
-														<span className="sys-cards">{links(c.cards)}</span>
+														// Largest memory first (the server's order): the turn to look at
+														// when the container runs full leads the list.
+														<ul className="sys-turns">
+															{c.cards.map((t) => (
+																<li key={`${t.project}/${t.id}`}>
+																	<SystemCardLink
+																		card={t}
+																		tasks={tasks}
+																		openTask={openTask}
+																	/>
+																	{t.usage !== null && (
+																		<span className="sys-sub">
+																			{turnUsageParts(t.usage).map(
+																				(part, i) => (
+																					<Fragment key={part}>
+																						{i > 0 && " · "}
+																						<span>{part}</span>
+																					</Fragment>
+																				),
+																			)}
+																		</span>
+																	)}
+																</li>
+															))}
+														</ul>
 													)}
 												</td>
 												<td data-label="Mutation lock">

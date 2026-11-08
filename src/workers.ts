@@ -144,6 +144,8 @@ export function serveWorker(opts: {
 	cgroupRoot?: string;
 	/** Only for tests: the mutation lock file GET /stats reads instead of tmpdir()/ott-stryker.lock. */
 	lockPath?: string;
+	/** Only for tests: the /proc tree GET /stats reads the runs' usage from instead of the real one. */
+	statsProcRoot?: string;
 }): Bun.Server<never> {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
@@ -197,12 +199,21 @@ export function serveWorker(opts: {
 				}
 			}
 			// The System view's per-container numbers: the worker reads its own cgroup, since
-			// the server's /proc sees only the whole Docker VM.
+			// the server's /proc sees only the whole Docker VM. Each live run's process tree
+			// (attached or detached) adds the turn's own share, keyed by the server's run id.
 			if (request.method === "GET" && url.pathname === "/stats") {
 				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
 					return new Response("unauthorized", { status: 401 });
+				const runs = [...active.values(), ...detached.values()].flatMap((e) =>
+					e.running && e.pid !== null ? [{ id: e.id, pid: e.pid }] : [],
+				);
 				return Response.json(
-					readCgroup({ root: opts.cgroupRoot, lockPath: opts.lockPath }),
+					readCgroup({
+						root: opts.cgroupRoot,
+						lockPath: opts.lockPath,
+						runs,
+						procRoot: opts.statsProcRoot,
+					}),
 				);
 			}
 			if (request.method === "POST" && url.pathname === "/sweep") {

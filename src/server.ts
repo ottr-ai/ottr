@@ -643,6 +643,7 @@ const app = createApp({
 				id: key.slice(slash + 1),
 				runner: e.url ? new URL(e.url).hostname : "server",
 				progress: e.progress ?? null,
+				runId: e.runId ?? null,
 			};
 		}),
 	claimedPids,

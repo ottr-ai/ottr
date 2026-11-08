@@ -58,7 +58,9 @@ with `docker stats` under load, then set about 2x the peak in the compose env fi
 the kernel stops a process in that container (OOM kill), not a process on the whole host.
 The board's **System** view (`/system`) shows each container's CPU, memory against its limit,
 memory limit hits and OOM kills from its own cgroup (workers report theirs on `GET /stats`),
-plus the Docker VM's CPU, load and free memory, over the last hour.
+plus the Docker VM's CPU, load and free memory, over the last hour. `GET /stats` also lists the
+memory (sum of Pss) and CPU time of each live turn's process tree, so the view shows which turn
+uses the container.
 
 ## Updates
 

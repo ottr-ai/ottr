@@ -920,6 +920,9 @@ interface RunHandle {
 	/** OTTR-454: the dispatched worker's url; absent for a local run. The turn engine
 	 * buckets live runs by it for GET /api/drain. */
 	url?: string;
+	/** The worker run id (WorkerRequest.id) the System view keys a turn's usage by; absent for
+	 * local and microVM runs. */
+	runId?: string;
 	done: Promise<RunResult>;
 	kill(): Promise<void>;
 	/** Id of the agent layer the run pinned at start; null when it ran the flat home. */
@@ -1527,9 +1530,11 @@ export function startRun(o: {
 		base: workerBase,
 		stripBoard: o.stripBoard,
 	});
+	// One id for the request and the handle: the worker's GET /stats reports usage by it.
+	const runId = crypto.randomUUID();
 	const workerHandle = runWorker(
 		{
-			id: crypto.randomUUID(),
+			id: runId,
 			argv: buildOmpArgs({ ...o, memoryConfig }),
 			cwd: o.cwd,
 			stdin: o.prompt,
@@ -1546,6 +1551,7 @@ export function startRun(o: {
 		pid: null,
 		// OTTR-454: the turn engine buckets live runs by this url for GET /api/drain.
 		url: workerHandle.url,
+		runId,
 		done: workerHandle.done
 			// The worker's own pid is in its container namespace; only the wall duration is local.
 			.then((r) => {
