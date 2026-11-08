@@ -2107,7 +2107,7 @@ function ModelField({
 				rows={
 					catalog === null
 						? []
-						: modelRows(models, catalog.roles ?? null, model, modelQuery)
+						: modelRows(allModels, catalog.roles ?? null, model, modelQuery)
 				}
 				shown={models.length}
 				total={allModels.length}

@@ -423,13 +423,22 @@ test("modelRows sets no divider when models is empty", () => {
 	);
 });
 
-test("modelRows query filters role rows case-insensitively but not catalog rows", () => {
+test("modelRows query filters role rows and catalog rows case-insensitively", () => {
 	const rows = modelRows(models, { slow: "Z/SLOW" }, "", "slow");
-	expect(rows.map((r) => r.key)).toEqual([
-		"role-default",
-		"role-Z/SLOW",
-		"a/smol",
-		"z/fast",
+	expect(rows.map((r) => r.key)).toEqual(["role-default", "role-Z/SLOW"]);
+});
+
+test("modelRows resolves role labels against the full catalog while the query filters the catalog section", () => {
+	const rows = modelRows(
+		[m("zai/glm-5.3-flash", "GLM-5.3-Flash"), m("x/fast", "Fast")],
+		{ default: "zai/glm-5.3-flash:max" },
+		"",
+		"fa",
+	);
+	// "fa" matches only the Fast catalog row, yet the default row keeps its display name.
+	expect(rows.map((r) => r.label)).toEqual([
+		"GLM-5.3-Flash max (default)",
+		"Fast (x/fast)",
 	]);
 });
 

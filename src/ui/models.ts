@@ -238,10 +238,10 @@ export type ModelRow = {
 /** Picker list data: the models omp roles use first, model first with its roles in braces
     (e.g. "zai/glm-5.3-flash (plan, smol)"), one row per model even when several roles share it;
     a divider; then the catalog grouped under provider headings — groups alphabetical, models
-    alphabetical inside each group. The first row runs on omp's default model
-    (empty selector, so the task follows a later default change); roles that share the default
-    model join that row. Catalog rows are NOT query-filtered here — the caller pre-filters with
-    modelMatches. */
+    alphabetical inside each group, filtered by `query` with modelMatches. The first row runs
+    on omp's default model (empty selector, so the task follows a later default change); roles
+    that share the default model join that row. Role labels always resolve against the full
+    `models` catalog, so a role row keeps its display name while the search hides its model. */
 export function modelRows(
 	models: readonly ModelOption[],
 	roles: Record<string, string> | null,
@@ -285,7 +285,9 @@ export function modelRows(
 	// alphabetical inside each group, the first row of each group carries the provider
 	// heading, and the section's first row keeps the roles divider.
 	const grouped = new Map<string, ModelRow[]>();
-	for (const m of [...models].sort((a, b) => a.name.localeCompare(b.name))) {
+	for (const m of [...models]
+		.filter((m) => modelMatches(m, query))
+		.sort((a, b) => a.name.localeCompare(b.name))) {
 		const slash = m.selector.indexOf("/");
 		const provider = slash === -1 ? m.selector : m.selector.slice(0, slash);
 		grouped.set(provider, [
