@@ -766,7 +766,10 @@ export function seedDemo(
 		);
 	}
 	// A running card must read as just-restarted on every boot, a fresh seed included.
-	refreshLive(root, reseed ? POOL.map((p) => p.name) : marker!.projects);
+	refreshLive(
+		root,
+		reseed ? POOL.map((p) => p.name) : (marker?.projects ?? []),
+	);
 	ensureAdmin(stateDir);
 }
 
