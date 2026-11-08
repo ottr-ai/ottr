@@ -368,7 +368,7 @@ Public hostnames need a login (first visit creates the admin user) or the API ke
 The commands are the same in bash and PowerShell:
 
 ```sh
-bun run check          # tsc, biome, boot smoke, license allowlist, scratch-image guard, UI-screenshot reminder
+bun run check          # tsc, biome, boot smoke, license allowlist, scratch-image guard, agent-data sync guard, UI-screenshot reminder
 bun test
 bun run test:mutation  # StrykerJS, five configs with break thresholds
 bun run audit:quality  # duplicate and dead code
