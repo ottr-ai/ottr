@@ -7969,6 +7969,36 @@ export function createApp(deps: AppDeps) {
 					}
 				}),
 		},
+		"/api/projects/:project/github/visibility": {
+			GET: (req) =>
+				api(req, async () => {
+					const e = deps.projects.get(req.params.project);
+					if (!e) return json({ error: "unknown project" }, 404);
+					if (e.github === null)
+						return json({ error: "project has no GitHub remote" }, 409);
+					const repo =
+						ownerRepo(`https://github.com/${e.github}.git`) ?? e.github;
+					try {
+						const r = await gh(["api", `repos/${repo}`], 30_000);
+						if (r.code !== 0)
+							return json(
+								{
+									error: `gh api repos/${repo} failed: ${r.stderr.trim().slice(0, 300)}`,
+								},
+								502,
+							);
+						const body = JSON.parse(r.stdout) as { private?: unknown };
+						if (typeof body.private !== "boolean")
+							return json(
+								{ error: "GitHub repo answer has no private field" },
+								502,
+							);
+						return json({ private: body.private });
+					} catch (err) {
+						return json({ error: errmsg(err) }, 502);
+					}
+				}),
+		},
 		"/api/projects/:project/tasks/:id/unmark-research": {
 			POST: (req) =>
 				api(req, async () => {

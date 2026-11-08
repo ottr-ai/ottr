@@ -4381,6 +4381,7 @@ function SaveTick({
  *  state catches up, and rolls back if the save fails. `sub` indents a dependent option. */
 function CheckRow({
 	name,
+	tag,
 	desc,
 	checked,
 	disabled,
@@ -4390,6 +4391,9 @@ function CheckRow({
 }: {
 	name: string;
 	desc: string;
+	/** A short muted pill after the name, e.g. "Not needed: private repo". Put the same fact
+	 *  in `desc` too: the pill is hidden from screen readers. */
+	tag?: string;
 	/** The saved value. */
 	checked: boolean;
 	disabled?: boolean;
@@ -4418,6 +4422,11 @@ function CheckRow({
 			<div className="alate-def-name">
 				<b>
 					<label htmlFor={id}>{name}</label>
+					{tag !== undefined && (
+						<span className="state-chip off" aria-hidden="true">
+							{tag}
+						</span>
+					)}
 					<SaveTick busy={s.busy} saved={s.saved} failed={s.failed} />
 				</b>
 				<span id={`${id}-desc`}>{desc}</span>
@@ -4463,20 +4472,30 @@ function SaveCard({
 	);
 }
 
-/** Updates chip: how many of the project's six automations are on (saved values, not the draft). */
-function updatesChip(s: ProjectView["settings"]): {
+/** Updates chip: how many of the Updates card's checkboxes are on (saved values, not the
+ *  draft). Friction filter counts only while Retro is on, as it is disabled otherwise. */
+export function updatesChip(s: ProjectView["settings"]): {
 	label: string;
 	tone: ChipTone;
 } {
-	const on = [
+	const retro = s.retroSince !== null;
+	const flags = [
 		s.holdUpdateMerges,
-		s.retroSince !== null,
+		retro,
+		retro && s.retroFilter,
 		s.forkResearch,
-		s.prReviews,
 		s.trendingScout,
+		s.prReviews,
+		s.prMode,
 		s.issueWatch,
-	].filter(Boolean).length;
-	return { label: `${on} of 6 on`, tone: on > 0 ? "ok" : "off" };
+		s.microVm,
+		s.pushSyncCommits,
+	];
+	const on = flags.filter(Boolean).length;
+	return {
+		label: `${on} of ${flags.length} on`,
+		tone: on > 0 ? "ok" : "off",
+	};
 }
 
 type SettingsCardProps = {
@@ -5088,6 +5107,34 @@ export function ProjectSettingsForm({
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const [marker, setMarker] = useState(project.settings.iconText ?? "");
 	const st = project.settings;
+	// Private repo: fork research, PR reviews and issue watch have no outside activity to watch.
+	// null = unknown (no remote, still loading, or the check failed); then no mark shows.
+	const [privateRepo, setPrivateRepo] = useState<boolean | null>(null);
+	useEffect(() => {
+		setPrivateRepo(null);
+		if (project.github === null) return;
+		let live = true;
+		const run = async (): Promise<void> => {
+			try {
+				const r = await unwrap<{ private: boolean }>(
+					await fetch(
+						`/api/projects/${encodeURIComponent(project.name)}/github/visibility`,
+					),
+				);
+				if (live) setPrivateRepo(r.private);
+			} catch {
+				// The mark is a hint only: an unknown visibility shows no mark.
+			}
+		};
+		void run();
+		return () => {
+			live = false;
+		};
+	}, [project.name, project.github]);
+	const privateTag =
+		privateRepo === true ? "Not needed: private repo" : undefined;
+	const privateNote = (what: string): string =>
+		privateRepo === true ? `Private repo: no outside ${what}. ` : "";
 	const [prefix, setPrefix] = useState(st.taskIdPrefix ?? "");
 	const icon = useInstantSave(act);
 	const markerSave = useInstantSave(act);
@@ -5613,7 +5660,8 @@ export function ProjectSettingsForm({
 						/>
 						<CheckRow
 							name="Fork research"
-							desc="Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval"
+							desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
+							tag={privateTag}
 							checked={st.forkResearch}
 							save={(v) => send({ forkResearch: v })}
 							act={act}
@@ -5627,7 +5675,8 @@ export function ProjectSettingsForm({
 						/>
 						<CheckRow
 							name="PR reviews"
-							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+							tag={privateTag}
 							checked={st.prReviews}
 							disabled={project.github === null && !st.prReviews}
 							save={(v) => send({ prReviews: v })}
@@ -5643,7 +5692,8 @@ export function ProjectSettingsForm({
 						/>
 						<CheckRow
 							name="Issue watch"
-							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+							desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+							tag={privateTag}
 							checked={st.issueWatch}
 							disabled={project.github === null && !st.issueWatch}
 							save={(v) => send({ issueWatch: v })}

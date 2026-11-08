@@ -9364,6 +9364,48 @@ describe("fork research routes", () => {
 		expect(unknown.status).toBe(404);
 	});
 
+	test("github visibility route: 404 unknown, 409 no remote", async () => {
+		const res = await get("/api/projects/p1/github/visibility");
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("project has no GitHub remote");
+		const unknown = await get("/api/projects/nope/github/visibility");
+		expect(unknown.status).toBe(404);
+		expect(await errorOf(unknown)).toBe("unknown project");
+	});
+
+	test("github visibility route reports the repo private flag and gh failures", async () => {
+		const p1 = projects.get("p1")!;
+		const ghProjects = new Map<string, Entry>([
+			["gv", { ...p1, name: "gv", github: "acme/widget" }],
+		]);
+		const calls: string[][] = [];
+		let answer = { code: 0, stdout: '{"private":true}', stderr: "" };
+		const m = mount({
+			projects: ghProjects,
+			gh: async (args) => {
+				calls.push(args);
+				return answer;
+			},
+		});
+		const url = "/api/projects/gv/github/visibility";
+		const on = await m.call(url);
+		expect(on.status).toBe(200);
+		expect(await on.json()).toEqual({ private: true });
+		expect(calls[0]).toEqual(["api", "repos/acme/widget"]);
+		answer = { code: 0, stdout: '{"private":false}', stderr: "" };
+		expect(await (await m.call(url)).json()).toEqual({ private: false });
+		answer = { code: 0, stdout: '{"name":"widget"}', stderr: "" };
+		const noField = await m.call(url);
+		expect(noField.status).toBe(502);
+		expect(await errorOf(noField)).toBe(
+			"GitHub repo answer has no private field",
+		);
+		answer = { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+		const failed = await m.call(url);
+		expect(failed.status).toBe(502);
+		expect(await errorOf(failed)).toContain("HTTP 404: Not Found");
+	});
+
 	test("forks/check refuses a project without a GitHub remote", async () => {
 		const res = await post("/api/projects/p1/forks/check", {});
 		expect(res.status).toBe(409);

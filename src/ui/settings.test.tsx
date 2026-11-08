@@ -23,6 +23,7 @@ import {
 	ProjectsOrderSection,
 	SessionSection,
 	SettingsPage,
+	updatesChip,
 } from "./settings.tsx";
 import { stamp } from "./time.ts";
 
@@ -1413,6 +1414,156 @@ describe("ProjectSettingsForm review counter", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+describe("Updates card", () => {
+	const settings = (
+		over: Partial<ProjectView["settings"]>,
+	): ProjectView["settings"] =>
+		({
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			trendingScout: false,
+			prReviews: false,
+			prMode: false,
+			issueWatch: false,
+			microVm: false,
+			pushSyncCommits: false,
+			...over,
+		}) as unknown as ProjectView["settings"];
+
+	test("the chip counts all ten checkboxes", () => {
+		expect(
+			updatesChip(
+				settings({
+					retroSince: 1,
+					retroFilter: true,
+					forkResearch: true,
+					trendingScout: true,
+					prReviews: true,
+					issueWatch: true,
+				}),
+			),
+		).toEqual({ label: "6 of 10 on", tone: "ok" });
+		expect(
+			updatesChip(
+				settings({
+					holdUpdateMerges: true,
+					prMode: true,
+					microVm: true,
+					pushSyncCommits: true,
+				}),
+			).label,
+		).toBe("4 of 10 on");
+	});
+
+	test("the friction filter does not count while retro is off", () => {
+		expect(updatesChip(settings({ retroFilter: true }))).toEqual({
+			label: "0 of 10 on",
+			tone: "off",
+		});
+	});
+
+	const TAG = "Not needed: private repo";
+	const project = (): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github: "octo/repo",
+			vmRunner: { configured: false, ok: false, reason: "not set" },
+			hasRules: true,
+			gitless: false,
+			archReview: null,
+			settings: {
+				...settings({}),
+				maxParallel: 2,
+				copyExtra: [],
+				displayName: null,
+				releaseCommand: null,
+				archReviewCap: 30,
+				maxImages: 4,
+				keptWorktreeDays: 7,
+				autoTend: false,
+				autoTendLimit: 5,
+				tendChurnGlobs: [],
+				setupChecklist: false,
+				targetBranch: null,
+				originUrl: null,
+			},
+		}) as unknown as ProjectView;
+
+	const json = (status: number, body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	/** Renders the form with the visibility route answering `visibility`; returns the names
+	 *  of the rows that show the private-repo tag. */
+	async function taggedRows(visibility: Response): Promise<string[]> {
+		const fetchMock = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/github/visibility"))
+				return visibility;
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return json(200, { own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSettingsForm
+						project={project()}
+						tasks={[]}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						openTask={() => {}}
+					/>,
+				);
+			});
+			await act(async () => {
+				const settled = Promise.withResolvers<void>();
+				setTimeout(settled.resolve, 0);
+				await settled.promise;
+			});
+			return [
+				...container.querySelectorAll("#project-updates-section .check-row"),
+			]
+				.filter((row) => row.textContent?.includes(TAG))
+				.map((row) => row.querySelector("label")?.textContent ?? "");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	}
+
+	test("a private repo marks fork research, PR reviews and issue watch", async () => {
+		expect(await taggedRows(json(200, { private: true }))).toEqual([
+			"Fork research",
+			"PR reviews",
+			"Issue watch",
+		]);
+	});
+
+	test("a public repo or an unknown visibility marks nothing", async () => {
+		expect(await taggedRows(json(200, { private: false }))).toEqual([]);
+		expect(await taggedRows(json(502, { error: "gh failed" }))).toEqual([]);
 	});
 });
 

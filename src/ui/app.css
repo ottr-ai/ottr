@@ -7747,6 +7747,13 @@ button.log-mode[aria-pressed="true"] {
 .check-row > input:disabled + .alate-def-name label {
 	cursor: default;
 }
+/* A muted pill after a row's name, e.g. "Not needed: private repo". */
+.check-row .alate-def-name b .state-chip {
+	margin-left: 8px;
+	font-weight: 400;
+	font-size: 11.5px;
+	vertical-align: 1px;
+}
 /* A dependent option hangs under its parent: one indent in, no rule between them. */
 .settings-sec .alate-def-row.check-row:has(+ .check-sub) {
 	border-bottom: none;
