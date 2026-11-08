@@ -7280,6 +7280,12 @@ button.log-mode[aria-pressed="true"] {
 	/* Flex margins add up: 8px here plus Meta's 10px keep the old 18px step. */
 	margin: 8px 0 10px;
 }
+/* The danger actions sit apart on the row's left edge; the constructive cluster
+   stays right, the same grammar as a dialog footer's image picker. */
+.drawer-actions .danger {
+	margin-right: auto;
+	order: -1;
+}
 .meta {
 	display: flex;
 	flex-direction: column;
