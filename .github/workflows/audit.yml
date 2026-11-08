@@ -149,7 +149,7 @@ jobs:
           persist-credentials: false
       - name: Install Opengrep (checksum-verified binary)
         run: |
-          curl -fsSLo /tmp/opengrep \
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLo /tmp/opengrep \
             https://github.com/opengrep/opengrep/releases/download/v1.33.1/opengrep_manylinux_x86
           echo "$OPENGREP_SHA256  /tmp/opengrep" | sha256sum -c -
           chmod +x /tmp/opengrep
@@ -180,7 +180,7 @@ jobs:
       - run: docker build -t ottr-worker:audit -f Dockerfile.worker .
       - name: Install Trivy (checksum-verified tarball)
         run: |
-          curl -fsSLo /tmp/trivy.tar.gz \
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLo /tmp/trivy.tar.gz \
             https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz
           echo "$TRIVY_SHA256  /tmp/trivy.tar.gz" | sha256sum -c -
           tar -xzf /tmp/trivy.tar.gz -C /tmp
