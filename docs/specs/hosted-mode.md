@@ -113,10 +113,25 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
   - The call fails: the card goes back to `queued` with `holdUntil` 60 seconds later and a
     reason that says the credit check failed. The scheduler tries again after the hold.
 - Mid-turn stop: the control plane calls `POST /api/hosted/stop` on the tenant (role
-  `control`). The board stops every running turn with `stopTurn` behavior: the agent stops,
-  the worktree, branch, and omp session stay, and the card parks `needs_you` with the credit
-  reason. The answer is `{"stopped": <count>}`. A second-model check run that is in progress
-  at that time is not stopped: `stopTurn` cannot stop it either.
+  `control`). The board stops these turns (`creditStop`, `src/turn.ts`):
+  - A running work or merge run: `stopTurn` behavior. The agent stops, the worktree, branch,
+    and omp session stay, and the card parks `needs_you` with the credit reason.
+  - A running second-model check run (the work check or the review findings check): the
+    board kills it. The check does not start its second attempt, and the card parks
+    `needs_you` with the credit reason. The worktree, branch, and omp session stay.
+  - A turn between its claim and its run (title, worktree, packages), or between its run and
+    its check: the board marks the turn. At its next model dispatch point, the turn starts no
+    model and the card parks `needs_you` with the credit reason.
+
+  The answer is `{"stopped": <count>}`, with all three types in the count. After the credit
+  park, no later write of the turn changes the reason or puts the card back in the queue. A
+  marked turn that settles before a dispatch point (for example, its run ended before the
+  kill) settles with its own outcome.
+- Credit hold: the stop also sets a hold for the board. While the hold is set, no turn starts
+  a model run: before each work or merge run, each check attempt (also the second attempt),
+  and each title call, a turn that sees the hold parks `needs_you` with the credit reason. A
+  gate call that starts after the stop and answers `ok: true` clears the hold. A gate answer
+  from a call that started before the stop does not clear it.
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.

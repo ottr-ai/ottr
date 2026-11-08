@@ -5,6 +5,7 @@ import {
 	DEFAULT_CREDIT_REASON,
 	type HostedConfig,
 	readHostedConfig,
+	takeHostedConfig,
 } from "./hosted.ts";
 
 const SECRET = "s".repeat(32);
@@ -149,5 +150,31 @@ describe("controlPlaneHooks", () => {
 		await expect(
 			fake(() => Response.json({ token: "" })).hooks.gitToken("app", "r"),
 		).rejects.toThrow("token");
+	});
+});
+
+describe("takeHostedConfig", () => {
+	test("returns the config and removes the secret from env", () => {
+		const env: Record<string, string | undefined> = { ...BASE };
+		expect(takeHostedConfig(env)?.secret).toBe(SECRET);
+		expect("OTTR_HOSTED_SECRET" in env).toBe(false);
+		expect(env.OTTR_HOSTED_TENANT).toBe("t-1");
+	});
+
+	test("flag off: returns null and still removes a stray secret", () => {
+		const env: Record<string, string | undefined> = {
+			OTTR_HOSTED_SECRET: SECRET,
+		};
+		expect(takeHostedConfig(env)).toBeNull();
+		expect("OTTR_HOSTED_SECRET" in env).toBe(false);
+	});
+
+	test("invalid env: throws and still removes the secret", () => {
+		const env: Record<string, string | undefined> = {
+			...BASE,
+			OTTR_HOSTED_CONTROL_URL: "",
+		};
+		expect(() => takeHostedConfig(env)).toThrow("OTTR_HOSTED_CONTROL_URL");
+		expect("OTTR_HOSTED_SECRET" in env).toBe(false);
 	});
 });

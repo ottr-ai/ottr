@@ -59,6 +59,23 @@ export function readHostedConfig(
 	};
 }
 
+/** The env name of the identity-signing key; a holder forges owner/control/tenant headers. */
+export const HOSTED_SECRET_ENV = "OTTR_HOSTED_SECRET";
+
+/**
+ * The boot read: readHostedConfig, then the secret leaves env (always, also on flag off or a
+ * throw), so no child process the server spawns later can inherit it.
+ */
+export function takeHostedConfig(
+	env: Record<string, string | undefined> = process.env,
+): HostedConfig | null {
+	try {
+		return readHostedConfig(env);
+	} finally {
+		delete env[HOSTED_SECRET_ENV];
+	}
+}
+
 /** https only, except plain http to a loopback host (tests, a same-machine control plane). */
 function controlUrl(raw: string): string {
 	if (raw === "") throw new Error("OTTR_HOSTED_CONTROL_URL must be set");

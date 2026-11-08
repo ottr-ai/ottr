@@ -14,7 +14,7 @@ import { defaultSshDir } from "./gitHosts.ts";
 import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { controlPlaneHooks, type Hosted, readHostedConfig } from "./hosted.ts";
+import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
 import { orphanPids } from "./orphans.ts";
@@ -109,7 +109,7 @@ const PUBLIC_HOSTS = publicHosts();
  * Hosted mode (docs/specs/hosted-mode.md): null on every self-hosted board, and then no hosted hook
  * exists. A half-set hosted env throws here and stops the boot.
  */
-const HOSTED = readHostedConfig();
+const HOSTED = takeHostedConfig();
 const hosted: Hosted | undefined =
 	HOSTED === null
 		? undefined

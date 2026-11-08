@@ -898,8 +898,9 @@ export interface TurnLoop {
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
-	/** Hosted mode: stops every running turn like stopTurn, parks each card with the credit
-	 * reason, and resolves to the number stopped. */
+	/** Hosted mode: sets the credit hold and stops every turn in flight (work or merge runs like
+	 * stopTurn, check runs, turns before their run), parks each card with the credit reason, and
+	 * resolves to the number stopped. */
 	creditStop(): Promise<number>;
 	finishKept(
 		e: TurnProject,
@@ -984,6 +985,8 @@ export function createTurnLoop(
 		log: (line: string) => void,
 	): Promise<boolean> {
 		let ok: boolean;
+		// A gate call that started before a creditStop must not clear that stop's hold.
+		const stopsBefore = creditStops;
 		let failure: string | null = null;
 		try {
 			ok = await hosted.hooks.creditOk();
@@ -991,7 +994,10 @@ export function createTurnLoop(
 			ok = false;
 			failure = errmsg(err);
 		}
-		if (ok) return true;
+		if (ok) {
+			if (stopsBefore === creditStops) creditHold = false;
+			return true;
+		}
 		const cur = store.getTask(claimed.id);
 		if (cur === null || cur.cancelledAt !== null || cur.state !== "preparing")
 			return false;
@@ -1042,6 +1048,16 @@ export function createTurnLoop(
 	 * settle, so a kill from stopTurn settles the card as stopped instead of leaving it to
 	 * cancelTask. */
 	const stopping = new Map<string, string>();
+	/** Hosted credit hold (docs/specs/hosted-mode.md section 5): creditStop sets it, and only a
+	 * gate's creditOk() call that started after the last creditStop and answered true clears it.
+	 * While it is set, no hosted model run starts. */
+	let creditHold = false;
+	/** The number of creditStop calls, so a gate answer older than a stop keeps the hold. */
+	let creditStops = 0;
+	/** Turns ("project/id") that creditStop stopped: a work or merge run, a check run, or a turn
+	 * in its prepare or settle awaits. The turn parks with the credit reason at its next model
+	 * dispatch point or check settle; the key's next claim clears the mark. */
+	const creditStopped = new Set<string>();
 	/** Release cards whose irreversible publish has begun, from the fresh no-cancel check in
 	 * publishReleaseCard to the caller's final card write: cancel refuses these keys, so a
 	 * cancel can neither lose to the tag/push nor be overwritten by "Released". */
@@ -1701,6 +1717,10 @@ export function createTurnLoop(
 					github: e.github,
 					archReview,
 					originUrl: settings.originUrl,
+					// Hosted: gh takes the project's minted token, never GH_TOKEN.
+					...(ops.hosted !== undefined && {
+						gh: await hostedGh(e.path, settings.originUrl),
+					}),
 				});
 			} else {
 				// Outside the worktree: the command may refuse a dirty tree.
@@ -1921,6 +1941,9 @@ export function createTurnLoop(
 			asked: null,
 		});
 		preparing.add(key);
+		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
+		// (a stop from now on marks it again, and the hold covers the gap until the gate).
+		creditStopped.delete(key);
 		const log = (line: string) => appendLog(store, id, line);
 		let turn: Turn | null = null;
 		/** This run's slot in `running`; null until startRun returns (the catch/finally may run early). */
@@ -1933,6 +1956,25 @@ export function createTurnLoop(
 		const meter = (role: string, r: RunResult) => {
 			if (ops.hosted !== undefined)
 				metered.push({ role, model: r.model, usage: r.usage ?? NO_USAGE });
+		};
+		/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
+		 * hold or this turn's creditStop mark forbids the next model run. The card then parks
+		 * needs_you with the credit reason, unless a cancel or another park already owns it. */
+		const creditBlocked = (): boolean => {
+			if (ops.hosted === undefined) return false;
+			if (!creditHold && !creditStopped.has(key)) return false;
+			log("- model run not started: the board is out of credit");
+			const cur = store.getTask(id);
+			if (
+				cur !== null &&
+				cur.cancelledAt === null &&
+				(cur.state === "preparing" || cur.state === "running")
+			)
+				store.updateTask(id, {
+					state: "needs_you",
+					needsReason: ops.hosted.config.wording.creditReason,
+				});
+			return true;
 		};
 		try {
 			if (
@@ -1984,6 +2026,8 @@ export function createTurnLoop(
 				const named = store.sessionTitle(task);
 				if (named !== null) sessionName = named;
 				else {
+					// The title is a model call: a credit stop in the prepare above ends here.
+					if (creditBlocked()) return;
 					let cause = "unknown failure";
 					const gen = await (ops.genTitle ?? generateTitle)(
 						task.prompt,
@@ -2462,6 +2506,9 @@ export function createTurnLoop(
 				: await usageResetFor(
 						runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
 					);
+			// The last await before the spawn: a credit stop that landed in any prepare await parks
+			// the card here, before the usage-limit hold could requeue it or omp could start.
+			if (creditBlocked()) return;
 			if (userOverride)
 				log("- user message queued: the usage-limit start gate does not hold");
 			if (startHold !== null) {
@@ -2487,6 +2534,7 @@ export function createTurnLoop(
 			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
 			const runStartedAt = Date.now();
 			const handle = ops.startRun({
+				meter: ops.hosted !== undefined,
 				cwd: wt,
 				prompt,
 				images: imagePaths,
@@ -4223,8 +4271,11 @@ export function createTurnLoop(
 					let hold: UsageHold | null = null;
 					let limitHit = false;
 					for (let attempt = 1; attempt <= 2; attempt++) {
+						// Hosted: no check attempt starts under a credit stop, the retry included.
+						if (creditBlocked()) return;
 						const startedAt = Date.now();
 						const handle = ops.startRun({
+							meter: ops.hosted !== undefined,
 							cwd: wt,
 							prompt: input,
 							sessionDir: store.sessionsDir,
@@ -4251,6 +4302,8 @@ export function createTurnLoop(
 							return;
 						}
 						running.delete(checkKey);
+						// A creditStop killed this check: park with the credit reason, no retry.
+						if (creditBlocked()) return;
 						checkMs += Date.now() - startedAt;
 						const err = checkRunError(checkResult);
 						if (err === null) {
@@ -4483,8 +4536,11 @@ export function createTurnLoop(
 						let hold: UsageHold | null = null;
 						let limitHit = false;
 						for (let attempt = 1; attempt <= 2; attempt++) {
+							// Hosted: no check attempt starts under a credit stop, the retry included.
+							if (creditBlocked()) return;
 							const startedAt = Date.now();
 							const handle = ops.startRun({
+								meter: ops.hosted !== undefined,
 								cwd: wt,
 								prompt: input,
 								sessionDir: store.sessionsDir,
@@ -4514,6 +4570,8 @@ export function createTurnLoop(
 								return;
 							}
 							running.delete(checkKey);
+							// A creditStop killed this check: park with the credit reason, no retry.
+							if (creditBlocked()) return;
 							checkMs += Date.now() - startedAt;
 							const err = checkRunError(checkResult);
 							if (err === null) {
@@ -4732,7 +4790,10 @@ export function createTurnLoop(
 			// An abandoned run's claim was already deleted by the sweep and may belong to the
 			// resumed replacement now; deleting it here would free the replacement's cap slot.
 			// A taken-over check is the same case: the sweep deleted this run's claim.
-			if (!entry?.abandoned && !checkTakenOver) preparing.delete(key);
+			if (!entry?.abandoned && !checkTakenOver) {
+				preparing.delete(key);
+				creditStopped.delete(key);
+			}
 			publishing.delete(key);
 			// Settle is done: report each run's usage, also of a stopped or failed run.
 			if (ops.hosted !== undefined && turn !== null)
@@ -4801,18 +4862,21 @@ export function createTurnLoop(
 	}
 
 	/** Hosted mode (docs/specs/hosted-mode.md section 5): the control plane's mid-turn stop at
-	 * zero credit. Every turn stopTurn can stop stops in parallel, and its card parks with the
-	 * credit reason. Resolves to the number stopped. */
+	 * zero credit. It sets the credit hold, then stops in parallel every work or merge run
+	 * (stopTurn), every running work or review check, and marks every turn in its prepare or
+	 * settle awaits. Each card parks with the credit reason. Resolves to the number stopped. */
 	async function creditStop(): Promise<number> {
 		const reason =
 			ops.hosted?.config.wording.creditReason ?? DEFAULT_CREDIT_REASON;
-		const stops: Promise<StopOutcome>[] = [];
+		// Before any await: from here on, no turn dispatches a model until a fresh gate answer.
+		creditHold = true;
+		creditStops += 1;
+		const stops: Promise<boolean>[] = [];
 		for (const e of projects.values()) {
 			try {
 				for (const t of e.store.listTasks()) {
-					const key = `${e.store.name}/${t.id}`;
-					if (running.has(key) || detached.has(key))
-						stops.push(stopTurn(e, t.id, reason));
+					const stop = creditStopTurn(e, t.id, reason);
+					if (stop !== null) stops.push(stop);
 				}
 			} catch (err) {
 				// One sick store must not keep the other projects' turns running.
@@ -4820,7 +4884,42 @@ export function createTurnLoop(
 			}
 		}
 		const outs = await Promise.all(stops);
-		return outs.filter((o) => "ok" in o).length;
+		return outs.filter(Boolean).length;
+	}
+
+	/** creditStop for one card: null when the card has no turn in flight, else resolves true
+	 * when the turn stopped. Every stopped turn gets the creditStopped mark. */
+	function creditStopTurn(
+		e: TurnProject,
+		id: string,
+		reason: string,
+	): Promise<boolean> | null {
+		const key = `${e.store.name}/${id}`;
+		if (running.has(key) || detached.has(key)) {
+			// The mark also covers a kill that raced a natural finish: no check follows.
+			creditStopped.add(key);
+			return stopTurn(e, id, reason).then((o) => "ok" in o);
+		}
+		const check =
+			running.get(`${key}:check`) ?? running.get(`${key}:workcheck`);
+		if (check !== undefined) {
+			// stopTurn sees only the unsuffixed key. The mark makes the killed check park the
+			// card with the credit reason instead of its second attempt.
+			creditStopped.add(key);
+			return (async () => {
+				await check.kill();
+				await Promise.race([
+					check.done.then(() => undefined),
+					new Promise<void>((r) => setTimeout(r, 15_000)),
+				]);
+				return true;
+			})();
+		}
+		// No run yet (title, git, packages) or between the run and its check: the turn parks at
+		// its next model dispatch point. A release publish (`settling`) starts no model.
+		if (!preparing.has(key) || settling.has(key)) return null;
+		creditStopped.add(key);
+		return Promise.resolve(true);
 	}
 
 	/**

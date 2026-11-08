@@ -663,7 +663,10 @@ export async function publishRelease(o: {
 	archReview?: { delta: number } | null;
 	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the push. */
 	originUrl: string | null;
+	/** gh runner for the release calls; hosted mode passes hostedGh's project-scoped client. */
+	gh?: typeof runGh;
 }): Promise<string> {
+	const gh = o.gh ?? runGh;
 	const parts: string[] = [];
 	// The release waits for its review's fixes, and the merge hold keeps every other card off the
 	// target, so the commits after `reviewed` are those fixes: the tag holds them, the notes list
@@ -732,12 +735,10 @@ export async function publishRelease(o: {
 		const repo = ownerRepo(o.github);
 		if (!repo)
 			throw new Error(`cannot read owner/name from GitHub remote ${o.github}`);
-		if (
-			(await runGh(["release", "view", o.version, "--repo", repo])).code === 0
-		) {
+		if ((await gh(["release", "view", o.version, "--repo", repo])).code === 0) {
 			parts.push(`GitHub release ${o.version} already exists`);
 		} else {
-			const c = await runGh([
+			const c = await gh([
 				"release",
 				"create",
 				o.version,
@@ -759,6 +760,13 @@ export async function publishRelease(o: {
 		}
 	}
 	return parts.join(", ");
+}
+
+function withoutHostedSecret(
+	env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+	const { OTTR_HOSTED_SECRET: _, ...rest } = env;
+	return rest;
 }
 
 /**
@@ -798,7 +806,8 @@ export async function runReleaseCommand(o: {
 			return Bun.spawn(argv, {
 				cwd: o.cwd,
 				env: {
-					...process.env,
+					// The hosted signing key never reaches the tenant's command (hosted-mode spec).
+					...withoutHostedSecret(process.env),
 					OTTR_RELEASE_VERSION: o.version,
 					OTTR_RELEASE_COMMIT: o.sha,
 					OTTR_RELEASE_NOTES_FILE: o.notesFile,

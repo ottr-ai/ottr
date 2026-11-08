@@ -17,6 +17,7 @@ import type {
 	MeteringRecord,
 	TokenUsage,
 } from "./hosted.ts";
+import { ARCH_REVIEW_MARKER } from "./prompts.ts";
 import { applyEvent, createRunSink, newEventState } from "./runner.ts";
 import { ProjectStore } from "./store.ts";
 import type { TurnOps, TurnProject } from "./turn.ts";
@@ -25,7 +26,7 @@ import {
 	CREDIT_RETRY_MS,
 	createTurnLoop,
 } from "./turn.ts";
-import type { Outcome, RunResult } from "./types.ts";
+import type { Outcome, RecordedFinding, RunResult } from "./types.ts";
 
 // ---- fakes -----------------------------------------------------------------
 
@@ -259,6 +260,7 @@ describe("hosted metering capture", () => {
 					cost: { input: 0.1, output: 0.2, total: 0.25 },
 				},
 			}),
+			true,
 		);
 		applyEvent(
 			s,
@@ -272,10 +274,11 @@ describe("hosted metering capture", () => {
 					cost: { total: 0.5 },
 				},
 			}),
+			true,
 		);
 		// Malformed: no usage object, a string, bad numbers, no cost, a user message.
-		applyEvent(s, end({ role: "assistant" }));
-		applyEvent(s, end({ role: "assistant", usage: "lots" }));
+		applyEvent(s, end({ role: "assistant" }), true);
+		applyEvent(s, end({ role: "assistant", usage: "lots" }), true);
 		applyEvent(
 			s,
 			end({
@@ -288,13 +291,23 @@ describe("hosted metering capture", () => {
 					cost: { total: "1" },
 				},
 			}),
+			true,
 		);
-		applyEvent(s, end({ role: "assistant", usage: { input: 1, cost: 3 } }));
+		applyEvent(
+			s,
+			end({ role: "assistant", usage: { input: 1, cost: 3 } }),
+			true,
+		);
 		applyEvent(
 			s,
 			end({ role: "user", usage: { input: 9999, cost: { total: 99 } } }),
+			true,
 		);
-		applyEvent(s, { type: "message_start", message: { role: "assistant" } });
+		applyEvent(
+			s,
+			{ type: "message_start", message: { role: "assistant" } },
+			true,
+		);
 		expect(s.usage).toEqual({
 			input: 151,
 			output: 30,
@@ -307,13 +320,21 @@ describe("hosted metering capture", () => {
 	test("a run sink puts the summed usage on its result, and leaves it out while omp reported none", () => {
 		const dir = mkdtempSync(join(tmpdir(), "hosted-sink-"));
 		dirs.push(dir);
-		const quiet = createRunSink({ logPath: join(dir, "a.log"), dataRoot: dir });
+		const quiet = createRunSink({
+			logPath: join(dir, "a.log"),
+			dataRoot: dir,
+			meter: true,
+		});
 		quiet.line(JSON.stringify(end({ role: "assistant" })));
 		expect(
 			"usage" in quiet.result({ exitCode: 0, killed: false, stderrTail: "" }),
 		).toBe(false);
 
-		const sink = createRunSink({ logPath: join(dir, "b.log"), dataRoot: dir });
+		const sink = createRunSink({
+			logPath: join(dir, "b.log"),
+			dataRoot: dir,
+			meter: true,
+		});
 		for (const n of [1, 2])
 			sink.line(
 				JSON.stringify(
@@ -332,6 +353,29 @@ describe("hosted metering capture", () => {
 		expect(
 			sink.result({ exitCode: 0, killed: false, stderrTail: "" }).usage,
 		).toEqual({ input: 3, output: 3, cacheRead: 3, cacheWrite: 3, cost: 3 });
+	});
+
+	test("without the meter flag, usage stays null and the sink result has no usage key", () => {
+		const usage = {
+			input: 5,
+			output: 5,
+			cacheRead: 5,
+			cacheWrite: 5,
+			cost: { total: 1 },
+		};
+		const s = newEventState();
+		applyEvent(s, end({ role: "assistant", usage }));
+		expect(s.usage).toBeNull();
+
+		const dir = mkdtempSync(join(tmpdir(), "hosted-sink-"));
+		dirs.push(dir);
+		const sink = createRunSink({ logPath: join(dir, "c.log"), dataRoot: dir });
+		sink.line(JSON.stringify(end({ role: "assistant", usage })));
+		sink.line(JSON.stringify(end({ role: "assistant", usage })));
+		expect(
+			"usage" in sink.result({ exitCode: 0, killed: false, stderrTail: "" }),
+		).toBe(false);
+		expect(sink.state.usage).toBeNull();
 	});
 });
 
@@ -655,6 +699,259 @@ describe("hosted credit stop", () => {
 		const { store, loop } = setup({ hosted });
 		store.createTask("work please");
 		await expect(loop.creditStop()).resolves.toBe(0);
+	});
+
+	/** Work or merge runs resolve `main` at once; each check run (check.yml) hangs until killed. */
+	function hangingChecks(main: RunResult) {
+		const runs: StartArgs[] = [];
+		const checks: { killed: boolean }[] = [];
+		const startRun = (o: StartArgs) => {
+			runs.push(o);
+			o.onSession?.("sess-1");
+			if (o.config?.endsWith("check.yml") !== true)
+				return { pid: 4242, done: Promise.resolve(main), kill: async () => {} };
+			const check = { killed: false };
+			checks.push(check);
+			const { promise, resolve } = Promise.withResolvers<RunResult>();
+			return {
+				pid: 4343,
+				done: promise,
+				kill: async () => {
+					check.killed = true;
+					resolve(runResult({ killed: true, sawTerminalEnd: false }));
+				},
+			};
+		};
+		return { runs, checks, startRun };
+	}
+
+	async function waitFor(cond: () => boolean) {
+		for (let i = 0; i < 200 && !cond(); i++) await flushPromises();
+		expect(cond()).toBe(true);
+	}
+
+	const readyRun = runResult({
+		model: "openai/gpt-6",
+		outcome: { status: "ready", summary: "did it" } satisfies Outcome,
+	});
+
+	test("creditStop kills a running work check: no second attempt, the card parks with the credit reason", async () => {
+		const { hosted } = fakeHosted();
+		const h = hangingChecks(readyRun);
+		const { store, record, loop } = setup({
+			hosted,
+			maxTotalRuns: () => 0,
+			targetSha: async () => "sha1",
+			workCheck: () => true,
+			modelRoles: () => ({
+				default: "fake/default-model",
+				adversary: "zai/glm-5.3-flash",
+			}),
+			startRun: h.startRun,
+		});
+		const task = store.createTask("work please");
+		const checkKey = `${store.name}/${task.id}:workcheck`;
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => loop.running.has(checkKey));
+
+		await expect(loop.creditStop()).resolves.toBe(1);
+		await run;
+
+		expect(h.checks).toEqual([{ killed: true }]);
+		// The work run and one check attempt: the killed check never retries.
+		expect(h.runs).toHaveLength(2);
+		expect(loop.running.has(checkKey)).toBe(false);
+		expect(record.removeWorktree).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+		expect(after.sessionId).toBe("sess-1");
+		expect(after.worktree).not.toBeNull();
+		expect(existsSync(after.worktree!)).toBe(true);
+		// No failed-check record: the stop is not a check verdict.
+		expect(after.workCheckLog).toEqual([]);
+	});
+
+	test("creditStop kills a running review check: no second attempt, nothing filed, the card parks with the credit reason", async () => {
+		const { hosted } = fakeHosted();
+		const finding: RecordedFinding = {
+			prompt: "Bug A",
+			model: null,
+			rank: 1,
+			security: null,
+		};
+		const h = hangingChecks(
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [finding],
+			}),
+		);
+		const { store, record, loop } = setup({
+			hosted,
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+			startRun: h.startRun,
+		});
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		const checkKey = `${store.name}/${review.id}:check`;
+		const run = loop.runTurn(store.name, review.id);
+		await waitFor(() => loop.running.has(checkKey));
+
+		await expect(loop.creditStop()).resolves.toBe(1);
+		await run;
+
+		expect(h.checks).toEqual([{ killed: true }]);
+		expect(h.runs).toHaveLength(2);
+		expect(loop.running.has(checkKey)).toBe(false);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
+			[],
+		);
+		const after = store.getTask(review.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
+	test("creditStop during the prepare parks the turn before any agent run starts", async () => {
+		const { hosted } = fakeHosted();
+		const prepare = Promise.withResolvers<void>();
+		let preparing = false;
+		const { store, record, loop } = setup({
+			hosted,
+			resolveTarget: async () => {
+				preparing = true;
+				await prepare.promise;
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => preparing);
+
+		await expect(loop.creditStop()).resolves.toBe(1);
+		prepare.resolve();
+		await run;
+
+		expect(record.runs).toHaveLength(0);
+		expect(store.listTurns(task.id)).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
+	test("a gate answer that started before the stop does not let the turn run", async () => {
+		const answer = Promise.withResolvers<boolean>();
+		const { hosted } = fakeHosted({ credit: () => answer.promise });
+		const { store, record, loop } = setup({ hosted });
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await flushPromises();
+		expect(store.getTask(task.id)!.state).toBe("preparing");
+
+		await expect(loop.creditStop()).resolves.toBe(1);
+		answer.resolve(true);
+		await run;
+
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+	});
+
+	test("after creditStop a new gate asks again: credit now runs the turn, no credit parks it", async () => {
+		let credit = false;
+		const { hosted, creditCalls } = fakeHosted({ credit: async () => credit });
+		const { store, record, loop } = setup({
+			hosted,
+			commitsAhead: async () => 0,
+		});
+		await expect(loop.creditStop()).resolves.toBe(0);
+
+		const parked = store.createTask("first");
+		await loop.runTurn(store.name, parked.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(parked.id)!.needsReason).toBe(CREDIT_REASON);
+
+		credit = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(creditCalls()).toBe(2);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a fresh gate answer clears the hold, but a turn marked in its prepare still parks", async () => {
+		const { hosted } = fakeHosted();
+		const prepare = Promise.withResolvers<void>();
+		let blocked: string | null = null;
+		const { store, record, loop } = setup({
+			hosted,
+			commitsAhead: async () => 0,
+			// Only the first card's prepare waits; every later prepare runs through.
+			resolveTarget: async () => {
+				if (blocked === null) {
+					blocked = "first";
+					await prepare.promise;
+				}
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		const first = store.createTask("first");
+		const run = loop.runTurn(store.name, first.id);
+		await waitFor(() => blocked !== null);
+		await expect(loop.creditStop()).resolves.toBe(1);
+
+		const second = store.createTask("second");
+		await loop.runTurn(store.name, second.id);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(second.id)!.stage).toBe("done");
+
+		prepare.resolve();
+		await run;
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(first.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+	});
+
+	test("a self-hosted loop ignores the credit hold: work run and check run as before", async () => {
+		const h = hangingChecks(readyRun);
+		const passCheck = (o: StartArgs) => {
+			if (o.config?.endsWith("check.yml") !== true) return h.startRun(o);
+			h.runs.push(o);
+			return {
+				pid: 4343,
+				done: Promise.resolve(
+					runResult({
+						finalText: JSON.stringify({ blockers: [], fixed: [], notes: [] }),
+					}),
+				),
+				kill: async () => {},
+			};
+		};
+		const { store, loop } = setup({
+			maxTotalRuns: () => 0,
+			targetSha: async () => "sha1",
+			workCheck: () => true,
+			startRun: passCheck,
+		});
+		await loop.creditStop();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(h.runs).toHaveLength(2);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.needsReason).toBeNull();
 	});
 });
 

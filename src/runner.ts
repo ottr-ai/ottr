@@ -89,6 +89,8 @@ export function childEnv(o: {
 	// no turn ever calls alate (only the board's server-side client does), so a turn
 	// that held it could rewrite the fleet's rules, skills and plugins (R5-1 class).
 	delete env.ALATE_API_KEY;
+	// The hosted identity-signing key: a holder forges owner/control/tenant headers.
+	delete env.OTTR_HOSTED_SECRET;
 	// Same strip in serveWorker: a corporate proxy URL with credentials
 	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
 	// port stay, so the proxy still routes the turn's network calls.
@@ -755,6 +757,8 @@ export function newEventState(): EventState {
 export function applyEvent(
 	state: EventState,
 	ev: unknown,
+	/** Hosted metering on: sum assistant usage into state.usage; off leaves it null. */
+	meter = false,
 ): { sessionStarted?: string } {
 	if (typeof ev !== "object" || ev === null) return {};
 	const e = ev as AnyRec;
@@ -791,7 +795,7 @@ export function applyEvent(
 			(m as AnyRec).role === "assistant"
 		) {
 			state.providerError = providerError(m as AnyRec);
-			addUsage(state, (m as AnyRec).usage);
+			if (meter) addUsage(state, (m as AnyRec).usage);
 		}
 		return {};
 	}
@@ -1012,6 +1016,8 @@ export function createRunSink(o: {
 	onProgress?: (text: string | null) => void;
 	/** Extra values redacted like the git secrets: the run's lent provider token. */
 	secrets?: readonly string[];
+	/** Hosted mode only: capture token usage into the result; default off keeps the self-hosted result shape. */
+	meter?: boolean;
 }): RunSink {
 	const es = newEventState();
 	let stderrTail = "";
@@ -1074,7 +1080,7 @@ export function createRunSink(o: {
 			return;
 		}
 		log.write(renderEvent(ev));
-		const { sessionStarted } = applyEvent(es, ev);
+		const { sessionStarted } = applyEvent(es, ev, o.meter === true);
 		if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
 	};
 
@@ -1304,6 +1310,8 @@ export function startRun(o: {
 	maxTime?: string | null;
 	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — tests only). */
 	memoryConfigPath?: string | null;
+	/** Hosted mode only: capture token usage for metering (createRunSink). */
+	meter?: boolean;
 }): RunHandle {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
@@ -1317,6 +1325,7 @@ export function startRun(o: {
 		onSession: o.onSession,
 		onProgress: o.onProgress,
 		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
+		meter: o.meter,
 	});
 
 	// Context a no-stderr death reports (classify folds it into the failure reason): how the

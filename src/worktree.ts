@@ -24,6 +24,7 @@ import {
 	trustedAnchor,
 } from "./confine.ts";
 import { githubHost, hostMatcher } from "./githubHost.ts";
+import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -1712,8 +1713,12 @@ export async function rebaseTargetBranch(
 export async function runMergeGates(
 	mainPath: string,
 ): Promise<{ ok: boolean; output: string }> {
+	// The gates run repo code: never hand it the hosted identity-signing key.
+	const env = { ...process.env };
+	delete env[HOSTED_SECRET_ENV];
 	const check = Bun.spawn([process.execPath, "run", "check"], {
 		cwd: mainPath,
+		env,
 		stdout: "pipe",
 		stderr: "pipe",
 		timeout: 1_800_000,
@@ -1728,6 +1733,7 @@ export async function runMergeGates(
 		};
 	const test = Bun.spawn([process.execPath, "test"], {
 		cwd: mainPath,
+		env,
 		stdout: "pipe",
 		stderr: "pipe",
 		timeout: 1_800_000,
