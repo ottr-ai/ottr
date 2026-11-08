@@ -5668,7 +5668,7 @@ export function ProjectSettingsForm({
 						/>
 						<CheckRow
 							name="Trending scout"
-							desc="Weekly: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+							desc="Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
 							checked={st.trendingScout}
 							save={(v) => send({ trendingScout: v })}
 							act={act}
