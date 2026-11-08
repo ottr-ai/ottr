@@ -4304,6 +4304,11 @@ dialog.diff-view {
 	width: min(560px, calc(100vw - 24px));
 	max-height: min(85dvh, 760px);
 }
+/* Create release stacks the commit list, the notes editor and the model picker: about 800px
+   tall, so the shared 760px cap made the whole dialog scroll. */
+.dialog.release-dialog {
+	max-height: min(94dvh, 960px);
+}
 /* Settings: the head stays put; only the body scrolls under it. */
 .dialog-body {
 	display: flex;

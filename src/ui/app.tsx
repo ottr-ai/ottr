@@ -2899,7 +2899,7 @@ function ReleaseDialog({
 			open={open}
 			onClose={onClose}
 			label={`Create release for ${label}`}
-			className="dialog"
+			className="dialog release-dialog"
 		>
 			<div className="dialog-body">
 				<div className="dialog-head">
