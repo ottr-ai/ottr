@@ -370,14 +370,39 @@ test("modelRows marks pressed via shared selector across role and catalog rows",
 	expect(rows.find((r) => r.key === "role-default")?.pressed).toBe(false);
 });
 
-test("modelRows sorts catalog by name with Name (id) labels", () => {
+test("modelRows groups catalog by provider, groups alphabetical, names inside", () => {
 	const rows = modelRows(
 		[m("z/fast", "Fast"), m("a/smol", "Smol")],
 		null,
 		"",
 		"",
 	).filter((r) => r.key !== "role-default");
-	expect(rows.map((r) => r.label)).toEqual(["Fast (z/fast)", "Smol (a/smol)"]);
+	expect(rows.map((r) => [r.label, r.heading])).toEqual([
+		["Smol (a/smol)", "a"],
+		["Fast (z/fast)", "z"],
+	]);
+});
+
+test("modelRows orders provider groups alphabetically with one heading per group", () => {
+	const rows = modelRows(
+		[
+			m("b/two", "Two"),
+			m("a/nine", "Nine"),
+			m("c/three", "Three"),
+			m("a/alpha", "Alpha"),
+		],
+		null,
+		"",
+		"",
+	).filter((r) => r.key !== "role-default");
+	expect(rows.map((r) => r.key)).toEqual([
+		"a/alpha",
+		"a/nine",
+		"b/two",
+		"c/three",
+	]);
+	expect(rows.map((r) => r.heading)).toEqual(["a", undefined, "b", "c"]);
+	expect(rows.filter((r) => r.divider).map((r) => r.key)).toEqual(["a/alpha"]);
 });
 
 test("modelRows sets divider only on the first catalog row", () => {
@@ -403,8 +428,8 @@ test("modelRows query filters role rows case-insensitively but not catalog rows"
 	expect(rows.map((r) => r.key)).toEqual([
 		"role-default",
 		"role-Z/SLOW",
-		"z/fast",
 		"a/smol",
+		"z/fast",
 	]);
 });
 

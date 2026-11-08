@@ -1047,11 +1047,20 @@ textarea {
 .model-option[aria-pressed="true"] > .icon-svg {
 	color: var(--accent);
 }
-/* Divider between the omp role rows and the alphabetical catalog, and above the Thinking row. */
+/* Divider between the omp role rows and the provider-grouped catalog, and above the Thinking row. */
 .model-divider {
 	margin: 6px 0;
 	border: 0;
 	border-top: 1px solid var(--line);
+}
+/* Provider heading inside the model list: the quota popover's provider row look
+   (.quota h3). The list gap holds 2px to the group's first row; the margin lifts the
+   heading off the row above, so a group reads as one labelled chunk. */
+.model-heading {
+	margin: 7px 0 0;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text);
 }
 /* Trigger: "model level" (Gemini's "Argon Mittel"): the model in the bright tone, the level
    after a space in the dim tone, so the model name reads first. */

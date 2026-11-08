@@ -231,11 +231,14 @@ export type ModelRow = {
 	selector: string;
 	pressed: boolean;
 	divider?: boolean;
+	/** Provider heading shown above this row; set on the first row of each provider group. */
+	heading?: string;
 };
 
 /** Picker list data: the models omp roles use first, model first with its roles in braces
     (e.g. "zai/glm-5.3-flash (plan, smol)"), one row per model even when several roles share it;
-    a divider; then the whole catalog alphabetically. The first row runs on omp's default model
+    a divider; then the catalog grouped under provider headings — groups alphabetical, models
+    alphabetical inside each group. The first row runs on omp's default model
     (empty selector, so the task follows a later default change); roles that share the default
     model join that row. Catalog rows are NOT query-filtered here — the caller pre-filters with
     modelMatches. */
@@ -277,17 +280,39 @@ export function modelRows(
 				pressed: splitLevel(s)[0] === selBase,
 			}),
 		);
-	const catalog = [...models]
-		.sort((a, b) => a.name.localeCompare(b.name))
-		.map(
-			(m, i): ModelRow => ({
+	// Catalog grouped by provider (the selector part before "/", the whole selector as
+	// the fallback for a selector without a slash): groups alphabetical, models
+	// alphabetical inside each group, the first row of each group carries the provider
+	// heading, and the section's first row keeps the roles divider.
+	const grouped = new Map<string, ModelRow[]>();
+	for (const m of [...models].sort((a, b) => a.name.localeCompare(b.name))) {
+		const slash = m.selector.indexOf("/");
+		const provider = slash === -1 ? m.selector : m.selector.slice(0, slash);
+		grouped.set(provider, [
+			...(grouped.get(provider) ?? []),
+			{
 				key: m.selector,
 				label: `${m.name} (${m.id})`,
 				selector: m.selector,
 				pressed: splitLevel(m.selector)[0] === selBase,
-				divider: i === 0,
-			}),
-		);
+			},
+		]);
+	}
+	const catalog: ModelRow[] = [];
+	let first = true;
+	for (const [provider, rows] of [...grouped].sort(([a], [b]) =>
+		a.localeCompare(b),
+	)) {
+		for (const [i, row] of rows.entries()) {
+			const head = i === 0;
+			catalog.push({
+				...row,
+				...(head ? { heading: provider } : {}),
+				...(head && first ? { divider: true } : {}),
+			});
+		}
+		first = false;
+	}
 	return [
 		{
 			key: "role-default",

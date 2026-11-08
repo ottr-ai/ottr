@@ -2215,6 +2215,9 @@ function ModelField({
 							(r) => (
 								<Fragment key={r.key}>
 									{r.divider && <hr className="model-divider" />}
+									{r.heading && (
+										<div className="model-heading">{r.heading}</div>
+									)}
 									<button
 										type="button"
 										className="model-option"
