@@ -21,3 +21,7 @@ AGENTS.md holds the process rules every agent turn reads: pipeline, gates, hard 
 - Process rules change by editing the file on each machine that holds it, with no review trail.
 - A stray tracked or untracked AGENTS.md is a defect: repair the exclude entry, never commit the file (AGENTS.md, "This file").
 - A future change to this rule requires a new ADR that supersedes this one.
+
+2026-11-08: the tracked source of AGENTS.md is agent-data `projects/ottr/AGENTS.md`
+(AGENTS.md, "This file"). The ottr-local copy stays untracked per this ADR;
+`scripts/agent-data-sync.ts` compares the copies.
