@@ -5244,19 +5244,26 @@ export function ProjectSettingsForm({
 								{project.icon !== null && (
 									<button
 										type="button"
-										className="ghost"
+										className="danger"
 										disabled={icon.busy}
-										onClick={() =>
+										onClick={async () => {
+											if (
+												!(await confirmDialog(
+													"Delete the uploaded icon? The project falls back to its source icon or letters.",
+													{ ok: "Delete icon", danger: true },
+												))
+											)
+												return;
 											icon.run(async () => {
 												const res = await fetch(
 													`/api/projects/${encodeURIComponent(project.name)}/icon`,
 													{ method: "DELETE" },
 												);
 												if (!res.ok) throw new Error(`HTTP ${res.status}`);
-											})
-										}
+											});
+										}}
 									>
-										Remove
+										Delete icon
 									</button>
 								)}
 								<SaveTick
