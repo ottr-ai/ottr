@@ -953,6 +953,83 @@ describe("hosted credit stop", () => {
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBeNull();
 	});
+
+	/** A loop whose title generations fail and whose run stalls until killed or finished. */
+	function titleRetrySetup(hosted: Hosted | undefined) {
+		let genCalls = 0;
+		const { promise: secondGen, resolve: sawSecondGen } =
+			Promise.withResolvers<void>();
+		const { promise: done, resolve } = Promise.withResolvers<RunResult>();
+		const { store, record, loop } = setup({
+			hosted,
+			// Long enough that the test reaches creditStop before the timer fires.
+			titleRetryDelayMs: 200,
+			genTitle: async () => {
+				genCalls += 1;
+				if (genCalls > 1) sawSecondGen();
+				return null;
+			},
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done,
+					kill: async () => {
+						resolve(runResult({ killed: true, sawTerminalEnd: false }));
+					},
+				};
+			},
+		});
+		// Resolves when the store releases the title hold: the retry settled or was cancelled.
+		const { promise: holdReleased, resolve: released } =
+			Promise.withResolvers<void>();
+		const release = store.releaseTitleHold.bind(store);
+		store.releaseTitleHold = (id: string) => {
+			const had = release(id);
+			if (had) released();
+			return had;
+		};
+		return {
+			store,
+			loop,
+			secondGen,
+			holdReleased,
+			finish: () => resolve(answered()),
+			genCalls: () => genCalls,
+		};
+	}
+
+	test("creditStop before a failed title's retry fires skips the retry's model call", async () => {
+		const { hosted } = fakeHosted();
+		const t = titleRetrySetup(hosted);
+		const task = t.store.createTask("work please");
+		const run = t.loop.runTurn(t.store.name, task.id);
+		const key = `${t.store.name}/${task.id}`;
+		await waitFor(() => t.loop.running.has(key));
+		expect(t.genCalls()).toBe(1);
+		expect(t.store.titleHold(task.id)).toBe(true);
+		await expect(t.loop.creditStop()).resolves.toBe(1);
+		await run;
+		await t.holdReleased;
+
+		expect(t.genCalls()).toBe(1);
+		expect(t.store.titleHold(task.id)).toBe(false);
+		const after = t.store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+	});
+
+	test("self-hosted: the failed title's retry still runs", async () => {
+		const t = titleRetrySetup(undefined);
+		const task = t.store.createTask("work please");
+		const run = t.loop.runTurn(t.store.name, task.id);
+		await t.secondGen;
+		await t.holdReleased;
+		expect(t.genCalls()).toBe(2);
+		t.finish();
+		await run;
+	});
 });
 
 // ---- hosted wording --------------------------------------------------------

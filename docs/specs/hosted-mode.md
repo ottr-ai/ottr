@@ -131,7 +131,8 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
   a model run: before each work or merge run, each check attempt (also the second attempt),
   and each title call, a turn that sees the hold parks `needs_you` with the credit reason. A
   gate call that starts after the stop and answers `ok: true` clears the hold. A gate answer
-  from a call that started before the stop does not clear it.
+  from a call that started before the stop does not clear it. The delayed retry of a failed
+  title call is also a model call: when it fires while the hold is set, it does not run.
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.

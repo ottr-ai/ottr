@@ -355,12 +355,17 @@ function scheduleTitleRetry(
 	prompt: string,
 	log: (line: string) => void,
 	ops: TurnOps,
+	creditBlocked: () => boolean = () => false,
 ): void {
 	const timer = setTimeout(() => {
 		void (async () => {
 			try {
 				const task = store.getTask(id);
 				if (task === null || task.cancelledAt !== null) return;
+				if (creditBlocked()) {
+					log("- title retry skipped: the board is out of credit");
+					return;
+				}
 				let cause = "unknown failure";
 				const gen = await (ops.genTitle ?? generateTitle)(
 					prompt,
@@ -2052,7 +2057,18 @@ export function createTurnLoop(
 							// give up, so the run's own transcript title can name the card.
 							store.releaseTitleHold(id);
 						} else {
-							scheduleTitleRetry(store, id, task.prompt, log, ops);
+							// Hosted: the retry is a model call, so a credit stop that lands
+							// before it fires skips it (docs/specs/hosted-mode.md section 5).
+							scheduleTitleRetry(
+								store,
+								id,
+								task.prompt,
+								log,
+								ops,
+								() =>
+									ops.hosted !== undefined &&
+									(creditHold || creditStopped.has(key)),
+							);
 						}
 					}
 				}
