@@ -3860,7 +3860,7 @@ describe("Error-Says-Fix messages", () => {
 		}
 	});
 
-	test("a failed Identity save marks the field and shows the reason under it", async () => {
+	test("a failed Identity save marks the fields and shows the reason under them", async () => {
 		const fetchMock = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
@@ -3918,10 +3918,12 @@ describe("Error-Says-Fix messages", () => {
 			await act(async () => {
 				form.dispatchEvent(submitEvent());
 			});
-			// A card-level save failure announces once, under Display name only.
+			// The audited acceptance: every field of the failed card save shows the
+			// reason under it (Error-Says-Fix Rule), so the card carries one alert
+			// per field.
 			const card = container.querySelector("#project-identity-section");
 			const errors = card?.querySelectorAll(".auth-error") ?? [];
-			expect(errors.length).toBe(1);
+			expect(errors.length).toBe(2);
 			expect(input.getAttribute("aria-invalid")).toBe("true");
 			const describedBy = input.getAttribute("aria-describedby");
 			expect(describedBy).not.toBeNull();
@@ -3937,7 +3939,15 @@ describe("Error-Says-Fix messages", () => {
 			);
 			if (prefixInput === null || prefixInput === undefined)
 				throw new Error("task id prefix input did not render");
-			expect(prefixInput.getAttribute("aria-invalid")).toBeNull();
+			expect(prefixInput.getAttribute("aria-invalid")).toBe("true");
+			const prefixDescribedBy = prefixInput.getAttribute("aria-describedby");
+			expect(prefixDescribedBy).not.toBeNull();
+			const prefixMessage = [
+				...container.querySelectorAll(`p[role="alert"]`),
+			].find((p) => p.id === prefixDescribedBy);
+			expect(prefixMessage).not.toBeNull();
+			expect(prefixMessage?.className).toContain("auth-error");
+			expect(prefixMessage?.textContent).toBe("settings locked");
 		} finally {
 			await act(async () => {
 				root.unmount();

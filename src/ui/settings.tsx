@@ -6276,8 +6276,21 @@ export function ProjectSettingsForm({
 											onChange={(e) => setPrefix(e.target.value)}
 											placeholder={project.taskPrefix}
 											aria-label="Task ID prefix"
+											aria-invalid={ident.failed || undefined}
+											aria-describedby={
+												ident.failed ? `${prefixFieldId}-err` : undefined
+											}
 										/>
 									</label>
+									{ident.failed && (
+										<p
+											className="auth-error"
+											id={`${prefixFieldId}-err`}
+											role="alert"
+										>
+											{ident.reason ?? "Not saved"}
+										</p>
+									)}
 								</div>
 							</DefRow>
 							{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
