@@ -82,6 +82,7 @@ import {
 	isClean,
 	isGitRepoWithCommit,
 	isIntegrated,
+	mergeHoldLanded,
 	mergeHoldMismatch,
 	originRemoteUrl,
 	prIntegrated,
@@ -598,6 +599,7 @@ const loop = createTurnLoop(projects, {
 	commitIdentity: () => shared.commitIdentity,
 	runMergeGates,
 	mergeHoldMismatch,
+	mergeHoldLanded,
 	resetBranchTo,
 	pidAlive,
 	// OTTR_WORKER_URLS selects worker dispatch for work turns; unset (the default) and any

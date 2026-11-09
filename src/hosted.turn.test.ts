@@ -124,6 +124,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			pushDiff: null,
 			auditedTip: null,
 		}),
+		mergeHoldLanded: async () => false,
 		resetBranchTo: async () => true,
 		pidAlive: () => true,
 		startRun: (o: StartArgs) => {

@@ -149,6 +149,7 @@ import type {
 	ignoreInMain,
 	isClean,
 	isIntegrated,
+	mergeHoldLanded,
 	mergeHoldMismatch,
 	pushBranch,
 	rebaseTargetBranch,
@@ -626,6 +627,8 @@ export interface TurnOps {
 	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
+	/** VELV-89: true when a hold-approved merge already landed on the fetched remote target and the approval carries no extra patches. */
+	mergeHoldLanded: typeof mergeHoldLanded;
 	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
 	resetBranchTo: typeof resetBranchTo;
 	pidAlive: typeof pidAlive;
@@ -3090,6 +3093,11 @@ export function createTurnLoop(
 			// The origin tip the gate fetched and audited; the push leases against it so a
 			// merge agent cannot aim the fetch and the push at different remotes.
 			let holdTip: string | null = null;
+			// VELV-89: the probe proved the merge already landed on the fetched remote target
+			// with no patches beyond the approval. No park, no push: the settle reads it as the
+			// integration proof (the worktree and the local branch can both still sit behind
+			// origin, so the ordinary git facts cannot prove it).
+			let remoteLanded = false;
 			// The merge push and the OTTR-510 automatic rebase retry in the pushError handling
 			// below push through the same closure. `refused` stays null for every non-merge
 			// turn: only a merge settle pays for the hold-tip read.
@@ -3315,61 +3323,88 @@ export function createTurnLoop(
 						if (localHead !== null && approvedHeads.includes(localHead)) {
 							// the exact head a reply approved: nothing new to judge
 						} else {
-							for (const ah of approvedHeads) {
-								const { mismatch, pushDiff, auditedTip } = await ops
-									.mergeHoldMismatch(
-										e.path,
-										target,
-										base,
-										ah,
-										settings.originUrl,
-									)
-									.catch(() => ({
-										mismatch: true,
-										pushDiff: null,
-										auditedTip: null,
-									}));
-								if (mismatch) {
-									holdMismatch = MERGE_HOLD_MISMATCH_REASON;
-									holdHead = localHead;
-									// Same cap as the merge-start capture: bigger diffs keep their numstat.
-									holdDiff =
-										pushDiff === null
-											? null
-											: pushDiff.length > 200_000
-												? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
-												: pushDiff;
-									holdFiles =
-										holdDiff === null
-											? null
-											: await ops
-													.diffStat(e.path, target, `refs/heads/${branch}`)
-													.catch(() => null);
-									log("! held merge carries patches beyond the approved head");
-									// OTTR-326: the park resets the branch to the gate's audited tip so the
-									// held patches cannot ship with a later card's un-gated push; the
-									// reviewer still reads them from holdDiff/holdFiles. Without an audited
-									// tip (gate fetch failed) there is no trusted tip to reset to, and the
-									// push refusal below keeps the branch pinned instead.
-									const reset =
-										auditedTip !== null &&
-										(await ops
-											.resetBranchTo(e.path, branch, auditedTip)
-											.catch(() => false));
-									if (!reset)
+							// VELV-89: the merge can land through a project rule that pushes the target
+							// from the worktree and never moves the main checkout's local branch, so
+							// the gate below would judge a stale push set and park a landed card. Ask
+							// the fetched remote target first: every approved head already contained
+							// in it and no patches beyond the approval means the merge landed — settle
+							// it. False on git trouble or extra patches: the gate below judges the
+							// push set, and it still fails closed into the park.
+							const landed = await ops
+								.mergeHoldLanded(
+									e.path,
+									target,
+									base,
+									approvedHeads,
+									settings.originUrl,
+								)
+								.catch(() => false);
+							if (landed) {
+								remoteLanded = true;
+								log(
+									`- approved head already on ${target}: the merge landed without the local branch moving`,
+								);
+							} else {
+								for (const ah of approvedHeads) {
+									const { mismatch, pushDiff, auditedTip } = await ops
+										.mergeHoldMismatch(
+											e.path,
+											target,
+											base,
+											ah,
+											settings.originUrl,
+										)
+										.catch(() => ({
+											mismatch: true,
+											pushDiff: null,
+											auditedTip: null,
+										}));
+									if (mismatch) {
+										holdMismatch = MERGE_HOLD_MISMATCH_REASON;
+										holdHead = localHead;
+										// Same cap as the merge-start capture: bigger diffs keep their numstat.
+										holdDiff =
+											pushDiff === null
+												? null
+												: pushDiff.length > 200_000
+													? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
+													: pushDiff;
+										holdFiles =
+											holdDiff === null
+												? null
+												: await ops
+														.diffStat(e.path, target, `refs/heads/${branch}`)
+														.catch(() => null);
 										log(
-											"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
+											"! held merge carries patches beyond the approved head",
 										);
-									break;
+										// OTTR-326: the park resets the branch to the gate's audited tip so the
+										// held patches cannot ship with a later card's un-gated push; the
+										// reviewer still reads them from holdDiff/holdFiles. Without an audited
+										// tip (gate fetch failed) there is no trusted tip to reset to, and the
+										// push refusal below keeps the branch pinned instead.
+										const reset =
+											auditedTip !== null &&
+											(await ops
+												.resetBranchTo(e.path, branch, auditedTip)
+												.catch(() => false));
+										if (!reset)
+											log(
+												"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
+											);
+										break;
+									}
+									holdTip = auditedTip;
 								}
-								holdTip = auditedTip;
 							}
 						}
 					}
 					// OTTR-326: a park whose branch reset could not run leaves the held patches as the
 					// local tip; no other card may push the branch while that head sits there.
 					refused = await heldMergeOnBranchTip(store, id, e.path, branch, ops);
-					if (holdMismatch === null) {
+					// A landed merge has nothing to push: the remote target already holds every
+					// approved patch, and pushing the stale local branch would only fight it.
+					if (holdMismatch === null && !remoteLanded) {
 						let p = await runPush();
 						let authLogged = false;
 						for (let attempt = 1; ; attempt++) {
@@ -3514,15 +3549,19 @@ export function createTurnLoop(
 					: vmOut !== null
 						? vmOut.dirty !== null && vmOut.dirty.length === 0
 						: await ops.isClean(wt).catch(() => false),
-				integrated: fromMain
-					? await ops
-							.branchMergedOrGone(e.path, task.branch ?? "", target)
-							.catch(() => false)
-					: prModeFacts
-						? ((await ops
-								.prIntegrated?.(e.path, wt, target)
-								.catch(() => false)) ?? false)
-						: await ops.isIntegrated(wt, target).catch(() => false),
+				integrated:
+					// VELV-89: the hold probe proved the fetched remote target holds the approved
+					// merge; the stale worktree proof cannot see it.
+					remoteLanded ||
+					(fromMain
+						? await ops
+								.branchMergedOrGone(e.path, task.branch ?? "", target)
+								.catch(() => false)
+						: prModeFacts
+							? ((await ops
+									.prIntegrated?.(e.path, wt, target)
+									.catch(() => false)) ?? false)
+							: await ops.isIntegrated(wt, target).catch(() => false)),
 			};
 			// Landable clean commits with the report file gone: the card did real work after its
 			// research mark. Clear the flag and classify like any other work turn — the ready

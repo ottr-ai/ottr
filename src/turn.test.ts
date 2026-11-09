@@ -246,6 +246,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			pushDiff: null,
 			auditedTip: null,
 		}),
+		mergeHoldLanded: async () => false,
 		resetBranchTo: async () => true,
 		pidAlive: () => true,
 		startRun: (o: {
@@ -4603,6 +4604,94 @@ describe("turn ci watch pinning", () => {
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(t.diffText).toBeNull();
+	});
+
+	test("an approved head already on origin settles a stale local main without a park", async () => {
+		const pushes: string[] = [];
+		const { store, record, loop, task } = mergeDoneSetup({
+			// VELV-89: the agent's own push moved only origin, so the local branch sits behind
+			// it and the ordinary worktree proof cannot see the landing.
+			isIntegrated: async () => false,
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/heads/main" ? "sha-stale-local" : "sha-approved",
+			mergeHoldLanded: async () => true,
+			mergeHoldMismatch: async () => {
+				throw new Error("a landed merge must not reach the mismatch gate");
+			},
+			serverMergePush: async () => {
+				pushes.push("origin/main");
+				return { status: "pushed" as const, output: "" };
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		// The remote target already holds the work: no push, no park, the card lands.
+		expect(pushes).toEqual([]);
+		expect(t.stage).toBe("done");
+		expect(t.state).toBe("idle");
+		expect(t.needsReason).toBeNull();
+		expect(t.holdHead).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(logText(store, task.id)).toContain(
+			"- approved head already on origin/main: the merge landed without the local branch moving",
+		);
+	});
+
+	test("a hold probe that cannot fetch still parks on the gate's failure", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/heads/main" ? "sha-stale-local" : "sha-origin",
+			// The probe fetch failed; the gate re-fetches and fails closed too.
+			mergeHoldLanded: async () => false,
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: "diff --git a/evil.txt b/evil.txt",
+				auditedTip: null,
+			}),
+			serverMergePush: async () => {
+				throw new Error("a parked hold must not push");
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+		expect(t.holdHead).toBe("sha-stale-local");
+	});
+
+	test("extra patches on the remote beyond the approved head still park a stale local main", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			targetSha: async (_mainPath: string, ref: string) =>
+				ref === "refs/heads/main" ? "sha-stale-local" : "sha-origin",
+			// Containment held but the remote carries patches beyond the approval.
+			mergeHoldLanded: async () => false,
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: "diff --git a/evil.txt b/evil.txt",
+				auditedTip: "sha-origin",
+			}),
+			resetBranchTo: async () => true,
+			serverMergePush: async () => {
+				throw new Error("a parked hold must not push");
+			},
+		});
+		store.updateTask(task.id, {
+			updateIds: ["x@1"],
+			updateMergeHead: "sha-approved",
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+		expect(t.diffText).toBe("diff --git a/evil.txt b/evil.txt");
 	});
 
 	test("a mismatch park resets the branch, so the next card's push excludes the held patches", async () => {

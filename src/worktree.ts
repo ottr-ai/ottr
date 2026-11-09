@@ -1762,7 +1762,11 @@ export async function runMergeGates(
  * merge agent can rewrite any local ref and the repo's remote config, so the fetch uses a
  * gate-owned refspec into refs/ottr/gate/<branch> (configured refspecs and the remote-tracking
  * ref stay irrelevant), names the server-pinned origin URL, not the remote name (R5-1), and
- * serverMergePush pins the real remote to the returned auditedTip. Any
+ * serverMergePush pins the real remote to the returned auditedTip. When the local target branch
+ * is an ancestor of the fetched tip (VELV-89: a merge that shipped through a project rule
+ * pushed the target from the worktree and never moved the local branch), the local head is not
+ * the push set: the patches the card's merge put on the remote target are judged instead — the
+ * remote's total tree effect since base must equal the approved one. Any
  * git trouble mismatches: the hold fails closed. Runs in the main repo, where the target refs
  * live.
  */
@@ -1820,14 +1824,93 @@ export async function mergeHoldMismatch(
 	const tip = await git(["rev-parse", `refs/ottr/gate/${branch}`], mainPath);
 	if (tip.code !== 0) return failClosed();
 	const auditedTip = tip.stdout.trim();
+	const approved = await effect(base, approvedHead);
+	// VELV-89: the local branch can sit behind the fetched remote tip (an ancestor of it) when
+	// the card's merge shipped through a project rule that pushed the target itself. Then the
+	// local head is not the push set: judge the patches the card's merge put on the remote
+	// target — the remote's total tree effect since base must equal the approved one. Commits
+	// cannot be attributed to cards, so the tree-effect proof judges the remote side exactly
+	// as it judges the push set. An unreadable approved-side diff falls through: the return
+	// below then mismatches, and the hold still fails closed.
+	if (
+		approved !== null &&
+		(await targetContains(
+			mainPath,
+			`refs/heads/${branch}`,
+			`refs/ottr/gate/${branch}`,
+		))
+	) {
+		const remoteEffect = await effect(base, `refs/ottr/gate/${branch}`);
+		return {
+			mismatch: remoteEffect === null || remoteEffect !== approved,
+			pushDiff: remoteEffect,
+			auditedTip,
+		};
+	}
 	const push = await effect(auditedTip, `refs/heads/${branch}`);
 	if (push === null) return failClosed();
-	const approved = await effect(base, approvedHead);
 	return {
 		mismatch: approved === null || push !== approved,
 		pushDiff: push,
 		auditedTip,
 	};
+}
+
+/**
+ * VELV-89: whether a held merge already landed without the main checkout's local branch
+ * moving. A merge turn can ship through a project rule that pushes the target from the
+ * worktree with its own credentials, so origin holds the work while refs/heads/<branch> still
+ * sits behind it — the mismatch gate would read a stale push set and park a landed card.
+ * Fetches the target with the gate's own refspec and pinned URL (R5-1) and lands only when
+ * every approved head is contained in the fetched tip and the remote carries no patches
+ * beyond the approval: commits cannot be attributed to cards, so the remote's total tree
+ * effect since base must equal the approved one — the same proof the push-set gate uses.
+ * False on any git trouble: the caller then judges the gate (mergeHoldMismatch), which fails
+ * closed into the park. Runs in the main repo, where the target refs live.
+ */
+export async function mergeHoldLanded(
+	mainPath: string,
+	target: string,
+	base: string,
+	approvedHeads: readonly string[],
+	originUrl: string | null = null,
+): Promise<boolean> {
+	if (!target.startsWith("origin/")) return false;
+	const branch = target.slice("origin/".length);
+	if (
+		originUrl === null ||
+		(await checkPinnedRemote(mainPath, originUrl)) !== null
+	)
+		return false;
+	const fetch = await git(
+		["fetch", originUrl, `+refs/heads/${branch}:refs/ottr/gate/${branch}`],
+		mainPath,
+	);
+	if (fetch.code !== 0) return false;
+	const gate = `refs/ottr/gate/${branch}`;
+	const effect = async (from: string, to: string): Promise<string | null> => {
+		const r = await git(
+			[
+				"diff",
+				"--no-renames",
+				"--full-index",
+				"--ignore-submodules=none",
+				from,
+				to,
+			],
+			mainPath,
+		);
+		return r.code === 0 ? r.stdout : null;
+	};
+	const remote = await effect(base, gate);
+	if (remote === null) return false;
+	for (const ah of approvedHeads) {
+		const on = await git(["merge-base", "--is-ancestor", ah, gate], mainPath);
+		if (on.code !== 0) return false;
+		const approved = await effect(base, ah);
+		if (approved === null || approved !== remote) return false;
+	}
+	return true;
 }
 
 /**

@@ -43,6 +43,7 @@ import {
 	ignoreInMain,
 	isClean,
 	isIntegrated,
+	mergeHoldLanded,
 	mergeHoldMismatch,
 	originRemoteUrl,
 	parseKeptChoices,
@@ -985,6 +986,153 @@ describe("mergeHoldMismatch", () => {
 			const r = await mismatch(f);
 			expect(r.mismatch).toBe(true);
 			expect(r.pushDiff).toContain("sub");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	// VELV-89's shape: the merge shipped through a project rule that pushed the target from
+	// the worktree, so origin holds the patches while the main checkout's local main still
+	// sits at base. The local head is not the push set; the remote side is judged instead.
+	const pushedFromWorktree = (extraEvil = false) => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-mhm-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "o.txt"), "o");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		const wt = join(dir, "wt");
+		run(main, "worktree", "add", "-q", "-b", "ott/x", wt);
+		for (const [name, text] of [
+			["p1.txt", "1"],
+			["p2.txt", "2"],
+		] as const) {
+			writeFileSync(join(wt, name), text);
+			run(wt, ...id, "add", ".");
+			run(wt, ...id, "commit", "-qm", name);
+		}
+		const base = run(main, "rev-parse", "refs/heads/main");
+		const approvedHead = run(wt, "rev-parse", "HEAD");
+		// The agent's own push: origin takes the approved head; the local branch never moves.
+		run(wt, "push", "-q", "origin", "HEAD:refs/heads/main");
+		if (extraEvil) {
+			writeFileSync(join(wt, "evil.txt"), "x");
+			run(wt, ...id, "add", ".");
+			run(wt, ...id, "commit", "-qm", "EVIL");
+			run(wt, "push", "-q", "origin", "HEAD:refs/heads/main");
+		}
+		return { dir, bare, main, wt, base, approvedHead };
+	};
+
+	test("a stale local main behind a landed remote judges the remote patches, not the push set", async () => {
+		const f = pushedFromWorktree();
+		try {
+			// The push set reads as the reverse diff (origin tip back to the stale local head);
+			// the old gate parked exactly this landed card. The remote side decides instead.
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(false);
+			expect(r.pushDiff).toContain("p1.txt");
+			expect(r.auditedTip).toBe(f.approvedHead);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("extra patches the merge put on the remote beyond the approval still mismatch", async () => {
+		const f = pushedFromWorktree(true);
+		try {
+			const r = await mismatch(f);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil.txt");
+			expect(r.auditedTip).toBe(run(f.bare, "rev-parse", "main"));
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("mergeHoldLanded (VELV-89)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const landed = async (
+		f: { main: string; base: string; approvedHead: string; bare: string },
+		originUrl: string = f.bare,
+	) =>
+		mergeHoldLanded(f.main, "origin/main", f.base, [f.approvedHead], originUrl);
+	const fixture = (pushFromWorktree: boolean) => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-mhl-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "o.txt"), "o");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		const wt = join(dir, "wt");
+		run(main, "worktree", "add", "-q", "-b", "ott/x", wt);
+		for (const [name, text] of [
+			["p1.txt", "1"],
+			["p2.txt", "2"],
+		] as const) {
+			writeFileSync(join(wt, name), text);
+			run(wt, ...id, "add", ".");
+			run(wt, ...id, "commit", "-qm", name);
+		}
+		const base = run(main, "rev-parse", "refs/heads/main");
+		const approvedHead = run(wt, "rev-parse", "HEAD");
+		if (pushFromWorktree)
+			run(wt, "push", "-q", "origin", "HEAD:refs/heads/main");
+		return { dir, bare, main, wt, base, approvedHead };
+	};
+
+	test("a merge that shipped through the worktree lands without the local branch moving", async () => {
+		const f = fixture(true);
+		try {
+			expect(await landed(f)).toBe(true);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a remote patch beyond the approval refuses to land", async () => {
+		const f = fixture(true);
+		try {
+			writeFileSync(join(f.wt, "evil.txt"), "x");
+			run(f.wt, ...id, "add", ".");
+			run(f.wt, ...id, "commit", "-qm", "EVIL");
+			run(f.wt, "push", "-q", "origin", "HEAD:refs/heads/main");
+			expect(await landed(f)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an approved head that origin lacks does not land", async () => {
+		const f = fixture(false);
+		try {
+			expect(await landed(f)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed fetch does not land", async () => {
+		const f = fixture(true);
+		try {
+			expect(await landed(f, join(f.dir, "no-such-origin.git"))).toBe(false);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
