@@ -12,6 +12,7 @@ import {
 	commitIdentityEnv,
 	DEFAULT_COMMIT_EMAIL,
 	DEFAULT_COMMIT_NAME,
+	type IdentProbeEnv,
 	probeGitIdent,
 } from "./gitIdentity.ts";
 import type { TokenUsage } from "./hosted.ts";
@@ -1223,6 +1224,10 @@ export function vmEnv(o: {
 		if (secrets.has(v)) continue;
 		// The guest owns its PATH, home and agent dir; the board's are meaningless inside.
 		if (k === "PATH" || k === "HOME" || k === "PI_CODING_AGENT_DIR") continue;
+		// OTTR-693: the guest mounts no board-config, so the board's GIT_CONFIG_GLOBAL
+		// pointer would name a missing file there; git would then skip the global scope
+		// entirely and never see an identity the VM image ships in its own home.
+		if (k === "GIT_CONFIG_GLOBAL") continue;
 		if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
 			continue;
 		env[k] = v;
@@ -1323,8 +1328,8 @@ export function startRun(o: {
 	stripGithubToken?: boolean;
 	/** OTTR-693: the Settings commit identity for this turn; null keeps the built-in Ottr default (src/gitIdentity.ts). */
 	commitIdentity?: CommitIdentity | null;
-	/** Test seam: replaces the git config probe. */
-	gitProbe?: (home: string | null) => { name: boolean; email: boolean };
+	/** Test seam: replaces the git config probe (src/gitIdentity.ts IdentProbeEnv). */
+	gitProbe?: (o: IdentProbeEnv) => { name: boolean; email: boolean };
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
 	tools?: string | null;
 	config?: string | null;
@@ -1400,11 +1405,15 @@ export function startRun(o: {
 		? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
 		: null;
 
-	// OTTR-693: the ident env beats every git config scope, so it is set only for the fields
-	// the turn's git config leaves empty (a user ~/.gitconfig, the pinned /etc/ottr/gitconfig
-	// keep winning). Worker containers ship no gitconfig, so without this the first commit in
-	// a worker turn died with "no author identity". A VM guest seeds the clone's own config
-	// (src/vmGuest.ts) and shares no home, so only an explicit Settings identity rides the VM env.
+	// OTTR-693: the ident env beats every git config scope, so the probe must mirror the
+	// turn's git exactly: same worktree (repo-local config and includeIf rules count), same
+	// HOME (the layer pin moves it), same GIT_CONFIG_GLOBAL. Worker dispatch strips the
+	// pointer below: the worker mounts no board-config, so a pinned path would name a
+	// missing file there and hide the shared home's ~/.gitconfig — the exact "no author
+	// identity" failure this fixes. A VM guest owns its home and seeds the clone's own
+	// config (src/vmGuest.ts; vmEnv drops the pointer too), so only an explicit Settings
+	// identity rides the VM env, never the automatic default.
+	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
 	let identityEnv: Record<string, string>;
 	if (o.vm) {
 		identityEnv =
@@ -1416,9 +1425,13 @@ export function startRun(o: {
 			name: DEFAULT_COMMIT_NAME,
 			email: DEFAULT_COMMIT_EMAIL,
 		};
-		const probe = (o.gitProbe ?? probeGitIdent)(
-			layerEnv?.HOME ?? process.env.HOME ?? null,
-		);
+		const probe = (o.gitProbe ?? probeGitIdent)({
+			cwd: o.cwd,
+			home: layerEnv?.HOME ?? process.env.HOME ?? null,
+			gitConfigGlobal:
+				o.worker != null ? null : (identBaseEnv.GIT_CONFIG_GLOBAL ?? null),
+			baseEnv: identBaseEnv,
+		});
 		identityEnv = commitIdentityEnv(identity, probe);
 	}
 
@@ -1634,6 +1647,11 @@ export function startRun(o: {
 		PI_CODING_AGENT_DIR: undefined,
 		OTTR_BOARD_OMP_HOME: undefined,
 	});
+	// OTTR-693: the worker mounts no board-config, so the board's GIT_CONFIG_GLOBAL
+	// pointer would name a missing file there; git would then skip the global scope
+	// entirely and never read the shared home's ~/.gitconfig (the CMIS-1 "no author
+	// identity" failure). The probe above strips the pointer for the same reason.
+	delete workerBase.GIT_CONFIG_GLOBAL;
 	if (layerEnv !== null) Object.assign(workerBase, layerEnv);
 	Object.assign(workerBase, identityEnv);
 	const env = childEnv({

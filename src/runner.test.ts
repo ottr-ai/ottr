@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import type { IdentProbeEnv } from "./gitIdentity.ts";
 import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
 import { LOST_SESSION } from "./prompts.ts";
@@ -3890,6 +3891,25 @@ describe("vmEnv", () => {
 		});
 	});
 
+	test("the board's GIT_CONFIG_GLOBAL pointer never rides to the guest", () => {
+		// OTTR-693: the guest mounts no board-config; a pointer to a missing file would
+		// make the turn's git skip the global scope and hide an identity the image ships.
+		const env = vmEnv({
+			env: { GIT_CONFIG_GLOBAL: "/etc/ottr/gitconfig", KEEP_ME: "1" },
+			board,
+			boardUrl: "http://ottr:8080",
+			token: "vm-token",
+			layerEnv: null,
+		});
+		expect(env).toEqual({
+			KEEP_ME: "1",
+			OTTR_BOARD_URL: "http://ottr:8080",
+			OTTR_BOARD_TOKEN: "vm-token",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "P-1",
+		});
+	});
+
 	test("stripBoard drops the board coordinates and the VM token", () => {
 		const env = vmEnv({
 			env: { OTTR_RETRO: "1" },
@@ -4186,8 +4206,11 @@ describe("startRun commit identity env", () => {
 
 	test("an unset identity applies the Ottr default for every field the probe leaves empty", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-default-"));
+		const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+		process.env.GIT_CONFIG_GLOBAL = "/etc/ottr/gitconfig";
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
+			const probes: IdentProbeEnv[] = [];
 			const handle = startRun({
 				cwd: dir,
 				prompt: "do the thing",
@@ -4197,7 +4220,10 @@ describe("startRun commit identity env", () => {
 				logPath: join(dir, "run.log"),
 				dataRoot: dir,
 				launcher: localLauncher(seen),
-				gitProbe: () => ({ name: false, email: false }),
+				gitProbe: (o) => {
+					probes.push(o);
+					return { name: false, email: false };
+				},
 			});
 			await handle.done;
 			expect(seen[0]!.env).toMatchObject({
@@ -4206,7 +4232,16 @@ describe("startRun commit identity env", () => {
 				GIT_COMMITTER_NAME: "Ottr",
 				GIT_COMMITTER_EMAIL: "ottr@localhost",
 			});
+			// A local turn keeps the board's pinned global: the probe must read what the
+			// turn's git reads, so the pinned identity never gets replaced by the env.
+			expect(probes[0]).toMatchObject({
+				cwd: dir,
+				gitConfigGlobal: "/etc/ottr/gitconfig",
+			});
+			expect(seen[0]?.env?.GIT_CONFIG_GLOBAL ?? "").toBe("/etc/ottr/gitconfig");
 		} finally {
+			if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -4269,7 +4304,7 @@ describe("startRun commit identity env", () => {
 			"ottr-ident-omp-",
 			"fake-omp-ident.exe",
 			[
-				`for (const k of ${JSON.stringify([...IDENT_VARS])})`,
+				`for (const k of ${JSON.stringify([...IDENT_VARS, "GIT_CONFIG_GLOBAL"])})`,
 				'\tprocess.stdout.write("IDENT " + k + "=" + String(process.env[k]) + "\\n");',
 				'process.stdout.write(JSON.stringify({ type: "session", id: "sess-ident" }) + "\\n");',
 				'process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");',
@@ -4277,7 +4312,10 @@ describe("startRun commit identity env", () => {
 			].join("\n"),
 		);
 		const server = serveWorker({ port: 0, ompPath: identOmp });
+		const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+		process.env.GIT_CONFIG_GLOBAL = "/etc/ottr/gitconfig";
 		try {
+			const probes: IdentProbeEnv[] = [];
 			const logPath = join(dir, "run.log");
 			const { done } = startRun({
 				cwd: dir,
@@ -4288,16 +4326,27 @@ describe("startRun commit identity env", () => {
 				logPath,
 				dataRoot: dir,
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				gitProbe: () => ({ name: false, email: false }),
+				gitProbe: (o) => {
+					probes.push(o);
+					return { name: false, email: false };
+				},
 			});
 			const r = await done;
 			expect(r.exitCode).toBe(0);
+			// The worker probe must mirror the worker's git: no pointer, because the
+			// dispatch strips GIT_CONFIG_GLOBAL (the worker mounts no board-config).
+			expect(probes[0]).toMatchObject({ cwd: dir, gitConfigGlobal: null });
 			const log = readFileSync(logPath, "utf8");
 			expect(log).toContain("IDENT GIT_AUTHOR_NAME=Ottr");
 			expect(log).toContain("IDENT GIT_AUTHOR_EMAIL=ottr@localhost");
 			expect(log).toContain("IDENT GIT_COMMITTER_NAME=Ottr");
 			expect(log).toContain("IDENT GIT_COMMITTER_EMAIL=ottr@localhost");
+			// The board's pinned pointer never reaches the worker's git: it would hide
+			// the shared home's ~/.gitconfig (the CMIS-1 failure).
+			expect(log).toContain("IDENT GIT_CONFIG_GLOBAL=undefined");
 		} finally {
+			if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
 		}

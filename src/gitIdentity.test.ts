@@ -122,71 +122,249 @@ describe("parseCommitField", () => {
 });
 
 describe("probeGitIdent", () => {
-	/** A temp home outside the repo; the caller removes it. */
-	function tempHome(prefix: string): string {
+	/** A temp dir outside the repo; the caller removes it. */
+	function tempDir(prefix: string): string {
 		return mkdtempSync(join(tmpdir(), prefix));
 	}
 
-	test("an empty home resolves nothing", () => {
-		const home = tempHome("ottr-probe-empty-");
+	/** A real repo (git init) whose HOME-less env keeps the probe off this machine's config. */
+	function tempRepo(prefix: string): string {
+		const dir = tempDir(prefix);
+		const run = (...args: string[]) => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd: dir,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { PATH: process.env.PATH ?? "" },
+			});
+			if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
+		};
+		run("init", "-q", "-b", "main");
+		return dir;
+	}
+
+	test("an empty home outside a repo resolves nothing", () => {
+		const home = tempDir("ottr-probe-empty-");
 		try {
-			expect(probeGitIdent(home)).toEqual({ name: false, email: false });
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: false, email: false });
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}
 	});
 
 	test("a .gitconfig identity resolves both fields", () => {
-		const home = tempHome("ottr-probe-full-");
+		const home = tempDir("ottr-probe-full-");
 		writeFileSync(
 			join(home, ".gitconfig"),
 			"[user]\n\tname = Tester\n\temail = t@example.com\n",
 		);
 		try {
-			expect(probeGitIdent(home)).toEqual({ name: true, email: true });
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}
 	});
 
 	test("only user.name resolves the name alone", () => {
-		const home = tempHome("ottr-probe-name-");
+		const home = tempDir("ottr-probe-name-");
 		writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = Tester\n");
 		try {
-			expect(probeGitIdent(home)).toEqual({ name: true, email: false });
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: false });
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}
 	});
 
-	test("GIT_CONFIG_GLOBAL must not count: the probe reads the home files only", () => {
-		const home = tempHome("ottr-probe-env-");
-		const cfg = tempHome("ottr-probe-envcfg-");
+	test("a kept GIT_CONFIG_GLOBAL pointer wins over the home, like the turn's git", () => {
+		// The board container case: the pinned /etc/ottr/gitconfig replaces the global
+		// scope, so the shared home's ~/.gitconfig is never consulted by the turn.
+		const home = tempDir("ottr-probe-pin-");
+		const cfgDir = tempDir("ottr-probe-pincfg-");
+		const cfg = join(cfgDir, "pinned.gitconfig");
 		writeFileSync(
-			join(cfg, "global.gitconfig"),
-			"[user]\n\tname = Env\n\temail = env@example.com\n",
+			join(home, ".gitconfig"),
+			"[user]\n\tname = Planted\n\temail = planted@example.com\n",
 		);
-		const saved = process.env.GIT_CONFIG_GLOBAL;
-		process.env.GIT_CONFIG_GLOBAL = join(cfg, "global.gitconfig");
+		writeFileSync(cfg, "[user]\n\tname = Pinned\n\temail = pinned@ottr\n");
 		try {
-			expect(probeGitIdent(home)).toEqual({ name: false, email: false });
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: cfg,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
+			// The pinned identity, not the planted home one, is what the probe saw: probe a
+			// pinned file without an identity and the planted home must still stay hidden.
+			writeFileSync(cfg, "[core]\n\tfsmonitor = false\n");
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: cfg,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: false, email: false });
 		} finally {
-			if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
-			else process.env.GIT_CONFIG_GLOBAL = saved;
 			rmSync(home, { recursive: true, force: true });
-			rmSync(cfg, { recursive: true, force: true });
+			rmSync(cfgDir, { recursive: true, force: true });
+		}
+	});
+
+	test("a stripped pointer (worker mode) reads the home's ~/.gitconfig", () => {
+		const home = tempDir("ottr-probe-worker-");
+		writeFileSync(
+			join(home, ".gitconfig"),
+			"[user]\n\tname = Shared\n\temail = shared@example.com\n",
+		);
+		try {
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("repo-local config counts when the probe cwd is the worktree", () => {
+		const home = tempDir("ottr-probe-repo-home-");
+		const repo = tempRepo("ottr-probe-repo-");
+		writeFileSync(
+			join(repo, ".git", "config"),
+			"[core]\n\trepositoryformatversion = 0\n[user]\n\tname = Repo Local\n\temail = repo@example.com\n",
+		);
+		try {
+			expect(
+				probeGitIdent({
+					cwd: repo,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("an includeIf gitdir identity counts", () => {
+		// The common corporate setup: one identity per checkout path via includeIf.
+		const home = tempDir("ottr-probe-if-home-");
+		const repo = tempRepo("ottr-probe-if-");
+		const ident = tempDir("ottr-probe-if-ident-");
+		const identFile = join(ident, "identity.gitconfig");
+		writeFileSync(
+			identFile,
+			"[user]\n\tname = Corp\n\temail = corp@ghe.example\n",
+		);
+		writeFileSync(
+			join(repo, ".git", "config"),
+			`[core]\n\trepositoryformatversion = 0\n[includeIf "gitdir:${repo}/"]\n\tpath = ${identFile}\n`,
+		);
+		try {
+			expect(
+				probeGitIdent({
+					cwd: repo,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+			rmSync(ident, { recursive: true, force: true });
+		}
+	});
+
+	test("an inherited ident env counts as configured", () => {
+		// The env beats every config scope, so a base env that already carries an author
+		// name must suppress the fallback env for that field alone.
+		const home = tempDir("ottr-probe-inh-");
+		try {
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: {
+						PATH: process.env.PATH ?? "",
+						GIT_AUTHOR_NAME: "Operator",
+					},
+				}),
+			).toEqual({ name: true, email: false });
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("GIT_CONFIG_COUNT injection cannot steer the probe", () => {
+		// The turn env strips the count form (withoutGitAuth); the probe must not let a
+		// leftover one fake a configured identity.
+		const home = tempDir("ottr-probe-count-");
+		try {
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: {
+						PATH: process.env.PATH ?? "",
+						GIT_CONFIG_COUNT: "1",
+						GIT_CONFIG_KEY_1: "user.name",
+						GIT_CONFIG_VALUE_1: "Injected",
+					},
+				}),
+			).toEqual({ name: false, email: false });
+		} finally {
+			rmSync(home, { recursive: true, force: true });
 		}
 	});
 
 	test("the XDG config also counts", () => {
-		const home = tempHome("ottr-probe-xdg-");
+		const home = tempDir("ottr-probe-xdg-");
 		mkdirSync(join(home, ".config", "git"), { recursive: true });
 		writeFileSync(
 			join(home, ".config", "git", "config"),
 			"[user]\n\tname = Xdg\n\temail = xdg@example.com\n",
 		);
 		try {
-			expect(probeGitIdent(home)).toEqual({ name: true, email: true });
+			expect(
+				probeGitIdent({
+					cwd: home,
+					home,
+					gitConfigGlobal: null,
+					baseEnv: { PATH: process.env.PATH ?? "" },
+				}),
+			).toEqual({ name: true, email: true });
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}

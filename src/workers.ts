@@ -365,6 +365,11 @@ export function serveWorker(opts: {
 				...body.env,
 			};
 			stripGitAuthEnv(env);
+			// OTTR-693: the board strips GIT_CONFIG_GLOBAL from the dispatched env (the
+			// pointer names a file only the server mounts); this side deletes whatever the
+			// worker container itself carries, so the turn's git never swaps the shared
+			// home's ~/.gitconfig for a file that does not exist here.
+			delete env.GIT_CONFIG_GLOBAL;
 			delete env.OTTR_WORKER_TOKEN;
 			// Same strip as childEnv on the server: no turn ever needs the alate key.
 			delete env.ALATE_API_KEY;

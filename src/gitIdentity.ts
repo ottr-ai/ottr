@@ -81,33 +81,53 @@ export function commitIdentityEnv(
 	return env;
 }
 
-/** Config-steering env names that must not reach the probe: it reads the turn's home files only. */
-const PROBE_STRIP = /^(GIT_CONFIG|GIT_AUTHOR_|GIT_COMMITTER_)/;
+/**
+ * Env names the turn's own env never carries (withoutGitAuth strips GIT_CONFIG_COUNT and
+ * friends), so the probe must not let them steer its reads either. GIT_CONFIG_GLOBAL and
+ * GIT_CONFIG_SYSTEM are NOT stripped: the turn's git honors them, so the probe must too.
+ */
+const PROBE_STRIP = /^(GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/;
+
+export interface IdentProbeEnv {
+	/** The turn's worktree: `git config` resolves repo-local config and includeIf rules here. */
+	cwd: string;
+	/** The HOME the turn's git sees (the layer pin moves it); null keeps the caller's. */
+	home: string | null;
+	/**
+	 * The GIT_CONFIG_GLOBAL value the turn's git sees, or null when the dispatch strips it
+	 * (a worker container mounts no board-config, so the pointer would name a missing file
+	 * and hide the shared home's ~/.gitconfig).
+	 */
+	gitConfigGlobal: string | null;
+	/**
+	 * The env the turn inherits before the ident env. A GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL
+	 * or GIT_COMMITTER_* value in it beats every config scope, so the probe reports that
+	 * field as configured.
+	 */
+	baseEnv: Record<string, string | undefined>;
+}
 
 /**
- * What git resolves for the ident from system + global config under `home` (repo-local
- * config stays out: the probe never runs inside a checkout). A spawn failure (git
- * missing) counts as unset, so the default still applies.
+ * What the turn's git resolves for the ident — the same cwd, the same global scope and
+ * the same inherited env, so the ident env is set exactly when git would otherwise find
+ * nothing. A spawn failure (git missing) counts as unset, so the default still applies.
  */
-export function probeGitIdent(home: string | null): {
+export function probeGitIdent(o: IdentProbeEnv): {
 	name: boolean;
 	email: boolean;
 } {
 	const get = (key: string): boolean => {
 		const env: Record<string, string> = {};
-		for (const [k, v] of Object.entries(process.env))
+		for (const [k, v] of Object.entries(o.baseEnv))
 			if (v !== undefined && !PROBE_STRIP.test(k)) env[k] = v;
-		if (home !== null) env.HOME = home;
-		// Without a home the probe has no cwd it owns: read the global scope only.
-		const args = [
-			"config",
-			...(home === null ? ["--global"] : []),
-			"--get",
-			key,
-		];
+		if (o.home !== null) env.HOME = o.home;
+		// The parameter is authoritative: it mirrors the pointer the turn's git sees,
+		// whether the base env carries it (local dispatch) or the dispatch strips it.
+		if (o.gitConfigGlobal === null) delete env.GIT_CONFIG_GLOBAL;
+		else env.GIT_CONFIG_GLOBAL = o.gitConfigGlobal;
 		try {
-			const r = spawnSync("git", args, {
-				cwd: home ?? undefined,
+			const r = spawnSync("git", ["config", "--get", key], {
+				cwd: o.cwd,
 				env,
 				stdio: ["ignore", "pipe", "ignore"],
 				windowsHide: true,
@@ -117,5 +137,11 @@ export function probeGitIdent(home: string | null): {
 			return false;
 		}
 	};
-	return { name: get("user.name"), email: get("user.email") };
+	const envNamed = (suffix: "NAME" | "EMAIL"): boolean =>
+		o.baseEnv[`GIT_AUTHOR_${suffix}`] !== undefined ||
+		o.baseEnv[`GIT_COMMITTER_${suffix}`] !== undefined;
+	return {
+		name: envNamed("NAME") || get("user.name"),
+		email: envNamed("EMAIL") || get("user.email"),
+	};
 }
