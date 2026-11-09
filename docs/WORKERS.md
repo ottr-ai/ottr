@@ -1175,6 +1175,17 @@ board refuses it, because a worker can point `.git` at any dir.
 Limits: omp writes its own session files in `sessions/` for turns that the board runs. This
 guard does not cover them.
 
+### The provisioned agent layer
+
+Alate provisions the agent layer (skills, rules, managed skills, config.yml) into the shared
+home from the data repo. The home copy takes no hand edits: the only path for a layer change
+is agent-data -> import -> provision. When a run settles, its container audits the files that
+alate's manifest records, `~/.alate/installed.json` (src/provision.ts,
+docs/specs/turn-provision-guard.md). A provisioned file that changed or went missing fails
+the turn: the card parks at needs_you and names the files. The audit only reads; it never
+blocks a write. It stays off when `.alate/current` exists (layer mode): a pinned turn writes
+its own layer, and alate no longer maintains the flat trees.
+
 ## Crash recovery
 
 A worker's lifetime is one turn and it owns no state: sessions and logs

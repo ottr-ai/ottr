@@ -1,4 +1,6 @@
+import { homedir } from "node:os";
 import { ensureAllPackages } from "./apt.ts";
+import { auditProvisioned } from "./provision.ts";
 import { ensureAllPython } from "./python.ts";
 import { sweepTmpDirs } from "./tmpsweep.ts";
 import { ensureAllTools } from "./tools.ts";
@@ -23,6 +25,9 @@ if (import.meta.main) {
 	const server = serveWorker({
 		port: Number(process.env.WORKER_PORT) || 8787,
 		token,
+		// The provision guard audits this container's shared home when a run settles
+		// (docs/specs/turn-provision-guard.md).
+		auditProvisioned: (sinceMs) => auditProvisioned(homedir(), sinceMs),
 	});
 
 	// Serving starts at once: a turn that arrives during the install queues behind it (src/apt.ts).

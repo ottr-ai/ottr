@@ -986,6 +986,43 @@ describe("runWorker", () => {
 		expect(result.ranOn).toBeUndefined();
 	}, 30_000);
 
+	test("the daemon's close audit rides the sentinel into the result", async () => {
+		const driftScript = join(dir, "drift-omp.js");
+		writeFileSync(driftScript, `process.exit(0);`);
+		const url = start({
+			ompPath: process.execPath,
+			auditProvisioned: () => [".omp/agent/skills/x/SKILL.md changed"],
+		});
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "drift1", argv: [driftScript], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		expect(result.provisionDrift).toEqual([
+			".omp/agent/skills/x/SKILL.md changed",
+		]);
+	}, 30_000);
+
+	test("a clean audit leaves provisionDrift unset", async () => {
+		const cleanScript = join(dir, "clean-omp.js");
+		writeFileSync(cleanScript, `process.exit(0);`);
+		const url = start({
+			ompPath: process.execPath,
+			auditProvisioned: () => [],
+		});
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "clean1", argv: [cleanScript], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.provisionDrift).toBeUndefined();
+	}, 30_000);
+
 	test("round-robins across urls", async () => {
 		const urls = [
 			start({ ompPath: process.execPath }),

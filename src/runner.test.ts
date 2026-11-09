@@ -936,6 +936,40 @@ describe("classify", () => {
 		});
 	});
 
+	test("1b. provision drift wins over killed and over a received receipt", () => {
+		const drift = [".omp/agent/skills/ui-ux-check/SKILL.md changed"];
+		expect(
+			run("work", result({ killed: true, provisionDrift: drift })),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `A turn changed the alate-provisioned agent layer: ${drift[0]}. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+		});
+		// A received ready report cannot outweigh drift: the next provision refuses the files.
+		expect(
+			run(
+				"work",
+				result({
+					exitCode: 0,
+					outcome: outcome(),
+					provisionDrift: [
+						".agents/x.md changed",
+						".ottr/workers/y.json missing",
+					],
+				}),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `A turn changed the alate-provisioned agent layer: .agents/x.md changed, .ottr/workers/y.json missing. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+		});
+		// The reason names at most four files, then counts the rest.
+		expect(
+			run("work", result({ provisionDrift: ["a", "b", "c", "d", "e"] }))
+				.needsReason,
+		).toContain("c, d (+1 more)");
+	});
+
 	test("2. a received terminal report wins over a post-report crash; no report still fails", () => {
 		// omp crashed at shutdown after report_outcome: the work decides, not the exit code.
 		expect(
@@ -2475,6 +2509,62 @@ describe("startRun", () => {
 			expect(seen[0]).toContain("--no-lsp");
 			expect(seen[0]).toContain(NO_DISCOVERY_CONFIG);
 			expect(r.ranOn).toBe(`board (${hostname()})`);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local run settles with the provision drift its audit reports", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-provision-drift-"));
+		try {
+			const launcher: RunLauncher = () => {
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+				auditProvisioned: () => [
+					".omp/agent/skills/ui-ux-check/SKILL.md changed",
+				],
+			});
+			const r = await handle.done;
+			expect(r.exitCode).toBe(0);
+			expect(r.provisionDrift).toEqual([
+				".omp/agent/skills/ui-ux-check/SKILL.md changed",
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local run without the audit option settles without provisionDrift", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-provision-clean-"));
+		try {
+			const launcher: RunLauncher = () => {
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			});
+			const r = await handle.done;
+			expect(r.provisionDrift).toBeUndefined();
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

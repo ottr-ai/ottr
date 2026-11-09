@@ -475,6 +475,17 @@ export function classify(o: {
 		needsReason: reason,
 	});
 
+	// The provision guard outweighs every other rule: a run that left the alate-provisioned
+	// agent layer drifted parks even on a received receipt — the next provision refuses the
+	// changed files, and the only fix is a data-repo commit (docs/specs/turn-provision-guard.md).
+	if (result.provisionDrift?.length) {
+		const shown = result.provisionDrift.slice(0, 4);
+		const more = result.provisionDrift.length - shown.length;
+		return needs(
+			`A turn changed the alate-provisioned agent layer: ${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+		);
+	}
+
 	if (result.killed) return needs("Stopped by the tracker.");
 
 	// One-shot omp runs exit 0 when the agent ends its reply on a pending wait/background call
@@ -1313,6 +1324,10 @@ export function startRun(o: {
 	memoryConfigPath?: string | null;
 	/** Hosted mode only: capture token usage for metering (createRunSink). */
 	meter?: boolean;
+	/** Post-run guard (docs/specs/turn-provision-guard.md): audits the shared home's provisioned
+	 * agent layer against alate's manifest when a local run settles, so a turn that edited it
+	 * settles with provisionDrift. Undefined skips the audit (tests); production passes it. */
+	auditProvisioned?: (sinceMs: number) => readonly string[];
 }): RunHandle {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
@@ -1416,6 +1431,9 @@ export function startRun(o: {
 			if (settled) return;
 			settled = true;
 			unregisterLayer();
+			// The provision guard fires after the run's writes are final; drift fails the
+			// run through classify (docs/specs/turn-provision-guard.md).
+			const drift = o.auditProvisioned?.(startedAt) ?? [];
 			resolveDone(
 				sink.result({
 					exitCode: code,
@@ -1423,6 +1441,7 @@ export function startRun(o: {
 					stderrTail: sink.tail(),
 					ranOn: `board (${hostname()})`,
 					dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
+					...(drift.length ? { provisionDrift: [...drift] } : {}),
 				}),
 			);
 		};

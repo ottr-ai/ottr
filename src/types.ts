@@ -594,6 +594,10 @@ export interface RunResult {
 	/** Tokens and cost summed over the run's assistant messages (hosted metering); absent while
 	 * omp reported none. */
 	usage?: TokenUsage;
+	/** Files of the alate-provisioned agent layer that no longer match alate's installed.json
+	 * manifest, audited when the run settled (docs/specs/turn-provision-guard.md). Non-empty
+	 * fails the turn: the only path for layer changes is agent-data -> import -> provision. */
+	provisionDrift?: string[];
 }
 
 /** Git checks the tracker runs in the worktree after a turn. */

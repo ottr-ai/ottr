@@ -110,7 +110,13 @@ export interface DetachedRun {
 	pid: number | null;
 	running: boolean;
 	startedAt: number;
-	result?: { exitCode: number | null; stderrTail: string; vm?: VmOutcome };
+	result?: {
+		exitCode: number | null;
+		stderrTail: string;
+		vm?: VmOutcome;
+		/** The shared home's provisioned-layer drift the daemon's close audit found. */
+		provisionDrift?: string[];
+	};
 	killed?: boolean;
 }
 
@@ -127,6 +133,10 @@ export function serveWorker(opts: {
 	ensurePython?: typeof ensureProjectPython;
 	/** Only for tests: replaces the link dir prepended to the child's PATH. */
 	buildPath?: typeof buildToolsPath;
+	/** The post-run provision guard (docs/specs/turn-provision-guard.md): the daemon audits its
+	 * container's shared home against alate's manifest when a run closes. src/worker.ts injects
+	 * the real audit; tests omit it and the audit stays off. */
+	auditProvisioned?: (sinceMs: number) => readonly string[];
 	/** Only for tests: roots the /sweep scan instead of /workspace. */
 	sweepRoots?: readonly string[];
 	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
@@ -460,16 +470,28 @@ export function serveWorker(opts: {
 						stopWatch();
 						forgetChild();
 						forgetEntry();
+						// The provision guard audits this container's shared home once the run's
+						// writes are final (docs/specs/turn-provision-guard.md); drift rides the
+						// result, and classify parks the turn.
+						const provisionDrift =
+							opts.auditProvisioned?.(entry.startedAt) ?? [];
+						const driftField = provisionDrift.length
+							? { provisionDrift: [...provisionDrift] }
+							: {};
 						if (entry.detached) {
 							// No client listens any more: the result waits in /detached for boot
 							// recovery instead of a sentinel on a gone stream.
 							entry.running = false;
-							entry.result = { exitCode: code ?? null, stderrTail };
+							entry.result = {
+								exitCode: code ?? null,
+								stderrTail,
+								...driftField,
+							};
 							return;
 						}
 						if (partial.length > 0) push(`${partial}\n`);
 						push(
-							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail, host: hostname() } })}\n`,
+							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail, host: hostname(), ...driftField } })}\n`,
 						);
 						if (!closed) controller.close(); // else the client aborted; the stream is gone
 					});
@@ -502,7 +524,10 @@ function parseSentinel(line: string): {
 	stderrTail: string;
 	host?: string;
 	vm?: VmOutcome;
+	provisionDrift?: string[];
 } | null {
+	const stringList = (v: unknown): v is string[] =>
+		Array.isArray(v) && v.length > 0 && v.every((l) => typeof l === "string");
 	try {
 		const v = JSON.parse(line) as Record<string, unknown>;
 		const done = v[WORKER_DONE] as Record<string, unknown> | undefined;
@@ -519,6 +544,9 @@ function parseSentinel(line: string): {
 					? { host: done.host }
 					: {}),
 				...(isVmOutcome(done.vm) ? { vm: vmOutcome(done.vm) } : {}),
+				...(stringList(done.provisionDrift)
+					? { provisionDrift: done.provisionDrift }
+					: {}),
 			};
 	} catch {
 		// not JSON, not the sentinel
@@ -665,6 +693,9 @@ export function runWorker(
 										}
 									: {}),
 								...(sentinel.vm ? { vm: sentinel.vm } : {}),
+								...(sentinel.provisionDrift
+									? { provisionDrift: sentinel.provisionDrift }
+									: {}),
 							}),
 						);
 						return;
