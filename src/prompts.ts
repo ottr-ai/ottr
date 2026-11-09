@@ -188,6 +188,7 @@ ${text}
 Refine it into a buildable task: run rounds of clarifying questions with the ask tool. End each turn with one ask call holding 1-5 questions, and give each question 2 to 5 concrete options that each name a real choice.
 Probe the scope, the edge cases, the boundaries, the acceptance checks, the non-goals, and the risks. Ask until a developer could build the task without guessing.
 This session is read-only: do NOT edit any file.
+Before you report ready, run a comprehension check: spawn one fresh subagent with the task tool and give it only the refined task text, never this conversation. Ask it to restate what it would build and how it would check it, and to list each question it would still have to ask before it builds. When its restatement differs from the user's answers or it lists an open question, fix the refined text or run one more ask round, then check the new text once more. Run the check at most two times in this session.
 When the idea is refined, call report_outcome with status "ready". Put the complete refined task text in the details: what to build, the acceptance checks, the boundaries, and the non-goals. The board appends those details to the card prompt when the user promotes this card to todo.
 The tracker parks this card in backlog after your report; it never merges anything from this session.`;
 }
