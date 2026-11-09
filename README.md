@@ -203,9 +203,10 @@ project has no Windows machine to verify them.
 
 - `podman compose` needs a compose provider. Use Docker Compose v2 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`), or `pip install podman-compose`.
 - Podman has no `local` log driver. Set `OTTR_LOG_DRIVER=k8s-file` (env or `.env`).
-- Windows + podman-compose cannot take the host paths as written: `C:\...` does not parse in a short volume mount, and a POSIX path like `/mnt/c/Users/<you>/.omp/oauth` goes through Python `abspath`, becomes `C:\mnt\c\...`, and podman mounts `/mnt/c/mnt/c/Users/...`. Rootful podman creates the missing source as an empty folder, so the stack starts with an empty oauth folder and `agent.db` as a folder — provider sign-in then fails, and nothing reports it. Use Docker Compose v2 as the provider, or:
+- Windows + podman-compose cannot take the host paths as written: `C:\...` does not parse in a short volume mount, and a POSIX path like `/mnt/c/Users/<you>/.omp/oauth` goes through Python `abspath`, becomes `C:\mnt\c\...`, and podman mounts `/mnt/c/mnt/c/Users/...`. Rootful podman creates the missing source as an empty folder, so the stack starts with an empty oauth folder and `agent.db` as a folder — provider sign-in then fails. The entry script refuses to start on the `agent.db` folder and warns on the empty oauth folder. Use Docker Compose v2 as the provider, or:
   - use paths relative to the compose folder, which podman-compose resolves there and the podman client translates into machine paths. From `C:\Users\<you>\ottr`: `OTTR_OAUTH_DIR=../../../../Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=../../../../Users/<you>/.omp/ottr-agent.db`;
   - or switch the two mounts in your compose copy to the long bind syntax (`type: bind`, `source:` the Windows path, `target:` the container path), which podman-compose takes as-is.
+- An empty oauth folder does not block the start: the entry script warns, then starts, because the host omp can keep every provider sign-in in `agent.db` (seen: GitHub Copilot only). If a sign-in should be there, the host path is wrong — fix it and sign in again. An empty `.keep` file in the folder stops the warning.
 - Check the mounts after `up` (podman-compose names the container `ottr_server_1`; Docker Compose v2 `ottr-server-1`):
 
   ```sh

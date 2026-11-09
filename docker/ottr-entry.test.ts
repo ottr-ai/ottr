@@ -33,13 +33,27 @@ describe("ottr-entry credential mounts", () => {
 		expect(err).toContain("Troubleshooting");
 	});
 
-	test("an empty OTTR_OAUTH_DIR refuses", () => {
+	test("an empty OTTR_OAUTH_DIR warns and boots", () => {
 		const oauth = join(root, "oauth-empty");
 		mkdirSync(oauth);
 		writeFileSync(join(root, "agent.db"), "x");
 		const r = run({ OTTR_AGENT_DB: join(root, "agent.db"), OTTR_OAUTH_DIR: oauth });
+		expect(r.exitCode).toBe(0);
+		const err = r.stderr.toString();
+		expect(err).toContain("OTTR_OAUTH_DIR");
+		expect(err).toContain(".keep");
+	});
+
+	test("a missing OTTR_OAUTH_DIR refuses", () => {
+		writeFileSync(join(root, "agent.db"), "x");
+		const r = run({
+			OTTR_AGENT_DB: join(root, "agent.db"),
+			OTTR_OAUTH_DIR: join(root, "oauth-missing"),
+		});
 		expect(r.exitCode).toBe(1);
-		expect(r.stderr.toString()).toContain("OTTR_OAUTH_DIR");
+		const err = r.stderr.toString();
+		expect(err).toContain("OTTR_OAUTH_DIR");
+		expect(err).toContain("refusing to start");
 	});
 
 	test("a real agent.db and a non-empty oauth dir boot", () => {
@@ -48,6 +62,7 @@ describe("ottr-entry credential mounts", () => {
 		writeFileSync(join(oauth, "creds.json"), "{}");
 		const r = run({ OTTR_AGENT_DB: join(root, "agent.db"), OTTR_OAUTH_DIR: oauth });
 		expect(r.exitCode).toBe(0);
+		expect(r.stderr.toString()).toBe("");
 	});
 });
 

@@ -1184,9 +1184,14 @@ Two failures from the same cause: `OTTR_OAUTH_DIR` or `OTTR_AGENT_DB` pointing a
 wrong host path. Rootful Podman creates an empty folder for a missing bind source
 instead of failing, so the stack starts with broken credential mounts.
 
-Symptom (a): the stack starts, but Settings and turns have no provider sign-in, and
-the logs show `ottr-entry:` refusing with the `OTTR_OAUTH_DIR` or `OTTR_AGENT_DB`
-message.
+Symptom (a): the stack starts, but Settings and turns have no provider sign-in. The
+logs show the `ottr-entry:` message: the refusal for an `OTTR_AGENT_DB` folder or an
+`OTTR_OAUTH_DIR` that is not a directory, or the warning for an empty `OTTR_OAUTH_DIR`.
+
+An empty `OTTR_OAUTH_DIR` can be correct: the host omp can keep every provider
+sign-in in `agent.db` (seen: GitHub Copilot only), and then the oauth folder stays
+empty. The entry script warns and starts. An empty `.keep` file in the folder stops
+the warning.
 
 Fix: correct the host path in the compose env file and recreate the stack.
 

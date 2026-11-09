@@ -42,18 +42,25 @@ if [ "${1:-}" = "repair-agent-db" ]; then
 fi
 # Credential mounts: compose interpolates OTTR_OAUTH_DIR and OTTR_AGENT_DB on the host,
 # so a wrong host path makes rootful Podman create an empty folder inside the container
-# and the stack starts with broken credential mounts that nothing reports. Refuse to
-# start before anything is written. Both variables are not inside the container env,
-# hence the fixed defaults. README, "Podman", and docs/WORKERS.md, Troubleshooting.
+# and the stack starts with broken credential mounts. Refuse to start before anything
+# is written; the empty oauth folder below is the one exception (OTTR-674). Both
+# variables are not inside the container env, hence the fixed defaults.
+# README, "Podman", and docs/WORKERS.md, Troubleshooting.
 db="${OTTR_AGENT_DB:-/root/.omp/agent/agent.db}"
 if [ ! -f "$db" ]; then
 	echo "ottr-entry: OTTR_AGENT_DB=$db is not a regular file: a wrong host path made rootful Podman create an empty folder; after fixing the path the home volume keeps that folder and the next recreate fails with 'crun: mount ... agent.db: Not a directory' — repair with docker compose run --rm home-repair. See README, \"Podman\" and docs/WORKERS.md, Troubleshooting; refusing to start" >&2
 	exit 1
 fi
 oauth="${OTTR_OAUTH_DIR:-/root/.omp/oauth}"
-if [ ! -d "$oauth" ] || [ -z "$(ls -A "$oauth")" ]; then
-	echo "ottr-entry: OTTR_OAUTH_DIR=$oauth is not a non-empty directory: a wrong host path made rootful Podman create an empty folder. Fix the host path and sign in again. See README, \"Podman\" and docs/WORKERS.md, Troubleshooting; refusing to start" >&2
+if [ ! -d "$oauth" ]; then
+	echo "ottr-entry: OTTR_OAUTH_DIR=$oauth is not a directory: the host path is wrong or points at a file. Fix the host path and sign in again. See README, \"Podman\" and docs/WORKERS.md, Troubleshooting; refusing to start" >&2
 	exit 1
+fi
+# OTTR-674: the host omp can keep every sign-in in agent.db (seen: GitHub Copilot
+# only), so an empty oauth folder is legitimate. Warn and start; the agent.db check
+# above still catches the wrong host path. An empty .keep file stops the warning.
+if [ -z "$(ls -A "$oauth")" ]; then
+	echo "ottr-entry: OTTR_OAUTH_DIR=$oauth is empty: fine when every provider sign-in lives in agent.db. If a sign-in should be there, fix the host path (a wrong one made rootful Podman create this empty folder; see README, \"Podman\" and docs/WORKERS.md, Troubleshooting) and sign in again, or drop an empty .keep file into the folder to stop this warning" >&2
 fi
 # R5-1: this script never copies from $HOME. A missing pinned git config gets the fixed
 # Ottr identity (the one src/app.ts commits with). gh starts empty: its config can name
