@@ -5964,6 +5964,75 @@ describe("ProjectBoard sync-commit advisories", () => {
 	});
 });
 
+describe("ProjectBoard rules interview action", () => {
+	const projectNoRules = {
+		name: "proj",
+		hasRules: false,
+		github: null,
+		gitless: false,
+		dirty: false,
+		mainBranch: null,
+		mainUnpushed: false,
+		target: "origin/main",
+		archReview: null,
+		latestRelease: null,
+		latestImage: null,
+		settings: { setupChecklist: false },
+		sessionsDir: "/tmp/s",
+	} as unknown as ProjectView;
+
+	const renderBoard = (tasks: TaskCard[]): string =>
+		renderToStaticMarkup(
+			<ProjectBoard
+				project={projectNoRules}
+				tasks={tasks}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async () => true}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
+
+	test("a live rules card offers Open rules task instead of Discuss rules", () => {
+		const html = renderBoard([
+			cardFixture({ id: "PROJ-7", kind: "interview", stage: "todo" }),
+		]);
+		expect(html).toContain("Open rules task");
+		expect(html).not.toContain("Discuss rules");
+	});
+
+	test("a done rules card is not live: Discuss rules stays", () => {
+		const html = renderBoard([
+			cardFixture({ id: "PROJ-7", kind: "interview", stage: "done" }),
+		]);
+		expect(html).toContain("Discuss rules");
+		expect(html).not.toContain("Open rules task");
+	});
+
+	test("a cancelled rules card is not live: Discuss rules stays", () => {
+		const html = renderBoard([
+			cardFixture({
+				id: "PROJ-7",
+				kind: "interview",
+				stage: "done",
+				cancelledAt: 5,
+			}),
+		]);
+		expect(html).toContain("Discuss rules");
+		expect(html).not.toContain("Open rules task");
+	});
+
+	test("no rules card at all: Discuss rules stays", () => {
+		const html = renderBoard([cardFixture({ id: "t1", title: "Fix bug" })]);
+		expect(html).toContain("Discuss rules");
+		expect(html).not.toContain("Open rules task");
+	});
+});
+
 describe("AddProjectModal board GitHub token reuse", () => {
 	// React interaction needs browser globals; the same happy-dom swap as the
 	// AskBlock tests above: installed after app.tsx's import, removed after.
@@ -6133,6 +6202,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 						act={actProp}
 						onClose={() => {}}
 						onAdded={(interview: string) => added.push(interview)}
+						openTask={() => {}}
 					/>,
 				);
 			});

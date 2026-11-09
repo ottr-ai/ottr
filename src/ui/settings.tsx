@@ -15,6 +15,7 @@ import type { AlertClass, ClassPrefs } from "../notifications.ts";
 import type { OmpStatsReport } from "../ompStats.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
+import { liveCardOf } from "../scheduler.ts";
 import type {
 	AppCheck,
 	ArchReview,
@@ -139,6 +140,8 @@ function pushedAge(pushedAt: number, now: number): string {
 export function ProjectSetupSteps({
 	project,
 	interview = "standalone",
+	rulesTask: rulesTaskProp = null,
+	openTask,
 	act,
 	onNotice,
 	onClose,
@@ -146,6 +149,11 @@ export function ProjectSetupSteps({
 	project: ProjectView;
 	/** Add response verdict for a fresh project: "queued" means the rules card is already filed. */
 	interview?: string;
+	/** The live rules interview card's id, when the caller knows one: the Rules section then
+	 * offers "Open rules task" instead of a second "Discuss rules" that would only queue. */
+	rulesTask?: string | null;
+	/** Opens the rules card in the board drawer; the "Open rules task" button needs it. */
+	openTask?: (id: string) => void;
 	act: Act;
 	onNotice?: (message: string) => void;
 	onClose: () => void;
@@ -156,6 +164,9 @@ export function ProjectSetupSteps({
 	const [err, setErr] = useState<string | null>(null);
 	const [gitless, setGitless] = useState(project.gitless);
 	const [rulesQueued, setRulesQueued] = useState(interview === "queued");
+	// The rules card the wizard can open: seeded from the caller, then set from every
+	// interview answer's id, so a queued or running card turns the button into an open.
+	const [rulesTask, setRulesTask] = useState<string | null>(rulesTaskProp);
 	// Fork pre-check draft: shown before the user touches the checkbox, persisted only on Next.
 	const [forkDraft, setForkDraft] = useState(false);
 	const forkTouched = useRef(false);
@@ -184,17 +195,18 @@ export function ProjectSetupSteps({
 			refreshState();
 		}, setErr);
 
-	/** One interview call; its verdict becomes a board notice. */
+	/** One interview call; its verdict becomes a board notice and its card id an open affordance. */
 	const runInterview = (
 		body: Record<string, unknown>,
 		after?: () => void,
 	): Promise<boolean> =>
 		act(async () => {
-			const r = await post<{ interview: string }>(
+			const r = await post<{ interview: string; id: string | null }>(
 				`/api/projects/${encodeURIComponent(view.name)}/interview`,
 				body,
 			);
 			onNotice?.(interviewMsg(r.interview));
+			if (r.id !== null) setRulesTask(r.id);
 			after?.();
 		}, setErr);
 
@@ -281,6 +293,23 @@ export function ProjectSetupSteps({
 							<div>
 								<BusyButton run={() => runInterview({ fix: true })}>
 									Align rules
+								</BusyButton>
+							</div>
+						</>
+					) : rulesTask !== null && openTask !== undefined ? (
+						<>
+							<p className="hint">
+								The rules task is live — it asks its questions on the card.
+							</p>
+							<div>
+								<BusyButton
+									run={async () => {
+										onClose();
+										openTask(rulesTask);
+										return true;
+									}}
+								>
+									Open rules task
 								</BusyButton>
 							</div>
 						</>
@@ -498,11 +527,16 @@ export function SetupWizardModal({
 	project,
 	act,
 	onNotice,
+	rulesTask,
+	openTask,
 	onClose,
 }: {
 	project: ProjectView;
 	act: Act;
 	onNotice?: (message: string) => void;
+	/** The live rules interview card's id, or null: a live card turns "Discuss rules" into "Open rules task". */
+	rulesTask?: string | null;
+	openTask?: (id: string) => void;
 	onClose: () => void;
 }) {
 	return (
@@ -516,6 +550,8 @@ export function SetupWizardModal({
 					project={project}
 					act={act}
 					onNotice={onNotice}
+					rulesTask={rulesTask}
+					openTask={openTask}
 					onClose={onClose}
 				/>
 			</div>
@@ -6301,6 +6337,13 @@ export function ProjectSettingsForm({
 				<SetupWizardModal
 					project={project}
 					act={act}
+					rulesTask={
+						liveCardOf(
+							tasks.filter((t) => t.project === project.name),
+							"interview",
+						)?.id ?? null
+					}
+					openTask={openTask}
 					onClose={() => setSetupOpen(false)}
 				/>
 			)}

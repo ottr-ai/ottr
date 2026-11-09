@@ -64,16 +64,26 @@ export function queueOrder<
 		);
 }
 
-/** True when a non-cancelled task of `kind` has not reached done: the one-live-card-per-kind
- * guard (rules interview, retro). kind is a trusted, server-set field, so this is the single place
- * that derives "a card of this kind is live" (R1-14). Reviews use reviewBlocked instead. */
+/** The non-cancelled task of `kind` that has not reached done, or null: the one card of the
+ * kind the one-live-card-per-kind rule keeps (rules interview, retro). kind is a trusted,
+ * server-set field, so this is the single place that derives "a card of this kind is live"
+ * (R1-14). Reviews use reviewBlocked instead. */
+export function liveCardOf<
+	T extends Pick<Task, "kind" | "cancelledAt" | "stage">,
+>(tasks: readonly T[], kind: TaskKind): T | null {
+	return (
+		tasks.find(
+			(t) => t.kind === kind && t.cancelledAt === null && t.stage !== "done",
+		) ?? null
+	);
+}
+
+/** True when liveCardOf finds a card: the boolean form for guards that only ask yes/no. */
 export function liveCard(
 	tasks: readonly Pick<Task, "kind" | "cancelledAt" | "stage">[],
 	kind: TaskKind,
 ): boolean {
-	return tasks.some(
-		(t) => t.kind === kind && t.cancelledAt === null && t.stage !== "done",
-	);
+	return liveCardOf(tasks, kind) !== null;
 }
 
 /** The fields the review policies read. */

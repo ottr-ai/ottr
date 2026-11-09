@@ -23,6 +23,7 @@ import {
 	OmpStatsSection,
 	openSettingsSection,
 	ProjectSettingsForm,
+	ProjectSetupSteps,
 	ProjectsOrderSection,
 	SessionSection,
 	SettingsPage,
@@ -3457,5 +3458,50 @@ describe("AlateSection stored API key", () => {
 				value: realClipboard,
 			});
 		}
+	});
+});
+
+describe("ProjectSetupSteps rules action", () => {
+	// A minimal ProjectView at step 2: the Rules section reads hasRules, gitless and the
+	// settings the step's drafts seed from.
+	const project = {
+		name: "proj",
+		hasRules: false,
+		gitless: false,
+		github: null,
+		settings: {
+			maxParallel: null,
+			copyExtra: [],
+			forkResearch: false,
+		},
+	} as unknown as ProjectView;
+
+	const renderSteps = (props: {
+		rulesTask?: string | null;
+		openTask?: (id: string) => void;
+	}): string =>
+		renderToStaticMarkup(
+			<ProjectSetupSteps
+				project={project}
+				rulesTask={props.rulesTask}
+				openTask={props.openTask}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onClose={() => {}}
+			/>,
+		);
+
+	test("a live rules card offers Open rules task instead of Discuss rules", () => {
+		const html = renderSteps({ rulesTask: "PROJ-7", openTask: () => {} });
+		expect(html).toContain("Open rules task");
+		expect(html).not.toContain("Discuss rules");
+	});
+
+	test("without a rules card or opener the Discuss rules button stays", () => {
+		const html = renderSteps({});
+		expect(html).toContain("Discuss rules");
+		expect(html).not.toContain("Open rules task");
 	});
 });

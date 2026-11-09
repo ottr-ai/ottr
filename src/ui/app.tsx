@@ -25,7 +25,12 @@ import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
-import { queueOrder, type ReviewTask, waitingOn } from "../scheduler.ts";
+import {
+	liveCardOf,
+	queueOrder,
+	type ReviewTask,
+	waitingOn,
+} from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
 import {
 	type AddProjectResponse,
@@ -3454,6 +3459,9 @@ export function ProjectBoard({
 			);
 			onNotice(interviewMsg(r.interview));
 		});
+	// The live rules interview card, if any: the no-rules advisory then offers opening it
+	// instead of a second "Discuss rules" that would only answer "queued".
+	const rulesTask = liveCardOf(tasks, "interview");
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
 	const { shown, counts } = laneCounts(tasks, applied, seenAnswers);
 	// The search count matches the lanes: a retro off the board is no task to count.
@@ -3735,9 +3743,20 @@ export function ProjectBoard({
 				<p className="advisory">
 					<Icon name="info" size={14} />
 					No AGENTS.md yet, so tasks wait in Todo.
-					<BusyButton run={() => interview("/interview", {})}>
-						Discuss rules
-					</BusyButton>
+					{rulesTask === null ? (
+						<BusyButton run={() => interview("/interview", {})}>
+							Discuss rules
+						</BusyButton>
+					) : (
+						<BusyButton
+							run={async () => {
+								open(rulesTask.id);
+								return true;
+							}}
+						>
+							Open rules task
+						</BusyButton>
+					)}
 				</p>
 			)}
 			{project.gitless && (
@@ -3767,6 +3786,8 @@ export function ProjectBoard({
 					project={project}
 					act={act}
 					onNotice={onNotice}
+					rulesTask={rulesTask?.id ?? null}
+					openTask={open}
 					onClose={() => setSetupOpen(false)}
 				/>
 			)}
@@ -6142,10 +6163,13 @@ export function AddProjectModal({
 	act,
 	onClose,
 	onAdded,
+	openTask,
 }: {
 	act: Act;
 	onClose: () => void;
 	onAdded: (interview: string) => void;
+	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
+	openTask: (id: string) => void;
 }) {
 	const hosted = useContext(HostedContext);
 	const [mode, setMode] = useState<"url" | "new">("url");
@@ -6233,7 +6257,11 @@ export function AddProjectModal({
 				if (status < 300) {
 					const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
 					onAdded(r.interview);
-					setAdded({ project: r.project, interview: r.interview });
+					setAdded({
+						project: r.project,
+						interview: r.interview,
+						id: r.id ?? null,
+					});
 				} else if (t !== null) {
 					setAddTrust(t);
 					throw new Error(t.error);
@@ -6338,6 +6366,7 @@ export function AddProjectModal({
 	const [added, setAdded] = useState<{
 		project: ProjectView;
 		interview: string;
+		id: string | null;
 	} | null>(null);
 
 	return (
@@ -6367,7 +6396,11 @@ export function AddProjectModal({
 										github: ghRepo,
 									});
 									onAdded(r.interview);
-									setAdded({ project: r.project, interview: r.interview });
+									setAdded({
+										project: r.project,
+										interview: r.interview,
+										id: r.id ?? null,
+									});
 								}, setErr),
 							);
 						}}
@@ -6611,7 +6644,11 @@ export function AddProjectModal({
 										if (status < 300) {
 											const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
 											onAdded(r.interview);
-											setAdded({ project: r.project, interview: r.interview });
+											setAdded({
+												project: r.project,
+												interview: r.interview,
+												id: r.id ?? null,
+											});
 											setAddTrust(null);
 											return { ok: true } as const;
 										}
@@ -6647,6 +6684,8 @@ export function AddProjectModal({
 					<ProjectSetupSteps
 						project={added.project}
 						interview={added.interview}
+						rulesTask={added.id}
+						openTask={openTask}
 						act={act}
 						onClose={onClose}
 					/>
@@ -12500,6 +12539,7 @@ export function App() {
 					act={act}
 					onClose={() => setShowAdd(false)}
 					onAdded={(i) => setNotice(interviewMsg(i))}
+					openTask={openTask}
 				/>
 			)}
 

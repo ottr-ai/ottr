@@ -1125,8 +1125,11 @@ export interface SessionContext {
 
 export interface AddProjectResponse {
 	project: ProjectView;
-	/** "queued" | "not-needed" */
+	/** "queued" | "not-needed" | "gitless" */
 	interview: string;
+	/** The rules interview card's id when the answer queued one; null when no card exists
+	 * ("not-needed", "gitless"). The setup wizard turns it into an "Open rules task" action. */
+	id: string | null;
 }
 
 /** GET /api/gh-status: gh auth facts for the Add project form's New tab. */

@@ -1319,30 +1319,34 @@ describe("task routes", () => {
 });
 
 describe("interview routes", () => {
-	test("post queues the interview once; existing rules answer not-needed", async () => {
+	test("post queues the interview once; a live card answers running with its id", async () => {
 		const res = await post("/api/projects/p1/interview", {});
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ interview: "queued" });
+		const queued = (await res.json()) as { interview: string; id: string };
 		const task = store
 			.listTasks()
 			.find((t) => t.prompt.startsWith(RULES_INTERVIEW_MARKER));
 		expect(task).toBeDefined();
 		expect(task!.cancelledAt).toBeNull();
-		// Idempotent while the first interview is live.
+		expect(queued).toEqual({ interview: "queued", id: task!.id });
+		// Idempotent while the first interview is live: running names the same card.
 		const again = await post("/api/projects/p1/interview", {});
-		expect(await again.json()).toEqual({ interview: "queued" });
+		expect(await again.json()).toEqual({ interview: "running", id: task!.id });
 		const count = store
 			.listTasks()
 			.filter((t) => t.prompt.startsWith(RULES_INTERVIEW_MARKER)).length;
 		expect(count).toBe(1);
 
-		// AGENTS.md present -> no interview.
+		// AGENTS.md present -> no interview, no card id.
 		const agents = join(projectDir, "AGENTS.md");
 		mkdirSync(projectDir, { recursive: true });
 		writeFileSync(agents, "rules");
 		try {
 			const notNeeded = await post("/api/projects/p1/interview", {});
-			expect(await notNeeded.json()).toEqual({ interview: "not-needed" });
+			expect(await notNeeded.json()).toEqual({
+				interview: "not-needed",
+				id: null,
+			});
 		} finally {
 			rmSync(agents);
 		}
@@ -1365,15 +1369,19 @@ describe("interview routes", () => {
 		try {
 			const res = await post("/api/projects/p1/interview", { fix: true });
 			expect(res.status).toBe(200);
-			expect(await res.json()).toEqual({ interview: "queued" });
+			const queued = (await res.json()) as { interview: string; id: string };
 			const task = store
 				.listTasks()
 				.find((t) => t.prompt.startsWith(RULES_INTERVIEW_MARKER));
 			expect(task).toBeDefined();
 			expect(task!.prompt).toContain("already has an AGENTS.md");
-			// Idempotent while that alignment card is live: still exactly one live interview.
+			expect(queued).toEqual({ interview: "queued", id: task!.id });
+			// Idempotent while that alignment card is live: running names it, still exactly one.
 			const again = await post("/api/projects/p1/interview", { fix: true });
-			expect(await again.json()).toEqual({ interview: "queued" });
+			expect(await again.json()).toEqual({
+				interview: "running",
+				id: task!.id,
+			});
 			const count = store
 				.listTasks()
 				.filter(

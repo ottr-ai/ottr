@@ -1012,11 +1012,13 @@ export function confirmDialog(
 export const interviewMsg = (interview: string): string =>
 	interview === "queued"
 		? "Rules interview queued as a card - it starts shortly and asks its questions on the card."
-		: interview === "not-needed"
-			? "AGENTS.md found - no interview needed."
-			: interview === "gitless"
-				? "Init a git repository first - actions wait until then."
-				: interview;
+		: interview === "running"
+			? "A rules task is already live - it asks its questions on the card."
+			: interview === "not-needed"
+				? "AGENTS.md found - no interview needed."
+				: interview === "gitless"
+					? "Init a git repository first - actions wait until then."
+					: interview;
 
 /** The name the board shows; the folder name stays the project's id in URLs and filters. */
 export function projectLabel(p: ProjectView): string {

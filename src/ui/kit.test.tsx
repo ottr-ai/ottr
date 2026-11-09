@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
 	clampPan,
+	interviewMsg,
 	LiveElapsed,
 	Skeleton,
 	ZoomableImage,
@@ -285,4 +286,22 @@ test("LiveElapsed ticks the elapsed duration, then the status words and the esti
 			<LiveElapsed since={now - 65_000} status="" etaMs={60_000} />,
 		),
 	).not.toContain("·");
+});
+
+describe("interviewMsg", () => {
+	test("each route verdict maps to its notice; unknown text passes through", () => {
+		expect(interviewMsg("queued")).toBe(
+			"Rules interview queued as a card - it starts shortly and asks its questions on the card.",
+		);
+		expect(interviewMsg("running")).toBe(
+			"A rules task is already live - it asks its questions on the card.",
+		);
+		expect(interviewMsg("not-needed")).toBe(
+			"AGENTS.md found - no interview needed.",
+		);
+		expect(interviewMsg("gitless")).toBe(
+			"Init a git repository first - actions wait until then.",
+		);
+		expect(interviewMsg("standalone")).toBe("standalone");
+	});
 });

@@ -24,6 +24,7 @@ import {
 	lastFullReviewBase,
 	lastReviewBase,
 	liveCard,
+	liveCardOf,
 	mergeAnywayPatch,
 	mergeHold,
 	modelVendor,
@@ -236,6 +237,13 @@ describe("liveCard", () => {
 
 	test("a card of another kind never matches", () => {
 		expect(liveCard([task()], "review")).toBe(false);
+	});
+
+	test("liveCardOf returns the live card itself, else null", () => {
+		const live = task({ id: "p1-3", kind: "interview", stage: "in_progress" });
+		const done = task({ id: "p1-1", kind: "interview", stage: "done" });
+		expect(liveCardOf([done, live], "interview")).toBe(live);
+		expect(liveCardOf([done], "interview")).toBeNull();
 	});
 });
 

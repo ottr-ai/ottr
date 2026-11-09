@@ -227,7 +227,7 @@ import {
 	isRetro,
 	isReview,
 	lastReviewBase,
-	liveCard,
+	liveCardOf,
 	mergeAnywayPatch,
 	openWorkBlockers,
 	PROMPT_EDIT_HELD,
@@ -3551,18 +3551,24 @@ export function createApp(deps: AppDeps) {
 		return patch;
 	}
 
-	/** Queues the rules interview as a card; idempotent while one is live. "not-needed" when rules exist, unless fix asks for an alignment pass over them. */
-	function startInterview(e: Entry, fix = false): string {
+	/** Queues the rules interview as a card; idempotent while one is live. "not-needed" when rules exist, unless fix asks for an alignment pass over them. The id names the card the answer talks about: the new one when queued, the live one when running, so the UI can open it. */
+	function startInterview(
+		e: Entry,
+		fix = false,
+	): {
+		interview: string;
+		id: string | null;
+	} {
 		const has = hasRules(e.path);
-		if (has && !fix) return "not-needed";
-		const live = liveCard(e.store.listTasks(), "interview");
-		if (!live)
-			e.store.createTask(
-				rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
-				null,
-				"interview",
-			);
-		return "queued";
+		if (has && !fix) return { interview: "not-needed", id: null };
+		const live = liveCardOf(e.store.listTasks(), "interview");
+		if (live !== null) return { interview: "running", id: live.id };
+		const t = e.store.createTask(
+			rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
+			null,
+			"interview",
+		);
+		return { interview: "queued", id: t.id };
 	}
 
 	/** Project ssh key file; "" when the board name cannot name one (a separator or a leading dot). */
@@ -4051,9 +4057,9 @@ export function createApp(deps: AppDeps) {
 		// A gitless project has no HEAD to create a worktree from; the turn machinery would
 		// crash, so the rules interview waits for POST /init.
 		if (e.gitless)
-			return json({ project: projectView(e), interview: "gitless" });
+			return json({ project: projectView(e), interview: "gitless", id: null });
 		const interview = startInterview(e);
-		return json({ project: projectView(e), interview });
+		return json({ project: projectView(e), ...interview });
 	}
 
 	/** 409 while any task is queued/preparing/running — removing or re-homing the project's
@@ -5534,7 +5540,7 @@ export function createApp(deps: AppDeps) {
 					e.gitless = false;
 					await refreshRemote(e);
 					const interview = startInterview(e);
-					return json({ project: projectView(e), interview });
+					return json({ project: projectView(e), ...interview });
 				}),
 		},
 		"/api/projects/:project/interview": {
@@ -5548,7 +5554,7 @@ export function createApp(deps: AppDeps) {
 					if ("error" in r) return r.error;
 					// parsed JSON boundary: shape is only trusted after the === true check
 					const b = r.body as { fix?: unknown };
-					return json({ interview: startInterview(e, b.fix === true) });
+					return json(startInterview(e, b.fix === true));
 				}),
 		},
 		"/api/projects/:project/remove": {
