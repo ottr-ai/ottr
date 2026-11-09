@@ -1,4 +1,3 @@
-import type { Mermaid } from "mermaid";
 import type {
 	CSSProperties,
 	ClipboardEvent as ReactClipboardEvent,
@@ -121,6 +120,7 @@ import {
 	ZoomableImage,
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
+import { loadMermaid } from "./mermaid.ts";
 import {
 	ModelMenuBody,
 	ModelMenuTrigger,
@@ -1756,33 +1756,6 @@ function WorkflowModal({
 			</p>
 		</Modal>
 	);
-}
-
-declare global {
-	interface Window {
-		/** Set by /mermaid.min.js; see loadMermaid. */
-		mermaid?: Mermaid;
-	}
-}
-let mermaidLoad: Promise<Mermaid> | null = null;
-/** mermaid's prebuilt bundle, served by the server at /mermaid.min.js and loaded once on first
- *  use: Bun's HTML bundler would inline a dynamic import into the board bundle. A failed load
- *  clears the promise, so the next open retries. */
-function loadMermaid(): Promise<Mermaid> {
-	if (mermaidLoad !== null) return mermaidLoad;
-	const { promise, resolve, reject } = Promise.withResolvers<Mermaid>();
-	const fail = () => {
-		mermaidLoad = null;
-		s.remove();
-		reject(new Error("mermaid failed to load"));
-	};
-	const s = document.createElement("script");
-	s.src = "/mermaid.min.js";
-	s.onload = () => (window.mermaid ? resolve(window.mermaid) : fail());
-	s.onerror = fail;
-	document.head.append(s);
-	mermaidLoad = promise;
-	return promise;
 }
 
 /** One Mermaid block drawn as SVG. mermaid's default securityLevel "strict" sanitizes the SVG

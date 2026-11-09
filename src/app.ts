@@ -15,7 +15,8 @@ import {
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { gzipSync } from "node:zlib";
+import { promisify } from "node:util";
+import { brotliCompress, gzip, gzipSync } from "node:zlib";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import {
@@ -142,6 +143,7 @@ import {
 	type MemoryHealth,
 	memoryBackendFromEnv,
 } from "./memory.ts";
+import { mermaidSrc } from "./mermaidVersion.ts";
 import {
 	commitMessage,
 	editModelRoles,
@@ -717,6 +719,66 @@ export function ompSessionStores(
 			folder: mirrorFolderName(name),
 		});
 	return stores;
+}
+
+// OTTR-719: mermaid's prebuilt bundle is ~5.5 MB raw and ~1.2 MB brotli (OTTR-662 tips 9 and
+// 27). It is served at a versioned path (src/mermaidVersion.ts) with an immutable year cache,
+// so a browser downloads it once per version. Compression runs once per process, on zlib's
+// threadpool: the first createApp kicks it off at boot, and a request that arrives earlier
+// just awaits the result.
+const mermaidRawPath = Bun.resolveSync(
+	"mermaid/dist/mermaid.min.js",
+	import.meta.dir,
+);
+const brotliAsync = promisify(brotliCompress);
+const gzipAsync = promisify(gzip);
+let mermaidBodies: Promise<{
+	br: Uint8Array<ArrayBuffer>;
+	gzip: Uint8Array<ArrayBuffer>;
+}> | null = null;
+const mermaidCompressed = () =>
+	(mermaidBodies ??= (async () => {
+		const raw = new Uint8Array(await Bun.file(mermaidRawPath).arrayBuffer());
+		const [br, gz] = await Promise.all([
+			brotliAsync(raw),
+			// gzip -9, as measured in OTTR-662 (1,568,811 bytes on this bundle).
+			gzipAsync(raw, { level: 9 }),
+		]);
+		// Copy out of zlib's possibly pooled Buffer: the copies are the one-time compressed
+		// bodies served for the process lifetime, and Response bodies need a plain view.
+		return { br: new Uint8Array(br), gzip: new Uint8Array(gz) };
+	})());
+
+/** Best of br and gzip that the request's Accept-Encoding allows; "identity" when neither is.
+ *  Unknown tokens (zstd, *) never select a compression this server did not make. Exported for
+ *  the parser tests; the HTTP tests prove only the header-visible picks. */
+export function pickEncoding(
+	header: string | null,
+): "br" | "gzip" | "identity" {
+	if (header === null) return "identity";
+	const q = new Map<string, number>();
+	for (const part of header.split(",")) {
+		const segments = part.trim().split(";");
+		const name = segments[0]?.trim().toLowerCase();
+		let value = 1;
+		for (const p of segments.slice(1)) {
+			const m = /^q=([\d.]+)$/i.exec(p.trim());
+			if (m) value = Number.parseFloat(m[1] ?? "") || 0;
+		}
+		if (name !== undefined && name !== "") q.set(name, value);
+	}
+	const accepts = (encoding: string) => {
+		const v = q.get(encoding);
+		if (v !== undefined) return v > 0;
+		const star = q.get("*");
+		return star !== undefined && star > 0;
+	};
+	// Highest q wins; a tie keeps br first (candidates are in preference order).
+	let best: "br" | "gzip" | null = null;
+	for (const encoding of (["br", "gzip"] as const).filter(accepts))
+		if (best === null || (q.get(encoding) ?? 0) > (q.get(best) ?? 0))
+			best = encoding;
+	return best ?? "identity";
 }
 
 /**
@@ -2792,27 +2854,38 @@ export function createApp(deps: AppDeps) {
 	}
 
 	// PWA statics: the manifest lists icons by URL, and Bun's HTML bundler would hash those away,
-	// so they are served at stable root paths straight from the ui directory.
-	const PWA_FILES: Record<string, [string, string]> = {
+	// so they are served at stable root paths straight from the ui directory. The icons change
+	// only with a new name in the manifest, so they cache for a day (OTTR-662 tip 27); the
+	// manifest itself can change at any deploy, so it keeps no cache header.
+	const PWA_FILES: Record<string, [string, string, string | null]> = {
 		"/manifest.webmanifest": [
 			"manifest.webmanifest",
 			"application/manifest+json",
+			null,
 		],
-		"/icon-192.png": ["icon-192.png", "image/png"],
-		"/icon-512.png": ["icon-512.png", "image/png"],
-		"/icon-512-maskable.png": ["icon-512-maskable.png", "image/png"],
+		"/icon-192.png": ["icon-192.png", "image/png", "public, max-age=86400"],
+		"/icon-512.png": ["icon-512.png", "image/png", "public, max-age=86400"],
+		"/icon-512-maskable.png": [
+			"icon-512-maskable.png",
+			"image/png",
+			"public, max-age=86400",
+		],
 	};
 	function pwaFile(url: string): Response {
 		const hit = PWA_FILES[url];
 		if (hit === undefined) return json({ error: "not found" }, 404);
-		const [name, type] = hit;
+		const [name, type, cache] = hit;
 		return new Response(Bun.file(join(import.meta.dir, "ui", name)), {
-			headers: { "Content-Type": type },
+			headers: {
+				"Content-Type": type,
+				...(cache !== null && { "Cache-Control": cache }),
+			},
 		});
 	}
 
 	// The workflow overview diagrams that the drawer's Workflow modal embeds (the README shows
 	// them too). They sit in src/ui like the PWA files: the image copies only src and extension.
+	// Their names are stable, so they cache for a day like the PWA icons (OTTR-662 tip 27).
 	const WORKFLOW_FILES: Record<string, string> = {
 		"/workflow-task.svg": "workflow-task.svg",
 		"/workflow-review.svg": "workflow-review.svg",
@@ -2822,9 +2895,39 @@ export function createApp(deps: AppDeps) {
 		const name = WORKFLOW_FILES[url];
 		if (name === undefined) return json({ error: "not found" }, 404);
 		return new Response(Bun.file(join(import.meta.dir, "ui", name)), {
-			headers: { "Content-Type": "image/svg+xml" },
+			headers: {
+				"Content-Type": "image/svg+xml",
+				"Cache-Control": "public, max-age=86400",
+			},
 		});
 	}
+
+	// OTTR-719: the versioned mermaid bundle (see mermaidCompressed above). Identity requests
+	// stream the dist file from disk; br and gzip requests await the one-time compression and
+	// serve the in-memory bytes. Old-path clients get a permanent redirect so tabs still
+	// running the pre-rename board bundle keep loading diagrams after a deploy; the redirect
+	// itself stays cacheable for a day, so a future path change propagates within a day.
+	const mermaidHeaders = {
+		"Content-Type": "text/javascript; charset=utf-8",
+		"Cache-Control": "public, max-age=31536000, immutable",
+		Vary: "Accept-Encoding",
+	};
+	function mermaidResponse(req: Request): Promise<Response> {
+		const encoding = pickEncoding(req.headers.get("accept-encoding"));
+		if (encoding === "identity")
+			return Promise.resolve(
+				new Response(Bun.file(mermaidRawPath), { headers: mermaidHeaders }),
+			);
+		return mermaidCompressed().then(
+			(bodies) =>
+				new Response(encoding === "br" ? bodies.br : bodies.gzip, {
+					headers: { ...mermaidHeaders, "Content-Encoding": encoding },
+				}),
+		);
+	}
+	// Compression runs once per process (memoized at module scope); kick it off at boot so the
+	// first Diagrams open never waits for brotli.
+	void mermaidCompressed();
 
 	/**
 	 * The board's address for turns when no allowlist covers it (compose: ottr:<port>); null on
@@ -4780,7 +4883,11 @@ export function createApp(deps: AppDeps) {
 		// --- Web Push (begin): service worker for notifications; the sibling PWA branch adds its static routes here too ---
 		"/sw.js": () =>
 			new Response(Bun.file(resolve(import.meta.dir, "ui", "sw.js")), {
-				headers: { "Content-Type": "application/javascript" },
+				headers: {
+					"Content-Type": "application/javascript",
+					// The worker re-registers per deploy and the browser must always re-check it.
+					"Cache-Control": "no-cache",
+				},
 			}),
 		// --- Web Push (end) ---
 		"/manifest.webmanifest": {
@@ -4815,16 +4922,23 @@ export function createApp(deps: AppDeps) {
 					token: process.env.HINDSIGHT_API_TOKEN,
 				}),
 			),
-		// The Diagrams modal loads mermaid's prebuilt bundle (3.5 MB) on first open, so the board's
-		// own bundle stays small: Bun's HTML bundler does not split a dynamic import into a chunk.
+		// The Diagrams modal loads mermaid's prebuilt bundle (~5.5 MB raw, ~1.2 MB brotli) on
+		// first open, so the board's own bundle stays small: Bun's HTML bundler does not split a
+		// dynamic import into a chunk. The bundle is content at a versioned path (its exact key
+		// comes from src/mermaidVersion.ts; Bun's router has no mid-segment wildcard), so it
+		// caches immutably for a year. The old unversioned path redirects (see mermaidResponse).
+		[mermaidSrc]: {
+			GET: (req: Request) => mermaidResponse(req),
+		},
 		"/mermaid.min.js": {
 			GET: () =>
-				new Response(
-					Bun.file(
-						Bun.resolveSync("mermaid/dist/mermaid.min.js", import.meta.dir),
-					),
-					{ headers: { "Content-Type": "text/javascript; charset=utf-8" } },
-				),
+				new Response(null, {
+					status: 301,
+					headers: {
+						Location: mermaidSrc,
+						"Cache-Control": "public, max-age=86400",
+					},
+				}),
 		},
 		"/api/ws": (req, srv) => {
 			if (prod)

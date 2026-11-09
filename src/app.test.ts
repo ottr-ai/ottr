@@ -35,6 +35,7 @@ import {
 	behindMain,
 	boardWarnings,
 	type Entry,
+	pickEncoding,
 	reconcileLayerUse,
 	storedProjectPaths,
 	workerSignInWarnings,
@@ -46,6 +47,7 @@ import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
+import { MERMAID_VERSION, mermaidSrc } from "./mermaidVersion.ts";
 import { modelRoles } from "./models.ts";
 import { ALL_CLASSES_ON, taskEntryKey } from "./notifications.ts";
 import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
@@ -1449,6 +1451,115 @@ describe("board check route", () => {
 		store.updateTask(next.id, { cancelledAt: Date.now(), state: "idle" });
 		expect((await check()).id).not.toBe(next.id);
 		expect((await check("nope")).status).toBe(404);
+	});
+});
+
+describe("static assets (OTTR-719)", () => {
+	/** Plain fetch without the api() Host/Origin headers; static routes sit outside api(). */
+	const raw = async (path: string, accept?: string, manual = false) =>
+		fetch(new URL(path, server.url), {
+			...(accept !== undefined && { headers: { "accept-encoding": accept } }),
+			...(manual && { redirect: "manual" }),
+		});
+
+	test("MERMAID_VERSION matches the installed mermaid package", () => {
+		const pkg = JSON.parse(
+			readFileSync(
+				Bun.resolveSync("mermaid/package.json", import.meta.dir),
+				"utf8",
+			),
+		) as { version: string };
+		expect(MERMAID_VERSION).toBe(pkg.version);
+	});
+
+	test("mermaid serves br, gzip and identity bodies that all decode to the dist bytes", async () => {
+		// A fresh process pays the one-time boot compression here; later variants reuse it.
+		const dist = readFileSync(
+			Bun.resolveSync("mermaid/dist/mermaid.min.js", import.meta.dir),
+		);
+		// Bun's fetch adds its own Accept-Encoding when a request sends none, so a truly
+		// headerless request is not reachable here; pickEncoding(null) is covered by the
+		// parser tests below. "identity" is the explicit token real clients send.
+		const cases: Array<[accept: string, encoding: string | null]> = [
+			["br", "br"],
+			["gzip", "gzip"],
+			["br, gzip", "br"],
+			["gzip, br", "br"],
+			["br;q=0, gzip", "gzip"],
+			["zstd", null],
+			["identity", null],
+		];
+		for (const [accept, encoding] of cases) {
+			const res = await raw(mermaidSrc, accept ?? undefined);
+			expect(res.status).toBe(200);
+			// Bun's fetch decompresses transparently, so the bytes must equal the dist file
+			// for every variant; the Content-Encoding header stays visible on the response.
+			expect(Buffer.from(await res.arrayBuffer()).equals(dist)).toBe(true);
+			expect(res.headers.get("content-encoding")).toBe(encoding);
+			expect(res.headers.get("content-type")).toBe(
+				"text/javascript; charset=utf-8",
+			);
+			expect(res.headers.get("cache-control")).toBe(
+				"public, max-age=31536000, immutable",
+			);
+			expect(res.headers.get("vary")).toBe("Accept-Encoding");
+		}
+	}, 60_000);
+
+	test("pickEncoding honours q-values and ignores unknown tokens", () => {
+		const picks: Array<[s: string | null, want: "br" | "gzip" | "identity"]> = [
+			[null, "identity"],
+			["", "identity"],
+			["br", "br"],
+			["GZIP", "gzip"],
+			[" gzip ; q=0.8 , br ; q=0.2 ", "gzip"],
+			["br;q=0, gzip;q=0.001", "gzip"],
+			["br;q=0", "identity"],
+			["*", "br"],
+			["zstd, *", "br"],
+			["zstd;q=1", "identity"],
+			["*;q=0", "identity"],
+			["gzip;q=0.0000", "identity"],
+		];
+		for (const [header, want] of picks) expect(pickEncoding(header)).toBe(want);
+	});
+
+	test("the unversioned mermaid path redirects permanently to the versioned one", async () => {
+		const res = await raw("/mermaid.min.js", undefined, true);
+		expect(res.status).toBe(301);
+		expect(res.headers.get("location")).toBe(mermaidSrc);
+		// The redirect itself is not immutable, so a future path change propagates.
+		expect(res.headers.get("cache-control")).toBe("public, max-age=86400");
+	});
+
+	test("an unknown mermaid path is a 404", async () => {
+		expect((await raw("/mermaid-9.9.9.min.js")).status).toBe(404);
+	});
+
+	test("/sw.js always revalidates", async () => {
+		const res = await raw("/sw.js");
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain("ottr");
+		expect(res.headers.get("content-type")).toBe("application/javascript");
+		expect(res.headers.get("cache-control")).toBe("no-cache");
+	});
+
+	test("PWA icons and workflow SVGs cache for a day, the manifest does not", async () => {
+		for (const path of [
+			"/icon-192.png",
+			"/icon-512.png",
+			"/icon-512-maskable.png",
+			"/workflow-task.svg",
+			"/workflow-review.svg",
+			"/workflow-release.svg",
+		]) {
+			const res = await raw(path);
+			expect(res.status).toBe(200);
+			expect(res.headers.get("cache-control")).toBe("public, max-age=86400");
+		}
+		const manifest = await raw("/manifest.webmanifest");
+		expect(manifest.status).toBe(200);
+		expect(manifest.headers.get("cache-control")).toBe(null);
 	});
 });
 
