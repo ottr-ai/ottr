@@ -203,6 +203,111 @@ export class AppTokenSource {
 	}
 }
 
+/** The auth + accept headers every app-JWT lookup carries. */
+function appHeaders(jwt: string): Record<string, string> {
+	return {
+		authorization: `Bearer ${jwt}`,
+		accept: "application/vnd.github+json",
+		"user-agent": "Ottr",
+	};
+}
+
+/** Reads GET /app into name/url; a failed lookup (status or transport) sets error and ends the check. */
+async function lookupApp(
+	get: (path: string) => Promise<Response>,
+	out: AppCheck,
+	timeoutMs: number,
+): Promise<boolean> {
+	try {
+		const app = await get("/app");
+		if (!app.ok) {
+			out.error = `app lookup answered ${app.status}`;
+			return false;
+		}
+		const body = (await app.json()) as { name?: unknown; html_url?: unknown };
+		out.name = typeof body.name === "string" ? body.name : null;
+		out.url =
+			typeof body.html_url === "string" && /^https:\/\//.test(body.html_url)
+				? body.html_url
+				: null;
+	} catch (err) {
+		// Network failures only; the key never reaches an error text from here.
+		out.error = errText(err, timeoutMs);
+		return false;
+	}
+	return true;
+}
+
+// A repo the app cannot see is private or gone; those get no outside PRs, so no
+// warning names them. The probe sends no authorization header: the app JWT is only
+// valid on /app and installation lookups, and a repo endpoint called with it answers
+// 401. Unauthenticated, a public repo is 200 and a private or gone one 404 — exactly
+// what the probe must tell apart.
+async function probeMissingRepo(
+	repo: string,
+	base: string,
+	out: AppCheck,
+	fetchImpl: (url: string, init?: RequestInit) => Promise<Response>,
+	timeoutMs: number,
+): Promise<void> {
+	const probe = await fetchImpl(`${base}/repos/${repo}`, {
+		signal: AbortSignal.timeout(timeoutMs),
+		headers: {
+			accept: "application/vnd.github+json",
+			"user-agent": "Ottr",
+		},
+	});
+	if (probe.status === 404) {
+		out.private.push(repo);
+		return;
+	}
+	if (!probe.ok) {
+		out.failed.push({
+			repo,
+			detail: `repo lookup answered ${probe.status}`,
+		});
+		return;
+	}
+	const probeBody = (await probe.json()) as { private?: unknown };
+	if (probeBody.private === true) {
+		out.private.push(repo);
+		return;
+	}
+	out.missing.push(repo);
+}
+
+/**
+ * One repo's verdict: installed, missing, private, or failed. A status other than 200
+ * or 404, or a network error, lands in `failed`; one repo's failure never stops the rest.
+ */
+async function checkRepo(
+	repo: string,
+	get: (path: string) => Promise<Response>,
+	base: string,
+	out: AppCheck,
+	fetchImpl: (url: string, init?: RequestInit) => Promise<Response>,
+	timeoutMs: number,
+): Promise<void> {
+	try {
+		const res = await get(`/repos/${repo}/installation`);
+		if (res.status === 404) {
+			await probeMissingRepo(repo, base, out, fetchImpl, timeoutMs);
+		} else if (!res.ok) {
+			out.failed.push({
+				repo,
+				detail: `installation lookup answered ${res.status}`,
+			});
+		}
+	} catch (err) {
+		// One repo's network failure must not stop the other repos; the message
+		// holds no key.
+		out.failed.push({
+			repo,
+			detail: errText(err, timeoutMs),
+		});
+	}
+}
+
 /**
  * Reads the app's name (GET /app) and looks up its installation on each repo. A 404 marks the
  * repo missing, and the visibility probe for it goes out unauthenticated: GitHub answers 401
@@ -237,78 +342,11 @@ export async function checkAppInstalls(deps: {
 	const get = (path: string) =>
 		fetchImpl(`${base}${path}`, {
 			signal: AbortSignal.timeout(timeoutMs),
-			headers: {
-				authorization: `Bearer ${signAppJwt(deps.appId, deps.keyObject, now()).jwt}`,
-				accept: "application/vnd.github+json",
-				"user-agent": "Ottr",
-			},
+			headers: appHeaders(signAppJwt(deps.appId, deps.keyObject, now()).jwt),
 		});
-	try {
-		const app = await get("/app");
-		if (!app.ok) {
-			out.error = `app lookup answered ${app.status}`;
-			return out;
-		}
-		const body = (await app.json()) as { name?: unknown; html_url?: unknown };
-		out.name = typeof body.name === "string" ? body.name : null;
-		out.url =
-			typeof body.html_url === "string" && /^https:\/\//.test(body.html_url)
-				? body.html_url
-				: null;
-	} catch (err) {
-		// Network failures only; the key never reaches an error text from here.
-		out.error = errText(err, timeoutMs);
-		return out;
-	}
+	if (!(await lookupApp(get, out, timeoutMs))) return out;
 	for (const repo of deps.repos) {
-		try {
-			const res = await get(`/repos/${repo}/installation`);
-			if (res.status === 404) {
-				// A repo the app cannot see is private or gone; those get no
-				// outside PRs, so no warning names them. The probe sends no
-				// authorization header: the app JWT is only valid on /app and
-				// installation lookups, and a repo endpoint called with it
-				// answers 401. Unauthenticated, a public repo is 200 and a
-				// private or gone one 404 — exactly what the probe must tell
-				// apart.
-				const probe = await fetchImpl(`${base}/repos/${repo}`, {
-					signal: AbortSignal.timeout(timeoutMs),
-					headers: {
-						accept: "application/vnd.github+json",
-						"user-agent": "Ottr",
-					},
-				});
-				if (probe.status === 404) {
-					out.private.push(repo);
-					continue;
-				}
-				if (!probe.ok) {
-					out.failed.push({
-						repo,
-						detail: `repo lookup answered ${probe.status}`,
-					});
-					continue;
-				}
-				const probeBody = (await probe.json()) as { private?: unknown };
-				if (probeBody.private === true) {
-					out.private.push(repo);
-					continue;
-				}
-				out.missing.push(repo);
-			} else if (!res.ok) {
-				out.failed.push({
-					repo,
-					detail: `installation lookup answered ${res.status}`,
-				});
-			}
-		} catch (err) {
-			// One repo's network failure must not stop the other repos; the
-			// message holds no key.
-			out.failed.push({
-				repo,
-				detail: errText(err, timeoutMs),
-			});
-		}
+		await checkRepo(repo, get, base, out, fetchImpl, timeoutMs);
 	}
 	return out;
 }

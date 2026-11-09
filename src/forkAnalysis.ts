@@ -121,81 +121,112 @@ function commitBlock(c: ForkCommit): string {
 	return lines.join("\n");
 }
 
-/** Assemble the labelled data blocks; every block passes stripInvisible then redactSecrets. */
-export function buildUserMessage(
+/** All labelled blocks after stripInvisible + redactSecrets, before budget capping. */
+function cleanBlocks(
 	range: ForkRange,
 	prior: { titles: string[]; declines: string[] },
-): string {
-	const fork = clean(
-		`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
-			range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
-	);
-	const allCommits = [...range.commits, ...range.merges];
-	const commitCount = allCommits.length;
-	let patches = allCommits.map((c) => clean(c.patch));
-	let total =
-		fork.length +
-		patches.reduce((n, p) => n + p.length, 0) +
-		clean(range.upstreamCommits.join("\n")).length +
-		clean(range.upstreamFiles.join("\n")).length +
-		clean(range.upstreamDocs).length +
-		clean(
-			prior.titles.map((t) => `title: ${t}`).join("\n") +
-				"\n" +
-				prior.declines.map((d) => `declined: ${d}`).join("\n"),
-		).length;
+): {
+	fork: string;
+	patches: string[];
+	upstreamCommits: string;
+	upstreamFiles: string;
+	upstreamDocs: string;
+	priorSection: string;
+} {
+	return {
+		fork: clean(
+			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
+				range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
+		),
+		patches: [...range.commits, ...range.merges].map((c) => clean(c.patch)),
+		upstreamCommits: clean(range.upstreamCommits.join("\n")),
+		upstreamFiles: clean(range.upstreamFiles.join("\n")),
+		upstreamDocs: clean(range.upstreamDocs),
+		priorSection: clean(
+			[
+				...prior.titles.map((t) => `title: ${t}`),
+				...prior.declines.map((d) => `declined: ${d}`),
+			].join("\n"),
+		),
+	};
+}
 
-	// ponytail: single budget; if over, cap the longest patches first, min 2000 chars each.
-	let truncationNote = "";
-	if (total > PROMPT_CHAR_BUDGET) {
-		const cap = Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
-		const order = patches
-			.map((p, i) => [p.length, i] as const)
-			.sort((a, b) => b[0] - a[0]);
-		for (const [, i] of order) {
-			const patch = patches[i];
-			if (patch !== undefined && patch.length > cap) {
-				total -= patch.length - cap;
-				patches = patches.map((p, j) => (j === i ? p.slice(0, cap) : p));
-			}
-			if (total <= PROMPT_CHAR_BUDGET) break;
+// ponytail: single budget; if over, cap the longest patches first, min 2000 chars each.
+function capPatches(
+	patches: string[],
+	total: number,
+	commitCount: number,
+): { patches: string[]; total: number; note: string } {
+	if (total <= PROMPT_CHAR_BUDGET) {
+		return { patches, total, note: "" };
+	}
+	const cap = Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
+	let out = patches;
+	let used = total;
+	const order = out
+		.map((p, i) => [p.length, i] as const)
+		.sort((a, b) => b[0] - a[0]);
+	for (const [, i] of order) {
+		const patch = out[i];
+		if (patch !== undefined && patch.length > cap) {
+			used -= patch.length - cap;
+			out = out.map((p, j) => (j === i ? p.slice(0, cap) : p));
 		}
-		truncationNote = `(patches truncated to ${cap} chars to fit the budget)`;
+		if (used <= PROMPT_CHAR_BUDGET) break;
 	}
-	if (total > PROMPT_CHAR_BUDGET) {
-		throw new RangeError(`range exceeds prompt budget: ${total} chars`);
-	}
+	return {
+		patches: out,
+		total: used,
+		note: `(patches truncated to ${cap} chars to fit the budget)`,
+	};
+}
 
-	const commitSection = range.commits
+function commitSections(
+	range: ForkRange,
+	patches: string[],
+): { commits: string; merges: string } {
+	const commits = range.commits
 		.map((c, i) => {
 			const patch = patches[i] ?? "";
 			return `[COMMIT ${i + 1}]\n${commitBlock({ ...c, patch })}`;
 		})
 		.join("\n");
-	const mergeSection = range.merges
+	const merges = range.merges
 		.map((c, i) => {
 			const patch = patches[range.commits.length + i] ?? "";
 			return `[MERGE ${i + 1}]\n${commitBlock({ ...c, patch })}`;
 		})
 		.join("\n");
-	const upstreamCommits = clean(range.upstreamCommits.join("\n"));
-	const upstreamFiles = clean(range.upstreamFiles.join("\n"));
-	const upstreamDocs = clean(range.upstreamDocs);
-	const priorSection = clean(
-		[
-			...prior.titles.map((t) => `title: ${t}`),
-			...prior.declines.map((d) => `declined: ${d}`),
-		].join("\n"),
-	);
+	return { commits, merges };
+}
 
+/** Assemble the labelled data blocks; every block passes stripInvisible then redactSecrets. */
+export function buildUserMessage(
+	range: ForkRange,
+	prior: { titles: string[]; declines: string[] },
+): string {
+	const b = cleanBlocks(range, prior);
+	const total =
+		b.fork.length +
+		b.patches.reduce((n, p) => n + p.length, 0) +
+		b.upstreamCommits.length +
+		b.upstreamFiles.length +
+		b.upstreamDocs.length +
+		b.priorSection.length;
+	const capped = capPatches(b.patches, total, b.patches.length);
+	if (capped.total > PROMPT_CHAR_BUDGET) {
+		throw new RangeError(`range exceeds prompt budget: ${capped.total} chars`);
+	}
+	const { commits, merges } = commitSections(range, capped.patches);
+	const orNone = (s: string) => s || "(none)";
 	return [
-		`FORK\n${fork}`,
-		`COMMITS ${truncationNote}\n${commitSection || "(none)"}`,
-		`MERGES\n${mergeSection || "(none)"}`,
-		`UPSTREAM_COMMITS\n${upstreamCommits || "(none)"}`,
-		`UPSTREAM_FILES\n${upstreamFiles || "(none)"}`,
-		`UPSTREAM_DOCS\n${upstreamDocs || "(none)"}`,
-		`PRIOR_PROPOSALS\n${priorSection || "(none)"}`,
+		`FORK\n${b.fork}`,
+		`COMMITS ${capped.note}\n${orNone(commits)}`,
+		`MERGES\n${orNone(merges)}`,
+		`UPSTREAM_COMMITS\n${orNone(b.upstreamCommits)}`,
+		`UPSTREAM_FILES\n${orNone(b.upstreamFiles)}`,
+		`UPSTREAM_DOCS\n${orNone(b.upstreamDocs)}`,
+		`PRIOR_PROPOSALS\n${orNone(b.priorSection)}`,
 	].join("\n\n");
 }
 
@@ -239,7 +270,7 @@ export async function runGateway(
 		body: { model, messages },
 	};
 	const result = await spawn(["omp", "auth-gateway", "stdio"], {
-		stdin: JSON.stringify(body) + "\n",
+		stdin: `${JSON.stringify(body)}\n`,
 		env: boardOmpEnv({
 			...process.env,
 			GH_TOKEN: undefined,

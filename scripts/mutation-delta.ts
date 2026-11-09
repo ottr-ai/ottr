@@ -138,6 +138,39 @@ export function configsFor(
 	return groups;
 }
 
+/** The mutant line, or null when the report has no usable location. */
+function mutantLine(m: ReportMutant): number | null {
+	const line = m.location?.start?.line;
+	return typeof line === "number" ? line : null;
+}
+
+/** Whether the line falls inside one of the added hunks of this file. */
+function onChangedLine(
+	file: string,
+	line: number,
+	ranges: DeltaRange[],
+): boolean {
+	return ranges.some(
+		(r) => r.file === file && line >= r.start && line <= r.end,
+	);
+}
+
+/** The mutant as a survivor, or null when its status passes the gate. */
+function survivorOf(
+	m: ReportMutant,
+	file: string,
+	line: number,
+): Survivor | null {
+	if (m.status !== "Survived" && m.status !== "NoCoverage") return null;
+	return {
+		file,
+		line,
+		mutatorName: m.mutatorName ?? "unknown",
+		replacement: m.replacement ?? "unknown",
+		status: m.status,
+	};
+}
+
 /** The report verdict: `tested` mutants on changed lines, `survivors` the failing ones. */
 export function verdict(
 	report: DeltaReport,
@@ -147,24 +180,11 @@ export function verdict(
 	const survivors: Survivor[] = [];
 	for (const [file, fileResult] of Object.entries(report.files ?? {})) {
 		for (const m of fileResult.mutants ?? []) {
-			const line = m.location?.start?.line;
-			if (typeof line !== "number") continue;
-			const inside = ranges.some(
-				(r) => r.file === file && line >= r.start && line <= r.end,
-			);
-			if (!inside) continue;
+			const line = mutantLine(m);
+			if (line === null || !onChangedLine(file, line, ranges)) continue;
 			tested++;
-			if (
-				m.status !== undefined &&
-				(m.status === "Survived" || m.status === "NoCoverage")
-			)
-				survivors.push({
-					file,
-					line,
-					mutatorName: m.mutatorName ?? "unknown",
-					replacement: m.replacement ?? "unknown",
-					status: m.status,
-				});
+			const s = survivorOf(m, file, line);
+			if (s !== null) survivors.push(s);
 		}
 	}
 	return { tested, survivors };
@@ -259,51 +279,124 @@ function readReport(path: string): { report: DeltaReport } | { error: string } {
 	}
 }
 
-export async function main(
-	argv: string[] = process.argv.slice(2),
-	deps: DeltaDeps = realDeps,
-): Promise<ExitCode> {
-	if (argv.length < 1 || argv.length > 2) {
-		console.error("usage: bun run test:mutation:delta <base> [head]");
-		return 2;
-	}
-	const base = argv[0] ?? "";
-	const head = argv[1] ?? "HEAD";
-	const repoRoot = resolve(import.meta.dir, "..");
-	const started = deps.now();
+/** Parsed CLI args, or null when the invocation is wrong. */
+function parseArgs(argv: string[]): { base: string; head: string } | null {
+	if (argv.length < 1 || argv.length > 2) return null;
+	return { base: argv[0] ?? "", head: argv[1] ?? "HEAD" };
+}
 
+/** The commit range to diff, or why the git plumbing failed. */
+function gitRanges(
+	repoRoot: string,
+	base: string,
+	head: string,
+	deps: DeltaDeps,
+): { mergeBase: string; diff: string } | { error: string } {
 	const merged = deps.spawn(["git", "merge-base", base, head], {
 		cwd: repoRoot,
 	});
-	if (merged.exitCode !== 0) {
-		console.error(
-			`mutation delta gate: git merge-base ${base} ${head} failed: ${merged.stderr.trim()}`,
-		);
-		return 2;
-	}
+	if (merged.exitCode !== 0)
+		return {
+			error: `git merge-base ${base} ${head} failed: ${merged.stderr.trim()}`,
+		};
 	const mergeBase = merged.stdout.trim();
 	const diff = deps.spawn(
 		["git", "diff", "-U0", "--no-renames", `${mergeBase}..${head}`],
 		{ cwd: repoRoot },
 	);
-	if (diff.exitCode !== 0) {
-		console.error(
-			`mutation delta gate: git diff ${mergeBase}..${head} failed: ${diff.stderr.trim()}`,
-		);
-		return 2;
-	}
+	if (diff.exitCode !== 0)
+		return {
+			error: `git diff ${mergeBase}..${head} failed: ${diff.stderr.trim()}`,
+		};
+	return { mergeBase, diff: diff.stdout };
+}
 
-	let configs: StrykerConfig[];
+/** The repo's Stryker configs, or why the gate cannot load them. */
+async function safeLoadConfigs(
+	repoRoot: string,
+	deps: DeltaDeps,
+): Promise<StrykerConfig[] | { error: string }> {
 	try {
-		configs = await deps.loadConfigs(repoRoot);
+		return await deps.loadConfigs(repoRoot);
 	} catch (e) {
-		console.error(
-			`mutation delta gate: cannot load Stryker configs: ${e instanceof Error ? e.message : String(e)}`,
+		return {
+			error: `cannot load Stryker configs: ${e instanceof Error ? e.message : String(e)}`,
+		};
+	}
+}
+
+/** One Stryker run over the owned ranges: its verdict, or why the gate cannot read it. */
+function runConfig(
+	repoRoot: string,
+	config: StrykerConfig,
+	ranges: DeltaRange[],
+	deps: DeltaDeps,
+): { tested: number; survivors: Survivor[] } | { error: string } {
+	// tmpdir() is machine-global and the board runs several delta gates in
+	// parallel worktrees: a fixed name let one gate read a report another
+	// card's run had written in between (OTTR-479). One UUID per config run
+	// keeps concurrent gates apart and lets the gate delete its own report.
+	const reportPath = join(
+		tmpdir(),
+		`ott-delta-${config.name}-${randomUUID()}.json`,
+	);
+	// The CLI's --mutate is a comma list (stryker-cli.js): a repeated flag overwrites.
+	// The JSON report path has no CLI form (commander registers no --jsonReporter
+	// flags), so each run extends the real config with the json reporter through a
+	// wrapper config next to it, removed again after the run. --force keeps a release
+	// review honest: the incremental differ cannot see fixture, config, dependency or
+	// Stryker-version changes, so a release never reuses a cached verdict.
+	const wrapper = writeWrapperConfig(repoRoot, config, reportPath);
+	let run: SpawnResult;
+	try {
+		run = deps.spawn(
+			[
+				join(repoRoot, "node_modules", ".bin", "stryker"),
+				"run",
+				wrapper,
+				"--mutate",
+				ranges.map((r) => `${r.file}:${r.start}-${r.end}`).join(","),
+				"--force",
+			],
+			{ cwd: repoRoot, stdio: "inherit" },
 		);
+	} finally {
+		rmSync(wrapper, { force: true });
+	}
+	const parsed = readReport(reportPath);
+	// The report is one run's tmp state: remove it once read, on a verdict
+	// or on an error, so no finished run leaves a report behind.
+	rmSync(reportPath, { force: true });
+	if ("error" in parsed)
+		return { error: `${parsed.error} (exit ${run.exitCode})` };
+	return verdict(parsed.report, ranges);
+}
+
+export async function main(
+	argv: string[] = process.argv.slice(2),
+	deps: DeltaDeps = realDeps,
+): Promise<ExitCode> {
+	const args = parseArgs(argv);
+	if (args === null) {
+		console.error("usage: bun run test:mutation:delta <base> [head]");
+		return 2;
+	}
+	const repoRoot = resolve(import.meta.dir, "..");
+	const started = deps.now();
+
+	const git = gitRanges(repoRoot, args.base, args.head, deps);
+	if ("error" in git) {
+		console.error(`mutation delta gate: ${git.error}`);
 		return 2;
 	}
 
-	const groups = configsFor(configs, addedRanges(diff.stdout));
+	const configs = await safeLoadConfigs(repoRoot, deps);
+	if (!Array.isArray(configs)) {
+		console.error(`mutation delta gate: ${configs.error}`);
+		return 2;
+	}
+
+	const groups = configsFor(configs, addedRanges(git.diff));
 	if (groups.length === 0) {
 		console.log("no ranges: no changed file is mutated by a Stryker config");
 		return 0;
@@ -312,48 +405,11 @@ export async function main(
 	const survivors: Survivor[] = [];
 	let tested = 0;
 	for (const { config, ranges } of groups) {
-		// tmpdir() is machine-global and the board runs several delta gates in
-		// parallel worktrees: a fixed name let one gate read a report another
-		// card's run had written in between (OTTR-479). One UUID per config run
-		// keeps concurrent gates apart and lets the gate delete its own report.
-		const reportPath = join(
-			tmpdir(),
-			`ott-delta-${config.name}-${randomUUID()}.json`,
-		);
-		// The CLI's --mutate is a comma list (stryker-cli.js): a repeated flag overwrites.
-		// The JSON report path has no CLI form (commander registers no --jsonReporter
-		// flags), so each run extends the real config with the json reporter through a
-		// wrapper config next to it, removed again after the run. --force keeps a release
-		// review honest: the incremental differ cannot see fixture, config, dependency or
-		// Stryker-version changes, so a release never reuses a cached verdict.
-		const wrapper = writeWrapperConfig(repoRoot, config, reportPath);
-		let run: SpawnResult;
-		try {
-			run = deps.spawn(
-				[
-					join(repoRoot, "node_modules", ".bin", "stryker"),
-					"run",
-					wrapper,
-					"--mutate",
-					ranges.map((r) => `${r.file}:${r.start}-${r.end}`).join(","),
-					"--force",
-				],
-				{ cwd: repoRoot, stdio: "inherit" },
-			);
-		} finally {
-			rmSync(wrapper, { force: true });
-		}
-		const parsed = readReport(reportPath);
-		// The report is one run's tmp state: remove it once read, on a verdict
-		// or on an error, so no finished run leaves a report behind.
-		rmSync(reportPath, { force: true });
-		if ("error" in parsed) {
-			console.error(
-				`mutation delta gate: ${parsed.error} (exit ${run.exitCode})`,
-			);
+		const v = runConfig(repoRoot, config, ranges, deps);
+		if ("error" in v) {
+			console.error(`mutation delta gate: ${v.error}`);
 			return 2;
 		}
-		const v = verdict(parsed.report, ranges);
 		tested += v.tested;
 		survivors.push(...v.survivors);
 	}

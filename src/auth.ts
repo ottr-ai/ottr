@@ -221,33 +221,41 @@ export function newSessionId(): string {
 	return randomBytes(12).toString("hex");
 }
 
+/** Name of the first matching browser in the UA, or an honest token-name fallback. */
+function detectBrowser(ua: string): string {
+	const s = (needle: string) => ua.includes(needle);
+	if (s("Edg/")) return "Edge";
+	if (s("OPR/")) return "Opera";
+	if (s("Chromium")) return "Chromium";
+	if (s("Chrome")) return "Chrome";
+	if (s("Firefox")) return "Firefox";
+	if (s("Safari")) return "Safari";
+	if (/^[A-Za-z][A-Za-z0-9._-]*\/\S/.test(ua)) {
+		const name = /^([A-Za-z][A-Za-z0-9._-]*)\//.exec(ua)?.[1];
+		if (name !== undefined) return name;
+	}
+	return "Unknown browser";
+}
+
+/** Name of the first matching OS in the UA; iPhone/iPad UAs contain "Mac OS X", so iOS wins. */
+function detectOs(ua: string): string {
+	const s = (needle: string) => ua.includes(needle);
+	if (s("Windows")) return "Windows";
+	if (s("Android")) return "Android";
+	if (s("iPhone") || s("iPad")) return "iOS";
+	if (s("Mac OS X")) return "macOS";
+	if (s("CrOS")) return "ChromeOS";
+	if (s("Linux")) return "Linux";
+	return "Unknown OS";
+}
+
 /**
  * `<browser> on <OS>` label from a User-Agent. Edge/Opera win over Chrome, Chrome wins over
  * Safari; anything unrecognized is named honestly or as Unknown. The raw UA is never stored.
  */
 export function sessionLabel(ua: string | null): string {
 	if (ua === null || ua.trim() === "") return "Unknown browser on Unknown OS";
-	const s = (needle: string) => ua.includes(needle);
-	let browser = "Unknown browser";
-	if (s("Edg/")) browser = "Edge";
-	else if (s("OPR/")) browser = "Opera";
-	else if (s("Chromium")) browser = "Chromium";
-	else if (s("Chrome")) browser = "Chrome";
-	else if (s("Firefox")) browser = "Firefox";
-	else if (s("Safari")) browser = "Safari";
-	else if (/^[A-Za-z][A-Za-z0-9._-]*\/\S/.test(ua)) {
-		const name = /^([A-Za-z][A-Za-z0-9._-]*)\//.exec(ua)?.[1];
-		if (name !== undefined) browser = name;
-	}
-	let os = "Unknown OS";
-	if (s("Windows")) os = "Windows";
-	// iPhone/iPad UAs contain "Mac OS X", so iOS must win over macOS.
-	else if (s("Android")) os = "Android";
-	else if (s("iPhone") || s("iPad")) os = "iOS";
-	else if (s("Mac OS X")) os = "macOS";
-	else if (s("CrOS")) os = "ChromeOS";
-	else if (s("Linux")) os = "Linux";
-	return `${browser} on ${os}`;
+	return `${detectBrowser(ua)} on ${detectOs(ua)}`;
 }
 
 /**

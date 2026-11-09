@@ -138,20 +138,26 @@ async function fileCard(args: {
 	return { ok: true, id: body.id };
 }
 
-// Shared validation of propose_task params; returns the error text or null.
-// The prompt/model messages keep the propose_task wording (not create_task's).
-function proposeValidationError(
-	params: CreateTaskParams,
-	reviewMode: boolean,
-): string | null {
-	const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
+// The prompt text: 1-20000 trimmed characters.
+function promptValidationError(params: CreateTaskParams): string | null {
+	const prompt = trimmed(params.prompt);
 	if (prompt === "" || prompt.length > 20000) {
 		return "Error: prompt must be a string of 1-20000 characters (trimmed).";
 	}
-	const model = typeof params.model === "string" ? params.model.trim() : "";
+	return null;
+}
+
+// The model name: non-empty when given.
+function modelValidationError(params: CreateTaskParams): string | null {
+	const model = trimmed(params.model);
 	if (params.model !== undefined && model === "") {
 		return "Error: model must be a non-empty string when given.";
 	}
+	return null;
+}
+
+// The five summary fields: 1-400 trimmed characters each, when given.
+function summaryFieldsValidationError(params: CreateTaskParams): string | null {
 	const summaryFields = [
 		"whatChanges",
 		"why",
@@ -161,11 +167,19 @@ function proposeValidationError(
 	] as const;
 	for (const field of summaryFields) {
 		if (params[field] === undefined) continue;
-		const value = typeof params[field] === "string" ? params[field].trim() : "";
+		const value = trimmed(params[field]);
 		if (value === "" || value.length > 400) {
 			return `Error: ${field} must be a string of 1-400 characters (trimmed) when given.`;
 		}
 	}
+	return null;
+}
+
+// The rank: an integer of 1 or more, checked only in review mode.
+function rankValidationError(
+	params: CreateTaskParams,
+	reviewMode: boolean,
+): string | null {
 	if (
 		reviewMode &&
 		params.rank !== undefined &&
@@ -178,10 +192,59 @@ function proposeValidationError(
 	return null;
 }
 
+// Shared validation of propose_task params; returns the error text or null.
+// The prompt/model messages keep the propose_task wording (not create_task's).
+function proposeValidationError(
+	params: CreateTaskParams,
+	reviewMode: boolean,
+): string | null {
+	return (
+		promptValidationError(params) ??
+		modelValidationError(params) ??
+		summaryFieldsValidationError(params) ??
+		rankValidationError(params, reviewMode)
+	);
+}
+
 // The tracker pins review session names via env so every review run gets the same board title.
 // Read per call like runGitSecrets: the env is fixed for the run, but a load-time capture leaks
 // an ambient OTTR_SESSION_NAME into instances loaded before a test cleared it (OTTR-499).
 const pinnedName = (): string => (process.env.OTTR_SESSION_NAME ?? "").trim();
+
+// The report_outcome session-title gate: a card without a session title shows the prompt's
+// first line. A run with a pinned name (OTTR_SESSION_NAME) applies that name here instead of
+// refusing, so the outcome records at once. Without a pin, refuse once and send the agent to
+// rename; the next call records even when the name is still missing, so an agent that ignores
+// the hint keeps its outcome. Retro and trending scout runs have no rename tool, so they never
+// refuse; a getSessionName failure records rather than blocks the outcome.
+async function ensureNamedSession(pi: Pi): Promise<void> {
+	if (refusedOnce) return;
+	if (process.env.OTTR_RETRO === "1") return;
+	if (process.env.OTTR_TRENDING === "1") return;
+	let unnamed = true;
+	try {
+		const name = await pi.getSessionName();
+		unnamed = typeof name !== "string" || name.trim() === "";
+	} catch {
+		unnamed = false;
+	}
+	if (unnamed && pinnedName() !== "") {
+		try {
+			await pi.setSessionName(pinnedName());
+		} catch {
+			// A failed name must not lose the outcome; record anyway.
+		}
+		return;
+	}
+	if (unnamed) {
+		refusedOnce = true;
+		throw new Error(
+			"This session has no title yet, so the board card would show the prompt's first line. " +
+				"Call the rename tool with a 3-8 word title for the task, then call report_outcome again with the same arguments. " +
+				"A second report_outcome without a rename is also recorded.",
+		);
+	}
+}
 
 /**
  * Git host secrets this run holds: a merge turn gets per-host tokens as OTTR_GIT_TOKEN_<i>
@@ -309,6 +372,37 @@ async function postVerdict(
 	return { ok: true, id: typeof out.id === "string" ? out.id : null };
 }
 
+// A normalized propose_repo call: the checked repo, title and prompt, or the error text.
+type ProposeRepoDraft =
+	| { ok: false; text: string }
+	| { ok: true; repo: string; title: string; prompt: string };
+
+// Normalize and validate one propose_repo call: repo as owner/repo, an optional title of
+// 1-200 trimmed characters and a prompt of 1-20000. Returns the error text or the draft.
+function proposeRepoDraft(params: TrendingParams): ProposeRepoDraft {
+	const repo = trimmed(params.repo);
+	if (!REPO_RE.test(repo))
+		return { ok: false, text: "Error: repo must be owner/repo." };
+	const title = trimmed(params.title);
+	if (params.title !== undefined && (title === "" || title.length > 200))
+		return {
+			ok: false,
+			text: "Error: title must be a string of 1-200 characters (trimmed) when given.",
+		};
+	const prompt = trimmed(params.prompt);
+	if (prompt === "" || prompt.length > 20000)
+		return {
+			ok: false,
+			text: "Error: prompt must be a string of 1-20000 characters (trimmed).",
+		};
+	return { ok: true, repo, title, prompt };
+}
+
+// A prompt's first line, trimmed: the fallback headline of an untitled proposal.
+function firstLine(prompt: string): string {
+	return (prompt.split("\n")[0] ?? "").trim();
+}
+
 export default function (pi: Pi) {
 	const z = pi.zod;
 
@@ -405,40 +499,7 @@ export default function (pi: Pi) {
 		loadMode: "essential",
 		approval: "read",
 		async execute(_toolCallId: string, params: ReportParams) {
-			// A card without a session title shows the prompt's first line. A run with a pinned
-			// name (OTTR_SESSION_NAME) applies that name here instead of refusing, so the
-			// outcome records at once. Without a pin, refuse once and send the agent to
-			// rename; the next call records even when the name is still missing, so an agent
-			// that ignores the hint keeps its outcome. Retro and trending scout runs have no
-			// rename tool, so they never refuse; a getSessionName failure records rather than
-			// blocks the outcome.
-			if (
-				!refusedOnce &&
-				process.env.OTTR_RETRO !== "1" &&
-				process.env.OTTR_TRENDING !== "1"
-			) {
-				let unnamed = true;
-				try {
-					const name = await pi.getSessionName();
-					unnamed = typeof name !== "string" || name.trim() === "";
-				} catch {
-					unnamed = false;
-				}
-				if (unnamed && pinnedName() !== "") {
-					try {
-						await pi.setSessionName(pinnedName());
-					} catch {
-						// A failed name must not lose the outcome; record anyway.
-					}
-				} else if (unnamed) {
-					refusedOnce = true;
-					throw new Error(
-						"This session has no title yet, so the board card would show the prompt's first line. " +
-							"Call the rename tool with a 3-8 word title for the task, then call report_outcome again with the same arguments. " +
-							"A second report_outcome without a rename is also recorded.",
-					);
-				}
-			}
+			await ensureNamedSession(pi);
 			reported = true;
 			return {
 				content: [{ type: "text", text: `Outcome recorded: ${params.status}` }],
@@ -770,22 +831,12 @@ export default function (pi: Pi) {
 			loadMode: "essential",
 			approval: "read",
 			async execute(_toolCallId: string, params: TrendingParams) {
-				const repo = trimmed(params.repo);
-				if (!REPO_RE.test(repo))
-					return textResult("Error: repo must be owner/repo.");
-				const title = trimmed(params.title);
-				if (params.title !== undefined && (title === "" || title.length > 200))
-					return textResult(
-						"Error: title must be a string of 1-200 characters (trimmed) when given.",
-					);
-				const prompt = trimmed(params.prompt);
-				if (prompt === "" || prompt.length > 20000)
-					return textResult(
-						"Error: prompt must be a string of 1-20000 characters (trimmed).",
-					);
+				const draft = proposeRepoDraft(params);
+				if (!draft.ok) return textResult(draft.text);
+				const { repo, title, prompt } = draft;
 				// The board stores a one-line reason with every verdict: a filed repo's is its
 				// proposal's headline.
-				const headline = title !== "" ? title : prompt.split("\n")[0]!.trim();
+				const headline = title !== "" ? title : firstLine(prompt);
 				const out = await postVerdict("propose_repo", {
 					repo,
 					verdict: "filed",

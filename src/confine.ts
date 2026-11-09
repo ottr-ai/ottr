@@ -314,6 +314,52 @@ interface Relink {
  * `relink.to` names the same path; a target inside the tree stays verbatim, so it names the
  * same relative entry in the destination tree.
  */
+/**
+ * Resolves the new target for a copied symlink. Null keeps the target verbatim: absolute
+ * targets, or any target when no relink applies, name the same entry after the copy.
+ */
+function relinkTarget(target: string, relink?: Relink): string | null {
+	if (!relink || isAbsolute(target)) return null;
+	const named = resolve(dirname(resolve(relink.from)), target);
+	if (inside(relink.fromTree, named)) return null;
+	return relative(dirname(resolve(relink.to)), named);
+}
+
+/** Copies a symlink as a link, never as what it points at. */
+function copySymlink(src: string, dst: string, relink?: Relink): void {
+	const target = readlinkSync(src);
+	const named = relinkTarget(target, relink);
+	symlinkSync(named ?? target, dst);
+}
+
+/** Opens `src` without following a final symlink, failing with "refusing <label>". */
+function openRegularFile(src: string, label: string): number {
+	try {
+		return openSync(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${label}: a symlink`);
+		throw err;
+	}
+}
+
+/** Copies a regular file's content and mode through two open descriptors. */
+function copyFileContent(sfd: number, dst: string, label: string): void {
+	const st = fstatSync(sfd);
+	if (!st.isFile()) throw new Error(`refusing ${label}: not a regular file`);
+	const dfd = openEntry(dst, label, "exclusive", st.mode & 0o777);
+	try {
+		const buf = Buffer.allocUnsafe(1 << 20);
+		for (;;) {
+			const n = readSync(sfd, buf, 0, buf.length, null);
+			if (n === 0) break;
+			for (let off = 0; off < n; ) off += writeSync(dfd, buf, off, n - off);
+		}
+	} finally {
+		closeSync(dfd);
+	}
+}
+
 function copyEntry(
 	src: string,
 	dst: string,
@@ -326,41 +372,12 @@ function copyEntry(
 		if (errCode(err) !== "ENOENT") throw err;
 	}
 	if (lstatSync(src).isSymbolicLink()) {
-		const target = readlinkSync(src);
-		const named =
-			relink && !isAbsolute(target)
-				? resolve(dirname(resolve(relink.from)), target)
-				: null;
-		symlinkSync(
-			relink && named !== null && !inside(relink.fromTree, named)
-				? relative(dirname(resolve(relink.to)), named)
-				: target,
-			dst,
-		);
+		copySymlink(src, dst, relink);
 		return;
 	}
-	let sfd: number;
+	const sfd = openRegularFile(src, label);
 	try {
-		sfd = openSync(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-	} catch (err) {
-		if (errCode(err) === "ELOOP")
-			throw new Error(`refusing ${label}: a symlink`);
-		throw err;
-	}
-	try {
-		const st = fstatSync(sfd);
-		if (!st.isFile()) throw new Error(`refusing ${label}: not a regular file`);
-		const dfd = openEntry(dst, label, "exclusive", st.mode & 0o777);
-		try {
-			const buf = Buffer.allocUnsafe(1 << 20);
-			for (;;) {
-				const n = readSync(sfd, buf, 0, buf.length, null);
-				if (n === 0) break;
-				for (let off = 0; off < n; ) off += writeSync(dfd, buf, off, n - off);
-			}
-		} finally {
-			closeSync(dfd);
-		}
+		copyFileContent(sfd, dst, label);
 	} finally {
 		closeSync(sfd);
 	}
@@ -461,6 +478,36 @@ export function appendLineBelow(
 	});
 }
 
+/** Reads the open descriptor fully, with the size checks; see readBelow. */
+function readRegularFile(d: Dir, file: string, maxBytes: number): Buffer {
+	let fd: number;
+	try {
+		fd = openSync(d.at(basename(file)), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${file}: a symlink`);
+		throw err;
+	}
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error(`refusing ${file}: not a regular file`);
+		if (st.size > maxBytes)
+			throw new Error(`refusing ${file}: larger than ${maxBytes} bytes`);
+		// One spare byte catches a file that grew after fstat.
+		const buf = Buffer.allocUnsafe(st.size + 1);
+		let n = 0;
+		while (n < buf.length) {
+			const r = readSync(fd, buf, n, buf.length - n, null);
+			if (r === 0) break;
+			n += r;
+		}
+		if (n > st.size) throw new Error(`refusing ${file}: it grew while read`);
+		return buf.subarray(0, n);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 /**
  * Reads the regular file `file` below `anchor`, following no symlink under the anchor (the
  * file included). Null when the file or a parent is missing. A symlink, a non-regular entry,
@@ -472,36 +519,9 @@ export function readBelow(
 	maxBytes: number,
 ): Buffer | null {
 	try {
-		return withDir(anchor, dirname(file), {}, (d) => {
-			let fd: number;
-			try {
-				fd = openSync(d.at(basename(file)), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-			} catch (err) {
-				if (errCode(err) === "ELOOP")
-					throw new Error(`refusing ${file}: a symlink`);
-				throw err;
-			}
-			try {
-				const st = fstatSync(fd);
-				if (!st.isFile())
-					throw new Error(`refusing ${file}: not a regular file`);
-				if (st.size > maxBytes)
-					throw new Error(`refusing ${file}: larger than ${maxBytes} bytes`);
-				// One spare byte catches a file that grew after fstat.
-				const buf = Buffer.allocUnsafe(st.size + 1);
-				let n = 0;
-				while (n < buf.length) {
-					const r = readSync(fd, buf, n, buf.length - n, null);
-					if (r === 0) break;
-					n += r;
-				}
-				if (n > st.size)
-					throw new Error(`refusing ${file}: it grew while read`);
-				return buf.subarray(0, n);
-			} finally {
-				closeSync(fd);
-			}
-		});
+		return withDir(anchor, dirname(file), {}, (d) =>
+			readRegularFile(d, file, maxBytes),
+		);
 	} catch (err) {
 		if (errCode(err) === "ENOENT") return null;
 		throw err;

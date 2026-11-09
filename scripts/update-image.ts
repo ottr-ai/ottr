@@ -86,7 +86,7 @@ const freeRunner = (runner: string): string =>
 // connected before the next one rolls. The url comes from the board's runner list, as
 // one string: a second encode would fetch a quoted literal and never reach the worker.
 const probeRunner = (url: string): string =>
-	`const r = await fetch(${JSON.stringify(url + "/healthz")});` +
+	`const r = await fetch(${JSON.stringify(`${url}/healthz`)});` +
 	"if (!r.ok) { console.log('HTTP ' + r.status); process.exit(1); }";
 // Tells a busy worker to release its /run streams and keep its omp children (POST
 // /detach, token-gated like /run): the server's death then drops only the streams,
@@ -186,7 +186,8 @@ export function envFileValues(args: string[]): Record<string, string> {
 function envFiles(args: string[]): string[] {
 	const files: string[] = [];
 	for (let i = 0; i < args.length; i++) {
-		const a = args[i]!;
+		const a = args[i];
+		if (a === undefined) break;
 		if (a === "--env-file") files.push(args[++i] ?? "");
 		else if (a.startsWith("--env-file="))
 			files.push(a.slice("--env-file=".length));
@@ -1022,6 +1023,207 @@ type RollOne =
 	| { kind: "stuck" }
 	| { kind: "rolled" };
 
+/** One wait-poll step's outcome: the run stops early, the hold ran out with a
+ * turn still on it, the runner idles (the roll goes on), or the poll keeps
+ * waiting. */
+type IdleWait =
+	| { kind: "stop"; early: number }
+	| { kind: "stuck" }
+	| { kind: "idle" }
+	| { kind: "busy" };
+
+/** Holds one runner for its roll; a failed hold stops the run. Null when the hold is on. */
+async function holdForRoll(
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	stop: (why: string) => number,
+): Promise<RollOne | null> {
+	const held = await exec(holdRunner(service));
+	if (held.code !== 0)
+		return {
+			kind: "stop",
+			early: stop(`the board cannot hold ${service}: ${lastLine(held.out)}`),
+		};
+	return null;
+}
+
+/**
+ * Asks the worker itself about the runs the board cannot see: a run the server
+ * step detached in an earlier run re-binds its row on the new server, and the
+ * count reads a map the restart emptied. The worker itself answers for them, and
+ * an old worker without the route answers []. A failed read is a real worker
+ * error: like an unreadable runner state, the roll stops, for recreating now
+ * would kill the run nobody can see. The probe execs in the worker's own
+ * container, not the server.
+ */
+async function detachedStillRuns(
+	d: Deps,
+	compose: string[],
+	service: string,
+	stop: (why: string) => number,
+): Promise<IdleWait> {
+	const listed = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		service,
+		"bun",
+		"-e",
+		DETACHED_LIST,
+	);
+	// ponytail: a failed exec prints only HTTP text, so JSON.parse would throw
+	// on it anyway and the catch below stops with the same words — this check
+	// fails fast, and its false-mutant cannot change the outcome.
+	if (listed.code !== 0)
+		return {
+			kind: "stop",
+			early: stop(
+				`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
+			),
+		};
+	let detached: { running?: boolean }[];
+	try {
+		detached = JSON.parse(listed.out) as { running?: boolean }[];
+	} catch {
+		return {
+			kind: "stop",
+			early: stop(
+				`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
+			),
+		};
+	}
+	// ponytail: the busy answer keeps the wait running when a detached entry
+	// still runs, so the next poll's probe sees it finished.
+	return detached.some((x) => x.running === true)
+		? { kind: "busy" }
+		: { kind: "idle" };
+}
+
+/**
+ * A wait poll's head: when the board counts the runner busy, the wait goes on
+ * without asking the worker. Otherwise the worker's own detached-runs answer
+ * decides.
+ */
+async function waitPollHead(
+	d: Deps,
+	compose: string[],
+	service: string,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<IdleWait> {
+	const r = board.runners.find((x) => x.id === service);
+	if (r === undefined || r.turns !== 0 || board.preparing !== 0)
+		return { kind: "busy" };
+	return detachedStillRuns(d, compose, service, stop);
+}
+
+/**
+ * A wait poll's tail: pauses one poll interval, re-reads the board into `board`
+ * in place, and renews the hold. A failed read stops the run, and a refused
+ * renewal leaves the turn on the runner (stuck).
+ */
+async function waitPollTail(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<IdleWait> {
+	await d.wait(POLL_MS);
+	const next = await readRunners(exec);
+	if (next === null)
+		return {
+			kind: "stop",
+			early: stop(
+				`the board's runners cannot be read: the hold on ${service} lapses 30 min after the last renewal`,
+			),
+		};
+	board.preparing = next.preparing;
+	board.runners = next.runners;
+	// One POST holds the runner for DRAIN_MS (30 min), and this wait can reach
+	// HOLD_LIMIT_MS (1 h): renew each poll like the whole-board hold does, or the
+	// hold lapses mid-wait and the worker takes turns again before its recreate.
+	// A refused renewal ends the wait as stuck: keepTurnStuck releases, and a
+	// later run rolls.
+	const renewed = await exec(holdRunner(service));
+	return renewed.code !== 0 ? { kind: "stuck" } : { kind: "busy" };
+}
+
+/**
+ * Waits while the runner keeps a turn: each poll renews the hold and refreshes
+ * `board` in place. "stuck" ends the wait at the hold limit (or on a refused
+ * renewal) with a turn still on it, "idle" frees the roll to recreate, and
+ * "stop" ends the run.
+ */
+async function waitRunnerIdle(
+	d: Deps,
+	compose: string[],
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<IdleWait> {
+	// The runner's turns drain while the other runners keep working. `preparing` is
+	// not attributable to one runner, so a preparing turn holds every runner idle.
+	const since = d.now();
+	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
+	// exclusive to the first pass, so Stryker's i-- mutant prints the same note.
+	for (let i = 0; ; i++) {
+		const head = await waitPollHead(d, compose, service, board, stop);
+		if (head.kind !== "busy") return head;
+		// The next poll would end past the limit.
+		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) return { kind: "stuck" };
+		if (i === 0)
+			d.log(
+				`${service} still runs its turns: the roll follows when they finish`,
+			);
+		const tail = await waitPollTail(d, exec, service, board, stop);
+		if (tail.kind !== "busy") return tail;
+	}
+}
+
+/**
+ * The runner keeps its turn past the hold limit: release it, leave it on the old
+ * image, and let a later run roll it.
+ */
+async function keepTurnStuck(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+): Promise<RollOne> {
+	const freed = await exec(freeRunner(service));
+	d.log(
+		freed.code === 0
+			? `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min: its hold ends, and its restart waits for a later run`
+			: `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min, and the board cannot end its hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
+	);
+	return { kind: "stuck" };
+}
+
+/**
+ * Healthy is not connected: the roll goes on only when the server reaches the
+ * new worker again. Null when it does; else the run's exit code.
+ */
+async function awaitConnected(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	url: string,
+	stop: (why: string) => number,
+): Promise<number | null> {
+	const since = d.now();
+	for (;;) {
+		const h = await exec(probeRunner(url));
+		if (h.code === 0) return null;
+		if (d.now() - since + POLL_MS > CONNECT_LIMIT_MS)
+			return stop(
+				`${service} never answers ${url}/healthz: ${lastLine(h.out)}`,
+			);
+		await d.wait(POLL_MS);
+	}
+}
+
 /**
  * Rolls one listed runner: holds it, waits its turns out (the wait renews the hold each
  * poll), recreates only its container, waits until the server reaches it again, and
@@ -1036,121 +1238,18 @@ async function rollRunner(
 	board: { preparing: number; runners: Runner[] },
 	stop: (why: string) => number,
 ): Promise<RollOne> {
-	const held = await exec(holdRunner(service));
-	if (held.code !== 0)
-		return {
-			kind: "stop",
-			early: stop(`the board cannot hold ${service}: ${lastLine(held.out)}`),
-		};
-	// The runner's turns drain while the other runners keep working. `preparing` is
-	// not attributable to one runner, so a preparing turn holds every runner idle.
-	const since = d.now();
-	let busy = true;
-	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
-	// exclusive to the first pass, so Stryker's i-- mutant prints the same note.
-	for (let i = 0; ; i++) {
-		const r = board.runners.find((x) => x.id === service);
-		if (r !== undefined && r.turns === 0 && board.preparing === 0) {
-			// The board count cannot see a run the server step detached in an
-			// earlier run: the new server re-binds its row, and the count reads a
-			// map the restart emptied. The worker itself answers for them, and an
-			// old worker without the route answers []. A failed read is a real
-			// worker error: like an unreadable runner state, the roll stops, for
-			// recreating now would kill the run nobody can see. The probe execs in
-			// the worker's own container, not the server.
-			const listed = await d.docker(
-				"compose",
-				...compose,
-				"exec",
-				"-T",
-				service,
-				"bun",
-				"-e",
-				DETACHED_LIST,
-			);
-			// ponytail: a failed exec prints only HTTP text, so JSON.parse would throw
-			// on it anyway and the catch below stops with the same words — this check
-			// fails fast, and its false-mutant cannot change the outcome.
-			if (listed.code !== 0)
-				return {
-					kind: "stop",
-					early: stop(
-						`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
-					),
-				};
-			let detached: { running?: boolean }[];
-			try {
-				detached = JSON.parse(listed.out) as { running?: boolean }[];
-			} catch {
-				return {
-					kind: "stop",
-					early: stop(
-						`${service} cannot read its detached runs: ${lastLine(listed.out)}`,
-					),
-				};
-			}
-			// ponytail: the fall-through keeps the wait running when a detached
-			// entry still runs, so the next poll's probe sees it finished.
-			if (!detached.some((x) => x.running === true)) {
-				busy = false;
-				break;
-			}
-		}
-		// The next poll would end past the limit.
-		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) break;
-		if (i === 0)
-			d.log(
-				`${service} still runs its turns: the roll follows when they finish`,
-			);
-		await d.wait(POLL_MS);
-		const next = await readRunners(exec);
-		if (next === null)
-			return {
-				kind: "stop",
-				early: stop(
-					`the board's runners cannot be read: the hold on ${service} lapses 30 min after the last renewal`,
-				),
-			};
-		board.preparing = next.preparing;
-		board.runners = next.runners;
-		// One POST holds the runner for DRAIN_MS (30 min), and this wait can reach
-		// HOLD_LIMIT_MS (1 h): renew each poll like the whole-board hold does, or the
-		// hold lapses mid-wait and the worker takes turns again before its recreate.
-		// A refused renewal lands in the busy path below: release, and a later run rolls.
-		const renewed = await exec(holdRunner(service));
-		if (renewed.code !== 0) break;
-	}
-	if (busy) {
-		// The runner keeps its turn: release it, leave it on the old image, and let
-		// a later run roll it.
-		const freed = await exec(freeRunner(service));
-		d.log(
-			freed.code === 0
-				? `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min: its hold ends, and its restart waits for a later run`
-				: `${service} keeps a turn after ${HOLD_LIMIT_MS / 60_000} min, and the board cannot end its hold (${lastLine(freed.out)}): it lapses 30 min after the last renewal`,
-		);
-		return { kind: "stuck" };
-	}
+	const held = await holdForRoll(exec, service, stop);
+	if (held !== null) return held;
+	const waited = await waitRunnerIdle(d, compose, exec, service, board, stop);
+	if (waited.kind === "stop") return waited;
+	if (waited.kind === "stuck") return keepTurnStuck(d, exec, service);
 	// --wait waits for the worker's own compose healthcheck; a failed recreate is a
 	// failed health check: the roll stops, and the other containers stay on the old image.
 	const failed = await recreate(d, compose, service, stop);
 	if (failed !== null) return { kind: "stop", early: failed };
 	if (runner.url !== null) {
-		// Healthy is not connected: the roll goes on only when the server reaches
-		// the new worker again.
-		const cSince = d.now();
-		for (;;) {
-			const h = await exec(probeRunner(runner.url));
-			if (h.code === 0) break;
-			if (d.now() - cSince + POLL_MS > CONNECT_LIMIT_MS)
-				return {
-					kind: "stop",
-					early: stop(
-						`${service} never answers ${runner.url}/healthz: ${lastLine(h.out)}`,
-					),
-				};
-			await d.wait(POLL_MS);
-		}
+		const early = await awaitConnected(d, exec, service, runner.url, stop);
+		if (early !== null) return { kind: "stop", early };
 	}
 	const freed = await exec(freeRunner(service));
 	if (freed.code !== 0)
@@ -1180,6 +1279,179 @@ type ServerRoll =
 	| { kind: "deferred" }
 	| { kind: "done" };
 
+/**
+ * Ends every hold on the board: a deferred step released nothing itself, so
+ * every hold must end now, and queued cards start again instead of waiting out
+ * the lapsed holds. A DELETE for a runner that never held clears nothing and
+ * answers either way.
+ */
+async function releaseAll(
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	board: { preparing: number; runners: Runner[] },
+): Promise<void> {
+	for (const r of board.runners) await exec(freeRunner(r.id));
+}
+
+/** Defers the server step to a later run: every hold ends, and the run logs why. */
+function deferRoll(d: Deps, why: string): ServerRoll {
+	d.log(`${why}: the holds end, and the server step waits for a later run`);
+	return { kind: "deferred" };
+}
+
+/**
+ * The server's local drain: holds local, reads the board fresh, and waits
+ * local's own turns out with the same 1 h limit as a worker. Null when local
+ * idles; else the step's outcome.
+ */
+async function drainLocal(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<ServerRoll | null> {
+	// Server-local turns die with the server process: they must finish first.
+	const held = await exec(holdRunner("local"));
+	if (held.code !== 0)
+		return {
+			kind: "early",
+			early: stop(`the board cannot hold local: ${lastLine(held.out)}`),
+		};
+	const since = d.now();
+	// The worker rolls refreshed this board only while a runner was busy: read it
+	// fresh, so a turn that started after its worker rolled still detaches.
+	const fresh = await readRunners(exec);
+	if (fresh === null) {
+		await releaseAll(exec, board);
+		return {
+			kind: "early",
+			early: stop(
+				"the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
+			),
+		};
+	}
+	board.preparing = fresh.preparing;
+	board.runners = fresh.runners;
+	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
+	// exclusive to the first pass, so Stryker's i-- mutant prints the same note;
+	// its i !== 0 mutant only moves the note one poll later, same count.
+	for (let i = 0; ; i++) {
+		const local = board.runners.find((r) => r.id === "local");
+		if (local === undefined || local.turns === 0) return null;
+		// The next poll would end past the limit.
+		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) {
+			await releaseAll(exec, board);
+			return deferRoll(
+				d,
+				`local keeps a turn after ${HOLD_LIMIT_MS / 60_000} min`,
+			);
+		}
+		if (i === 0)
+			d.log(
+				"local still runs its turns: the server restart follows when they finish",
+			);
+		const step = await pollLocalTurn(d, exec, board, stop);
+		if (step !== null) return step;
+	}
+}
+
+/**
+ * One drain poll for local: pauses one poll interval, re-reads the board into
+ * `board` in place, and renews the hold. A failed read stops the run, and a
+ * refused renewal defers the step. Null when the poll went through; else the
+ * step's outcome.
+ */
+async function pollLocalTurn(
+	d: Deps,
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<ServerRoll | null> {
+	await d.wait(POLL_MS);
+	const next = await readRunners(exec);
+	if (next === null) {
+		await releaseAll(exec, board);
+		return {
+			kind: "early",
+			early: stop(
+				"the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
+			),
+		};
+	}
+	board.preparing = next.preparing;
+	board.runners = next.runners;
+	// One POST holds the runner for DRAIN_MS (30 min), and this wait can reach
+	// HOLD_LIMIT_MS (1 h): renew each poll like the worker holds do. A refused
+	// renewal ends the wait: release, and a later run rolls.
+	const renewed = await exec(holdRunner("local"));
+	if (renewed.code !== 0) {
+		await releaseAll(exec, board);
+		return deferRoll(d, "the board cannot hold local any more");
+	}
+	return null;
+}
+
+/**
+ * Holds every worker runner: worker holds stop new dispatches for the seconds of
+ * the restart window, the cards stay queued, and no board-wide notice shows.
+ * Local skips: its hold is already on, and a second hold for it would name an
+ * empty runner. Null when every hold is on; else the step's outcome.
+ */
+async function holdWorkers(
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<ServerRoll | null> {
+	for (const r of board.runners) {
+		if (r.id === "local") continue;
+		const h = await exec(holdRunner(r.id));
+		if (h.code !== 0) {
+			await releaseAll(exec, board);
+			return {
+				kind: "early",
+				early: stop(`the board cannot hold ${r.id}: ${lastLine(h.out)}`),
+			};
+		}
+	}
+	return null;
+}
+
+/**
+ * Tells every busy worker to detach its running turn: the exec runs in the
+ * worker's own container, with its own token, so the turn survives the server's
+ * death and the new server's boot recovery re-binds it. An idle worker skips it.
+ * A worker that cannot detach (an old image answers 404) defers the step: every
+ * hold releases, and the step waits for a later run — killing that turn is not
+ * worth the update. Null when every busy worker detached; else the outcome.
+ */
+async function detachBusyWorkers(
+	d: Deps,
+	compose: string[],
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	board: { preparing: number; runners: Runner[] },
+): Promise<ServerRoll | null> {
+	for (const r of board.runners) {
+		if (r.id === "local" || r.turns === 0) continue;
+		const det = await d.docker(
+			"compose",
+			...compose,
+			"exec",
+			"-T",
+			r.id,
+			"bun",
+			"-e",
+			DETACH_WORKER,
+		);
+		if (det.code !== 0) {
+			await releaseAll(exec, board);
+			return deferRoll(
+				d,
+				`${r.id} cannot detach its turn (${lastLine(det.out)})`,
+			);
+		}
+	}
+	return null;
+}
+
 async function rollServer(
 	d: Deps,
 	compose: string[],
@@ -1197,108 +1469,12 @@ async function rollServer(
 	if (!changed && !seeded) return { kind: "done" };
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
-	// A deferred step released nothing itself: every hold must end now, so queued
-	// cards start again instead of waiting out the lapsed holds. A DELETE for a
-	// runner that never held clears nothing and answers either way.
-	const release = async (): Promise<void> => {
-		for (const r of board.runners) await exec(freeRunner(r.id));
-	};
-	const defer = (why: string): ServerRoll => {
-		d.log(`${why}: the holds end, and the server step waits for a later run`);
-		return { kind: "deferred" };
-	};
-	// Server-local turns die with the server process: they must finish first.
-	const held = await exec(holdRunner("local"));
-	if (held.code !== 0)
-		return {
-			kind: "early",
-			early: stop(`the board cannot hold local: ${lastLine(held.out)}`),
-		};
-	const since = d.now();
-	// The worker rolls refreshed this board only while a runner was busy: read it
-	// fresh, so a turn that started after its worker rolled still detaches.
-	const fresh = await readRunners(exec);
-	if (fresh === null) {
-		await release();
-		return {
-			kind: "early",
-			early: stop(
-				"the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
-			),
-		};
-	}
-	board.preparing = fresh.preparing;
-	board.runners = fresh.runners;
-	// ponytail: i only guards the first-poll note below, and i-- keeps i === 0
-	// exclusive to the first pass, so Stryker's i-- mutant prints the same note;
-	// its i !== 0 mutant only moves the note one poll later, same count.
-	for (let i = 0; ; i++) {
-		const local = board.runners.find((r) => r.id === "local");
-		if (local === undefined || local.turns === 0) break;
-		// The next poll would end past the limit.
-		if (d.now() - since + POLL_MS > HOLD_LIMIT_MS) {
-			await release();
-			return defer(`local keeps a turn after ${HOLD_LIMIT_MS / 60_000} min`);
-		}
-		if (i === 0)
-			d.log(
-				"local still runs its turns: the server restart follows when they finish",
-			);
-		await d.wait(POLL_MS);
-		const next = await readRunners(exec);
-		if (next === null) {
-			await release();
-			return {
-				kind: "early",
-				early: stop(
-					"the board's runners cannot be read: the hold on local lapses 30 min after the last renewal",
-				),
-			};
-		}
-		board.preparing = next.preparing;
-		board.runners = next.runners;
-		// One POST holds the runner for DRAIN_MS (30 min), and this wait can reach
-		// HOLD_LIMIT_MS (1 h): renew each poll like the worker holds do. A refused
-		// renewal ends the wait: release, and a later run rolls.
-		const renewed = await exec(holdRunner("local"));
-		if (renewed.code !== 0) {
-			await release();
-			return defer("the board cannot hold local any more");
-		}
-	}
-	// Worker holds stop new dispatches for the seconds of the restart window; the
-	// cards stay queued, and no board-wide notice shows. Local skips: its hold is
-	// already on, and a second hold for it would name an empty runner.
-	for (const r of board.runners) {
-		if (r.id === "local") continue;
-		const h = await exec(holdRunner(r.id));
-		if (h.code !== 0) {
-			await release();
-			return {
-				kind: "early",
-				early: stop(`the board cannot hold ${r.id}: ${lastLine(h.out)}`),
-			};
-		}
-	}
-	// A busy worker keeps its turn only detached: the exec runs in the worker's own
-	// container, with its own token. An idle worker skips it.
-	for (const r of board.runners) {
-		if (r.id === "local" || r.turns === 0) continue;
-		const det = await d.docker(
-			"compose",
-			...compose,
-			"exec",
-			"-T",
-			r.id,
-			"bun",
-			"-e",
-			DETACH_WORKER,
-		);
-		if (det.code !== 0) {
-			await release();
-			return defer(`${r.id} cannot detach its turn (${lastLine(det.out)})`);
-		}
-	}
+	const drained = await drainLocal(d, exec, board, stop);
+	if (drained !== null) return drained;
+	const held = await holdWorkers(exec, board, stop);
+	if (held !== null) return held;
+	const detached = await detachBusyWorkers(d, compose, exec, board);
+	if (detached !== null) return detached;
 	if (changed) {
 		const failed = await recreate(d, compose, "server", stop);
 		return failed !== null
@@ -1321,6 +1497,102 @@ async function rollServer(
  * variants, so the early returns carry no flag a mutant could flip in the dark. */
 type RollOutcome = { early: number } | { early: null; settled: boolean };
 
+/**
+ * `up -d --wait` for the whole stack: starts a service that is not running and
+ * waits for the server's health. The early exit code when it fails; null when it
+ * is up.
+ */
+async function upAndWait(
+	d: Deps,
+	compose: string[],
+	stop: (why: string) => number,
+): Promise<number | null> {
+	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
+	// ponytail: up.out is always a defined string, so the trim's
+	// optional-chain mutant is a no-op.
+	if (up.code !== 0)
+		return stop(`docker compose up --wait failed: ${up.out.trim()}`);
+	return null;
+}
+
+/**
+ * Starts a stack that is not running: no board, no turn can run (workers kill a
+ * turn when the board's request drops, and merge turns die with the board), so
+ * the roll skips and the stack starts.
+ */
+async function startWithoutBoard(
+	d: Deps,
+	compose: string[],
+	stop: (why: string) => number,
+): Promise<RollOutcome> {
+	d.log("no running board to count turns in; restarting anyway");
+	const failed = await upAndWait(d, compose, stop);
+	return failed !== null ? { early: failed } : { early: null, settled: true };
+}
+
+/** One worker service's step of the roll: the run stops early, the runner keeps
+ * its turn, or the step moved on. */
+type ServiceStep =
+	| { kind: "stop"; early: number }
+	| { kind: "stuck" }
+	| { kind: "next" };
+
+/**
+ * Rolls one worker service: compares its image with the build, recreates it
+ * without a hold when no runner lists it, or rolls its runner through the
+ * hold-wait-recreate-release phases.
+ */
+async function rollWorkerService(
+	d: Deps,
+	compose: string[],
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	service: string,
+	board: { preparing: number; runners: Runner[] },
+	stop: (why: string) => number,
+): Promise<ServiceStep> {
+	const ch = await imageChanged(d, compose, service);
+	if ("error" in ch) {
+		d.log(
+			`skipping ${service}: its image cannot be compared with the build: ${ch.error}`,
+		);
+		return { kind: "next" };
+	}
+	if (!ch.changed) return { kind: "next" };
+	const runner = board.runners.find((r) => r.id === service);
+	if (runner === undefined) {
+		// No runner lists this hostname, so no turn can reach it: it recreates
+		// without a hold and without a turns wait, like a sidecar service does.
+		d.log(`${service} is no runner on the board: it recreates without a hold`);
+		const failed = await recreate(d, compose, service, stop);
+		if (failed !== null) return { kind: "stop", early: failed };
+		return { kind: "next" };
+	}
+	const one = await rollRunner(d, compose, exec, service, runner, board, stop);
+	if (one.kind === "stop") return { kind: "stop", early: one.early };
+	if (one.kind === "stuck") return { kind: "stuck" };
+	return { kind: "next" };
+}
+
+/**
+ * From the server step's outcome to the run's end: a deferred step leaves turns
+ * running un-detached, so the whole-stack up would recreate exactly those
+ * containers — the run skips it, and leaves the seed record for the run that
+ * rolls the server (a failed seed still fails the run). Otherwise the whole
+ * stack starts what is not running and waits for the server's health: every
+ * changed container was rolled per service above.
+ */
+async function settleAfterRoll(
+	d: Deps,
+	compose: string[],
+	step: ServerRoll,
+	seedFailed: boolean,
+	stop: (why: string) => number,
+): Promise<RollOutcome> {
+	if (step.kind === "deferred") return { early: seedFailed ? 1 : 0 };
+	const failed = await upAndWait(d, compose, stop);
+	return failed !== null ? { early: failed } : { early: null, settled: true };
+}
+
 async function rollAndRestart(
 	d: Deps,
 	compose: string[],
@@ -1334,19 +1606,7 @@ async function rollAndRestart(
 ): Promise<RollOutcome> {
 	const exec = (code: string) =>
 		d.docker("compose", ...compose, "exec", "-T", "server", "bun", "-e", code);
-	// No running board, no turn can run: workers kill a turn when the board's request
-	// drops, and merge turns die with the board. Skip the roll and start the stack.
-	if (!serverWasRunning) {
-		d.log("no running board to count turns in; restarting anyway");
-		const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
-		// ponytail: up.out is always a defined string, so the trim's
-		// optional-chain mutant is a no-op.
-		if (up.code !== 0)
-			return {
-				early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
-			};
-		return { early: null, settled: true };
-	}
+	if (!serverWasRunning) return startWithoutBoard(d, compose, stop);
 	const board = await readRunners(exec);
 	if (board === null) {
 		// A board one version older has none of the per-runner parts.
@@ -1365,36 +1625,16 @@ async function rollAndRestart(
 	// Workers roll first, one at a time, in compose ps order; the server rolls last.
 	let stuck = false;
 	for (const service of services.filter((s) => s !== "server")) {
-		const ch = await imageChanged(d, compose, service);
-		if ("error" in ch) {
-			d.log(
-				`skipping ${service}: its image cannot be compared with the build: ${ch.error}`,
-			);
-			continue;
-		}
-		if (!ch.changed) continue;
-		const runner = board.runners.find((r) => r.id === service);
-		if (runner === undefined) {
-			// No runner lists this hostname, so no turn can reach it: it recreates
-			// without a hold and without a turns wait, like a sidecar service does.
-			d.log(
-				`${service} is no runner on the board: it recreates without a hold`,
-			);
-			const failed = await recreate(d, compose, service, stop);
-			if (failed !== null) return { early: failed };
-			continue;
-		}
-		const one = await rollRunner(
+		const step = await rollWorkerService(
 			d,
 			compose,
 			exec,
 			service,
-			runner,
 			board,
 			stop,
 		);
-		if (one.kind === "stop") return { early: one.early };
-		if (one.kind === "stuck") stuck = true;
+		if (step.kind === "stop") return { early: step.early };
+		if (step.kind === "stuck") stuck = true;
 	}
 	// The server is the last runner: a restart kills every turn it runs itself and every
 	// turn a worker streams to it, so a stuck runner's turn forbids the restart.
@@ -1413,20 +1653,7 @@ async function rollAndRestart(
 		};
 	const step = await rollServer(d, compose, board, seeded, ch.changed, stop);
 	if (step.kind === "early") return { early: step.early };
-	// A deferred step leaves turns running un-detached, so the whole-stack up
-	// would recreate exactly those containers: skip it, and leave the seed record
-	// for the run that rolls the server. A failed seed still fails the run.
-	if (step.kind === "deferred") return { early: seedFailed ? 1 : 0 };
-	// The whole-stack up only starts a service that is not running and waits for the
-	// server's health: every changed container was rolled per service above.
-	const up = await d.docker("compose", ...compose, "up", "-d", "--wait");
-	// ponytail: up.out is always a defined string, so the trim's
-	// optional-chain mutant is a no-op.
-	if (up.code !== 0)
-		return {
-			early: stop(`docker compose up --wait failed: ${up.out.trim()}`),
-		};
-	return { early: null, settled: true };
+	return settleAfterRoll(d, compose, step, seedFailed, stop);
 }
 
 /**
@@ -1508,37 +1735,37 @@ async function recordDeployed(
 }
 
 /**
- * The wait report a deferred server restart ends the run with: how long the restart has
- * already waited (the first deferral time, kept next to the seed record), a warning past
- * RESTART_WAIT_WARN_MS that names the turns that hold it, and both commits — the main
- * the image holds and the one the running server still has. The server keeps running,
- * so every exec answers. Advisory: a failed read or write only degrades a line.
+ * The wait's start: the first deferral writes its time, and a later one counts
+ * from it, so the wait survives the hourly runs on the board-config volume. A
+ * failed write only restarts the clock on a later run.
  */
-async function reportRestartWait(
+async function waitStart(
 	d: Deps,
-	compose: string[],
-	head: string,
-	omp: string,
-	repo: string,
-): Promise<void> {
-	const exec = (code: string) =>
-		d.docker("compose", ...compose, "exec", "-T", "server", "sh", "-c", code);
-	// The first deferral writes its time; a later one counts from it, so the wait
-	// survives the hourly runs on the board-config volume.
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+): Promise<number> {
 	const since = await exec("cat /etc/ottr/restart-waiting-since");
 	const kept = since.code === 0 ? since.out.trim() : "";
-	let first = Number(kept);
-	if (!Number.isInteger(first) || first <= 0) {
-		first = d.now();
-		const w = await exec(
-			`printf %s '${first}' > /etc/ottr/restart-waiting-since`,
-		);
-		if (w.code !== 0)
-			d.log("the wait record failed: a later run starts the wait clock again");
-	}
-	d.log(`the server restart has waited ${fmtWait(d.now() - first)}`);
-	// The ids run on every deferral: the warning line uses them past RESTART_WAIT_WARN_MS,
-	// and the restart-wait record names them so the board can show a bell notice.
+	const read = Number(kept);
+	if (Number.isInteger(read) && read > 0) return read;
+	const first = d.now();
+	const w = await exec(
+		`printf %s '${first}' > /etc/ottr/restart-waiting-since`,
+	);
+	if (w.code !== 0)
+		d.log("the wait record failed: a later run starts the wait clock again");
+	return first;
+}
+
+/**
+ * The turn ids a deferral reads on every run: the warning line uses them past
+ * RESTART_WAIT_WARN_MS, and the restart-wait record names them so the board can
+ * show a bell notice. Null when the read fails.
+ */
+async function holdingTurns(
+	d: Deps,
+	compose: string[],
+	first: number,
+): Promise<string | null> {
 	const t = await d.docker(
 		"compose",
 		...compose,
@@ -1559,18 +1786,53 @@ async function reportRestartWait(
 					: `warning: the server restart still waits; these turns hold it: ${ids}`,
 		);
 	}
-	// The deploy record lands only when the board took the deploy (recordDeployed),
-	// so it names the commit the running server still has.
+	return ids;
+}
+
+/**
+ * The commit the running server holds (the deploy record lands only when the
+ * board took the deploy, so it names that commit), and how many commits it
+ * lacks: a server that has none recorded (or already runs the head) has nothing
+ * to catch up on, and a failed count reads as 0.
+ */
+async function runningServer(
+	exec: (code: string) => Promise<{ code: number; out: string }>,
+	head: string,
+	repo: string,
+): Promise<{ running: string; commits: number }> {
 	const dep = await exec("cat /etc/ottr/build-commit");
 	const running = dep.code === 0 ? dep.out.trim() : "";
-	// How many commits the running server lacks. A server that has none recorded
-	// (or already runs the head) has nothing to catch up on.
-	let commits = 0;
-	if (running !== "" && running !== head) {
-		const c = await git(["rev-list", "--count", `${running}..${head}`], repo);
-		const n = Number(c.stdout.trim());
-		commits = c.code === 0 && Number.isInteger(n) && n >= 0 ? n : 0;
-	}
+	if (running === "" || running === head) return { running, commits: 0 };
+	const c = await git(["rev-list", "--count", `${running}..${head}`], repo);
+	const n = Number(c.stdout.trim());
+	return {
+		running,
+		commits: c.code === 0 && Number.isInteger(n) && n >= 0 ? n : 0,
+	};
+}
+
+/**
+ * The wait report a deferred server restart ends the run with: how long the restart has
+ * already waited (the first deferral time, kept next to the seed record), a warning past
+ * RESTART_WAIT_WARN_MS that names the turns that hold it, and both commits — the main
+ * the image holds and the one the running server still has. The server keeps running,
+ * so every exec answers. Advisory: a failed read or write only degrades a line.
+ */
+async function reportRestartWait(
+	d: Deps,
+	compose: string[],
+	head: string,
+	omp: string,
+	repo: string,
+): Promise<void> {
+	const exec = (code: string) =>
+		d.docker("compose", ...compose, "exec", "-T", "server", "sh", "-c", code);
+	const first = await waitStart(d, exec);
+	d.log(`the server restart has waited ${fmtWait(d.now() - first)}`);
+	const ids = await holdingTurns(d, compose, first);
+	const srv = await runningServer(exec, head, repo);
+	const running = srv.running;
+	const commits = srv.commits;
 	// The record the board reads to show a bell notice after 6 h of waiting. The ids
 	// are sanitized to a safe charset, so the printf never sees a quote.
 	const turns = (ids ?? "")

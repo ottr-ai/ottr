@@ -23,78 +23,119 @@ export type GithubAuthHintOpts = {
 	timeoutMs?: number;
 };
 
+/** Classification result: a GitHub https repo URL with a usable token and API base. */
+type RepoProbeTarget = {
+	owner: string;
+	repo: string;
+	apiBase: string;
+	token: string;
+};
+
+/** All URL-shape and token rules; null when any early-return guard fires. */
+function classifyRepoUrl(
+	url: string,
+	o: GithubAuthHintOpts,
+): RepoProbeTarget | null {
+	const remote = parseGitUrl(url);
+	if ("error" in remote || remote.scheme !== "https") return null;
+	if (!isGithubRepoHost(remote.host, o.configuredHost)) return null;
+	// Repo path: everything after the authority, one trailing "/" or ".git" stripped;
+	// exactly owner/repo, nothing else (a three-segment path is not a REST repo).
+	const at = url.indexOf("/", "https://".length);
+	if (at === -1) return null;
+	const path = url
+		.slice(at + 1)
+		.replace(/\/$/, "")
+		.replace(/\.git$/, "");
+	const segments = path.split("/").filter((s) => s !== "");
+	if (segments.length !== 2) return null;
+	const owner = segments[0];
+	const repo = segments[1];
+	if (owner === undefined || repo === undefined) return null;
+	const token =
+		o.tokens.find((t) => t.host === remote.hostKey)?.token ??
+		(remote.host === o.configuredHost ? o.envToken : null);
+	if (token === null || token === "") return null;
+	const parsed = parseGithubHost(remote.host);
+	if ("error" in parsed) return null;
+	return {
+		owner,
+		repo,
+		apiBase: parsed.apiBase,
+		token,
+	};
+}
+
+/**
+ * One API probe with the timeout race: the ceiling must hold even when a transport
+ * ignores the abort signal, so the await races the fetch against the timer; the loser's
+ * late rejection is already answered — swallow it.
+ */
+async function probeRepo(
+	target: RepoProbeTarget,
+	o: GithubAuthHintOpts,
+): Promise<Response> {
+	const ac = new AbortController();
+	const gate = Promise.withResolvers<never>();
+	const pending = (o.fetchImpl ?? fetch)(
+		`${target.apiBase}/repos/${target.owner}/${target.repo}`,
+		{
+			headers: {
+				Authorization: `Bearer ${target.token}`,
+				Accept: "application/vnd.github+json",
+				"User-Agent": "ottr",
+			},
+			signal: ac.signal,
+		},
+	);
+	void pending.catch(() => {});
+	const timer = setTimeout(() => {
+		ac.abort();
+		gate.reject(new Error("github api probe timed out"));
+	}, o.timeoutMs ?? 5000);
+	try {
+		return await Promise.race([pending, gate.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** The hint lines from the probe response; null when the body carries no message. */
+async function hintFromResponse(
+	res: Response,
+	o: GithubAuthHintOpts,
+): Promise<string | null> {
+	if (res.status !== 401 && res.status !== 403) return null;
+	let body: unknown;
+	try {
+		body = await res.json();
+	} catch {
+		return null;
+	}
+	if (typeof body !== "object" || body === null) return null;
+	const message =
+		"message" in body && typeof body.message === "string"
+			? body.message.trim()
+			: "";
+	if (message === "") return null;
+	const docs =
+		"documentation_url" in body && typeof body.documentation_url === "string"
+			? body.documentation_url.trim()
+			: "";
+	let out = `\nGitHub: ${redact(message.slice(0, 300), o.secrets)}`;
+	if (docs !== "") out += `\nDocs: ${docs}`;
+	return out;
+}
+
 export async function githubAuthHint(
 	url: string,
 	o: GithubAuthHintOpts,
 ): Promise<string | null> {
 	try {
-		const remote = parseGitUrl(url);
-		if ("error" in remote || remote.scheme !== "https") return null;
-		if (!isGithubRepoHost(remote.host, o.configuredHost)) return null;
-		// Repo path: everything after the authority, one trailing "/" or ".git" stripped;
-		// exactly owner/repo, nothing else (a three-segment path is not a REST repo).
-		const at = url.indexOf("/", "https://".length);
-		if (at === -1) return null;
-		const path = url
-			.slice(at + 1)
-			.replace(/\/$/, "")
-			.replace(/\.git$/, "");
-		const segments = path.split("/").filter((s) => s !== "");
-		if (segments.length !== 2) return null;
-		const [owner, repo] = segments;
-		const token =
-			o.tokens.find((t) => t.host === remote.hostKey)?.token ??
-			(remote.host === o.configuredHost ? o.envToken : null);
-		if (token === null || token === "") return null;
-		const parsed = parseGithubHost(remote.host);
-		if ("error" in parsed) return null;
-		const ac = new AbortController();
-		// The ceiling must hold even when a transport ignores the abort signal, so the
-		// await races the fetch against the timer; the loser's late rejection is already
-		// answered — swallow it.
-		const gate = Promise.withResolvers<never>();
-		const pending = (o.fetchImpl ?? fetch)(
-			`${parsed.apiBase}/repos/${owner}/${repo}`,
-			{
-				headers: {
-					Authorization: `Bearer ${token}`,
-					Accept: "application/vnd.github+json",
-					"User-Agent": "ottr",
-				},
-				signal: ac.signal,
-			},
-		);
-		void pending.catch(() => {});
-		const timer = setTimeout(() => {
-			ac.abort();
-			gate.reject(new Error("github api probe timed out"));
-		}, o.timeoutMs ?? 5000);
-		let res: Response;
-		try {
-			res = await Promise.race([pending, gate.promise]);
-		} finally {
-			clearTimeout(timer);
-		}
-		if (res.status !== 401 && res.status !== 403) return null;
-		let body: unknown;
-		try {
-			body = await res.json();
-		} catch {
-			return null;
-		}
-		if (typeof body !== "object" || body === null) return null;
-		const message =
-			"message" in body && typeof body.message === "string"
-				? body.message.trim()
-				: "";
-		if (message === "") return null;
-		const docs =
-			"documentation_url" in body && typeof body.documentation_url === "string"
-				? body.documentation_url.trim()
-				: "";
-		let out = `\nGitHub: ${redact(message.slice(0, 300), o.secrets)}`;
-		if (docs !== "") out += `\nDocs: ${docs}`;
-		return out;
+		const target = classifyRepoUrl(url, o);
+		if (target === null) return null;
+		const res = await probeRepo(target, o);
+		return await hintFromResponse(res, o);
 	} catch {
 		return null;
 	}

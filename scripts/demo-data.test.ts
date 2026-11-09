@@ -14,16 +14,56 @@ import { join } from "node:path";
 import { GlobalStore } from "../src/globalStore.ts";
 import { mergeHold } from "../src/scheduler.ts";
 import { ProjectStore } from "../src/store.ts";
+import type { RunState, Stage, TaskKind } from "../src/types.ts";
 import { strykerProgress } from "../src/ui/status.ts";
 import { demoProgressMap, heldDb, seedDemo } from "./demo-data.ts";
 
-type Row = Record<string, any> & { id: string };
+// The columns of tasks, turns, and events this file reads, with the schema's types.
+type TaskRow = {
+	id: string;
+	kind: TaskKind;
+	stage: Stage;
+	state: RunState;
+	title: string;
+	created_at: number;
+	done_at: number | null;
+	cancelled_at: number | null;
+	needs_reason: string | null;
+	pending_prompt: string | null;
+	pending_by: "user" | "supervisor" | null;
+	asked: string | null;
+	depends_on: string;
+	follow_up_of: string | null;
+	release_version: string | null;
+	release_notes: string | null;
+	commits: string | null;
+	push_retries: number;
+	research: number;
+} & Record<string, unknown>;
+type TurnRow = {
+	kind: string;
+	task_id: string;
+	ended_at: number | null;
+	pid: number | null;
+	prompt: string;
+	question: string;
+} & Record<string, unknown>;
+type EventRow = {
+	kind: string;
+	to_value: string;
+	task_id: string;
+} & Record<string, unknown>;
 interface ProjectData {
-	tasks: Row[];
-	turns: Row[];
-	events: Row[];
+	tasks: TaskRow[];
+	turns: TurnRow[];
+	events: EventRow[];
 }
 type Board = Record<string, ProjectData>;
+// The shape the demo seed writes under the "config" global key.
+type GlobalConfig = {
+	admin: { name: string; passHash: string };
+	githubToken?: unknown;
+};
 
 const root = mkdtempSync(join(tmpdir(), "demo-data-"));
 const stateDir = join(root, "state");
@@ -41,9 +81,9 @@ function projectNames(): string[] {
 
 function readDb(dir: string): ProjectData {
 	const db = new Database(join(dir, ".tasks", "tasks.db"));
-	const tasks = db.query("SELECT * FROM tasks ORDER BY id").all() as Row[];
-	const turns = db.query("SELECT * FROM turns ORDER BY id").all() as Row[];
-	const events = db.query("SELECT * FROM events").all() as Row[];
+	const tasks = db.query("SELECT * FROM tasks ORDER BY id").all() as TaskRow[];
+	const turns = db.query("SELECT * FROM turns ORDER BY id").all() as TurnRow[];
+	const events = db.query("SELECT * FROM events").all() as EventRow[];
 	db.close();
 	return { tasks, turns, events };
 }
@@ -53,7 +93,7 @@ const board = (): Board =>
 
 const allTasks = (b: Board) => Object.values(b).flatMap((p) => p.tasks);
 
-const toReview = (t: Row) => ({
+const toReview = (t: TaskRow) => ({
 	id: t.id,
 	kind: t.kind,
 	releaseVersion: t.release_version,
@@ -64,7 +104,7 @@ const toReview = (t: Row) => ({
 	pendingBy: t.pending_by,
 	createdAt: t.created_at,
 	doneAt: t.done_at,
-	dependsOn: t.depends_on,
+	dependsOn: JSON.parse(t.depends_on) as string[],
 	followUpOf: t.follow_up_of,
 });
 
@@ -111,7 +151,7 @@ test("seed covers every display shape with clean checkouts", () => {
 	// in_progress coverage
 	expect(tasks.some((t) => t.state === "preparing")).toBe(true);
 	const preparingTurn = firstBoard.hollowpine!.turns.find(
-		(tn: Row) => tn.ended_at === null && tn.kind === "work",
+		(tn: TurnRow) => tn.ended_at === null && tn.kind === "work",
 	);
 	expect(preparingTurn?.pid).toBeNull();
 	expect(tasks.some((t) => t.state === "running")).toBe(true);
@@ -121,7 +161,7 @@ test("seed covers every display shape with clean checkouts", () => {
 	expect(gate?.state).toBe("running");
 	const gateTurn = Object.values(firstBoard)
 		.flatMap((p) => p.turns)
-		.find((tn: Row) => tn.task_id === gate!.id && tn.kind === "work");
+		.find((tn: TurnRow) => tn.task_id === gate!.id && tn.kind === "work");
 	expect(gateTurn?.ended_at).toBeNull();
 	expect(gateTurn?.prompt).toMatch(/mutation gate/i);
 	const action = tasks.find((t) => t.state === "needs_you" && t.asked === null);
@@ -130,9 +170,12 @@ test("seed covers every display shape with clean checkouts", () => {
 	expect(asked).toBeDefined();
 	const askedTurns = Object.values(firstBoard)
 		.flatMap((p) => p.turns)
-		.filter((tn: Row) => tn.task_id === asked!.id);
+		.filter((tn: TurnRow) => tn.task_id === asked!.id);
 	// asked stores the ask tool's JSON shape; parseAsked must produce a real question.
-	const parsedAsked = JSON.parse(asked!.asked)[0];
+	const askedJson = asked?.asked;
+	if (askedJson === undefined || askedJson === null)
+		throw new Error("asked card without an asked payload");
+	const parsedAsked = JSON.parse(askedJson)[0];
 	expect(parsedAsked.question).toBeTruthy();
 	expect(parsedAsked.options.length).toBeGreaterThan(0);
 	expect(askedTurns.at(-1)?.question).toBe(parsedAsked.question);
@@ -144,7 +187,7 @@ test("seed covers every display shape with clean checkouts", () => {
 	const crashedEvents = Object.values(firstBoard).flatMap((p) => p.events);
 	expect(
 		crashedEvents.some(
-			(e: Row) =>
+			(e: EventRow) =>
 				e.kind === "error" &&
 				e.to_value === "needs_you" &&
 				e.task_id === crashed!.id,
@@ -170,7 +213,7 @@ test("seed covers every display shape with clean checkouts", () => {
 	expect(liveMerge).toBeDefined();
 	const openMergeTurn = Object.values(firstBoard)
 		.flatMap((p) => p.turns)
-		.find((tn: Row) => tn.kind === "merge" && tn.ended_at === null);
+		.find((tn: TurnRow) => tn.kind === "merge" && tn.ended_at === null);
 	expect(openMergeTurn?.task_id).toBe(liveMerge!.id);
 	expect(
 		tasks.some((t) => t.stage === "merging" && t.state === "needs_you"),
@@ -223,8 +266,9 @@ test("demo progress fabricates a parseable Stryker line for the gate card alone"
 
 test("admin is bootstrapped without a plain password", () => {
 	const store = GlobalStore.open(stateDir);
-	const config = store.get<any>("config");
+	const config = store.get<GlobalConfig>("config");
 	store.close();
+	if (config === null) throw new Error("config missing after seed");
 	expect(typeof config.admin.name).toBe("string");
 	expect(typeof config.admin.passHash).toBe("string");
 	expect(config.admin.passHash.length).toBeGreaterThan(0);
@@ -246,7 +290,7 @@ test("second seed refreshes live clocks and keeps the rest", () => {
 	);
 	expect(after.get(done.id)!.created_at).toBe(done.created_at);
 	const store = GlobalStore.open(stateDir);
-	expect(store.get<any>("config").admin.passHash).toBe(adminPassHash);
+	expect(store.get<GlobalConfig>("config")?.admin.passHash).toBe(adminPassHash);
 	store.close();
 });
 
@@ -298,6 +342,6 @@ test("force reseed replaces the pool and drops stale projects", () => {
 	// every boot leaves a running card freshly restarted, a force reseed included
 	expect(reseeded.created_at).toBeGreaterThanOrEqual(Date.now() - 10 * 60_000);
 	const store = GlobalStore.open(stateDir);
-	expect(store.get<any>("config").admin.passHash).toBe(adminPassHash);
+	expect(store.get<GlobalConfig>("config")?.admin.passHash).toBe(adminPassHash);
 	store.close();
 }, 20_000);
