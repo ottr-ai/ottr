@@ -334,6 +334,47 @@ like a failed apt install. The turn image carries `python3-venv`
 (Dockerfile.worker); Debian ships no pip without it. Until alate provisions the
 new list (its `WORKER_FILES`), no list reaches a home and every build is a no-op.
 
+### Package mirrors
+
+Turns install npm, Maven, pip and Gradle packages from your mirrors, not from the
+public registries, when the data repo carries the tools' config files. Alate
+installs each `user/<path>` file as `~/.<path>` in the turn home: install-user.mjs
+maps `user/<path>` to `~/<path>` ([The agent layers](#the-agent-layers)). The user
+layer goes into the workers' shared home and into the board home, so work turns and
+merge turns see the same mirrors.
+
+| Data repo file | Path in the turn home | Tool |
+|---|---|---|
+| `user/npmrc` | `~/.npmrc` | npm, bun |
+| `user/m2/settings.xml` | `~/.m2/settings.xml` | Maven |
+| `user/config/pip/pip.conf` | `~/.config/pip/pip.conf` | pip |
+| `user/gradle/init.d/*.gradle` | `~/.gradle/init.d/*.gradle` | Gradle |
+
+Rules:
+
+- Put only names in `workers/<project>/env.txt` (or `workers/_all/env.txt`), one
+  name per line, never a value. The value lives on the board: save it once under
+  **Settings → Env**. Every turn of the project then receives the name as an
+  environment variable.
+- Never put a token in the data repo. The data repo is a git repo, not a secret
+  store.
+- In `settings.xml`, read the credentials from the turn env, for example
+  `${env.ARTIFACTORY_TOKEN}`. Never ship `settings-security.xml` in the data repo.
+  The master key plus the encrypted passwords in one repo equal plaintext
+  credentials.
+- In `npmrc`, write `_authToken=${ARTIFACTORY_TOKEN?}`. The `${VAR?}` form keeps
+  npm working while the variable holds no value yet, and npm and bun resolve
+  private packages once the board carries the value.
+
+The image build still pulls from the public registries: `Dockerfile.worker` takes
+no mirror config and no registry credentials, so a mirror applies to the turns'
+installs only. The image carries no JDK and no Maven; it carries `python3` and
+`python3-venv`, so pip is already there. A Java project lists its toolchain in
+`workers/<project>/apt.txt`, for example:
+
+    openjdk-21-jdk-headless
+    maven
+
 ## Env settings
 
 - Server: `OTTR_WORKER_URLS` (comma-separated, e.g.
