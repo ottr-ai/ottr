@@ -13778,6 +13778,7 @@ describe("omp stats dashboard proxy (docs/specs/omp-stats-dashboard.md)", () => 
 			workCheck: true,
 			idleReviews: true,
 			trendingScan: true,
+			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
