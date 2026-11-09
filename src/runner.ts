@@ -430,11 +430,12 @@ export function deathLine(stderr: string): string | undefined {
 
 /** True when the run stopped at the provider's usage or quota limit: a retry before the
  * reset fails the same way. Covers omp's usage_limit_reached, the human "usage limit"
- * wording, and the gateways' "quota exhausted" / "quota exceeded" / "no quota" /
- * insufficient_quota forms. Rate limits stay out: they clear in seconds, so an immediate
- * retry is right for them. Shared with the check runs' hold logic in turn.ts. */
+ * wording, the gateways' "quota exhausted" / "quota exceeded" / "no quota" /
+ * insufficient_quota forms, and ZAI's "Weekly/Monthly Limit Exhausted" (OTTR-670). Rate
+ * limits stay out: they clear in seconds, so an immediate retry is right for them. Shared
+ * with the check runs' hold logic in turn.ts. */
 export function hitUsageLimit(r: RunResult): boolean {
-	return /usage_limit_reached|usage limit|quota exhausted|quota exceeded|no quota|insufficient_quota/i.test(
+	return /usage_limit_reached|usage limit|limit exhausted|quota exhausted|quota exceeded|no quota|insufficient_quota/i.test(
 		`${r.stderrTail}\n${r.providerError ?? ""}`,
 	);
 }

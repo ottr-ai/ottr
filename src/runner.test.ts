@@ -888,9 +888,25 @@ describe("hitUsageLimit", () => {
 				result({ providerError: "quota exceeded for this project" }),
 			),
 		).toBe(true);
+		expect(
+			hitUsageLimit(
+				result({
+					providerError:
+						'429 {"type":"error","error":{"type":"rate_limit_error","code":"1310","message":"[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-11-10 19:51:43]"}}',
+				}),
+			),
+		).toBe(true);
 	});
 
 	test("leaves rate limits and ordinary deaths to the generic rules", () => {
+		expect(
+			hitUsageLimit(
+				result({
+					providerError:
+						'429 {"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}',
+				}),
+			),
+		).toBe(false);
 		expect(hitUsageLimit(result({ stderrTail: "boom\n" }))).toBe(false);
 		expect(
 			hitUsageLimit(
@@ -2597,7 +2613,7 @@ describe("startRun", () => {
 					role: "assistant",
 					stopReason: "error",
 					errorMessage: [
-						"429 Weekly/Monthly Limit Exhausted.",
+						"500 upstream connect error.",
 						`Authorization: Bearer ${hidden}`,
 						`password="${hidden} \\"private-fragment\\""`,
 						`https://${hidden}:${hidden}@example.invalid/?token=${hidden}`,
@@ -2620,12 +2636,12 @@ describe("startRun", () => {
 				images: 1,
 			});
 			expect(next.state).toBe("needs_you");
-			expect(next.needsReason).toContain("429 Weekly/Monthly Limit Exhausted");
+			expect(next.needsReason).toContain("500 upstream connect error");
 			expect(next.needsReason).not.toContain("test-only-value");
 			expect(next.needsReason).not.toContain("private-fragment");
 			expect(next.needsReason).not.toContain(stored);
 			const log = readFileSync(logPath, "utf8");
-			expect(log).toContain("429 Weekly/Monthly Limit Exhausted");
+			expect(log).toContain("500 upstream connect error");
 			expect(log).not.toContain("test-only-value");
 			expect(log).not.toContain("private-fragment");
 			expect(next.quarantineImages).toBeUndefined();

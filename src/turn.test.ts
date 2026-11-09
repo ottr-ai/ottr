@@ -11099,6 +11099,41 @@ describe("review findings check", () => {
 			),
 		).toBe("the check run exited with code 1: Main: omp --resume abc");
 	});
+
+	test("checkRunError shows the provider's error when stderr names no cause (OTTR-670)", () => {
+		expect(
+			checkRunError(
+				runResult({
+					exitCode: 1,
+					stderrTail: "",
+					providerError: "500 upstream\nconnect error",
+				}),
+			),
+		).toBe("the check run exited with code 1: 500 upstream connect error");
+		const long = checkRunError(
+			runResult({
+				exitCode: 1,
+				providerError: `overloaded ${"x".repeat(900)}`,
+			}),
+		);
+		expect(long).toStartWith("the check run exited with code 1: overloaded x");
+		expect(long?.length).toBeLessThan(400);
+		expect(
+			checkRunError(
+				runResult({
+					exitCode: 1,
+					stderrTail: "error: boom\n",
+					providerError: "500 upstream",
+				}),
+			),
+		).toBe("the check run exited with code 1: boom");
+		const zai = runResult({
+			exitCode: 1,
+			providerError:
+				'429 {"type":"error","error":{"type":"rate_limit_error","code":"1310","message":"[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-11-10 19:51:43]"}}',
+		});
+		expect(checkRunError(zai)).toMatch(/provider usage limit is reached/);
+	});
 });
 
 describe("work card check", () => {

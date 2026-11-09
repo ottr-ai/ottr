@@ -723,13 +723,17 @@ export function appendLog(store: ProjectStore, id: string, line: string): void {
 	notifyHook(store.name, id);
 }
 
+/** Longest provider error a check failure message shows; a gateway can return a whole JSON body. */
+const PROVIDER_ERROR_MAX = 300;
+
 /** Why a review check run failed and must retry, else null: a stopped run, a non-zero exit, or
  * one that ended without a final message to parse. The stderr cause comes from deathLine, so
- * omp's recovery hints lose to the error line. Verdict JSON problems surface in runTurn. */
+ * omp's recovery hints lose to the error line; with no stderr line, the provider's redacted
+ * error (OTTR-670), cut to one line. Verdict JSON problems surface in runTurn. */
 export function checkRunError(r: RunResult): string | null {
 	if (r.killed) return "the check run was stopped";
 	if (r.exitCode !== 0) {
-		const last = deathLine(r.stderrTail) ?? "";
+		const last = deathLine(r.stderrTail) ?? oneLine(r.providerError ?? "");
 		const provider = /^No API key found for (.+)$/.exec(last)?.[1];
 		if (provider)
 			return `the check run exited with code ${r.exitCode}: ${provider} has no usable sign-in. Sign in again under Settings, then reply to re-run the check`;
@@ -740,6 +744,13 @@ export function checkRunError(r: RunResult): string | null {
 	if (r.finalText.trim() === "")
 		return "the check run ended without a final message";
 	return null;
+}
+
+function oneLine(text: string): string {
+	const line = text.replace(/\s+/g, " ").trim();
+	return line.length > PROVIDER_ERROR_MAX
+		? `${line.slice(0, PROVIDER_ERROR_MAX - 1)}…`
+		: line;
 }
 
 /** The queued write that holds a check run until its provider's usage limit resets. */
