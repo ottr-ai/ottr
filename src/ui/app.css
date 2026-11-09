@@ -3885,10 +3885,23 @@ a.pr-link:hover {
 	margin: 0;
 	min-inline-size: 0;
 }
-/* Only the caption is small: the segmented strip keeps the input type size, so the row's controls share one height. */
+/* In the drawer's triage row the strip takes its own line when the row is too
+   narrow for both controls (five whole labels need ~340px); the follow-up CTA
+   reuses the caption class without the growth. */
+.triage-row > .triage-rank {
+	flex: 1 1 340px;
+	min-width: 0;
+}
 .triage-rank > span {
 	font-size: 13px;
 	color: var(--dim);
+	white-space: nowrap;
+}
+/* One caption slot for both wrapped rows, so the strip and the close-reason
+   field start at the same x. */
+.triage-row > .triage-rank > span,
+.triage-row .triage-nominate > label > span {
+	flex: 0 0 92px;
 }
 /* Drawer triage rank (DESIGN.md, Segmented controls): five peer choices, every
    segment the same width. The stock button grey carries the press state —
@@ -3896,6 +3909,7 @@ a.pr-link:hover {
    strip too tight for all five scrolls instead of shrinking or cutting one. */
 .rank-seg {
 	display: flex;
+	flex: 1 1 0; /* fills the rank block the wrap layout gives it */
 	gap: 2px;
 	min-width: 0;
 	overflow-x: auto;
@@ -3916,7 +3930,9 @@ a.pr-link:hover {
 }
 .triage-nominate {
 	display: inline-flex;
-	flex: 1;
+	/* Natural width of caption, field and button: below it the form wraps to
+	   its own line instead of squeezing the field shut. */
+	flex: 1 1 420px;
 	min-width: 220px;
 	gap: 6px;
 }

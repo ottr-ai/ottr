@@ -8510,8 +8510,9 @@ export function Drawer({
 			return false;
 		}
 	};
-	// The rank select leads: the picked value shows at once, the triage POST follows,
-	// a failure rolls the select back and lands in the inline alert (onError).
+	// The rank strip leads: the picked segment presses at once, the triage POST
+	// follows, a failure rolls the strip back and lands in the inline alert
+	// (onError).
 	const rank = useOptimisticValue(task.priority ?? "", act);
 	const triageUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/triage`;
 	const setRank = (p: string): void => {
