@@ -36,7 +36,7 @@ Ottr is mainly built with Ottr itself.
 
 Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch.
 
-Before a card enters the merge queue, a second memory-less model checks it (optional, **Settings**): it reads the card, the diff and the transcript, and hunts for test tampering, fabricated actions, unmet acceptance items, logic errors and security flaws. A blocker must quote the diff or transcript; at most two send-backs. After the third block, the card asks you with two buttons: **Send it back** or **Merge anyway**.
+Before a card enters the merge queue, a second memory-less model checks it (optional, **Settings**): it reads the card, the diff and the transcript, and hunts for test tampering, fabricated actions, unmet acceptance items, logic errors and security flaws. A blocker must quote the diff or transcript; at most four send-backs. After the fifth block, the card asks you with two buttons: **Send it back** or **Merge anyway**.
 
 A **research** task answers a question instead of changing code: the agent writes a report that Ottr archives on the card. Research cards end `answered` and never merge. A starred done research card shows a star in place of the done check, and the star icon in its drawer pins the report in the done lane's **Starred** section, so you can find it again. The **Implement steps** button on a research report that recommends steps starts a follow-up task that implements the recommended steps of the report. That task files a separate card for each independent piece of work.
 

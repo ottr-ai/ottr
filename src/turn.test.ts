@@ -39,6 +39,7 @@ import {
 	RULES_INTERVIEW_MARKER,
 	replyPrompt,
 	restartResumePrompt,
+	WORK_CHECK_MAX_SENDBACKS,
 } from "./prompts.ts";
 import { hitUsageLimit, WORKER_LOST } from "./runner.ts";
 import {
@@ -11478,11 +11479,13 @@ describe("work card check", () => {
 		expect(after.workCheckLog[1]!.outcome).toBe("pass");
 	});
 
-	test("a third blocking check parks the card on needs_you with the findings", async () => {
+	test("a fifth blocking check parks the card on needs_you with the findings", async () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = workCheckCase(
 			head,
 			[
+				block("tests were weakened", "const x = 1;"),
+				block("scope creep", "also touched README"),
 				block("tests were weakened", "const x = 1;"),
 				block("scope creep", "also touched README"),
 				runResult({
@@ -11513,16 +11516,28 @@ describe("work card check", () => {
 
 		head.sha = "sha3";
 		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(3);
+
+		head.sha = "sha4";
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
+			WORK_CHECK_MAX_SENDBACKS,
+		);
+
+		head.sha = "sha5";
+		await loop.runTurn(store.name, task.id);
 
 		const after = store.getTask(task.id)!;
-		expect(record.runs).toHaveLength(6); // three work runs, three checks
+		expect(record.runs).toHaveLength(10); // five work runs, five checks
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toContain("a third time");
+		expect(after.needsReason).toContain(
+			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
+		);
 		expect(after.needsReason).toContain("scope creep");
 		const longFinding = "long finding ".repeat(40).trim() + " end";
 		expect(after.needsReason).toContain(longFinding);
-		expect(after.workCheckHead).toBe("sha3");
+		expect(after.workCheckHead).toBe("sha5");
 		// The user gets clickable choices, not only a reason text.
 		expect(after.asked![0]!.question).toContain("scope creep");
 		expect(after.asked![0]!.options.map((o) => o.label)).toEqual([
@@ -11547,7 +11562,7 @@ describe("work card check", () => {
 		expect(after.workCheckLog).toEqual([]);
 	});
 
-	test("a re-ready at an unchanged head with open blockers resends them, and the third block parks", async () => {
+	test("a re-ready at an unchanged head with open blockers resends them, and the fifth block parks", async () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = workCheckCase(
 			head,
@@ -11567,13 +11582,23 @@ describe("work card check", () => {
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 
-		// A third resend at the same head hits the cap: needs_you.
+		// Resends three and four add one work run each.
 		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(4);
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(5);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
+			WORK_CHECK_MAX_SENDBACKS,
+		);
+
+		// A fifth resend at the same head hits the cap: needs_you.
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(6);
 		const parked = store.getTask(task.id)!;
 		expect(parked.state).toBe("needs_you");
-		expect(parked.needsReason).toContain("a third time");
-		expect(parked.workCheckSendbacks).toBe(2);
+		expect(parked.needsReason).toContain(
+			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
+		);
+		expect(parked.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS);
 	});
 
 	test("a human reply at an unchanged head reruns the check with the reply in its input", async () => {
@@ -16616,7 +16641,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(prompt).not.toContain("const x = 1;\nconst y = 2;");
 	});
 
-	test("a blocker sent back names attempt 1 of 2 in the prompt and the log", async () => {
+	test("a blocker sent back names attempt 1 of the cap in the prompt and the log", async () => {
 		const { store, loop } = checkCase([
 			verdict({ blockers: [{ finding: "weak tests", quote: "const x = 1;" }] }),
 		]);
@@ -16626,14 +16651,14 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.pendingPrompt).toContain(
-			"Send-back 1 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again",
+			`Send-back 1 of ${WORK_CHECK_MAX_SENDBACKS}: while fewer than ${WORK_CHECK_MAX_SENDBACKS} send-backs have run, a failing next check sends the card back again`,
 		);
 		expect(logText(store, task.id)).toContain(
-			"sent back to the work agent (1 of 2)",
+			`sent back to the work agent (1 of ${WORK_CHECK_MAX_SENDBACKS})`,
 		);
 	});
 
-	test("the third block numbers every finding in the needs_you reason", async () => {
+	test("the fifth block numbers every finding in the needs_you reason", async () => {
 		const { store, loop } = checkCase(
 			[
 				verdict({
@@ -16646,7 +16671,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 			{ diffText: async () => "const x = 1;\nconst y = 2;\n" },
 		);
 		const task = store.createTask("work please");
-		store.updateTask(task.id, { workCheckSendbacks: 2 });
+		store.updateTask(task.id, { workCheckSendbacks: WORK_CHECK_MAX_SENDBACKS });
 		await loop.runTurn(store.name, task.id);
 
 		const after = store.getTask(task.id)!;

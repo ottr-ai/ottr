@@ -343,7 +343,7 @@ export const WORK_CHECK_SENDBACK_OPENING =
 
 /** Send-backs the tracker sends on its own; after this many, every failing check asks the user
  * (turn.ts) and a "Send it back" answer (app.ts) sends one more. */
-export const WORK_CHECK_MAX_SENDBACKS = 2;
+export const WORK_CHECK_MAX_SENDBACKS = 4;
 
 /** The blockers a work check found, sent back to the work agent as a reply in its own session;
  * runTurn wraps this with the standard reply rules (rename, no destruction, outcomes). */

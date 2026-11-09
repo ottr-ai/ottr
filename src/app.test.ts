@@ -59,6 +59,7 @@ import {
 	RELEASE_SUMMARY_INSTRUCTIONS,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
+	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { PR_GATES } from "./prs.ts";
@@ -69,7 +70,7 @@ import {
 	pickRunnable,
 	type ReviewTask,
 	SILENT_LOG_MS,
-	WORK_CHECK_THIRD_BLOCK,
+	WORK_CHECK_ASK_BLOCK,
 	workCheckAsk,
 } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
@@ -6695,14 +6696,14 @@ describe("merge anyway (OTTR-28)", () => {
 		const t = inProgress([blockersRun()]);
 		store.updateTask(t.id, {
 			state: "needs_you",
-			needsReason: `${WORK_CHECK_THIRD_BLOCK}: 1. still open.`,
+			needsReason: `${WORK_CHECK_ASK_BLOCK}: 1. still open.`,
 			asked: workCheckAsk([{ finding: "still open", quote: "q1" }]),
-			workCheckSendbacks: 2,
+			workCheckSendbacks: WORK_CHECK_MAX_SENDBACKS,
 		});
 		return t;
 	};
 
-	test("the third block's Merge anyway answer overrides the blockers and queues the merge", async () => {
+	test("the fifth block's Merge anyway answer overrides the blockers and queues the merge", async () => {
 		const t = parked();
 		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
 			text: "Merge anyway",
@@ -6716,7 +6717,7 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.workCheckLog[0]!.blockers[0]!.status).toBe("overridden");
 	});
 
-	test("the third block's Send it back answer resends the open blockers to the agent", async () => {
+	test("the fifth block's Send it back answer resends the open blockers to the agent", async () => {
 		const t = parked();
 		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
 			text: "Send it back",
@@ -6726,12 +6727,12 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.stage).toBe("in_progress");
 		expect(row.state).toBe("queued");
 		expect(row.asked).toBeNull();
-		expect(row.workCheckSendbacks).toBe(3);
+		expect(row.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS + 1);
 		// A tracker send-back, so the next check does not count it as a human reply.
 		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
 		// The denominator stays the tracker's cap, and the contract names the ask, not a park.
 		expect(row.pendingPrompt).toContain(
-			"Send-back 3 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again; after 2 of them, the tracker asks the user before another send-back.",
+			`Send-back ${WORK_CHECK_MAX_SENDBACKS + 1} of ${WORK_CHECK_MAX_SENDBACKS}: while fewer than ${WORK_CHECK_MAX_SENDBACKS} send-backs have run, a failing next check sends the card back again; after ${WORK_CHECK_MAX_SENDBACKS} of them, the tracker asks the user before another send-back.`,
 		);
 		expect(row.pendingPrompt).not.toContain("goes to needs_you");
 		expect(row.pendingPrompt).toContain("still open");

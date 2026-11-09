@@ -254,9 +254,9 @@ import {
 	reviewBlocked,
 	reviewFindings,
 	silentSince,
+	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_SEND_BACK,
-	WORK_CHECK_THIRD_BLOCK,
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
 import { derivedTaskPrefix, ProjectStore } from "./store.ts";
@@ -7652,12 +7652,12 @@ export function createApp(deps: AppDeps) {
 						(trimmed === "" && decoded.images.length === 0)
 					)
 						return json({ error: "text must be 1-20000 characters" }, 400);
-					// A click on the third work-check block's ask: the send-back or the merge, done here.
-					// Any other text, or a picture, is a plain reply to the agent below.
+					// A click on the cap-exceeded work-check block's ask: the send-back or the
+					// merge, done here. Any other text, or a picture, is a plain reply to the agent below.
 					const open = openWorkBlockers(task.workCheckLog);
 					if (
 						task.asked !== null &&
-						task.needsReason?.startsWith(WORK_CHECK_THIRD_BLOCK) === true &&
+						task.needsReason?.startsWith(WORK_CHECK_ASK_BLOCK) === true &&
 						open.length > 0 &&
 						decoded.images.length === 0
 					) {
@@ -7666,7 +7666,7 @@ export function createApp(deps: AppDeps) {
 								task.id,
 								mergeAnywayPatch(
 									task,
-									"Merge anyway, chosen in the ask after the third work-check block",
+									"Merge anyway, chosen in the work-check ask",
 								),
 							);
 							deps.schedule();

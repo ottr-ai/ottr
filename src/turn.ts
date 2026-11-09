@@ -93,7 +93,7 @@ import {
 	pickRunnable,
 	reviewFindings,
 	selectFindings,
-	WORK_CHECK_THIRD_BLOCK,
+	WORK_CHECK_ASK_BLOCK,
 	workCheckAsk,
 } from "./scheduler.ts";
 import {
@@ -4516,7 +4516,7 @@ export function createTurnLoop(
 							store.updateTask(id, {
 								stage: "in_progress",
 								state: "needs_you",
-								needsReason: `${WORK_CHECK_THIRD_BLOCK}: ${blockers
+								needsReason: `${WORK_CHECK_ASK_BLOCK}: ${blockers
 									.map((b, i) => `${i + 1}. ${b.finding}`)
 									.join(
 										" ",

@@ -1,5 +1,6 @@
 import { statSync } from "node:fs";
 import { splitLevel } from "./levels.ts";
+import { WORK_CHECK_MAX_SENDBACKS } from "./prompts.ts";
 import type {
 	ArchReview,
 	AskQuestion,
@@ -789,21 +790,21 @@ export function openWorkBlockers(
 	return [];
 }
 
-/** Opening of the needs_you reason a third work-check block sets; the reply route reads the
- * ask answers below only on a card parked with it. */
-export const WORK_CHECK_THIRD_BLOCK =
-	"The work check blocked the merge a third time";
+/** Opening of the needs_you reason the work-check block at the send-back cap sets; the reply
+ * route reads the ask answers below only on a card parked with it. The count derives from
+ * WORK_CHECK_MAX_SENDBACKS so the wording cannot drift from the cap. */
+export const WORK_CHECK_ASK_BLOCK = `The work check blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`;
 export const WORK_CHECK_ASK_SEND_BACK = "Send it back";
 export const WORK_CHECK_ASK_MERGE = "Merge anyway";
 
-/** The clickable question a third work-check block puts on the card. The reply route turns a
- * click into the send-back or the merge; any other text is a plain reply to the agent. */
+/** The clickable question the cap-exceeded work-check block puts on the card. The reply route
+ * turns a click into the send-back or the merge; any other text is a plain reply to the agent. */
 export function workCheckAsk(
 	blockers: readonly WorkCheckBlocker[],
 ): AskQuestion[] {
 	return [
 		{
-			question: `${WORK_CHECK_THIRD_BLOCK}: ${blockers.map((b, i) => `${i + 1}. ${b.finding}`).join(" ")}. How do you want to continue?`,
+			question: `${WORK_CHECK_ASK_BLOCK}: ${blockers.map((b, i) => `${i + 1}. ${b.finding}`).join(" ")}. How do you want to continue?`,
 			options: [
 				{
 					label: WORK_CHECK_ASK_SEND_BACK,
@@ -843,7 +844,7 @@ export function overrideWorkBlockers(
 }
 
 /** Merge anyway: the user's override of the open work-check blockers, with `reason` on each,
- * then the merge queue. Shared by the Merge anyway button and the third block's ask. */
+ * then the merge queue. Shared by the Merge anyway button and the work-check ask. */
 export function mergeAnywayPatch(
 	task: Pick<Task, "workCheckLog">,
 	reason: string,
