@@ -365,6 +365,8 @@ describe("openPrsView", () => {
 		head: "a".repeat(40),
 		draft,
 		title: `pr ${number}`,
+		headRepoId: null,
+		headRef: null,
 	});
 
 	test("zero pulls gives an empty view", () => {
