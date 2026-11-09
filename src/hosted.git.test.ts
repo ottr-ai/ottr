@@ -442,6 +442,7 @@ function board(
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,

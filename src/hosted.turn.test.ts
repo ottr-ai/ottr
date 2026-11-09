@@ -155,6 +155,7 @@ function fakeProject(store: ProjectStore): TurnProject {
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
