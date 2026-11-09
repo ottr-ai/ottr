@@ -11747,8 +11747,8 @@ export function App() {
 			onOnline: () => setOffline(false),
 			// A dead socket cannot show the HTTP status, so live mode asks once per drop: an
 			// expired or revoked session lands on the login page instead of an endless
-			// "Retrying…". Polling already carries the failed /api/state's status here,
-			// so it never refetches.
+			// "Retrying…". Polling always carries the failed /api/state's status here —
+			// 0 on a transport failure, which cannot be a session loss — so it never refetches.
 			onOffline: (status?: number) => {
 				setOffline(true);
 				if (status !== undefined) {

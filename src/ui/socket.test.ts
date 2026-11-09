@@ -352,7 +352,7 @@ describe("connectLive", () => {
 		try {
 			const dispose = connectLive(makeHandlers().h);
 			refreshState();
-			for (let i = 0; i < 10; i++) await Promise.resolve();
+			for (let i = 0; i < 60; i++) await Promise.resolve();
 			expect(polled).toEqual([]);
 			dispose();
 		} finally {
@@ -473,17 +473,34 @@ describe("connectPolling", () => {
 		fetch: g.fetch,
 	};
 
-	/** Stub fetch keyed by URL path; handlers return a Response or a promise of one, or throw. */
+	/** Stub fetch keyed by URL path; handlers return a Response or a promise of one, or throw.
+	 * An aborted signal rejects the result even when the handler's promise never settles. */
 	let routes: Record<string, () => Response | Promise<Response>>;
 	const calls: string[] = [];
-	const fakeFetch = (input: string | URL | Request): Promise<Response> => {
+	const fakeFetch = (
+		input: string | URL | Request,
+		init?: RequestInit,
+	): Promise<Response> => {
 		const path = new URL(String(input), "http://poll.test").pathname;
 		calls.push(path);
 		const handler = routes[path];
 		try {
 			// Real fetch rejects instead of throwing, so a missing route rejects too.
 			if (!handler) throw new Error(`unexpected fetch: ${path}`);
-			return Promise.resolve(handler());
+			const result = Promise.resolve(handler());
+			const signal = init?.signal;
+			if (!signal) return result;
+			return new Promise<Response>((resolve, reject) => {
+				if (signal.aborted)
+					reject(new DOMException("The operation was aborted.", "AbortError"));
+				else
+					signal.addEventListener("abort", () =>
+						reject(
+							new DOMException("The operation was aborted.", "AbortError"),
+						),
+					);
+				result.then(resolve, reject);
+			});
 		} catch (e) {
 			return Promise.reject(e);
 		}
@@ -491,9 +508,10 @@ describe("connectPolling", () => {
 	const ok = (body: unknown): Response =>
 		new Response(JSON.stringify(body), { status: 200 });
 
-	/** Let the poll chain's microtasks settle; the queue drains fully on one yield. */
+	/** Let the poll chains settle: each Response.json() and the abort wiring take
+	 * several microtask rounds, so one yield is nowhere near enough. */
 	const drain = async (): Promise<void> => {
-		for (let i = 0; i < 10; i++) await Promise.resolve();
+		for (let i = 0; i < 40; i++) await Promise.resolve();
 	};
 
 	beforeEach(() => {
@@ -618,6 +636,9 @@ describe("connectPolling", () => {
 		advance(5000);
 		await drain();
 		expect(seen.offline).toBe(1);
+		// a rejected fetch has no HTTP status: the transport status 0 tells the App
+		// this cannot be a session loss, so it never probes /api/state again
+		expect(seen.offlineStatus).toBe(0);
 		expect(seen.online).toBe(1);
 		expect(seen.state).toEqual(STATE);
 		dispose();
@@ -635,7 +656,7 @@ describe("connectPolling", () => {
 		expect(calls).toEqual(["/api/state", "/api/system"]);
 	});
 
-	test("a tick during a slow poll marks dirty and runs one follow-up", async () => {
+	test("a refresh during a slow poll marks dirty and runs one follow-up", async () => {
 		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
 		routes["/api/state"] = async () => {
 			await gate;
@@ -651,8 +672,8 @@ describe("connectPolling", () => {
 		expect(calls.filter((p) => p === "/api/system").length).toBe(1);
 		expect(seen.online).toBe(0);
 
-		// The 5 s tick during the flight is guarded: no overlapping request.
-		advance(5000);
+		// A mutation-driven refresh during the flight is guarded: no overlapping request.
+		refreshState();
 		await drain();
 		expect(states()).toBe(1);
 		expect(calls.filter((p) => p === "/api/system").length).toBe(1);
@@ -669,6 +690,34 @@ describe("connectPolling", () => {
 		advance(1);
 		await drain();
 		expect(states()).toBe(3);
+		dispose();
+	});
+
+	test("a poll that never settles aborts, goes offline, and recovers", async () => {
+		let hang = true;
+		routes["/api/state"] = () => {
+			// The server accepted the connection but never answers.
+			if (hang) return new Promise<Response>(() => {});
+			return ok(STATE);
+		};
+		routes["/api/system"] = () => ok(SYSTEM);
+		const { h, seen } = makeHandlers();
+		const dispose = connectPolling(h);
+		await drain();
+		const states = (): number => calls.filter((p) => p === "/api/state").length;
+		expect(states()).toBe(1);
+		expect(seen.offline).toBe(0);
+
+		// POLL_MS aborts the hung flight; the same mark's tick only sets dirty.
+		// The aborted flight reports offline with the transport status 0, and the
+		// follow-up its settle schedules sends a fresh request, which recovers.
+		advance(5000);
+		hang = false; // the follow-up's own request gets a real answer
+		await drain();
+		expect(seen.offline).toBe(1);
+		expect(seen.offlineStatus).toBe(0);
+		expect(states()).toBe(2);
+		expect(seen.online).toBe(1);
 		dispose();
 	});
 

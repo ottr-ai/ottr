@@ -10,7 +10,8 @@ interface LiveHandlers {
 	onState(state: StateResponse): void;
 	onUpdate(behind: number, commits: string[]): void;
 	onOnline(): void;
-	/** `status` rides when the caller knows it (the poll's failed /api/state); a dead socket passes none. */
+	/** `status` rides when the caller knows it: the poll's failed /api/state passes the
+	 * response status, or 0 on a transport failure (never a session loss); a dead socket passes none. */
 	onOffline(status?: number): void;
 }
 
@@ -225,6 +226,8 @@ export function connectPolling(h: LiveHandlers): () => void {
 
 	let inFlight = false;
 	let dirty = false;
+	let flight: AbortController | null = null;
+	let abortTimer: ReturnType<typeof setTimeout> | undefined;
 	const poll = (): void => {
 		if (disposed) return;
 		// Overlap guard: a tick or a mutation-driven refresh during a running poll only
@@ -234,9 +237,15 @@ export function connectPolling(h: LiveHandlers): () => void {
 			return;
 		}
 		inFlight = true;
+		// The guard holds every later tick, so a flight that never settles would stall
+		// the board forever (a browser fetch has no default timeout). Abort the flight
+		// after POLL_MS — a localhost poll outliving the cadence means a dead server —
+		// and let its rejection report offline; the same mark's tick then re-polls.
+		flight = new AbortController();
+		const { signal } = flight;
 		// State and system ride in parallel: the system snapshot no longer waits for
 		// the state response, and a failed state poll never skips it.
-		const stateReq = fetch("/api/state")
+		const stateReq = fetch("/api/state", { signal })
 			.then(async (r) => {
 				if (!r.ok) {
 					// The failed /api/state carries its status, so onOffline can gate on it
@@ -251,8 +260,11 @@ export function connectPolling(h: LiveHandlers): () => void {
 				h.onOnline();
 				liveEvents.dispatchEvent(new Event("open"));
 			})
-			.catch(() => h.onOffline());
-		const systemReq = fetch("/api/system")
+			// Transport failure (network error, abort, bad JSON, a throw in a handler):
+			// no HTTP status exists. Status 0 tells the App this cannot be a session
+			// loss, so it reports the banner without probing /api/state again.
+			.catch(() => h.onOffline(0));
+		const systemReq = fetch("/api/system", { signal })
 			.then(async (sr) => {
 				if (!sr.ok) return;
 				const system = (await sr.json()) as SystemSnapshot;
@@ -262,10 +274,12 @@ export function connectPolling(h: LiveHandlers): () => void {
 			.catch(() => {});
 		void Promise.all([stateReq, systemReq]).then(() => {
 			inFlight = false;
+			clearTimeout(abortTimer);
 			if (disposed || !dirty) return;
 			dirty = false;
 			poll();
 		});
+		abortTimer = setTimeout(() => flight?.abort(), POLL_MS);
 		// Reschedule at call time: the cadence stays fixed even when a response is slow.
 		pollTimer = setTimeout(poll, POLL_MS);
 	};
@@ -301,6 +315,9 @@ export function connectPolling(h: LiveHandlers): () => void {
 		disposed = true;
 		pollNow = null;
 		clearTimeout(pollTimer);
+		// Without this, a later abort would reject the abandoned fetch and fire
+		// onOffline after dispose.
+		clearTimeout(abortTimer);
 		clearTimeout(updateTimer);
 	};
 }

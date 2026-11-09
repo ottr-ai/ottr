@@ -702,6 +702,67 @@ test("boot requests /api/state once, with /api/system alongside it", async () =>
 	}
 });
 
+/** Mounts App without waiting for the board: a failed poll never finishes loading it. */
+async function mountRaw(path: string): Promise<void> {
+	window.history.replaceState(null, "", path);
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	await act(async () => {
+		root?.render(<App />);
+	});
+}
+
+test("a 401 poll gates the board without a second /api/state fetch", async () => {
+	const realFetch = host.fetch;
+	const stateCalls: string[] = [];
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state") {
+			stateCalls.push("/api/state");
+			return new Response("{}", { status: 401 });
+		}
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountRaw("/projects/alpha");
+		// The poll's own status gates the board: no boot probe, no offline probe.
+		await waitFor(() => document.querySelector("main.main") === null);
+		expect(stateCalls).toEqual(["/api/state"]);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("a failed state poll shows the offline banner without a second probe", async () => {
+	const realFetch = host.fetch;
+	const stateCalls: string[] = [];
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state") {
+			stateCalls.push("/api/state");
+			throw new TypeError("network down");
+		}
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountRaw("/projects/alpha");
+		// The transport failure carries status 0, which cannot be a session loss:
+		// the banner shows and no probe fetch runs.
+		await waitFor(() =>
+			document.body.textContent!.includes("Server connection lost. Retrying…"),
+		);
+		expect(document.querySelector("main.main")).not.toBeNull();
+		expect(stateCalls).toEqual(["/api/state"]);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
 /** Swaps the global interval functions for recording fakes and returns the restore pair. */
 function fakeIntervals(): {
 	ticks: Array<() => void>;
