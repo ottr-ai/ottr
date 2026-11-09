@@ -30,6 +30,9 @@
 	--on-alarm: #14181d; /* ink on a solid amber fill */
 	--on-crit: #1d0d0c; /* ink on a solid red fill */
 	--on-grey: #14181d; /* ink on a solid grey fill: status you cannot click */
+	--mark-ink: #1c1e21; /* dark "!" ink strokes on the state marks; fixed across themes */
+	--mark-ink-crit: #fff4f2; /* the ink flips near-white on the red square */
+	--on-scrim: #faf9f6; /* text over a dark image scrim: the lightbox */
 	--diff-add: #7cc97f; /* added diff lines: the one non-alarm colour, diff text only */
 	--diff-add-bg: rgb(63 138 66 / 0.16);
 	--line-hover: #5a616a;
@@ -74,7 +77,10 @@
 	--crit-text: #b3261e;
 	--on-alarm: #faf9f6;
 	--on-crit: #faf9f6;
-	--on-grey: #14181d; /* ink on a solid grey fill: status you cannot click */
+	--on-grey: #14181d;
+	--mark-ink: #1c1e21;
+	--mark-ink-crit: #fff4f2;
+	--on-scrim: #faf9f6;
 	--diff-add: #1a7f37;
 	--diff-add-bg: rgb(52 153 77 / 0.14);
 	--scrim: rgba(30, 34, 40, 0.4);
@@ -554,12 +560,12 @@ textarea {
 }
 .mark-ink {
 	fill: none;
-	stroke: #1c1e21;
+	stroke: var(--mark-ink);
 	stroke-width: 1.9;
 	stroke-linecap: round;
 }
 .mark-crit .mark-ink {
-	stroke: #fff4f2;
+	stroke: var(--mark-ink-crit);
 }
 .mark-running,
 .mark-preparing {
@@ -4101,7 +4107,7 @@ dialog.lightbox {
 	border: 0;
 	border-radius: 50%;
 	background: rgb(1 0 19 / 0.55);
-	color: #faf9f6;
+	color: var(--on-scrim);
 	cursor: pointer;
 }
 .lightbox .page {
@@ -4143,7 +4149,7 @@ dialog.lightbox {
 	padding: 4px 10px;
 	border-radius: 4px;
 	background: rgb(1 0 19 / 0.7);
-	color: #faf9f6;
+	color: var(--on-scrim);
 	font-size: 13px;
 	overflow-wrap: anywhere;
 	text-align: center;
@@ -6669,10 +6675,12 @@ button.log-mode[aria-pressed="true"] {
 	background: var(--card);
 	border-color: var(--line);
 }
-/* Markdown prose: results, research reports, release notes. */
+/* Markdown prose: results, research reports, release notes. The measure stops at
+   75ch, because a long line is hard to read (DESIGN.md "Typography"). */
 .md {
 	display: grid;
 	gap: 8px;
+	max-width: 75ch;
 	overflow-wrap: anywhere;
 }
 .md h1,

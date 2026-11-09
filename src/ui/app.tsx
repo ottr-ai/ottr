@@ -143,6 +143,7 @@ import {
 	saveComposeDraft,
 	seenToDrop,
 } from "./notify.ts";
+import { fmtNum } from "./numbers.ts";
 import {
 	autoMarkOnOpen,
 	donePage,
@@ -1318,8 +1319,10 @@ function eventCount(total: number | null, hour: number | null): ReactNode {
 	if (total === null) return "n/a";
 	return (
 		<>
-			{total}
-			{hour !== null && <span className="sys-sub"> +{hour} in 1 h</span>}
+			{fmtNum(total)}
+			{hour !== null && (
+				<span className="sys-sub"> +{fmtNum(hour)} in 1 h</span>
+			)}
 		</>
 	);
 }
@@ -3794,7 +3797,9 @@ export function ProjectBoard({
 							{c.key !== "done" && (
 								<>
 									<span className="tabs-digits">
-										{q === "" ? count.shown : `${count.shown}/${count.total}`}
+										{q === ""
+											? fmtNum(count.shown)
+											: `${fmtNum(count.shown)}/${fmtNum(count.total)}`}
 									</span>
 									{count.alarm !== null && (
 										<span
@@ -3959,8 +3964,8 @@ export function ProjectBoard({
 								)}
 								<span className={q === "" ? "count" : "count filtered"}>
 									{q === "" && doneHidden === 0
-										? col.length
-										: `${col.length}/${count.total}`}
+										? fmtNum(col.length)
+										: `${fmtNum(col.length)}/${fmtNum(count.total)}`}
 								</span>
 							</h2>
 							<LaneCol
@@ -7173,7 +7178,7 @@ function AskPanel({
 						onClick={send}
 					>
 						{locked && <span className="spinner" aria-hidden="true" />}
-						Send {count}/{asked.length} answers
+						Send {fmtNum(count)}/{fmtNum(asked.length)} answers
 					</button>
 				)}
 			</div>
@@ -8737,7 +8742,7 @@ export function Drawer({
 									<div>
 										<dt>Tested</dt>
 										<dd>
-											{mut.tested} / {mut.total}
+											{fmtNum(mut.tested)} / {fmtNum(mut.total)}
 										</dd>
 									</div>
 									{/* The tail's parts are known words (survived, elapsed, left, timed out); a part the format grows later keeps its raw text. */}
