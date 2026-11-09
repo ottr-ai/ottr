@@ -9,7 +9,7 @@ import {
 } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
 import { isProposalReason } from "./prompts.ts";
-import { listPulls } from "./prs.ts";
+import { listPulls, type PullInfo } from "./prs.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 import type { ProjectStore } from "./store.ts";
@@ -619,10 +619,10 @@ export function createForkWatcher(deps: {
 
 			const fresh = store.listAllForkBranches();
 			const isManual = manual !== undefined;
-			// Commits of a fork branch with an open PR into this repo arrive through that PR;
-			// porting them would duplicate it. Listed once per project, only when a fork has
+			// The commits of every open PR into this repo arrive through that PR; porting them
+			// would duplicate it, in any fork. Listed once per project, only when a fork has
 			// pending work.
-			let prHeads: Set<string> | null = null;
+			let pulls: PullInfo[] | null = null;
 			for (const fork of forks) {
 				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
 					deps.log(
@@ -635,23 +635,20 @@ export function createForkWatcher(deps: {
 					(r) => r.head !== null && r.head !== r.analyzedHead,
 				);
 				if (changed.length === 0) continue;
-				if (prHeads === null) {
+				if (pulls === null) {
 					try {
-						prHeads = new Set(
-							(await listPulls(repo, gh)).map(
-								(p) => `${p.headRepoId}:${p.headRef}`,
-							),
-						);
+						pulls = await listPulls(repo, gh);
 					} catch (e) {
 						deps.log(`forks: ${project.name}: ${(e as Error).message}`);
 						break;
 					}
 				}
-				const withPr = prHeads;
-				const prRows = rows.filter(
-					(r) => r.head !== null && withPr.has(`${fork.id}:${r.branch}`),
+				const prHeads = new Set(
+					pulls.map((p) => `${p.headRepoId}:${p.headRef}`),
 				);
-				const pending = changed.filter((r) => !prRows.includes(r));
+				const pending = changed.filter(
+					(r) => !prHeads.has(`${fork.id}:${r.branch}`),
+				);
 				if (pending.length === 0) continue;
 				const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
 				if (lastRun + FORK_GATES.FORK_RUN_SPACING_MS > now()) continue;
@@ -681,10 +678,24 @@ export function createForkWatcher(deps: {
 					// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
 					// out of workers' reach.
 					const cachePath = await ensureCache(store.serverDir, fork, runGit);
-					const refspecs = [...pending, ...prRows].map(
+					const refspecs = pending.map(
 						(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
 					);
 					await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
+					// PR heads come from the upstream repo's pull refs, so a PR from any fork (or a
+					// branch of the repo itself) is covered. Ref names use only the validated number.
+					if (pulls.length > 0) {
+						if (!REPO_RE.test(repo))
+							throw new Error(`invalid repo id: ${repo}`);
+						await fetchFork(
+							cachePath,
+							`${githubHost().webBase}/${repo}.git`,
+							pulls.map(
+								(p) => `+refs/pull/${p.number}/head:refs/heads/pr-${p.number}`,
+							),
+							runGit,
+						);
+					}
 					const range = await collectRange({
 						cachePath,
 						mainPath: project.path,
@@ -695,14 +706,10 @@ export function createForkWatcher(deps: {
 							head: r.head!,
 							analyzedHead: r.analyzedHead,
 						})),
-						exclude: prRows.map((r) => `refs/heads/${r.branchHash}`),
+						exclude: pulls.map((p) => `refs/heads/pr-${p.number}`),
 						git: runGit,
 					});
-					if (prRows.length > 0)
-						deps.log(
-							`forks: ${fork.owner}/${fork.name}: left out the commits of ${prRows.length} branch(es) with an open PR into ${repo}`,
-						);
-					if (range.commits.length === 0) {
+					if (range.commits.length === 0 && range.merges.length === 0) {
 						// Nothing new to analyze: move the cursors without a model call, a run
 						// record, or a fork pause, so later work is not held back.
 						for (const r of pending)

@@ -576,21 +576,56 @@ describe("watcher", () => {
 		expect(store.listTasks().length).toBe(0);
 	});
 
-	async function prWatcher(name: string, main: string, store: ProjectStore) {
+	/** Publishes `branch` of `forkDir` as the upstream pull ref of PR `n`, as GitHub does. */
+	async function openPr(
+		main: string,
+		forkDir: string,
+		branch: string,
+		n: number,
+	) {
+		await run(
+			[
+				"-c",
+				"protocol.file.allow=always",
+				"fetch",
+				"-q",
+				forkDir,
+				`+refs/heads/${branch}:refs/pull/${n}/head`,
+				main,
+			],
+			main,
+		);
+		return {
+			number: n,
+			state: "open",
+			draft: false,
+			title: "t",
+			head: { sha: await shaOf(forkDir, branch), ref: branch, repo: { id: 1 } },
+		};
+	}
+
+	/** Fork watcher whose GitHub URLs map to local fixture repos (`o/main` is the upstream). */
+	function prWatcher(
+		name: string,
+		main: string,
+		store: ProjectStore,
+		forks: Array<{ id: number; owner: string; dir: string }>,
+		pulls: unknown[],
+	) {
 		const state = {
-			pulls: [
-				{
-					number: 2,
-					state: "open",
-					draft: false,
-					title: "t",
-					head: { sha: "a".repeat(40), ref: "feat", repo: { id: 1 } },
-				},
-			] as unknown[],
+			pulls,
 			ghCalls: [] as string[],
 			subjects: [] as string[][],
+			merges: [] as number[],
 			logs: [] as string[],
 		};
+		const urls = new Map<string, string>([
+			["https://github.com/o/main.git", main],
+			...forks.map(
+				(f) =>
+					[`https://github.com/${f.owner}/r.git`, f.dir] as [string, string],
+			),
+		]);
 		const watcher = createForkWatcher({
 			projects: () => [{ name, path: main, store, github: "o/main" }],
 			log: (m) => state.logs.push(m),
@@ -599,12 +634,31 @@ describe("watcher", () => {
 				state.ghCalls.push(url);
 				const body = url.startsWith("repos/o/main/pulls")
 					? state.pulls
-					: [forkPageEntry(1)];
+					: forks.map((f) => ({
+							...forkPageEntry(f.id),
+							owner: { login: f.owner },
+						}));
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
-			git: localFileGit(join(root, `${name}-fork`)),
+			git: (args, cwd, timeoutMs) => {
+				const at = args.indexOf("fetch");
+				const mapped = args.map((a) => urls.get(a) ?? a);
+				return git(
+					at >= 0
+						? [
+								...mapped.slice(0, at),
+								"-c",
+								"protocol.file.allow=always",
+								...mapped.slice(at),
+							]
+						: mapped,
+					cwd,
+					timeoutMs,
+				);
+			},
 			analyze: async (range) => {
 				state.subjects.push(range.commits.map((c) => c.subject));
+				state.merges.push(range.merges.length);
 				return {
 					features: [],
 					proposals: [],
@@ -618,6 +672,13 @@ describe("watcher", () => {
 		return { watcher, state };
 	}
 
+	async function commitFile(dir: string, file: string, subject: string) {
+		// A real file change: empty commits share one patch id, so --cherry-pick would match them.
+		writeFileSync(join(dir, file), `${subject}\n`);
+		await run(["add", file, dir], dir);
+		await run(["commit", "-q", "-m", subject, dir], dir);
+	}
+
 	test("commits of an open PR branch stay out of the range, also on a child branch", async () => {
 		const name = "watch-pr-child";
 		const main = await initUpstream(name);
@@ -625,20 +686,51 @@ describe("watcher", () => {
 		store.setSettings({ forkResearch: true });
 		const forkDir = await makeFork(`${name}-fork`, main);
 		await run(["checkout", "-q", "-b", "independent", forkDir], forkDir);
-		// A real file change: empty commits share one patch id, so --cherry-pick would match them.
-		writeFileSync(join(forkDir, "own.txt"), "own\n");
-		await run(["add", "own.txt", forkDir], forkDir);
-		await run(["commit", "-m", "own work", forkDir], forkDir);
-		const { watcher, state } = await prWatcher(name, main, store);
+		await commitFile(forkDir, "own.txt", "own work");
+		const pr = await openPr(main, forkDir, "feat", 2);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
 		await watcher.tick();
 		expect(state.ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
 		expect(state.subjects).toEqual([["own work"]]);
-		expect(state.logs.some((m) => m.includes("open PR into o/main"))).toBe(
-			true,
-		);
 		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
 		expect(feat.analyzedHead).toBeNull();
 		expect(feat.retries).toBe(0);
+	});
+
+	test("commits of an open PR from one fork stay out of another fork's range", async () => {
+		const name = "watch-pr-cross";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkA = mkRepo(`${name}-a`);
+		await run(["clone", "-q", main, forkA], root);
+		await run(["checkout", "-q", "-b", "feat", forkA], forkA);
+		await commitFile(forkA, "pr.txt", "PR change");
+		const forkB = mkRepo(`${name}-b`);
+		await run(["clone", "-q", "-b", "feat", forkA, forkB], root);
+		await run(["checkout", "-q", "-b", "mix", forkB], forkB);
+		await commitFile(forkB, "other.txt", "Unrelated change");
+		await run(["branch", "-D", "feat", forkB], forkB);
+		const pr = await openPr(main, forkA, "feat", 2);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[
+				{ id: 1, owner: "a", dir: forkA },
+				{ id: 2, owner: "b", dir: forkB },
+			],
+			[pr],
+		);
+		await watcher.tick();
+		// Fork A only holds the PR and an unchanged main: nothing to analyze.
+		expect(state.subjects).toEqual([["Unrelated change"]]);
 	});
 
 	test("a range emptied by an open PR files nothing and does not pause the fork", async () => {
@@ -646,8 +738,15 @@ describe("watcher", () => {
 		const main = await initUpstream(name);
 		const store = ProjectStore.init(main);
 		store.setSettings({ forkResearch: true });
-		await makeFork(`${name}-fork`, main);
-		const { watcher, state } = await prWatcher(name, main, store);
+		const forkDir = await makeFork(`${name}-fork`, main);
+		const pr = await openPr(main, forkDir, "feat", 2);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
 		await watcher.tick();
 		// The fork's unchanged main is pending too, but it carries no new commit.
 		expect(state.subjects).toEqual([]);
@@ -661,6 +760,31 @@ describe("watcher", () => {
 		state.pulls = [];
 		await watcher.tick();
 		expect(state.subjects).toEqual([["fork feature"]]);
+	});
+
+	test("a merge-only range still reaches the analysis", async () => {
+		const name = "watch-merge-only";
+		const main = await initUpstream(name);
+		await commitFile(main, "up.txt", "upstream work");
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, forkDir], root);
+		await run(["checkout", "-q", "-b", "feat", "HEAD~1", forkDir], forkDir);
+		await run(
+			["merge", "-q", "--no-ff", "-m", "merge upstream", "main", forkDir],
+			forkDir,
+		);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[],
+		);
+		await watcher.tick();
+		expect(state.subjects).toEqual([[]]);
+		expect(state.merges).toEqual([1]);
 	});
 
 	test("a failed open-PR listing ports nothing", async () => {
