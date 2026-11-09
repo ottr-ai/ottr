@@ -19,12 +19,16 @@ import {
 import { join } from "node:path";
 import { hashPassword, newSecret } from "../src/auth.ts";
 import { GlobalStore } from "../src/globalStore.ts";
-import { ARCH_REVIEW_MARKER } from "../src/prompts.ts";
+import {
+	ARCH_REVIEW_MARKER,
+	proposedReason,
+	RETRO_MARKER,
+} from "../src/prompts.ts";
 import { ProjectStore } from "../src/store.ts";
 
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
-const POOL_VERSION = 5;
+const POOL_VERSION = 6;
 
 type Stage = "todo" | "in_progress" | "merging" | "done";
 type RunState = "queued" | "preparing" | "running" | "needs_you" | "idle";
@@ -56,6 +60,10 @@ export interface Spec {
 	release?: { version: string; notes: string };
 	/** Sets the trusted review kind on the card; the ARCH_REVIEW_MARKER prompt stays for realism. */
 	review?: boolean;
+	/** Sets the trusted retro kind: the prompt gets the "Retro of " marker and the id ends in "-retro". */
+	retro?: boolean;
+	/** Index of the retro card this pending proposal continues; seeds the proposal reason and lineage link. */
+	proposalOf?: number;
 }
 
 export interface ProjectSpec {
@@ -178,6 +186,24 @@ const POOL: ProjectSpec[] = [
 				work: 24,
 				merge: 3,
 				research: true,
+			},
+			{
+				title: "Retro of Fix the heatmap legend contrast the review flagged",
+				retro: true,
+				stage: "done",
+				state: "idle",
+				age: 1.5,
+				work: 11,
+				followUpOf: 10,
+			},
+			{
+				title: "Spot-check contrast on the dashboard palette",
+				prompt:
+					"Spot-check contrast on the dashboard palette in every shot run and fix any token that fails the ratio.",
+				stage: "todo",
+				state: "needs_you",
+				age: 1.4,
+				proposalOf: 12,
 			},
 		],
 	},
@@ -388,11 +414,15 @@ function askedJson(t: Spec): string | null {
 }
 
 function taskDoneAt(t: Spec, now: number): number | null {
-	if (t.stage !== "done" || t.merge === undefined) return null;
+	if (t.stage !== "done") return null;
+	// A retro settles right after its turn; it never integrates.
+	if (t.retro) return now - t.age * DAY + (t.work ?? 0) * MIN;
+	if (t.merge === undefined) return null;
 	return now - t.age * DAY + ((t.work ?? 0) + t.merge) * MIN;
 }
 
 function taskCommits(t: Spec, i: number): number | null {
+	if (t.retro) return null; // a retro files lessons, never commits
 	if (t.stage === "done") return 1 + (i % 3);
 	if (t.stage === "merging") return 1;
 	return null;
@@ -419,8 +449,13 @@ export function insertTaskRow(
 		.replaceAll(/[^A-Za-z0-9]/g, "")
 		.toUpperCase()
 		.slice(0, 4);
-	const id = `${prefix}-${i + 1}`;
-	const prompt = t.prompt ?? `fix: ${t.title}`;
+	// A retro is a child of its source card (`<source id>-retro`) and consumes no counter
+	// value (store.ts createTask), so the next numbered card keeps a gap-free id.
+	const id = t.retro
+		? `${prefix}-${(t.followUpOf ?? 0) + 1}-retro`
+		: `${prefix}-${project.tasks.slice(0, i).filter((x) => !x.retro).length + 1}`;
+	const prompt =
+		t.prompt ?? (t.retro ? `${RETRO_MARKER}${t.title}` : `fix: ${t.title}`);
 	const createdAt = now - t.age * DAY - i * 7 * MIN;
 	const isDone = t.stage === "done";
 	const doneAt = taskDoneAt(t, now);
@@ -428,6 +463,21 @@ export function insertTaskRow(
 	const dependsOn = JSON.stringify(
 		(t.deps ?? []).map((d) => `${prefix}-${d + 1}`),
 	);
+	// A proposal links its retro; a follow-up links the card it continues.
+	let followUpOf: string | null = null;
+	let proposalReason: string | null = null;
+	if (t.followUpOf !== undefined) {
+		followUpOf = `${prefix}-${t.followUpOf + 1}`;
+	} else if (t.proposalOf !== undefined) {
+		// proposalOf names the retro spec; the retro's own id comes from its source card.
+		const retroSpec = project.tasks[t.proposalOf];
+		const retroId = `${prefix}-${(retroSpec?.followUpOf ?? 0) + 1}-retro`;
+		followUpOf = retroId;
+		// A pending proposal parks with the reason the retro turn wrote
+		// (prompts.ts proposedReason).
+		proposalReason = proposedReason({ id: retroId });
+	}
+	const needs = proposalReason ?? t.needs ?? null;
 	// queued_at marks cards that sit in a queue right now.
 	const queuedAt = t.state === "queued" ? createdAt : null;
 	const updatedAt =
@@ -444,13 +494,13 @@ export function insertTaskRow(
 			prompt,
 			t.stage,
 			t.state,
-			t.needs ?? null,
+			needs,
 			t.pending ?? null,
 			t.research ? 1 : 0,
 			askedJson(t),
 			t.release?.version ?? null,
 			t.release?.notes ?? null,
-			t.followUpOf !== undefined ? `${prefix}-${t.followUpOf + 1}` : null,
+			followUpOf,
 			dependsOn,
 			createdAt,
 			updatedAt,
@@ -460,7 +510,7 @@ export function insertTaskRow(
 			commits,
 			`demo-${id}`,
 			t.title.slice(0, 60),
-			t.review === true ? "review" : "work",
+			t.review === true ? "review" : t.retro === true ? "retro" : "work",
 		],
 	);
 	return { id, prompt, createdAt, isDone, spec: t };
@@ -481,8 +531,14 @@ function insertWorkTurn(
 	let summary: string | null = null;
 	if (!open) {
 		exitCode = t.crashed ? 1 : 0;
-		outcome = isDone || t.stage === "merging" ? "ready" : null;
-		summary = isDone ? "Implemented and committed." : null;
+		if (t.retro) {
+			// A retro turn answers with its lessons, not a merge-ready report.
+			outcome = "answered";
+			summary = "Filed one proposal from the lessons.";
+		} else {
+			outcome = isDone || t.stage === "merging" ? "ready" : null;
+			summary = isDone ? "Implemented and committed." : null;
+		}
 	}
 	db.run(
 		`INSERT INTO turns (task_id, kind, prompt, started_at, ended_at, pid, exit_code, outcome, summary, question, error, model)
@@ -560,6 +616,11 @@ function seedMergeEvents(
 export function seedTaskEvents(db: Database, seed: TaskSeed): void {
 	const { spec: t, id, prompt, createdAt, isDone } = seed;
 	insertEvent(db, id, "create", null, "todo", createdAt);
+	if (t.proposalOf !== undefined) {
+		// A proposal never ran: the retro filed it, and it parks waiting for a decision.
+		insertEvent(db, id, "state", "queued", "needs_you", createdAt + MIN);
+		return;
+	}
 	if (t.work === undefined) return; // todo or review card: nothing ran yet
 	const wStart = createdAt + 2 * MIN;
 	const workOpen =
@@ -580,6 +641,12 @@ export function seedTaskEvents(db: Database, seed: TaskSeed): void {
 	if (wEnd === null) return; // open work turn: a live card has no downstream events
 	if (t.state === "needs_you" && t.stage === "in_progress") {
 		seedNeedsYouEvents(db, id, t, wEnd);
+		return;
+	}
+	if (t.retro) {
+		// A retro settles like a merged card, minus the merge turn.
+		insertEvent(db, id, "stage", "in_progress", "done", wEnd);
+		insertEvent(db, id, "state", "running", "idle", wEnd);
 		return;
 	}
 	if (isDone || t.stage === "merging") seedMergeEvents(db, id, t, wEnd, isDone);
@@ -623,10 +690,11 @@ function seedProject(root: string, spec: ProjectSpec, now: number): void {
 		const seed = insertTaskRow(db, spec, t, i, now);
 		seedTaskEvents(db, seed);
 	});
-	// A task created on the demo board continues the key sequence instead of probing taken ids.
+	// A task created on the demo board continues the key sequence instead of probing taken
+	// ids; the retro child consumes no number, so it stays out of the count.
 	db.run(
 		"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-		[JSON.stringify(spec.tasks.length + 1)],
+		[JSON.stringify(spec.tasks.filter((t) => !t.retro).length + 1)],
 	);
 	db.close();
 }

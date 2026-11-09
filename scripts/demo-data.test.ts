@@ -116,8 +116,13 @@ let adminPassHash: string;
 test("seed covers every display shape with clean checkouts", () => {
 	firstBoard = board();
 	const tasks = allTasks(firstBoard);
-	// id shape
-	for (const t of tasks) expect(t.id).toMatch(/^[A-Z0-9]{1,4}-[0-9]+$/);
+	// id shape; a retro is its source card's `-retro` child (store.ts createTask)
+	for (const t of tasks)
+		expect(t.id).toMatch(
+			t.kind === "retro"
+				? /^[A-Z0-9]{1,4}-[0-9]+-retro$/
+				: /^[A-Z0-9]{1,4}-[0-9]+$/,
+		);
 	// no-AGENTS.md project has a queued todo
 	const noRules = "paperkrane";
 	expect(existsSync(join(root, noRules, "AGENTS.md"))).toBe(false);
@@ -243,6 +248,65 @@ test("seed covers every display shape with clean checkouts", () => {
 		]);
 		expect(r.stdout.toString()).toBe("");
 	}
+});
+
+// The pool seeds one retro with a pending proposal: the shapes the lineage rail and the
+// proposal box read (store.ts createTask's retro child id, prompts.ts proposedReason).
+test("the seeded retro files a proposal that waits for a decision", () => {
+	const lookup = byId(firstBoard);
+	const lumen = firstBoard.lumen!;
+	const source = lumen.tasks.find((t) =>
+		/heatmap legend contrast/.test(t.title),
+	)!;
+	const retro = lookup.get(`${source.id}-retro`)!;
+	expect(retro.kind).toBe("retro");
+	expect(retro.stage).toBe("done");
+	expect(retro.state).toBe("idle");
+	expect(retro.follow_up_of).toBe(source.id);
+	expect(retro.prompt).toMatch(/^Retro of /);
+	expect(retro.done_at).not.toBeNull();
+	expect(retro.commits).toBeNull();
+	// The source card's Work steps show the retro's turn, so the retro has one.
+	const retroTurn = lumen.turns.find((tn: TurnRow) => tn.task_id === retro.id);
+	expect(retroTurn?.ended_at).not.toBeNull();
+	expect(retroTurn?.outcome).toBe("answered");
+	// The retro settled: its timeline carries the stage and state transitions.
+	const retroEvents = lumen.events.filter(
+		(e: EventRow) => e.task_id === retro.id,
+	);
+	expect(
+		retroEvents.some(
+			(e: EventRow) => e.kind === "stage" && e.to_value === "done",
+		),
+	).toBe(true);
+	expect(
+		retroEvents.some(
+			(e: EventRow) => e.kind === "state" && e.to_value === "idle",
+		),
+	).toBe(true);
+
+	const proposal = lumen.tasks.find((t) =>
+		t.needs_reason?.startsWith("Retro proposal from "),
+	)!;
+	expect(proposal.kind).toBe("work");
+	expect(proposal.stage).toBe("todo");
+	expect(proposal.state).toBe("needs_you");
+	expect(proposal.cancelled_at).toBeNull();
+	expect(proposal.queued_at).toBeNull();
+	expect(proposal.follow_up_of).toBe(retro.id);
+	expect(proposal.needs_reason).toBe(
+		`Retro proposal from ${retro.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+	);
+	// A proposal never ran a turn, and the retro consumed no counter value.
+	expect(
+		lumen.turns.find((tn: TurnRow) => tn.task_id === proposal.id),
+	).toBeUndefined();
+	const counter = new Database(join(root, "lumen", ".tasks", "tasks.db"))
+		.query<{ value: string }, []>(
+			"SELECT value FROM settings WHERE key = 'next-task-num'",
+		)
+		.get()!.value;
+	expect(JSON.parse(counter)).toBe(14);
 });
 
 // The dev board shows the mutation meter only when progress parses as a Stryker line, so
