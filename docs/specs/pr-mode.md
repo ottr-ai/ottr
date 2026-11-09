@@ -47,6 +47,23 @@ does either (ADR 0002 unchanged on that point).
   (src/ui/settings.tsx), same `disabled={project.github === null}` gate and
   needs-a-remote description prefix.
 
+## Detection: the board suggests PR mode (OTTR-675)
+
+Where the GitHub remote resolves (project add, git init, a settings save that
+refreshes remotes), the board probes the target branch's repository rules:
+`GET <apiBase>/repos/{o}/{r}/rules/branches/{branch}` with the board's GitHub
+token for that host (per-host git token, else `GH_TOKEN` on the configured
+host). The probe is advisory and total:
+
+- A `pull_request` rule on the target with PR mode off turns on the project
+  header advisory; its "Turn on PR mode" action saves `{ prMode: true }`.
+- A failed or 404 probe, a missing token, a non-GitHub remote, or PR mode
+  already on shows nothing. The probe never blocks a route.
+
+When a merge turn's server push is refused by a branch rule (git carries
+GitHub's "protected branch" / "repository rule violations" wording), the
+card's `needs_you` reason names PR mode as the fix.
+
 ## Merge turn (PR variant)
 
 The merge turn stays an agent turn — the rebase, the gates and the
@@ -191,6 +208,10 @@ server remains the only writer of origin.
   CI watch byte-identical.
 - The settings route accepts only a boolean and refuses `true` on a project
   without a GitHub remote with 400; the UI row disables like "PR reviews".
+- The rules probe: a pull_request rule with PR mode off sets the suggestion;
+  an absent rule, an error or 404, and PR mode on do not (unit tests for the
+  parse and the view field). A branch-rule push refusal names PR mode in the
+  card's needs_you reason; a plain push failure does not.
 - Happy path on a PR-mode project: merge turn runs the PR variant (no
   `git merge --ff-only` prompt text), the server pushes the branch and opens
   the PR, the card sits `merging`/`idle` with the PR link, is not pickable,

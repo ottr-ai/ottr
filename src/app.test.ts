@@ -270,6 +270,13 @@ let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
 // Live progress the /api/state silent tests set ({ text, at }); null is the default:
 // no progress at all, the log-only warning rule.
 let fakeProgress: { text: string; at?: number } | null = null;
+// OTTR-675: the branch-rules probe seam; tests swap branchRulesImpl per case. The
+// default answers 404, so an unstubbed probe keeps the advisory off.
+let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
+	async () =>
+		new Response(null, {
+			status: 404,
+		});
 const app = createApp({
 	gstore,
 	defaultDir: root,
@@ -301,6 +308,7 @@ projects.set("p1", {
 	target: null,
 	gitless: false,
 	github: null,
+	protectedTarget: false,
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
@@ -319,6 +327,7 @@ projects.set("p2", {
 	target: null,
 	gitless: false,
 	github: null,
+	protectedTarget: false,
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
@@ -336,6 +345,7 @@ projects.set("p3", {
 	target: null,
 	gitless: false,
 	github: null,
+	protectedTarget: false,
 	remote: null,
 	dirty: false,
 	mainUnpushed: false,
@@ -392,6 +402,8 @@ function mount(
 		keyscan?: Keyscan;
 		/** Fetch/timeout seam for the git 401/403 probe; passed through to createApp. */
 		githubAuthProbe?: Parameters<typeof createApp>[0]["githubAuthProbe"];
+		/** Fetch seam for the branch-rules probe (OTTR-675); passed through to createApp. */
+		branchRulesFetch?: Parameters<typeof createApp>[0]["branchRulesFetch"];
 		models?: Parameters<typeof createApp>[0]["models"];
 		/** Latest GitHub release seam (release chip + Create release routes); tests inject. */
 		latestRelease?: Parameters<typeof createApp>[0]["latestRelease"];
@@ -457,6 +469,7 @@ function mount(
 		sshDir: input.sshDir,
 		keyscan: input.keyscan,
 		githubAuthProbe: input.githubAuthProbe,
+		branchRulesFetch: input.branchRulesFetch,
 		models: input.models,
 		latestRelease: input.latestRelease,
 		releaseSummarySpawn: input.releaseSummarySpawn,
@@ -744,6 +757,7 @@ describe("task routes", () => {
 				target: null,
 				gitless: false,
 				github: null,
+				protectedTarget: false,
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,
@@ -759,6 +773,7 @@ describe("task routes", () => {
 				target: null,
 				gitless: false,
 				github: null,
+				protectedTarget: false,
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,
@@ -2071,6 +2086,7 @@ describe("trending scout routes", () => {
 			target: null,
 			gitless: false,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -3702,6 +3718,7 @@ describe("alate provision trigger (U9)", () => {
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
@@ -3972,6 +3989,7 @@ describe("agent layer boot reconcile", () => {
 			target: null,
 			gitless: false,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -5375,6 +5393,7 @@ describe("release-summary route", () => {
 			target: "main",
 			gitless: false,
 			github: opts.github ?? null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -6943,6 +6962,7 @@ describe("push-main route (OTTR-531)", () => {
 			target: "origin/main",
 			gitless: false,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: true,
@@ -7032,6 +7052,7 @@ describe("push-main on an empty origin (OTTR-605)", () => {
 			target: null,
 			gitless: false,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -7189,6 +7210,141 @@ describe("projectView githubHostNotice", () => {
 			expect(await noticeOf()).toBeNull();
 		});
 		restoreHost();
+	});
+});
+
+describe("projectView prModeSuggestion (OTTR-675)", () => {
+	// An isolated app+repo: refreshRemote stamps github/target on the Entry it probes,
+	// and the shared p1 fixture must stay remote-less for the later no-GitHub-remote
+	// routes (fork research, PR review).
+	const savedToken = process.env.GH_TOKEN;
+	const rulesDir = join(root, "p-rules");
+	mkdirSync(rulesDir, { recursive: true });
+	const rulesStore = ProjectStore.open(rulesDir);
+	afterAll(() => {
+		rulesStore.close();
+		if (savedToken === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = savedToken;
+	});
+	const sh = (cmd: string) => execSync(cmd, { cwd: rulesDir, stdio: "ignore" });
+	// git-init the dir offline exactly like the shared fixture repos: one seed commit,
+	// a github.com origin, and a planted origin/main ref, so refreshRemote resolves the
+	// target with no network.
+	sh("git init -q -b main");
+	sh("git config user.email t@t && git config user.name t");
+	writeFileSync(join(rulesDir, "seed.txt"), "s");
+	sh("git add seed.txt && git commit -qm seed");
+	sh("git remote add origin https://github.com/acme/widget");
+	sh("git update-ref refs/remotes/origin/main HEAD");
+	const rulesProjects = new Map<string, Entry>();
+	rulesProjects.set("p-rules", {
+		path: rulesDir,
+		name: "p-rules",
+		store: rulesStore,
+		target: null,
+		gitless: false,
+		github: null,
+		protectedTarget: false,
+		remote: null,
+		dirty: false,
+		mainUnpushed: false,
+		mainBranch: null,
+		latestRelease: null,
+		latestImage: null,
+		archReview: null,
+	});
+	const m = mount({
+		projects: rulesProjects,
+		branchRulesFetch: (input, init) => branchRulesImpl(input, init),
+	});
+	/** Runs a real refreshRemote via the settings route, then reads the field off /api/state. */
+	const suggestionOf = async (): Promise<boolean> => {
+		const res = await m.call("/api/projects/p-rules/settings", {
+			targetBranch: "main",
+		});
+		expect(res.status).toBe(200);
+		const state = await m.call("/api/state");
+		expect(state.status).toBe(200);
+		const b = (await state.json()) as {
+			projects: { name: string; prModeSuggestion: boolean }[];
+		};
+		return b.projects.find((p) => p.name === "p-rules")!.prModeSuggestion;
+	};
+
+	test("a pull_request rule turns the suggestion on", async () => {
+		process.env.GH_TOKEN = "ghs_test_0000";
+		branchRulesImpl = async () =>
+			new Response(
+				JSON.stringify([{ type: "creation" }, { type: "pull_request" }]),
+				{ status: 200 },
+			);
+		try {
+			expect(await suggestionOf()).toBe(true);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+		}
+	});
+
+	test("rules without a pull_request rule keep the suggestion off", async () => {
+		process.env.GH_TOKEN = "ghs_test_0000";
+		branchRulesImpl = async () =>
+			new Response(JSON.stringify([{ type: "creation" }]), { status: 200 });
+		try {
+			expect(await suggestionOf()).toBe(false);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+		}
+	});
+
+	test("a 404 probe keeps the suggestion off", async () => {
+		process.env.GH_TOKEN = "ghs_test_0000";
+		branchRulesImpl = async () => new Response(null, { status: 404 });
+		try {
+			expect(await suggestionOf()).toBe(false);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+		}
+	});
+
+	test("a network error keeps the suggestion off", async () => {
+		process.env.GH_TOKEN = "ghs_test_0000";
+		branchRulesImpl = async () => {
+			throw new Error("boom");
+		};
+		try {
+			expect(await suggestionOf()).toBe(false);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+		}
+	});
+
+	test("PR mode on skips the probe entirely", async () => {
+		delete process.env.GH_TOKEN;
+		rulesStore.setSettings({ prMode: true });
+		branchRulesImpl = async () => {
+			throw new Error("probe must not run");
+		};
+		try {
+			expect(await suggestionOf()).toBe(false);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+			rulesStore.setSettings({ prMode: false });
+		}
+	});
+
+	test("no token skips the probe entirely", async () => {
+		delete process.env.GH_TOKEN;
+		let calls = 0;
+		branchRulesImpl = async () => {
+			calls++;
+			return new Response(null, { status: 404 });
+		};
+		try {
+			expect(await suggestionOf()).toBe(false);
+			expect(calls).toBe(0);
+		} finally {
+			branchRulesImpl = async () => new Response(null, { status: 404 });
+		}
 	});
 });
 
@@ -7912,6 +8068,7 @@ describe("web push (R1-1, R2-3)", () => {
 					target: null,
 					gitless: false,
 					github: null,
+					protectedTarget: false,
 					remote: null,
 					dirty: false,
 					mainUnpushed: false,
@@ -9179,6 +9336,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
@@ -10059,6 +10217,7 @@ describe("PR review routes", () => {
 		target: null,
 		gitless: false,
 		github: "acme/widget",
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
@@ -10619,6 +10778,7 @@ describe("PR review routes", () => {
 			target: null,
 			gitless: false,
 			github: "acme/widget",
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -11721,6 +11881,7 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 			target: null,
 			gitless: false,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -12774,6 +12935,7 @@ describe("GET /api/settings/omp-stats", () => {
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
@@ -13365,6 +13527,7 @@ describe("project order route", () => {
 				target: null,
 				gitless: false,
 				github: null,
+				protectedTarget: false,
 				remote: null,
 				dirty: false,
 				mainUnpushed: false,

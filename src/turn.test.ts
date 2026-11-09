@@ -307,6 +307,7 @@ function fakeProject(store: ProjectStore): TurnProject {
 		target: null,
 		gitless: false,
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,
@@ -4875,6 +4876,38 @@ describe("turn ci watch pinning", () => {
 		// OTTR-465: without a pinned URL no re-check can run, so the retry stays off and says so.
 		expect(logText(store, task.id)).toContain("no pinned origin URL");
 		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a server push refused by a GitHub branch rule parks with the PR-mode hint", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error:
+					"remote: error: GH013: Repository rule violations found for refs/heads/main.\nremote: - Changes must be made through a pull request.",
+			}),
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toContain("PR mode");
+		expect(t.needsReason).toContain(
+			"This push was refused by a GitHub branch rule",
+		);
+	});
+
+	test("a plain server push failure parks without the PR-mode hint", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error: "remote: HTTP Basic: Access denied",
+			}),
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).not.toContain("PR mode");
 	});
 
 	test("a rejected server push fetches origin and queues a rebase merge turn, not needs_you", async () => {

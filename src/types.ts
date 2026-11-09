@@ -815,6 +815,10 @@ export interface ProjectView {
 	 * Settings → Git hosts → GitHub host. Null when the features are on or the origin is
 	 * not a ghe.com tenant. */
 	githubHostNotice: string | null;
+	/** OTTR-675: true when the target branch requires pull requests (a pull_request
+	 * repository rule) and PR mode is off; the project header shows the advisory with
+	 * the turn-on action. */
+	prModeSuggestion: boolean;
 	/** Latest release: the repo's latest GitHub release (its name when the tag is not
 	 * `vX.Y.Z`), else the highest `vX.Y.Z` tag merged into the target; null until the first
 	 * scan or when both are unknown. */

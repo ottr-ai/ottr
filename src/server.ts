@@ -377,6 +377,7 @@ for (const p of discoverProjects(
 		target: null,
 		gitless: !(await isGitRepoWithCommit(p)),
 		github: null,
+		protectedTarget: false,
 		remote: null,
 		dirty: false,
 		mainUnpushed: false,

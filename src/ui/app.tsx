@@ -3786,6 +3786,18 @@ export function ProjectBoard({
 					<BusyButton run={pushMain}>Push to origin</BusyButton>
 				</p>
 			)}
+			{project.prModeSuggestion && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					<span>
+						GitHub requires pull requests into <code>{short}</code>, so the
+						merge turn's push would be refused.{" "}
+						<BusyButton run={() => saveCheck({ prMode: true })}>
+							Turn on PR mode
+						</BusyButton>
+					</span>
+				</p>
+			)}
 			{project.githubHostNotice &&
 				!hostedHidden(hosted, "github-host-block") && (
 					<p className="advisory">

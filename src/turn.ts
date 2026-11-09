@@ -17,7 +17,7 @@ import {
 import type { pidAlive } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
-import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
+import { BRANCH_RULE_REJECTION, GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
 import type { CommitIdentity } from "./gitIdentity.ts";
 import {
@@ -475,6 +475,11 @@ export interface TurnProject {
 	gitless: boolean;
 	/** GitHub remote URL, resolved once at registration; null when the project has none. */
 	github: string | null;
+	/** OTTR-675: true when the last branch-rules probe of the target found a pull_request
+	 * rule (the probe runs where the GitHub remote resolves: add, init, settings save).
+	 * Advisory only: the project view folds it with the prMode setting into the PR-mode
+	 * suggestion. A failed or 404 probe keeps it false. */
+	protectedTarget: boolean;
 	/** HTTPS form of the origin push remote on any host, resolved once at registration beside
 	 * github; null when the project has none. Icon adoption reads this. */
 	remote: string | null;
@@ -3587,6 +3592,9 @@ export function createTurnLoop(
 					? target.slice("origin/".length)
 					: null;
 				const retries = store.getTask(id)?.pushRetries ?? 0;
+				const ruleHint = BRANCH_RULE_REJECTION.test(pushError)
+					? "\nThis push was refused by a GitHub branch rule: the target branch requires pull requests. Project PR mode ships cards as pull requests instead; turn it on under the project's settings."
+					: "";
 				if (
 					pushRejected &&
 					holdTip === null &&
@@ -3606,7 +3614,7 @@ export function createTurnLoop(
 						next = {
 							stage: "merging",
 							state: "needs_you",
-							needsReason: `Server push to origin failed: ${pushError}`,
+							needsReason: `Server push to origin failed: ${pushError}${ruleHint}`,
 						};
 					} else {
 						log(
@@ -3634,7 +3642,7 @@ export function createTurnLoop(
 								next = {
 									stage: "merging",
 									state: "needs_you",
-									needsReason: `Server push to origin failed: ${pushError}\norigin re-fetch before the recovery turn failed: ${refetchError}`,
+									needsReason: `Server push to origin failed: ${pushError}\norigin re-fetch before the recovery turn failed: ${refetchError}${ruleHint}`,
 								};
 								return;
 							}
@@ -3680,7 +3688,7 @@ export function createTurnLoop(
 							next = {
 								stage: "merging",
 								state: "needs_you",
-								needsReason: `Server push to origin failed: ${pushError}\nthe automatic rebase failed: ${rb.error}`,
+								needsReason: `Server push to origin failed: ${pushError}\nthe automatic rebase failed: ${rb.error}${ruleHint}`,
 							};
 						} else {
 							log(
@@ -3728,7 +3736,7 @@ export function createTurnLoop(
 					next = {
 						stage: "merging",
 						state: "needs_you",
-						needsReason: `Server push to origin failed: ${pushError}${recheckError === null ? "" : `\norigin re-check failed: ${recheckError}`}`,
+						needsReason: `Server push to origin failed: ${pushError}${recheckError === null ? "" : `\norigin re-check failed: ${recheckError}`}${ruleHint}`,
 					};
 				}
 			}

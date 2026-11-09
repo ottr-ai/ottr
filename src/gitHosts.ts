@@ -801,6 +801,11 @@ export function pushAuthKind(
 export const GIT_AUTH_FAILURE =
 	/Authentication failed|could not read Username|terminal prompts disabled|HTTP Basic: Access denied| 401| 403|Permission denied/;
 
+/** GitHub's wording when a push is refused by a branch rule: GH006 "Protected branch
+ * update failed", "protected branch hook declined", GH013 "Repository rule violations
+ * found". OTTR-675: the merge park names PR mode on it. */
+export const BRANCH_RULE_REJECTION = /protected branch|repository rule/i;
+
 /** `git ls-remote` against the URL with the auth env; the error line is redacted. */
 export async function testRemote(
 	url: string,

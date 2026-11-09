@@ -5959,6 +5959,7 @@ describe("ProjectBoard sync-commit advisories", () => {
 			dirty: false,
 			mainBranch: null,
 			mainUnpushed: false,
+			prModeSuggestion: false,
 			target: "origin/main",
 			archReview: null,
 			latestRelease: null,
@@ -5996,6 +5997,18 @@ describe("ProjectBoard sync-commit advisories", () => {
 		const html = renderBoard(projectWith({ mainUnpushed: true }));
 		expect(html).toContain("Push to origin");
 		expect(html).toContain("has commits origin lacks");
+	});
+
+	test("a PR-mode suggestion renders the advisory with the turn-on action", () => {
+		const html = renderBoard(projectWith({ prModeSuggestion: true }));
+		expect(html).toContain("GitHub requires pull requests into");
+		expect(html).toContain("Turn on PR mode");
+	});
+
+	test("no PR-mode suggestion renders no advisory", () => {
+		const html = renderBoard(projectWith({}));
+		expect(html).not.toContain("GitHub requires pull requests into");
+		expect(html).not.toContain("Turn on PR mode");
 	});
 
 	test("a ghe.com origin mismatch names the host and links the GitHub host setting", () => {
@@ -6081,6 +6094,128 @@ describe("ProjectBoard rules interview action", () => {
 		const html = renderBoard([cardFixture({ id: "t1", title: "Fix bug" })]);
 		expect(html).toContain("Discuss rules");
 		expect(html).not.toContain("Open rules task");
+	});
+});
+
+describe("ProjectBoard PR-mode suggestion action", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// settings-shortcut tests above.
+	const window = new Window({ url: "http://localhost/projects/proj" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The production onClick React rendered onto the node; a dispatched click never
+	 *  reaches React's event plugin under happy-dom (see the search delay tests). */
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	test("the Turn on PR mode button posts prMode true to the project settings", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: { url: string; body: unknown }[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			if (String(url).endsWith("/api/projects/proj/settings")) {
+				posts.push({
+					url: String(url),
+					body: JSON.parse(String(init?.body ?? "{}")),
+				});
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={
+							{
+								name: "proj",
+								hasRules: true,
+								github: null,
+								gitless: false,
+								dirty: false,
+								mainBranch: null,
+								mainUnpushed: false,
+								prModeSuggestion: true,
+								target: "origin/main",
+								archReview: null,
+								latestRelease: null,
+								latestImage: null,
+								settings: { setupChecklist: false },
+								sessionsDir: "/tmp/s",
+							} as unknown as ProjectView
+						}
+						tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const btn = Array.from(container.querySelectorAll("button")).find(
+				(b) => b.textContent === "Turn on PR mode",
+			);
+			if (btn === undefined) throw new Error("no Turn on PR mode button");
+			await act(async () => {
+				onClickOf(btn)({});
+			});
+			await act(async () => {});
+			const post = posts.at(-1);
+			expect(post?.url).toContain("/api/projects/proj/settings");
+			expect(post?.body).toEqual({ prMode: true });
+		} finally {
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
 	});
 });
 

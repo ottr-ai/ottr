@@ -48,6 +48,7 @@ import {
 	verifyIdentity,
 	verifySession,
 } from "./auth.ts";
+import { lookupBranchRules } from "./branchRules.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import { deepenDraft } from "./deepen.ts";
@@ -577,6 +578,8 @@ interface AppDeps {
 		fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 		timeoutMs?: number;
 	};
+	/** Fetch seam for the branch-rules probe (OTTR-675, src/branchRules.ts); defaults to fetch. Tests inject a stub. */
+	branchRulesFetch?: (url: string, init?: RequestInit) => Promise<Response>;
 	/** Model catalog seam for the model roles editor; defaults to modelList. */
 	models?: () => Promise<ModelOption[]>;
 	/**
@@ -3062,6 +3065,7 @@ export function createApp(deps: AppDeps) {
 			github: e.github,
 			vmRunner: vmState.health,
 			githubHostNotice: gheNoticeHost(e.remote, configuredGithubHostname()),
+			prModeSuggestion: e.protectedTarget === true && settings.prMode !== true,
 			remote: e.remote,
 			latestRelease: e.latestRelease,
 			latestReleaseUrl: e.latestReleaseUrl ?? null,
@@ -4186,6 +4190,7 @@ export function createApp(deps: AppDeps) {
 			target: null,
 			gitless,
 			github: null,
+			protectedTarget: false,
 			remote: null,
 			dirty: false,
 			mainUnpushed: false,
@@ -4269,6 +4274,43 @@ export function createApp(deps: AppDeps) {
 		}
 		e.github = await githubUrl(e.path).catch(() => null);
 		e.remote = await remoteUrl(e.path).catch(() => null);
+		await refreshBranchRules(e);
+	}
+
+	/** OTTR-675: probes the target branch's repository rules where the GitHub remote
+	 * resolves (refreshRemote). Advisory: a failed or 404 probe and a missing token keep
+	 * the field false, so nothing shows. */
+	async function refreshBranchRules(e: Entry): Promise<void> {
+		e.protectedTarget = false;
+		if (e.store.getSettings().prMode === true) return;
+		const repo = e.github === null ? null : ownerRepo(e.github);
+		const slash = repo === null ? -1 : repo.indexOf("/");
+		const remote = parseGitUrl(e.github ?? "");
+		if (
+			repo === null ||
+			slash <= 0 ||
+			e.target === null ||
+			!e.target.startsWith("origin/") ||
+			"error" in remote
+		)
+			return;
+		const token =
+			gitTokens.find((t) => t.host === remote.hostKey)?.token ??
+			(remote.host === githubHost().host
+				? (process.env.GH_TOKEN ?? null)
+				: null);
+		if (token === null || token === "") return;
+		const parsed = parseGithubHost(remote.host);
+		if ("error" in parsed) return;
+		const r = await lookupBranchRules({
+			apiBase: parsed.apiBase,
+			owner: repo.slice(0, slash),
+			repo: repo.slice(slash + 1),
+			branch: e.target.slice("origin/".length),
+			token,
+			fetchImpl: deps.branchRulesFetch,
+		});
+		e.protectedTarget = r.ok && r.pullRequest;
 	}
 
 	/**
