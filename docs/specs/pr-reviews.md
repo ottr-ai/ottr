@@ -58,9 +58,21 @@ Each project has its own store, so the PR number is the key inside it.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
 - `savePrDraft({ run, number, head, draft, prompt })` runs in one transaction:
   - No card yet: create a card with kind `pr_review`, title `PR review: #N <title>`, topic `pr review`.
-  - The card gets stage `done`, state `idle`, the draft as its `details`, and a one-line summary. A card that exists gets the new prompt.
+  - The card gets the draft as its `details` and a one-line summary. A card that exists gets the new prompt. `syncPrCard` then sets the card's stage and state (see "Card state").
   - Set `task_id` and `reviewed_head`, clear `post_error`, and set `done = 1` on the run. Other columns stay, because the save runs after the model call.
 - A `pr_review` card has no turns, no branch and no worktree. The scheduler never runs it, and the supervisor files no retro for it.
+
+### Card state
+
+A draft that nobody posted waits for the user, so the card must not hide in Done while the PR is open.
+
+- `store.syncPrCard(number)` derives the card's place from the `pr_review` row and writes it only when it differs:
+  - The PR is `open`, the card has `details`, and `posted_head !== reviewed_head`: stage `in_progress`, state `needs_you`, `needsReason` = `PR_REVIEW_WAITING` ("Review the draft, then post it to GitHub or ask for a new draft.").
+  - Else (posted, closed, or merged): stage `done`, state `idle`, `needsReason` null.
+  - A cancelled card or a row with no card stays as it is.
+- Callers: `savePrDraft` (in its transaction), a successful Post, the watcher after it writes `closed` or `merged`, and every watcher tick for every row of an enabled project. The tick call converges cards that an older build left in Done.
+- A failed Post keeps the card at `needs_you`.
+- The `needs_you` state raises the usual request alert. The drawer shows the PR section, not the generic reply form, the "Go to reply" link, or the restart-session button. The card does not show `needsReason` as an error.
 
 ### Post
 
@@ -69,18 +81,34 @@ Each project has its own store, so the PR number is the key inside it.
 - For an open PR the drawer shows a second composer, **Ask for a new draft**: the text posts to the reply route as the maintainer note, the field clears on success with a hint that the new draft will appear on the card, and a closed or merged PR hides the composer.
 - `POST /api/projects/:project/tasks/:id/pr-review/post { body }`:
   - `body` must be a non-empty string of at most `REVIEW_BODY_MAX` characters (65536 minus the footer), else 400.
-  - The card must be kind `pr_review`, in `done/idle`, and have `details`, else 409.
+  - The card must be kind `pr_review`, not cancelled, and have `details`, else 409.
+  - `parseReviewDraft(body)` splits the text into the review body and the inline comments (see "Inline comments"). An empty review body with inline comments gets 400 `write a summary above the inline comments`.
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the GitHub call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
-  - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with event `COMMENT`, the body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), and `commit_id` set to the reviewed head.
+  - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with event `COMMENT`, the review body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), `commit_id` set to the reviewed head, and `comments` when the draft has inline comments.
   - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`.
-  - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST -f event=COMMENT -f body=<body + REVIEW_FOOTER> -f commit_id=<reviewedHead>`. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
+  - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST --input <file>`. The file is a JSON payload `{ event: "COMMENT", body: <review body + REVIEW_FOOTER>, commit_id: <reviewedHead>, comments? }` in a fresh directory below the OS temp dir. Ottr removes the directory after the call. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
   - On success Ottr parses the response body and stores its `html_url` in `posted_url`, and its `user.login` in `posted_login`; a body without an `https://github.com/` URL stores null for the URL. `setPrPostedUrl(number, url, login = null)` writes both columns in one statement. `PrReviewRow` and `PrReviewView` gain `postedLogin: string | null` (additive, the `posted_url` pattern).
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
+  - On success the route calls `syncPrCard`, so the card moves to `done/idle`. The response gains `inline: <number of inline comments sent>`.
   - The route and the watcher change only their own columns after an await. A Post never changes `state`, and the watcher writes only `state` for a vanished PR.
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
 - A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review (a new head) rewrites the draft and drops the read mark, so the updated card wears the badge again.
+
+### Inline comments
+
+The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it.
+
+- A block starts with a line `<!-- inline <path>:<line> -->` or `<!-- inline <path>:<start>-<end> -->` and ends with a line `<!-- /inline -->`. Marker lines match after trimming. The lines between are the comment body.
+- `<line>` and `<end>` are line numbers of the new file (the `RIGHT` side). `<start>` is less than `<end>`. The path holds no newline and at most 1000 characters.
+- A code suggestion is a ```` ```suggestion ```` fence in the comment body. GitHub shows it as a change that the PR author can apply.
+- `parseReviewDraft(text)` returns `{ body, comments }`. Text outside blocks is the body, trimmed. A block with a bad marker or no close marker stays in the body as plain text. A block with an empty body is dropped.
+- The system prompt tells the model to put a finding that belongs to diff lines into an inline block, with a suggestion fence for a concrete fix of exactly those lines, and to keep other findings in the summary.
+- Before `savePrDraft`, `fitDraftToDiff(draft, diff)` checks each block against the diff. GitHub accepts a comment only on a line that the diff shows (an added or context line) and a range only inside one hunk. A block that does not fit moves into the body as `` **`<path>:<line>`** `` and its text, so no finding is lost and the draft never fails the post for that reason. A user edit after the save is not checked: GitHub's error then shows as `post_error`.
+- The post sends each comment as `{ path, line, side: "RIGHT", body }`, plus `start_line` and `start_side: "RIGHT"` for a range.
+- A re-review keeps the earlier inline findings: when the posted review is found, `fetchReReviewContext` reads `repos/{repo}/pulls/N/reviews/<id>/comments` and appends each comment to the earlier review as an inline block. The comments list of the re-review skips comments of that review.
+- The drawer shows the number of inline comments in the draft under the text box and explains the marker format.
 
 ## Boundaries
 
@@ -104,7 +132,9 @@ Each project has its own store, so the PR number is the key inside it.
 - A re-review of a new head carries the earlier review body, the comments after it with author and date, and the range diff; the re-review system paragraph reaches the model. A missing compare range says the range is unavailable and keeps the full diff. Over budget the oldest comments are cut first and the message says how many.
 - The re-review paragraph instructs both triage outcomes: list only the still open or partly fixed findings with evidence, and one short line of thanks with no per-finding list when every earlier finding is fixed.
 - A reply on a `pr_review` card runs a new draft for the refreshed current head with the note outside the DATA blocks, counts one cap slot, and gets 429 once the daily cap is full, 409 on a closed PR, and 400 on empty or oversized text.
-- Post sends one `COMMENT` review with the edited body and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
+- Post sends one `COMMENT` review with the edited body, the inline comments, and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
+- An inline block on a diff line posts as an inline comment with `side: "RIGHT"`; a range block also sends `start_line`. A block outside the diff lands in the body of the saved draft. A suggestion fence reaches GitHub unchanged.
+- An open PR with an unposted draft puts the card in `in_progress/needs_you`. A Post, a close, or a merge moves it to `done/idle`. A new head on a posted card brings it back to `needs_you`. A card that an older build left in Done moves at the next tick.
 - A closed or merged PR disables Post and stops new reviews.
 - The app JWT has the right header, `iss = appId`, `iat = now - 60`, and an `exp` of at most 10 minutes; a test verifies the signature with the test key pair's public key.
 - With the app configured and an installation found, the post call carries the installation token, and the board token's `gh` path stays unused.
@@ -113,7 +143,7 @@ Each project has its own store, so the PR number is the key inside it.
 
 ## Non-goals
 
-- Inline line comments.
+- Comments on deleted lines (the `LEFT` side) or on whole files.
 - Running PR tests or CI.
 - GitHub webhooks.
 - A post without a click.

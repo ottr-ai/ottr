@@ -55,7 +55,7 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
-import { askQuestions } from "./types.ts";
+import { askQuestions, PR_REVIEW_WAITING } from "./types.ts";
 
 export const DEFAULT_SETTINGS: ProjectSettings = {
 	maxParallel: 2,
@@ -2277,9 +2277,10 @@ export class ProjectStore {
 	}
 
 	/**
-	 * Saves a review draft in one transaction: files the PR's card done/idle with the draft as
-	 * its details (or updates the existing card), marks `head` reviewed and the run done. It runs
-	 * after the model call, so it writes only its own columns of the live row.
+	 * Saves a review draft in one transaction: files the PR's card with the draft as its
+	 * details (or updates the existing card), marks `head` reviewed and the run done, then
+	 * lets syncPrCard place the card. It runs after the model call, so it writes only its
+	 * own columns of the live row.
 	 */
 	savePrDraft(o: {
 		run: number;
@@ -2302,8 +2303,8 @@ export class ProjectStore {
 							topic: "pr review",
 						}
 					: { prompt: o.prompt }),
-				stage: "done",
-				state: "idle",
+				// A new card leaves the queue here; syncPrCard sets its final place below.
+				...(existing === null ? { stage: "in_progress", state: "idle" } : {}),
 				queuedAt: null,
 				summary,
 				details: o.draft,
@@ -2314,11 +2315,42 @@ export class ProjectStore {
 				[card.id, o.head, o.number],
 			);
 			this.db.run("UPDATE pr_review_runs SET done = 1 WHERE id = ?", [o.run]);
+			this.syncPrCard(o.number);
 		});
 		tx();
 		const card = this.getTask(cardId);
 		if (!card) throw new Error(`pr review card vanished: ${cardId}`);
 		return card;
+	}
+
+	/**
+	 * Places a PR review card from its row: an open PR with an unposted draft waits at
+	 * needs_you; posted, closed or merged goes to done/idle. A cancelled card or a row without
+	 * a card stays. Writes only on a difference, so done_at is not stamped again.
+	 */
+	syncPrCard(number: number): void {
+		const row = this.getPrReview(number);
+		if (!row || row.taskId === null) return;
+		const card = this.getTask(row.taskId);
+		if (!card || card.cancelledAt !== null) return;
+		const waiting =
+			row.state === "open" &&
+			card.details !== null &&
+			row.postedHead !== row.reviewedHead;
+		const want = waiting
+			? ({
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: PR_REVIEW_WAITING,
+				} as const)
+			: ({ stage: "done", state: "idle", needsReason: null } as const);
+		if (
+			card.stage === want.stage &&
+			card.state === want.state &&
+			card.needsReason === want.needsReason
+		)
+			return;
+		this.updateTask(card.id, want);
 	}
 
 	/**

@@ -21,6 +21,7 @@ import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import { shortKey, taskEntryKey } from "../notifications.ts";
+import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
@@ -745,11 +746,19 @@ function Card({
 				    card-open title also carries it. Ask rounds keep the prompt: their reason just
 				    echoes the first question the drawer's ask panel shows in full. A live turn
 				    whose log went silent past the board's limit takes the same line as
-				    .card-silent — grey, it reports, it does not alarm. */}
+				    .card-silent — grey, it reports, it does not alarm. A PR review waiting for
+				    its Post is no error either, so its reason takes the grey line too. */}
 				{task.state === "needs_you" &&
 				task.asked === null &&
 				task.needsReason !== null ? (
-					<span className="card-error" title={task.needsReason}>
+					<span
+						className={
+							task.kind === "pr_review"
+								? "card-error card-silent"
+								: "card-error"
+						}
+						title={task.needsReason}
+					>
 						{task.needsReason}
 					</span>
 				) : silent !== null ? (
@@ -5502,8 +5511,14 @@ export function LaneCol({
 							</section>
 						);
 					})
-				: view
-						.filter((t) => t.cancelledAt !== null || (!unread(t) && !t.starred))
+				: // Only the done lane pins unread and starred cards above; other lanes show every card.
+					view
+						.filter(
+							(t) =>
+								stage !== "done" ||
+								t.cancelledAt !== null ||
+								(!unread(t) && !t.starred),
+						)
 						.map(card)}
 			{more > 0 && onMore && (
 				<button
@@ -7257,7 +7272,7 @@ function RelatedTasks({
 }
 
 /** PR review card: the model's review draft as an editable comment; it reaches GitHub only on the Post click. */
-function PrReviewSection({
+export function PrReviewSection({
 	task,
 	pr,
 	draft,
@@ -7266,7 +7281,7 @@ function PrReviewSection({
 }: {
 	task: TaskView;
 	pr: PrReviewView;
-	/** The review draft that the watcher saved as the done card's details; null before the first review lands. */
+	/** The review draft that the watcher saved as the card's details; null before the first review lands. */
 	draft: string | null;
 	act: Act;
 	onLoaded: (v: TaskView) => void;
@@ -7299,11 +7314,12 @@ function PrReviewSection({
 			: (postedLabel ??
 				(draft === null
 					? "No review draft yet"
-					: task.stage !== "done" || task.state !== "idle"
-						? "The review is not done"
+					: task.cancelledAt !== null
+						? "The card is cancelled"
 						: body.trim() === ""
 							? "The comment is empty"
 							: null));
+	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
 	return (
 		<>
@@ -7321,8 +7337,18 @@ function PrReviewSection({
 					rows={10}
 					maxLength={REVIEW_BODY_MAX}
 					value={body}
+					aria-describedby="pr-review-inline"
 					onChange={(e) => setBody(e.target.value)}
 				/>
+				<p id="pr-review-inline" className="dim pr-inline-hint">
+					{inlineCount === 0
+						? "No inline comments"
+						: `${inlineCount} inline comment${inlineCount === 1 ? "" : "s"}`}
+					. Lines between <code>{"<!-- inline path:line -->"}</code> and{" "}
+					<code>{"<!-- /inline -->"}</code> post as an inline comment on that
+					line. A <code>suggestion</code> code block in a comment proposes a
+					change.
+				</p>
 				<div className="reply-actions">
 					{blocked !== null && (
 						<span className="dim">
@@ -8378,11 +8404,10 @@ export function Drawer({
 		proposal ||
 		(task.state === "needs_you" && task.keptFiles.length > 0);
 	const prReviewOpen = task.kind === "pr_review" && task.prReview !== undefined;
-	// PR review card: the watcher saves each draft as the done card's details.
+	// PR review card: the watcher saves each draft as the card's details, both while it
+	// waits for the Post (needs_you) and after it (done).
 	const prDraft =
-		task.kind === "pr_review" &&
-		task.prReview !== undefined &&
-		task.stage === "done"
+		task.kind === "pr_review" && task.prReview !== undefined
 			? task.details
 			: null;
 	// The Result skips details shown elsewhere: the research report section or the PR review draft.
@@ -8889,21 +8914,24 @@ export function Drawer({
 					    gates the approval. */}
 					{/* A stopped card only interacts through the composer at the very bottom;
 					    the jump link skips the report so no manual scrolling is needed. */}
-					{task.state === "needs_you" && !askedNow && !followUp && (
-						<p className="jump-reply">
-							<button
-								type="button"
-								className="jump-link"
-								onClick={() =>
-									document
-										.getElementById("drawer-reply")
-										?.scrollIntoView({ block: "start" })
-								}
-							>
-								Go to reply ↓
-							</button>
-						</p>
-					)}
+					{task.state === "needs_you" &&
+						!askedNow &&
+						!followUp &&
+						!prReviewOpen && (
+							<p className="jump-reply">
+								<button
+									type="button"
+									className="jump-link"
+									onClick={() =>
+										document
+											.getElementById("drawer-reply")
+											?.scrollIntoView({ block: "start" })
+									}
+								>
+									Go to reply ↓
+								</button>
+							</p>
+						)}
 					{task.state === "needs_you" && task.keptFiles.length > 0 && (
 						<KeptFilesPanel task={task} act={act} onClose={onClose} />
 					)}
@@ -10000,7 +10028,9 @@ export function Drawer({
 							</p>
 						</div>
 					) : (
-						task.state === "needs_you" && (
+						// A PR review posts and asks for drafts in its own section, not this composer.
+						task.state === "needs_you" &&
+						!prReviewOpen && (
 							<form
 								id="drawer-reply"
 								className="reply-form"

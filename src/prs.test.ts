@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import { PROMPT_CHAR_BUDGET } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
+import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
 	fetchReReviewContext,
@@ -95,6 +96,10 @@ function setup(
 	let reviews: unknown[] = [];
 	let issueComments: unknown[] = [];
 	let pullComments: unknown[] = [];
+	/** The inline comments of a posted review (`reviews/<id>/comments`). */
+	let reviewComments: unknown[] = [];
+	/** The model's answer; null gives the numbered default. */
+	let answer: string | null = null;
 	/** null makes the compare GET fail, like a force-pushed branch on GitHub. */
 	let compare: string | null = null;
 	const logs: string[] = [];
@@ -125,6 +130,8 @@ function setup(
 				: (closed.get(n) ?? {});
 			return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 		}
+		if (/\/reviews\/\d+\/comments/.test(path))
+			return { code: 0, stdout: JSON.stringify(reviewComments), stderr: "" };
 		if (path.includes("/reviews"))
 			return { code: 0, stdout: JSON.stringify(reviews), stderr: "" };
 		if (path.includes("/issues/") && path.includes("/comments"))
@@ -156,7 +163,7 @@ function setup(
 			: async (messages) => {
 					prompts.push(messages.map((x) => x.content).join("\n"));
 					if (reviewFail) throw new Error("gateway down");
-					return `  ## Summary\nreview ${prompts.length}\n`;
+					return answer ?? `  ## Summary\nreview ${prompts.length}\n`;
 				},
 	});
 	return {
@@ -188,6 +195,12 @@ function setup(
 		},
 		setPullComments: (v: unknown[]) => {
 			pullComments = v;
+		},
+		setReviewComments: (v: unknown[]) => {
+			reviewComments = v;
+		},
+		setAnswer: (v: string | null) => {
+			answer = v;
 		},
 		setCompare: (v: string | null) => {
 			compare = v;
@@ -437,6 +450,54 @@ describe("review prompt and draft", () => {
 			}),
 		).toBeNull();
 	});
+	test("fetchReReviewContext reads the inline comments of a review matched by commit; a failed read keeps the body", async () => {
+		let commentsFail = false;
+		const paths: string[] = [];
+		const gh: GhFn = async (args) => {
+			const path = args.at(-1) ?? "";
+			paths.push(path);
+			if (path.includes("/reviews/5/comments"))
+				return commentsFail
+					? { code: 1, stdout: "", stderr: "HTTP 500" }
+					: {
+							code: 0,
+							stdout: JSON.stringify([
+								{ path: "src/a.ts", line: 4, body: "Check this." },
+							]),
+							stderr: "",
+						};
+			if (path.includes("/reviews"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([
+						ghReview(5, sha("a"), "earlier", "2026-01-01T00:00:00Z"),
+					]),
+					stderr: "",
+				};
+			return { code: 0, stdout: "[]", stderr: "" };
+		};
+		const o = {
+			repo: "o/r",
+			number: 1,
+			gh,
+			postedHead: sha("a"),
+			// No review id in the URL: the review matches by its commit.
+			postedUrl: null,
+			postedLogin: null,
+			reviewedHead: sha("a"),
+			head: sha("a"),
+			draftBody: null,
+			draftAt: null,
+		};
+		expect((await fetchReReviewContext(o))?.review).toBe(
+			"earlier\n\n<!-- inline src/a.ts:4 -->\nCheck this.\n<!-- /inline -->",
+		);
+		expect(paths).toContain(
+			"repos/o/r/pulls/1/reviews/5/comments?per_page=100",
+		);
+		commentsFail = true;
+		expect((await fetchReReviewContext(o))?.review).toBe("earlier");
+	});
 	test("a same-head re-review renders the no-code-change line; a null range renders the unavailable line", () => {
 		const same = reviewUserMessage({
 			repo: "o/r",
@@ -484,7 +545,7 @@ describe("createPrWatcher", () => {
 		expect(a.calls.length + b.calls.length).toBe(0);
 	});
 
-	test("a new PR waits for the quiet gate, then files exactly one done card with the draft", async () => {
+	test("a new PR waits for the quiet gate, then files exactly one waiting card with the draft", async () => {
 		const s = setup();
 		s.setOpen([pr(7, sha("a"), false, "Add export")]);
 		await s.watcher.tick();
@@ -494,8 +555,9 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		expect(s.cards().length).toBe(1);
 		const card = s.cards()[0]!;
-		expect(card.stage).toBe("done");
-		expect(card.state).toBe("idle");
+		// Open and unposted: the card waits for the user, not in Done.
+		expect(card.stage).toBe("in_progress");
+		expect(card.state).toBe("needs_you");
 		expect(card.details).toBe("## Summary\nreview 1");
 		expect(s.store.getPrReview(7)!.reviewedHead).toBe(sha("a"));
 		expect(s.store.getPrReviewByTask(card.id)!.number).toBe(7);
@@ -567,6 +629,113 @@ describe("createPrWatcher", () => {
 		);
 		// The re-review paragraph reached the system prompt.
 		expect(msg).toContain("re-review");
+	});
+
+	test("an inline block on a diff line stays inline; one outside the diff moves into the body", async () => {
+		const s = setup();
+		s.diffs.set(
+			7,
+			"diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n one\n+two\n three\n",
+		);
+		s.setAnswer(
+			[
+				"Summary.",
+				"",
+				"<!-- inline src/a.ts:2 -->",
+				"Name it.",
+				"```suggestion",
+				"const two = 2;",
+				"```",
+				"<!-- /inline -->",
+				"",
+				"<!-- inline src/a.ts:40 -->",
+				"Far away.",
+				"<!-- /inline -->",
+			].join("\n"),
+		);
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The system prompt names the marker format.
+		expect(s.prompts[0]).toContain("<!-- inline <path>:<line> -->");
+		const draft = parseReviewDraft(s.cards()[0]!.details!);
+		expect(draft.comments).toEqual([
+			{
+				path: "src/a.ts",
+				line: 2,
+				startLine: null,
+				body: "Name it.\n```suggestion\nconst two = 2;\n```",
+			},
+		]);
+		expect(draft.body).toBe("Summary.\n\n**`src/a.ts:40`**\n\nFar away.");
+		expect(s.logs).toContain(
+			"prs: p: #7: 1 inline comment(s) outside the diff moved into the body",
+		);
+	});
+
+	test("a re-review keeps the posted review's inline comments in the earlier review, not in the comment list", async () => {
+		const s = setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(22)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "Earlier summary", "2026-01-01T00:00:00Z"),
+		]);
+		const inline = {
+			...ghComment("bot", "2026-01-02T00:00:00Z", "Off by one."),
+			path: "src/a.ts",
+			line: 2,
+			start_line: null,
+			pull_request_review_id: 1,
+		};
+		s.setReviewComments([
+			inline,
+			// Outdated on the new head: GitHub keeps only the original line.
+			{
+				...ghComment("bot", "2026-01-02T00:00:00Z", "Range note."),
+				path: "src/b.ts",
+				line: null,
+				original_line: 9,
+				start_line: 7,
+				pull_request_review_id: 1,
+			},
+			// Untrusted shapes without a usable path or line are skipped.
+			{ body: "no path here", line: 3 },
+			{ body: "bad line here", path: "src/c.ts", line: "3" },
+		]);
+		// GitHub lists the review's own comments among the PR review comments too.
+		s.setPullComments([
+			inline,
+			{
+				...ghComment("dave", "2026-01-03T00:00:00Z", "A reply"),
+				path: "src/a.ts",
+				line: 2,
+				pull_request_review_id: 2,
+			},
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.calls).toContain(
+			"repos/o/r/pulls/22/reviews/1/comments?per_page=100",
+		);
+		const msg = s.prompts.at(-1)!;
+		expect(msg).toContain(
+			"EARLIER REVIEW\n<<<DATA\nEarlier summary\n\n<!-- inline src/a.ts:2 -->\nOff by one.\n<!-- /inline -->\n\n<!-- inline src/b.ts:7-9 -->\nRange note.\n<!-- /inline -->\nDATA>>>",
+		);
+		expect(msg.split("Off by one.").length - 1).toBe(1);
+		expect(msg).toContain("COMMENT dave 2026-01-03T00:00:00Z");
+		expect(msg).not.toContain("no path here");
+		expect(msg).not.toContain("bad line here");
 	});
 
 	test("the re-review prompt lists earlier findings only while some stay open or partly fixed", async () => {
@@ -887,6 +1056,44 @@ describe("createPrWatcher", () => {
 		expect(s.store.getPrReview(8)!.state).toBe("merged");
 		expect(s.store.getPrReview(9)!.state).toBe("closed");
 		expect(s.cards().length).toBe(0);
+	});
+
+	test("closing or merging a PR moves its waiting card to done/idle", async () => {
+		const s = setup();
+		s.setOpen([pr(8, sha("a")), pr(9, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.cards().map((c) => c.state)).toEqual(["needs_you", "needs_you"]);
+		s.closed.set(8, { merged_at: "2026-01-01T00:00:00Z" });
+		s.closed.set(9, { merged_at: null });
+		s.setOpen([]);
+		await s.watcher.tick();
+		for (const c of s.cards()) {
+			expect(c.stage).toBe("done");
+			expect(c.state).toBe("idle");
+			expect(c.needsReason).toBeNull();
+		}
+	});
+
+	test("a tick moves an open unposted card that an older build left in Done to needs_you", async () => {
+		const s = setup();
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = s.cards()[0]!;
+		s.store.updateTask(card.id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		await s.watcher.tick();
+		expect(s.store.getTask(card.id)).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(s.prompts).toHaveLength(1);
 	});
 
 	test("a vanished-PR state write keeps a post made during its gh call", async () => {

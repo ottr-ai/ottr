@@ -19,6 +19,7 @@ import type {
 import {
 	FORK_HOLD_REASON,
 	MERGE_HOLD_MISMATCH_REASON,
+	PR_REVIEW_WAITING,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
@@ -65,6 +66,7 @@ const {
 	OrphanNotice,
 	ranOnLabel,
 	AuthPage,
+	PrReviewSection,
 } = await import("./app.tsx");
 const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
 	await import("./kit.tsx");
@@ -4161,7 +4163,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 	});
 
 	// OTTR-565: the pr_review drawer's second composer asks for a fresh draft.
-	const prView = (state: "open" | "closed") => ({
+	const prView = (state: "open" | "closed"): PrReviewView => ({
 		number: 7,
 		url: "https://github.com/acme/widget/pull/7",
 		state,
@@ -4200,6 +4202,105 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).not.toContain("Ask for a new draft");
 		expect(html).not.toContain('id="pr-review-note"');
+	});
+
+	// A pr_review card waits as needs_you until its draft is posted; the PR section owns the input.
+	const waitingReview = (): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			id: "P-3",
+			kind: "pr_review",
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: PR_REVIEW_WAITING,
+			// drawerFields parks a merge hold; a PR review card never has one.
+			holdHead: null,
+			prReview: prView("open"),
+		});
+	// The drawer fetches details after mount, so a static Drawer render never has the draft;
+	// the draft-dependent checks render the PR section with the loaded view instead.
+	const section = (
+		card: TaskCard,
+		draft: string,
+		pr = prView("open"),
+	): string => {
+		const view: TaskView = {
+			...card,
+			turns: [],
+			details: draft,
+			report: null,
+			diffFiles: null,
+		};
+		return renderToStaticMarkup(
+			<PrReviewSection
+				task={view}
+				pr={pr}
+				draft={draft}
+				act={async () => true}
+				onLoaded={() => {}}
+			/>,
+		);
+	};
+	const postButton = (html: string): string => {
+		const m = /<button(?:(?!<button)[\s\S])*?Post review<\/button>/.exec(html);
+		if (m === null) throw new Error("no Post review button");
+		return m[0];
+	};
+
+	test("a needs_you pr_review drawer shows the PR section and no generic reply composer", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={waitingReview()} />,
+		);
+		expect(html).toContain('id="pr-review-text"');
+		expect(html).not.toContain('id="drawer-reply"');
+		expect(html).not.toContain("Go to reply");
+		expect(html).not.toContain("New session");
+		// The Post button is the one primary; closed compose dialogs do not count.
+		const visible = html.replace(
+			/<dialog class="dialog"[\s\S]*?<\/dialog>/g,
+			"",
+		);
+		expect(visible.match(/class="primary"/g)).toHaveLength(1);
+	});
+
+	test("a needs_you pr_review draft is postable", () => {
+		const html = section(waitingReview(), "## Summary\nreview");
+		expect(html).toContain("## Summary\nreview</textarea>");
+		expect(postButton(html)).not.toContain("disabled");
+	});
+
+	test("a posted head or a cancelled card keeps Post disabled", () => {
+		const posted = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			postedHead: "c".repeat(40),
+		});
+		expect(postButton(posted)).toContain("disabled");
+		const cancelled = section(
+			{ ...waitingReview(), cancelledAt: 1760000000000 },
+			"## Summary\nreview",
+		);
+		expect(postButton(cancelled)).toContain("disabled");
+		expect(cancelled).toContain("The card is cancelled");
+	});
+
+	test("the pr_review hint counts the inline comments of the draft", () => {
+		const draft = [
+			"## Summary",
+			"Two nits.",
+			"<!-- inline src/a.ts:3 -->",
+			"Rename this.",
+			"<!-- /inline -->",
+			"<!-- inline src/b.ts:4-6 -->",
+			"```suggestion",
+			"const x = 1;",
+			"```",
+			"<!-- /inline -->",
+		].join("\n");
+		const two = section(waitingReview(), draft);
+		expect(two).toMatch(/id="pr-review-inline"[^>]*>2 inline comments/);
+		expect(two).toContain('aria-describedby="pr-review-inline"');
+		const none = section(waitingReview(), "## Summary\nfine");
+		expect(none).toMatch(/id="pr-review-inline"[^>]*>No inline comments/);
 	});
 });
 
@@ -4259,6 +4360,48 @@ describe("LaneCol release hold", () => {
 		expect(html).toContain("All 2 findings are done.");
 		expect(html).toContain("m1, m2");
 		expect(html).toContain("Release again");
+	});
+
+	test("a waiting PR review card shows its reason as a grey line, not an error", () => {
+		const pr = cardFixture({
+			id: "p9",
+			kind: "pr_review",
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: PR_REVIEW_WAITING,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="in_progress"
+				tasks={[pr]}
+				projectTasks={[pr]}
+			/>,
+		);
+		expect(html).toContain(
+			`class="card-error card-silent" title="${PR_REVIEW_WAITING}"`,
+		);
+	});
+
+	test("an unread PR review card still renders in the In progress lane", () => {
+		// Every pr_review card is seenable, so a new one is unread; only Done pins unread cards.
+		const pr = cardFixture({
+			id: "p10",
+			kind: "pr_review",
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: PR_REVIEW_WAITING,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="in_progress"
+				tasks={[pr]}
+				projectTasks={[pr]}
+				unread={() => true}
+			/>,
+		);
+		expect(html.match(/title="Task p10"/g)).toHaveLength(1);
 	});
 
 	test("a release card with an open finding shows no re-release line", () => {

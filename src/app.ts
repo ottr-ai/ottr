@@ -10,7 +10,8 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
@@ -182,6 +183,7 @@ import {
 } from "./orphans.ts";
 import { perfMetrics, turnMedianKey, turnMedians } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
+import { parseReviewDraft, reviewPayloadComments } from "./prInline.ts";
 import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
 import {
 	BOARD_CHECK_PROMPT,
@@ -7978,6 +7980,16 @@ export function createApp(deps: AppDeps) {
 						return json({ error: "body must be a non-empty string" }, 400);
 					if (body.length > REVIEW_BODY_MAX)
 						return json({ error: "body is too long" }, 400);
+					const draft = parseReviewDraft(body);
+					if (draft.comments.length > 0 && draft.body === "")
+						return json(
+							{ error: "write a summary above the inline comments" },
+							400,
+						);
+					const comments =
+						draft.comments.length > 0
+							? { comments: reviewPayloadComments(draft.comments) }
+							: {};
 					const found = resolveTask(req.params.project, req.params.id);
 					if (found instanceof Response) return found;
 					const { e, task } = found;
@@ -7987,12 +7999,8 @@ export function createApp(deps: AppDeps) {
 							: null;
 					if (row === null || e.github === null)
 						return json({ error: "not a PR review card" }, 409);
-					// The watcher saves each draft as the done card's details.
-					if (
-						task.stage !== "done" ||
-						task.state !== "idle" ||
-						task.details === null
-					)
+					// The watcher saves each draft as the card's details; a cancelled card has none to post.
+					if (task.cancelledAt !== null || task.details === null)
 						return json({ error: "no draft to post" }, 409);
 					if (row.state !== "open")
 						return json({ error: `PR is ${row.state}` }, 409);
@@ -8043,8 +8051,9 @@ export function createApp(deps: AppDeps) {
 											event: "COMMENT",
 											// No footer: the review posts as the app, so GitHub's Bot badge
 											// already says who posted it.
-											body: body,
+											body: draft.body,
 											commit_id: head,
+											...comments,
 										}),
 									},
 								);
@@ -8068,24 +8077,33 @@ export function createApp(deps: AppDeps) {
 						}
 					}
 					if (stdout === null) {
-						// argv array, no shell: body and head never reach a command line parser.
+						// argv array, no shell; the payload goes in a private temp file, so body,
+						// comments and head never reach a command line parser.
+						const payload = {
+							event: "COMMENT",
+							body: `${draft.body}${REVIEW_FOOTER}`,
+							commit_id: head,
+							...comments,
+						};
 						let res: { code: number; stdout: string; stderr: string };
+						let dir: string | null = null;
 						try {
+							dir = await mkdtemp(join(tmpdir(), "ottr-review-"));
+							const file = join(dir, "review.json");
+							await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
 							res = await gh([
 								"api",
 								`repos/${repo}/pulls/${row.number}/reviews`,
 								"-X",
 								"POST",
-								"-f",
-								"event=COMMENT",
-								"-f",
-								`body=${body}${REVIEW_FOOTER}`,
-								"-f",
-								`commit_id=${head}`,
+								"--input",
+								file,
 							]);
 						} catch (err) {
-							// A spawn failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
+							// A spawn or temp file failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
 							res = { code: -1, stdout: "", stderr: errmsg(err) };
+						} finally {
+							if (dir !== null) await rm(dir, { recursive: true, force: true });
 						}
 						if (res.code !== 0) {
 							const error =
@@ -8132,7 +8150,9 @@ export function createApp(deps: AppDeps) {
 						// No parseable body: the drawer just shows the posted head without a link.
 					}
 					e.store.setPrPostedUrl(row.number, url, login);
-					return json({ ok: true, login, via });
+					// The head is posted: the card leaves needs_you for done/idle.
+					e.store.syncPrCard(row.number);
+					return json({ ok: true, login, via, inline: draft.comments.length });
 				}),
 		},
 		"/api/projects/:project/github": {

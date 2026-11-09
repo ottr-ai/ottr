@@ -3530,7 +3530,7 @@ describe("pr review store methods", () => {
 		expect(store.lastPrRunAt(12, "xyz")).toBeNull();
 	});
 
-	test("savePrDraft files one done card, then updates the same card; only saved heads count as reviewed", () => {
+	test("savePrDraft files one waiting card, then updates the same card; only saved heads count as reviewed", () => {
 		const store = open(join(root, "pr-draft"));
 		expect(() =>
 			store.savePrDraft({
@@ -3554,8 +3554,12 @@ describe("pr review store methods", () => {
 		});
 		expect(card.kind).toBe("pr_review");
 		expect(card.title).toBe("PR review: #12 Fix the thing");
-		expect(card.stage).toBe("done");
-		expect(card.state).toBe("idle");
+		// An open PR with an unposted draft waits for the user.
+		expect(card.stage).toBe("in_progress");
+		expect(card.state).toBe("needs_you");
+		expect(card.needsReason).toBe(
+			"Review the draft, then post it to GitHub or ask for a new draft.",
+		);
 		expect(card.details).toBe("## Summary\nok");
 		expect(card.topic).toBe("pr review");
 		expect(store.prHeadReviewed(12, "abc")).toBe(true);
@@ -3578,11 +3582,79 @@ describe("pr review store methods", () => {
 		expect(again.details).toBe("second");
 		expect(again.prompt).toBe("review 2");
 		expect(store.listTasks()).toHaveLength(1);
+		// A merged PR has nothing left to post.
+		expect(again.stage).toBe("done");
+		expect(again.state).toBe("idle");
+		expect(again.needsReason).toBeNull();
 		expect(store.getPrReview(12)).toMatchObject({
 			reviewedHead: "def",
 			state: "merged",
 		});
 		expect(store.prReviewRunsSince(0)).toBe(2);
+	});
+
+	test("syncPrCard places the card from its row and writes only on a difference", () => {
+		const store = open(join(root, "pr-sync"));
+		store.savePrReview(row);
+		const card = store.savePrDraft({
+			run: store.startPrRun(12, "abc", 1),
+			number: 12,
+			head: "abc",
+			draft: "d",
+			prompt: "p",
+		});
+		expect(card.state).toBe("needs_you");
+		// Posted head: done/idle, done_at stamped once.
+		store.savePrReview({ ...store.getPrReview(12)!, postedHead: "abc" });
+		store.syncPrCard(12);
+		const done = store.getTask(card.id)!;
+		expect(done).toMatchObject({
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		expect(done.doneAt).not.toBeNull();
+		Bun.sleepSync(5);
+		store.syncPrCard(12);
+		const same = store.getTask(card.id)!;
+		expect(same.doneAt).toBe(done.doneAt);
+		expect(same.updatedAt).toBe(done.updatedAt);
+		// A new head's draft on the posted card waits again.
+		const again = store.savePrDraft({
+			run: store.startPrRun(12, "def", 2),
+			number: 12,
+			head: "def",
+			draft: "d2",
+			prompt: "p",
+		});
+		expect(again).toMatchObject({ stage: "in_progress", state: "needs_you" });
+		// Closed: done/idle.
+		store.setPrState(12, "closed");
+		store.syncPrCard(12);
+		expect(store.getTask(card.id)).toMatchObject({
+			stage: "done",
+			state: "idle",
+		});
+		// Reopened: waits again.
+		store.setPrState(12, "open");
+		store.syncPrCard(12);
+		expect(store.getTask(card.id)).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		// A cancelled card stays as it is.
+		store.updateTask(card.id, { cancelledAt: 5 });
+		store.setPrState(12, "merged");
+		store.syncPrCard(12);
+		expect(store.getTask(card.id)).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		// No card: no throw, no write.
+		store.savePrReview({ ...row, number: 13 });
+		store.syncPrCard(13);
+		store.syncPrCard(99);
+		expect(store.listTasks()).toHaveLength(1);
 	});
 
 	test("an old database gains the pr_review tables on open, same shape as fresh", () => {

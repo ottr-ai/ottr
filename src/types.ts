@@ -1314,6 +1314,9 @@ export const REVIEW_FOOTER =
 	"\n\n---\n<sub>Drafted by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker. A person read the draft and posted it.</sub>";
 /** GitHub's limit on a review body (65536 characters) minus the footer: the editable draft's limit. */
 export const REVIEW_BODY_MAX = 65536 - REVIEW_FOOTER.length;
+/** The card's needsReason while a PR review draft waits for the user to post it. */
+export const PR_REVIEW_WAITING =
+	"Review the draft, then post it to GitHub or ask for a new draft.";
 
 /** Time ranges the performance dashboard can filter by. */
 export const PERF_RANGES = ["1h", "24h", "7d", "30d", "90d", "all"] as const;

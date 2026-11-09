@@ -7181,6 +7181,10 @@ button.log-mode[aria-pressed="true"] {
 	text-transform: uppercase;
 	color: var(--dim);
 }
+/* The PR review hint names marker lines: each marker stays whole on one line. */
+.pr-inline-hint code {
+	white-space: nowrap;
+}
 .reply-actions {
 	display: flex;
 	flex-wrap: wrap;

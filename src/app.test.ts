@@ -8486,9 +8486,9 @@ describe("read marks (/api/seen)", () => {
 			draft: "the draft",
 			prompt: "review",
 		});
-		// The watcher files the card done with the draft as its details.
+		// The watcher files the card with the draft as its details; it waits for a Post.
 		expect(pr.kind).toBe("pr_review");
-		expect(pr.stage).toBe("done");
+		expect(pr.state).toBe("needs_you");
 		const res = await post("/api/seen", { ids: [pr.id] });
 		expect(res.status).toBe(200);
 		expect(await seenIn()).toContain(pr.id);
@@ -9610,6 +9610,10 @@ describe("PR review routes", () => {
 		archReview: null,
 	});
 	const ghCalls: string[][] = [];
+	/** The JSON payload of each `gh api ... --input <file>` call, read inside the fake: the
+	 *  route deletes the file after the call. */
+	const ghPayloads: unknown[] = [];
+	const ghInputFiles: string[] = [];
 	let ghResult = { code: 0, stdout: "{}", stderr: "" };
 	/** Runs inside the fake gh call, after the route's checks: a race window for tests. */
 	let ghHook: (() => Promise<void>) | null = null;
@@ -9622,7 +9626,7 @@ describe("PR review routes", () => {
 	const prPrompts: string[] = [];
 	/** Canned answers for the read-only gh API GETs a re-review reads; null falls through.
 	 * Only bare two-argument `gh api <path>` calls match: the diff fetch carries -H, and a
-	 * review POST carries -X/-f, so both keep the ghResult flow. */
+	 * review POST carries -X/--input, so both keep the ghResult flow. */
 	const prApiStub = (
 		args: string[],
 	): { code: number; stdout: string; stderr: string } | null => {
@@ -9662,6 +9666,12 @@ describe("PR review routes", () => {
 		projects: prProjects,
 		gh: async (args) => {
 			ghCalls.push(args);
+			const input = args.indexOf("--input");
+			if (input !== -1) {
+				const file = args[input + 1]!;
+				ghInputFiles.push(file);
+				ghPayloads.push(JSON.parse(readFileSync(file, "utf8")));
+			}
 			await ghHook?.();
 			// The read-only GET routes a re-review fetches get canned answers; everything
 			// else (diffs, review POSTs) keeps the ghResult flow.
@@ -9692,6 +9702,8 @@ describe("PR review routes", () => {
 	});
 	beforeEach(() => {
 		ghCalls.length = 0;
+		ghPayloads.length = 0;
+		ghInputFiles.length = 0;
 		ghResult = { code: 0, stdout: "{}", stderr: "" };
 		ghHook = null;
 		appCalls.length = 0;
@@ -9735,18 +9747,19 @@ describe("PR review routes", () => {
 			head: prStore.getPrReviewByTask(id)?.reviewedHead,
 			...body,
 		});
-	const expectedArgv = (n: number, body: string, head: string) => [
+	const expectedArgv = (n: number) => [
 		"api",
 		`repos/acme/widget/pulls/${n}/reviews`,
 		"-X",
 		"POST",
-		"-f",
-		"event=COMMENT",
-		"-f",
-		`body=${body}${REVIEW_FOOTER}`,
-		"-f",
-		`commit_id=${head}`,
+		"--input",
+		expect.any(String),
 	];
+	const expectedPayload = (body: string, head: string) => ({
+		event: "COMMENT",
+		body: `${body}${REVIEW_FOOTER}`,
+		commit_id: head,
+	});
 
 	test("project settings route accepts prReviews and rejects non-boolean", async () => {
 		const ok = await post("/api/projects/p1/settings", { prReviews: true });
@@ -9861,17 +9874,85 @@ describe("PR review routes", () => {
 		expect(ghCalls).toEqual([]);
 		const full = "x".repeat(REVIEW_BODY_MAX);
 		expect((await postReview(t.id, { body: full })).status).toBe(200);
-		const sent = ghCalls[0]!.find((a) => a.startsWith("body="))!.slice(5);
-		expect(sent).toBe(full + REVIEW_FOOTER);
-		expect(sent.length).toBe(65536);
+		expect(ghPayloads).toEqual([expectedPayload(full, H1)]);
+		expect(full.length + REVIEW_FOOTER.length).toBe(65536);
 		expect(REVIEW_FOOTER).toContain("Ottr");
+	});
+
+	test("post sends inline blocks as review comments through a gh --input file it removes", async () => {
+		const t = reviewed(42, H1);
+		const body = [
+			"Summary here.",
+			"",
+			"<!-- inline src/a.ts:3 -->",
+			"Off by one.",
+			"<!-- /inline -->",
+			"",
+			"<!-- inline src/b.ts:5-7 -->",
+			"Use a loop.",
+			"```suggestion",
+			"for (const x of xs) f(x);",
+			"```",
+			"<!-- /inline -->",
+		].join("\n");
+		const res = await postReview(t.id, { body });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: null,
+			via: "token",
+			inline: 2,
+		});
+		expect(ghCalls).toEqual([expectedArgv(42)]);
+		expect(ghPayloads).toEqual([
+			{
+				event: "COMMENT",
+				body: `Summary here.${REVIEW_FOOTER}`,
+				commit_id: H1,
+				comments: [
+					{ path: "src/a.ts", line: 3, side: "RIGHT", body: "Off by one." },
+					{
+						path: "src/b.ts",
+						line: 7,
+						side: "RIGHT",
+						body: "Use a loop.\n```suggestion\nfor (const x of xs) f(x);\n```",
+						start_line: 5,
+						start_side: "RIGHT",
+					},
+				],
+			},
+		]);
+		// The payload file sat in its own temp dir, gone after the call.
+		expect(existsSync(dirname(ghInputFiles[0]!))).toBe(false);
+		expect(row(42).postedHead).toBe(H1);
+	});
+
+	test("post refuses inline comments without a summary and sends nothing", async () => {
+		const t = reviewed(43, H1);
+		const res = await postReview(t.id, {
+			body: "<!-- inline src/a.ts:3 -->\nOff by one.\n<!-- /inline -->",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"write a summary above the inline comments",
+		);
+		expect(ghCalls).toEqual([]);
+		expect(row(43).postedHead).toBeNull();
 	});
 
 	test("post sends one COMMENT review at the reviewed head, then refuses the same head", async () => {
 		const t = reviewed(1, H1);
+		expect(t).toMatchObject({ stage: "in_progress", state: "needs_you" });
 		const res = await postReview(t.id, { body: "Looks good." });
 		expect(res.status).toBe(200);
-		expect(ghCalls).toEqual([expectedArgv(1, "Looks good.", H1)]);
+		// The posted head moves the waiting card to done/idle.
+		expect(prStore.getTask(t.id)).toMatchObject({
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		expect(ghCalls).toEqual([expectedArgv(1)]);
+		expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
 		expect(row(1).postedHead).toBe(H1);
 		// The default gh body is "{}": no parseable html_url, no link.
 		expect(row(1).postedUrl).toBeNull();
@@ -9913,7 +9994,8 @@ describe("PR review routes", () => {
 		expect(reviewed(2, H2).id).toBe(t.id);
 		const res = await postReview(t.id, { body: "second" });
 		expect(res.status).toBe(200);
-		expect(ghCalls.at(-1)).toEqual(expectedArgv(2, "second", H2));
+		expect(ghCalls.at(-1)).toEqual(expectedArgv(2));
+		expect(ghPayloads.at(-1)).toEqual(expectedPayload("second", H2));
 		expect(row(2).postedHead).toBe(H2);
 	});
 
@@ -9928,7 +10010,8 @@ describe("PR review routes", () => {
 		expect(ghCalls).toHaveLength(0);
 		expect(row(14).postedHead).toBeNull();
 		expect((await postReview(t.id, { body: "B", head: H2 })).status).toBe(200);
-		expect(ghCalls).toEqual([expectedArgv(14, "B", H2)]);
+		expect(ghCalls).toEqual([expectedArgv(14)]);
+		expect(ghPayloads).toEqual([expectedPayload("B", H2)]);
 	});
 
 	test("post refuses a closed PR", async () => {
@@ -9959,13 +10042,26 @@ describe("PR review routes", () => {
 		expect(ghCalls).toHaveLength(0);
 	});
 
+	test("post refuses a cancelled card", async () => {
+		const t = reviewed(17, H1);
+		prStore.updateTask(t.id, { cancelledAt: Date.now() });
+		const res = await postReview(t.id, { body: "x" });
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no draft to post");
+		expect(ghCalls).toHaveLength(0);
+	});
+
 	test("a gh failure returns 502, stores the error and keeps postedHead null", async () => {
 		const t = reviewed(6, H1);
 		ghResult = { code: 1, stdout: "", stderr: "  HTTP 422: nope\n" };
 		const res = await postReview(t.id, { body: "fail" });
 		expect(res.status).toBe(502);
-		expect(await errorOf(res)).toBe("HTTP 422: nope");
 		expect(row(6).postError).toBe("HTTP 422: nope");
+		// A failed Post keeps the card waiting.
+		expect(prStore.getTask(t.id)).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
 		expect(row(6).postedHead).toBeNull();
 		expect(row(6).postedUrl).toBeNull();
 	});
@@ -10262,8 +10358,10 @@ describe("PR review routes", () => {
 			ok: true,
 			login: "octocat",
 			via: "token",
+			inline: 0,
 		});
-		expect(ghCalls).toEqual([expectedArgv(20, "Looks good.", H1)]);
+		expect(ghCalls).toEqual([expectedArgv(20)]);
+		expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
 		expect(appCalls).toEqual([]);
 		expect(row(20).postedLogin).toBe("octocat");
 	});
@@ -10286,9 +10384,11 @@ describe("PR review routes", () => {
 			ok: true,
 			login: "octocat",
 			via: "token",
+			inline: 0,
 		});
 		expect(appCalls.some((c) => c.url.endsWith("/installation"))).toBe(true);
-		expect(ghCalls).toEqual([expectedArgv(21, "Looks good.", H1)]);
+		expect(ghCalls).toEqual([expectedArgv(21)]);
+		expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
 		await removeApp();
 	});
 
@@ -10305,6 +10405,7 @@ describe("PR review routes", () => {
 			ok: true,
 			login: "ottr[bot]",
 			via: "app",
+			inline: 0,
 		});
 		expect(ghCalls).toEqual([]);
 		const mint = appCalls.find((c) => c.url.endsWith("/installation"))!;
@@ -10334,6 +10435,36 @@ describe("PR review routes", () => {
 		await removeApp();
 	});
 
+	test("an app post carries the inline comments and no footer", async () => {
+		await saveApp();
+		appHappyPath({
+			html_url: "https://github.com/acme/widget/pull/44#review-1",
+			user: { login: "ottr[bot]" },
+		});
+		const t = reviewed(44, H1);
+		const res = await postReview(t.id, {
+			body: "Ship it.\n\n<!-- inline src/a.ts:3 -->\nOff by one.\n<!-- /inline -->",
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "ottr[bot]",
+			via: "app",
+			inline: 1,
+		});
+		expect(ghCalls).toEqual([]);
+		const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+		expect(JSON.parse(postCall.init!.body as string)).toEqual({
+			event: "COMMENT",
+			body: "Ship it.",
+			commit_id: H1,
+			comments: [
+				{ path: "src/a.ts", line: 3, side: "RIGHT", body: "Off by one." },
+			],
+		});
+		await removeApp();
+	});
+
 	test("on another host the app mint and the review post sit on that host's API base", async () => {
 		const savedHost = process.env.OTTR_GITHUB_HOST;
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
@@ -10350,6 +10481,7 @@ describe("PR review routes", () => {
 				ok: true,
 				login: "ottr[bot]",
 				via: "app",
+				inline: 0,
 			});
 			const mint = appCalls.find((c) => c.url.endsWith("/installation"))!;
 			expect(mint.url).toBe(
