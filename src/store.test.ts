@@ -3234,8 +3234,9 @@ describe("fork research store methods", () => {
 			{ ...row, head: "def", retries: 2, lastError: "boom" },
 		]);
 		expect(store.listAllForkBranches()).toHaveLength(1);
-		store.saveForkBranch({ ...row, holdPrs: [5], holdBase: null });
-		expect(store.listForkBranches(1)[0]!.holdPrs).toEqual([5]);
+		const hold = [{ n: 5, head: "h5" }];
+		store.saveForkBranch({ ...row, holdPrs: hold, holdBase: null });
+		expect(store.listForkBranches(1)[0]!.holdPrs).toEqual(hold);
 	});
 
 	test("forkRunsSince counts recorded runs", () => {
@@ -3276,7 +3277,13 @@ describe("fork research store methods", () => {
 					branchHash: "h1",
 					head: "abc",
 					at: 42,
-					hold: { prs: [3, 4], base: "base0" },
+					hold: {
+						prs: [
+							{ n: 3, head: "h3" },
+							{ n: 4, head: "h4" },
+						],
+						base: "base0",
+					},
 				},
 			],
 		});
@@ -3305,7 +3312,10 @@ describe("fork research store methods", () => {
 		expect(branch.lastRunAt).toBe(42);
 		expect(branch.lastError).toBeNull();
 		expect(branch.retries).toBe(0);
-		expect(branch.holdPrs).toEqual([3, 4]);
+		expect(branch.holdPrs).toEqual([
+			{ n: 3, head: "h3" },
+			{ n: 4, head: "h4" },
+		]);
 		expect(branch.holdBase).toBe("base0");
 	});
 });
@@ -3946,9 +3956,13 @@ describe("pr review store methods", () => {
 		const store = open(dir);
 		const row = store.listForkBranches(1)[0]!;
 		expect(row).toMatchObject({ head: "b", holdPrs: null, holdBase: null });
-		store.saveForkBranch({ ...row, holdPrs: [2], holdBase: "a" });
+		store.saveForkBranch({
+			...row,
+			holdPrs: [{ n: 2, head: "h2" }],
+			holdBase: "a",
+		});
 		expect(store.listForkBranches(1)[0]).toMatchObject({
-			holdPrs: [2],
+			holdPrs: [{ n: 2, head: "h2" }],
 			holdBase: "a",
 		});
 		store.close();

@@ -328,16 +328,25 @@ interface ForkBranchRow {
 	hold_base: string | null;
 }
 
-/** Stored hold list: a JSON array of positive PR numbers; anything else reads as no hold. */
-function parseHoldPrs(s: string | null): number[] | null {
+/** Stored hold list: a JSON array of `{ n, head }` entries; anything else reads as no hold. */
+function parseHoldPrs(s: string | null): ForkBranchState["holdPrs"] {
 	if (s === null) return null;
 	try {
 		const v: unknown = JSON.parse(s);
 		if (!Array.isArray(v)) return null;
-		const ns = v.filter(
-			(n): n is number => typeof n === "number" && Number.isInteger(n) && n > 0,
-		);
-		return ns.length > 0 ? ns : null;
+		const out: Array<{ n: number; head: string }> = [];
+		for (const e of v) {
+			if (typeof e !== "object" || e === null) continue;
+			const { n, head } = e as Record<string, unknown>;
+			if (
+				typeof n === "number" &&
+				Number.isInteger(n) &&
+				n > 0 &&
+				typeof head === "string"
+			)
+				out.push({ n, head });
+		}
+		return out.length > 0 ? out : null;
 	} catch {
 		return null;
 	}
@@ -1940,7 +1949,10 @@ export class ProjectStore {
 			head: string;
 			at: number;
 			/** The branch's hold after this run (see ForkBranchState.holdPrs). */
-			hold: { prs: number[]; base: string | null } | null;
+			hold: {
+				prs: NonNullable<ForkBranchState["holdPrs"]>;
+				base: string | null;
+			} | null;
 		}>;
 	}): Task {
 		let cardId = "";

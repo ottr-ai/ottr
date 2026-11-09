@@ -225,6 +225,36 @@ export async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {
 	return pulls;
 }
 
+/**
+ * State of a PR the open list no longer shows: whether it merged and its final head SHA.
+ * Returns null while GitHub still shows it open. Throws on a gh failure or a malformed
+ * body, so callers never guess a state.
+ */
+export async function pullState(
+	repo: string,
+	n: number,
+	gh: GhFn,
+): Promise<{ merged: boolean; head: string } | null> {
+	const r = await gh(["api", `repos/${repo}/pulls/${n}`]);
+	if (r.code !== 0)
+		throw new Error(
+			`gh pull ${n} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+		);
+	const body: unknown = JSON.parse(r.stdout);
+	if (typeof body !== "object" || body === null)
+		throw new Error(`gh pull ${n}: not an object`);
+	const x = body as Record<string, unknown>;
+	if (x.state === "open") return null;
+	const head = x.head as Record<string, unknown> | null | undefined;
+	const sha = typeof head === "object" && head !== null ? head.sha : undefined;
+	if (x.state !== "closed" || typeof sha !== "string" || !SHA_RE.test(sha))
+		throw new Error(`gh pull ${n}: unreadable state`);
+	return {
+		merged: typeof x.merged_at === "string" && x.merged_at !== "",
+		head: sha,
+	};
+}
+
 /** One conversation or review comment on the PR under re-review. */
 export interface PrComment {
 	author: string;

@@ -680,10 +680,11 @@ export interface ForkBranchState {
 	/** Consecutive failed analysis attempts; at 3 the range pauses until a manual check succeeds. */
 	retries: number;
 	/**
-	 * Open PRs whose commits this branch's cursor moved past without analysis; null = no hold.
-	 * When one of them closes without a merge, the cursor returns to `holdBase`.
+	 * PRs whose commits this branch's cursor moved past without analysis, each with the PR
+	 * head the work was judged against; null = no hold. When a PR gets another head or closes
+	 * without a merge, the cursor returns to `holdBase`.
 	 */
-	holdPrs: number[] | null;
+	holdPrs: Array<{ n: number; head: string }> | null;
 	/** Cursor before the first held run (null = from upstream); meaningful only with `holdPrs`. */
 	holdBase: string | null;
 }

@@ -619,6 +619,8 @@ describe("watcher", () => {
 	) {
 		const state = {
 			pulls,
+			/** merged_at and final head of each closed PR the fake GitHub knows. */
+			closed: new Map<number, { merged_at: string | null; head: string }>(),
 			clock: Date.now(),
 			ghCalls: [] as string[],
 			subjects: [] as string[][],
@@ -638,12 +640,16 @@ describe("watcher", () => {
 			gh: async (args) => {
 				const url = args.at(-1) ?? "";
 				state.ghCalls.push(url);
-				const body = url.startsWith("repos/o/main/pulls")
-					? state.pulls
-					: forks.map((f) => ({
-							...forkPageEntry(f.id),
-							owner: { login: f.owner },
-						}));
+				const one = url.match(/^repos\/o\/main\/pulls\/(\d+)$/);
+				const c = one ? state.closed.get(Number(one[1])) : undefined;
+				const body = c
+					? { state: "closed", merged_at: c.merged_at, head: { sha: c.head } }
+					: url.startsWith("repos/o/main/pulls")
+						? state.pulls
+						: forks.map((f) => ({
+								...forkPageEntry(f.id),
+								owner: { login: f.owner },
+							}));
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
 			git: (args, cwd, timeoutMs) => {
@@ -815,8 +821,9 @@ describe("watcher", () => {
 		const feat = () =>
 			store.listAllForkBranches().find((r) => r.branch === "feat")!;
 		expect(feat().analyzedHead).toBe(feat().head);
-		expect(feat().holdPrs).toEqual([2]);
+		expect(feat().holdPrs).toEqual([{ n: 2, head: pr.head.sha }]);
 		state.pulls = [];
+		state.closed.set(2, { merged_at: null, head: pr.head.sha });
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects).toEqual([["fork feature"]]);
@@ -846,40 +853,40 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(state.subjects).toEqual([["Other work"]]);
 		state.pulls = [];
+		state.closed.set(2, { merged_at: null, head: pr.head.sha });
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects.length).toBe(2);
 		expect(state.subjects[1]).toContain("PR work");
 	});
 
-	test("a merged PR ends the hold without a new analysis once upstream holds its work", async () => {
-		const name = "watch-hold-merged";
-		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
-		const forkDir = await makeFork(`${name}-fork`, main);
-		const pr = await openPr(main, forkDir, "feat", 2, 99);
-		const { watcher, state } = prWatcher(
-			name,
-			main,
-			store,
-			[{ id: 1, owner: "o", dir: forkDir }],
-			[pr],
-		);
-		await watcher.tick();
-		// The merge brings the PR head into upstream.
-		await run(["merge", "-q", "--ff-only", "refs/pull/2/head", main], main);
-		state.pulls = [];
-		state.clock += 2 * DAY;
-		await watcher.tick();
-		expect(state.subjects).toEqual([]);
-		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
-		expect(feat.holdPrs).toBeNull();
-		expect(feat.analyzedHead).toBe(feat.head);
-	});
+	// Merged with the held head: the work arrived, so a squash merge or a merge the local
+	// checkout has not pulled yet (upstream here never gets pr.txt) files nothing new.
+	for (const other of [false, true])
+		test(`a PR merged with the held head ends the hold without a new analysis${other ? ", next to analyzed work" : ""}`, async () => {
+			const { watcher, state, store, pr } = await heldPrFork(
+				`watch-hold-merged-${other}`,
+				other,
+			);
+			await watcher.tick();
+			const before = state.subjects.length;
+			state.pulls = [];
+			state.closed.set(2, {
+				merged_at: "2026-11-09T00:00:00Z",
+				head: pr.head.sha,
+			});
+			state.clock += 2 * DAY;
+			await watcher.tick();
+			expect(state.subjects.length).toBe(before);
+			const feat = store
+				.listAllForkBranches()
+				.find((r) => r.branch === "feat")!;
+			expect(feat.holdPrs).toBeNull();
+			expect(feat.analyzedHead).toBe(feat.head);
+		});
 
 	/** A fork whose `feat` holds "PR work" (and optionally "Other work" on top) behind PR 2. */
-	async function rewrittenPrFork(name: string, other: boolean) {
+	async function heldPrFork(name: string, other: boolean) {
 		const main = await initUpstream(name);
 		const store = ProjectStore.init(main);
 		store.setSettings({ forkResearch: true });
@@ -898,24 +905,54 @@ describe("watcher", () => {
 			[{ id: 1, owner: "o", dir: forkDir }],
 			[pr],
 		);
-		return { main, ...w };
+		return { main, store, pr, ...w };
 	}
 
-	for (const other of [false, true])
-		test(`held work comes back when the PR drops it before its merge${other ? ", next to analyzed work" : ""}`, async () => {
-			const { main, watcher, state } = await rewrittenPrFork(
-				`watch-hold-rewrite-${other}`,
+	/** Force-pushes PR `n` in the upstream fixture to a new commit without the held work. */
+	async function rewritePr(main: string, n: number): Promise<string> {
+		writeFileSync(join(main, "rw.txt"), "rewritten\n");
+		await run(["add", "rw.txt", main], main);
+		const tree = await run(["write-tree", main], main);
+		await run(["reset", "-q", main], main);
+		const sha = await run(
+			["commit-tree", tree, "-p", "HEAD", "-m", "Rewritten", main],
+			main,
+		);
+		await run(["update-ref", `refs/pull/${n}/head`, sha, main], main);
+		return sha;
+	}
+
+	for (const other of [false, true]) {
+		const next = other ? ", next to analyzed work" : "";
+		test(`held work comes back when an open PR drops it${next}`, async () => {
+			const { main, watcher, state, pr } = await heldPrFork(
+				`watch-hold-open-rewrite-${other}`,
 				other,
 			);
 			await watcher.tick();
 			expect(state.subjects).toEqual(other ? [["Other work"]] : []);
-			// Force-pushed PR: its merge brings other content, never pr.txt.
-			await commitFile(main, "rw.txt", "Rewritten");
-			state.pulls = [];
+			const sha = await rewritePr(main, 2);
+			state.pulls = [{ ...pr, head: { ...pr.head, sha } }];
 			state.clock += 2 * DAY;
 			await watcher.tick();
 			expect(state.subjects.at(-1)).toContain("PR work");
 		});
+
+		test(`held work comes back when the PR drops it before its merge${next}`, async () => {
+			const { main, watcher, state } = await heldPrFork(
+				`watch-hold-rewrite-${other}`,
+				other,
+			);
+			await watcher.tick();
+			const sha = await rewritePr(main, 2);
+			state.pulls = [];
+			state.closed.set(2, { merged_at: "2026-11-09T00:00:00Z", head: sha });
+			state.clock += 2 * DAY;
+			await watcher.tick();
+			expect(state.subjects.at(-1)).toContain("PR work");
+			expect(state.subjects.at(-1)).not.toContain("Rewritten");
+		});
+	}
 
 	test("a failed open-PR listing ports nothing", async () => {
 		const name = "watch-pr-fail";
