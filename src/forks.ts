@@ -9,12 +9,13 @@ import {
 } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
 import { isProposalReason } from "./prompts.ts";
-import { listPulls, type PullInfo } from "./prs.ts";
+import { listPulls, type PullInfo, pullMerged } from "./prs.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
 	ForkAnalysisResult,
+	ForkBranchState,
 	ForkCommit,
 	ForkInfo,
 	ForkRange,
@@ -232,7 +233,7 @@ export async function fetchFork(
  * Non-merge new work of one branch: exact-SHA intersection of the analysis-base and upstream
  * comparisons, so rewritten commits already analyzed count as new only when they carry work
  * upstream lacks. Commits reachable from an `exclude` ref, or patch-equal to one of them,
- * are left out.
+ * are left out; `held` names each exclude ref that removed at least one commit or merge.
  */
 export async function rangeCommits(
 	cachePath: string,
@@ -241,7 +242,7 @@ export async function rangeCommits(
 	upstreamHead: string,
 	git: GitFn,
 	exclude: string[] = [],
-): Promise<{ shas: string[]; merges: string[] }> {
+): Promise<{ shas: string[]; merges: string[]; held: string[] }> {
 	const base = analyzedHead ?? upstreamHead;
 	const run = (args: string[]) =>
 		git(["rev-list", ...args], cachePath, 60_000).then((r) => {
@@ -251,28 +252,38 @@ export async function rangeCommits(
 				);
 			return r.stdout.split("\n").filter(Boolean);
 		});
-	// The analysis base defines the range; every later left side only narrows it.
-	let shas: string[] | null = null;
-	for (const left of [
-		base,
-		...(analyzedHead !== null ? [upstreamHead] : []),
-		...exclude,
-	]) {
-		const right = await run([
-			"--no-merges",
-			"--cherry-pick",
-			"--right-only",
-			`${left}...${head}`,
-		]);
-		const keep = new Set(right);
-		shas = shas === null ? right : shas.filter((s) => keep.has(s));
+	const rightOf = (left: string) =>
+		run(["--no-merges", "--cherry-pick", "--right-only", `${left}...${head}`]);
+	// The analysis base defines the range; the upstream side only narrows it.
+	let shas = await rightOf(base);
+	if (analyzedHead !== null) {
+		const up = new Set(await rightOf(upstreamHead));
+		shas = shas.filter((s) => up.has(s));
 	}
-	const merges = await run([
-		"--merges",
-		`${base}..${head}`,
-		...exclude.map((e) => `^${e}`),
-	]);
-	return { shas: shas ?? [], merges };
+	const allMerges = await run(["--merges", `${base}..${head}`]);
+	// Each exclude ref is judged against the unexcluded range, so every PR that covers a
+	// commit is held, not only the first one.
+	const held: string[] = [];
+	let kept = shas;
+	for (const ref of exclude) {
+		const keep = new Set(await rightOf(ref));
+		const mergesLeft =
+			allMerges.length === 0
+				? 0
+				: (await run(["--merges", `${base}..${head}`, `^${ref}`])).length;
+		if (shas.some((s) => !keep.has(s)) || mergesLeft < allMerges.length)
+			held.push(ref);
+		kept = kept.filter((s) => keep.has(s));
+	}
+	const merges =
+		held.length === 0
+			? allMerges
+			: await run([
+					"--merges",
+					`${base}..${head}`,
+					...held.map((e) => `^${e}`),
+				]);
+	return { shas: kept, merges, held };
 }
 
 function errSnippet(e: string, code: number, stderr: string): Error {
@@ -300,7 +311,10 @@ function parseShow(out: string): {
 	return { sha, subject, patch };
 }
 
-/** One upstream fetch into the cache plus the full ForkRange for the pending branches. */
+/**
+ * One upstream fetch into the cache plus the full ForkRange for the pending branches.
+ * `held` maps a branch hash to the exclude refs that removed work from that branch.
+ */
 export async function collectRange(o: {
 	cachePath: string;
 	mainPath: string;
@@ -314,7 +328,7 @@ export async function collectRange(o: {
 	/** Refs whose commits stay out of the range (fork branches with an open PR upstream). */
 	exclude?: string[];
 	git: GitFn;
-}): Promise<ForkRange> {
+}): Promise<{ range: ForkRange; held: Map<string, string[]> }> {
 	const { cachePath, mainPath, fork, branches, git } = o;
 	const fetchUp = await git(
 		[
@@ -349,8 +363,9 @@ export async function collectRange(o: {
 	const bySha = new Map<string, ForkCommit>();
 	const commits: ForkCommit[] = [];
 	const merges: ForkCommit[] = [];
+	const held = new Map<string, string[]>();
 	for (const b of branches) {
-		const { shas, merges: mergeShas } = await rangeCommits(
+		const r0 = await rangeCommits(
 			cachePath,
 			b.analyzedHead,
 			b.head,
@@ -358,6 +373,8 @@ export async function collectRange(o: {
 			git,
 			o.exclude,
 		);
+		const { shas, merges: mergeShas } = r0;
+		if (r0.held.length > 0) held.set(b.branchHash, r0.held);
 		for (const sha of shas) {
 			const r = await git(
 				[
@@ -473,7 +490,7 @@ export async function collectRange(o: {
 		if (r.code !== 0) continue;
 		upstreamDocs += `${r.stdout.slice(0, 8000 - upstreamDocs.length)}\n`;
 	}
-	return {
+	const range: ForkRange = {
 		fork,
 		commits,
 		merges,
@@ -486,6 +503,7 @@ export async function collectRange(o: {
 			head: b.head,
 		})),
 	};
+	return { range, held };
 }
 
 export interface ForkProject {
@@ -530,6 +548,26 @@ function openProposals(store: ProjectStore): number {
 		).length;
 }
 
+/** Cache ref prefix of an upstream PR head; the suffix is the validated PR number. */
+const PR_REF = "refs/heads/pr-";
+
+/**
+ * A branch's hold after its cursor moves: the PRs held before plus the PRs that removed work
+ * in this run. The base stays the cursor from before the first held run.
+ */
+export function holdAfter(
+	row: ForkBranchState,
+	heldRefs: string[] = [],
+): Pick<ForkBranchState, "holdPrs" | "holdBase"> {
+	const prs = heldRefs.map((r) => Number(r.slice(PR_REF.length)));
+	if (prs.length === 0 && row.holdPrs === null)
+		return { holdPrs: null, holdBase: null };
+	return {
+		holdPrs: [...new Set([...(row.holdPrs ?? []), ...prs])],
+		holdBase: row.holdPrs !== null ? row.holdBase : row.analyzedHead,
+	};
+}
+
 export function createForkWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	log: (msg: string) => void;
@@ -548,6 +586,61 @@ export function createForkWatcher(deps: {
 		((range: ForkRange, prior: { titles: string[]; declines: string[] }) =>
 			analyzeRange(range, prior));
 	const now = deps.now ?? Date.now;
+
+	/**
+	 * Checks the held PRs of one fork's branches. A PR closed without a merge puts the cursor
+	 * back on the hold base, so the next run sees the held work again. A merged PR leaves the
+	 * hold: its work arrived. An unknown state (gh failure, still open) keeps the hold.
+	 */
+	async function releaseHolds(
+		store: ProjectStore,
+		holding: ForkBranchState[],
+		pulls: PullInfo[],
+		merged: Map<number, boolean | null>,
+		repo: string,
+		fork: ForkInfo,
+	): Promise<void> {
+		if (!REPO_RE.test(repo)) {
+			deps.log(`forks: invalid repo id: ${repo}`);
+			return;
+		}
+		const open = new Set(pulls.map((p) => p.number));
+		for (const r of holding) {
+			const prs = r.holdPrs ?? [];
+			const states: Array<boolean | null> = [];
+			for (const n of prs.filter((p) => !open.has(p))) {
+				if (!merged.has(n)) {
+					try {
+						merged.set(n, await pullMerged(repo, n, gh));
+					} catch (e) {
+						deps.log(`forks: ${repo}#${n}: ${(e as Error).message}`);
+						merged.set(n, null);
+					}
+				}
+				states.push(merged.get(n) ?? null);
+			}
+			if (states.length === 0) continue;
+			if (states.includes(false)) {
+				store.saveForkBranch({
+					...r,
+					analyzedHead: r.holdBase,
+					firstPendingAt: null,
+					holdPrs: null,
+					holdBase: null,
+				});
+				deps.log(
+					`forks: ${fork.owner}/${fork.name}: a held PR closed without a merge, its work is pending again`,
+				);
+			} else if (!states.includes(null)) {
+				const rest = prs.filter((p) => open.has(p));
+				store.saveForkBranch({
+					...r,
+					holdPrs: rest.length > 0 ? rest : null,
+					holdBase: rest.length > 0 ? r.holdBase : null,
+				});
+			}
+		}
+	}
 
 	async function scan(opts?: { manual?: string }): Promise<void> {
 		const manual = opts?.manual;
@@ -598,6 +691,8 @@ export function createForkWatcher(deps: {
 							lastRunAt: null,
 							lastError: null,
 							retries: 0,
+							holdPrs: null,
+							holdBase: null,
 						});
 						continue;
 					}
@@ -621,8 +716,10 @@ export function createForkWatcher(deps: {
 			const isManual = manual !== undefined;
 			// The commits of every open PR into this repo arrive through that PR; porting them
 			// would duplicate it, in any fork. Listed once per project, only when a fork has
-			// pending work.
+			// pending work or a hold to check. A cursor that moves past such commits keeps a
+			// hold (ForkBranchState.holdPrs), so a PR closed without a merge brings them back.
 			let pulls: PullInfo[] | null = null;
+			const merged = new Map<number, boolean | null>();
 			for (const fork of forks) {
 				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
 					deps.log(
@@ -630,11 +727,13 @@ export function createForkWatcher(deps: {
 					);
 					continue;
 				}
-				const rows = fresh.filter((r) => r.forkId === fork.id);
-				const changed = rows.filter(
-					(r) => r.head !== null && r.head !== r.analyzedHead,
-				);
-				if (changed.length === 0) continue;
+				let rows = fresh.filter((r) => r.forkId === fork.id);
+				const holding = rows.filter((r) => r.holdPrs !== null);
+				if (
+					holding.length === 0 &&
+					!rows.some((r) => r.head !== null && r.head !== r.analyzedHead)
+				)
+					continue;
 				if (pulls === null) {
 					try {
 						pulls = await listPulls(repo, gh);
@@ -643,11 +742,20 @@ export function createForkWatcher(deps: {
 						break;
 					}
 				}
+				if (holding.length > 0) {
+					await releaseHolds(store, holding, pulls, merged, repo, fork);
+					rows = store
+						.listAllForkBranches()
+						.filter((r) => r.forkId === fork.id);
+				}
 				const prHeads = new Set(
 					pulls.map((p) => `${p.headRepoId}:${p.headRef}`),
 				);
-				const pending = changed.filter(
-					(r) => !prHeads.has(`${fork.id}:${r.branch}`),
+				const pending = rows.filter(
+					(r) =>
+						r.head !== null &&
+						r.head !== r.analyzedHead &&
+						!prHeads.has(`${fork.id}:${r.branch}`),
 				);
 				if (pending.length === 0) continue;
 				const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
@@ -691,12 +799,12 @@ export function createForkWatcher(deps: {
 							cachePath,
 							`${githubHost().webBase}/${repo}.git`,
 							pulls.map(
-								(p) => `+refs/pull/${p.number}/head:refs/heads/pr-${p.number}`,
+								(p) => `+refs/pull/${p.number}/head:${PR_REF}${p.number}`,
 							),
 							runGit,
 						);
 					}
-					const range = await collectRange({
+					const { range, held } = await collectRange({
 						cachePath,
 						mainPath: project.path,
 						fork,
@@ -706,15 +814,17 @@ export function createForkWatcher(deps: {
 							head: r.head!,
 							analyzedHead: r.analyzedHead,
 						})),
-						exclude: pulls.map((p) => `refs/heads/pr-${p.number}`),
+						exclude: pulls.map((p) => `${PR_REF}${p.number}`),
 						git: runGit,
 					});
+					const byHash = new Map(pending.map((r) => [r.branchHash, r]));
 					if (range.commits.length === 0 && range.merges.length === 0) {
 						// Nothing new to analyze: move the cursors without a model call, a run
 						// record, or a fork pause, so later work is not held back.
 						for (const r of pending)
 							store.saveForkBranch({
 								...r,
+								...holdAfter(r, held.get(r.branchHash)),
 								analyzedHead: r.head,
 								firstPendingAt: null,
 								lastError: null,
@@ -730,7 +840,14 @@ export function createForkWatcher(deps: {
 						branchHash: string;
 						head: string;
 						at: number;
+						hold: { prs: number[]; base: string | null } | null;
 					}> = [];
+					const holdOf = (branchHash: string) => {
+						const h = holdAfter(byHash.get(branchHash)!, held.get(branchHash));
+						return h.holdPrs === null
+							? null
+							: { prs: h.holdPrs, base: h.holdBase };
+					};
 					if (result.deferred.length > 0) {
 						deps.log(
 							`forks: ${fork.owner}/${fork.name}: deferred ${result.deferred.length} commit(s), cursor stays on the last covered sha`,
@@ -747,6 +864,7 @@ export function createForkWatcher(deps: {
 									branchHash: h.branchHash,
 									head: last,
 									at: now(),
+									hold: holdOf(h.branchHash),
 								});
 						}
 					} else {
@@ -756,6 +874,7 @@ export function createForkWatcher(deps: {
 								branchHash: h.branchHash,
 								head: h.head,
 								at: now(),
+								hold: holdOf(h.branchHash),
 							});
 					}
 					const rangeLabel = range.heads

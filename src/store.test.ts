@@ -3220,6 +3220,8 @@ describe("fork research store methods", () => {
 			lastRunAt: null,
 			lastError: null,
 			retries: 0,
+			holdPrs: null,
+			holdBase: null,
 		};
 		store.saveForkBranch(row);
 		store.saveForkBranch({
@@ -3232,6 +3234,8 @@ describe("fork research store methods", () => {
 			{ ...row, head: "def", retries: 2, lastError: "boom" },
 		]);
 		expect(store.listAllForkBranches()).toHaveLength(1);
+		store.saveForkBranch({ ...row, holdPrs: [5], holdBase: null });
+		expect(store.listForkBranches(1)[0]!.holdPrs).toEqual([5]);
 	});
 
 	test("forkRunsSince counts recorded runs", () => {
@@ -3254,6 +3258,8 @@ describe("fork research store methods", () => {
 			lastRunAt: null,
 			lastError: "earlier failure",
 			retries: 2,
+			holdPrs: null,
+			holdBase: null,
 		});
 		const card = store.createForkResult({
 			prompt: "report prompt",
@@ -3264,7 +3270,15 @@ describe("fork research store methods", () => {
 				{ prompt: "do a", model: null },
 				{ prompt: "do b", model: "m" },
 			],
-			analyzed: [{ forkId: 7, branchHash: "h1", head: "abc", at: 42 }],
+			analyzed: [
+				{
+					forkId: 7,
+					branchHash: "h1",
+					head: "abc",
+					at: 42,
+					hold: { prs: [3, 4], base: "base0" },
+				},
+			],
 		});
 		const stored = store.getTask(card.id)!;
 		expect(stored.research).toBe(true);
@@ -3291,6 +3305,8 @@ describe("fork research store methods", () => {
 		expect(branch.lastRunAt).toBe(42);
 		expect(branch.lastError).toBeNull();
 		expect(branch.retries).toBe(0);
+		expect(branch.holdPrs).toEqual([3, 4]);
+		expect(branch.holdBase).toBe("base0");
 	});
 });
 
@@ -3900,6 +3916,40 @@ describe("pr review store methods", () => {
 		expect(store.getPrReview(7)).toMatchObject({
 			postedUrl: null,
 			postedLogin: null,
+		});
+		store.close();
+	});
+
+	test("a pre-hold fork_branch converges on open and keeps its rows", () => {
+		const dir = join(root, "fork-branch-hold");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE fork_branch (
+  fork_id INTEGER NOT NULL,
+  branch_hash TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT,
+  analyzed_head TEXT,
+  first_pending_at INTEGER,
+  last_run_at INTEGER,
+  last_error TEXT,
+  retries INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (fork_id, branch_hash)
+)`);
+		old.run(
+			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head) VALUES (1, 'h', 'feat', 'b', 'a')",
+		);
+		old.close();
+		const store = open(dir);
+		const row = store.listForkBranches(1)[0]!;
+		expect(row).toMatchObject({ head: "b", holdPrs: null, holdBase: null });
+		store.saveForkBranch({ ...row, holdPrs: [2], holdBase: "a" });
+		expect(store.listForkBranches(1)[0]).toMatchObject({
+			holdPrs: [2],
+			holdBase: "a",
 		});
 		store.close();
 	});

@@ -373,7 +373,7 @@ describe("collectRange", () => {
 			[`+refs/heads/feat:refs/heads/${branchHash("feat")}`],
 			localFileGit(fork),
 		);
-		const range = await collectRange({
+		const { range } = await collectRange({
 			cachePath,
 			mainPath: main,
 			fork: forkPageEntry(1) as never,
@@ -582,6 +582,7 @@ describe("watcher", () => {
 		forkDir: string,
 		branch: string,
 		n: number,
+		headRepoId = 1,
 	) {
 		await run(
 			[
@@ -600,7 +601,11 @@ describe("watcher", () => {
 			state: "open",
 			draft: false,
 			title: "t",
-			head: { sha: await shaOf(forkDir, branch), ref: branch, repo: { id: 1 } },
+			head: {
+				sha: await shaOf(forkDir, branch),
+				ref: branch,
+				repo: { id: headRepoId },
+			},
 		};
 	}
 
@@ -614,6 +619,9 @@ describe("watcher", () => {
 	) {
 		const state = {
 			pulls,
+			/** merged_at of each closed PR the fake GitHub knows (null = closed unmerged). */
+			closed: new Map<number, string | null>(),
+			clock: Date.now(),
 			ghCalls: [] as string[],
 			subjects: [] as string[][],
 			merges: [] as number[],
@@ -632,12 +640,18 @@ describe("watcher", () => {
 			gh: async (args) => {
 				const url = args.at(-1) ?? "";
 				state.ghCalls.push(url);
-				const body = url.startsWith("repos/o/main/pulls")
-					? state.pulls
-					: forks.map((f) => ({
-							...forkPageEntry(f.id),
-							owner: { login: f.owner },
-						}));
+				const one = url.match(/^repos\/o\/main\/pulls\/(\d+)$/);
+				const body = one
+					? {
+							state: "closed",
+							merged_at: state.closed.get(Number(one[1])) ?? null,
+						}
+					: url.startsWith("repos/o/main/pulls")
+						? state.pulls
+						: forks.map((f) => ({
+								...forkPageEntry(f.id),
+								owner: { login: f.owner },
+							}));
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
 			git: (args, cwd, timeoutMs) => {
@@ -667,7 +681,7 @@ describe("watcher", () => {
 					deferred: [],
 				} as never;
 			},
-			now: () => Date.now(),
+			now: () => state.clock,
 		});
 		return { watcher, state };
 	}
@@ -785,6 +799,92 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(state.subjects).toEqual([[]]);
 		expect(state.merges).toEqual([1]);
+	});
+
+	const DAY = 24 * 60 * 60 * 1000;
+
+	test("work held by a PR of the project's own branch comes back when the PR closes unmerged", async () => {
+		const name = "watch-hold-empty";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = await makeFork(`${name}-fork`, main);
+		// Head repo 99 is the project itself: the fork branch only copies the PR's commit.
+		const pr = await openPr(main, forkDir, "feat", 2, 99);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
+		await watcher.tick();
+		expect(state.subjects).toEqual([]);
+		const feat = () =>
+			store.listAllForkBranches().find((r) => r.branch === "feat")!;
+		expect(feat().analyzedHead).toBe(feat().head);
+		expect(feat().holdPrs).toEqual([2]);
+		state.pulls = [];
+		state.closed.set(2, null);
+		state.clock += 2 * DAY;
+		await watcher.tick();
+		expect(state.subjects).toEqual([["fork feature"]]);
+		expect(feat().holdPrs).toBeNull();
+	});
+
+	test("work held next to analyzed work comes back when the PR closes unmerged", async () => {
+		const name = "watch-hold-mixed";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, forkDir], root);
+		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
+		await commitFile(forkDir, "pr.txt", "PR work");
+		await run(["branch", "prbranch", forkDir], forkDir);
+		await commitFile(forkDir, "other.txt", "Other work");
+		const pr = await openPr(main, forkDir, "prbranch", 2, 99);
+		await run(["branch", "-D", "prbranch", forkDir], forkDir);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
+		await watcher.tick();
+		expect(state.subjects).toEqual([["Other work"]]);
+		state.pulls = [];
+		state.closed.set(2, null);
+		state.clock += 2 * DAY;
+		await watcher.tick();
+		expect(state.subjects.length).toBe(2);
+		expect(state.subjects[1]).toContain("PR work");
+	});
+
+	test("a merged PR drops the hold without a new analysis", async () => {
+		const name = "watch-hold-merged";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = await makeFork(`${name}-fork`, main);
+		const pr = await openPr(main, forkDir, "feat", 2, 99);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
+		await watcher.tick();
+		state.pulls = [];
+		state.closed.set(2, "2026-11-09T00:00:00Z");
+		state.clock += 2 * DAY;
+		await watcher.tick();
+		expect(state.subjects).toEqual([]);
+		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
+		expect(feat.holdPrs).toBeNull();
+		expect(feat.analyzedHead).toBe(feat.head);
 	});
 
 	test("a failed open-PR listing ports nothing", async () => {

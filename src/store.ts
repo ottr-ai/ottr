@@ -196,6 +196,8 @@ CREATE TABLE IF NOT EXISTS fork_branch (
   last_run_at INTEGER,
   last_error TEXT,
   retries INTEGER NOT NULL DEFAULT 0,
+  hold_prs TEXT,
+  hold_base TEXT,
   PRIMARY KEY (fork_id, branch_hash)
 );
 CREATE TABLE IF NOT EXISTS fork_runs (
@@ -322,6 +324,23 @@ interface ForkBranchRow {
 	last_run_at: number | null;
 	last_error: string | null;
 	retries: number;
+	hold_prs: string | null;
+	hold_base: string | null;
+}
+
+/** Stored hold list: a JSON array of positive PR numbers; anything else reads as no hold. */
+function parseHoldPrs(s: string | null): number[] | null {
+	if (s === null) return null;
+	try {
+		const v: unknown = JSON.parse(s);
+		if (!Array.isArray(v)) return null;
+		const ns = v.filter(
+			(n): n is number => typeof n === "number" && Number.isInteger(n) && n > 0,
+		);
+		return ns.length > 0 ? ns : null;
+	} catch {
+		return null;
+	}
 }
 
 function toForkBranch(r: ForkBranchRow): ForkBranchState {
@@ -335,6 +354,8 @@ function toForkBranch(r: ForkBranchRow): ForkBranchState {
 		lastRunAt: r.last_run_at,
 		lastError: r.last_error,
 		retries: r.retries,
+		holdPrs: parseHoldPrs(r.hold_prs),
+		holdBase: r.hold_base,
 	};
 }
 
@@ -1593,6 +1614,15 @@ export class ProjectStore {
 			.map((c) => c.name);
 		if (!prCols.includes("posted_url"))
 			db.exec("ALTER TABLE pr_review ADD COLUMN posted_url TEXT");
+		// The open-PR hold columns landed after the first fork_branch release: same additive
+		// convergence; null reads as "no hold", the state of every older row.
+		const forkCols = db
+			.query<{ name: string }, []>("PRAGMA table_info(fork_branch)")
+			.all()
+			.map((c) => c.name);
+		for (const col of ["hold_prs", "hold_base"])
+			if (!forkCols.includes(col))
+				db.exec(`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`);
 		// posted_login landed with the GitHub App posts: same additive convergence, so an
 		// older database still reads and posts without a rebuild.
 		if (!prCols.includes("posted_login"))
@@ -1840,12 +1870,13 @@ export class ProjectStore {
 	/** Upserts one branch watch row. */
 	saveForkBranch(s: ForkBranchState): void {
 		this.db.run(
-			`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries, hold_prs, hold_base)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(fork_id, branch_hash) DO UPDATE SET
 			   branch = excluded.branch, head = excluded.head, analyzed_head = excluded.analyzed_head,
 			   first_pending_at = excluded.first_pending_at, last_run_at = excluded.last_run_at,
-			   last_error = excluded.last_error, retries = excluded.retries`,
+			   last_error = excluded.last_error, retries = excluded.retries,
+			   hold_prs = excluded.hold_prs, hold_base = excluded.hold_base`,
 			[
 				s.forkId,
 				s.branchHash,
@@ -1856,6 +1887,8 @@ export class ProjectStore {
 				s.lastRunAt,
 				s.lastError,
 				s.retries,
+				s.holdPrs === null ? null : JSON.stringify(s.holdPrs),
+				s.holdBase,
 			],
 		);
 	}
@@ -1906,6 +1939,8 @@ export class ProjectStore {
 			branchHash: string;
 			head: string;
 			at: number;
+			/** The branch's hold after this run (see ForkBranchState.holdPrs). */
+			hold: { prs: number[]; base: string | null } | null;
 		}>;
 	}): Task {
 		let cardId = "";
@@ -1931,8 +1966,15 @@ export class ProjectStore {
 			}
 			for (const a of o.analyzed) {
 				this.db.run(
-					"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0 WHERE fork_id = ? AND branch_hash = ?",
-					[a.head, a.at, a.forkId, a.branchHash],
+					"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0, hold_prs = ?, hold_base = ? WHERE fork_id = ? AND branch_hash = ?",
+					[
+						a.head,
+						a.at,
+						a.hold === null ? null : JSON.stringify(a.hold.prs),
+						a.hold?.base ?? null,
+						a.forkId,
+						a.branchHash,
+					],
 				);
 			}
 		});
