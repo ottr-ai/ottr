@@ -570,6 +570,97 @@ describe("watcher", () => {
 		expect(store.listTasks().length).toBe(0);
 	});
 
+	test("a fork branch with an open PR into the repo is not ported until the PR closes", async () => {
+		const name = "watch-pr";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = await makeFork(`${name}-fork`, main);
+		// Only `feat` carries fork work; drop the cloned main so it stays the sole branch.
+		await run(["branch", "-D", "main", forkDir], forkDir);
+		let pulls: unknown[] = [
+			{
+				number: 2,
+				state: "open",
+				draft: false,
+				title: "t",
+				head: { sha: "a".repeat(40), ref: "feat", repo: { id: 1 } },
+			},
+		];
+		const ghCalls: string[] = [];
+		let ranges: string[][] = [];
+		const logs: string[] = [];
+		const watcher = createForkWatcher({
+			projects: () => [{ name, path: main, store, github: "o/main" }],
+			log: (m) => logs.push(m),
+			gh: async (args) => {
+				const url = args.at(-1) ?? "";
+				ghCalls.push(url);
+				const body = url.startsWith("repos/o/main/pulls")
+					? pulls
+					: [forkPageEntry(1)];
+				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
+			},
+			git: localFileGit(join(root, `${name}-fork`)),
+			analyze: async (range) => {
+				ranges = [...ranges, range.heads.map((h) => h.branch)];
+				return {
+					features: [],
+					proposals: [],
+					coverage: "",
+					commits: [],
+					deferred: [],
+				} as never;
+			},
+			now: () => Date.now(),
+		});
+		await watcher.tick();
+		expect(ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
+		expect(ranges).toEqual([]);
+		expect(logs.some((m) => m.includes("open PR into o/main"))).toBe(true);
+		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
+		expect(feat.analyzedHead).toBeNull();
+		expect(feat.retries).toBe(0);
+		expect(store.listTasks().length).toBe(0);
+		// Once the PR closes, the branch is pending work again.
+		pulls = [];
+		await watcher.tick();
+		expect(ranges.length).toBe(1);
+		expect(ranges[0]).toContain("feat");
+	});
+
+	test("a failed open-PR listing ports nothing", async () => {
+		const name = "watch-pr-fail";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		await makeFork(`${name}-fork`, main);
+		let analyzeCalls = 0;
+		const logs: string[] = [];
+		const watcher = createForkWatcher({
+			projects: () => [{ name, path: main, store, github: "o/main" }],
+			log: (m) => logs.push(m),
+			gh: async (args) =>
+				(args.at(-1) ?? "").startsWith("repos/o/main/pulls")
+					? { code: 1, stdout: "", stderr: "HTTP 502" }
+					: {
+							code: 0,
+							stdout: JSON.stringify([forkPageEntry(1)]),
+							stderr: "",
+						},
+			git: localFileGit(join(root, `${name}-fork`)),
+			analyze: async () => {
+				analyzeCalls++;
+				throw new Error("never reached");
+			},
+			now: () => Date.now(),
+		});
+		await watcher.tick();
+		expect(analyzeCalls).toBe(0);
+		expect(logs.some((m) => m.includes("HTTP 502"))).toBe(true);
+		expect(store.listTasks().length).toBe(0);
+	});
+
 	test("daily cap blocks the fourth run in 24h", async () => {
 		const { main, store, watcher, calls } = await setup(
 			"watch-cap",

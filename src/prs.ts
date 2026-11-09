@@ -31,6 +31,10 @@ export interface PullInfo {
 	head: string;
 	draft: boolean;
 	title: string;
+	/** GitHub id of the repo that holds the head branch; null when GitHub omits it (deleted fork). */
+	headRepoId: number | null;
+	/** Head branch name; only compared, never passed to a command. */
+	headRef: string | null;
 }
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -64,7 +68,24 @@ export function parsePullPage(body: unknown): PullInfo[] {
 			typeof x.title === "string"
 				? stripInvisible(x.title).text.trim().slice(0, 120)
 				: "";
-		out.push({ number: x.number, head: sha, draft: x.draft, title });
+		const repo = (head as Record<string, unknown>).repo as
+			| Record<string, unknown>
+			| null
+			| undefined;
+		const repoId =
+			typeof repo === "object" && repo !== null ? repo.id : undefined;
+		const ref = (head as Record<string, unknown>).ref;
+		out.push({
+			number: x.number,
+			head: sha,
+			draft: x.draft,
+			title,
+			headRepoId:
+				typeof repoId === "number" && Number.isInteger(repoId) && repoId > 0
+					? repoId
+					: null,
+			headRef: typeof ref === "string" && ref.length > 0 ? ref : null,
+		});
 	}
 	return out;
 }

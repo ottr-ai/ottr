@@ -341,6 +341,22 @@ describe("parsePullPage", () => {
 		expect(out[1]!.title).toBe("");
 		expect(parsePullPage({})).toEqual([]);
 	});
+
+	test("keeps the head repo id and branch only when well-formed", () => {
+		const base = pr(1, sha("a"));
+		const out = parsePullPage([
+			{ ...base, head: { sha: sha("a"), ref: "feat", repo: { id: 7 } } },
+			{ ...base, head: { sha: sha("a"), ref: "", repo: { id: 0 } } },
+			{ ...base, head: { sha: sha("a"), ref: 3, repo: null } },
+			{ ...base, head: { sha: sha("a"), repo: { id: 1.5 } } },
+		]);
+		expect(out.map((p) => [p.headRepoId, p.headRef])).toEqual([
+			[7, "feat"],
+			[null, null],
+			[null, null],
+			[null, null],
+		]);
+	});
 });
 
 describe("openPrsView", () => {

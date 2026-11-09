@@ -9,6 +9,7 @@ import {
 } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
 import { isProposalReason } from "./prompts.ts";
+import { listPulls } from "./prs.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 import type { ProjectStore } from "./store.ts";
@@ -610,6 +611,9 @@ export function createForkWatcher(deps: {
 
 			const fresh = store.listAllForkBranches();
 			const isManual = manual !== undefined;
+			// Fork branches with an open PR into this repo arrive through that PR; porting them
+			// would duplicate it. Fetched once per project, only when a fork has pending work.
+			let prHeads: Set<string> | null = null;
 			for (const fork of forks) {
 				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
 					deps.log(
@@ -618,9 +622,30 @@ export function createForkWatcher(deps: {
 					continue;
 				}
 				const rows = fresh.filter((r) => r.forkId === fork.id);
-				const pending = rows.filter(
+				const changed = rows.filter(
 					(r) => r.head !== null && r.head !== r.analyzedHead,
 				);
+				if (changed.length === 0) continue;
+				if (prHeads === null) {
+					try {
+						prHeads = new Set(
+							(await listPulls(repo, gh)).map(
+								(p) => `${p.headRepoId}:${p.headRef}`,
+							),
+						);
+					} catch (e) {
+						deps.log(`forks: ${project.name}: ${(e as Error).message}`);
+						break;
+					}
+				}
+				const withPr = prHeads;
+				const pending = changed.filter(
+					(r) => !withPr.has(`${fork.id}:${r.branch}`),
+				);
+				if (pending.length < changed.length)
+					deps.log(
+						`forks: ${fork.owner}/${fork.name}: skipped ${changed.length - pending.length} branch(es) with an open PR into ${repo}`,
+					);
 				if (pending.length === 0) continue;
 				const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
 				if (lastRun + FORK_GATES.FORK_RUN_SPACING_MS > now()) continue;
@@ -731,11 +756,13 @@ export function createForkWatcher(deps: {
 					});
 				} catch (e) {
 					const msg = ((e as Error).message ?? String(e)).slice(0, 300);
+					const attempted = new Set(pending.map((r) => r.branchHash));
 					for (const r of store
 						.listAllForkBranches()
 						.filter(
 							(x) =>
 								x.forkId === fork.id &&
+								attempted.has(x.branchHash) &&
 								x.head !== null &&
 								x.head !== x.analyzedHead,
 						)) {
