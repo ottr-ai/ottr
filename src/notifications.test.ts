@@ -435,9 +435,9 @@ describe("PR review notifications", () => {
 
 	test("taskEntryKey carries the draft stamp for pr_review cards only", () => {
 		expect(taskEntryKey(pr({ prDraft: 7 }))).toBe("task:P:needs-pr7");
-		expect(
-			taskEntryKey(pr({ prOccurrence: { draft: 8, comments: null } })),
-		).toBe("task:P:needs-pr8");
+		expect(taskEntryKey({ ...pr(), prOccurrence: { draft: 8 } })).toBe(
+			"task:P:needs-pr8",
+		);
 		expect(taskEntryKey(pr({ prDraft: null }))).toBe("task:P:needs");
 		expect(taskEntryKey({ id: "A", asked: null })).toBe("task:A:needs");
 	});
