@@ -8,6 +8,7 @@ node_modules/
 .update-restart.vbs
 .update-restart.pid
 .dev/
+.dev-*/
 push-subs.json
 seen-answers.json
 .impeccable/live/*

@@ -1,7 +1,7 @@
 // Coverage test for the demo pool: seeds once into a temp root, then checks every display
 // shape the board must show, clean git status, the admin bootstrap, refresh, and force reseed.
 import { Database } from "bun:sqlite";
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -15,7 +15,7 @@ import { GlobalStore } from "../src/globalStore.ts";
 import { mergeHold } from "../src/scheduler.ts";
 import { ProjectStore } from "../src/store.ts";
 import { strykerProgress } from "../src/ui/status.ts";
-import { demoProgressMap, seedDemo } from "./demo-data.ts";
+import { demoProgressMap, heldDb, seedDemo } from "./demo-data.ts";
 
 type Row = Record<string, any> & { id: string };
 interface ProjectData {
@@ -248,6 +248,40 @@ test("second seed refreshes live clocks and keeps the rest", () => {
 	const store = GlobalStore.open(stateDir);
 	expect(store.get<any>("config").admin.passHash).toBe(adminPassHash);
 	store.close();
+});
+
+test("a project db held by another writer is skipped with a warning, the rest refresh", () => {
+	const names = projectNames();
+	const runningIn = (name: string) =>
+		readDb(join(root, name)).tasks.find((t) => t.state === "running");
+	const lockedName = names.find((n) => runningIn(n) !== undefined)!;
+	const freeName = names.find(
+		(n) => n !== lockedName && runningIn(n) !== undefined,
+	)!;
+	const lockedPath = join(root, lockedName, ".tasks", "tasks.db");
+	// Backdate both so a refresh is observable.
+	for (const name of [lockedName, freeName]) {
+		const db = new Database(join(root, name, ".tasks", "tasks.db"));
+		db.run("UPDATE tasks SET created_at = 1 WHERE state = 'running'");
+		db.close();
+	}
+	const holder = new Database(lockedPath);
+	holder.run("BEGIN IMMEDIATE");
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	try {
+		expect(heldDb(root)).toBe(lockedPath);
+		seedDemo(root, false, stateDir);
+		const warned = warn.mock.calls.flat().join("\n");
+		expect(warned).toContain(lockedPath);
+		expect(warned).not.toContain(freeName);
+	} finally {
+		warn.mockRestore();
+		holder.run("ROLLBACK");
+		holder.close();
+	}
+	expect(heldDb(root)).toBeNull();
+	expect(runningIn(lockedName)!.created_at).toBe(1);
+	expect(runningIn(freeName)!.created_at).toBeGreaterThan(1);
 });
 
 // Two full seeds exceed bun's 5s default on slow machines; the cap is not the assertion.

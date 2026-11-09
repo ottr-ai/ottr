@@ -12,10 +12,21 @@ import { resolve } from "node:path";
  * seed demo data and leak env into every test file before any test installs its mocks.
  */
 export async function bootstrap(): Promise<void> {
-	const root = resolve(import.meta.dir, "..", ".dev");
+	process.env.PORT ??= "5747"; // outside 4700-4899, where scripts/e2e-steer.js picks its ports
+	const { heldDb, seedDemo } = await import("../scripts/demo-data.ts");
+	// A board that still runs on the shared .dev root (a leftover shot attempt) holds its
+	// dbs under an exclusive lock, and server.ts refuses a second instance. This board then
+	// seeds its own root per port, so it boots beside the other one.
+	let root = resolve(import.meta.dir, "..", ".dev");
+	const held = heldDb(root);
+	if (held !== null) {
+		root = resolve(import.meta.dir, "..", `.dev-${process.env.PORT}`);
+		console.warn(
+			`dev board: ${held} is held by another board; seeding ${root} instead`,
+		);
+	}
 	// Full demo pool for design work: five projects with backdated tasks, turns and events.
 	// Seeds once; `bun scripts/demo-data.ts --force` rebuilds it.
-	const { seedDemo } = await import("../scripts/demo-data.ts");
 	seedDemo(root);
 	process.env.OMP_TRACKER_ROOTS = root;
 	process.env.OTTR_STATE_DIR ??= resolve(root, "state");
@@ -37,7 +48,6 @@ export async function bootstrap(): Promise<void> {
 	// queued ones must never start: no agent processes exist here. OTTR_DEMO blocks all three.
 	process.env.OTTR_DEMO = "1";
 	process.env.OMP_TRACKER_MAX_TOTAL = "none"; // the header shows n/∞, as on a board with no cap
-	process.env.PORT ??= "5747"; // outside 4700-4899, where scripts/e2e-steer.js picks its ports
 	// Opts into Bun's HTML dev server (HMR); see the development flag in server.ts.
 	process.env.NODE_ENV ??= "development";
 	// Dynamic on purpose: server.ts reads the env and scans the roots while it loads, and a static

@@ -396,7 +396,7 @@ A running card shows a live **Mutation testing** meter when the card's progress 
 
 CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; weekly workflows add Docker build checks, Trivy, a warn-only Opengrep SAST scan over `src/` and an OWASP ZAP baseline scan. Package versions stay 7 days back (`bunfig.toml`), and every action pins a full commit SHA.
 
-For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
+For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. When another dev board still holds `.dev/`, the new board seeds its own root `.dev-<PORT>/` and prints a warning, so set a free `PORT` for it. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
 
 ### Screenshot proofs for UI cards
 

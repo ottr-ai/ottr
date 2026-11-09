@@ -6,7 +6,7 @@
 // pass --force; otherwise existing projects are refreshed in place. An admin login is
 // bootstrapped into the global store if (and only if) the board has none.
 // Only ever writes under the root it is given; never point it at a real checkout.
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import {
 	appendFileSync,
 	existsSync,
@@ -642,22 +642,82 @@ function removeStaleProjects(root: string): void {
 	}
 }
 
+const BUSY_TRIES = 3;
+const BUSY_SLEEP_MS = 200;
+
+/** errno is the extended code: its low byte is SQLITE_BUSY (5) for every busy variant. */
+function isBusy(err: unknown): boolean {
+	return err instanceof SQLiteError && (err.errno & 0xff) === 5;
+}
+
+/** First db under `root` (a project's tasks.db, the state's tracker.db) that another
+ * process holds, or null. A live board keeps every db it opened under an EXCLUSIVE
+ * lock (src/dblock.ts), so one held file means a board already runs on this root. */
+export function heldDb(root: string): string | null {
+	if (!existsSync(root)) return null;
+	for (const entry of readdirSync(root, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		for (const file of ["tasks.db", "tracker.db"]) {
+			const dbPath = join(root, entry.name, ".tasks", file);
+			if (!existsSync(dbPath)) continue;
+			const db = new Database(dbPath);
+			try {
+				db.exec("PRAGMA busy_timeout = 0");
+				db.exec("BEGIN IMMEDIATE");
+				db.exec("ROLLBACK");
+			} catch (err) {
+				if (isBusy(err)) return dbPath;
+				throw err;
+			} finally {
+				db.close();
+			}
+		}
+	}
+	return null;
+}
+
 /** Keep live clocks plausible on an existing board: running/preparing cards restarted a
- * moment ago, their open turns with them. Raw handles, no ProjectStore lock. */
+ * moment ago, their open turns with them. Raw handles, no ProjectStore lock.
+ * A db that another process keeps locked (a leftover dev board) is skipped with a
+ * warning after a few tries, so one held project never stops the boot. */
 function refreshLive(root: string, names: string[]): void {
 	const now = Date.now();
 	for (const name of names) {
 		const dbPath = join(root, name, ".tasks", "tasks.db");
 		if (!existsSync(dbPath)) continue;
-		const db = new Database(dbPath);
-		db.run(
-			"UPDATE tasks SET created_at = ?, updated_at = ? WHERE state IN ('running','preparing') AND cancelled_at IS NULL",
-			[now - 5 * MIN, now],
-		);
-		db.run(
-			"UPDATE turns SET started_at = ? WHERE ended_at IS NULL AND task_id IN (SELECT id FROM tasks WHERE state IN ('running','preparing'))",
-			[now - 3 * MIN],
-		);
+		for (let attempt = 1; ; attempt++) {
+			try {
+				refreshProject(dbPath, now);
+				break;
+			} catch (err) {
+				if (!isBusy(err)) throw err;
+				if (attempt >= BUSY_TRIES) {
+					console.warn(
+						`demo seed: ${dbPath} is locked by another process, live clocks not refreshed`,
+					);
+					break;
+				}
+				Bun.sleepSync(BUSY_SLEEP_MS);
+			}
+		}
+	}
+}
+
+/** Both updates in one transaction, so a busy retry never repeats half a refresh. */
+function refreshProject(dbPath: string, now: number): void {
+	const db = new Database(dbPath);
+	try {
+		db.transaction(() => {
+			db.run(
+				"UPDATE tasks SET created_at = ?, updated_at = ? WHERE state IN ('running','preparing') AND cancelled_at IS NULL",
+				[now - 5 * MIN, now],
+			);
+			db.run(
+				"UPDATE turns SET started_at = ? WHERE ended_at IS NULL AND task_id IN (SELECT id FROM tasks WHERE state IN ('running','preparing'))",
+				[now - 3 * MIN],
+			);
+		})();
+	} finally {
 		db.close();
 	}
 }

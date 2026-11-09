@@ -1,45 +1,46 @@
 import { describe, expect, mock, test } from "bun:test";
-import { resolve } from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 // dev.ts is entry-only side effects behind an exported bootstrap(): it seeds the scratch
 // root, points the tracker env at it, then imports the server. Mock the seed and the
 // server so the bootstrap stays pure enough to assert on.
 describe("dev board bootstrap", () => {
-	test("seeds the .dev root, points the env at it, and loads the server", async () => {
-		const seeded: string[] = [];
-		const serverLoads: number[] = [];
-		mock.module("../scripts/demo-data.ts", () => ({
-			seedDemo: (root: string) => {
-				seeded.push(root);
-			},
-		}));
-		mock.module("./server.ts", () => {
-			serverLoads.push(1);
-			return {};
-		});
+	const seeded: string[] = [];
+	const serverLoads: number[] = [];
+	let held: string | null = null;
+	mock.module("../scripts/demo-data.ts", () => ({
+		heldDb: () => held,
+		seedDemo: (root: string) => {
+			seeded.push(root);
+		},
+	}));
+	mock.module("./server.ts", () => {
+		serverLoads.push(1);
+		return {};
+	});
 
+	/** Run bootstrap with the env restored exactly afterwards: snapshot keys keep (or lose)
+	 * their old value; keys the bootstrap ADDED must be deleted, or later test files in this
+	 * process inherit them (a leaked OTTR_DEMO silenced the sweeps in turn.test.ts). */
+	async function boot(
+		env: Record<string, string>,
+		check: (prev: Record<string, string | undefined>) => void,
+	): Promise<void> {
 		const prev: Record<string, string | undefined> = { ...process.env };
 		try {
+			delete process.env.OTTR_STATE_DIR;
+			delete process.env.PORT;
+			Object.assign(process.env, env);
 			// Dynamic import is the point: the module itself is import-safe (its entry
-			// behavior lives in bootstrap(), called below), and the mocks must be
+			// behavior lives in bootstrap(), called here), and the mocks must be
 			// registered before bootstrap runs — an unmocked import would start the
 			// real server before this test can intercept.
 			const { bootstrap } = await import("./dev.ts");
 			await bootstrap();
-			const root = resolve(import.meta.dir, "..", ".dev");
-			expect(seeded).toEqual([root]);
-			expect(process.env.OMP_TRACKER_ROOTS).toBe(root);
-			expect(process.env.OTTR_STATE_DIR).toBe(
-				prev.OTTR_STATE_DIR ?? resolve(root, "state"),
-			);
-			expect(process.env.OMP_TRACKER_MAX_TOTAL).toBe("none");
-			// The sweeps must leave the fabricated running/preparing cards alone.
-			expect(process.env.OTTR_DEMO).toBe("1");
-			expect(serverLoads).toHaveLength(1);
+			check(prev);
 		} finally {
-			// Exact restore: snapshot keys keep (or lose) their old value; keys the
-			// bootstrap ADDED must be deleted, or later test files in this process
-			// inherit them (a leaked OTTR_DEMO silenced the sweeps in turn.test.ts).
 			for (const key of Object.keys(process.env)) {
 				if (!Object.hasOwn(prev, key)) delete process.env[key];
 			}
@@ -47,6 +48,38 @@ describe("dev board bootstrap", () => {
 				if (value === undefined) delete process.env[key];
 				else process.env[key] = value;
 			}
+		}
+	}
+
+	test("seeds the .dev root, points the env at it, and loads the server", async () => {
+		await boot({}, () => {
+			const root = resolve(import.meta.dir, "..", ".dev");
+			expect(seeded).toEqual([root]);
+			expect(process.env.OMP_TRACKER_ROOTS).toBe(root);
+			expect(process.env.OTTR_STATE_DIR).toBe(resolve(root, "state"));
+			expect(process.env.PORT).toBe("5747");
+			expect(process.env.OMP_TRACKER_MAX_TOTAL).toBe("none");
+			// The sweeps must leave the fabricated running/preparing cards alone.
+			expect(process.env.OTTR_DEMO).toBe("1");
+			expect(serverLoads).toHaveLength(1);
+		});
+	});
+
+	test("a .dev root held by another board seeds a root of its own per port", async () => {
+		held = "/x/.dev/lumen/.tasks/tasks.db";
+		seeded.length = 0;
+		try {
+			// The workers home is set so the env fixture is written to a temp dir, not to
+			// a .dev-5801 folder in the checkout.
+			const home = mkdtempSync(join(tmpdir(), "dev-board-"));
+			await boot({ PORT: "5801", OTTR_WORKERS_HOME: home }, () => {
+				const root = resolve(import.meta.dir, "..", ".dev-5801");
+				expect(seeded).toEqual([root]);
+				expect(process.env.OMP_TRACKER_ROOTS).toBe(root);
+				expect(process.env.OTTR_STATE_DIR).toBe(resolve(root, "state"));
+			});
+		} finally {
+			held = null;
 		}
 	});
 
