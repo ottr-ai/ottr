@@ -18,6 +18,8 @@ import {
 	parseRepo,
 	parseVerdict,
 	reviewMessage,
+	UPSTREAM_API_BASE,
+	upstreamToken,
 } from "./ompWatch.ts";
 import { OMP_REVIEW_INSTRUCTIONS } from "./prompts.ts";
 import { ProjectStore } from "./store.ts";
@@ -772,5 +774,82 @@ describe("createOmpWatcher", () => {
 		await Promise.all([w.watcher.tick(), w.watcher.tick()]);
 		expect(w.model.requests).toHaveLength(1);
 		expect(w.cards()).toHaveLength(1);
+	});
+});
+
+describe("upstream release host", () => {
+	test("upstreamToken lends GH_TOKEN only when the board's host is github.com", () => {
+		expect(upstreamToken({ GH_TOKEN: "t" })).toBe("t");
+		expect(
+			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "github.com" }),
+		).toBe("t");
+		expect(
+			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "acme.ghe.com" }),
+		).toBeUndefined();
+		expect(
+			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "git.corp.example" }),
+		).toBeUndefined();
+	});
+
+	test("a board on an enterprise host reads omp's notes from public github.com, without the enterprise token", async () => {
+		const saved = {
+			host: process.env.OTTR_GITHUB_HOST,
+			token: process.env.GH_TOKEN,
+		};
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		process.env.GH_TOKEN = "enterprise-token";
+		try {
+			const project = newProject();
+			const net = fakeNet();
+			const model = fakeModel();
+			net.release("18.16.0", 10 * DAY);
+			const seen: { url: string; auth: string | null }[] = [];
+			// Only the public endpoint has the notes: any other host answers 404.
+			const fetch = (async (
+				input: string | URL | Request,
+				init?: RequestInit,
+			) => {
+				const url = String(input);
+				seen.push({
+					url,
+					auth: new Headers(init?.headers).get("authorization"),
+				});
+				if (url === OMP_PACKAGE_URL) return net.fetch(input, init);
+				if (url.startsWith(`${UPSTREAM_API_BASE}/`))
+					return net.fetch(url.replace(UPSTREAM_API_BASE, API), init);
+				return Response.json({ message: "Not Found" }, { status: 404 });
+			}) as typeof globalThis.fetch;
+			const state = new Map<string, unknown>();
+			const watcher = createOmpWatcher({
+				projects: () => [project],
+				load: (p) => state.get(p),
+				save: (p, s) => state.set(p, JSON.parse(JSON.stringify(s))),
+				log: () => {},
+				schedule: () => {},
+				fetch,
+				spawn: model.spawn,
+				now: () => NOW,
+			});
+			await watcher.tick();
+			const release = seen.find((c) => c.url !== OMP_PACKAGE_URL);
+			expect(release?.url).toBe(
+				"https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.16.0",
+			);
+			expect(release?.auth).toBeNull();
+			expect(model.reviewed()).toEqual(["18.16.0"]);
+			expect(
+				parseOmpWatchState(state.get(project.name)).verdicts["18.16.0"]
+					?.verdict,
+			).toBe("pass");
+			expect(project.store.listTasks().map((t) => t.title)).toEqual([
+				"Bump omp to 18.16.0",
+			]);
+			project.store.close();
+		} finally {
+			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved.host;
+			if (saved.token === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = saved.token;
+		}
 	});
 });

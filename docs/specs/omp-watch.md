@@ -49,8 +49,11 @@ flight: a tick that starts while one runs joins it. For each project with `ompWa
 ## Review of one version
 
 - Notes source: the GitHub release `v<version>` of the repo that the packument names in
-  `repository.url` (today `can1357/oh-my-pi`), through `GET {apiBase}/repos/<repo>/releases/tags/v<version>`
-  with `GH_TOKEN` when set. The repo id must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`.
+  `repository.url` (today `can1357/oh-my-pi`), through
+  `GET https://api.github.com/repos/<repo>/releases/tags/v<version>`. The upstream is always
+  public github.com, also when the board uses an enterprise host (`OTTR_GITHUB_HOST`). The
+  request sends `GH_TOKEN` only when the board's host is github.com. An enterprise token never
+  goes to github.com. The repo id must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`.
 - No release (404) and the version is younger than one day: no verdict, retry on a later tick.
   No release and older than one day: verdict `fail` with the reason "omp published no release
   notes for <version>": a human must look.

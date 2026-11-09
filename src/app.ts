@@ -1831,8 +1831,6 @@ export function createApp(deps: AppDeps) {
 		save: (p, s) => deps.gstore.set(`ompWatch:${p}`, s),
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
-		token: () => process.env.GH_TOKEN,
-		apiBase: () => githubHost().apiBase,
 	});
 
 	/**

@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { clean, runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import type { ForkProject } from "./forks.ts";
+import { githubHost } from "./githubHost.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
 	ompBumpCardPrompt,
@@ -255,6 +256,20 @@ function safeText(raw: string, max: number): string {
 
 type Notes = { kind: "notes"; body: string } | { kind: "missing" };
 
+/** omp's upstream releases live on public github.com, whatever host the board uses. */
+export const UPSTREAM_API_BASE = "https://api.github.com";
+
+/**
+ * The token for the upstream release fetch: GH_TOKEN only when the board's own host is
+ * github.com. An enterprise host's token never goes to github.com; the public release
+ * endpoint then runs without a token.
+ */
+export function upstreamToken(
+	env: Record<string, string | undefined> = process.env,
+): string | undefined {
+	return githubHost(env).isDefault ? env.GH_TOKEN : undefined;
+}
+
 export function createOmpWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	load: (project: string) => unknown;
@@ -265,6 +280,7 @@ export function createOmpWatcher(deps: {
 	spawn?: SpawnFn;
 	now?: () => number;
 	token?: () => string | undefined;
+	/** Test seam only; production uses UPSTREAM_API_BASE. */
 	apiBase?: () => string;
 }): { tick(): Promise<void> } {
 	const doFetch = deps.fetch ?? fetch;
@@ -291,14 +307,11 @@ export function createOmpWatcher(deps: {
 
 	/** The GitHub release notes of `v<version>`; missing on 404, throws on other failures. */
 	async function releaseNotes(repo: string, version: string): Promise<Notes> {
-		const base = (deps.apiBase?.() ?? "https://api.github.com").replace(
-			/\/+$/,
-			"",
-		);
+		const base = (deps.apiBase?.() ?? UPSTREAM_API_BASE).replace(/\/+$/, "");
 		const headers: Record<string, string> = {
 			accept: "application/vnd.github+json",
 		};
-		const token = deps.token?.();
+		const token = (deps.token ?? upstreamToken)();
 		if (token) headers.authorization = `Bearer ${token}`;
 		const r = await getJson(
 			`${base}/repos/${repo}/releases/tags/v${version}`,
