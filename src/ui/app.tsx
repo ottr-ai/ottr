@@ -10750,9 +10750,10 @@ export function AuthPage({
 }) {
 	const [name, setName] = useState("");
 	const [password, setPassword] = useState("");
-	const [repeat, setRepeat] = useState("");
+	const [reveal, setReveal] = useState(false);
 	const [githubToken, setGithubToken] = useState("");
 	const [githubHost, setGithubHost] = useState("");
+	const pwId = useId();
 	const tokenHint = useId();
 	const [remember, setRemember] = useState(true);
 	const [error, setError] = useState<string | null>(null);
@@ -10761,10 +10762,6 @@ export function AuthPage({
 	const submit = (e: React.FormEvent): void => {
 		e.preventDefault();
 		if (busy) return;
-		if (setup && password !== repeat) {
-			setError("The passwords do not match.");
-			return;
-		}
 		setError(null);
 		setBusy(true);
 		const host = githubHost.trim();
@@ -10814,28 +10811,37 @@ export function AuthPage({
 						/>
 					</label>
 					<label>
-						Password{setup ? " (at least 8 characters)" : ""}
-						<input
-							type="password"
-							autoComplete={setup ? "new-password" : "current-password"}
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-							minLength={setup ? 8 : undefined}
-							required
-						/>
-					</label>
-					{setup && (
-						<label>
-							Repeat password
+						Password
+						<span className="pw-wrap">
 							<input
-								type="password"
-								autoComplete="new-password"
-								value={repeat}
-								onChange={(e) => setRepeat(e.target.value)}
+								id={pwId}
+								type={reveal ? "text" : "password"}
+								autoComplete={setup ? "new-password" : "current-password"}
+								value={password}
+								onChange={(e) => setPassword(e.target.value)}
+								minLength={setup ? 8 : undefined}
 								required
 							/>
-						</label>
-					)}
+							<button
+								type="button"
+								className="icon pw-toggle"
+								aria-pressed={reveal}
+								aria-controls={pwId}
+								aria-label={reveal ? "Hide password" : "Show password"}
+								title={reveal ? "Hide password" : "Show password"}
+								onClick={() => setReveal((v) => !v)}
+							>
+								<Icon name={reveal ? "eye-off" : "eye"} />
+							</button>
+						</span>
+						{setup && (
+							<span className="hint pw-count" role="status">
+								{password.length >= 8
+									? "ok"
+									: `${password.length} / 8 characters`}
+							</span>
+						)}
+					</label>
 					{setup && (
 						<label>
 							GitHub token

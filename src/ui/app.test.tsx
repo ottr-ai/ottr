@@ -6633,6 +6633,18 @@ describe("AuthPage setup form", () => {
 		if (props.onChange === undefined) throw new Error("node has no onChange");
 		return props.onChange;
 	};
+	/** Buttons get the same treatment: dispatch never reaches React's onClick. */
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
 
 	interface PostCall {
 		url: string;
@@ -6718,7 +6730,6 @@ describe("AuthPage setup form", () => {
 		};
 		set("Name", "ada");
 		set("Password", "hunter222");
-		set("Repeat password", "hunter222");
 		set("GitHub token", "ghp_t");
 		if (hostValue !== "") set("GitHub host", hostValue);
 	}
@@ -6826,6 +6837,59 @@ describe("AuthPage setup form", () => {
 			expect(alert?.textContent ?? "").toContain("bare hostname");
 			expect(alert?.textContent ?? "").toContain("Settings → Git hosts");
 			expect(reloadCalls.n).toBe(0);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the password reveal toggle switches the input type", async () => {
+		const { container, unmount } = await mountAuth(() => Response.json({}));
+		try {
+			const input = container.querySelector<HTMLInputElement>(".pw-wrap input");
+			const button = container.querySelector<HTMLButtonElement>(".pw-toggle");
+			if (input === null || button === null)
+				throw new Error("no password field");
+			expect(input.type).toBe("password");
+			expect(button.getAttribute("aria-pressed")).toBe("false");
+			expect(button.getAttribute("aria-label")).toBe("Show password");
+			expect(button.getAttribute("aria-controls")).toBe(input.id);
+			await act(async () => {
+				onClickOf(button)({} as unknown);
+			});
+			expect(input.type).toBe("text");
+			expect(button.getAttribute("aria-pressed")).toBe("true");
+			expect(button.getAttribute("aria-label")).toBe("Hide password");
+			await act(async () => {
+				onClickOf(button)({} as unknown);
+			});
+			expect(input.type).toBe("password");
+			expect(button.getAttribute("aria-pressed")).toBe("false");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("setup shows a live count that reports ok at eight characters", async () => {
+		const { container, field, unmount } = await mountAuth(() =>
+			Response.json({}),
+		);
+		try {
+			expect(container.textContent).not.toContain("Repeat password");
+			const count = container.querySelector(".pw-count");
+			if (count === null) throw new Error("no count line");
+			expect(count.getAttribute("role")).toBe("status");
+			expect(count.textContent).toBe("0 / 8 characters");
+			const pw = field("Password");
+			typeInto(pw, "hunter2");
+			await act(async () => {
+				onChangeOf(pw)({ target: pw, currentTarget: pw });
+			});
+			expect(count.textContent).toBe("7 / 8 characters");
+			typeInto(pw, "hunter222");
+			await act(async () => {
+				onChangeOf(pw)({ target: pw, currentTarget: pw });
+			});
+			expect(count.textContent).toBe("ok");
 		} finally {
 			await unmount();
 		}

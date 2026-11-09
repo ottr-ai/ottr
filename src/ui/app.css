@@ -7767,6 +7767,26 @@ button.log-mode[aria-pressed="true"] {
 	width: 100%;
 	margin-top: 4px;
 }
+/* Password field: the reveal toggle sits inside the field's right edge, and the
+   setup count line is quiet mono metadata, the same grammar as a settings shape line. */
+.pw-wrap {
+	position: relative;
+	display: flex;
+}
+.pw-wrap input {
+	flex: 1;
+	padding-right: 36px;
+}
+.pw-toggle {
+	position: absolute;
+	top: 50%;
+	right: 4px;
+	transform: translateY(-50%);
+}
+.pw-count {
+	font-family: var(--mono);
+	font-size: 11.5px;
+}
 .auth-version {
 	margin: 18px 0 0;
 	color: var(--dim);
