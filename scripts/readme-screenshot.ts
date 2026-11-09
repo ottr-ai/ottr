@@ -223,7 +223,7 @@ const chromePath = findChrome();
 const port = await freePort();
 const boardUrl = `http://127.0.0.1:${port}/#lumen`;
 
-// Demo board only: src/dev.ts seeds .dev/ and never touches a real board. Production
+// Demo board only: src/dev.ts seeds a unique scratch root under .dev/ per spawn (OTTR_DEV_ROOT pins it) and never touches a real board. Production
 // asset mode: the dev-mode HMR server stalls the first request while it bundles the app.
 const board = Bun.spawn(["bun", "src/dev.ts"], {
 	cwd: REPO,

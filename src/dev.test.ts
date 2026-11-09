@@ -51,12 +51,14 @@ describe("dev board bootstrap", () => {
 		}
 	}
 
-	test("seeds the .dev root, points the env at it, and loads the server", async () => {
+	test("seeds a fresh root under .dev, points the env at it, and loads the server", async () => {
 		await boot({}, () => {
-			const root = resolve(import.meta.dir, "..", ".dev");
-			expect(seeded).toEqual([root]);
-			expect(process.env.OMP_TRACKER_ROOTS).toBe(root);
-			expect(process.env.OTTR_STATE_DIR).toBe(resolve(root, "state"));
+			const dev = resolve(import.meta.dir, "..", ".dev");
+			expect(seeded).toHaveLength(1);
+			expect(seeded[0]!.startsWith(resolve(dev, "board-"))).toBe(true);
+			expect(seeded[0]).not.toBe(dev);
+			expect(process.env.OMP_TRACKER_ROOTS).toBe(seeded[0]);
+			expect(process.env.OTTR_STATE_DIR).toBe(resolve(seeded[0]!, "state"));
 			expect(process.env.PORT).toBe("5747");
 			expect(process.env.OMP_TRACKER_MAX_TOTAL).toBe("none");
 			// The sweeps must leave the fabricated running/preparing cards alone.
@@ -81,6 +83,15 @@ describe("dev board bootstrap", () => {
 		} finally {
 			held = null;
 		}
+	});
+
+	test("seeds a pinned OTTR_DEV_ROOT instead of a fresh one", async () => {
+		seeded.length = 0;
+		const pinned = join(tmpdir(), "ottr-dev-root-pin-test");
+		await boot({ OTTR_DEV_ROOT: pinned }, () => {
+			expect(seeded).toEqual([pinned]);
+			expect(process.env.OMP_TRACKER_ROOTS).toBe(pinned);
+		});
 	});
 
 	test("the bootstrap leaks no added env keys into later test files", () => {

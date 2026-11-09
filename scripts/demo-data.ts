@@ -845,6 +845,6 @@ if (import.meta.main) {
 
 function resolveRoot(arg?: string): string {
 	if (arg) return arg;
-	// default: this repo's .dev scratch, matching src/dev.ts
+	// default: this repo's .dev scratch; src/dev.ts instead picks a unique per-spawn root under it
 	return join(import.meta.dir, "..", ".dev");
 }

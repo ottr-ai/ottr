@@ -1,8 +1,23 @@
-// A board for UI work, e.g. impeccable live: one scratch project under .dev/ and no agent runs.
+// A board for UI work, e.g. impeccable live: each start gets its own fresh scratch root under
+// .dev/ (OTTR_DEV_ROOT pins it) and no agent runs.
 // Never `bun start` in a checkout for this: it adopts every project in the parent folder, marks the
 // live board's running turns "tracker restarted" and queues them again, so they run twice.
-import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+/**
+ * Scratch root for this board: OTTR_DEV_ROOT pins it (deterministic e2e/CI runs);
+ * otherwise every spawn gets its own mkdtemp root under .dev/, so two dev boards in
+ * one checkout never share a seeded database and a crashed board cannot hold the
+ * seed lock (OTTR-676). Called from bootstrap only: module import stays side-effect-free.
+ */
+export function devRoot(): string {
+	const pinned = process.env.OTTR_DEV_ROOT;
+	if (pinned) return pinned;
+	const dev = resolve(import.meta.dir, "..", ".dev");
+	mkdirSync(dev, { recursive: true });
+	return mkdtempSync(join(dev, "board-"));
+}
 
 /**
  * Seeds the scratch root, points the env at it, and loads the server. Entry-only behavior,
@@ -14,10 +29,11 @@ import { resolve } from "node:path";
 export async function bootstrap(): Promise<void> {
 	process.env.PORT ??= "5747"; // outside 4700-4899, where scripts/e2e-steer.js picks its ports
 	const { heldDb, seedDemo } = await import("../scripts/demo-data.ts");
-	// A board that still runs on the shared .dev root (a leftover shot attempt) holds its
-	// dbs under an exclusive lock, and server.ts refuses a second instance. This board then
-	// seeds its own root per port, so it boots beside the other one.
-	let root = resolve(import.meta.dir, "..", ".dev");
+	let root = devRoot();
+	// A board that still runs on a pinned OTTR_DEV_ROOT holds its dbs under an exclusive
+	// lock, and server.ts refuses a second instance. This board then seeds its own root
+	// per port, so it boots beside the other one. A fresh root is never held: no other
+	// board knows its mkdtemp name.
 	const held = heldDb(root);
 	if (held !== null) {
 		root = resolve(import.meta.dir, "..", `.dev-${process.env.PORT}`);
@@ -26,7 +42,8 @@ export async function bootstrap(): Promise<void> {
 		);
 	}
 	// Full demo pool for design work: five projects with backdated tasks, turns and events.
-	// Seeds once; `bun scripts/demo-data.ts --force` rebuilds it.
+	// A pinned OTTR_DEV_ROOT seeds once; `bun scripts/demo-data.ts <root> --force` rebuilds it.
+	// An unpinned root is fresh every spawn, so every board seeds its own pool.
 	seedDemo(root);
 	process.env.OMP_TRACKER_ROOTS = root;
 	process.env.OTTR_STATE_DIR ??= resolve(root, "state");
