@@ -7,11 +7,13 @@ import type {
 } from "react";
 import {
 	Fragment,
+	memo,
 	useCallback,
 	useContext,
 	useEffect,
 	useId,
 	useLayoutEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -24,12 +26,7 @@ import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
-import {
-	liveCardOf,
-	queueOrder,
-	type ReviewTask,
-	waitingOn,
-} from "../scheduler.ts";
+import { liveCardOf, queueOrder, waitingOn } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
 import {
 	type AddProjectResponse,
@@ -605,9 +602,12 @@ export function triageWait(a: TaskCard, b: TaskCard): number {
 	return ra - rb || a.updatedAt - b.updatedAt;
 }
 
-function Card({
+/** Render probe for tests: a test sets `fn` to count Card renders; a memoized Card that skips
+ * its render never calls it. Production never sets it, so the call stays a no-op on the board. */
+export const cardRenderProbe: { fn: (() => void) | null } = { fn: null };
+
+const Card = memo(function Card({
 	task,
-	hasRules,
 	github,
 	onOpen,
 	unread,
@@ -615,8 +615,7 @@ function Card({
 	fuOf,
 	drag,
 	hold,
-	drain,
-	tasks,
+	status,
 	locked,
 	holdRelease,
 	onOpenTask,
@@ -624,9 +623,9 @@ function Card({
 	onRerelease,
 }: {
 	task: TaskCard;
-	hasRules: boolean;
 	github: string | null;
-	onOpen: () => void;
+	/** Opens this card's drawer; stable across frames, so memoized cards keep it. */
+	onOpen: (id: string) => void;
 	unread: boolean;
 	delta?: number;
 	fuOf?: string | null;
@@ -634,12 +633,9 @@ function Card({
 	/** Why the tracker holds this queued card (a merge: a live review or its findings; a todo: its
 	 * unfinished dependencies); null or undefined otherwise. */
 	hold?: string | null;
-	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
-	drain?: boolean;
-	/** The project's cards: a running review counts its landed findings, a queued card names
-	 * its queue slot (statusLine's tasks argument); undefined drops both refinements. */
-	tasks?: readonly (ReviewTask &
-		Pick<TaskCard, "title" | "state" | "queuedAt">)[];
+	/** The card's status words (statusLine over the project's cards), computed once per lane
+	 * render; undefined renders none. */
+	status?: string;
 	/** A reorder request for this card is in flight; the card dims and cannot start another drag. */
 	locked?: boolean;
 	/** The release card whose heldMerges list names this card; null or undefined otherwise. */
@@ -648,9 +644,14 @@ function Card({
 	onOpenTask?: (id: string) => void;
 	/** A stalled release card's re-release view: findings done, merges waiting. Null otherwise. */
 	reRelease?: { ids: string[]; findings: number } | null;
-	/** Cancels the release card and opens Create release; set only while reRelease is non-null. */
-	onRerelease?: () => void;
+	/** Cancels the release card this id names and opens Create release; set only while
+	 * reRelease is non-null. */
+	onRerelease?: (id: string) => void;
+	/** Bumped every 30 s so the relative ages on unchanged cards keep ticking; a memoized
+	 * card skips pushed frames it is unchanged in, so the tick is its only time refresh. */
+	tick?: number;
 }) {
+	cardRenderProbe.fn?.();
 	// The model chip names the model as omp does (display name); one cached catalog serves every card.
 	const catalog = useModels();
 	const release = releaseOf(task);
@@ -703,7 +704,7 @@ function Card({
 						? (task.needsReason ?? "Action required")
 						: undefined
 				}
-				onClick={(e) => navClick(e, onOpen)}
+				onClick={(e) => navClick(e, () => onOpen(task.id))}
 			>
 				<span className="card-head">
 					{task.starred && task.cancelledAt === null ? (
@@ -814,11 +815,7 @@ function Card({
 					) : task.runStartedAt !== undefined ? (
 						<LiveElapsed
 							since={task.runStartedAt}
-							status={
-								sp === null
-									? statusLine(task, hasRules, hold, drain, tasks)
-									: null
-							}
+							status={sp === null ? status : null}
 							etaMs={sp === null ? task.etaMs : undefined}
 						/>
 					) : (
@@ -835,7 +832,7 @@ function Card({
 								<span className="sr">{task.needsReason}</span>
 							</span>
 						) : (
-							<>· {statusLine(task, hasRules, hold, drain, tasks)}</>
+							<>· {status}</>
 						))}
 					{commits !== null && (
 						<span
@@ -922,7 +919,7 @@ function Card({
 								// The card body is a stretched open button: keep the click off it.
 								e.preventDefault();
 								e.stopPropagation();
-								onRerelease();
+								onRerelease(task.id);
 							}}
 						>
 							<Icon name="corner-up-left" size={12} />
@@ -960,7 +957,7 @@ function Card({
 							onClick={(e) => {
 								// The card body is a stretched open link: keep the click off it.
 								e.stopPropagation();
-								onOpen();
+								onOpen(task.id);
 							}}
 						>
 							Decide
@@ -969,7 +966,7 @@ function Card({
 				)}
 		</div>
 	);
-}
+});
 
 /** The System snapshot: pushed every 30 s over the board socket, polled from /api/system in
  *  production mode. Null until the first sample lands. */
@@ -3370,6 +3367,7 @@ export function ProjectBoard({
 	act,
 	onNotice,
 	draining,
+	tick,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
@@ -3382,37 +3380,49 @@ export function ProjectBoard({
 	onNotice: (message: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
+	/** The board's 30 s clock tick; feeds the memoized cards so their ages keep ticking. */
+	tick?: number;
 }) {
 	const hosted = useContext(HostedContext);
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
-	// A stalled release card's action: cancel the release, then open Create release so the user
-	// re-releases with the same version; the held merges then wait for the new release's review.
-	const rerelease = async (t: TaskCard): Promise<void> => {
-		if (
-			!(await confirmDialog(
-				`Cancel release ${t.releaseVersion ?? ""} and open Create release? The held merges then wait for the new release's review.`,
-				{ ok: "Cancel release", danger: true },
-			))
-		)
-			return;
-		void act(async () => {
-			const url = `/api/projects/${encodeURIComponent(t.project)}/tasks/${t.id}/cancel`;
-			const r = await post<{ kept?: string }>(url, {});
-			// The server kept unmerged work and wants a second yes; a release card normally keeps nothing.
-			if (r.kept !== undefined) {
-				if (
-					!(await confirmDialog(
-						`Delete the kept worktree and branch of ${t.id} "${t.title}"? The worktree was kept: ${r.kept}.`,
-						{ ok: "Delete", danger: true },
-					))
-				)
-					return;
-				await post(url, { force: true });
-			}
-			setShowRelease(true);
-		});
-	};
+	// The project's cards at the last render: the re-release callback stays stable across
+	// frames (a memoized card keeps its callback), so it reads the card from here instead
+	// of closing over a frame's array.
+	const tasksRef = useRef(tasks);
+	tasksRef.current = tasks;
+	// A stalled release card's action: cancel the release, then open Create release so the
+	// user re-releases with the same version; the held merges then wait for the new release's review.
+	const rerelease = useCallback(
+		async (id: string): Promise<void> => {
+			const t = tasksRef.current.find((x) => x.id === id);
+			if (t === undefined) return;
+			if (
+				!(await confirmDialog(
+					`Cancel release ${t.releaseVersion ?? ""} and open Create release? The held merges then wait for the new release's review.`,
+					{ ok: "Cancel release", danger: true },
+				))
+			)
+				return;
+			void act(async () => {
+				const url = `/api/projects/${encodeURIComponent(t.project)}/tasks/${t.id}/cancel`;
+				const r = await post<{ kept?: string }>(url, {});
+				// The server kept unmerged work and wants a second yes; a release card normally keeps nothing.
+				if (r.kept !== undefined) {
+					if (
+						!(await confirmDialog(
+							`Delete the kept worktree and branch of ${t.id} "${t.title}"? The worktree was kept: ${r.kept}.`,
+							{ ok: "Delete", danger: true },
+						))
+					)
+						return;
+					await post(url, { force: true });
+				}
+				setShowRelease(true);
+			});
+		},
+		[act],
+	);
 	const [showDiagrams, setShowDiagrams] = useState(false);
 	// The search box takes each keystroke uncontrolled; the filter lands after the
 	// pause (SEARCH_APPLY_MS), so a big board does not re-render per keypress.
@@ -4079,6 +4089,7 @@ export function ProjectBoard({
 								onReorder={onReorder}
 								filtering={q !== ""}
 								draining={draining}
+								tick={tick}
 							/>
 						</section>
 					);
@@ -5168,6 +5179,7 @@ export function LaneCol({
 	onMore,
 	onTopicMore,
 	onRerelease,
+	tick,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
@@ -5188,8 +5200,9 @@ export function LaneCol({
 		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
 		| null;
 	onTopicMore?: (key: string) => void;
-	/** Cancels a stalled release card and opens Create release; set only for the release flow. */
-	onRerelease?: (t: TaskCard) => void;
+	/** Cancels the stalled release card this id names and opens Create release; set only for
+	 * the release flow. */
+	onRerelease?: (id: string) => void;
 	collapsed: Record<string, boolean>;
 	onToggle: (key: string) => void;
 	hasRules: boolean;
@@ -5201,6 +5214,8 @@ export function LaneCol({
 	filtering: boolean;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
+	/** The board's 30 s clock tick; feeds the memoized cards so their ages keep ticking. */
+	tick?: number;
 }) {
 	const boxRef = useRef<HTMLDivElement | null>(null);
 	const uid = useId();
@@ -5260,6 +5275,75 @@ export function LaneCol({
 			).finished.then(reset, reset);
 		}
 	});
+	// Queued-card facts the drag map keys on: the joined id order changes only when the
+	// queue's membership or order changes, so unchanged frames reuse the drag objects.
+	const queued = tasks.filter((t) => t.state === "queued");
+	const queuedIds = queued.map((t) => t.id).join(" ");
+	const dnd = queued.length >= 2;
+	const busy = pending !== null;
+	const clear = useCallback((): void => {
+		setDragId(null);
+		setDrop(undefined);
+	}, []);
+	// Per-card facts over the project's cards, one pass per lane render: holdFor, reReleaseOf
+	// and statusLine each scan the project's cards, so calling them per rendered card is
+	// quadratic on a big board. The lane's own cards and the parked backlog row join the pass,
+	// because a lane list can hold cards the project list misses in tests.
+	const facts = useMemo(() => {
+		const holds = new Map<string, string | null>();
+		const statuses = new Map<string, string>();
+		const rereleases = new Map<
+			string,
+			{ ids: string[]; findings: number } | null
+		>();
+		const done = new Set<string>();
+		const scan = (list: readonly TaskCard[]): void => {
+			for (const t of list) {
+				if (done.has(t.id)) continue;
+				done.add(t.id);
+				const hold = holdFor(t, projectTasks);
+				holds.set(t.id, hold);
+				statuses.set(
+					t.id,
+					statusLine(t, hasRules, hold, draining, projectTasks),
+				);
+				rereleases.set(t.id, reReleaseOf(t, projectTasks));
+			}
+		};
+		scan(projectTasks);
+		scan(tasks);
+		if (parked !== undefined) scan(parked);
+		return { holds, statuses, rereleases };
+	}, [projectTasks, tasks, parked, hasRules, draining]);
+	// One drag wiring per queued card, rebuilt only when the drag state or the queued order
+	// changes: a fresh object on every frame would break the memoized Card's shallow compare.
+	// The handlers capture the id, never the card object, so a changed card elsewhere in the
+	// project does not rebuild them.
+	const drags = useMemo(() => {
+		const m = new Map<string, CardDrag>();
+		if (!dnd || busy) return m;
+		for (const id of queuedIds.split(" ")) {
+			m.set(id, {
+				draggable: true,
+				dragging: dragId === id,
+				dropBefore: drop === id,
+				onDragStart: (e) => {
+					// Firefox refuses to start a drag with an empty dataTransfer.
+					e.dataTransfer.setData("text/plain", id);
+					e.dataTransfer.effectAllowed = "move";
+					// The end slot previews the dragged card's own height.
+					boxRef.current?.style.setProperty(
+						"--drag-h",
+						`${e.currentTarget.offsetHeight}px`,
+					);
+					// Hollow the card only after the browser has captured it as the drag image.
+					requestAnimationFrame(() => setDragId(id));
+				},
+				onDragEnd: clear,
+			});
+		}
+		return m;
+	}, [dnd, busy, queuedIds, dragId, drop, clear]);
 	const hasTasks = tasks.length > 0 || (parked?.length ?? 0) > 0;
 	const showBacklogRow = parked != null;
 	// "Show more" moves focus to the first card it reveals: the button may unmount on the last page,
@@ -5292,8 +5376,6 @@ export function LaneCol({
 	// --- Queue drag & drop (native HTML5) -------------------------------------
 	// Only queued cards drag; only queued cards and the area below them are drop
 	// targets, so a queued card can never land above a running/needs_you card.
-	const queued = tasks.filter((t) => t.state === "queued");
-	const dnd = queued.length >= 2;
 	// The rendered list: with an overlay held, non-queued cards keep their positions first
 	// and the queued block follows the client's order (the partition laneOrder draws).
 	const view =
@@ -5305,10 +5387,6 @@ export function LaneCol({
 						.map((id) => tasks.find((t) => t.id === id))
 						.filter((t) => t !== undefined),
 				];
-	const clear = (): void => {
-		setDragId(null);
-		setDrop(undefined);
-	};
 	// One reorder at a time: a second request would be computed from the pre-reorder order and
 	// overwrite the first on the server (last write wins). Every reorder path routes through here.
 	const sendReorder = (id: string, before: string | null): void => {
@@ -5323,7 +5401,6 @@ export function LaneCol({
 			})
 			.finally(() => setPending(null));
 	};
-	const busy = pending !== null;
 	// ponytail: read live card midpoints during drag; cache only if columns reach hundreds of cards.
 	const dropAt = (y: number): string | null | undefined => {
 		const box = boxRef.current;
@@ -5364,46 +5441,25 @@ export function LaneCol({
 		<Card
 			key={t.id}
 			task={t}
-			hasRules={hasRules}
 			github={github}
 			delta={deltas.get(t.id)}
-			hold={holdFor(t, projectTasks)}
-			drain={draining}
-			tasks={projectTasks}
+			hold={facts.holds.get(t.id) ?? null}
+			status={facts.statuses.get(t.id)}
 			fuOf={t.followUpOf}
-			onOpen={() => open(t.id)}
+			onOpen={open}
 			unread={unread(t)}
 			locked={pending?.id === t.id}
 			holdRelease={heldBy.get(t.id)}
 			onOpenTask={open}
-			reRelease={reReleaseOf(t, projectTasks)}
+			reRelease={facts.rereleases.get(t.id) ?? null}
 			onRerelease={
-				onRerelease !== undefined && reReleaseOf(t, projectTasks) !== null
-					? () => onRerelease(t)
+				onRerelease !== undefined &&
+				(facts.rereleases.get(t.id) ?? null) !== null
+					? onRerelease
 					: undefined
 			}
-			drag={
-				dnd && !busy && t.state === "queued"
-					? {
-							draggable: true,
-							dragging: dragId === t.id,
-							dropBefore: drop === t.id,
-							onDragStart: (e) => {
-								// Firefox refuses to start a drag with an empty dataTransfer.
-								e.dataTransfer.setData("text/plain", t.id);
-								e.dataTransfer.effectAllowed = "move";
-								// The end slot previews the dragged card's own height.
-								boxRef.current?.style.setProperty(
-									"--drag-h",
-									`${e.currentTarget.offsetHeight}px`,
-								);
-								// Hollow the card only after the browser has captured it as the drag image.
-								requestAnimationFrame(() => setDragId(t.id));
-							},
-							onDragEnd: clear,
-						}
-					: undefined
-			}
+			drag={drags.get(t.id)}
+			tick={tick}
 		/>
 	);
 	// Done lane: unseen answers pin above a divider; read cards keep landing order (stable
@@ -11283,6 +11339,45 @@ export function RestartWaitLine({
 	);
 }
 
+/** True when two wire copies of one card carry equal content. The server re-serializes every
+ * frame, so array and object fields never keep reference identity; a shallow primitive compare
+ * first, then a JSON compare for the fields where references differ. Key counts differ when
+ * the server adds or drops a conditional field, which also counts as changed. */
+function sameCard(a: TaskCard, b: TaskCard): boolean {
+	const keys = Object.keys(a) as (keyof TaskCard)[];
+	if (keys.length !== Object.keys(b).length) return false;
+	for (const k of keys) {
+		if (a[k] === b[k]) continue;
+		if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) return false;
+	}
+	return true;
+}
+
+/** Merges a pushed state frame with the previous one: a card the frame carries unchanged keeps
+ * the previous object, so a memoized Card skips its render, and a frame that changes no card
+ * keeps even the tasks array. The frame's other fields always come through unchanged. */
+export function reuseCards(
+	prev: StateResponse | null,
+	next: StateResponse,
+): StateResponse {
+	if (prev === null) return next;
+	const prevById = new Map(prev.tasks.map((t) => [t.id, t]));
+	const tasks = next.tasks.map((t) => {
+		const p = prevById.get(t.id);
+		return p !== undefined && sameCard(p, t) ? p : t;
+	});
+	for (let i = 0; i < tasks.length; i++) {
+		if (tasks[i] !== prev.tasks[i]) return { ...next, tasks };
+	}
+	return prev.tasks.length === tasks.length ? prev : { ...next, tasks };
+}
+
+/** One card per rendered card, `<id>:<stage>`; two frames whose cards sit in the same stages
+ * cannot fly a card between lanes, so the board FLIP effect has nothing to measure. */
+export function boardFlipSig(tasks: readonly TaskCard[]): string {
+	return tasks.map((t) => `${t.id}:${t.stage}`).join(" ");
+}
+
 /** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
 export function App() {
 	// One-time client migration: an old hash URL becomes its path URL before the first
@@ -11430,8 +11525,8 @@ export function App() {
 	]);
 	/** "New" = not acknowledged yet. */
 	const isNew = (key: string): boolean => !inboxSeen.has(key);
-	/** Bumped every 30 s so relative ages re-render; nothing reads the number itself. */
-	const [, setClockTick] = useState(0);
+	/** Bumped every 30 s so relative ages re-render; the memoized cards read it as their tick. */
+	const [clockTick, setClockTick] = useState(0);
 	const [update, setUpdate] = useState<{
 		behind: number;
 		commits: string[];
@@ -11603,7 +11698,9 @@ export function App() {
 		if (live === null) return; // boot hasn't answered yet
 		const h = {
 			onState: (s: StateResponse) => {
-				setState(s);
+				// Unchanged cards keep their previous object (reuseCards), so the memoized
+				// cards skip their render and only the changed card redraws.
+				setState((prev) => reuseCards(prev, s));
 				// The frame carries the server's seen list, which now includes (or settled) every ack sent before it.
 				setAckLocal(new Set());
 				// The open card can vanish (cancelled in another tab): drop the selection,
@@ -11684,12 +11781,23 @@ export function App() {
 
 	/** Cards travel: when a task's stage changes, fly the card from its old column to its new one (FLIP). */
 	const cardPos = useRef(new Map<string, CardPos>());
+	/** The last frame the FLIP effect measured: its id:stage signature and path. A frame whose
+	 * cards sit in the same stages at the same path cannot fly a card between lanes. */
+	const flipKey = useRef<{ sig: string; path: string }>({ sig: "", path: "" });
 	/** Every task id seen so far; a task missing here was just created and gets an entrance. */
 	const seenIds = useRef<Set<string> | null>(null);
 	/** A follow-up awaiting its first board render: { id: the new task, from: the done task it continues. } */
 	const origin = useRef<{ id: string; from: string } | null>(null);
 	useLayoutEffect(() => {
 		if (state === null) return;
+		// Skip the document-wide rect scan when no id or stage changed (an unchanged card's
+		// push, the clock tick's siblings); the entrance and flight animations all need one of
+		// the two. A path change remeasures, because another board's DOM sits where the last
+		// scan measured.
+		const sig = boardFlipSig(state.tasks);
+		const path = location.pathname;
+		if (sig === flipKey.current.sig && path === flipKey.current.path) return;
+		flipKey.current = { sig, path };
 		const prev = cardPos.current;
 		const next = new Map<string, CardPos>();
 		const els = new Map<string, HTMLElement>();
@@ -12633,6 +12741,7 @@ export function App() {
 							act={act}
 							onNotice={setNotice}
 							draining={draining}
+							tick={clockTick}
 						/>
 					)}
 				</main>

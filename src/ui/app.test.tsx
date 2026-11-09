@@ -10,6 +10,7 @@ import type {
 	ProjectView,
 	ProposalSummary,
 	PrReviewView,
+	StateResponse,
 	Task,
 	TaskCard,
 	TaskView,
@@ -67,6 +68,9 @@ const {
 	ranOnLabel,
 	AuthPage,
 	PrReviewSection,
+	boardFlipSig,
+	cardRenderProbe,
+	reuseCards,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -8753,6 +8757,191 @@ describe("LogView fetch start offset (client)", () => {
 			expect(urls[0]).toContain("/tasks/t1/log?from=0");
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+describe("reuseCards", () => {
+	const frame = (tasks: TaskCard[]): StateResponse =>
+		({ tasks }) as unknown as StateResponse;
+
+	test("an unchanged card keeps its object, a changed card gets the new one", () => {
+		const a = cardFixture({ id: "a1", title: "Alpha" });
+		const b = cardFixture({ id: "b1", title: "Beta" });
+		const b2 = { ...b, summary: "update" };
+		const merged = reuseCards(frame([a, b]), frame([a, b2]));
+		expect(merged.tasks[0]).toBe(a);
+		expect(merged.tasks[1]).toBe(b2);
+	});
+
+	test("a frame that changes no card returns the previous state", () => {
+		const a = cardFixture({ id: "a1" });
+		const b = cardFixture({ id: "b1" });
+		const prev = frame([a, b]);
+		// The server re-serializes every frame: fresh objects, equal content.
+		expect(reuseCards(prev, frame([{ ...a }, { ...b }]))).toBe(prev);
+	});
+
+	test("a card the frame drops is a change even when the rest are equal", () => {
+		const a = cardFixture({ id: "a1" });
+		const b = cardFixture({ id: "b1" });
+		const prev = frame([a, b]);
+		const merged = reuseCards(prev, frame([{ ...a }]));
+		expect(merged).not.toBe(prev);
+		expect(merged.tasks).toHaveLength(1);
+	});
+
+	test("a server field gained or lost counts as a change", () => {
+		const plain = cardFixture({ id: "a1" });
+		const withHold = cardFixture({ id: "a1", pushHold: true });
+		const prev = frame([plain]);
+		expect(reuseCards(prev, frame([withHold]))).not.toBe(prev);
+		expect(reuseCards(frame([withHold]), frame([{ ...plain }]))).not.toBe(
+			frame([withHold]),
+		);
+	});
+});
+
+describe("boardFlipSig", () => {
+	const t = (id: string, stage: TaskCard["stage"]): TaskCard =>
+		cardFixture({ id, stage });
+
+	test("a frame with the same cards and stages keeps the signature", () => {
+		expect(boardFlipSig([t("a", "todo")])).toBe(boardFlipSig([t("a", "todo")]));
+	});
+
+	test("a stage change or a new card changes the signature", () => {
+		expect(boardFlipSig([t("a", "todo")])).not.toBe(
+			boardFlipSig([t("a", "in_progress")]),
+		);
+		expect(boardFlipSig([t("a", "todo")])).not.toBe(
+			boardFlipSig([t("a", "todo"), t("b", "todo")]),
+		);
+	});
+});
+
+describe("memoized Card renders", () => {
+	// React interaction needs browser globals; the setup mirrors the drawer
+	// describes: happy-dom registers them for this describe, and afterAll puts
+	// the originals back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	// The callbacks the production board also keeps stable (App's openTask is a
+	// useCallback): fresh closures per render would break the memo in the test itself.
+	const stable = {
+		onToggle: (): void => {},
+		open: (): void => {},
+		unread: (): boolean => false,
+		onReorder: async (): Promise<boolean> => true,
+	};
+	const laneProps = (tasks: TaskCard[], projectTasks: TaskCard[]) => ({
+		stage: "todo" as const,
+		tasks,
+		projectTasks,
+		groups: null,
+		collapsed: {},
+		onToggle: stable.onToggle,
+		hasRules: true,
+		github: null,
+		deltas: new Map<string, number>(),
+		open: stable.open,
+		unread: stable.unread,
+		onReorder: stable.onReorder,
+		filtering: false,
+		draining: false,
+	});
+
+	test("a state push that changes one card does not re-render the unchanged card", async () => {
+		const realFetch = globalThis.fetch;
+		// Card's model catalog fetch degrades to no catalog on a failed response.
+		globalThis.fetch = (async () =>
+			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const frame = (tasks: TaskCard[]): StateResponse =>
+			({ tasks }) as unknown as StateResponse;
+		let renders = 0;
+		try {
+			const a = cardFixture({
+				id: "a1",
+				title: "Alpha",
+				state: "running",
+				progress: "10%",
+			});
+			const b = cardFixture({ id: "b1", title: "Beta", state: "queued" });
+			const renderLane = async (tasks: TaskCard[]): Promise<void> => {
+				await act(async () => {
+					root.render(<LaneCol {...laneProps(tasks, tasks)} tick={0} />);
+				});
+			};
+			cardRenderProbe.fn = (): void => {
+				renders += 1;
+			};
+			await renderLane([a, b]);
+			// First paint: each card renders, then once more when the model catalog
+			// lands (useModels sets the fetched catalog after mount; the fetch here
+			// answers 404, which degrades to an empty catalog).
+			const afterMount = renders;
+			expect(afterMount).toBe(4);
+			// A frame that changes only Alpha: Beta's card object survives the
+			// merge, so Beta's memoized Card skips its render.
+			const a2 = { ...a, progress: "50%" };
+			const merged = reuseCards(frame([a, b]), frame([a2, b]));
+			expect(merged.tasks[0]).toBe(a2);
+			expect(merged.tasks[1]).toBe(b);
+			await renderLane(merged.tasks);
+			expect(renders).toBe(afterMount + 1);
+			expect(container.textContent).toContain("50%");
+			// A frame with equal content but fresh objects changes nothing: the
+			// merge returns the previous state and no card re-renders.
+			const same = reuseCards(merged, frame([{ ...a2 }, { ...b }]));
+			expect(same).toBe(merged);
+			await renderLane(same.tasks);
+			expect(renders).toBe(afterMount + 1);
+			// A frame that changes Beta re-renders Beta, and still not Alpha.
+			const b2 = { ...b, title: "Beta 2" };
+			const merged2 = reuseCards(merged, frame([a2, b2]));
+			expect(merged2.tasks[0]).toBe(a2);
+			await renderLane(merged2.tasks);
+			expect(renders).toBe(afterMount + 2);
+			expect(container.textContent).toContain("Beta 2");
+		} finally {
+			cardRenderProbe.fn = null;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
 		}
 	});
 });
