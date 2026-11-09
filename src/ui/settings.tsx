@@ -4696,7 +4696,8 @@ function CheckRow({
 	act,
 }: {
 	name: string;
-	desc: string;
+	/** Text or nodes; a dependent row puts its link to the master switch here. */
+	desc: ReactNode;
 	/** A short muted pill after the name, e.g. "Not needed: private repo". Put the same fact
 	 *  in `desc` too: the pill is hidden from screen readers. */
 	tag?: string;
@@ -5396,6 +5397,7 @@ export function SettingsPage({
 							key={project.name}
 							project={project}
 							tasks={tasks}
+							trendingScan={trendingScan}
 							act={act}
 							openTask={openTask}
 							hosted={host}
@@ -5468,12 +5470,16 @@ function ReviewCounter({
 export function ProjectSettingsForm({
 	project,
 	tasks,
+	trendingScan,
 	act,
 	openTask,
 	hosted,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
+	/** The board's general "Weekly trending scan" switch: a project's Trending scout
+	 *  never runs while it is off, so the row shows that state. */
+	trendingScan: boolean;
 	act: Act;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
 	openTask: (id: string) => void;
@@ -6060,8 +6066,30 @@ export function ProjectSettingsForm({
 							/>
 							<CheckRow
 								name="Trending scout"
-								desc="Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+								desc={
+									!trendingScan ? (
+										<>
+											The general 'Weekly trending scan' switch is off, so the
+											scout never runs — turn it on in{" "}
+											<a
+												href={`${settingsPath(null)}#runners-section`}
+												onClick={(e) =>
+													navClick(e, () =>
+														openSettingsSection("runners-section"),
+													)
+												}
+											>
+												General settings
+											</a>
+											. Weekly: an agent judges GitHub trending repos for this
+											project and files up to 3 backlog proposals
+										</>
+									) : (
+										"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+									)
+								}
 								checked={st.trendingScout}
+								disabled={!trendingScan && !st.trendingScout}
 								save={(v) => send({ trendingScout: v })}
 								act={act}
 							/>

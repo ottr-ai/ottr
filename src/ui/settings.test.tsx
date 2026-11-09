@@ -526,6 +526,7 @@ describe("ProjectSettingsForm target branch", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					trendingScan={true}
 					act={async (fn) => {
 						await fn();
 						return true;
@@ -779,6 +780,7 @@ describe("ProjectSettingsForm icon text marker", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					trendingScan={true}
 					act={async (fn) => {
 						await fn();
 						return true;
@@ -1282,6 +1284,7 @@ describe("ProjectSettingsForm review counter", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={tasks}
+					trendingScan={true}
 					act={async (fn) => {
 						await fn();
 						return true;
@@ -1552,6 +1555,7 @@ describe("Updates card", () => {
 					<ProjectSettingsForm
 						project={project()}
 						tasks={[]}
+						trendingScan={true}
 						act={async (fn) => {
 							await fn();
 							return true;
@@ -1590,6 +1594,135 @@ describe("Updates card", () => {
 	test("a public repo or an unknown visibility marks nothing", async () => {
 		expect(await taggedRows(json(200, { private: false }))).toEqual([]);
 		expect(await taggedRows(json(502, { error: "gh failed" }))).toEqual([]);
+	});
+});
+
+describe("Trending scout depends on the general weekly scan", () => {
+	const project = (trendingScout: boolean): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github: "octo/repo",
+			vmRunner: { configured: false, ok: false, reason: "not set" },
+			hasRules: true,
+			gitless: false,
+			archReview: null,
+			settings: {
+				holdUpdateMerges: false,
+				retroSince: null,
+				retroFilter: false,
+				forkResearch: false,
+				trendingScout,
+				prReviews: false,
+				prMode: false,
+				issueWatch: false,
+				microVm: false,
+				pushSyncCommits: false,
+				maxParallel: 2,
+				copyExtra: [],
+				displayName: null,
+				releaseCommand: null,
+				archReviewCap: 30,
+				maxImages: 4,
+				keptWorktreeDays: 7,
+				autoTend: false,
+				autoTendLimit: 5,
+				tendChurnGlobs: [],
+				setupChecklist: false,
+				targetBranch: null,
+				originUrl: null,
+			},
+		}) as unknown as ProjectView;
+
+	/** Mounts the form with the board's general trending switch at `trendingScan`; returns
+	 *  the Trending scout row. The fetch stub answers the two mount calls, same as above. */
+	async function scoutRow(
+		trendingScan: boolean,
+		trendingScout: boolean,
+	): Promise<{ row: Element; unmount: () => Promise<void> }> {
+		const json = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/github/visibility"))
+				return json({ private: false });
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return json({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project(trendingScout)}
+					tasks={[]}
+					trendingScan={trendingScan}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		const row = [
+			...container.querySelectorAll("#project-updates-section .check-row"),
+		].find((r) => r.querySelector("label")?.textContent === "Trending scout");
+		return {
+			row: row as Element,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("the general switch off disables the project box and links General settings", async () => {
+		const { row, unmount } = await scoutRow(false, false);
+		try {
+			const box = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
+			expect(box?.disabled).toBe(true);
+			const link = row.querySelector("a");
+			expect(link?.textContent).toBe("General settings");
+			expect(link?.getAttribute("href")).toBe("/settings#runners-section");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a scout already on stays clearable while the general switch is off", async () => {
+		const { row, unmount } = await scoutRow(false, true);
+		try {
+			const box = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
+			expect(box?.disabled).toBe(false);
+			expect(row.querySelector("a")?.textContent).toBe("General settings");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the general switch on leaves the row enabled with no hint link", async () => {
+		const { row, unmount } = await scoutRow(true, false);
+		try {
+			const box = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
+			expect(box?.disabled).toBe(false);
+			expect(row.querySelector("a")).toBeNull();
+		} finally {
+			await unmount();
+		}
 	});
 });
 
@@ -2244,6 +2377,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 					<ProjectSettingsForm
 						project={project}
 						tasks={[]}
+						trendingScan={true}
 						act={async (fn) => {
 							await fn();
 							return true;
