@@ -711,8 +711,13 @@ describe("watcher", () => {
 		expect(state.ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
 		expect(state.subjects).toEqual([["own work"]]);
 		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
-		expect(feat.analyzedHead).toBeNull();
+		// The per-commit model advances the cursor through held work: the PR commits
+		// are held rows, so they stay out of the analysis while the PR is open.
+		expect(feat.analyzedHead).toBe(feat.head);
 		expect(feat.retries).toBe(0);
+		expect(store.listForkHolds(1).some((h) => h.sha === pr.head.sha)).toBe(
+			true,
+		);
 	});
 
 	test("commits of an open PR from one fork stay out of another fork's range", async () => {
@@ -768,8 +773,11 @@ describe("watcher", () => {
 			expect(r.lastRunAt).toBeNull();
 			expect(r.retries).toBe(0);
 		}
-		// Once the PR closes, the next check analyzes the branch.
+		// Once the PR closes, the next check analyzes the branch. The close must be
+		// resolvable (pullState answers it): an open list that simply lost the PR
+		// keeps the per-commit rows held until GitHub proves the PR's state.
 		state.pulls = [];
+		state.closed.set(2, { merged_at: null, head: pr.head.sha });
 		await watcher.tick();
 		expect(state.subjects).toEqual([["fork feature"]]);
 	});
@@ -821,13 +829,11 @@ describe("watcher", () => {
 		const feat = () =>
 			store.listAllForkBranches().find((r) => r.branch === "feat")!;
 		expect(feat().analyzedHead).toBe(feat().head);
-		expect(feat().holdPrs).toEqual([{ n: 2, head: pr.head.sha }]);
 		state.pulls = [];
 		state.closed.set(2, { merged_at: null, head: pr.head.sha });
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects).toEqual([["fork feature"]]);
-		expect(feat().holdPrs).toBeNull();
 	});
 
 	test("work held next to analyzed work comes back when the PR closes unmerged", async () => {
@@ -881,7 +887,6 @@ describe("watcher", () => {
 			const feat = store
 				.listAllForkBranches()
 				.find((r) => r.branch === "feat")!;
-			expect(feat.holdPrs).toBeNull();
 			expect(feat.analyzedHead).toBe(feat.head);
 		});
 
@@ -1105,5 +1110,338 @@ describe("ensureCache", () => {
 		expect(existsSync(join(p1, "HEAD"))).toBe(true);
 		const p2 = await ensureCache(dir, fork, git);
 		expect(p2).toBe(p1);
+	});
+});
+
+describe("hold acceptance checks", () => {
+	const HOUR = 3_600_000;
+
+	/** Local git remap: the fork URL goes to the fixture fork, the project repo URL to the fixture upstream. */
+	function holdGit(forkPath: string, mainPath: string): GitFn {
+		return async (args, cwd, timeoutMs) => {
+			let a = args.map((u) =>
+				u === "https://github.com/o/r.git"
+					? forkPath
+					: u === "https://github.com/o/main.git"
+						? mainPath
+						: u,
+			);
+			const at = a.indexOf("fetch");
+			if (at >= 0)
+				a = [
+					...a.slice(0, at),
+					"-c",
+					"protocol.file.allow=always",
+					...a.slice(at),
+				];
+			return git(a, cwd, timeoutMs);
+		};
+	}
+
+	const bySha = (x: { sha: string }, y: { sha: string }) =>
+		x.sha < y.sha ? -1 : 1;
+
+	function holds(store: ProjectStore) {
+		return store
+			.listForkHolds(1)
+			.map((h) => ({
+				sha: h.sha,
+				pr: h.pr,
+				prHead: h.prHead,
+				released: h.released,
+			}))
+			.sort(bySha);
+	}
+
+	function forkCards(store: ProjectStore) {
+		return store.listTasks().filter((t) => t.topic === "fork research");
+	}
+
+	/** Fork fixture with a feat branch, pull refs in the upstream fixture, and a clock-driven tick. */
+	async function holdFixture(name: string) {
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const fork = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		let fileNo = 0;
+		const commit = async (msg: string): Promise<string> => {
+			fileNo++;
+			Bun.write(join(fork, `f${fileNo}.txt`), `data ${fileNo}\n`);
+			await run(["add", `f${fileNo}.txt`, fork], fork);
+			await run(["commit", "-q", "-m", msg, fork], fork);
+			return shaOf(fork);
+		};
+		// Publishes a fork commit as the upstream pull ref `refs/pull/<n>/head`; the
+		// temp branch never survives a tick, so the watcher never discovers it.
+		const setPullRefAt = async (n: number, sha: string) => {
+			const tmp = `tmp-pr${n}`;
+			await run(["branch", tmp, sha, fork], fork);
+			await run(
+				[
+					"-c",
+					"protocol.file.allow=always",
+					"fetch",
+					"-q",
+					fork,
+					`+refs/heads/${tmp}:refs/pull/${n}/head`,
+				],
+				main,
+			);
+			await run(["branch", "-D", tmp, fork], fork);
+		};
+		let clock = Date.now();
+		let analyzeCalls = 0;
+		const tick = async (o: {
+			pulls: Array<{ n: number; head: string }>;
+			states?: Record<number, { merged: boolean; head: string } | null>;
+		}): Promise<number> => {
+			// Each tick lands past the one-run-per-day gate of the previous tick.
+			clock += FORK_GATES.FORK_RUN_SPACING_MS + HOUR;
+			const before = analyzeCalls;
+			const gh: GhFn = async (args) => {
+				const url = args[1] ?? "";
+				if (url.includes("/forks?"))
+					return {
+						code: 0,
+						stdout: JSON.stringify([forkPageEntry(1)]),
+						stderr: "",
+					};
+				if (url.includes("/pulls?state=open"))
+					return {
+						code: 0,
+						stdout: JSON.stringify(
+							o.pulls.map((p) => ({
+								number: p.n,
+								state: "open",
+								draft: false,
+								title: `pr ${p.n}`,
+								head: { sha: p.head },
+							})),
+						),
+						stderr: "",
+					};
+				const m = url.match(/\/pulls\/(\d+)$/);
+				if (m) {
+					const s = o.states?.[Number(m[1])] ?? null;
+					return {
+						code: 0,
+						stdout: JSON.stringify(
+							s === null
+								? { state: "open", head: { sha: "" } }
+								: {
+										state: "closed",
+										head: { sha: s.head },
+										merged_at: s.merged ? "2026-01-02T00:00:00Z" : null,
+									},
+						),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: "[]", stderr: "" };
+			};
+			const watcher = createForkWatcher({
+				projects: () => [
+					{ name, path: main, store, github: "o/main" } satisfies ForkProject,
+				],
+				log: () => {},
+				gh,
+				git: holdGit(fork, main),
+				analyze: async (range) => {
+					analyzeCalls++;
+					return {
+						features: [],
+						proposals: [],
+						coverage: "",
+						deferred: [],
+						commits: range.commits.map((c) => c.sha),
+					};
+				},
+				now: () => clock,
+			});
+			await watcher.tick();
+			return analyzeCalls - before;
+		};
+		// Marks the branch's pending wait as spent, so the next tick's run passes the quiet gate.
+		const waitOut = () => {
+			const row = store.listAllForkBranches().find((r) => r.branch === "feat");
+			if (row)
+				store.saveForkBranch({
+					...row,
+					firstPendingAt: clock - (FORK_GATES.QUIET_MS + HOUR),
+				});
+		};
+		return {
+			main,
+			fork,
+			store,
+			commit,
+			setPullRefAt,
+			tick,
+			waitOut,
+			calls: () => analyzeCalls,
+		};
+	}
+
+	const featRow = (store: ProjectStore) =>
+		store.listAllForkBranches().find((r) => r.branch === "feat")!;
+
+	test("a direct PR branch held; a squash merge at the same head files nothing", async () => {
+		const f = await holdFixture("hold-squash");
+		const a = await f.commit("fork feature one");
+		await f.setPullRefAt(5, a);
+		// Tick 1: the open PR covers the branch head; it is held, the cursor advances, no run.
+		expect(await f.tick({ pulls: [{ n: 5, head: a }] })).toBe(0);
+		expect(forkCards(f.store).length).toBe(0);
+		expect(holds(f.store)).toEqual([{ sha: a, pr: 5, prHead: a, released: 0 }]);
+		const row = featRow(f.store);
+		expect(row.analyzedHead).toBe(a);
+		expect(row.firstPendingAt).toBeNull();
+		// Upstream gains only an unrelated squash commit with a different sha.
+		touch(join(f.main, "sq.txt"), 1);
+		await run(["add", "sq.txt", f.main], f.main);
+		await run(["commit", "-q", "-m", "squash: unrelated", f.main], f.main);
+		// Tick 2: GitHub reports the PR merged at the held head; the rows drop, no run.
+		expect(
+			await f.tick({ pulls: [], states: { 5: { merged: true, head: a } } }),
+		).toBe(0);
+		expect(holds(f.store)).toEqual([]);
+		expect(forkCards(f.store).length).toBe(0);
+	});
+
+	test("a merged PR not pulled locally drops its holds without a run", async () => {
+		const f = await holdFixture("hold-merged-local");
+		const a = await f.commit("fork feature one");
+		await f.setPullRefAt(5, a);
+		expect(await f.tick({ pulls: [{ n: 5, head: a }] })).toBe(0);
+		expect(holds(f.store).length).toBe(1);
+		// The local main fixture never receives the merge; pullState still proves it.
+		expect(
+			await f.tick({ pulls: [], states: { 5: { merged: true, head: a } } }),
+		).toBe(0);
+		expect(holds(f.store)).toEqual([]);
+		expect(f.calls()).toBe(0);
+		expect(forkCards(f.store).length).toBe(0);
+	});
+
+	test("a PR append never resends already analyzed work", async () => {
+		const f = await holdFixture("hold-append");
+		await f.commit("feature a");
+		// A analyzed first: one card, cursor at A.
+		expect(await f.tick({ pulls: [] })).toBe(1);
+		expect(f.calls()).toBe(1);
+		const b = await f.commit("feature b");
+		await f.setPullRefAt(5, b);
+		f.waitOut();
+		// The PR opens with head A+B: B is held, the cursor advances to B, no resend.
+		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
+		expect(f.calls()).toBe(1);
+		expect(forkCards(f.store).length).toBe(1);
+		expect(featRow(f.store).analyzedHead).toBe(b);
+		expect(holds(f.store)).toEqual([{ sha: b, pr: 5, prHead: b, released: 0 }]);
+		const c = await f.commit("feature c");
+		await f.setPullRefAt(5, c);
+		f.waitOut();
+		// The append to C re-judges B (covered by C), holds C, and still never re-runs.
+		expect(await f.tick({ pulls: [{ n: 5, head: c }] })).toBe(0);
+		expect(f.calls()).toBe(1);
+		expect(forkCards(f.store).length).toBe(1);
+		expect(featRow(f.store).analyzedHead).toBe(c);
+		expect(holds(f.store)).toEqual(
+			[
+				{ sha: b, pr: 5, prHead: c, released: 0 },
+				{ sha: c, pr: 5, prHead: c, released: 0 },
+			].sort(bySha),
+		);
+	});
+
+	test("a PR that drops a held commit gets that commit analyzed", async () => {
+		const f = await holdFixture("hold-drop");
+		const b = await f.commit("held feature b");
+		await f.setPullRefAt(5, b);
+		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
+		expect(holds(f.store)).toEqual([{ sha: b, pr: 5, prHead: b, released: 0 }]);
+		// The PR force-pushes a rebased head D that lacks B (and shares no patch with it).
+		await run(["checkout", "-q", "--detach", "origin/main", f.fork], f.fork);
+		touch(join(f.fork, "side.txt"), 1);
+		await run(["add", "side.txt", f.fork], f.fork);
+		await run(["commit", "-q", "-m", "side rework", f.fork], f.fork);
+		const d = await shaOf(f.fork);
+		await run(["branch", "-q", "-f", "feat", f.fork], f.fork);
+		await run(["checkout", "-q", "feat", f.fork], f.fork);
+		await f.setPullRefAt(5, d);
+		f.waitOut();
+		// B is not covered by D or any other open PR: it is released and analyzed.
+		expect(await f.tick({ pulls: [{ n: 5, head: d }] })).toBe(1);
+		const card = forkCards(f.store)[0]!;
+		expect(card.report).toContain("held feature b");
+		// B's consumed row is deleted after the successful run; D's row survives.
+		expect(holds(f.store)).toEqual([{ sha: d, pr: 5, prHead: d, released: 0 }]);
+		expect(featRow(f.store).analyzedHead).toBe(d);
+	});
+
+	test("a closed unmerged PR gets its held commits analyzed", async () => {
+		const f = await holdFixture("hold-closed");
+		const b = await f.commit("held feature b");
+		await f.setPullRefAt(5, b);
+		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
+		expect(f.calls()).toBe(0);
+		const c = await f.commit("feature c");
+		f.waitOut();
+		// pullState reports closed unmerged: B is released and rides the run.
+		expect(
+			await f.tick({
+				pulls: [],
+				states: { 5: { merged: false, head: b } },
+			}),
+		).toBe(1);
+		const card = forkCards(f.store)[0]!;
+		expect(card.report).toContain("held feature b");
+		expect(holds(f.store)).toEqual([]);
+		expect(featRow(f.store).analyzedHead).toBe(c);
+	});
+
+	test("a held commit covered by another open PR re-points and stays held", async () => {
+		const f = await holdFixture("hold-move");
+		const b = await f.commit("held feature b");
+		await f.setPullRefAt(5, b);
+		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
+		expect(f.calls()).toBe(0);
+		// PR 6 opens with a head that contains B, while PR 5 force-pushes a head that lacks it.
+		await run(["checkout", "-q", "-b", "pr6", f.fork], f.fork);
+		touch(join(f.fork, "six.txt"), 6);
+		await run(["add", "six.txt", f.fork], f.fork);
+		await run(["commit", "-q", "-m", "pr six work", f.fork], f.fork);
+		const e = await shaOf(f.fork);
+		await f.setPullRefAt(6, e);
+		await run(["checkout", "-q", "feat", f.fork], f.fork);
+		await run(["branch", "-D", "pr6", f.fork], f.fork);
+		await run(["checkout", "-q", "--detach", "origin/main", f.fork], f.fork);
+		touch(join(f.fork, "side.txt"), 1);
+		await run(["add", "side.txt", f.fork], f.fork);
+		await run(["commit", "-q", "-m", "side rework", f.fork], f.fork);
+		const d = await shaOf(f.fork);
+		await run(["branch", "-q", "-f", "feat", f.fork], f.fork);
+		await run(["checkout", "-q", "feat", f.fork], f.fork);
+		await f.setPullRefAt(5, d);
+		f.waitOut();
+		// B re-points to PR 6 and stays held; D is held too, so nothing runs.
+		expect(
+			await f.tick({
+				pulls: [
+					{ n: 5, head: d },
+					{ n: 6, head: e },
+				],
+			}),
+		).toBe(0);
+		expect(holds(f.store)).toEqual(
+			[
+				{ sha: b, pr: 6, prHead: e, released: 0 },
+				{ sha: d, pr: 5, prHead: d, released: 0 },
+			].sort(bySha),
+		);
+		expect(featRow(f.store).analyzedHead).toBe(d);
+		expect(forkCards(f.store).length).toBe(0);
 	});
 });

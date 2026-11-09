@@ -3327,8 +3327,6 @@ describe("fork research store methods", () => {
 			lastRunAt: null,
 			lastError: null,
 			retries: 0,
-			holdPrs: null,
-			holdBase: null,
 		};
 		store.saveForkBranch(row);
 		store.saveForkBranch({
@@ -3341,9 +3339,6 @@ describe("fork research store methods", () => {
 			{ ...row, head: "def", retries: 2, lastError: "boom" },
 		]);
 		expect(store.listAllForkBranches()).toHaveLength(1);
-		const hold = [{ n: 5, head: "h5" }];
-		store.saveForkBranch({ ...row, holdPrs: hold, holdBase: null });
-		expect(store.listForkBranches(1)[0]!.holdPrs).toEqual(hold);
 	});
 
 	test("forkRunsSince counts recorded runs", () => {
@@ -3366,8 +3361,6 @@ describe("fork research store methods", () => {
 			lastRunAt: null,
 			lastError: "earlier failure",
 			retries: 2,
-			holdPrs: null,
-			holdBase: null,
 		});
 		const card = store.createForkResult({
 			prompt: "report prompt",
@@ -3384,13 +3377,6 @@ describe("fork research store methods", () => {
 					branchHash: "h1",
 					head: "abc",
 					at: 42,
-					hold: {
-						prs: [
-							{ n: 3, head: "h3" },
-							{ n: 4, head: "h4" },
-						],
-						base: "base0",
-					},
 				},
 			],
 		});
@@ -3419,11 +3405,132 @@ describe("fork research store methods", () => {
 		expect(branch.lastRunAt).toBe(42);
 		expect(branch.lastError).toBeNull();
 		expect(branch.retries).toBe(0);
-		expect(branch.holdPrs).toEqual([
-			{ n: 3, head: "h3" },
-			{ n: 4, head: "h4" },
+	});
+});
+
+describe("fork hold store", () => {
+	test("a legacy database without the table converges on open", () => {
+		const dir = join(root, "fork-hold-legacy");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		// Schema as it was before fork_hold existed (pre-feature done card).
+		db.exec(`CREATE TABLE IF NOT EXISTS fork_branch (
+  fork_id INTEGER NOT NULL,
+  branch_hash TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT,
+  analyzed_head TEXT,
+  first_pending_at INTEGER,
+  last_run_at INTEGER,
+  last_error TEXT,
+  retries INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (fork_id, branch_hash)
+)`);
+		db.exec(
+			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head) VALUES (1, 'h1', 'feat', 'abc', NULL)",
+		);
+		db.close();
+		const store = open(dir);
+		expect(store.listForkHolds(1)).toEqual([]);
+		store.setForkHolds(1, "h1", [
+			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
 		]);
-		expect(branch.holdBase).toBe("base0");
+		expect(store.listForkHolds(1)).toEqual([
+			{
+				forkId: 1,
+				branchHash: "h1",
+				sha: "a".repeat(40),
+				pr: 5,
+				prHead: "b".repeat(40),
+				released: 0,
+			},
+		]);
+		store.close();
+	});
+
+	test("setForkHolds replaces the branch's rows", () => {
+		const store = open(join(root, "fork-hold-replace"));
+		store.setForkHolds(1, "h1", [
+			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
+			{ sha: "c".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
+		]);
+		store.setForkHolds(1, "h1", [
+			{ sha: "c".repeat(40), pr: 6, prHead: "d".repeat(40), released: true },
+		]);
+		expect(store.listForkHolds(1)).toEqual([
+			{
+				forkId: 1,
+				branchHash: "h1",
+				sha: "c".repeat(40),
+				pr: 6,
+				prHead: "d".repeat(40),
+				released: 1,
+			},
+		]);
+		store.close();
+	});
+
+	test("deleteForkBranchesNotIn prunes holds of absent forks and clears all on empty ids", () => {
+		const store = open(join(root, "fork-hold-prune"));
+		store.setForkHolds(1, "h1", [
+			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
+		]);
+		store.setForkHolds(2, "h2", [
+			{ sha: "c".repeat(40), pr: 6, prHead: "d".repeat(40), released: false },
+		]);
+		store.deleteForkBranchesNotIn([1]);
+		expect(store.listForkHolds(2)).toEqual([]);
+		expect(store.listForkHolds(1)).toHaveLength(1);
+		store.deleteForkBranchesNotIn([]);
+		expect(store.listForkHolds(1)).toEqual([]);
+		store.close();
+	});
+
+	test("createForkResult deletes consumed hold rows in-transaction and leaves the rest", () => {
+		const store = open(join(root, "fork-hold-consume"));
+		store.saveForkBranch({
+			forkId: 7,
+			branchHash: "h1",
+			branch: "feat-a",
+			head: "abc",
+			analyzedHead: null,
+			firstPendingAt: 5,
+			lastRunAt: null,
+			lastError: null,
+			retries: 0,
+		});
+		store.setForkHolds(7, "h1", [
+			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
+			{ sha: "c".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
+		]);
+		store.createForkResult({
+			prompt: "report prompt",
+			title: "Fork research",
+			report: "# findings",
+			topic: "fork research",
+			proposals: [],
+			analyzed: [
+				{
+					forkId: 7,
+					branchHash: "h1",
+					head: "abc",
+					at: 42,
+					consumed: ["a".repeat(40)],
+				},
+			],
+		});
+		expect(store.listForkHolds(7)).toEqual([
+			{
+				forkId: 7,
+				branchHash: "h1",
+				sha: "c".repeat(40),
+				pr: 5,
+				prHead: "b".repeat(40),
+				released: 1,
+			},
+		]);
+		expect(store.listForkBranches(7)[0]!.analyzedHead).toBe("abc");
+		store.close();
 	});
 });
 
@@ -4067,18 +4174,69 @@ describe("pr review store methods", () => {
 		);
 		old.close();
 		const store = open(dir);
-		const row = store.listForkBranches(1)[0]!;
-		expect(row).toMatchObject({ head: "b", holdPrs: null, holdBase: null });
-		store.saveForkBranch({
-			...row,
-			holdPrs: [{ n: 2, head: "h2" }],
-			holdBase: "a",
-		});
+		// The retired columns converge additively; the row reads with no hold state.
 		expect(store.listForkBranches(1)[0]).toMatchObject({
-			holdPrs: [{ n: 2, head: "h2" }],
-			holdBase: "a",
+			head: "b",
+			analyzedHead: "a",
 		});
 		store.close();
+	});
+
+	test("a legacy hold_prs row converts into fork_hold rows on open", () => {
+		const dir = join(root, "fork-branch-hold-legacy");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		// The fork_branch shape as the retired cursor hold left it: no fork_hold table.
+		old.exec(`CREATE TABLE fork_branch (
+  fork_id INTEGER NOT NULL,
+  branch_hash TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT,
+  analyzed_head TEXT,
+  first_pending_at INTEGER,
+  last_run_at INTEGER,
+  last_error TEXT,
+  retries INTEGER NOT NULL DEFAULT 0,
+  hold_prs TEXT,
+  hold_base TEXT,
+  PRIMARY KEY (fork_id, branch_hash)
+)`);
+		old.run(
+			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, hold_prs, hold_base) VALUES (1, 'h', 'feat', 'b', 'a', '[{\"n\":2,\"head\":\"h2\"}]', 'a')",
+		);
+		old.run(
+			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, hold_prs) VALUES (2, 'i', 'dev', 'c', NULL, 'not json')",
+		);
+		old.close();
+		const store = open(dir);
+		// Each legacy entry held its PR head: the head sha seeds the per-commit hold
+		// row, and the watcher expands the PR's other held commits when it resolves.
+		expect(store.listForkHolds(1)).toEqual([
+			{
+				forkId: 1,
+				branchHash: "h",
+				sha: "h2",
+				pr: 2,
+				prHead: "h2",
+				released: 0,
+			},
+		]);
+		expect(store.listForkHolds(2)).toEqual([]);
+		// The retired columns are cleared, so the conversion never runs twice.
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const row = raw
+			.query<{ hold_prs: string | null; hold_base: string | null }, []>(
+				"SELECT hold_prs, hold_base FROM fork_branch WHERE fork_id = 1",
+			)
+			.get();
+		raw.close();
+		// hold_prs is spent; hold_base stays for the watcher's expansion, which
+		// clears it once the legacy hold is per-commit.
+		expect(row).toEqual({ hold_prs: null, hold_base: "a" });
 	});
 
 	const runShape = (dir: string) => {

@@ -17,6 +17,7 @@ import {
 	parseDraft,
 	parsePullPage,
 	prUrl,
+	pullState,
 	reviewUserMessage,
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
@@ -406,6 +407,71 @@ describe("parsePullPage", () => {
 			[null, null],
 			[null, null],
 		]);
+	});
+});
+
+describe("pullState", () => {
+	const ghOk =
+		(body: unknown): GhFn =>
+		async () => ({
+			code: 0,
+			stdout: JSON.stringify(body),
+			stderr: "",
+		});
+
+	test("an open PR returns null", async () => {
+		const out = await pullState(
+			"o/r",
+			5,
+			ghOk({ state: "open", head: { sha: sha("a") } }),
+		);
+		expect(out).toBeNull();
+	});
+
+	test("a closed merged PR reports merged with the head", async () => {
+		const out = await pullState(
+			"o/r",
+			5,
+			ghOk({
+				state: "closed",
+				merged_at: "2026-01-02T03:04:05Z",
+				head: { sha: sha("b") },
+			}),
+		);
+		expect(out).toEqual({ merged: true, head: sha("b") });
+	});
+
+	test("a closed unmerged PR reports merged false", async () => {
+		const out = await pullState(
+			"o/r",
+			5,
+			ghOk({ state: "closed", merged_at: null, head: { sha: sha("c") } }),
+		);
+		expect(out).toEqual({ merged: false, head: sha("c") });
+	});
+
+	test("a gh failure throws with the capped stderr", async () => {
+		const gh: GhFn = async () => ({
+			code: 1,
+			stdout: "",
+			stderr: `boom\n${"y".repeat(400)}`,
+		});
+		await expect(pullState("o/r", 5, gh)).rejects.toThrow(
+			"gh pull 5 failed (1)",
+		);
+	});
+
+	test.each([
+		["not an object", "null"],
+		["missing sha", JSON.stringify({ state: "closed", merged_at: null })],
+		["bad sha", JSON.stringify({ state: "closed", head: { sha: "abc" } })],
+		[
+			"unknown state",
+			JSON.stringify({ state: "draft", head: { sha: sha("d") } }),
+		],
+	])("a malformed body (%s) throws", async (_label, stdout) => {
+		const gh: GhFn = async () => ({ code: 0, stdout, stderr: "" });
+		await expect(pullState("o/r", 5, gh)).rejects.toThrow();
 	});
 });
 

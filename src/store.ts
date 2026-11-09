@@ -40,6 +40,7 @@ import type {
 	AskQuestion,
 	DiffFileStat,
 	ForkBranchState,
+	ForkHoldState,
 	ListedTask,
 	OutcomeStatus,
 	ProjectSettings,
@@ -198,6 +199,15 @@ CREATE TABLE IF NOT EXISTS fork_runs (
   fork_id INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fork_runs_at ON fork_runs (started_at);
+CREATE TABLE IF NOT EXISTS fork_hold (
+  fork_id INTEGER NOT NULL,
+  branch_hash TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  pr INTEGER NOT NULL,
+  pr_head TEXT NOT NULL,
+  released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0,1)),
+  PRIMARY KEY (fork_id, branch_hash, sha)
+);
 CREATE TABLE IF NOT EXISTS pr_review (
   number INTEGER PRIMARY KEY,
   task_id TEXT,
@@ -325,12 +335,18 @@ interface ForkBranchRow {
 	last_run_at: number | null;
 	last_error: string | null;
 	retries: number;
+	// Retired cursor-hold columns, superseded by fork_hold; read once by the open
+	// migration, then cleared. Never written again.
 	hold_prs: string | null;
 	hold_base: string | null;
 }
 
-/** Stored hold list: a JSON array of `{ n, head }` entries; anything else reads as no hold. */
-function parseHoldPrs(s: string | null): ForkBranchState["holdPrs"] {
+/** Legacy hold list: a JSON array of `{ n, head }` entries; anything else reads as none.
+ * The per-commit model replaced the cursor hold; this parser only feeds the one-time
+ * migration in ProjectStore.open. */
+function parseHoldPrs(
+	s: string | null,
+): Array<{ n: number; head: string }> | null {
 	if (s === null) return null;
 	try {
 		const v: unknown = JSON.parse(s);
@@ -364,8 +380,27 @@ function toForkBranch(r: ForkBranchRow): ForkBranchState {
 		lastRunAt: r.last_run_at,
 		lastError: r.last_error,
 		retries: r.retries,
-		holdPrs: parseHoldPrs(r.hold_prs),
-		holdBase: r.hold_base,
+	};
+}
+
+/** One fork_hold row: a held commit with the PR and head it was judged against. */
+interface ForkHoldRow {
+	fork_id: number;
+	branch_hash: string;
+	sha: string;
+	pr: number;
+	pr_head: string;
+	released: number;
+}
+
+function toForkHold(r: ForkHoldRow): ForkHoldState {
+	return {
+		forkId: r.fork_id,
+		branchHash: r.branch_hash,
+		sha: r.sha,
+		pr: r.pr,
+		prHead: r.pr_head,
+		released: r.released,
 	};
 }
 
@@ -2014,6 +2049,36 @@ export class ProjectStore {
 				col,
 				`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`,
 			);
+		// The retired cursor hold (hold_prs/hold_base, superseded by the per-commit
+		// fork_hold rows) converts in two steps, so a live board keeps every held
+		// commit: each legacy entry held its PR's head, so the head sha seeds the
+		// fork_hold row here; the watcher then expands the PR's other held commits
+		// (they live between hold_base and the head, a window only git knows) and
+		// clears hold_base. One transaction for this step; a later open is a no-op.
+		db.transaction(() => {
+			const legacy = db
+				.query<
+					{ fork_id: number; branch_hash: string; hold_prs: string | null },
+					[]
+				>(
+					"SELECT fork_id, branch_hash, hold_prs FROM fork_branch WHERE hold_prs IS NOT NULL",
+				)
+				.all();
+			for (const row of legacy) {
+				const prs = parseHoldPrs(row.hold_prs);
+				if (prs !== null) {
+					for (const e of prs)
+						db.run(
+							"INSERT OR IGNORE INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, 0)",
+							[row.fork_id, row.branch_hash, e.head, e.n, e.head],
+						);
+				}
+				db.run(
+					"UPDATE fork_branch SET hold_prs = NULL WHERE fork_id = ? AND branch_hash = ?",
+					[row.fork_id, row.branch_hash],
+				);
+			}
+		})();
 		// posted_login landed with the GitHub App posts: same additive convergence, so an
 		// older database still reads and posts without a rebuild.
 		ProjectStore.addColumn(
@@ -2232,16 +2297,71 @@ export class ProjectStore {
 			.map(toForkBranch);
 	}
 
+	/** Per-commit holds of one fork, any order (the watcher merges them per branch). */
+	listForkHolds(forkId: number): ForkHoldState[] {
+		return this.db
+			.query<ForkHoldRow, [number]>("SELECT * FROM fork_hold WHERE fork_id = ?")
+			.all(forkId)
+			.map(toForkHold);
+	}
+
+	/** Replaces ALL per-commit hold rows of one branch in one transaction. */
+	setForkHolds(
+		forkId: number,
+		branchHash: string,
+		rows: Array<{ sha: string; pr: number; prHead: string; released: boolean }>,
+	): void {
+		for (const r of rows) {
+			if (!/^[0-9a-f]{40}$/.test(r.prHead)) {
+				throw new Error(`fork_hold: pr_head must be 40-hex, got ${r.prHead}`);
+			}
+		}
+		this.db.transaction(() => {
+			this.db.run(
+				"DELETE FROM fork_hold WHERE fork_id = ? AND branch_hash = ?",
+				[forkId, branchHash],
+			);
+			for (const r of rows) {
+				this.db.run(
+					"INSERT INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, ?)",
+					[forkId, branchHash, r.sha, r.pr, r.prHead, r.released ? 1 : 0],
+				);
+			}
+		})();
+	}
+
+	/**
+	 * The retired cursor-hold base of one branch (null once drained). The watcher reads
+	 * it to expand a migrated PR-level hold into per-commit rows, then clears it; a
+	 * failed expansion leaves it in place, so the next tick retries the conversion.
+	 */
+	legacyForkHoldBase(forkId: number, branchHash: string): string | null {
+		return (
+			this.db
+				.query<{ hold_base: string | null }, [number, string]>(
+					"SELECT hold_base FROM fork_branch WHERE fork_id = ? AND branch_hash = ?",
+				)
+				.get(forkId, branchHash)?.hold_base ?? null
+		);
+	}
+
+	/** Clears the retired cursor-hold base after a successful legacy conversion. */
+	clearLegacyForkHoldBase(forkId: number, branchHash: string): void {
+		this.db.run(
+			"UPDATE fork_branch SET hold_base = NULL WHERE fork_id = ? AND branch_hash = ?",
+			[forkId, branchHash],
+		);
+	}
+
 	/** Upserts one branch watch row. */
 	saveForkBranch(s: ForkBranchState): void {
 		this.db.run(
-			`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries, hold_prs, hold_base)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(fork_id, branch_hash) DO UPDATE SET
 			   branch = excluded.branch, head = excluded.head, analyzed_head = excluded.analyzed_head,
 			   first_pending_at = excluded.first_pending_at, last_run_at = excluded.last_run_at,
-			   last_error = excluded.last_error, retries = excluded.retries,
-			   hold_prs = excluded.hold_prs, hold_base = excluded.hold_base`,
+			   last_error = excluded.last_error, retries = excluded.retries`,
 			[
 				s.forkId,
 				s.branchHash,
@@ -2252,8 +2372,6 @@ export class ProjectStore {
 				s.lastRunAt,
 				s.lastError,
 				s.retries,
-				s.holdPrs === null ? null : JSON.stringify(s.holdPrs),
-				s.holdBase,
 			],
 		);
 	}
@@ -2280,10 +2398,12 @@ export class ProjectStore {
 	deleteForkBranchesNotIn(ids: number[]): void {
 		if (ids.length === 0) {
 			this.db.run("DELETE FROM fork_branch");
+			this.db.run("DELETE FROM fork_hold");
 			return;
 		}
 		const ph = ids.map(() => "?").join(", ");
 		this.db.run(`DELETE FROM fork_branch WHERE fork_id NOT IN (${ph})`, ids);
+		this.db.run(`DELETE FROM fork_hold WHERE fork_id NOT IN (${ph})`, ids);
 	}
 
 	/**
@@ -2304,11 +2424,8 @@ export class ProjectStore {
 			branchHash: string;
 			head: string;
 			at: number;
-			/** The branch's hold after this run (see ForkBranchState.holdPrs). */
-			hold: {
-				prs: NonNullable<ForkBranchState["holdPrs"]>;
-				base: string | null;
-			} | null;
+			/** Per-commit hold shas this run consumed; the rows die with the cursor advance. */
+			consumed?: string[];
 		}>;
 	}): Task {
 		let cardId = "";
@@ -2334,16 +2451,16 @@ export class ProjectStore {
 			}
 			for (const a of o.analyzed) {
 				this.db.run(
-					"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0, hold_prs = ?, hold_base = ? WHERE fork_id = ? AND branch_hash = ?",
-					[
-						a.head,
-						a.at,
-						a.hold === null ? null : JSON.stringify(a.hold.prs),
-						a.hold?.base ?? null,
-						a.forkId,
-						a.branchHash,
-					],
+					"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0 WHERE fork_id = ? AND branch_hash = ?",
+					[a.head, a.at, a.forkId, a.branchHash],
 				);
+				if (a.consumed && a.consumed.length > 0) {
+					const ph = a.consumed.map(() => "?").join(", ");
+					this.db.run(
+						`DELETE FROM fork_hold WHERE fork_id = ? AND branch_hash = ? AND sha IN (${ph})`,
+						[a.forkId, a.branchHash, ...a.consumed],
+					);
+				}
 			}
 		});
 		tx();

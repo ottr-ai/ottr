@@ -706,14 +706,20 @@ export interface ForkBranchState {
 	lastError: string | null;
 	/** Consecutive failed analysis attempts; at 3 the range pauses until a manual check succeeds. */
 	retries: number;
-	/**
-	 * PRs whose commits this branch's cursor moved past without analysis, each with the PR
-	 * head the work was judged against; null = no hold. When a PR gets another head or closes
-	 * without a merge, the cursor returns to `holdBase`.
-	 */
-	holdPrs: Array<{ n: number; head: string }> | null;
-	/** Cursor before the first held run (null = from upstream); meaningful only with `holdPrs`. */
-	holdBase: string | null;
+}
+
+/** One held fork-branch commit with the PR it was judged against. */
+export interface ForkHoldState {
+	forkId: number;
+	branchHash: string;
+	/** 40-hex commit sha. */
+	sha: string;
+	/** PR number the commit was judged against. */
+	pr: number;
+	/** PR head the judgment used (40-hex). */
+	prHead: string;
+	/** 1 = dropped from its PR; rides the next analysis range, then the row is deleted. */
+	released: number;
 }
 
 /** One fork commit selected for analysis. */
