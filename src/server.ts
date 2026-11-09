@@ -812,17 +812,4 @@ try {
 	);
 }
 
-// What the deploy pinned at boot: a stale OTTR_IMAGE or an old host path still in the
-// shell beats .env and silently keeps the previous release (README, Podman). Log the
-// values once so `docker compose logs server` shows them; empty values log nothing.
-const pinned: string[] = [];
-for (const [key, value] of Object.entries({
-	image: process.env.OTTR_IMAGE,
-	"oauth dir": process.env.OTTR_OAUTH_DIR,
-	"agent db": process.env.OTTR_AGENT_DB,
-})) {
-	if (value) pinned.push(`${key}=${value}`);
-}
-if (pinned.length > 0) console.log(`pinned: ${pinned.join(", ")}`);
-
 console.log(`Ottr on http://127.0.0.1:${PORT}`);

@@ -2,6 +2,17 @@
 # The agent layer (rules, config, skills, plugins) lives in the HOME volume
 # (default /root); alate provisions it there, the image carries none.
 set -e
+# Boot report: what the deploy pinned. Compose passes the host values as
+# OTTR_PINNED_* (server service only); the real OTTR_OAUTH_DIR/OTTR_AGENT_DB stay
+# out of the container env, because the checks below fall back to the container-side
+# fixed paths and a host path string in the env would fail them on every start. A
+# stale OTTR_IMAGE or old host path in the shell beats .env and silently keeps the
+# previous release (README, Podman), so the line prints before any refusal below:
+# `docker compose logs server` shows the values even when the start is refused.
+# Workers get none of the variables and log nothing.
+if [ -n "${OTTR_PINNED_IMAGE:-}${OTTR_PINNED_OAUTH_DIR:-}${OTTR_PINNED_AGENT_DB:-}" ]; then
+	echo "ottr-entry: pinned: image=${OTTR_PINNED_IMAGE:-<unset>}, oauth dir=${OTTR_PINNED_OAUTH_DIR:-<unset>}, agent db=${OTTR_PINNED_AGENT_DB:-<unset>}" >&2
+fi
 # R5-1: workers share the home volume read-write, so a turn can plant anything the board
 # reads from it. The board pins its git config, gh config, omp agent dir and the HOME of
 # its own omp spawns (GIT_CONFIG_GLOBAL / GH_CONFIG_DIR / PI_CODING_AGENT_DIR /
