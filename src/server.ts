@@ -832,6 +832,10 @@ setInterval(() => void app.prReviewTick(), 3_600_000);
 void app.issueWatchTick();
 setInterval(() => void app.issueWatchTick(), 3_600_000);
 
+// omp watch: hourly npm poll; a model reviews each new omp release, files fail and bump cards.
+void app.ompWatchTick();
+setInterval(() => void app.ompWatchTick(), 3_600_000);
+
 // Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
 void app.tokenReminderTick();
 setInterval(() => void app.tokenReminderTick(), 86_400_000);

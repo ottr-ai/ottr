@@ -178,6 +178,7 @@ import {
 	type OmpStatsSource,
 	scanSessionUsage,
 } from "./ompStats.ts";
+import { createOmpWatcher } from "./ompWatch.ts";
 import {
 	forwardToDashboard,
 	type OmpStatsDashboard,
@@ -1821,6 +1822,17 @@ export function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[issues] ${msg}`),
 		gh,
+	});
+
+	// omp watch: reviews new omp releases per opted-in project; state lives in gstore.
+	const ompWatcher = createOmpWatcher({
+		projects: () => deps.projects.values(),
+		load: (p) => deps.gstore.get(`ompWatch:${p}`),
+		save: (p, s) => deps.gstore.set(`ompWatch:${p}`, s),
+		log: (m) => console.log(`[omp-watch] ${m}`),
+		schedule: deps.schedule,
+		token: () => process.env.GH_TOKEN,
+		apiBase: () => githubHost().apiBase,
 	});
 
 	/**
@@ -3596,6 +3608,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof iw !== "boolean")
 				return json({ error: "issueWatch must be a boolean" }, 400);
 			patch.issueWatch = iw;
+		}
+		const ow = body.ompWatch;
+		if (ow !== undefined) {
+			if (typeof ow !== "boolean")
+				return json({ error: "ompWatch must be a boolean" }, 400);
+			patch.ompWatch = ow;
 		}
 		const mv = body.microVm;
 		if (mv !== undefined) {
@@ -8643,5 +8661,6 @@ export function createApp(deps: AppDeps) {
 		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
 		prReviewIdle: () => prWatcher.reviewIdle(),
 		issueWatchTick: (opts?: { manual?: string }) => issueWatcher.tick(opts),
+		ompWatchTick: () => ompWatcher.tick(),
 	};
 }

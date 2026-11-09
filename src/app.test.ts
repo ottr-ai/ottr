@@ -10121,6 +10121,15 @@ describe("PR review routes", () => {
 		p1.github = null;
 	});
 
+	test("ompWatch rejects a non-boolean and saves true", async () => {
+		const bad = await post("/api/projects/p1/settings", { ompWatch: "yes" });
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("ompWatch must be a boolean");
+		const ok = await post("/api/projects/p1/settings", { ompWatch: true });
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().ompWatch).toBe(true);
+	});
+
 	test("issueWatch on sets issueWatchSince, a re-save keeps it, off then on moves it", async () => {
 		const bad = await post("/api/projects/p1/settings", { issueWatch: "yes" });
 		expect(bad.status).toBe(400);

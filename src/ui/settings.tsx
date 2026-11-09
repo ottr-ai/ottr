@@ -5125,6 +5125,7 @@ export function updatesChip(s: ProjectView["settings"]): {
 		s.prReviews,
 		s.prMode,
 		s.issueWatch,
+		s.ompWatch,
 		s.microVm,
 		s.pushSyncCommits,
 	];
@@ -6455,6 +6456,13 @@ export function ProjectSettingsForm({
 								checked={st.issueWatch}
 								disabled={project.github === null && !st.issueWatch}
 								save={(v) => send({ issueWatch: v })}
+								act={act}
+							/>
+							<CheckRow
+								name="omp watch"
+								desc="Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker."
+								checked={st.ompWatch}
+								save={(v) => send({ ompWatch: v })}
 								act={act}
 							/>
 							<CheckRow

@@ -61,8 +61,9 @@ existing number plus one.
 | 0002 | Integration is ff-only linear history; only the server pushes | accepted |
 | 0003 | tasks.db schema changes are additive | accepted |
 | 0004 | AGENTS.md is local-only | accepted |
-| 0005 | The omp pin follows npm automatically | accepted |
+| 0005 | The omp pin follows npm automatically | superseded by ADR-0010 |
 | 0006 | Dependency licenses are allowlisted | accepted |
 | 0007 | The merge target is a project setting | accepted |
 | 0008 | PR mode is a per-project choice | accepted |
 | 0009 | Work turns can run in a Firecracker microVM per turn | accepted (experimental) |
+| 0010 | The omp bump follows a changelog review | accepted |

@@ -64,20 +64,29 @@ uses the container.
 
 ## Updates
 
-omp is the main tool and gets a new release almost every day, so the image follows the
-newest omp that is 7 or more days old: workers run about one week behind npm, so a
-broken or yanked release has a week to surface before it ships. The server and the
-workers run this one image, so the board, merge
-turns and work turns all get the new omp. Two parts do the work:
+omp is the main tool and gets a new release almost every day. The image follows the newest
+omp that passed a changelog review and is 7 or more days old. Workers thus run about one week
+behind npm, so a broken or yanked release has a week to surface before it ships. The server
+and the workers run this one image, so the board, merge turns and work turns all get the new
+omp. Two parts do the work:
 
-1. The workflow `.github/workflows/omp-bump.yml` runs every 6 hours on GitHub. When npm
-   has an omp that is 7 or more days old and newer than `OMP_VERSION` in
-   `Dockerfile.worker`, it starts that omp on
-   the image's bun, then pushes `chore: bump omp to <version>` to `main`. It pushes
-   over SSH with a write deploy key (Actions secret `OMP_BUMP_DEPLOY_KEY`), because
-   the ruleset on `main` lets only admins and deploy keys bypass it. It is the
-   only place that moves the pin. The pin sits above the omp layer, near the end of
-   the file, so a bump rebuilds only the last layers.
+1. The Ottr server's omp watch moves the pin (spec: `docs/specs/omp-watch.md`, ADR 0010).
+   Turn on the project setting **omp watch** (`ompWatch`) only for the project that holds
+   Ottr. Every hour, the watch reads the npm releases of omp above `OMP_VERSION` in
+   `Dockerfile.worker`. A model reads the GitHub release notes of each new version and
+   replies `PASS` or `FAIL`.
+   - A failed version gets the card `omp <version>: compatibility review failed`. The card
+     holds the pin for that version and for all later versions. Finish or cancel the card to
+     clear the hold.
+   - When a version passed and is 7 or more days old, the watch files the card
+     `Bump omp to <version>`. The merge turn of that card pushes
+     `chore: bump omp to <version>` to `main`. This card is the only way that the pin moves.
+   - The workflow `.github/workflows/omp-bump.yml` is a check only. It runs on a push to
+     `main` that changes `Dockerfile.worker`, and on manual dispatch. It starts the pinned omp
+     on the image's bun. It holds no deploy key and pushes nothing.
+
+   The pin sits above the omp layer, near the end of the file, so a bump rebuilds only the
+   last layers.
 2. Each host that runs the stack deploys `main` with `scripts/update-image.ts`, from
    a clean `main` checkout — this rolling flow serves only that deployment. A
    deployment that runs a published release image (`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`,
@@ -221,8 +230,10 @@ so name bun in full):
 
 The containers take provider keys from the
 environment that runs compose, else from the env file. Cron has almost no
-environment, so on Linux put them in the env file. To stay on an older omp, disable
-the workflow, then revert the bump commit.
+environment, so on Linux put them in the env file. To stay on an older omp, leave its
+fail card open or cancel its bump card. Do not pin omp by hand. To undo a bump that
+shipped, revert the bump commit. The omp watch files no new card for that version, only
+for a higher one.
 
 Only omp has automation. Every other pin is a hand bump: edit the `ARG <TOOL>_VERSION`
 and its `*_SHA256` in `Dockerfile.worker`, commit, and let `update-image.ts` deploy the

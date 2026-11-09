@@ -1592,12 +1592,13 @@ describe("Updates card", () => {
 			prReviews: false,
 			prMode: false,
 			issueWatch: false,
+			ompWatch: false,
 			microVm: false,
 			pushSyncCommits: false,
 			...over,
 		}) as unknown as ProjectView["settings"];
 
-	test("the chip counts all eleven checkboxes", () => {
+	test("the chip counts all twelve checkboxes", () => {
 		expect(
 			updatesChip(
 				settings({
@@ -1607,9 +1608,10 @@ describe("Updates card", () => {
 					trendingScout: true,
 					prReviews: true,
 					issueWatch: true,
+					ompWatch: true,
 				}),
 			),
-		).toEqual({ label: "6 of 11 on", tone: "ok" });
+		).toEqual({ label: "7 of 12 on", tone: "ok" });
 		expect(
 			updatesChip(
 				settings({
@@ -1619,12 +1621,12 @@ describe("Updates card", () => {
 					pushSyncCommits: true,
 				}),
 			).label,
-		).toBe("4 of 11 on");
+		).toBe("4 of 12 on");
 	});
 
 	test("the friction filter does not count while retro is off", () => {
 		expect(updatesChip(settings({ retroFilter: true }))).toEqual({
-			label: "0 of 11 on",
+			label: "0 of 12 on",
 			tone: "off",
 		});
 	});

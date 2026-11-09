@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-accepted
+superseded by [ADR-0010](0010-omp-bump-follows-changelog-review.md)
 
 ## Context
 

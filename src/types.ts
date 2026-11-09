@@ -187,6 +187,8 @@ export interface ProjectSettings {
 	issueWatch: boolean;
 	/** When issueWatch last turned on (epoch ms); null while never enabled. */
 	issueWatchSince: number | null;
+	/** Hourly omp release watch: a model reviews each new omp release; fail and bump cards (off by default; docs/specs/omp-watch.md). */
+	ompWatch: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 	/**
