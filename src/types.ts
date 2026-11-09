@@ -748,6 +748,23 @@ export interface LatestImage {
 	url: string;
 }
 
+/** One open-pull-request chip in the project header; GitHub data parsed as untrusted
+ * (prs.ts's parsePullPage), so only the fields listed here exist. */
+export interface OpenPrSummary {
+	number: number;
+	title: string;
+	draft: boolean;
+	url: string;
+}
+
+/** The project header's open-PR view: the repo's open pull request count plus at most
+ * the first three chips in GitHub's order. When `prs` is shorter than `total`, the UI
+ * collapses the list into one count link to the repo's pulls page. */
+export interface OpenPrsView {
+	total: number;
+	prs: OpenPrSummary[];
+}
+
 export interface ProjectView {
 	name: string;
 	/** mtime in ms of the project's custom icon file, or null when none is set. */
@@ -791,6 +808,9 @@ export interface ProjectView {
 	latestImage: LatestImage | null;
 	/** Since the last arch review on the target; null with no target, before the first scan, or when git fails. */
 	archReview: ArchReview | null;
+	/** Open pull requests on the GitHub repo, newest first; null with no GitHub remote,
+	 * before the first probe, or when gh fails. */
+	openPrs: OpenPrsView | null;
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;

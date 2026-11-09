@@ -556,3 +556,124 @@ test("the System view's Turns cell shows each worker turn's memory and CPU", asy
 		await unmountApp();
 	}
 });
+
+test("open PR chips render per PR when three or fewer open PRs exist", async () => {
+	const saved = state.projects;
+	state.projects = [
+		{
+			...project("alpha", "Alpha"),
+			github: "https://github.com/octo/repo",
+			openPrs: {
+				total: 2,
+				prs: [
+					{
+						number: 7,
+						title: "Add watcher",
+						draft: false,
+						url: "https://github.com/octo/repo/pull/7",
+					},
+					{
+						number: 9,
+						title: "Fix gates",
+						draft: false,
+						url: "https://github.com/octo/repo/pull/9",
+					},
+				],
+			},
+		},
+		project("beta", "Beta"),
+	] as typeof state.projects;
+	try {
+		await mountAt("/projects/alpha");
+		const anchors = [...document.querySelectorAll(".project-meta a")];
+		const prAnchors = anchors.filter(
+			(a) =>
+				(a as HTMLAnchorElement).href === "https://github.com/octo/repo/pull/7",
+		);
+		expect(prAnchors).toHaveLength(1);
+		const first = prAnchors[0] as HTMLAnchorElement;
+		expect(first.textContent).toContain("#7");
+		expect(first.title).toBe("Add watcher");
+		const second = anchors.find(
+			(a) =>
+				(a as HTMLAnchorElement).href === "https://github.com/octo/repo/pull/9",
+		) as HTMLAnchorElement | undefined;
+		expect(second?.textContent).toContain("#9");
+	} finally {
+		state.projects = saved;
+		await unmountApp();
+	}
+});
+
+test("more than three open PRs collapse to one count link to the pulls page", async () => {
+	const saved = state.projects;
+	state.projects = [
+		{
+			...project("alpha", "Alpha"),
+			github: "https://github.com/octo/repo",
+			openPrs: {
+				total: 5,
+				prs: [
+					{
+						number: 7,
+						title: "Add watcher",
+						draft: false,
+						url: "https://github.com/octo/repo/pull/7",
+					},
+					{
+						number: 9,
+						title: "Fix gates",
+						draft: false,
+						url: "https://github.com/octo/repo/pull/9",
+					},
+					{
+						number: 11,
+						title: "Tune limits",
+						draft: true,
+						url: "https://github.com/octo/repo/pull/11",
+					},
+				],
+			},
+		},
+		project("beta", "Beta"),
+	] as typeof state.projects;
+	try {
+		await mountAt("/projects/alpha");
+		const anchors = [...document.querySelectorAll(".project-meta a")];
+		const pulls = anchors.filter(
+			(a) =>
+				(a as HTMLAnchorElement).href === "https://github.com/octo/repo/pulls",
+		);
+		expect(pulls).toHaveLength(1);
+		expect((pulls[0] as HTMLAnchorElement).textContent).toContain("5 open PRs");
+		// No per-PR chips leak out when collapsed.
+		expect(
+			anchors.some((a) => (a as HTMLAnchorElement).href.endsWith("/pull/7")),
+		).toBe(false);
+	} finally {
+		state.projects = saved;
+		await unmountApp();
+	}
+});
+
+test("a project without openPrs data renders no pull-request chips", async () => {
+	const saved = state.projects;
+	state.projects = [
+		{ ...project("alpha", "Alpha"), github: "https://github.com/octo/repo" },
+		project("beta", "Beta"),
+	] as typeof state.projects;
+	try {
+		await mountAt("/projects/alpha");
+		const anchors = [...document.querySelectorAll(".project-meta a")];
+		expect(
+			anchors.some(
+				(a) =>
+					(a as HTMLAnchorElement).href.includes("/pull") &&
+					(a as HTMLAnchorElement).href !== "https://github.com/octo/repo",
+			),
+		).toBe(false);
+	} finally {
+		state.projects = saved;
+		await unmountApp();
+	}
+});

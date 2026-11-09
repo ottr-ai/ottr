@@ -2975,6 +2975,7 @@ export function createApp(deps: AppDeps) {
 			latestReleaseUrl: e.latestReleaseUrl ?? null,
 			latestImage: e.latestImage,
 			archReview: e.archReview,
+			openPrs: e.openPrs ?? null,
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
 		};

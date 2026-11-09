@@ -9,7 +9,9 @@ import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
 	fetchReReviewContext,
+	openPrsView,
 	openPullRequest,
+	PR_CHIP_MAX,
 	PR_GATES,
 	parseCreatedPr,
 	parseDraft,
@@ -338,6 +340,39 @@ describe("parsePullPage", () => {
 		expect(out[0]!.title.length).toBe(120);
 		expect(out[1]!.title).toBe("");
 		expect(parsePullPage({})).toEqual([]);
+	});
+});
+
+describe("openPrsView", () => {
+	const pull = (number: number, draft = false) => ({
+		number,
+		head: "a".repeat(40),
+		draft,
+		title: `pr ${number}`,
+	});
+
+	test("zero pulls gives an empty view", () => {
+		expect(openPrsView([], "o/r")).toEqual({ total: 0, prs: [] });
+	});
+
+	test("three or fewer pulls each become a chip with the repo url", () => {
+		const out = openPrsView([pull(1), pull(2, true), pull(3)], "o/r");
+		expect(out.total).toBe(3);
+		expect(out.prs.map((p) => [p.number, p.title, p.draft, p.url])).toEqual([
+			[1, "pr 1", false, "https://github.com/o/r/pull/1"],
+			[2, "pr 2", true, "https://github.com/o/r/pull/2"],
+			[3, "pr 3", false, "https://github.com/o/r/pull/3"],
+		]);
+	});
+
+	test("more than PR_CHIP_MAX keeps the first chips but the full total", () => {
+		const out = openPrsView(
+			[pull(1), pull(2), pull(3), pull(4), pull(5)],
+			"o/r",
+		);
+		expect(out.total).toBe(5);
+		expect(out.prs).toHaveLength(PR_CHIP_MAX);
+		expect(out.prs.map((p) => p.number)).toEqual([1, 2, 3]);
 	});
 });
 

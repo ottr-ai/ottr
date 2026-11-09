@@ -107,6 +107,7 @@ import type {
 	GitFacts,
 	LatestImage,
 	Next,
+	OpenPrsView,
 	Outcome,
 	ProjectSettings,
 	QuotaState,
@@ -495,6 +496,10 @@ export interface TurnProject {
 	latestReleaseUrl?: string | null;
 	/** Public ghcr.io image of the repo; probed on a TTL by the scheduler tick, read-only elsewhere. */
 	latestImage: LatestImage | null;
+	/** Open pull requests on the GitHub repo, newest first; probed on a TTL by the
+	 * scheduler tick (server.ts's refreshOpenPrs), read-only elsewhere. null with no
+	 * GitHub remote, before the first probe, or when gh fails. */
+	openPrs?: OpenPrsView | null;
 	/** Commits since the last arch review on the target; refreshed by the scheduler tick, read-only elsewhere. */
 	archReview: ArchReview | null;
 }
@@ -550,6 +555,10 @@ export interface TurnOps {
 	notifyLog(project: string, id: string): void;
 	refreshRelease(e: TurnProject): Promise<void>;
 	refreshArchReview(e: TurnProject): Promise<void>;
+	/** OTTR-691: stamps the header's open-PR chips (server.ts, one gh probe per TTL per
+	 * repo, fire-and-forget like the image chip); absent in test fakes, so the tick must
+	 * call it optional. */
+	refreshOpenPrs?(e: TurnProject): void;
 	resolveTarget: typeof resolveTarget;
 	createWorktree: typeof createWorktree;
 	removeWorktree: typeof removeWorktree;
@@ -1605,6 +1614,7 @@ export function createTurnLoop(
 				});
 			void ops.refreshRelease(e);
 			void ops.refreshArchReview(e);
+			void ops.refreshOpenPrs?.(e);
 		}
 		// An update waits for an idle board: the running turns finish, and no new turn, merge or
 		// release publish starts until the restart (scripts/update-image.ts). The board check is

@@ -10,7 +10,7 @@ import { githubHost } from "./githubHost.ts";
 import { fitDraftToDiff, formatInlineComment } from "./prInline.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
-import type { PrReviewRow } from "./types.ts";
+import type { OpenPrsView, PrReviewRow } from "./types.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -67,6 +67,25 @@ export function parsePullPage(body: unknown): PullInfo[] {
 		out.push({ number: x.number, head: sha, draft: x.draft, title });
 	}
 	return out;
+}
+
+/** Header chip cap: more open pull requests than this collapse into one count link to
+ * the repo's pulls page (OpenPrsView.prs then stays shorter than OpenPrsView.total). */
+export const PR_CHIP_MAX = 3;
+
+/** The project header's open-PR view: the repo's open pull request count plus at most
+ * the first PR_CHIP_MAX chips, in GitHub's order. `repo` is `owner/repo`; the urls go
+ * through prUrl, so they follow the configured GitHub host. */
+export function openPrsView(pulls: PullInfo[], repo: string): OpenPrsView {
+	return {
+		total: pulls.length,
+		prs: pulls.slice(0, PR_CHIP_MAX).map((p) => ({
+			number: p.number,
+			title: p.title,
+			draft: p.draft,
+			url: prUrl(repo, p.number),
+		})),
+	};
 }
 
 /** A created PR is untrusted: only a positive-int number and an optional string html_url pass. */
@@ -166,7 +185,9 @@ export async function openPullRequest(o: {
 	return { ok: true, pr };
 }
 
-async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {
+/** The repo's open pull requests, newest first, every field parsed as untrusted. Shared by
+ * the review watcher and the header chip refresh (server.ts). */
+export async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {
 	const pulls: PullInfo[] = [];
 	for (let page = 1; page <= 100; page++) {
 		const r = await gh([

@@ -23,7 +23,7 @@ import {
 } from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
-import { openPullRequest } from "./prs.ts";
+import { listPulls, openPrsView, openPullRequest } from "./prs.ts";
 import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
@@ -54,7 +54,7 @@ import {
 	parseReleaseVersion,
 	type TurnLoop,
 } from "./turn.ts";
-import type { LatestImage } from "./types.ts";
+import type { LatestImage, OpenPrsView } from "./types.ts";
 import { VM_UNCONFIGURED, vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
@@ -261,6 +261,33 @@ async function refreshArchReview(e: Entry): Promise<void> {
 	e.archReview = a === null ? null : archReviewView(last, a, cap, running);
 }
 
+/** Open-PR header chips re-probe gh at most this often; a PR opened between probes waits out the TTL. */
+const PR_TTL = 10 * 60_000;
+const prChips = new Map<string, { at: number; value: OpenPrsView | null }>();
+
+/** Open-PR chips piggybacking on the release refresh: writes e.openPrs, one gh probe per TTL per repo. */
+function refreshOpenPrs(e: Entry): void {
+	const repo = e.github === null ? null : ownerRepo(e.github);
+	if (repo === null) {
+		e.openPrs = null;
+		return;
+	}
+	const cached = prChips.get(repo);
+	if (cached !== undefined && Date.now() - cached.at < PR_TTL) {
+		e.openPrs = cached.value;
+		return;
+	}
+	// Seed before fetching so a hung probe cannot stack one request per scheduler tick.
+	prChips.set(repo, { at: Date.now(), value: null });
+	listPulls(repo, runGh)
+		.then((pulls) => {
+			const value = openPrsView(pulls, repo);
+			prChips.set(repo, { at: Date.now(), value });
+			e.openPrs = value;
+		})
+		.catch(() => {}); // gh unreachable: keep the null seed until the next TTL
+}
+
 /** Local tip of a ref, else null (quiet rev-parse): the push-sha capture compares local and pushed. */
 async function targetSha(
 	mainPath: string,
@@ -353,6 +380,7 @@ for (const p of discoverProjects(
 		latestRelease: null,
 		latestImage: null,
 		archReview: null,
+		openPrs: null,
 	};
 	projects.set(store.name, e);
 
@@ -524,6 +552,7 @@ const loop = createTurnLoop(projects, {
 	notifyLog: (project, id) => app.notifyLog(project, id),
 	refreshRelease,
 	refreshArchReview,
+	refreshOpenPrs,
 	resolveTarget,
 	createWorktree,
 	removeWorktree,

@@ -3532,6 +3532,32 @@ export function ProjectBoard({
 											: "Un-reviewed — review due"}
 								</span>
 							)}
+							{/* More than three open PRs collapse to one count link, mirroring prs.ts's PR_CHIP_MAX. */}
+							{project.openPrs != null &&
+								project.github !== null &&
+								(project.openPrs.prs.length < project.openPrs.total ? (
+									<a
+										href={`${project.github}/pulls`}
+										target="_blank"
+										rel="noopener noreferrer"
+										title="Open pull requests"
+									>
+										<Icon name="git-pr" size={13} />
+										{project.openPrs.total} open PRs
+									</a>
+								) : (
+									project.openPrs.prs.map((pr) => (
+										<a
+											key={pr.number}
+											href={pr.url}
+											target="_blank"
+											rel="noopener noreferrer"
+											title={`${pr.title}${pr.draft ? " (draft)" : ""}`}
+										>
+											<Icon name="git-pr" size={13} />#{pr.number}
+										</a>
+									))
+								))}
 							{project.github !== null && (
 								<a
 									href={project.github}

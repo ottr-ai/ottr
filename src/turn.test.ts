@@ -1926,9 +1926,10 @@ describe("turn schedule", () => {
 		expect(record.runs[1]!.prompt).toContain("second");
 	});
 
-	test("each tick refreshes release and arch review per project", async () => {
+	test("each tick refreshes release, arch review and open PRs per project", async () => {
 		let released = 0;
 		let reviewed = 0;
+		let prs = 0;
 		const { loop } = setup({
 			refreshRelease: async () => {
 				released += 1;
@@ -1936,11 +1937,15 @@ describe("turn schedule", () => {
 			refreshArchReview: async () => {
 				reviewed += 1;
 			},
+			refreshOpenPrs: () => {
+				prs += 1;
+			},
 		});
 		loop.schedule();
 		await flushPromises();
 		expect(released).toBe(1);
 		expect(reviewed).toBe(1);
+		expect(prs).toBe(1);
 	});
 
 	test("isClean result lands in dirty; a git failure keeps the old flag", async () => {

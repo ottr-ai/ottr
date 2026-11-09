@@ -88,6 +88,13 @@ const ICON_PATHS = {
 			<path d="M6 21V9a9 9 0 0 0 9 9" />
 		</>
 	),
+	"git-pr": (
+		<>
+			<circle cx="18" cy="18" r="3" />
+			<circle cx="6" cy="6" r="3" />
+			<path d="M13 6h3a2 2 0 0 1 2 2v7" />
+		</>
+	),
 	bell: (
 		<>
 			<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
