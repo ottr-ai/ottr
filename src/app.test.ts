@@ -14654,3 +14654,149 @@ describe("slow api log and clone idle exemption (OTTR-715)", () => {
 		expect(timeouts).toEqual([0]);
 	});
 });
+
+describe("compressed serving (docs/specs/compressed-serving.md)", () => {
+	/** The state route carries the seeded tasks; a big report pushes it past the gzip threshold. */
+	const bigReport = "r".repeat(40_000);
+
+	test("the board html serves the memory bundle with the import route's headers plus encoding headers", async () => {
+		const identity = await fetch(new URL("/", server.url), {
+			// Bun's fetch injects "Accept-Encoding: … br" when unset; ask for identity.
+			headers: { "Accept-Encoding": "identity" },
+		});
+		expect(identity.status).toBe(200);
+		expect(identity.headers.get("cache-control")).toBe("no-cache");
+		expect(identity.headers.get("content-type")).toBe(
+			"text/html;charset=utf-8",
+		);
+		expect(identity.headers.get("vary")).toBe("Accept-Encoding");
+		expect(identity.headers.get("content-encoding")).toBeNull();
+		expect(identity.headers.get("etag")).toMatch(/^"[0-9a-f]{16}"$/);
+		const html = new TextDecoder().decode(
+			new Uint8Array(await identity.arrayBuffer()),
+		);
+		// Absolute refs, so the nested client routes resolve the hashed outputs.
+		expect(html).not.toContain('="./');
+		const assetRefs = [...html.matchAll(/(?:src|href)="(\/[^"]+)"/g)].map(
+			(m) => m[1]!,
+		);
+		expect(assetRefs.length).toBeGreaterThan(0);
+
+		for (const [accept, ce] of [
+			["br, gzip", "br"],
+			["gzip", "gzip"],
+			["identity", null],
+		] as const) {
+			const res = await fetch(new URL("/", server.url), {
+				headers: { "Accept-Encoding": accept },
+			});
+			expect(res.headers.get("content-encoding"), accept).toBe(ce);
+			// The client auto-decompresses, so every variant decodes to the same html.
+			const text = new TextDecoder().decode(
+				new Uint8Array(await res.arrayBuffer()),
+			);
+			expect(text).toBe(html);
+		}
+
+		// 304 through the app's route handler.
+		const revalidate = await fetch(new URL("/", server.url), {
+			headers: { "If-None-Match": identity.headers.get("etag")! },
+		});
+		expect(revalidate.status).toBe(304);
+		expect(await revalidate.text()).toBe("");
+	});
+
+	test("hashed bundle outputs serve immutable with negotiation through the fetch fallback", async () => {
+		const first = await fetch(new URL("/", server.url));
+		const html = new TextDecoder().decode(
+			new Uint8Array(await first.arrayBuffer()),
+		);
+		const refs = [...html.matchAll(/(?:src|href)="(\/[^"]+)"/g)].map(
+			(m) => m[1]!,
+		);
+		const js = refs.find((r) => r.endsWith(".js"))!;
+		const css = refs.find((r) => r.endsWith(".css"))!;
+		const jsIdentity = await fetch(new URL(js, server.url));
+		expect(jsIdentity.headers.get("cache-control")).toBe(
+			"public, max-age=31536000, immutable",
+		);
+		expect(jsIdentity.headers.get("vary")).toBe("Accept-Encoding");
+		const jsBytes = new Uint8Array(await jsIdentity.arrayBuffer());
+		const jsBr = await fetch(new URL(js, server.url), {
+			headers: { "Accept-Encoding": "br, gzip" },
+		});
+		expect(jsBr.headers.get("content-encoding")).toBe("br");
+		// Auto-decompressed view matches the identity bytes exactly.
+		expect([...new Uint8Array(await jsBr.arrayBuffer())]).toEqual([...jsBytes]);
+		// 304 through the fallback.
+		const again = await fetch(new URL(css, server.url), {
+			headers: { "If-None-Match": '"nomatch"' },
+		});
+		expect(again.status).toBe(200);
+		await again.body?.cancel();
+	});
+
+	test("a path outside the bundle still answers the json 404", async () => {
+		const res = await fetch(new URL("/no-such-thing", server.url));
+		expect(res.status).toBe(404);
+		expect(await res.text()).toBe(JSON.stringify({ error: "not found" }));
+	});
+
+	test("json() gzips a large drawer response when the client accepts gzip", async () => {
+		const t = store.createTask("compression probe");
+		store.updateTask(t.id, { report: bigReport, state: "idle" });
+		const path = `/api/projects/p1/tasks/${t.id}`;
+		const headers = {
+			Host: "127.0.0.1:0",
+			Origin: "http://127.0.0.1:0",
+			"Accept-Encoding": "gzip",
+		};
+		const gzipped = await fetch(new URL(path, server.url), { headers });
+		expect(gzipped.status).toBe(200);
+		// The drawer view carries the full report, so the body crossed the threshold.
+		expect(gzipped.headers.get("content-encoding")).toBe("gzip");
+		// The Windows keep-alive workaround must survive compression.
+		expect(gzipped.headers.get("connection")).toBe("close");
+		expect(gzipped.headers.get("vary")).toBe("Accept-Encoding");
+		const identity = await fetch(new URL(path, server.url), {
+			headers: {
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+				"Accept-Encoding": "identity",
+			},
+		});
+		expect(identity.headers.get("content-encoding")).toBeNull();
+		expect(identity.headers.get("connection")).toBe("close");
+		// Both bodies decode to the same document.
+		const fromGzip = (await gzipped.json()) as unknown;
+		const fromIdentity = (await identity.json()) as unknown;
+		expect(fromGzip).toEqual(fromIdentity);
+		// ...and it is the seeded report that pushed it over the threshold.
+		expect(JSON.stringify(fromGzip)).toContain(bigReport.slice(0, 100));
+		// A client without gzip keeps identity even above the threshold.
+		const noGzip = await fetch(new URL(path, server.url), {
+			headers: {
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+				"Accept-Encoding": "br",
+			},
+		});
+		expect(noGzip.headers.get("content-encoding")).toBeNull();
+		await noGzip.body?.cancel();
+	});
+
+	test("json() below the threshold stays identity but still varies", async () => {
+		const res = await fetch(new URL("/api/orphans", server.url), {
+			headers: {
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+				"Accept-Encoding": "gzip",
+			},
+		});
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-encoding")).toBeNull();
+		expect(res.headers.get("vary")).toBe("Accept-Encoding");
+		expect(res.headers.get("connection")).toBe("close");
+		await res.body?.cancel();
+	});
+});

@@ -1,5 +1,7 @@
 // Ottr: request-serving half of the tracker — HTTP routes, board state push, stats.
 // All mutable request state lives in createApp's closure, so two instances never share state.
+
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	closeSync,
 	existsSync,
@@ -13,6 +15,7 @@ import {
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { gzipSync } from "node:zlib";
 import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import {
@@ -48,6 +51,7 @@ import {
 	verifyIdentity,
 	verifySession,
 } from "./auth.ts";
+import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
@@ -2701,15 +2705,69 @@ export function createApp(deps: AppDeps) {
 	void workerSignInTick();
 	const logins = providerLogin();
 
+	// NODE_ENV=development keeps Bun's HTML dev server (HMR, /_bun/… paths); every other
+	// value serves the boot-built bundle from memory with precompressed variants
+	// (docs/specs/compressed-serving.md). bun test runs with NODE_ENV unset and gets the
+	// bundle path, so the serving behavior is integration-tested.
+	const devUi = process.env.NODE_ENV === "development";
+	// Warm the build while the rest of createApp runs; the routes await the same memoized promise.
+	if (!devUi)
+		boardBundle().catch((err) =>
+			console.error(`[boot] ui bundle failed: ${errmsg(err)}`),
+		);
+	// json() needs the request's Accept-Encoding but its ~200 call sites pass none, so
+	// api() plants it here per request; concurrent requests cannot cross encodings.
+	const requestEnc = new AsyncLocalStorage<{ enc: string | null }>();
+
+	/** The board HTML from the memory bundle, 304-aware; build failure answers 500 (spec "Error cases"). */
+	async function boardHtml(req: Request): Promise<Response> {
+		try {
+			return bundleResponse((await boardBundle()).html, req);
+		} catch (err) {
+			return new Response(`ui bundle failed: ${errmsg(err)}`, {
+				status: 500,
+				headers: { "Content-Type": "text/plain; charset=utf-8" },
+			});
+		}
+	}
+
+	/** A hashed bundle output by URL path, or null when the path is not one (dev mode: always null). */
+	async function boardAsset(req: Request): Promise<Response | null> {
+		if (devUi) return null;
+		try {
+			const asset = (await boardBundle()).assets.get(new URL(req.url).pathname);
+			return asset === undefined ? null : bundleResponse(asset, req);
+		} catch (err) {
+			return new Response(`ui bundle failed: ${errmsg(err)}`, {
+				status: 500,
+				headers: { "Content-Type": "text/plain; charset=utf-8" },
+			});
+		}
+	}
+
 	function json(v: unknown, status = 200): Response {
 		// Connection: close works around a Bun 1.3.14 Windows bug: while an agent turn runs, a request
 		// that arrives on a reused keep-alive connection is not dispatched until the agent's process
 		// exits, so the "Add task" spinner spins for the length of a turn. Fresh connections dispatch
 		// fine, so the browser must never reuse one. The WebSocket is unaffected.
-		return new Response(JSON.stringify(v), {
-			status,
-			headers: { "Content-Type": "application/json", Connection: "close" },
-		});
+		const text = JSON.stringify(v);
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			// Encodings differ per request even below the threshold, where the same URL
+			// can cross the size line later: caches must key on Accept-Encoding.
+			Vary: "Accept-Encoding",
+			Connection: "close",
+		};
+		if (
+			Buffer.byteLength(text, "utf8") >= 32 * 1024 &&
+			acceptsGzip(requestEnc.getStore()?.enc ?? null)
+		) {
+			return new Response(gzipSync(Buffer.from(text, "utf8")), {
+				status,
+				headers: { ...headers, "Content-Encoding": "gzip" },
+			});
+		}
+		return new Response(text, { status, headers });
 	}
 
 	/** Like json(), but with Cache-Control: no-store — for responses that carry a secret. */
@@ -2907,7 +2965,7 @@ export function createApp(deps: AppDeps) {
 		// Every mutation that reaches a handler counts as input for the idle clock
 		// (docs/specs/mutation-delta.md §7): the walls passed, so the request is real.
 		if (req.method !== "GET") lastInputAt = now();
-		return (
+		return requestEnc.run({ enc: req.headers.get("accept-encoding") }, () =>
 			fn()
 				.catch((err) => {
 					logError(`api ${req.method} ${new URL(req.url).pathname}`, err);
@@ -2916,7 +2974,7 @@ export function createApp(deps: AppDeps) {
 				// Mutations (POST/PUT/DELETE) may change the board: push a state diff after the response.
 				.finally(() => {
 					if (req.method !== "GET") publishSoon();
-				})
+				}),
 		);
 	}
 
@@ -4710,13 +4768,15 @@ export function createApp(deps: AppDeps) {
 	}
 
 	const routes = defineRoutes({
-		"/": board,
-		// Fixed-path views serve the same board HTML; the client routes on location.pathname.
-		"/projects/:project": board,
-		"/projects/:project/tasks/:id": board,
-		"/settings": board,
-		"/system": board,
-		"/settings/:project": board,
+		// Dev: Bun's HTML dev server (import route, HMR). Prod: the boot-built bundle
+		// from memory (docs/specs/compressed-serving.md). The fixed-path views serve the
+		// same board HTML; the client routes on location.pathname.
+		"/": devUi ? board : (req) => boardHtml(req),
+		"/projects/:project": devUi ? board : (req) => boardHtml(req),
+		"/projects/:project/tasks/:id": devUi ? board : (req) => boardHtml(req),
+		"/settings": devUi ? board : (req) => boardHtml(req),
+		"/system": devUi ? board : (req) => boardHtml(req),
+		"/settings/:project": devUi ? board : (req) => boardHtml(req),
 		// --- Web Push (begin): service worker for notifications; the sibling PWA branch adds its static routes here too ---
 		"/sw.js": () =>
 			new Response(Bun.file(resolve(import.meta.dir, "ui", "sw.js")), {
@@ -8794,7 +8854,9 @@ export function createApp(deps: AppDeps) {
 			// A provider's sign-in redirect to localhost:<port> lands here when compose publishes that
 			// port to the board; anything else stays a 404.
 			fetch: async (req: Request) =>
-				(await logins.callback(req)) ?? json({ error: "not found" }, 404),
+				(await logins.callback(req)) ??
+				(await boardAsset(req)) ??
+				json({ error: "not found" }, 404),
 			websocket: {
 				open(ws: ServerWebSocket<undefined>) {
 					// Increment BEFORE publishState so this socket is either in the publish or sent the frame.
