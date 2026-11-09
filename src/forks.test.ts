@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -570,63 +576,91 @@ describe("watcher", () => {
 		expect(store.listTasks().length).toBe(0);
 	});
 
-	test("a fork branch with an open PR into the repo is not ported until the PR closes", async () => {
-		const name = "watch-pr";
-		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
-		const forkDir = await makeFork(`${name}-fork`, main);
-		// Only `feat` carries fork work; drop the cloned main so it stays the sole branch.
-		await run(["branch", "-D", "main", forkDir], forkDir);
-		let pulls: unknown[] = [
-			{
-				number: 2,
-				state: "open",
-				draft: false,
-				title: "t",
-				head: { sha: "a".repeat(40), ref: "feat", repo: { id: 1 } },
-			},
-		];
-		const ghCalls: string[] = [];
-		let ranges: string[][] = [];
-		const logs: string[] = [];
+	async function prWatcher(name: string, main: string, store: ProjectStore) {
+		const state = {
+			pulls: [
+				{
+					number: 2,
+					state: "open",
+					draft: false,
+					title: "t",
+					head: { sha: "a".repeat(40), ref: "feat", repo: { id: 1 } },
+				},
+			] as unknown[],
+			ghCalls: [] as string[],
+			subjects: [] as string[][],
+			logs: [] as string[],
+		};
 		const watcher = createForkWatcher({
 			projects: () => [{ name, path: main, store, github: "o/main" }],
-			log: (m) => logs.push(m),
+			log: (m) => state.logs.push(m),
 			gh: async (args) => {
 				const url = args.at(-1) ?? "";
-				ghCalls.push(url);
+				state.ghCalls.push(url);
 				const body = url.startsWith("repos/o/main/pulls")
-					? pulls
+					? state.pulls
 					: [forkPageEntry(1)];
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
 			git: localFileGit(join(root, `${name}-fork`)),
 			analyze: async (range) => {
-				ranges = [...ranges, range.heads.map((h) => h.branch)];
+				state.subjects.push(range.commits.map((c) => c.subject));
 				return {
 					features: [],
 					proposals: [],
 					coverage: "",
-					commits: [],
+					commits: range.commits.map((c) => c.sha),
 					deferred: [],
 				} as never;
 			},
 			now: () => Date.now(),
 		});
+		return { watcher, state };
+	}
+
+	test("commits of an open PR branch stay out of the range, also on a child branch", async () => {
+		const name = "watch-pr-child";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = await makeFork(`${name}-fork`, main);
+		await run(["checkout", "-q", "-b", "independent", forkDir], forkDir);
+		// A real file change: empty commits share one patch id, so --cherry-pick would match them.
+		writeFileSync(join(forkDir, "own.txt"), "own\n");
+		await run(["add", "own.txt", forkDir], forkDir);
+		await run(["commit", "-m", "own work", forkDir], forkDir);
+		const { watcher, state } = await prWatcher(name, main, store);
 		await watcher.tick();
-		expect(ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
-		expect(ranges).toEqual([]);
-		expect(logs.some((m) => m.includes("open PR into o/main"))).toBe(true);
+		expect(state.ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
+		expect(state.subjects).toEqual([["own work"]]);
+		expect(state.logs.some((m) => m.includes("open PR into o/main"))).toBe(
+			true,
+		);
 		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
 		expect(feat.analyzedHead).toBeNull();
 		expect(feat.retries).toBe(0);
-		expect(store.listTasks().length).toBe(0);
-		// Once the PR closes, the branch is pending work again.
-		pulls = [];
+	});
+
+	test("a range emptied by an open PR files nothing and does not pause the fork", async () => {
+		const name = "watch-pr";
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		await makeFork(`${name}-fork`, main);
+		const { watcher, state } = await prWatcher(name, main, store);
 		await watcher.tick();
-		expect(ranges.length).toBe(1);
-		expect(ranges[0]).toContain("feat");
+		// The fork's unchanged main is pending too, but it carries no new commit.
+		expect(state.subjects).toEqual([]);
+		expect(store.listTasks().length).toBe(0);
+		expect(store.forkRunsSince(0)).toBe(0);
+		for (const r of store.listAllForkBranches()) {
+			expect(r.lastRunAt).toBeNull();
+			expect(r.retries).toBe(0);
+		}
+		// Once the PR closes, the next check analyzes the branch.
+		state.pulls = [];
+		await watcher.tick();
+		expect(state.subjects).toEqual([["fork feature"]]);
 	});
 
 	test("a failed open-PR listing ports nothing", async () => {

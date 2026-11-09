@@ -231,7 +231,8 @@ export async function fetchFork(
 /**
  * Non-merge new work of one branch: exact-SHA intersection of the analysis-base and upstream
  * comparisons, so rewritten commits already analyzed count as new only when they carry work
- * upstream lacks.
+ * upstream lacks. Commits reachable from an `exclude` ref, or patch-equal to one of them,
+ * are left out.
  */
 export async function rangeCommits(
 	cachePath: string,
@@ -239,6 +240,7 @@ export async function rangeCommits(
 	head: string,
 	upstreamHead: string,
 	git: GitFn,
+	exclude: string[] = [],
 ): Promise<{ shas: string[]; merges: string[] }> {
 	const base = analyzedHead ?? upstreamHead;
 	const run = (args: string[]) =>
@@ -249,25 +251,28 @@ export async function rangeCommits(
 				);
 			return r.stdout.split("\n").filter(Boolean);
 		});
-	const fromAnalysis = await run([
-		"--no-merges",
-		"--cherry-pick",
-		"--right-only",
-		`${base}...${head}`,
-	]);
-	let shas = fromAnalysis;
-	if (analyzedHead !== null) {
-		const fromUpstream = await run([
+	// The analysis base defines the range; every later left side only narrows it.
+	let shas: string[] | null = null;
+	for (const left of [
+		base,
+		...(analyzedHead !== null ? [upstreamHead] : []),
+		...exclude,
+	]) {
+		const right = await run([
 			"--no-merges",
 			"--cherry-pick",
 			"--right-only",
-			`${upstreamHead}...${head}`,
+			`${left}...${head}`,
 		]);
-		const up = new Set(fromUpstream);
-		shas = fromAnalysis.filter((s) => up.has(s));
+		const keep = new Set(right);
+		shas = shas === null ? right : shas.filter((s) => keep.has(s));
 	}
-	const merges = await run(["--merges", `${base}..${head}`]);
-	return { shas, merges };
+	const merges = await run([
+		"--merges",
+		`${base}..${head}`,
+		...exclude.map((e) => `^${e}`),
+	]);
+	return { shas: shas ?? [], merges };
 }
 
 function errSnippet(e: string, code: number, stderr: string): Error {
@@ -306,6 +311,8 @@ export async function collectRange(o: {
 		head: string;
 		analyzedHead: string | null;
 	}>;
+	/** Refs whose commits stay out of the range (fork branches with an open PR upstream). */
+	exclude?: string[];
 	git: GitFn;
 }): Promise<ForkRange> {
 	const { cachePath, mainPath, fork, branches, git } = o;
@@ -349,6 +356,7 @@ export async function collectRange(o: {
 			b.head,
 			upstreamHead,
 			git,
+			o.exclude,
 		);
 		for (const sha of shas) {
 			const r = await git(
@@ -611,8 +619,9 @@ export function createForkWatcher(deps: {
 
 			const fresh = store.listAllForkBranches();
 			const isManual = manual !== undefined;
-			// Fork branches with an open PR into this repo arrive through that PR; porting them
-			// would duplicate it. Fetched once per project, only when a fork has pending work.
+			// Commits of a fork branch with an open PR into this repo arrive through that PR;
+			// porting them would duplicate it. Listed once per project, only when a fork has
+			// pending work.
 			let prHeads: Set<string> | null = null;
 			for (const fork of forks) {
 				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
@@ -639,13 +648,10 @@ export function createForkWatcher(deps: {
 					}
 				}
 				const withPr = prHeads;
-				const pending = changed.filter(
-					(r) => !withPr.has(`${fork.id}:${r.branch}`),
+				const prRows = rows.filter(
+					(r) => r.head !== null && withPr.has(`${fork.id}:${r.branch}`),
 				);
-				if (pending.length < changed.length)
-					deps.log(
-						`forks: ${fork.owner}/${fork.name}: skipped ${changed.length - pending.length} branch(es) with an open PR into ${repo}`,
-					);
+				const pending = changed.filter((r) => !prRows.includes(r));
 				if (pending.length === 0) continue;
 				const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
 				if (lastRun + FORK_GATES.FORK_RUN_SPACING_MS > now()) continue;
@@ -670,13 +676,12 @@ export function createForkWatcher(deps: {
 					);
 					break;
 				}
-				store.recordForkRun(fork.id, now());
 				try {
 					// Server-only state dir (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the
 					// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
 					// out of workers' reach.
 					const cachePath = await ensureCache(store.serverDir, fork, runGit);
-					const refspecs = pending.map(
+					const refspecs = [...pending, ...prRows].map(
 						(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
 					);
 					await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
@@ -690,8 +695,27 @@ export function createForkWatcher(deps: {
 							head: r.head!,
 							analyzedHead: r.analyzedHead,
 						})),
+						exclude: prRows.map((r) => `refs/heads/${r.branchHash}`),
 						git: runGit,
 					});
+					if (prRows.length > 0)
+						deps.log(
+							`forks: ${fork.owner}/${fork.name}: left out the commits of ${prRows.length} branch(es) with an open PR into ${repo}`,
+						);
+					if (range.commits.length === 0) {
+						// Nothing new to analyze: move the cursors without a model call, a run
+						// record, or a fork pause, so later work is not held back.
+						for (const r of pending)
+							store.saveForkBranch({
+								...r,
+								analyzedHead: r.head,
+								firstPendingAt: null,
+								lastError: null,
+								retries: 0,
+							});
+						continue;
+					}
+					store.recordForkRun(fork.id, now());
 					const result = await analyze(range, buildPrior(store));
 					const covered = new Set(result.commits);
 					const analyzed: Array<{
