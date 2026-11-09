@@ -619,8 +619,6 @@ describe("watcher", () => {
 	) {
 		const state = {
 			pulls,
-			/** merged_at of each closed PR the fake GitHub knows (null = closed unmerged). */
-			closed: new Map<number, string | null>(),
 			clock: Date.now(),
 			ghCalls: [] as string[],
 			subjects: [] as string[][],
@@ -640,18 +638,12 @@ describe("watcher", () => {
 			gh: async (args) => {
 				const url = args.at(-1) ?? "";
 				state.ghCalls.push(url);
-				const one = url.match(/^repos\/o\/main\/pulls\/(\d+)$/);
-				const body = one
-					? {
-							state: "closed",
-							merged_at: state.closed.get(Number(one[1])) ?? null,
-						}
-					: url.startsWith("repos/o/main/pulls")
-						? state.pulls
-						: forks.map((f) => ({
-								...forkPageEntry(f.id),
-								owner: { login: f.owner },
-							}));
+				const body = url.startsWith("repos/o/main/pulls")
+					? state.pulls
+					: forks.map((f) => ({
+							...forkPageEntry(f.id),
+							owner: { login: f.owner },
+						}));
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
 			git: (args, cwd, timeoutMs) => {
@@ -825,7 +817,6 @@ describe("watcher", () => {
 		expect(feat().analyzedHead).toBe(feat().head);
 		expect(feat().holdPrs).toEqual([2]);
 		state.pulls = [];
-		state.closed.set(2, null);
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects).toEqual([["fork feature"]]);
@@ -855,14 +846,13 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(state.subjects).toEqual([["Other work"]]);
 		state.pulls = [];
-		state.closed.set(2, null);
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects.length).toBe(2);
 		expect(state.subjects[1]).toContain("PR work");
 	});
 
-	test("a merged PR drops the hold without a new analysis", async () => {
+	test("a merged PR ends the hold without a new analysis once upstream holds its work", async () => {
 		const name = "watch-hold-merged";
 		const main = await initUpstream(name);
 		const store = ProjectStore.init(main);
@@ -877,8 +867,9 @@ describe("watcher", () => {
 			[pr],
 		);
 		await watcher.tick();
+		// The merge brings the PR head into upstream.
+		await run(["merge", "-q", "--ff-only", "refs/pull/2/head", main], main);
 		state.pulls = [];
-		state.closed.set(2, "2026-11-09T00:00:00Z");
 		state.clock += 2 * DAY;
 		await watcher.tick();
 		expect(state.subjects).toEqual([]);
@@ -886,6 +877,45 @@ describe("watcher", () => {
 		expect(feat.holdPrs).toBeNull();
 		expect(feat.analyzedHead).toBe(feat.head);
 	});
+
+	/** A fork whose `feat` holds "PR work" (and optionally "Other work" on top) behind PR 2. */
+	async function rewrittenPrFork(name: string, other: boolean) {
+		const main = await initUpstream(name);
+		const store = ProjectStore.init(main);
+		store.setSettings({ forkResearch: true });
+		const forkDir = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, forkDir], root);
+		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
+		await commitFile(forkDir, "pr.txt", "PR work");
+		await run(["branch", "prbranch", forkDir], forkDir);
+		if (other) await commitFile(forkDir, "other.txt", "Other work");
+		const pr = await openPr(main, forkDir, "prbranch", 2, 99);
+		await run(["branch", "-D", "prbranch", forkDir], forkDir);
+		const w = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[pr],
+		);
+		return { main, ...w };
+	}
+
+	for (const other of [false, true])
+		test(`held work comes back when the PR drops it before its merge${other ? ", next to analyzed work" : ""}`, async () => {
+			const { main, watcher, state } = await rewrittenPrFork(
+				`watch-hold-rewrite-${other}`,
+				other,
+			);
+			await watcher.tick();
+			expect(state.subjects).toEqual(other ? [["Other work"]] : []);
+			// Force-pushed PR: its merge brings other content, never pr.txt.
+			await commitFile(main, "rw.txt", "Rewritten");
+			state.pulls = [];
+			state.clock += 2 * DAY;
+			await watcher.tick();
+			expect(state.subjects.at(-1)).toContain("PR work");
+		});
 
 	test("a failed open-PR listing ports nothing", async () => {
 		const name = "watch-pr-fail";

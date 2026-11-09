@@ -9,7 +9,7 @@ import {
 } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
 import { isProposalReason } from "./prompts.ts";
-import { listPulls, type PullInfo, pullMerged } from "./prs.ts";
+import { listPulls, type PullInfo } from "./prs.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 import type { ProjectStore } from "./store.ts";
@@ -588,57 +588,31 @@ export function createForkWatcher(deps: {
 	const now = deps.now ?? Date.now;
 
 	/**
-	 * Checks the held PRs of one fork's branches. A PR closed without a merge puts the cursor
-	 * back on the hold base, so the next run sees the held work again. A merged PR leaves the
-	 * hold: its work arrived. An unknown state (gh failure, still open) keeps the hold.
+	 * Checks the held PRs of one fork's branches. Once any held PR is no longer open (merged or
+	 * not), the cursor goes back to the hold base and the next run judges the held work again
+	 * against upstream and the PRs still open. So work that a PR dropped before its merge, or
+	 * that a merge never brought upstream, is analyzed, and merged work stays out through the
+	 * upstream comparison. A still-open PR keeps the hold, whatever its head is now.
 	 */
-	async function releaseHolds(
+	function releaseHolds(
 		store: ProjectStore,
 		holding: ForkBranchState[],
 		pulls: PullInfo[],
-		merged: Map<number, boolean | null>,
-		repo: string,
 		fork: ForkInfo,
-	): Promise<void> {
-		if (!REPO_RE.test(repo)) {
-			deps.log(`forks: invalid repo id: ${repo}`);
-			return;
-		}
+	): void {
 		const open = new Set(pulls.map((p) => p.number));
 		for (const r of holding) {
-			const prs = r.holdPrs ?? [];
-			const states: Array<boolean | null> = [];
-			for (const n of prs.filter((p) => !open.has(p))) {
-				if (!merged.has(n)) {
-					try {
-						merged.set(n, await pullMerged(repo, n, gh));
-					} catch (e) {
-						deps.log(`forks: ${repo}#${n}: ${(e as Error).message}`);
-						merged.set(n, null);
-					}
-				}
-				states.push(merged.get(n) ?? null);
-			}
-			if (states.length === 0) continue;
-			if (states.includes(false)) {
-				store.saveForkBranch({
-					...r,
-					analyzedHead: r.holdBase,
-					firstPendingAt: null,
-					holdPrs: null,
-					holdBase: null,
-				});
-				deps.log(
-					`forks: ${fork.owner}/${fork.name}: a held PR closed without a merge, its work is pending again`,
-				);
-			} else if (!states.includes(null)) {
-				const rest = prs.filter((p) => open.has(p));
-				store.saveForkBranch({
-					...r,
-					holdPrs: rest.length > 0 ? rest : null,
-					holdBase: rest.length > 0 ? r.holdBase : null,
-				});
-			}
+			if ((r.holdPrs ?? []).every((p) => open.has(p))) continue;
+			store.saveForkBranch({
+				...r,
+				analyzedHead: r.holdBase,
+				firstPendingAt: null,
+				holdPrs: null,
+				holdBase: null,
+			});
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: a held PR closed, its work is checked again`,
+			);
 		}
 	}
 
@@ -717,9 +691,8 @@ export function createForkWatcher(deps: {
 			// The commits of every open PR into this repo arrive through that PR; porting them
 			// would duplicate it, in any fork. Listed once per project, only when a fork has
 			// pending work or a hold to check. A cursor that moves past such commits keeps a
-			// hold (ForkBranchState.holdPrs), so a PR closed without a merge brings them back.
+			// hold (ForkBranchState.holdPrs), so a closed PR brings them back for a new check.
 			let pulls: PullInfo[] | null = null;
-			const merged = new Map<number, boolean | null>();
 			for (const fork of forks) {
 				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
 					deps.log(
@@ -743,7 +716,7 @@ export function createForkWatcher(deps: {
 					}
 				}
 				if (holding.length > 0) {
-					await releaseHolds(store, holding, pulls, merged, repo, fork);
+					releaseHolds(store, holding, pulls, fork);
 					rows = store
 						.listAllForkBranches()
 						.filter((r) => r.forkId === fork.id);

@@ -225,29 +225,6 @@ export async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {
 	return pulls;
 }
 
-/**
- * Whether PR `n` was merged: true or false once it is closed, null while GitHub still shows
- * it open. Throws on a gh failure or an unreadable body, so callers never guess a state.
- */
-export async function pullMerged(
-	repo: string,
-	n: number,
-	gh: GhFn,
-): Promise<boolean | null> {
-	const r = await gh(["api", `repos/${repo}/pulls/${n}`]);
-	if (r.code !== 0)
-		throw new Error(
-			`gh pull ${n} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-		);
-	const body: unknown = JSON.parse(r.stdout);
-	if (typeof body !== "object" || body === null)
-		throw new Error(`gh pull ${n}: not an object`);
-	const x = body as Record<string, unknown>;
-	if (x.state === "open") return null;
-	if (x.state !== "closed") throw new Error(`gh pull ${n}: unknown state`);
-	return typeof x.merged_at === "string" && x.merged_at !== "";
-}
-
 /** One conversation or review comment on the PR under re-review. */
 export interface PrComment {
 	author: string;
