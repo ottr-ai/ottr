@@ -11313,8 +11313,13 @@ describe("work card check", () => {
 	// startRun fake: work-agent runs report ready, check runs (spotted by the check prompt's
 	// first words) are served from `checks` in order — one turn appends exactly one work run
 	// plus its check runs, so absolute run indexes would hand a check verdict to a work run.
-	const checkedRun = (record: Recorded, checks: RunResult[]) => {
+	const checkedRun = (
+		record: Recorded,
+		checks: RunResult[],
+		works: RunResult[] = [],
+	) => {
 		let checkIndex = 0;
+		let workIndex = 0;
 		return (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
 			o.onSession?.(`sess-${record.runs.length}`);
@@ -11324,12 +11329,13 @@ describe("work card check", () => {
 				done: Promise.resolve(
 					isCheck
 						? (checks[checkIndex++] ?? runResult({}))
-						: runResult({
-								outcome: {
-									status: "ready",
-									summary: "did it",
-								} satisfies Outcome,
-							}),
+						: (works[workIndex++] ??
+								runResult({
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})),
 				),
 				kill: async () => {},
 			};
@@ -11343,13 +11349,14 @@ describe("work card check", () => {
 		head: { sha: string },
 		checks: RunResult[],
 		overrides: Partial<TurnOps> = {},
+		works: RunResult[] = [],
 	) {
 		const record = baseRecord();
 		return setupWith(record, {
 			maxTotalRuns: () => 0,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
-			startRun: checkedRun(record, checks),
+			startRun: checkedRun(record, checks, works),
 			workCheck: () => true,
 			...overrides,
 		});
@@ -11393,6 +11400,8 @@ describe("work card check", () => {
 		expect(after.state).toBe("queued");
 		expect(after.workCheckHead).toBe("sha1");
 		expect(after.workCheckSendbacks).toBe(0);
+		// The first completed check stamps the ready report it judged.
+		expect(after.workCheckReport).toBe("did it");
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
 		expect(after.workCheckLog[0]!.notes).toEqual(["small nit"]);
@@ -11543,6 +11552,9 @@ describe("work card check", () => {
 		);
 		expect(recheckPrompt).toContain("const y = 2;\n");
 		expect(recheckPrompt).not.toContain("const x = 1;\nconst y = 2;\n");
+		// The re-check judges the update against the original result.
+		expect(recheckPrompt).toContain("Original ready report");
+		expect(recheckPrompt).toContain("New ready report");
 		const after = store.getTask(task.id)!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckHead).toBe("sha2");
@@ -11669,100 +11681,63 @@ describe("work card check", () => {
 		expect(after.workCheckLog).toEqual([]);
 	});
 
-	test("a re-ready at an unchanged head with open blockers resends them, and the fifth block parks", async () => {
+	test("a re-ready at an unchanged head after a send-back reruns the check, and the fifth block parks", async () => {
 		const head = { sha: "sha1" };
+		const diffs: string[] = [];
 		const { store, record, loop } = workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;")],
-			{ diffText: async () => "const x = 1;\n" },
+			[
+				block("tests were weakened", "const x = 1;"),
+				block("tests were weakened", "const x = 1;"),
+				block("tests were weakened", "const x = 1;"),
+				block("tests were weakened", "const x = 1;"),
+				block("tests were weakened", "const x = 1;"),
+			],
+			{
+				diffText: async (_wt: unknown, from: string) => {
+					diffs.push(from);
+					return "const x = 1;\n";
+				},
+			},
 		);
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
 
-		// Ready again with no new commits: no check run, the blockers go back once more.
+		// Ready again with no new commits and no new report text: still a fresh check run —
+		// the update may be new evidence or a corrected claim — never a word-for-word resend.
 		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(3); // the second turn added only its work run
+		expect(record.runs).toHaveLength(4); // two work runs, two checks
+		const recheck = record.runs[3]!;
+		expect(recheck.prompt).toContain("This is a re-check");
+		expect(recheck.prompt).toContain("Original ready report");
+		expect(recheck.prompt).toContain("did it");
+		expect(recheck.prompt).toContain("tests were weakened");
+		// At the unchanged head the re-check diff starts at the checked head, not the base.
+		expect(diffs[diffs.length - 1]).toBe("sha1");
+		expect(recheck.prompt).toContain(
+			"Diff of only the new commits since the previous check",
+		);
+		expect(recheck.prompt).not.toContain("Diff of the branch");
 		const after = store.getTask(task.id)!;
 		expect(after.workCheckSendbacks).toBe(2);
 		expect(after.pendingPrompt).toContain("tests were weakened");
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
-
-		// Resends three and four add one work run each.
-		await loop.runTurn(store.name, task.id);
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(5);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
-			WORK_CHECK_MAX_SENDBACKS,
-		);
-
-		// A fifth resend at the same head hits the cap: needs_you.
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(6);
-		const parked = store.getTask(task.id)!;
-		expect(parked.state).toBe("needs_you");
-		expect(parked.needsReason).toContain(
-			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
-		);
-		expect(parked.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS);
-	});
-
-	test("a re-ready at an unchanged head with an open unverified-claim blocker reruns the check, and the cap still holds", async () => {
-		const head = { sha: "sha1" };
-		const stillUnverified = block(
-			"still no check run backs the ready report",
-			"const x = 1;",
-			"unverified-claim",
-		);
-		const { store, record, loop } = workCheckCase(
-			head,
-			[
-				block(
-					"no check run backs the ready report",
-					"const x = 1;",
-					"unverified-claim",
-				),
-				stillUnverified,
-				stillUnverified,
-				stillUnverified,
-				stillUnverified,
-			],
-			{ diffText: async () => "const x = 1;\n" },
-		);
-		const task = store.createTask("work please");
-		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
-
-		// Ready again with no new commits: an unverified claim is fixed by new evidence
-		// in the transcript, not by a commit, so a fresh check runs instead of a resend.
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(4); // two work runs, two checks
-		const rerun = record.runs[3]!;
-		// The rerun sees the earlier blockers and, at the unchanged head, the full
-		// branch diff; the transcript path carries the turns since the last check.
-		expect(rerun.prompt).toContain("This is a re-check");
-		expect(rerun.prompt).toContain("no check run backs the ready report");
-		expect(rerun.prompt).toContain("Diff of the branch");
-		expect(rerun.prompt).toContain("Work transcript");
-		const rerunState = store.getTask(task.id)!;
-		expect(rerunState.stage).toBe("in_progress");
-		expect(rerunState.state).toBe("queued");
-		expect(rerunState.workCheckSendbacks).toBe(2);
-		expect(rerunState.pendingPrompt).toContain("[unverified-claim]");
-		expect(rerunState.workCheckLog).toHaveLength(2);
-		expect(rerunState.workCheckLog[1]!.outcome).toBe("blockers");
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[1]!.outcome).toBe("blockers");
 		// The rerun re-cited the quote, so the first blocker stays open.
-		expect(rerunState.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
 
-		// The reruns count against the send-back cap like resends: the block past the
-		// cap parks the card, so the unchanged-head loop stays bounded.
+		// Reruns three and four add one work run and one check run each.
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(3);
 		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(8);
 		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
 			WORK_CHECK_MAX_SENDBACKS,
 		);
+
+		// The fifth failing check at the same head hits the cap: needs_you.
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(10); // five work runs, five checks
 		const parked = store.getTask(task.id)!;
@@ -11777,26 +11752,62 @@ describe("work card check", () => {
 		]);
 	});
 
-	test("a re-ready at an unchanged head with a code-defect blocker still resends with no check run", async () => {
+	test("the re-check input holds the original report, the sent-back blockers, and the new report", async () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = workCheckCase(
 			head,
-			[block("off by one", "const x = 1;", "off-by-one")],
+			[block("the claim is wrong", "const x = 1;"), pass()],
 			{ diffText: async () => "const x = 1;\n" },
+			[
+				runResult({
+					outcome: {
+						status: "ready",
+						summary: "first report",
+						details: "Claims the widget works on this branch.",
+					} satisfies Outcome,
+				}),
+				runResult({
+					outcome: {
+						status: "ready",
+						summary: "second report",
+						details: "Corrects the claim: the widget needs a config flag.",
+					} satisfies Outcome,
+				}),
+			],
 		);
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
 
-		// A code defect only clears with a commit, which changes the head and re-checks:
-		// the same-head ready resends the blocker, and no second check run starts.
+		// The first check input has the run's report and neither earlier blockers nor an
+		// original report; the completed check stamps the report as the original result.
+		const first = record.runs[1]!;
+		expect(first.prompt).toContain("Ready report of the run being checked");
+		expect(first.prompt).toContain("Claims the widget works on this branch.");
+		expect(first.prompt).not.toContain("Original ready report");
+		expect(first.prompt).not.toContain("Earlier blockers:");
+		expect(store.getTask(task.id)!.workCheckReport).toBe(
+			"first report\n\nClaims the widget works on this branch.",
+		);
+
+		// Ready again at the unchanged head: the re-check judges the update against the
+		// original result, and a corrected claim is not a current claim.
 		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(3); // the second turn added only its work run
+		const recheck = record.runs[3]!;
+		expect(recheck.prompt).toContain("Original ready report");
+		expect(recheck.prompt).toContain("Claims the widget works on this branch.");
+		expect(recheck.prompt).toContain("New ready report");
+		expect(recheck.prompt).toContain("Corrects the claim");
+		expect(recheck.prompt).toContain(
+			"a claim the new report corrects or takes back is not a blocker",
+		);
+		expect(recheck.prompt).toContain("the claim is wrong");
+		// The second check passed, and the original report stays stored, never overwritten.
 		const after = store.getTask(task.id)!;
-		expect(after.workCheckSendbacks).toBe(2);
-		expect(after.pendingPrompt).toContain("off by one");
-		expect(after.pendingPrompt).toContain("[off-by-one]");
-		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckReport).toBe(
+			"first report\n\nClaims the widget works on this branch.",
+		);
 	});
 
 	test("an evidence rerun that passes at the unchanged head resolves the blocker", async () => {
@@ -16813,7 +16824,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(after.workCheckHead).toBeNull();
 	});
 
-	test("a stored head without any check run still checks the full branch diff", async () => {
+	test("a stored head without any check run still re-checks from the stored head", async () => {
 		const froms: string[] = [];
 		const { store, record, loop } = checkCase([verdict({})], {
 			diffText: async (_wt: string, from: string) => {
@@ -16825,8 +16836,13 @@ describe("turn survivor round 5 — work card to merging", () => {
 		store.updateTask(task.id, { workCheckHead: "old" });
 		await loop.runTurn(store.name, task.id);
 
-		expect(froms).toEqual(["origin/main"]);
-		expect(checkPrompts(record)[0]!.prompt).toContain("Diff of the branch");
+		// The stored head counts as a completed check: the re-check diff starts there, and
+		// the full branch diff is still read to ground quotes.
+		expect(froms).toEqual(["origin/main", "old"]);
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).toContain(
+			"Diff of only the new commits since the previous check",
+		);
 		expect(store.getTask(task.id)!.workCheckHead).toBe("sha1");
 	});
 
@@ -16875,7 +16891,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(after.workCheckLog[1]!.blockers).toEqual([]);
 	});
 
-	test("a human message from the last check's start instant does not re-open it", async () => {
+	test("a human message from the last check's start instant is not reply data, and the re-check runs anyway", async () => {
 		const { store, record, loop } = checkCase([verdict({})]);
 		const task = store.createTask("work please");
 		const said = humanTurn(store, task.id, "looks fine to me");
@@ -16884,14 +16900,16 @@ describe("turn survivor round 5 — work card to merging", () => {
 				storedRun(said, [{ finding: "weak tests", quote: "const x = 1;" }]),
 			],
 			workCheckHead: "sha1",
+			workCheckSendbacks: 1,
 		});
 		await loop.runTurn(store.name, task.id);
 
-		// No check run: the open blocker goes back once more.
-		expect(checkPrompts(record)).toHaveLength(0);
-		const after = store.getTask(task.id)!;
-		expect(after.workCheckSendbacks).toBe(1);
-		expect(after.pendingPrompt).toContain("weak tests");
+		// Open blockers re-check on every ready. The message at the check's start instant
+		// is not a reply, so it rides in no prompt.
+		const prompt = checkPrompts(record)[0]!.prompt;
+		expect(prompt).not.toContain("looks fine to me");
+		expect(prompt).not.toContain("Human messages to the work agent");
+		expect(store.getTask(task.id)!.stage).toBe("merging");
 	});
 
 	test("a human reply after a passed check at the same head starts no check", async () => {
@@ -16911,7 +16929,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(after.workCheckLog).toHaveLength(1);
 	});
 
-	test("a reply-driven re-check at an unchanged head sees the whole branch diff", async () => {
+	test("a reply-driven re-check at an unchanged head sees the reply and the since-head diff", async () => {
 		const { store, record, loop } = checkCase([verdict({})]);
 		const task = store.createTask("work please");
 		const said = humanTurn(store, task.id, "I approve the auth change");
@@ -16928,8 +16946,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 		const prompt = checkPrompts(record)[0]!.prompt;
 		expect(prompt).toContain("I approve the auth change");
-		expect(prompt).toContain("Diff of the branch");
-		expect(prompt).not.toContain("Diff of only the new commits");
+		// At the unchanged head the re-check diff starts at the checked head, not the base.
+		expect(prompt).toContain(
+			"Diff of only the new commits since the previous check",
+		);
+		expect(prompt).not.toContain("Diff of the branch");
 		expect(store.getTask(task.id)!.stage).toBe("merging");
 	});
 

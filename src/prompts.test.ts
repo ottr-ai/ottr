@@ -493,6 +493,7 @@ describe("workCheckPrompt", () => {
 		base: "abc1234",
 		head: "def5678",
 		diff: "diff --git a/src/w.ts b/src/w.ts",
+		report: "The widget works. Tests pass on this branch.",
 		transcriptPath: "/data/sessions/123_sess.jsonl",
 		earlier: [],
 		replies: [],
@@ -510,19 +511,26 @@ describe("workCheckPrompt", () => {
 		expect(prompt).toContain("is a note, not a blocker");
 		expect(prompt).toContain("STRICT JSON only");
 		expect(prompt).toContain(
-			'"quote": "<verbatim part of the diff or transcript>"',
+			'"quote": "<verbatim part of the report or the diff>"',
 		);
 		expect(prompt).toContain("Card Fix the widget, branch abc1234..def5678");
 		expect(prompt).toContain("The widget works.");
 		expect(prompt).toContain("diff --git a/src/w.ts b/src/w.ts");
 		expect(prompt).toContain("/data/sessions/123_sess.jsonl");
+		expect(prompt).toContain("Ready report of the run being checked");
+		expect(prompt).toContain("The widget works. Tests pass on this branch.");
+		// The transcript is evidence for claimed runs only, never a source of claims.
+		expect(prompt).toContain("never as a source of new claims to judge");
 		expect(prompt).not.toContain("Earlier blockers:");
+		expect(prompt).not.toContain("Original ready report");
 		expect(prompt).not.toContain("Human messages to the work agent");
 	});
 
 	test("a re-check numbers the earlier blockers and demands per-blocker confirmations", () => {
 		const prompt = workCheckPrompt({
 			...input,
+			report: "Fixed the test; it now asserts the real value.",
+			originalReport: "The widget works. Tests pass on this branch.",
 			earlier: [
 				{
 					id: 1,
@@ -535,6 +543,14 @@ describe("workCheckPrompt", () => {
 		expect(prompt).toContain("1. The test asserts nothing");
 		expect(prompt).toContain("quote: expect(x).toBe(true);");
 		expect(prompt).toContain('"id": <earlier blocker id>');
+		expect(prompt).toContain("Original ready report");
+		expect(prompt).toContain("The widget works. Tests pass on this branch.");
+		expect(prompt).toContain("New ready report");
+		expect(prompt).toContain("Fixed the test; it now asserts the real value.");
+		// The original report is history: a claim the new report takes back is not a claim.
+		expect(prompt).toContain(
+			"a claim the new report corrects or takes back is not a blocker",
+		);
 	});
 
 	test("asks for severities, bug classes, and REVIEW.md guidance", () => {
@@ -555,6 +571,7 @@ describe("workCheckPrompt", () => {
 		expect(since).toContain(
 			"Diff of only the new commits since the previous check",
 		);
+		expect(since).toContain("empty when no commit was added");
 		expect(since).not.toContain("Diff of the branch");
 	});
 
@@ -808,6 +825,7 @@ describe("handoffMarkdown research report", () => {
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
+		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
 		holdProvider: null,

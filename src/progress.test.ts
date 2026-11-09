@@ -62,6 +62,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
+		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
 	};

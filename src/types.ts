@@ -439,8 +439,10 @@ export interface Task {
 	workCheckLog: WorkCheckRun[];
 	/** Work-check send-backs to the work agent so far; once WORK_CHECK_MAX_SENDBACKS have run, every failing check asks the user (send it back, merge anyway, or cancel) before another send-back. */
 	workCheckSendbacks: number;
-	/** Branch head the last completed check saw; a ready report at the same head does not re-check. */
+	/** Branch head the last completed check saw; the re-check's diff starts here (empty when the head did not move). */
 	workCheckHead: string | null;
+	/** The ready report (summary and details, else the run's final message) the card's first completed work check judged; every re-check gets it as the original result next to the update. Null until a completed check stamps it, never overwritten. */
+	workCheckReport: string | null;
 	/** Epoch ms before which the queued card must not start (a check held until a provider usage
 	 * limit resets); null = no hold. Kept apart from queuedAt: a queue reorder rewrites that. */
 	holdUntil: number | null;
@@ -492,7 +494,7 @@ export interface WorkCheckRun {
 	/** pass = nothing blocks, blockers = real problems found, error = the run itself failed after a retry. */
 	outcome: "pass" | "blockers" | "error";
 	blockers: WorkCheckBlocker[];
-	/** Non-blocking findings: no quote, or the quote matched nothing in the diff or transcript. */
+	/** Non-blocking findings: no quote, or the quote matched nothing in the diff, the report, or the transcript. */
 	notes: string[];
 	durationMs: number;
 	/** The failed-run reason when outcome is "error". */

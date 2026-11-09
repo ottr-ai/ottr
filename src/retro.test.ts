@@ -99,6 +99,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
+		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
 		...p,

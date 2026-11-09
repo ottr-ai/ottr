@@ -21,7 +21,6 @@ import {
 	findDep,
 	findingsHold,
 	findingsSettledAt,
-	isEvidenceBugClass,
 	isRetro,
 	isReview,
 	lastFullReview,
@@ -221,6 +220,7 @@ function task(p: Partial<Task> = {}): Task {
 		workCheckLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
+		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
 		kind: "work",
@@ -1716,6 +1716,7 @@ describe("work check helpers", () => {
 			},
 			"const x = 1;",
 			"",
+			"",
 		);
 		expect(blockers).toEqual([
 			{
@@ -1731,10 +1732,11 @@ describe("work check helpers", () => {
 		]);
 	});
 
-	test("demoteUnquoted keeps only quotes the diff or transcript contains, demotions first", () => {
+	test("demoteUnquoted keeps only quotes the diff, report, or transcript contains, demotions first", () => {
 		const { blockers, notes } = demoteUnquoted(
 			verdict,
 			"diff --git a/x.ts const x = 1;",
+			"",
 			"",
 		);
 		expect(blockers).toEqual([
@@ -1751,7 +1753,21 @@ describe("work check helpers", () => {
 		const { blockers, notes } = demoteUnquoted(
 			verdict,
 			"",
+			"",
 			"transcript NOT IN THE SOURCES",
+		);
+		expect(blockers).toEqual([
+			{ finding: "fabricated", quote: "NOT IN THE SOURCES" },
+		]);
+		expect(notes).toHaveLength(3); // two demotions plus the plain note
+	});
+
+	test("demoteUnquoted grounds a quote in the ready report when it is in neither diff nor transcript", () => {
+		const { blockers, notes } = demoteUnquoted(
+			verdict,
+			"",
+			"report NOT IN THE SOURCES",
+			"",
 		);
 		expect(blockers).toEqual([
 			{ finding: "fabricated", quote: "NOT IN THE SOURCES" },
@@ -1792,16 +1808,6 @@ describe("work check helpers", () => {
 		];
 		expect(openWorkBlockers(runs)).toEqual([{ finding: "live", quote: "q2" }]);
 		expect(openWorkBlockers([])).toEqual([]);
-	});
-
-	test("isEvidenceBugClass matches the evidence-type classes, normalizing case and spacing", () => {
-		expect(isEvidenceBugClass("unverified-claim")).toBe(true);
-		expect(isEvidenceBugClass("Unverified Claim")).toBe(true);
-		expect(isEvidenceBugClass("fabricated_actions")).toBe(true);
-		expect(isEvidenceBugClass("Sycophancy")).toBe(true);
-		expect(isEvidenceBugClass("off-by-one")).toBe(false);
-		expect(isEvidenceBugClass("test-tampering")).toBe(false);
-		expect(isEvidenceBugClass(undefined)).toBe(false);
 	});
 });
 

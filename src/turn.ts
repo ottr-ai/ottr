@@ -87,7 +87,6 @@ import {
 	FINDINGS_HOLD,
 	findDep,
 	findingsHold,
-	isEvidenceBugClass,
 	isRetro,
 	isReview,
 	lastReviewBase,
@@ -449,6 +448,16 @@ function prBody(task: Task, outcome: Outcome | null): string {
 		.filter((s) => s !== "")
 		.join("\n\n");
 	return `${report !== "" ? report : "Integrated the card branch."}\n\nTask: ${task.id}\n\n---\n<sub>Opened by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker.</sub>`;
+}
+
+/** The ready report text a work check judges: the outcome's summary and details, else the
+ * run's final message when the agent sent no report. Pure. */
+function readyReportText(outcome: Outcome | null, finalText: string): string {
+	if (outcome === null) return finalText;
+	return [outcome.summary, outcome.details ?? ""]
+		.map((s) => s.trim())
+		.filter((s) => s !== "")
+		.join("\n\n");
 }
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
@@ -4880,14 +4889,22 @@ export function createTurnLoop(
 								!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
 						)
 						.map((t) => t.input as string);
+					// The ready report of the run being checked: the outcome's summary and
+					// details, else the run's final message. The first completed check stamps
+					// it on the card as the original result every later re-check gets.
+					const readyReport = readyReportText(result.outcome, result.finalText);
 					// Send the blockers back to the work agent, or ask the user once the cap is
-					// spent: shared by the re-ready resend and a fresh verdict below; a resend
-					// counts as an attempt against the same WORK_CHECK_MAX_SENDBACKS cap.
+					// spent: only a fresh verdict reaches this, and a send-back counts as an
+					// attempt against the same WORK_CHECK_MAX_SENDBACKS cap.
 					const sendBack = (
 						blockers: WorkCheckBlocker[],
 						runs: WorkCheckRun[],
 					) => {
 						const sendbacks = cur.workCheckSendbacks;
+						const reportStamp =
+							cur.workCheckReport === null
+								? { workCheckReport: readyReport }
+								: {};
 						// A block after the cap asks the user: the reply route turns a click into the
 						// send-back or the merge (no board check skill needed to unstick it).
 						if (sendbacks >= WORK_CHECK_MAX_SENDBACKS)
@@ -4902,6 +4919,7 @@ export function createTurnLoop(
 								asked: workCheckAsk(blockers),
 								workCheckLog: runs,
 								workCheckHead: head,
+								...reportStamp,
 							});
 						else {
 							store.updateTask(id, {
@@ -4918,41 +4936,27 @@ export function createTurnLoop(
 								workCheckLog: runs,
 								workCheckHead: head,
 								workCheckSendbacks: sendbacks + 1,
+								...reportStamp,
 							});
 							log(
 								`- work check: sent back to the work agent (${sendbacks + 1} of ${WORK_CHECK_MAX_SENDBACKS})`,
 							);
 						}
 					};
-					const evidenceRecheck = open.some((b) =>
-						isEvidenceBugClass(b.bugClass),
-					);
-					if (
-						seen &&
-						open.length > 0 &&
-						replies.length === 0 &&
-						!evidenceRecheck
-					) {
-						// The agent re-reported ready with no new commits and no human word since
-						// the check: nothing new to check, so no check run starts — the open
-						// blockers go back once more. An evidence-type blocker re-checks instead
-						// (the branch below): its fix is new evidence in the transcript, not a
-						// commit, so a resend would loop to the cap with the claim still unverified.
-						sendBack(open, priorLog);
-					} else if (
-						!seen ||
-						(open.length > 0 && (replies.length > 0 || evidenceRecheck))
-					) {
+					// Every ready report after a send-back gets a fresh check, even at an
+					// unchanged head with no new report text: the update may be new evidence
+					// (a run the transcript now shows) or a corrected claim, and only a fresh
+					// session judges it. A re-ready after a passing check at an unchanged head
+					// starts nothing: the last check passed and nothing changed.
+					if (!seen || open.length > 0) {
 						const checkBase = task.base ?? target ?? "HEAD";
-						// A re-check after new commits sees only those commits: the checked code was
-						// already reviewed once, and repeat checks mostly re-flag old code. At an
-						// unchanged head (a reply- or evidence-driven re-check) the full diff
-						// stays, so the check can re-cite an earlier blocker's quote verbatim.
+						// A re-check sees only the commits since the head the last completed
+						// check stamped — empty at an unchanged head, where only the report
+						// moved. The checked code was already reviewed once, and repeat checks
+						// mostly re-flag old code; the full branch diff is still read below for
+						// quote grounding, so a re-cited blocker's quote stays verbatim there.
 						const checkFrom =
-							priorLog.length > 0 &&
-							head !== null &&
-							cur.workCheckHead !== null &&
-							cur.workCheckHead !== head
+							head !== null && cur.workCheckHead !== null
 								? cur.workCheckHead
 								: checkBase;
 						const sincePreviousCheck = checkFrom !== checkBase;
@@ -4996,6 +5000,8 @@ export function createTurnLoop(
 							head: head ?? "HEAD",
 							diff: checkDiff,
 							sincePreviousCheck,
+							report: readyReport,
+							originalReport: cur.workCheckReport ?? undefined,
 							transcriptPath,
 							earlier: open.map((b, i) => ({
 								id: i + 1,
@@ -5061,7 +5067,12 @@ export function createTurnLoop(
 							if (err === null) {
 								const verdict = parseWorkCheck(checkResult.finalText);
 								if (verdict !== null) {
-									split = demoteUnquoted(verdict, diff, transcriptText);
+									split = demoteUnquoted(
+										verdict,
+										diff,
+										readyReport,
+										transcriptText,
+									);
 									checkFailed = null; // the retry succeeded
 									// Earlier blockers resolve three ways: the verdict's fixed list
 									// (by the prompt's 1-based id) wins; a blocker whose exact quote
@@ -5120,6 +5131,9 @@ export function createTurnLoop(
 											workCheckLog: allRuns,
 											workCheckHead: head,
 											workCheckSendbacks: cur.workCheckSendbacks,
+											...(cur.workCheckReport === null
+												? { workCheckReport: readyReport }
+												: {}),
 										});
 									else sendBack(split.blockers, allRuns);
 									break;

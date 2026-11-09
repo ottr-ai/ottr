@@ -301,6 +301,7 @@ interface TaskRow {
 	work_check_log: string;
 	work_check_sendbacks: number;
 	work_check_head: string | null;
+	work_check_report: string | null;
 	priority: string | null;
 	close_candidate: string | null;
 	hold_until: number | null;
@@ -455,6 +456,7 @@ function toListedTask(
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
 		workCheckSendbacks: r.work_check_sendbacks,
 		workCheckHead: r.work_check_head,
+		workCheckReport: r.work_check_report,
 		priority: (r.priority as Task["priority"]) ?? null,
 		closeCandidate: r.close_candidate,
 		kind: r.kind as TaskKind,
@@ -692,6 +694,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	workCheckLog: "work_check_log",
 	workCheckSendbacks: "work_check_sendbacks",
 	workCheckHead: "work_check_head",
+	workCheckReport: "work_check_report",
 	priority: "priority",
 	closeCandidate: "close_candidate",
 	holdUntil: "hold_until",
@@ -1290,6 +1293,8 @@ export class ProjectStore {
 			);
 		if (!cols.includes("work_check_head"))
 			db.exec("ALTER TABLE tasks ADD COLUMN work_check_head TEXT");
+		if (!cols.includes("work_check_report"))
+			db.exec("ALTER TABLE tasks ADD COLUMN work_check_report TEXT");
 		// fork_merge_approved lives after the state-CHECK rebuild on purpose (like topic and the
 		// diff columns): it is ALTER-only, so a rebuild before its backfill would drop the
 		// column and the stale `cols` list would never re-add it.
@@ -1330,6 +1335,9 @@ export class ProjectStore {
 				);
 				db.exec("ALTER TABLE tasks_migrating ADD COLUMN work_check_head TEXT");
 				db.exec(
+					"ALTER TABLE tasks_migrating ADD COLUMN work_check_report TEXT",
+				);
+				db.exec(
 					"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
 				);
 				const names = `id, title, prompt, stage, state, needs_reason, pending_prompt,
@@ -1338,7 +1346,7 @@ export class ProjectStore {
 					release_version, release_notes, session_title, asked, model, kept_files,
 					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,
 					commits, done_at, topic, depends_on, diff_files, diff_text, work_check_log,
-					work_check_sendbacks, work_check_head`;
+					work_check_sendbacks, work_check_head, work_check_report`;
 				db.exec(
 					`INSERT INTO tasks_migrating (${names}) SELECT ${names} FROM tasks`,
 				);

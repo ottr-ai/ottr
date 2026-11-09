@@ -941,25 +941,6 @@ export function openWorkBlockers(
 	return [];
 }
 
-/** The evidence-type bug classes of the work-check prompt: "fabricated actions" and
- * "sycophancy" — a claim with no run behind it, or more than the evidence shows — plus the
- * "unverified-claim" name the check wrote in the field. Their fix is new evidence in the work
- * transcript (a real command run), not a commit, so an unchanged head re-runs the check on the
- * new transcript instead of resending; a resend would only loop to the cap with nothing new
- * to verify. Class names are free-form, so the match normalizes case and spacing. */
-export const EVIDENCE_BUG_CLASSES: readonly string[] = [
-	"unverified-claim",
-	"fabricated-actions",
-	"sycophancy",
-];
-
-/** True when a blocker's bugClass names an evidence-type class (EVIDENCE_BUG_CLASSES). Pure. */
-export function isEvidenceBugClass(bugClass: string | undefined): boolean {
-	if (bugClass === undefined) return false;
-	const norm = bugClass.trim().toLowerCase();
-	return EVIDENCE_BUG_CLASSES.includes(norm.replace(/[\s_]+/g, "-"));
-}
-
 /** Opening of the needs_you reason the work-check block at the send-back cap sets; the reply
  * route reads the ask answers below only on a card parked with it. The count derives from
  * WORK_CHECK_MAX_SENDBACKS so the wording cannot drift from the cap. */
@@ -1032,12 +1013,14 @@ export function mergeAnywayPatch(
 }
 
 /** Splits a check verdict's blockers from its notes. A blocker must quote a verbatim part of
- * the diff or of the work transcript (the card's decision 6); an empty quote, or one that
- * matches nothing in either, demotes to a note instead of blocking. A severity of nit or
- * pre-existing demotes too: only important findings (the default when untagged) block. Pure. */
+ * the diff, of the ready report, or of the work transcript (the card's decision 6); an empty
+ * quote, or one that matches nothing in any of them, demotes to a note instead of blocking.
+ * A severity of nit or pre-existing demotes too: only important findings (the default when
+ * untagged) block. Pure. */
 export function demoteUnquoted(
 	verdict: WorkCheckVerdict,
 	diffText: string,
+	reportText: string,
 	transcriptText: string,
 ): { blockers: WorkCheckBlocker[]; notes: string[] } {
 	const blockers: WorkCheckBlocker[] = [];
@@ -1045,13 +1028,14 @@ export function demoteUnquoted(
 	for (const b of verdict.blockers) {
 		const quote = b.quote.trim();
 		const inDiff = diffText !== "" && diffText.includes(quote);
+		const inReport = reportText !== "" && reportText.includes(quote);
 		const inTranscript =
 			transcriptText !== "" && transcriptText.includes(quote);
-		if (quote === "" || (!inDiff && !inTranscript)) {
+		if (quote === "" || (!inDiff && !inReport && !inTranscript)) {
 			demoted.push(
 				quote === ""
 					? `${b.finding} (no quote — not blocking)`
-					: `${b.finding} (quote matched nothing in the diff or the transcript — not blocking)`,
+					: `${b.finding} (quote matched nothing in the diff, the report, or the transcript — not blocking)`,
 			);
 			continue;
 		}
