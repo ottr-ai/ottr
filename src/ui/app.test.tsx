@@ -8774,12 +8774,28 @@ describe("reuseCards", () => {
 		expect(merged.tasks[1]).toBe(b2);
 	});
 
-	test("a frame that changes no card returns the previous state", () => {
+	test("a frame that changes no card keeps the cards and the tasks array", () => {
 		const a = cardFixture({ id: "a1" });
 		const b = cardFixture({ id: "b1" });
 		const prev = frame([a, b]);
-		// The server re-serializes every frame: fresh objects, equal content.
-		expect(reuseCards(prev, frame([{ ...a }, { ...b }]))).toBe(prev);
+		// The server re-serializes every frame: fresh objects, equal content. The
+		// cards and the array keep their identity; the state itself is the new frame.
+		const merged = reuseCards(prev, frame([{ ...a }, { ...b }]));
+		expect(merged).not.toBe(prev);
+		expect(merged.tasks).toBe(prev.tasks);
+		expect(merged.tasks[0]).toBe(a);
+	});
+
+	test("a frame that moves only non-task fields still reaches the UI", () => {
+		const a = cardFixture({ id: "a1" });
+		const prev = { tasks: [a], quota: null } as unknown as StateResponse;
+		const next = {
+			tasks: [{ ...a }],
+			quota: { provider: "p" },
+		} as unknown as StateResponse;
+		const merged = reuseCards(prev, next);
+		expect(merged.quota).toBe(next.quota);
+		expect(merged.tasks[0]).toBe(a);
 	});
 
 	test("a card the frame drops is a change even when the rest are equal", () => {
@@ -8922,10 +8938,11 @@ describe("memoized Card renders", () => {
 			await renderLane(merged.tasks);
 			expect(renders).toBe(afterMount + 1);
 			expect(container.textContent).toContain("50%");
-			// A frame with equal content but fresh objects changes nothing: the
-			// merge returns the previous state and no card re-renders.
+			// A frame with equal content but fresh objects changes nothing: the merge
+			// keeps the cards and the tasks array, so no card re-renders.
 			const same = reuseCards(merged, frame([{ ...a2 }, { ...b }]));
-			expect(same).toBe(merged);
+			expect(same.tasks).toBe(merged.tasks);
+			expect(same.tasks[1]).toBe(b);
 			await renderLane(same.tasks);
 			expect(renders).toBe(afterMount + 1);
 			// A frame that changes Beta re-renders Beta, and still not Alpha.

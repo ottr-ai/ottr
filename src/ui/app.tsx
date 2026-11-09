@@ -11355,7 +11355,8 @@ function sameCard(a: TaskCard, b: TaskCard): boolean {
 
 /** Merges a pushed state frame with the previous one: a card the frame carries unchanged keeps
  * the previous object, so a memoized Card skips its render, and a frame that changes no card
- * keeps even the tasks array. The frame's other fields always come through unchanged. */
+ * keeps even the tasks array. The frame's other fields (quota, server version, projects)
+ * always come through: a frame that moves only them must still reach the UI. */
 export function reuseCards(
 	prev: StateResponse | null,
 	next: StateResponse,
@@ -11369,7 +11370,9 @@ export function reuseCards(
 	for (let i = 0; i < tasks.length; i++) {
 		if (tasks[i] !== prev.tasks[i]) return { ...next, tasks };
 	}
-	return prev.tasks.length === tasks.length ? prev : { ...next, tasks };
+	return prev.tasks.length === tasks.length
+		? { ...next, tasks: prev.tasks }
+		: { ...next, tasks };
 }
 
 /** One card per rendered card, `<id>:<stage>`; two frames whose cards sit in the same stages
