@@ -247,6 +247,14 @@ The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot doe
 
 No data repo yet? Alate's `create-data-repo` skill builds a private one from the omp setup on your machine: install it with `npx skills add ottr-ai/alate --skill create-data-repo`, then ask your agent to run it. It scans for secrets first and asks before every step that leaves your machine (see [Alate, Start from your current setup](https://github.com/ottr-ai/alate#start-from-your-current-setup)).
 
+Before the first provision, capture this machine's omp user layer into the data repo. Run this from a checkout of the alate repo (https://github.com/ottr-ai/alate):
+
+```sh
+node sync-user.mjs --data /path/to/your-data-repo
+```
+
+It copies your omp settings, MCP servers, plugins and skills into the data repo's `user/` tree, and it scans for secrets first. Without this step, the workers get none of your user layer. The `create-data-repo` skill already runs this capture; run the command by hand when you built the data repo another way, or after you change your omp setup. Then provision again under **Settings → Alate** (or in the alate dashboard), so the workers' next install carries your layer.
+
 The Alate lines in the quick start write `COMPOSE_PROFILES`, `ALATE_URL`, and `ALATE_API_KEY` into `.env`, and start the bundled Alate server (compose profile `alate`) together with the board. The board reads `ALATE_URL` and `ALATE_API_KEY` at boot and seeds **Settings → Alate** with them. A value saved under Settings wins over the env at every boot. A user whose Alate server already runs omits the Alate block and pairs the board under **Settings → Alate** instead.
 
 The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570>. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). The seed installs a layer and switches it in place, so no restart is needed. Replace `OWNER/NAME` with your data repo. The line is the same in bash and PowerShell:

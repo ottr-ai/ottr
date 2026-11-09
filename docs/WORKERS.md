@@ -956,14 +956,22 @@ Do these steps once after the first `docker compose up`. The hourly deploy repea
 seed by itself when the env file names the data repo (below). The first deploy of this
 change also needs them: an existing stack starts with an empty `board-config` volume.
 
-1. Run the seed. For a private data repo, export `GH_TOKEN` first:
+1. Capture your machine's omp user layer into the data repo: run
+   `node sync-user.mjs --data /path/to/your-data-repo`
+   from a checkout of the alate repo (https://github.com/ottr-ai/alate). It copies your
+   omp settings, MCP servers, plugins and skills into the data repo's `user/` tree and
+   scans for secrets first. The `create-data-repo` skill already runs this capture; run
+   the command again after you change your omp setup, then provision again. Run this
+   before the first provision, so the first install already carries your layer
+   ([README, After the first start](../README.md#after-the-first-start)).
+2. Run the seed. For a private data repo, export `GH_TOKEN` first:
    `docker compose run --rm board-seed --repo <owner/name>`.
    To use a local checkout of the data repo, run
    `docker compose run --rm -v <data-repo>:/data:ro board-seed --data /data`.
    No restart follows: the seed installs a layer and switches `.alate/current`
    ([The agent layers](#the-agent-layers)), turns pin the current layer at spawn, and
    the board's config readers follow the current layer at read time.
-2. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
+3. Sign in once under **Settings → Provider sign-in**. Alternatively, pass provider API
    keys (`ANTHROPIC_API_KEY`, ...) in the env.
 
 To seed with no hand step, set one of these in the compose env file:
