@@ -5,7 +5,6 @@ import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import { PROMPT_CHAR_BUDGET } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
-import type { PrReviewRow } from "./types.ts";
 import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
@@ -22,6 +21,7 @@ import {
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
+import type { PrReviewRow } from "./types.ts";
 
 describe("prUrl", () => {
 	const oldHost = process.env.OTTR_GITHUB_HOST;
@@ -1466,9 +1466,7 @@ describe("createPrWatcher", () => {
 		expect(row.commentsUnseen).toBe(true);
 		expect(row.commentsAt).toBe(Date.parse("2026-01-03T00:00:00Z"));
 		expect(s.forgotten).toEqual([id]);
-		expect(s.logs.some((m) => m.includes("#52: 2 new comment(s)"))).toBe(
-			true,
-		);
+		expect(s.logs.some((m) => m.includes("#52: 2 new comment(s)"))).toBe(true);
 	});
 
 	test("the author's own comments, stale comments and malformed entries count nothing", async () => {
@@ -1508,7 +1506,11 @@ describe("createPrWatcher", () => {
 				const path = args.at(-1) ?? "";
 				if (path.includes("/comments"))
 					return { code: 1, stdout: "", stderr: "HTTP 500" };
-				return { code: 0, stdout: JSON.stringify([pr(54, sha("a"))]), stderr: "" };
+				return {
+					code: 0,
+					stdout: JSON.stringify([pr(54, sha("a"))]),
+					stderr: "",
+				};
 			},
 		});
 		await watcher.tick();
@@ -1516,7 +1518,9 @@ describe("createPrWatcher", () => {
 		expect(row.commentsAt).toBe(cutoff);
 		expect(row.commentsUnseen).toBe(false);
 		expect(
-			logs.some((m) => m.includes("#54 sweep failed") && m.includes("HTTP 500")),
+			logs.some(
+				(m) => m.includes("#54 sweep failed") && m.includes("HTTP 500"),
+			),
 		).toBe(true);
 	});
 
@@ -1557,9 +1561,11 @@ describe("createPrWatcher", () => {
 		const cutoff = Date.parse("2026-01-01T00:00:00Z");
 		await postRow(s, 58, { commentsAt: cutoff });
 		const runs = s.store.prReviewRunsSince(0);
+		const prompted = s.prompts.length;
 		s.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
 		await s.watcher.tick();
 		expect(s.store.prReviewRunsSince(0)).toBe(runs);
-		expect(s.prompts).toHaveLength(0);
+		// postRow's own setup reviews sit in prompts; the wave must add none.
+		expect(s.prompts).toHaveLength(prompted);
 	});
 });

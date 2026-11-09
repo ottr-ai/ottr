@@ -298,7 +298,11 @@ export function alarmLabel(needs: number, asks: number, pr = 0): string {
 				? "1 question asked"
 				: `${asks} questions asked`
 			: null,
-		pr === 1 ? "1 PR review has activity" : pr > 0 ? `${pr} PR reviews have activity` : null,
+		pr === 1
+			? "1 PR review has activity"
+			: pr > 0
+				? `${pr} PR reviews have activity`
+				: null,
 	]
 		.filter(Boolean)
 		.join(" · ");

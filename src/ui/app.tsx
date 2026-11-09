@@ -12044,10 +12044,12 @@ export function App() {
 	// Projects with PR review notifications off show no PR rows in the bell.
 	const prQuiet = (t: TaskCard): boolean =>
 		t.kind === "pr_review" &&
-		projects.find((p) => p.name === t.project)?.settings.prReviewNotify === false;
+		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
+			false;
 	const needsShown = needTasks.filter((t) => !prQuiet(t));
 	const prActivity = tasks.filter(
-		(t) => t.kind === "pr_review" && t.prOccurrence?.comments != null && !prQuiet(t),
+		(t) =>
+			t.kind === "pr_review" && t.prOccurrence?.comments != null && !prQuiet(t),
 	);
 	const alarmLine = alarmLabel(
 		needsShown.length,

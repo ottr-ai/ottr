@@ -5922,9 +5922,7 @@ export function createApp(deps: AppDeps) {
 												kind: t.kind,
 												prOccurrence: {
 													draft:
-														row !== null
-															? e.store.lastPrRun(row.number)
-															: null,
+														row !== null ? e.store.lastPrRun(row.number) : null,
 												},
 											}),
 										);

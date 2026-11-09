@@ -435,6 +435,9 @@ describe("PR review notifications", () => {
 
 	test("taskEntryKey carries the draft stamp for pr_review cards only", () => {
 		expect(taskEntryKey(pr({ prDraft: 7 }))).toBe("task:P:needs-pr7");
+		expect(
+			taskEntryKey(pr({ prOccurrence: { draft: 8, comments: null } })),
+		).toBe("task:P:needs-pr8");
 		expect(taskEntryKey(pr({ prDraft: null }))).toBe("task:P:needs");
 		expect(taskEntryKey({ id: "A", asked: null })).toBe("task:A:needs");
 	});
@@ -449,13 +452,15 @@ describe("PR review notifications", () => {
 	test("a rewritten draft on a waiting card is a new occurrence", () => {
 		const old = pr({ state: "needs_you", prDraft: 3 });
 		const t = pr({ state: "needs_you", prDraft: 4 });
-		expect(diffEvents([old], [t]).map((e) => [e.class, e.key, e.body])).toEqual([
+		expect(diffEvents([old], [t]).map((e) => [e.class, e.key, e.body])).toEqual(
 			[
-				"request",
-				"task:P:needs-pr4",
-				"Review draft updated — re-read it before posting",
+				[
+					"request",
+					"task:P:needs-pr4",
+					"Review draft updated — re-read it before posting",
+				],
 			],
-		]);
+		);
 		expect(diffEvents([t], [t])).toEqual([]);
 	});
 
@@ -483,7 +488,9 @@ describe("PR review notifications", () => {
 		});
 		expect(
 			diffEvents([old], [wave]).map((e) => [e.class, e.key, e.body]),
-		).toEqual([["request", "pr:P:500", "New comments after your posted review"]]);
+		).toEqual([
+			["request", "pr:P:500", "New comments after your posted review"],
+		]);
 		expect(diffEvents([wave], [wave])).toEqual([]);
 		const read = pr({ state: "idle", stage: "done", prDraft: 3 });
 		expect(diffEvents([wave], [read])).toEqual([]);
@@ -502,9 +509,13 @@ describe("PR review notifications", () => {
 		expect(clearedAlerts([a], [pr({ prComments: 600 })], new Set())).toEqual([
 			a,
 		]);
-		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set())).toEqual([]);
+		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set())).toEqual(
+			[],
+		);
 		expect(clearedAlerts([a], [pr()], new Set())).toEqual([a]);
-		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set(["pr:P:500"]))).toEqual([a]);
+		expect(
+			clearedAlerts([a], [pr({ prComments: 500 })], new Set(["pr:P:500"])),
+		).toEqual([a]);
 	});
 });
 

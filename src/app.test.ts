@@ -8597,9 +8597,10 @@ describe("web push (R1-1, R2-3)", () => {
 				prOccurrence?: { draft: number | null; comments: number | null };
 			}>;
 		};
-		expect(
-			occOf.tasks.find((c) => c.id === t.id)?.prOccurrence,
-		).toEqual({ draft: run, comments: null });
+		expect(occOf.tasks.find((c) => c.id === t.id)?.prOccurrence).toEqual({
+			draft: run,
+			comments: null,
+		});
 		const from = pushSends.length;
 		expect(
 			(
@@ -10973,9 +10974,7 @@ describe("PR review routes", () => {
 	test("a successful post sets the comment baseline at the post time", async () => {
 		const t = reviewed(51, H1);
 		const before = Date.now();
-		expect((await postReview(t.id, { body: "Looks good." })).status).toBe(
-			200,
-		);
+		expect((await postReview(t.id, { body: "Looks good." })).status).toBe(200);
 		const r = row(51);
 		expect(r.postedHead).toBe(H1);
 		expect(r.commentsUnseen).toBe(false);

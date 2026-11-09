@@ -2882,7 +2882,10 @@ export class ProjectStore {
 		}
 		// One grouped query and one row scan per project: the occurrence stamps the board
 		// build and the alert diff read for pr_review cards.
-		const pr = new Map<string, { draft: number | null; comments: number | null }>();
+		const pr = new Map<
+			string,
+			{ draft: number | null; comments: number | null }
+		>();
 		const runs = new Map<number, number>();
 		for (const r of this.db
 			.query<{ number: number; id: number }, []>(

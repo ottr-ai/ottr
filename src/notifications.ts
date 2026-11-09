@@ -35,18 +35,20 @@ function askHash(text: string): string {
 }
 
 /** Occurrence key of a needs_you card's inbox entry: a new ask round is a new entry, and a
- * new PR review draft (a fresh run id) is one too. */
+ * new PR review draft (a fresh run id) is one too. Cards carry the stamp on `prOccurrence`;
+ * the alert diff's inputs carry it flat as `prDraft`. */
 export function taskEntryKey(t: {
 	id: string;
 	asked: AskQuestion[] | null;
 	kind?: TaskKind;
 	prOccurrence?: { draft: number | null } | null;
+	prDraft?: number | null;
 }): string {
 	const draft =
-		t.kind === "pr_review" && t.prOccurrence?.draft != null
-			? `-pr${t.prOccurrence.draft}`
-			: "";
-	return `task:${t.id}:${t.asked === null ? `needs${draft}` : `ask-${askHash(JSON.stringify(t.asked))}`}`;
+		t.kind === "pr_review"
+			? (t.prOccurrence?.draft ?? t.prDraft ?? null)
+			: null;
+	return `task:${t.id}:${t.asked === null ? (draft !== null ? `needs-pr${draft}` : "needs") : `ask-${askHash(JSON.stringify(t.asked))}`}`;
 }
 
 /** Card facts the event diff reads. Built by the server from TaskCard + its latest turn. */
@@ -252,8 +254,7 @@ export function clearedAlerts(
 		if (t === undefined || t.cancelled) return true;
 		if (a.key.startsWith("task:"))
 			return t.state !== "needs_you" || taskEntryKey(t) !== a.key;
-		if (a.key.startsWith("pr:"))
-			return a.key !== `pr:${t.id}:${t.prComments}`;
+		if (a.key.startsWith("pr:")) return a.key !== `pr:${t.id}:${t.prComments}`;
 		if (a.key.startsWith("done:")) {
 			// An answered question-only card completes without entering done.
 			return t.stage !== "done" && !t.answered;
