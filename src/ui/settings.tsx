@@ -6783,7 +6783,7 @@ export function ProjectSettingsForm({
 								name="PR review notifications"
 								desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
 								checked={st.prReviewNotify}
-								disabled={!st.prReviews && !st.prReviewNotify}
+								disabled={!st.prReviews}
 								save={(v) => send({ prReviewNotify: v })}
 								act={act}
 							/>
