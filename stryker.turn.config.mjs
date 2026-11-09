@@ -28,7 +28,10 @@ export default {
   // v0.2.0 review run at 16b3326; that run reported 94.50 with 28 timeouts and 145 survivors).
   // Timeouts count as detected but are not counted here: under host load they are mostly slow
   // survivors, not hangs (a 2026-10-31 rerun at a load average of ~90 timed out 1000 mutants and
-  // left 3 survivors). Raise the break when a clean run on a quiet host measures more. History:
-  // 86.59 (2026-10-25, after round 5), 84.10 (2026-10-14 clean run), 77.51 (2026-10-25 review).
-  thresholds: { ...base.thresholds, break: 93 },
+  // left 3 survivors). The measured 93.4 exceeds 90, so the break holds the cap of 90 per
+  // coding-guideline.md (2026-11-09): a break never goes above 90; a threshold above 90 may be
+  // set to 90. Raise the break when a clean run on a quiet host measures more, but never above
+  // 90. History: 93 (2026-11-09, capped from the measured 93), 86.59 (2026-10-25, after round 5),
+  // 84.10 (2026-10-14 clean run), 77.51 (2026-10-25 review).
+  thresholds: { ...base.thresholds, break: 90 },
 };

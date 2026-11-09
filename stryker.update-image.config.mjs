@@ -37,9 +37,11 @@ export default {
   // tests: 684 killed, 3 timed out, 60 survived, with the 8-way 120 s + 3x budget above). The
   // 2026-10-30 review's 88.95 and the earlier 83.08 (2026-10-25, f0e3416) and 76.96 (2026-10-14)
   // ran 24-way on the 10 s + 2x budget and counted slow survivors as timeouts: the same code
-  // measured 76.84 on the honest budget before these tests. Raise it when the score rises. Most
-  // survivors left are equivalent (unreachable fallbacks, never-empty git output) or sit in the
+  // measured 76.84 on the honest budget before these tests. The measured 94.52 exceeds 90, so
+  // the break holds the cap of 90 per coding-guideline.md (2026-11-09): a break never goes above
+  // 90; a threshold above 90 may be set to 90. Raise it when the score rises, but never above
+  // 90. Most survivors left are equivalent (unreachable fallbacks, never-empty git output) or sit in the
   // `import.meta.main` CLI entry. The script-side caps are defense in depth: the /api/drain
   // route re-sanitizes, so a surviving cap mutant cannot change what the notice shows.
-  thresholds: { ...base.thresholds, break: 94 },
+  thresholds: { ...base.thresholds, break: 90 },
 };
