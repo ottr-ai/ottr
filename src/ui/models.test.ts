@@ -346,6 +346,7 @@ test("classifyRolesSave: failures keep string fields and the error", () => {
 			"Try again; if it repeats, the server log has the reason.",
 		),
 		fields: {},
+		fallbackFields: {},
 	});
 });
 
@@ -354,16 +355,19 @@ test("classifyRolesSave: failed fallback names the save, status and next step", 
 		kind: "failed",
 		error: fallback(401, "not signed in", "Sign in again."),
 		fields: {},
+		fallbackFields: {},
 	});
 	expect(classifyRolesSave(false, 418, { error: null, fields: "no" })).toEqual({
 		kind: "failed",
 		error: fallback(418, "status 418", "Check the value and try again."),
 		fields: {},
+		fallbackFields: {},
 	});
 	expect(classifyRolesSave(false, 500, { error: "boom" })).toEqual({
 		kind: "failed",
 		error: "boom",
 		fields: {},
+		fallbackFields: {},
 	});
 });
 

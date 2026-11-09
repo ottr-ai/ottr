@@ -162,6 +162,15 @@ const submitEvent = (): Event =>
 		cancelable: true,
 	}) as unknown as Event;
 
+/** Flushes confirmDialog's deferred unmount and any deferred lane update (a
+ *  timer React starts for the new dialog root) inside the test's window, so a
+ *  pending React update cannot outlive the file's DOM globals. */
+const settleDialog = async (): Promise<void> => {
+	await act(async () => {
+		await Bun.sleep(50);
+	});
+};
+
 /** Mounts the section against `fetchMock`; the cleanup puts fetch and the DOM back. */
 async function mountSection(fetchMock: typeof fetch): Promise<{
 	container: HTMLDivElement;
@@ -3471,6 +3480,7 @@ describe("AlateSection stored API key", () => {
 			});
 			expect(posts).toBe(1);
 			expect(container.textContent).toContain("rotated_key");
+			await settleDialog();
 		} finally {
 			await unmount();
 		}
@@ -3508,6 +3518,7 @@ describe("AlateSection stored API key", () => {
 			const alert = container.querySelector('p[role="alert"]');
 			expect(alert?.textContent).toContain("disk full");
 			expect(container.textContent).toContain("rotated_key");
+			await settleDialog();
 		} finally {
 			await unmount();
 		}
@@ -3543,6 +3554,7 @@ describe("AlateSection stored API key", () => {
 			);
 			expect(container.textContent).toContain("••••••••••••");
 			expect(container.textContent).not.toContain("rotated_key");
+			await settleDialog();
 		} finally {
 			await unmount();
 		}
@@ -3818,6 +3830,7 @@ describe("Error-Says-Fix messages", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					trendingScan={false}
 					// The app's act reports the thrown message; the tick repeats it.
 					act={async (fn, onError) => {
 						try {
@@ -3890,6 +3903,7 @@ describe("Error-Says-Fix messages", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					trendingScan={false}
 					act={async (fn, onError) => {
 						try {
 							await fn();
@@ -4016,6 +4030,7 @@ describe("Error-Says-Fix messages", () => {
 					<ProjectSettingsForm
 						project={project}
 						tasks={[]}
+						trendingScan={false}
 						act={async (fn) => {
 							await fn();
 							return true;
@@ -4073,6 +4088,7 @@ describe("Error-Says-Fix messages", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					trendingScan={false}
 					act={async (fn) => {
 						await fn();
 						return true;
@@ -4107,6 +4123,7 @@ describe("Error-Says-Fix messages", () => {
 						currentTarget: cancel as unknown as Element,
 					});
 			});
+			await settleDialog();
 		} finally {
 			await act(async () => {
 				root.unmount();

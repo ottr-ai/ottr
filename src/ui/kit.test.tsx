@@ -7,11 +7,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
 	type Act,
 	clampPan,
-	interviewMsg,
 	httpNextStep,
 	httpProblem,
 	httpStatusWords,
 	type InstantSave,
+	interviewMsg,
 	LiveElapsed,
 	Skeleton,
 	unwrap,
@@ -295,7 +295,6 @@ test("LiveElapsed ticks the elapsed duration, then the status words and the esti
 	).not.toContain("·");
 });
 
-<<<<<<< HEAD
 describe("interviewMsg", () => {
 	test("each route verdict maps to its notice; unknown text passes through", () => {
 		expect(interviewMsg("queued")).toBe(

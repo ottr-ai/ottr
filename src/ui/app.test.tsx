@@ -7744,6 +7744,7 @@ describe("AddProjectModal Git URL field error", () => {
 						}}
 						onClose={() => {}}
 						onAdded={() => {}}
+						openTask={() => {}}
 					/>,
 				);
 			});
