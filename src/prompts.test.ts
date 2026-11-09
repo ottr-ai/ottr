@@ -810,6 +810,8 @@ describe("handoffMarkdown research report", () => {
 		workCheckHead: null,
 		priority: null,
 		closeCandidate: null,
+		holdProvider: null,
+		holdWindow: null,
 		pendingBy: null,
 		pushRetries: 0,
 	};

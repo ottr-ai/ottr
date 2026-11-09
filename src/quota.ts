@@ -108,13 +108,18 @@ export function forModel(
 }
 
 /** When this model's provider can run again: over its exhausted windows (100% used) with a
- *  future reset, the latest reset (every full window must reset). Null when none is known. */
+ *  future reset, the latest reset (every full window must reset). `window` is that binding
+ *  window's id, null when omp names no window. Null when none is known. */
 export function usageReset(
 	limits: QuotaLimit[],
 	model: string | null,
 	now: number,
-): { provider: string; resetsAt: number } | null {
-	let best: { provider: string; resetsAt: number } | null = null;
+): { provider: string; resetsAt: number; window: string | null } | null {
+	let best: {
+		provider: string;
+		resetsAt: number;
+		window: string | null;
+	} | null = null;
 	for (const l of forModel(limits, model))
 		if (
 			l.usedPct >= 100 &&
@@ -122,8 +127,29 @@ export function usageReset(
 			l.resetsAt > now &&
 			(best === null || l.resetsAt > best.resetsAt)
 		)
-			best = { provider: l.provider, resetsAt: l.resetsAt };
+			best = { provider: l.provider, resetsAt: l.resetsAt, window: l.window };
 	return best;
+}
+
+/** The provider's binding exhausted window: 100% used with a future reset, the latest reset
+ *  wins. Null when the provider reports no blocking window — every window below 100%, or a
+ *  full window whose reset has passed. Pure; the quota refresh uses this to release holds
+ *  early (OTTR-688). */
+export function providerBlocked(
+	limits: QuotaLimit[],
+	provider: string,
+	now: number,
+): QuotaLimit | null {
+	let best: { limit: QuotaLimit; resetsAt: number } | null = null;
+	for (const l of forProvider(limits, provider))
+		if (
+			l.usedPct >= 100 &&
+			l.resetsAt !== null &&
+			l.resetsAt > now &&
+			(best === null || l.resetsAt > best.resetsAt)
+		)
+			best = { limit: l, resetsAt: l.resetsAt };
+	return best?.limit ?? null;
 }
 
 /** Runs `omp usage --json` with `env` (the board's own omp env, login.ts boardOmpEnv: this

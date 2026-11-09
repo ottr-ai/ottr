@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
 	forModel,
 	parseUsage,
+	providerBlocked,
 	tightest,
 	tightestFor,
 	usageReset,
@@ -262,7 +263,54 @@ test("usageReset waits for the latest reset of the model's full windows", () => 
 	expect(usageReset(rows, "openai-codex/gpt-5", 100)).toEqual({
 		provider: "openai-codex",
 		resetsAt: 900,
+		window: "7d",
 	});
+	// The binding window's id rides along; a windowless row binds with window null.
+	expect(
+		usageReset(
+			[row({ usedPct: 100, resetsAt: 900 })],
+			"openai-codex/gpt-5",
+			100,
+		)?.window,
+	).toBeNull();
 	expect(usageReset(rows, "openai-codex/gpt-5", 1_000)).toBeNull();
 	expect(usageReset(rows, "gpt-5", 100)).toBeNull();
+});
+
+test("providerBlocked names the binding exhausted window; free or past-reset is null", () => {
+	const row = (p: Partial<QuotaLimit>): QuotaLimit => ({
+		provider: "zai",
+		label: "x",
+		window: null,
+		plan: null,
+		usedPct: 100,
+		resetsAt: 500,
+		...p,
+	});
+	// 100% with a future reset blocks, and the latest reset is the binding window.
+	expect(
+		providerBlocked([row({ window: "7d", resetsAt: 900 })], "zai", 100),
+	).toEqual(row({ window: "7d", resetsAt: 900 }));
+	expect(
+		providerBlocked(
+			[
+				row({ window: "5h", resetsAt: 300 }),
+				row({ window: "7d", resetsAt: 900 }),
+			],
+			"zai",
+			100,
+		)?.window,
+	).toBe("7d");
+	// A full window whose reset passed no longer blocks.
+	expect(providerBlocked([row({ resetsAt: 50 })], "zai", 100)).toBeNull();
+	// Below 100% does not block.
+	expect(
+		providerBlocked([row({ usedPct: 99.9, resetsAt: 900 })], "zai", 100),
+	).toBeNull();
+	// No windows at all (an unknown provider or a failed report) blocks nothing here;
+	// the release keeps such holds because forProvider returns no rows.
+	expect(providerBlocked([], "zai", 100)).toBeNull();
+	expect(
+		providerBlocked([row({ provider: "anthropic" })], "zai", 100),
+	).toBeNull();
 });

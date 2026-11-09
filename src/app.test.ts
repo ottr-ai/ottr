@@ -80,7 +80,7 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
-import type { TaskCard } from "./types.ts";
+import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
 	doneReadKey,
@@ -125,7 +125,7 @@ mock.module("web-push", () => ({
 		return {};
 	},
 }));
-const { createApp } = await import("./app.ts");
+const { createApp, releaseUsageHolds } = await import("./app.ts");
 
 const root = mkdtempSync(join(tmpdir(), "app-routes-"));
 
@@ -13757,5 +13757,180 @@ describe("omp stats dashboard proxy (docs/specs/omp-stats-dashboard.md)", () => 
 		).json()) as { port: number | null; error: string | null };
 		expect(body.port).toBeNull();
 		expect(body.error).toBeTruthy();
+	});
+});
+
+describe("releaseUsageHolds (OTTR-688)", () => {
+	const NOW = 1_700_000_000_000;
+	const window = (p: Partial<QuotaLimit>): QuotaLimit => ({
+		provider: "zai",
+		label: "x",
+		window: "7d",
+		plan: null,
+		usedPct: 100,
+		resetsAt: NOW + 86_400_000,
+		...p,
+	});
+	const quota = (limits: QuotaLimit[]): QuotaState => ({
+		limits,
+		error: null,
+		at: NOW,
+	});
+	const held = (
+		store: ProjectStore,
+		title: string,
+		hold: {
+			holdUntil: number;
+			holdProvider: string | null;
+			holdWindow?: string | null;
+		},
+	) => {
+		const t = store.createTask(title);
+		store.updateTask(t.id, { ...hold });
+		return t;
+	};
+
+	test("frees the held provider across projects and keeps every other hold", () => {
+		const a = { store: ProjectStore.open(join(root, "quota-a")), name: "a" };
+		const b = { store: ProjectStore.open(join(root, "quota-b")), name: "b" };
+		const zaiA = held(a.store, "zai a", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		const other = held(a.store, "anthropic a", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "anthropic",
+			holdWindow: "5h",
+		});
+		const editor = held(a.store, "editing a", {
+			holdUntil: PROMPT_EDIT_HELD,
+			holdProvider: null,
+		});
+		const retry = held(a.store, "credit retry a", {
+			holdUntil: NOW + 60_000,
+			holdProvider: null,
+		});
+		// Already runnable: the scheduler picks it regardless, so it never counts.
+		const stale = held(a.store, "stale a", {
+			holdUntil: NOW - 1,
+			holdProvider: "zai",
+		});
+		const gone = held(a.store, "cancelled a", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "zai",
+		});
+		a.store.updateTask(gone.id, { cancelledAt: NOW });
+		const zaiB = held(b.store, "zai b", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "zai",
+		});
+
+		// zai reports free again; anthropic is still full with a future reset.
+		const released = releaseUsageHolds(
+			quota([
+				window({ provider: "zai", usedPct: 40 }),
+				window({
+					provider: "anthropic",
+					usedPct: 100,
+					resetsAt: NOW + 3_600_000,
+				}),
+			]),
+			[a, b],
+			NOW,
+		);
+
+		expect(released).toBe(2);
+		const freeA = a.store.getTask(zaiA.id)!;
+		expect(freeA.holdUntil).toBeNull();
+		expect(freeA.holdProvider).toBeNull();
+		expect(freeA.holdWindow).toBeNull();
+		expect(b.store.getTask(zaiB.id)?.holdUntil).toBeNull();
+		expect(a.store.getTask(other.id)?.holdUntil).toBeGreaterThan(NOW);
+		expect(a.store.getTask(other.id)?.holdProvider).toBe("anthropic");
+		expect(a.store.getTask(editor.id)?.holdUntil).toBe(PROMPT_EDIT_HELD);
+		expect(a.store.getTask(retry.id)?.holdUntil).toBeGreaterThan(NOW);
+		expect(a.store.getTask(stale.id)?.holdUntil).toBe(NOW - 1);
+		expect(a.store.getTask(gone.id)?.holdUntil).toBe(NOW + 3_600_000);
+		a.store.close();
+		b.store.close();
+	});
+
+	test("no quota data keeps every hold until holdUntil", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-nodata")),
+			name: "a",
+		};
+		const t = held(a.store, "held", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "zai",
+		});
+		// A failed report: error set, no limits.
+		expect(
+			releaseUsageHolds(
+				{ limits: [], error: "omp usage exited with 1", at: NOW },
+				[a],
+				NOW,
+			),
+		).toBe(0);
+		const cur = a.store.getTask(t.id)!;
+		expect(cur.holdUntil).toBe(NOW + 3_600_000);
+		expect(cur.holdProvider).toBe("zai");
+		a.store.close();
+	});
+
+	test("a provider still full keeps its holds; a passed reset releases", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-full")),
+			name: "a",
+		};
+		const full = held(a.store, "full", {
+			holdUntil: NOW + 86_400_000,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		const passed = held(a.store, "passed", {
+			holdUntil: NOW + 720_000,
+			holdProvider: "anthropic",
+		});
+		expect(
+			releaseUsageHolds(
+				quota([
+					window({ usedPct: 100, resetsAt: NOW + 86_400_000 }),
+					window({ provider: "anthropic", usedPct: 100, resetsAt: NOW - 1 }),
+				]),
+				[a],
+				NOW,
+			),
+		).toBe(1);
+		expect(a.store.getTask(full.id)?.holdUntil).toBe(NOW + 86_400_000);
+		expect(a.store.getTask(passed.id)?.holdUntil).toBeNull();
+		a.store.close();
+	});
+
+	test("a re-hold after a release does not loop: a full report keeps the new hold", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-loop")),
+			name: "a",
+		};
+		const t = held(a.store, "loop", {
+			holdUntil: NOW + 86_400_000,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		const free = quota([window({ usedPct: 20 })]);
+		expect(releaseUsageHolds(free, [a], NOW)).toBe(1);
+		expect(a.store.getTask(t.id)?.holdUntil).toBeNull();
+		// The card starts, dies at the provider again, and re-holds from a report
+		// that says full: the next refresh with that report must keep it.
+		a.store.updateTask(t.id, {
+			holdUntil: NOW + 86_400_000,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		const full = quota([window({ usedPct: 100 })]);
+		expect(releaseUsageHolds(full, [a], NOW)).toBe(0);
+		expect(a.store.getTask(t.id)?.holdUntil).toBe(NOW + 86_400_000);
+		a.store.close();
 	});
 });

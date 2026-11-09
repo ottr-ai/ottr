@@ -301,6 +301,8 @@ interface TaskRow {
 	priority: string | null;
 	close_candidate: string | null;
 	hold_until: number | null;
+	hold_provider: string | null;
+	hold_window: string | null;
 	proposal_summary: string | null;
 	kind: string;
 }
@@ -451,6 +453,8 @@ function toTask(project: string, r: TaskRow): Task {
 		closeCandidate: r.close_candidate,
 		kind: r.kind as TaskKind,
 		holdUntil: r.hold_until,
+		holdProvider: r.hold_provider,
+		holdWindow: r.hold_window,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 	};
 }
@@ -680,6 +684,8 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	priority: "priority",
 	closeCandidate: "close_candidate",
 	holdUntil: "hold_until",
+	holdProvider: "hold_provider",
+	holdWindow: "hold_window",
 	proposalSummary: "proposal_summary",
 };
 
@@ -1405,6 +1411,13 @@ export class ProjectStore {
 		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
 		if (!cols.includes("hold_until"))
 			db.exec("ALTER TABLE tasks ADD COLUMN hold_until INTEGER");
+		// OTTR-688: which provider (and window) a usage-limit hold waits for; null on non-usage
+		// holds. Nullable TEXT, so plain ADD COLUMN converges; ALTER-only after every rebuild
+		// like hold_until above.
+		if (!cols.includes("hold_provider"))
+			db.exec("ALTER TABLE tasks ADD COLUMN hold_provider TEXT");
+		if (!cols.includes("hold_window"))
+			db.exec("ALTER TABLE tasks ADD COLUMN hold_window TEXT");
 		if (!cols.includes("starred"))
 			db.exec(
 				"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
@@ -2428,6 +2441,8 @@ export class ProjectStore {
 			prompt,
 			title: deriveTitle(prompt),
 			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
 		});
 	}
 

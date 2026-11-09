@@ -4002,3 +4002,49 @@ describe("starred flag", () => {
 		store.close();
 	});
 });
+
+describe("hold provider columns", () => {
+	test("open backfills hold_provider and hold_window on a pre-existing database and they round-trip", () => {
+		const dir = join(root, "legacy-hold-provider");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		// Schema as it was before OTTR-688 added the usage-hold owner columns; one row
+		// already held on the old shape.
+		db.exec(
+			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]', hold_until INTEGER)",
+		);
+		db.run(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, hold_until) VALUES ('old1', 'held', 'p', 'todo', 'queued', 1, 1, 5000)",
+		);
+		db.close();
+		const store = open(dir);
+		// The old row converges: the columns exist and read null (owner unknown).
+		const old = store.getTask("old1");
+		expect(old?.holdUntil).toBe(5000);
+		expect(old?.holdProvider).toBeNull();
+		expect(old?.holdWindow).toBeNull();
+		const task = store.createTask("held for zai");
+		expect(task.holdProvider).toBeNull();
+		expect(task.holdWindow).toBeNull();
+		store.updateTask(task.id, {
+			holdUntil: 1_000,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		const round = store.getTask(task.id);
+		expect(round?.holdUntil).toBe(1_000);
+		expect(round?.holdProvider).toBe("zai");
+		expect(round?.holdWindow).toBe("7d");
+		// Clearing a hold clears its owner in the same write.
+		store.updateTask(task.id, {
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+		});
+		const cleared = store.getTask(task.id);
+		expect(cleared?.holdUntil).toBeNull();
+		expect(cleared?.holdProvider).toBeNull();
+		expect(cleared?.holdWindow).toBeNull();
+		store.close();
+	});
+});

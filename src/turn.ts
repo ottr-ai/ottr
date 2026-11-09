@@ -767,6 +767,10 @@ interface UsageHold {
 	holdUntil: number;
 	needsReason: string;
 	pendingPrompt: string;
+	/** The provider (and window id) the hold waits for, stored beside holdUntil so the
+	 * quota refresh can release the hold early (OTTR-688). */
+	provider: string;
+	window: string | null;
 }
 
 const KEPT_PREFIX = "Kept the worktree: ";
@@ -961,13 +965,17 @@ export function createTurnLoop(
 			holdUntil: hit.resetsAt,
 			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
 			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+			provider: hit.provider,
+			window: hit.window,
 		};
 	}
 	/** The dispatched model's provider's exhausted-window reset from the board's quota state
 	 * (ops.quota is optional and may be absent in tests): null when nothing is known. */
-	async function usageResetFor(
-		model: string | null,
-	): Promise<{ provider: string; resetsAt: number } | null> {
+	async function usageResetFor(model: string | null): Promise<{
+		provider: string;
+		resetsAt: number;
+		window: string | null;
+	} | null> {
 		const q = await ops.quota?.().catch(() => null);
 		return q ? usageReset(q.limits, model, Date.now()) : null;
 	}
@@ -987,6 +995,8 @@ export function createTurnLoop(
 			state: "queued" as const,
 			queuedAt: Date.now(),
 			holdUntil: hold.holdUntil,
+			holdProvider: hold.provider,
+			holdWindow: hold.window,
 			needsReason: hold.needsReason,
 			pendingPrompt:
 				cur.pendingPrompt === null
@@ -1029,9 +1039,12 @@ export function createTurnLoop(
 		if (failure !== null) {
 			log(`! credit check failed: ${failure}`);
 			// Back to the queue as before the claim, held so the scheduler asks again in a minute.
+			// Not a usage hold: holdProvider stays null so the quota refresh never releases it.
 			store.updateTask(claimed.id, {
 				state: "queued",
 				holdUntil: Date.now() + CREDIT_RETRY_MS,
+				holdProvider: null,
+				holdWindow: null,
 				needsReason: CREDIT_CHECK_FAILED,
 				asked: claimed.asked,
 			});
@@ -2562,6 +2575,8 @@ export function createTurnLoop(
 						state: "queued",
 						queuedAt: Date.now(),
 						holdUntil: startHold.resetsAt,
+						holdProvider: startHold.provider,
+						holdWindow: startHold.window,
 						needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
 					});
 				ops.publishSoon();
@@ -3539,6 +3554,8 @@ export function createTurnLoop(
 					next = {
 						...next,
 						holdUntil: hit.resetsAt,
+						holdProvider: hit.provider,
+						holdWindow: hit.window,
 						needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
 					};
 				}
@@ -4143,8 +4160,13 @@ export function createTurnLoop(
 							needsReason: next.needsReason,
 							queuedAt: next.state === "queued" ? now : task.queuedAt,
 							// A usage-limit continue's reset hold; undefined keeps the column.
+							// The owner rides with it so the quota refresh can release early.
 							...(next.holdUntil !== undefined
-								? { holdUntil: next.holdUntil }
+								? {
+										holdUntil: next.holdUntil,
+										holdProvider: next.holdProvider ?? null,
+										holdWindow: next.holdWindow ?? null,
+									}
 								: {}),
 						}),
 				shots,

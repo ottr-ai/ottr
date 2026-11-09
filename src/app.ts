@@ -209,7 +209,7 @@ import {
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
-import { fetchQuota } from "./quota.ts";
+import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
 import {
 	cachedLatestGhRelease,
 	includedTasks,
@@ -418,6 +418,54 @@ function isFolderName(name: string): boolean {
 
 /** The per-project row the board and the turn loop share; defined by the turn module. */
 export type Entry = TurnProject;
+
+/** OTTR-688: release usage-limit holds early. For every provider that still holds cards, when
+ * the fresh quota report no longer shows a blocking window (a window 100% used with a future
+ * reset), the provider's holds clear on every project and the scheduler picks the cards up;
+ * holdUntil stays the upper bound when the report is silent for that provider. Only usage holds
+ * go: a hold without holdProvider (an open prompt edit, a hosted credit retry) and holds whose
+ * time already passed (the scheduler runs them anyway) stay. One pass per refresh releases a
+ * provider at most once, and logs one line per freed provider; a re-hold after a release was
+ * stamped from a full report, so the next refresh with that report keeps it. Returns the
+ * released card count. */
+export function releaseUsageHolds(
+	q: QuotaState,
+	projects: Iterable<{ store: ProjectStore }>,
+	now: number,
+): number {
+	const held = new Map<string, { store: ProjectStore; id: string }[]>();
+	for (const p of projects)
+		for (const t of p.store.listTasks()) {
+			if (
+				t.cancelledAt !== null ||
+				t.holdUntil === null ||
+				t.holdUntil <= now ||
+				t.holdProvider === null
+			)
+				continue;
+			const list = held.get(t.holdProvider) ?? [];
+			list.push({ store: p.store, id: t.id });
+			held.set(t.holdProvider, list);
+		}
+	let released = 0;
+	for (const [provider, cards] of held) {
+		const rows = forProvider(q.limits, provider);
+		// No data for the provider (a failed usage check included): holdUntil stays the bound.
+		if (rows.length === 0 || providerBlocked(rows, provider, now) !== null)
+			continue;
+		for (const c of cards)
+			c.store.updateTask(c.id, {
+				holdUntil: null,
+				holdProvider: null,
+				holdWindow: null,
+			});
+		released += cards.length;
+		console.log(
+			`[quota] released ${cards.length} cards held for ${provider}: the limit reports free again`,
+		);
+	}
+	return released;
+}
 
 interface AppDeps {
 	gstore: GlobalStore;
@@ -4492,6 +4540,16 @@ export function createApp(deps: AppDeps) {
 			void fetchQuota(boardOmpEnv())
 				.then((q) => {
 					quota = q;
+					// OTTR-688: holds of providers the fresh report shows free start now,
+					// not at their stored reset; nothing scheduled when nothing released.
+					try {
+						if (releaseUsageHolds(q, deps.projects.values(), Date.now()) > 0) {
+							deps.schedule();
+							publishSoon();
+						}
+					} catch (err) {
+						console.log(`[quota] hold release failed: ${errmsg(err)}`);
+					}
 					publishState();
 				})
 				.finally(() => {
@@ -7278,6 +7336,10 @@ export function createApp(deps: AppDeps) {
 						);
 					e.store.updateTask(task.id, {
 						holdUntil: PROMPT_EDIT_HELD,
+						// Not a usage hold: the owner clears so the quota refresh never releases
+						// a card whose editor is open (OTTR-688).
+						holdProvider: null,
+						holdWindow: null,
 					});
 					return json({ ok: true });
 				}),
@@ -7291,7 +7353,11 @@ export function createApp(deps: AppDeps) {
 					// Idempotent, and guard-free on purpose: the drawer posts it on every editor
 					// close (a save already cleared the hold), and clearing can only let a card
 					// start sooner — it never stalls one.
-					e.store.updateTask(task.id, { holdUntil: null });
+					e.store.updateTask(task.id, {
+						holdUntil: null,
+						holdProvider: null,
+						holdWindow: null,
+					});
 					return json({ ok: true });
 				}),
 		},

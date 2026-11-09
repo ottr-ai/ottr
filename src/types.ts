@@ -441,6 +441,13 @@ export interface Task {
 	/** Epoch ms before which the queued card must not start (a check held until a provider usage
 	 * limit resets); null = no hold. Kept apart from queuedAt: a queue reorder rewrites that. */
 	holdUntil: number | null;
+	/** Which provider's usage limit this hold waits for ("zai"); null = the hold is not a usage
+	 * hold (an open prompt edit, a hosted credit retry). Set with holdUntil by the usage-hold
+	 * writers; the quota refresh releases holds whose provider reports free again (OTTR-688). */
+	holdProvider: string | null;
+	/** omp window id ("5h", "7d") of the blocking usage window when the reset named one; null when
+	 * the window is unnamed or the hold is not a usage hold. */
+	holdWindow: string | null;
 	/** Manual triage rank; null = unrated. Overview triage sorts P0 first, unrated last. */
 	priority: Priority | null;
 	/** Close-candidate nomination: the reason this card is a duplicate, superseded, or drifted; null = not nominated. */
@@ -610,6 +617,10 @@ export interface Next {
 	/** Epoch ms before which the scheduler must not start the queued card: a usage-limit
 	 * continue waiting for the provider's reset. Absent keeps the column. */
 	holdUntil?: number;
+	/** Which provider's usage limit holdUntil waits for, and its window id when the reset named
+	 * one; set whenever holdUntil is set. Absent keeps the columns. */
+	holdProvider?: string;
+	holdWindow?: string | null;
 	/** Who authored pendingPrompt; defaults to "supervisor" when the settle writes it. */
 	pendingBy?: "user" | "supervisor" | null;
 	/** Outstanding agent ask to store on the task (the "?" state); absent/undefined clears nothing by itself. */

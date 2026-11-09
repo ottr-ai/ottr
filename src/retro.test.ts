@@ -68,6 +68,8 @@ function retroTask(p: Partial<Task> = {}): Task {
 		updatedAt: 1,
 		queuedAt: 1,
 		holdUntil: null,
+		holdProvider: null,
+		holdWindow: null,
 		doneAt: 1,
 		cancelledAt: null,
 		commits: null,

@@ -36,6 +36,8 @@ function done(id: string, project: string, commits: number | null): Task {
 		updatedAt: 0,
 		queuedAt: null,
 		holdUntil: null,
+		holdProvider: null,
+		holdWindow: null,
 		doneAt: null,
 		cancelledAt: null,
 		commits,
