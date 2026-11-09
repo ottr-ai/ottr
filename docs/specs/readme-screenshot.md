@@ -22,7 +22,9 @@ fixed afterwards (a5019bd) by hand. Two gaps:
 ## Capture behaviour
 
 - Starts the demo board (`bun src/dev.ts`) on a free port in the repo checkout; demo
-  data only, never a real board.
+  data only, never a real board. The board seeds a unique scratch root under `.dev/`
+  per spawn (`OTTR_DEV_ROOT` pins it), so concurrent boards in one checkout never
+  share a seeded database.
 - Drives Chrome headless over CDP with Bun's WebSocket client. No npm dependency:
   adding one is an AGENTS.md hard stop.
 - Chrome discovery: `OTTR_SCREENSHOT_CHROME` env wins, else the newest Chrome across the

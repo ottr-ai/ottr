@@ -396,11 +396,11 @@ A running card shows a live **Mutation testing** meter when the card's progress 
 
 CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; weekly workflows add Docker build checks, Trivy, a warn-only Opengrep SAST scan over `src/` and an OWASP ZAP baseline scan. Package versions stay 7 days back (`bunfig.toml`), and every action pins a full commit SHA.
 
-For UI work use `bun run dev`: it seeds five demo projects in `.dev/`, starts no agents, and never touches a real board. When another dev board still holds `.dev/`, the new board seeds its own root `.dev-<PORT>/` and prints a warning, so set a free `PORT` for it. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
+For UI work use `bun run dev`: it seeds five demo projects in `.dev/` (a fresh root per start), starts no agents, and never touches a real board. A board whose pinned `OTTR_DEV_ROOT` is held by another board seeds its own root `.dev-<PORT>/` and prints a warning, so set a free `PORT` for it. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
 
 ### Screenshot proofs for UI cards
 
-A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board.
+A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board. Each start seeds its own fresh scratch root under `.dev/` (unless `OTTR_DEV_ROOT` pins it), so two boards in one checkout never share a seeded database.
 
 1. Create the shots folder and start the demo board from inside the shot script — never as a named background service held across tool calls (registered boards die between calls and the proof phase burns restart loops). Bind every run to a fresh port number — never port 0: the board prints `http://127.0.0.1:${PORT}` straight from its env value, so with PORT=0 the printed URL and step 2's readiness poll name a port nobody bound — and give the run its own `mktemp -d` state directory and its own puppeteer profile (`--user-data-dir`), so parallel boards never collide. Keep `timeout` on the board command, but never trust it to free the port: `timeout` signals `bun run`, and the server child survives it, so `timeout N bun run dev` can outlive N with the board still holding its port — the standing no-kill rule stays intact:
 
@@ -410,6 +410,8 @@ A UI change needs a picture of the new surface. `bun run dev` serves the demo bo
    state=$(mktemp -d)               # own state directory per run
    PORT=$port OTTR_STATE_DIR="$state" timeout 900 bun run dev &
    ```
+
+A shot harness stops its spawned board on every exit path through try/finally with the `stopChildren` pattern of `scripts/readme-screenshot.ts`; `timeout` alone leaves an orphan that holds the seed lock.
 
 Never wait for a leftover board to expire, and never reuse a port while any board still holds it: with this step's fresh port and state directory a leftover board cannot block the run, so switch to a new port and start the new board at once — let the tracker expire the old one.
 
