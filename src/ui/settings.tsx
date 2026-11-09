@@ -36,6 +36,9 @@ import {
 	confirmDialog,
 	copyText,
 	Help,
+	httpNextStep,
+	httpProblem,
+	httpStatusWords,
 	Icon,
 	type IconName,
 	type InstantSave,
@@ -1541,7 +1544,12 @@ export function ProjectsOrderSection({
 			// The footer draws a border, so it only renders while it has a tick to show.
 			footer={
 				busy || s.saved || s.failed ? (
-					<SaveTick busy={busy} saved={s.saved} failed={s.failed} />
+					<SaveTick
+						busy={busy}
+						saved={s.saved}
+						failed={s.failed}
+						reason={s.reason}
+					/>
 				) : undefined
 			}
 		>
@@ -1985,8 +1993,14 @@ export async function gitReq(
 
 export const asTrust = (d: Record<string, unknown>): TrustNeeded | null =>
 	d.needsTrust === true ? (d as unknown as TrustNeeded) : null;
-export const asError = (d: Record<string, unknown>, status: number): string =>
-	typeof d.error === "string" ? d.error : `HTTP ${status}`;
+export const asError = (
+	d: Record<string, unknown>,
+	status: number,
+	what: string,
+): string =>
+	typeof d.error === "string"
+		? d.error
+		: `${what} failed: the server answered ${status} (${httpStatusWords(status)}). ${httpNextStep(status)}`;
 /** One SSH test or key save as a TestAnswer: 200 passed, 409 asks to trust the host key. */
 const toTestAnswer = ({
 	status,
@@ -1997,7 +2011,7 @@ const toTestAnswer = ({
 }): TestAnswer =>
 	status === 200
 		? { ok: true }
-		: (asTrust(data) ?? { error: asError(data, status) });
+		: (asTrust(data) ?? { error: asError(data, status, "the SSH key test") });
 
 /** The app's GitHub name and its installs on the board repos, from the server's last check. */
 export function AppCheckLines({ check }: { check: AppCheck | null }) {
@@ -2200,7 +2214,7 @@ export function PendingKeyRow({
 			({ status, data }) => {
 				setBusy(false);
 				if (status !== 200) {
-					setError(asError(data, status));
+					setError(asError(data, status, "saving the pasted key"));
 					return;
 				}
 				setPasted("");
@@ -2395,7 +2409,8 @@ export function GitHostsSection() {
 					"/api/git-hosts/github-token",
 					{ testUrl: tUrl.trim() },
 				);
-				if (status !== 200) throw new Error(asError(data, status));
+				if (status !== 200)
+					throw new Error(asError(data, status, "testing the token"));
 				setTToken("");
 				setTUser(defaultGitUsername(tHost.trim(), state?.githubHost ?? null));
 				await load();
@@ -2414,7 +2429,8 @@ export function GitHostsSection() {
 					token: tToken,
 					testUrl: tUrl.trim(),
 				});
-				if (status !== 200) throw new Error(asError(data, status));
+				if (status !== 200)
+					throw new Error(asError(data, status, "saving the token"));
 				setTToken("");
 				await load();
 				return true;
@@ -2434,7 +2450,10 @@ export function GitHostsSection() {
 				"DELETE",
 				`/api/git-hosts/tokens/${encodeURIComponent(host)}`,
 			);
-			if (status !== 200) throw new Error(asError(data, status));
+			if (status !== 200)
+				throw new Error(
+					asError(data, status, `removing the token for ${host}`),
+				);
 			await load();
 			return true;
 		});
@@ -2451,7 +2470,8 @@ export function GitHostsSection() {
 				"DELETE",
 				"/api/git-hosts/ssh/global",
 			);
-			if (status !== 200) throw new Error(asError(data, status));
+			if (status !== 200)
+				throw new Error(asError(data, status, "removing the global SSH key"));
 			await load();
 			return true;
 		});
@@ -2468,7 +2488,8 @@ export function GitHostsSection() {
 					"/api/git-hosts/github-app",
 					{ id, key: appKey },
 				);
-				if (status !== 200) throw new Error(asError(data, status));
+				if (status !== 200)
+					throw new Error(asError(data, status, "saving the GitHub App"));
 				setAppId("");
 				setAppKey("");
 				setAppFormOpen(false);
@@ -2490,7 +2511,8 @@ export function GitHostsSection() {
 				"DELETE",
 				"/api/git-hosts/github-app",
 			);
-			if (status !== 200) throw new Error(asError(data, status));
+			if (status !== 200)
+				throw new Error(asError(data, status, "removing the GitHub App"));
 			await load();
 			return true;
 		});
@@ -2503,7 +2525,8 @@ export function GitHostsSection() {
 					"/api/settings/github-host",
 					{ host: (ghHostDraft ?? state?.githubHost ?? "").trim() },
 				);
-				if (status !== 200) throw new Error(asError(data, status));
+				if (status !== 200)
+					throw new Error(asError(data, status, "saving the GitHub host"));
 				setGhHostDraft(null);
 				await load();
 				return true;
@@ -2779,6 +2802,9 @@ export function GitHostsSection() {
 									value={tUrl}
 									onChange={(e) => setTUrl(e.target.value)}
 									placeholder="https://gitlab.com/group/repo.git"
+									inputMode="url"
+									spellCheck={false}
+									autoComplete="off"
 									required
 									aria-label="Test URL (a repository the token can read)"
 								/>
@@ -2863,6 +2889,9 @@ export function GitHostsSection() {
 								value={gUrl}
 								onChange={(e) => setGUrl(e.target.value)}
 								placeholder="git@gitlab.com:group/repo.git"
+								inputMode="url"
+								spellCheck={false}
+								autoComplete="off"
 								aria-label="Test URL (a repository the key can read)"
 							/>
 						</label>
@@ -2948,7 +2977,7 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			setError(null);
 			if (
 				!(await confirmDialog(
-					"Remove this project's key? The project then uses the global key.",
+					`Remove ${project.name}'s SSH key? The project then uses the global key.`,
 					{ ok: "Use global key", danger: true },
 				))
 			)
@@ -2958,7 +2987,10 @@ function SshKeySection({ project }: { project: ProjectView }) {
 					"DELETE",
 					`/api/projects/${encodeURIComponent(project.name)}/ssh-key`,
 				);
-				if (status !== 200) throw new Error(asError(data, status));
+				if (status !== 200)
+					throw new Error(
+						asError(data, status, `removing ${project.name}'s SSH key`),
+					);
 				await load();
 				return true;
 			} catch (err) {
@@ -3010,6 +3042,9 @@ function SshKeySection({ project }: { project: ProjectView }) {
 							value={pUrl}
 							onChange={(e) => setPUrl(e.target.value)}
 							placeholder="git@host:group/repo.git"
+							inputMode="url"
+							spellCheck={false}
+							autoComplete="off"
 							aria-label="Test URL (a repository this key can read)"
 						/>
 					</label>
@@ -5085,10 +5120,13 @@ function SaveTick({
 	busy,
 	saved,
 	failed,
+	reason,
 }: {
 	busy: boolean;
 	saved: boolean;
 	failed: boolean;
+	/** The server's message from the last failed save; shown after "Not saved". */
+	reason?: string | null;
 }) {
 	return (
 		<span className="save-tick" role="status">
@@ -5098,7 +5136,9 @@ function SaveTick({
 					<span className="sr">Saving</span>
 				</>
 			) : failed ? (
-				<span className="save-tick-failed">Not saved</span>
+				<span className="save-tick-failed" role="alert">
+					Not saved{reason ? `: ${reason}` : ""}
+				</span>
 			) : saved ? (
 				<svg viewBox="0 0 16 16" role="img" aria-label="Saved">
 					<path d="M3 8.5l3.2 3.1L13 4.6" />
@@ -5160,7 +5200,12 @@ function CheckRow({
 							{tag}
 						</span>
 					)}
-					<SaveTick busy={s.busy} saved={s.saved} failed={s.failed} />
+					<SaveTick
+						busy={s.busy}
+						saved={s.saved}
+						failed={s.failed}
+						reason={s.reason}
+					/>
 				</b>
 				<span id={`${id}-desc`}>{desc}</span>
 			</div>
@@ -5183,7 +5228,7 @@ function SaveCard({
 	dirty: boolean;
 	save: () => Promise<unknown>;
 	act: Act;
-	children: ReactNode | ((saveButton: ReactNode) => ReactNode);
+	children: ReactNode | ((saveButton: ReactNode, s: InstantSave) => ReactNode);
 }) {
 	const s = useInstantSave(act);
 	const formId = useId();
@@ -5199,7 +5244,7 @@ function SaveCard({
 					if (dirty) s.run(save);
 				}}
 			>
-				{inline ? children(button) : children}
+				{inline ? children(button, s) : children}
 			</form>
 		</SettingsCard>
 	);
@@ -5970,6 +6015,10 @@ export function ProjectSettingsForm({
 	const icon = useInstantSave(act);
 	const markerSave = useInstantSave(act);
 	const markerFormId = useId();
+	const markerFieldId = useId();
+	const labelFieldId = useId();
+	const prefixFieldId = useId();
+	const branchFieldId = useId();
 	const markerDirty = marker.trim() !== (st.iconText ?? "");
 	// The setup wizard, opened by Open setup.
 	const [setupOpen, setSetupOpen] = useState(false);
@@ -6055,19 +6104,10 @@ export function ProjectSettingsForm({
 													`/api/projects/${encodeURIComponent(project.name)}/icon`,
 													{ method: "POST", body: file },
 												);
-												if (!res.ok) {
-													let error = `HTTP ${res.status}`;
-													try {
-														const data = (await res.json()) as {
-															error?: string;
-														};
-														if (typeof data.error === "string")
-															error = data.error;
-													} catch {
-														// non-JSON error body; keep the HTTP status text
-													}
-													throw new Error(error);
-												}
+												if (!res.ok)
+													throw new Error(
+														await httpProblem(res, "the icon upload"),
+													);
 											});
 										}}
 									/>
@@ -6090,7 +6130,10 @@ export function ProjectSettingsForm({
 													`/api/projects/${encodeURIComponent(project.name)}/icon`,
 													{ method: "DELETE" },
 												);
-												if (!res.ok) throw new Error(`HTTP ${res.status}`);
+												if (!res.ok)
+													throw new Error(
+														await httpProblem(res, "the icon removal"),
+													);
 											});
 										}}
 									>
@@ -6101,6 +6144,7 @@ export function ProjectSettingsForm({
 									busy={icon.busy}
 									saved={icon.saved}
 									failed={icon.failed}
+									reason={icon.reason}
 								/>
 							</div>
 						</DefRow>
@@ -6127,16 +6171,32 @@ export function ProjectSettingsForm({
 										);
 								}}
 							>
-								<label>
-									<input
-										type="text"
-										maxLength={4}
-										value={marker}
-										onChange={(e) => setMarker(e.target.value)}
-										placeholder="e.g. OT"
-										aria-label="Text marker"
-									/>
-								</label>
+								<div className="alate-field-stack">
+									<label>
+										<input
+											id={markerFieldId}
+											type="text"
+											maxLength={4}
+											value={marker}
+											onChange={(e) => setMarker(e.target.value)}
+											placeholder="e.g. OT"
+											aria-label="Text marker"
+											aria-invalid={markerSave.failed || undefined}
+											aria-describedby={
+												markerSave.failed ? `${markerFieldId}-err` : undefined
+											}
+										/>
+									</label>
+									{markerSave.failed && (
+										<p
+											className="auth-error"
+											id={`${markerFieldId}-err`}
+											role="alert"
+										>
+											{markerSave.reason ?? "Not saved"}
+										</p>
+									)}
+								</div>
 							</form>
 						</DefRow>
 					</div>
@@ -6167,58 +6227,83 @@ export function ProjectSettingsForm({
 								: { label: "Local git", tone: "off" }
 					}
 				>
-					<DefRow
-						name="Display name"
-						optional
-						help="A friendly name for the board. The folder and the repo keep their real names."
-					>
-						<label>
-							<input
-								type="text"
-								maxLength={60}
-								value={label}
-								onChange={(e) => setLabel(e.target.value)}
-								placeholder={project.name}
-								aria-label="Display name"
-							/>
-						</label>
-					</DefRow>
-					<DefRow
-						name="Task ID prefix"
-						help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
-						shape="empty = from folder name"
-					>
-						<label>
-							<input
-								type="text"
-								maxLength={8}
-								value={prefix}
-								onChange={(e) => setPrefix(e.target.value)}
-								placeholder={project.taskPrefix}
-								aria-label="Task ID prefix"
-							/>
-						</label>
-					</DefRow>
-					{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-					<DefRow
-						name="Folder path"
-						desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
-					>
-						<code>{project.path}</code>
-					</DefRow>
-					{project.github !== null && (
-						<DefRow
-							name="GitHub"
-							desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
-						>
-							<a
-								href={project.github}
-								target="_blank"
-								rel="noopener noreferrer"
+					{(save, ident) => (
+						<>
+							<DefRow
+								name="Display name"
+								optional
+								help="A friendly name for the board. The folder and the repo keep their real names."
 							>
-								{project.github}
-							</a>
-						</DefRow>
+								<div className="alate-field-stack">
+									<label>
+										<input
+											id={labelFieldId}
+											type="text"
+											maxLength={60}
+											value={label}
+											onChange={(e) => setLabel(e.target.value)}
+											placeholder={project.name}
+											aria-label="Display name"
+											aria-invalid={ident.failed || undefined}
+											aria-describedby={
+												ident.failed ? `${labelFieldId}-err` : undefined
+											}
+										/>
+									</label>
+									{ident.failed && (
+										<p
+											className="auth-error"
+											id={`${labelFieldId}-err`}
+											role="alert"
+										>
+											{ident.reason ?? "Not saved"}
+										</p>
+									)}
+								</div>
+							</DefRow>
+							<DefRow
+								name="Task ID prefix"
+								help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
+								shape="empty = from folder name"
+							>
+								<div className="alate-field-stack">
+									<label>
+										<input
+											id={prefixFieldId}
+											type="text"
+											maxLength={8}
+											value={prefix}
+											onChange={(e) => setPrefix(e.target.value)}
+											placeholder={project.taskPrefix}
+											aria-label="Task ID prefix"
+										/>
+									</label>
+								</div>
+							</DefRow>
+							{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+							<DefRow
+								name="Folder path"
+								desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
+							>
+								<code>{project.path}</code>
+							</DefRow>
+							{project.github !== null && (
+								<DefRow
+									name="GitHub"
+									desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+								>
+									<a
+										href={project.github}
+										target="_blank"
+										rel="noopener noreferrer"
+									>
+										{project.github}
+									</a>
+								</DefRow>
+							)}
+							{/* One save for the card (OTTR-679): the action row closes the form. */}
+							<div className="alate-def-actions">{save}</div>
+						</>
 					)}
 				</SaveCard>
 			</section>
@@ -6292,54 +6377,74 @@ export function ProjectSettingsForm({
 						'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
 					}
 				>
-					<DefRow
-						name="Target branch"
-						help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
-						shape="branch name · empty = default"
-					>
-						<label>
-							<input
-								type="text"
-								maxLength={200}
-								placeholder="main"
-								aria-label="Target branch for merges"
-								value={tb}
-								onChange={(e) => setTb(e.target.value)}
-							/>
-						</label>
-					</DefRow>
-					<DefRow
-						name="Extra paths"
-						help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
-						shape="one path per line"
-					>
-						<label>
-							<textarea
-								rows={3}
-								value={extra}
-								onChange={(e) => setExtra(e.target.value)}
-								placeholder="scripts/release.mjs"
-								aria-label="Extra paths"
-							/>
-						</label>
-					</DefRow>
-					<DefRow
-						name="Quarantine after"
-						help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
-						shape="days · 0 = immediately"
-					>
-						<label>
-							<input
-								type="number"
-								min={0}
-								max={365}
-								required
-								value={kwd}
-								onChange={(e) => setKwd(e.target.value)}
-								aria-label="Quarantine kept worktrees after this many idle days"
-							/>
-						</label>
-					</DefRow>
+					{(_save, wtS) => (
+						<>
+							<DefRow
+								name="Target branch"
+								help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
+								shape="branch name · empty = default"
+							>
+								<div className="alate-field-stack">
+									<label>
+										<input
+											id={branchFieldId}
+											type="text"
+											maxLength={200}
+											placeholder="main"
+											aria-label="Target branch for merges"
+											value={tb}
+											onChange={(e) => setTb(e.target.value)}
+											aria-invalid={wtS.failed || undefined}
+											aria-describedby={
+												wtS.failed ? `${branchFieldId}-err` : undefined
+											}
+										/>
+									</label>
+									{wtS.failed && (
+										<p
+											className="auth-error"
+											id={`${branchFieldId}-err`}
+											role="alert"
+										>
+											{wtS.reason ?? "Not saved"}
+										</p>
+									)}
+								</div>
+							</DefRow>
+							<DefRow
+								name="Extra paths"
+								help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
+								shape="one path per line"
+							>
+								<label>
+									<textarea
+										rows={3}
+										value={extra}
+										onChange={(e) => setExtra(e.target.value)}
+										placeholder="scripts/release.mjs"
+										aria-label="Extra paths"
+									/>
+								</label>
+							</DefRow>
+							<DefRow
+								name="Quarantine after"
+								help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
+								shape="days · 0 = immediately"
+							>
+								<label>
+									<input
+										type="number"
+										min={0}
+										max={365}
+										required
+										value={kwd}
+										onChange={(e) => setKwd(e.target.value)}
+										aria-label="Quarantine kept worktrees after this many idle days"
+									/>
+								</label>
+							</DefRow>
+						</>
+					)}
 				</SaveCard>
 				<SaveCard
 					id="project-messages-section"

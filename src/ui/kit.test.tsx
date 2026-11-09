@@ -5,10 +5,17 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+	type Act,
 	clampPan,
 	interviewMsg,
+	httpNextStep,
+	httpProblem,
+	httpStatusWords,
+	type InstantSave,
 	LiveElapsed,
 	Skeleton,
+	unwrap,
+	useInstantSave,
 	ZoomableImage,
 	zoomAt,
 } from "./kit.tsx";
@@ -288,6 +295,7 @@ test("LiveElapsed ticks the elapsed duration, then the status words and the esti
 	).not.toContain("·");
 });
 
+<<<<<<< HEAD
 describe("interviewMsg", () => {
 	test("each route verdict maps to its notice; unknown text passes through", () => {
 		expect(interviewMsg("queued")).toBe(
@@ -303,5 +311,165 @@ describe("interviewMsg", () => {
 			"Init a git repository first - actions wait until then.",
 		);
 		expect(interviewMsg("standalone")).toBe("standalone");
+	});
+});
+
+describe("httpStatusWords and httpNextStep", () => {
+	test("known statuses map to their words", () => {
+		expect(httpStatusWords(400)).toBe("invalid request");
+		expect(httpStatusWords(401)).toBe("not signed in");
+		expect(httpStatusWords(403)).toBe("refused");
+		expect(httpStatusWords(404)).toBe("not found");
+		expect(httpStatusWords(409)).toBe("conflict");
+		expect(httpStatusWords(413)).toBe("too large");
+		expect(httpStatusWords(429)).toBe("too many requests");
+		expect(httpStatusWords(500)).toBe("server error");
+		expect(httpStatusWords(502)).toBe("bad gateway");
+		expect(httpStatusWords(503)).toBe("unavailable");
+		expect(httpStatusWords(504)).toBe("gateway timeout");
+	});
+	test("unknown statuses fall back to status n", () => {
+		expect(httpStatusWords(418)).toBe("status 418");
+		expect(httpStatusWords(599)).toBe("status 599");
+	});
+	test("next steps match the status", () => {
+		expect(httpNextStep(401)).toBe("Sign in again.");
+		expect(httpNextStep(403)).toBe("Check the board token's access.");
+		expect(httpNextStep(404)).toBe("Refresh the board; it may be gone.");
+		expect(httpNextStep(409)).toBe("Refresh and try again.");
+		expect(httpNextStep(500)).toBe(
+			"Try again; if it repeats, the server log has the reason.",
+		);
+		expect(httpNextStep(599)).toBe(
+			"Try again; if it repeats, the server log has the reason.",
+		);
+		expect(httpNextStep(400)).toBe("Check the value and try again.");
+		expect(httpNextStep(429)).toBe("Check the value and try again.");
+	});
+});
+
+describe("httpProblem", () => {
+	test("a JSON string error field wins verbatim", async () => {
+		const res = new Response('{"error":"boom: bad roles"}', { status: 400 });
+		expect(await httpProblem(res, "Save")).toBe("boom: bad roles");
+	});
+	test("a non-JSON body names what, the status words and the next step", async () => {
+		const res = new Response("<html>oops</html>", { status: 503 });
+		const message = await httpProblem(res, "Save the roles");
+		expect(message).toContain("Save the roles failed");
+		expect(message).toContain("503");
+		expect(message).toContain("unavailable");
+		expect(message).toContain(
+			"Try again; if it repeats, the server log has the reason.",
+		);
+	});
+});
+
+describe("unwrap", () => {
+	test("a non-JSON 500 names the path, the status words and the next step", async () => {
+		const res = new Response("nope", { status: 500 });
+		Object.defineProperty(res, "url", {
+			value: "http://localhost/api/models/roles",
+		});
+		const err = await unwrap(res).then(
+			() => null,
+			(e: unknown) => e as Error,
+		);
+		expect(err?.message).toContain("/api/models/roles");
+		expect(err?.message).toContain("500");
+		expect(err?.message).toContain("server error");
+		expect(err?.message).toContain(
+			"Try again; if it repeats, the server log has the reason.",
+		);
+	});
+	test("a JSON error body still wins verbatim", async () => {
+		const res = new Response('{"error":"kept verbatim"}', { status: 400 });
+		const err = await unwrap(res).then(
+			() => null,
+			(e: unknown) => e as Error,
+		);
+		expect(err?.message).toBe("kept verbatim");
+	});
+});
+
+describe("useInstantSave reason", () => {
+	type Captured = InstantSave & { run: InstantSave["run"] };
+	let latest: Captured | undefined;
+	function Probe({ act }: { act: Act }) {
+		latest = useInstantSave(act) as Captured;
+		return null;
+	}
+	// happy-dom's DOM classes do not structurally match lib.dom's; the boundary
+	// converts once here, like settings.test.tsx does.
+	function render(hookAct: Act): { root: Root; container: HTMLDivElement } {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.append(container as unknown as HappyNode);
+		const root = createRoot(container);
+		act(() => {
+			root.render(<Probe act={hookAct} />);
+		});
+		return { root, container };
+	}
+	const failAct: Act = async (fn, onError) => {
+		try {
+			await fn();
+			return true;
+		} catch (err) {
+			onError?.(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const silentAct: Act = async (fn) => {
+		try {
+			await fn();
+		} catch {
+			// act reports the failure without a message, like the real act can.
+		}
+		return false;
+	};
+	function teardown(root: Root, container: HTMLDivElement): void {
+		act(() => root.unmount());
+		container.remove();
+	}
+
+	test("a failed run sets reason and still fires the caller's onError", async () => {
+		const { root, container } = render(failAct);
+		const seen: string[] = [];
+		await act(async () => {
+			latest?.run(
+				() => Promise.reject(new Error("boom")),
+				undefined,
+				(m) => seen.push(m),
+			);
+		});
+		expect(latest?.reason).toBe("boom");
+		expect(seen).toEqual(["boom"]);
+		expect(latest?.failed).toBe(true);
+		teardown(root, container);
+	});
+
+	test("a following successful run clears reason", async () => {
+		const { root, container } = render(failAct);
+		await act(async () => {
+			latest?.run(() => Promise.reject(new Error("boom")));
+		});
+		expect(latest?.reason).toBe("boom");
+		await act(async () => {
+			latest?.run(() => Promise.resolve());
+		});
+		expect(latest?.reason).toBeNull();
+		teardown(root, container);
+	});
+
+	test("a failing run whose act reports no message leaves reason null", async () => {
+		const { root, container } = render(silentAct);
+		await act(async () => {
+			latest?.run(() => Promise.reject(new Error("boom")));
+		});
+		expect(latest?.failed).toBe(true);
+		expect(latest?.reason).toBeNull();
+		teardown(root, container);
 	});
 });

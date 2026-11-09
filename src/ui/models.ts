@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { splitLevel } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
+import { httpNextStep, httpStatusWords } from "./kit.tsx";
 
 export type ModelCatalog = {
 	models: ModelOption[];
@@ -265,7 +266,9 @@ export function classifyRolesSave(
 		};
 	return {
 		kind: "failed",
-		error: error ?? `HTTP ${status}`,
+		error:
+			error ??
+			`the model roles save failed: the server answered ${status} (${httpStatusWords(status)}). ${httpNextStep(status)}`,
 		fields: strings("fields"),
 		fallbackFields: strings("fallbackFields"),
 	};

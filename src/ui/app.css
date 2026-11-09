@@ -3879,11 +3879,40 @@ a.pr-link:hover {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
+	/* fieldset semantics (biome useSemanticElements) without fieldset chrome. */
+	border: 0;
+	padding: 0;
+	margin: 0;
+	min-inline-size: 0;
 }
-/* Only the caption is small: the select keeps the input type size, so the row's controls share one height. */
+/* Only the caption is small: the segmented strip keeps the input type size, so the row's controls share one height. */
 .triage-rank > span {
 	font-size: 13px;
 	color: var(--dim);
+}
+/* Drawer triage rank (DESIGN.md, Segmented controls): five peer choices, every
+   segment the same width. The stock button grey carries the press state —
+   grey/steel only. min-width:auto plus nowrap keeps each label whole, so a
+   strip too tight for all five scrolls instead of shrinking or cutting one. */
+.rank-seg {
+	display: flex;
+	gap: 2px;
+	min-width: 0;
+	overflow-x: auto;
+}
+.rank-seg button {
+	flex: 1 1 0; /* segmented control: equal segments, not content width */
+	min-height: 32px;
+	padding: 0 8px;
+	font-size: 13.5px;
+	white-space: nowrap;
+}
+.rank-seg button:hover {
+	background: var(--card-hover);
+}
+.rank-seg button[aria-pressed="true"] {
+	background: var(--card-active);
+	border-color: var(--line-hover);
 }
 .triage-nominate {
 	display: inline-flex;
@@ -7879,6 +7908,26 @@ button.log-mode[aria-pressed="true"] {
 .settings-sec .alate-def-row > label > textarea {
 	width: 100%;
 }
+.settings-sec .alate-field-stack {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
+	min-width: 0;
+}
+.settings-sec .alate-field-stack > label {
+	display: flex;
+	width: 100%;
+}
+.settings-sec .alate-field-stack > label > input:not([type="checkbox"]),
+.settings-sec .alate-field-stack > label > textarea {
+	flex: 1;
+	min-width: 0;
+	width: 100%;
+}
+.settings-sec .alate-field-stack > .auth-error {
+	flex: none;
+}
 .settings-sec .alate-def-name {
 	display: grid;
 	gap: 2px;
@@ -7924,6 +7973,12 @@ button.log-mode[aria-pressed="true"] {
 	> :is(input, textarea) {
 	flex: 1;
 	min-width: 0;
+}
+/* A field stack (input plus its error under it) must not stretch the row's Save
+   button to the stack's full height: top-align the group instead, so the button
+   keeps its own height and lines up with the input. */
+.settings-sec .alate-def-row > .alate-def-actions:has(.alate-field-stack) {
+	align-items: flex-start;
 }
 /* Usage windows inside a sign-in row: span both columns of the row grid. */
 .settings-sec .alate-def-row .quota {

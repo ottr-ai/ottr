@@ -13,6 +13,7 @@ import { resetCatalogCache } from "./models.ts";
 import {
 	AlateSection,
 	AppCheckLines,
+	asError,
 	dashboardLink,
 	fmtCost,
 	fmtCount,
@@ -3727,5 +3728,381 @@ describe("AlateSection user layer", () => {
 		);
 		expect(userLayerEmpty({ skills: [], plugins: [], mcp: ["x"] })).toBe(true);
 		expect(userLayerEmpty({ skills: ["a"], plugins: [], mcp: [] })).toBe(false);
+	});
+});
+
+describe("Error-Says-Fix messages", () => {
+	// The same minimal ProjectView the form tests use: the form reads the name
+	// and the full settings shape.
+	const project = {
+		name: "proj",
+		icon: null,
+		remote: null,
+		github: null,
+		vmRunner: {
+			configured: false,
+			ok: false,
+			reason: "OTTR_VM_RUNNER_URL is not set",
+		},
+		hasRules: true,
+		gitless: false,
+		settings: {
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: true,
+			forkResearch: false,
+			prReviews: false,
+			prMode: false,
+			microVm: false,
+			pushSyncCommits: false,
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+			taskIdPrefix: null,
+		},
+		taskPrefix: "PROJ",
+	} as unknown as ProjectView;
+
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	test("asError names the request, the status in words and a next step", () => {
+		const line = asError({}, 500, "saving the token");
+		expect(line).toBe(
+			"saving the token failed: the server answered 500 (server error). Try again; if it repeats, the server log has the reason.",
+		);
+		expect(asError({}, 503, "saving the token")).toContain("(unavailable)");
+		// The server's own error string wins verbatim.
+		expect(asError({ error: "locked" }, 409, "saving the token")).toBe(
+			"locked",
+		);
+	});
+
+	test("the icon row's tick shows the server's reason after a failed upload", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/icon") && init?.method === "POST")
+				return new Response(JSON.stringify({ error: "icon too large" }), {
+					status: 413,
+					headers: { "Content-Type": "application/json" },
+				});
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					// The app's act reports the thrown message; the tick repeats it.
+					act={async (fn, onError) => {
+						try {
+							await fn();
+							return true;
+						} catch (err) {
+							onError?.(err instanceof Error ? err.message : String(err));
+							return false;
+						}
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				'input[type="file"][accept^="image/"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("icon upload input did not render");
+			const file = new window.File([new Uint8Array([1])], "icon.png", {
+				type: "image/png",
+			});
+			await act(async () => {
+				onChangeOf(input)({
+					target: { files: [file], value: "" },
+					currentTarget: input,
+				});
+			});
+			const tick = container.querySelector(".save-tick-failed");
+			expect(tick).not.toBeNull();
+			expect(tick?.getAttribute("role")).toBe("alert");
+			expect(tick?.textContent).toBe("Not saved: icon too large");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a failed Identity save marks the field and shows the reason under it", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			)
+				return new Response(JSON.stringify({ error: "settings locked" }), {
+					status: 409,
+					headers: { "Content-Type": "application/json" },
+				});
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					act={async (fn, onError) => {
+						try {
+							await fn();
+							return true;
+						} catch (err) {
+							onError?.(err instanceof Error ? err.message : String(err));
+							return false;
+						}
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				'input[aria-label="Display name"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("display name input did not render");
+			await act(async () => {
+				typeInto(input, "chs");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = container.querySelector("#project-identity-section form");
+			if (form === null) throw new Error("form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// A card-level save failure announces once, under Display name only.
+			const card = container.querySelector("#project-identity-section");
+			const errors = card?.querySelectorAll(".auth-error") ?? [];
+			expect(errors.length).toBe(1);
+			expect(input.getAttribute("aria-invalid")).toBe("true");
+			const describedBy = input.getAttribute("aria-describedby");
+			expect(describedBy).not.toBeNull();
+			const message = [...container.querySelectorAll(`p[role="alert"]`)].find(
+				(p) => p.id === describedBy,
+			);
+			expect(message).not.toBeNull();
+			expect(message?.getAttribute("role")).toBe("alert");
+			expect(message?.className).toContain("auth-error");
+			expect(message?.textContent).toBe("settings locked");
+			const prefixInput = container.querySelector<HTMLInputElement>(
+				'input[aria-label="Task ID prefix"]',
+			);
+			if (prefixInput === null || prefixInput === undefined)
+				throw new Error("task id prefix input did not render");
+			expect(prefixInput.getAttribute("aria-invalid")).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("the git remote inputs carry inputMode, spellCheck and autoComplete off", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts"))
+				return ok({
+					githubHost: "github.com",
+					tokens: [],
+					globalKey: null,
+					githubApp: null,
+					githubTokenSet: false,
+				});
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<GitHostsSection />);
+		});
+		try {
+			const urls = [
+				...container.querySelectorAll<HTMLInputElement>(
+					'input[aria-label^="Test URL"]',
+				),
+			];
+			expect(urls.length).toBe(2);
+			for (const input of urls) {
+				expect(input.getAttribute("inputmode")).toBe("url");
+				expect(input.getAttribute("spellcheck")).toBe("false");
+				expect(input.getAttribute("autocomplete")).toBe("off");
+			}
+			// The project SSH key's test URL carries the same three attributes.
+			const formFetch = (async (
+				input: RequestInfo | URL,
+				init?: RequestInit,
+			): Promise<Response> => {
+				const url = String(input);
+				if (url.endsWith("/api/projects/proj/ssh-key"))
+					return ok({ own: null, expiresAt: null });
+				throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+			}) as typeof fetch;
+			globalThis.fetch = formFetch;
+			const formContainer = window.document.createElement(
+				"div",
+			) as unknown as HTMLDivElement;
+			window.document.body.appendChild(formContainer as unknown as HappyNode);
+			const formRoot = createRoot(formContainer);
+			await act(async () => {
+				formRoot.render(
+					<ProjectSettingsForm
+						project={project}
+						tasks={[]}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						openTask={() => {}}
+					/>,
+				);
+			});
+			try {
+				const pUrl = formContainer.querySelector<HTMLInputElement>(
+					'input[aria-label="Test URL (a repository this key can read)"]',
+				);
+				if (pUrl === null || pUrl === undefined)
+					throw new Error("project test URL input did not render");
+				expect(pUrl.getAttribute("inputmode")).toBe("url");
+				expect(pUrl.getAttribute("spellcheck")).toBe("false");
+				expect(pUrl.getAttribute("autocomplete")).toBe("off");
+			} finally {
+				await act(async () => {
+					formRoot.unmount();
+				});
+				formContainer.remove();
+			}
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("the SSH key confirm dialog names the project", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({
+					own: { publicKey: "ssh-ed25519 AAA", fingerprint: "FP01" },
+					expiresAt: null,
+				});
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		try {
+			const button = [
+				...container.querySelectorAll<HTMLElement>("button"),
+			].find((b) => b.textContent === "Use global key");
+			if (button === undefined)
+				throw new Error("Use global key button did not render");
+			await act(async () => {
+				onClickOf(button)({ target: button, currentTarget: button });
+			});
+			const dialog = [...window.document.body.querySelectorAll("dialog")].at(
+				-1,
+			);
+			expect(dialog).not.toBeNull();
+			expect(dialog?.textContent).toContain("Remove proj's SSH key?");
+			expect(dialog?.textContent).toContain("Use global key");
+			// Close the dialog so it does not leak into later tests.
+			const cancel = [...(dialog?.querySelectorAll("button") ?? [])].find(
+				(b) => b.textContent === "Cancel",
+			);
+			await act(async () => {
+				if (cancel !== undefined)
+					onClickOf(cancel as unknown as Element)({
+						target: cancel as unknown as Element,
+						currentTarget: cancel as unknown as Element,
+					});
+			});
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });

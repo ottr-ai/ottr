@@ -52,7 +52,7 @@ import { lookupBranchRules } from "./branchRules.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import { deepenDraft } from "./deepen.ts";
-import { errmsg } from "./errmsg.ts";
+import { errmsg, requestFailed } from "./errmsg.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
 	createForkWatcher,
@@ -1574,7 +1574,14 @@ export function createApp(deps: AppDeps) {
 				},
 			);
 			// A 401/403/5xx has no expiration header; null would wrongly clear the stored date.
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			if (!res.ok)
+				throw new Error(
+					requestFailed(
+						`the token expiry probe of ${h.isDefault ? "api.github.com" : `${h.apiBase}/user`}`,
+						res.status,
+						"check or renew the board token; the stored expiry stays until a probe succeeds",
+					),
+				);
 			return parseGithubExpiry(
 				res.headers.get("github-authentication-token-expiration"),
 			);
@@ -1691,7 +1698,14 @@ export function createApp(deps: AppDeps) {
 						redirect: "manual",
 						signal: AbortSignal.timeout(5_000),
 					});
-					if (res.status !== 200) throw new Error(`responded ${res.status}`);
+					if (res.status !== 200)
+						throw new Error(
+							requestFailed(
+								`the sign-in report probe of ${url}/signins`,
+								res.status,
+								"check that the worker is reachable; the board warns nothing while its report is unknown",
+							),
+						);
 					const body = (await res.json()) as {
 						signIns?: unknown;
 						error?: unknown;
@@ -1981,7 +1995,13 @@ export function createApp(deps: AppDeps) {
 				if (!res.ok) {
 					logError(
 						"updates pull failed",
-						new Error(`alate returned ${res.status}`),
+						new Error(
+							requestFailed(
+								`the alate updates pull of ${alate.url}/api/updates`,
+								res.status,
+								"the board keeps the last good list and retries on the next tick",
+							),
+						),
 					);
 					return;
 				}
@@ -2100,7 +2120,11 @@ export function createApp(deps: AppDeps) {
 				const msg =
 					typeof body?.error === "string"
 						? body.error
-						: `alate returned ${res.status}`;
+						: requestFailed(
+								"The alate provision request",
+								res.status,
+								"check that the alate server is up, then run Provision again",
+							);
 				return { ok: false, status: res.status, error: msg };
 			}
 			return { ok: true, body };
@@ -7846,7 +7870,11 @@ export function createApp(deps: AppDeps) {
 						const error =
 							res.status === 403 || res.status === 404
 								? `GitHub refused the re-run (HTTP ${res.status}): the board's token lacks the actions:write scope for ${match[1]}/${match[2]}`
-								: `GitHub returned HTTP ${res.status} for the re-run`;
+								: requestFailed(
+										`The re-run of failed jobs for ${match[1]}/${match[2]} run ${match[3]}`,
+										res.status,
+										"check the board's token access, then run the re-run again",
+									);
 						return json({ error }, res.status);
 					}
 					return json({ ok: true, url }, 200);
@@ -8470,7 +8498,11 @@ export function createApp(deps: AppDeps) {
 								if (!res.ok) {
 									const error =
 										redact(text.trim().slice(0, 300), appSecrets) ||
-										`GitHub answered ${res.status}`;
+										requestFailed(
+											`The review post to ${repo}#${row.number}`,
+											res.status,
+											"check the app's or token's permissions, then post the review again",
+										);
 									e.store.releasePrPost(row.number, head, prev, error);
 									return json({ error }, 502);
 								}

@@ -3429,7 +3429,7 @@ export function ProjectBoard({
 			if (r.kept !== undefined) {
 				if (
 					!(await confirmDialog(
-						`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+						`Delete the kept worktree and branch of ${t.id} "${t.title}"? The worktree was kept: ${r.kept}.`,
 						{ ok: "Delete", danger: true },
 					))
 				)
@@ -6276,6 +6276,9 @@ export function AddProjectModal({
 	const [tokToken, setTokToken] = useState("");
 	const repoName = name.trim();
 	const trimmedUrl = url.trim();
+	// The URL field's own error (The Error-Says-Fix Rule): shown while the URL tab
+	// holds a value that cannot parse, under the field it names.
+	const urlProblem = gitUrlProblem(trimmedUrl);
 	const ssh = isSshUrl(trimmedUrl);
 	const sshKey = ssh
 		? sshMode === "global"
@@ -6344,9 +6347,9 @@ export function AddProjectModal({
 					throw new Error(t.error);
 				} else if (typeof data.needsToken === "string") {
 					setNeedsTokenHost(data.needsToken);
-					throw new Error(asError(data, status));
+					throw new Error(asError(data, status, "adding the project"));
 				} else {
-					throw new Error(asError(data, status));
+					throw new Error(asError(data, status, "adding the project"));
 				}
 			}, setErr),
 		);
@@ -6362,7 +6365,10 @@ export function AddProjectModal({
 				token: tokToken,
 				testUrl: trimmedUrl,
 			});
-			if (status !== 200) throw new Error(asError(data, status));
+			if (status !== 200)
+				throw new Error(
+					asError(data, status, `saving the token for ${needsTokenHost}`),
+				);
 			setNeedsTokenHost(null);
 			setTokToken("");
 			addProject(trusted);
@@ -6379,7 +6385,8 @@ export function AddProjectModal({
 					testUrl: trimmedUrl,
 				},
 			);
-			if (status !== 200) throw new Error(asError(data, status));
+			if (status !== 200)
+				throw new Error(asError(data, status, "saving the board GitHub token"));
 			setNeedsTokenHost(null);
 			setTokToken("");
 			addProject(trusted);
@@ -6403,7 +6410,7 @@ export function AddProjectModal({
 			const t = asTrust(data);
 			if (status === 200) return { ok: true } as const;
 			if (t !== null) return t;
-			return { error: asError(data, status) };
+			return { error: asError(data, status, "the SSH key test") };
 		});
 	};
 	const sshTested =
@@ -6463,6 +6470,8 @@ export function AddProjectModal({
 						onSubmit={(e) => {
 							e.preventDefault();
 							if (mode === "url") {
+								// The field error already says why; a known-bad URL never posts.
+								if (urlProblem !== null) return;
 								addProject(trusted);
 								return;
 							}
@@ -6530,7 +6539,23 @@ export function AddProjectModal({
 									onChange={(e) => onUrl(e.target.value)}
 									placeholder="https://gitlab.com/group/repo.git or git@host:group/repo.git"
 									required={mode === "url"}
+									inputMode="url"
+									spellCheck={false}
+									autoComplete="off"
+									aria-invalid={urlProblem !== null || undefined}
+									aria-describedby={
+										urlProblem !== null ? "add-git-url-error" : undefined
+									}
 								/>
+								{urlProblem !== null && (
+									<span
+										className="auth-error"
+										id="add-git-url-error"
+										role="alert"
+									>
+										{urlProblem}
+									</span>
+								)}
 								<code>https or SSH git URL</code>
 							</label>
 							<label>
@@ -6730,7 +6755,9 @@ export function AddProjectModal({
 											return { ok: true } as const;
 										}
 										if (t !== null) return t;
-										return { error: asError(data, status) };
+										return {
+											error: asError(data, status, "adding the project"),
+										};
 									})
 								}
 							/>
@@ -8591,13 +8618,18 @@ export function Drawer({
 		const repo = task.trendingRepo;
 		const yes =
 			task.stage === "done"
-				? // A done task has no run, worktree or branch left; this only removes the card from the board.
-					await confirmDialog("Delete this done task from the board?", {
-						ok: "Delete task",
-						danger: true,
-					})
-				: await confirmDialog(
-						"Cancel this task? It stops the run and deletes its worktree and branch.",
+				? // A done task has no run, worktree or branch left; this only removes
+					// the card from the board. The dialog names the card it acts on.
+					await confirmDialog(
+						`Delete the done task ${task.id} "${task.title}" from the board?`,
+						{
+							ok: "Delete task",
+							danger: true,
+						},
+					)
+				: // The Named-Object Rule: the dialog names the card it acts on.
+					await confirmDialog(
+						`Cancel ${task.id} "${task.title}"? It stops the run and deletes its worktree and branch.`,
 						{
 							ok: "Cancel task",
 							cancel: "Keep task",
@@ -8625,7 +8657,7 @@ export function Drawer({
 			if (r.kept !== undefined) {
 				if (
 					!(await confirmDialog(
-						`Delete the worktree and its branch anyway? The worktree was kept: ${r.kept}.`,
+						`Delete the kept worktree and branch of ${task.id} "${task.title}"? The worktree was kept: ${r.kept}.`,
 						{ ok: "Delete", danger: true },
 					))
 				)
@@ -10006,21 +10038,30 @@ export function Drawer({
 					{task.stage !== "done" && !cancelled && (
 						<DrawerSec id="drawer-triage" label="Triage" defaultOpen={false}>
 							<div className="triage-row">
-								<label className="triage-rank">
+								{/* The rank picker: five fixed options show all at once as a
+								    segmented control, never a select (DESIGN.md, Choice controls).
+								    The optimistic wiring is unchanged: rank.set shows the pick at
+								    once, rank.run posts it, a failure rolls the press back. */}
+								<fieldset className="triage-rank">
+									{/* fieldset names the group for assistive tech (the visible
+									    caption stays the span); biome's useSemanticElements
+									    requires the real element over role="group". */}
+									<legend className="sr">Triage rank</legend>
 									<span>Rank</span>
-									<select
-										value={rank.value}
-										disabled={triageSave.busy || rank.busy}
-										onChange={(e) => setRank(e.target.value)}
-									>
-										<option value="">Default</option>
-										{PRIORITIES.map((p) => (
-											<option key={p} value={p}>
-												{p}
-											</option>
+									<div className="rank-seg">
+										{["", ...PRIORITIES].map((p) => (
+											<button
+												key={p}
+												type="button"
+												aria-pressed={rank.value === p}
+												disabled={triageSave.busy || rank.busy}
+												onClick={() => setRank(p)}
+											>
+												{p === "" ? "Default" : p}
+											</button>
 										))}
-									</select>
-								</label>
+									</div>
+								</fieldset>
 								{task.closeCandidate === null ? (
 									<form
 										className="triage-nominate"
@@ -10206,7 +10247,7 @@ export function Drawer({
 													title="Start a fresh omp session in the same worktree; the broken one is abandoned (its files stay in .tasks/sessions)"
 													run={async () =>
 														(await confirmDialog(
-															"Start a fresh omp session for this task? The broken session is abandoned (its transcript stays in .tasks/sessions).",
+															`Start a fresh omp session for ${task.id} "${task.title}"? The broken session is abandoned (its transcript stays in .tasks/sessions).`,
 															{ ok: "Start fresh session" },
 														))
 															? act(async () => {
@@ -10311,11 +10352,11 @@ export function Drawer({
 												title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
 												run={async () =>
 													(await confirmDialog(
-														"Stop this turn? The card waits for your reply.",
+														`Stop the running turn of ${task.id} "${task.title}"? The card waits for your reply.`,
 														{ ok: "Stop turn" },
 													)) &&
 													(await confirmDialog(
-														"Really stop the running turn?",
+														`Really stop the running turn of ${task.id} "${task.title}"?`,
 														{ ok: "Stop turn", danger: true },
 													))
 														? act(async () => {
@@ -10863,6 +10904,46 @@ export function AuthPage({
 /** An scp-style or ssh:// URL (the two forms that need a key); https URLs use tokens. */
 const isSshUrl = (u: string): boolean =>
 	/^ssh:\/\//i.test(u) || /^[^/@\s]+@[^/\s]*:/.test(u);
+
+/** Field error for a Git URL that cannot parse; the wording of the server's
+ * GIT_URL_ERROR (gitHosts.ts) restated for the field. */
+const GIT_URL_FIELD_ERROR =
+	"Not a git repository URL. Use https://…, git@host:path or ssh://….";
+
+/** Client-side mirror of the server's parseGitUrl classes (gitHosts.ts), so the
+ * field error shows while typing instead of after a rejected POST. Not the trust
+ * boundary: the server re-validates every Add, and a class this mirror is looser
+ * about still lands in the dialog-level alert. */
+const gitUrlProblem = (raw: string): string | null => {
+	const url = raw.trim();
+	if (url === "") return null; // the input's required check covers empty
+	if (url.startsWith("-") || /[\s\p{Cc}]/u.test(url))
+		return GIT_URL_FIELD_ERROR;
+	const lower = url.toLowerCase();
+	if (lower.startsWith("https://") || lower.startsWith("ssh://")) {
+		const rest = url.slice(lower.startsWith("https://") ? 8 : 6);
+		const at = rest.lastIndexOf("@");
+		// https carries no user in the URL, ever; ssh may name one.
+		if (at !== -1 && !lower.startsWith("ssh://")) return GIT_URL_FIELD_ERROR;
+		const hostPort = at === -1 ? rest : rest.slice(at + 1);
+		const slash = hostPort.indexOf("/");
+		const path = slash === -1 ? "" : hostPort.slice(slash + 1);
+		if (
+			!/^[A-Za-z0-9.-]+(:[0-9]+)?$/.test(
+				slash === -1 ? hostPort : hostPort.slice(0, slash),
+			) ||
+			!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*(\/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$/.test(
+				path,
+			)
+		)
+			return GIT_URL_FIELD_ERROR;
+		return null;
+	}
+	// scp form: user@host:path; the path is relative (no leading slash).
+	return /^([A-Za-z0-9_.-]+)@([A-Za-z0-9.-]+):(?!\/)\S+$/.test(url)
+		? null
+		: GIT_URL_FIELD_ERROR;
+};
 
 /** User theme choice; "system" follows `prefers-color-scheme` (dark when the OS is dark). */
 type Theme = "system" | "light" | "dark";

@@ -7055,45 +7055,41 @@ describe("Optimistic taps (client)", () => {
 	test("triage rank shows the pick before the server answers and rolls it back on failure", async () => {
 		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
 		await withDrawer(rankTask(), [g], async () => {
-			const select = window.document.querySelector(
-				".triage-rank select",
-			) as unknown as HTMLSelectElement | null;
-			expect(select).not.toBeNull();
-			expect(select!.value).toBe("");
+			const seg = () =>
+				[...window.document.querySelectorAll(".rank-seg button")].find(
+					(b) => b.textContent === "P1",
+				)!;
+			const defaultSeg = () =>
+				[...window.document.querySelectorAll(".rank-seg button")].find(
+					(b) => b.textContent === "Default",
+				)!;
+			expect(seg().getAttribute("aria-pressed")).toBe("false");
 			await act(async () => {
-				select!.value = "P1";
-				select!.dispatchEvent(
-					new window.Event("change", {
-						bubbles: true,
-					}) as unknown as Event,
-				);
+				propHandler(seg(), "onClick")({} as unknown);
 			});
-			// In flight: the select leads, the POST follows.
-			expect(select!.value).toBe("P1");
+			// In flight: the pick leads, the POST follows.
+			expect(seg().getAttribute("aria-pressed")).toBe("true");
 			g.resolve(500);
 			await act(async () => {});
-			expect(select!.value).toBe("");
+			expect(seg().getAttribute("aria-pressed")).toBe("false");
+			expect(defaultSeg().getAttribute("aria-pressed")).toBe("true");
 		});
 	});
 
 	test("triage rank keeps the pick after the server confirms", async () => {
 		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
 		await withDrawer(rankTask(), [g], async () => {
-			const select = window.document.querySelector(
-				".triage-rank select",
-			)! as unknown as HTMLSelectElement;
+			const seg = () =>
+				[...window.document.querySelectorAll(".rank-seg button")].find(
+					(b) => b.textContent === "P1",
+				)!;
 			await act(async () => {
-				select.value = "P1";
-				select.dispatchEvent(
-					new window.Event("change", {
-						bubbles: true,
-					}) as unknown as Event,
-				);
+				propHandler(seg(), "onClick")({} as unknown);
 			});
-			expect(select.value).toBe("P1");
+			expect(seg().getAttribute("aria-pressed")).toBe("true");
 			g.resolve(200);
 			await act(async () => {});
-			expect(select.value).toBe("P1");
+			expect(seg().getAttribute("aria-pressed")).toBe("true");
 		});
 	});
 
@@ -7637,5 +7633,876 @@ describe("Drawer re-run failed jobs action", () => {
 				expect(container.textContent).not.toContain("Re-run failed jobs");
 			},
 		);
+	});
+});
+
+describe("AddProjectModal Git URL field error", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// board-GitHub-token describe above: installed after app.tsx's import,
+	// removed after this describe's tests.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const submitEvent = (): Event =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		}) as unknown as Event;
+
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1, copyExtra: [] },
+	} as unknown as ProjectView;
+
+	/** Mounts the Add-project dialog under a stub; the stub records /api/projects
+	 * POSTs (the field error must keep them at zero) and 404s everything else. */
+	async function withAdd(
+		run: (args: {
+			container: HTMLDivElement;
+			root: ReturnType<typeof createRoot>;
+			posts: { url: string }[];
+		}) => Promise<void>,
+	): Promise<void> {
+		const posts: { url: string }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			if (url.endsWith("/api/projects") && method === "POST") {
+				posts.push({ url });
+				return new Response(JSON.stringify({ project, interview: "i1" }), {
+					status: 200,
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<AddProjectModal
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {}}
+						onAdded={() => {}}
+					/>,
+				);
+			});
+			await run({ container, root, posts });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	}
+
+	const typeUrl = async (
+		container: HTMLDivElement,
+		value: string,
+	): Promise<HTMLInputElement> => {
+		const urlInput = container.querySelector(
+			"input[data-autofocus]",
+		) as unknown as HTMLInputElement;
+		if (urlInput === null) throw new Error("no Git URL input");
+		await act(async () => {
+			typeInto(urlInput, value);
+			onChangeOf(urlInput)({ target: urlInput, currentTarget: urlInput });
+		});
+		return urlInput;
+	};
+
+	test("an invalid URL sets aria-invalid and shows the message under the field", async () => {
+		await withAdd(async ({ container, posts }) => {
+			const urlInput = await typeUrl(container, "not a url");
+			// The field carries the error state (The Error-Says-Fix Rule).
+			expect(urlInput.getAttribute("aria-invalid")).toBe("true");
+			expect(urlInput.getAttribute("aria-describedby")).toBe(
+				"add-git-url-error",
+			);
+			// The message sits directly under the field it names, linked by that id.
+			const message = urlInput.nextElementSibling;
+			expect(message?.id).toBe("add-git-url-error");
+			expect(message?.getAttribute("role")).toBe("alert");
+			expect(message?.textContent).toContain("Not a git repository URL");
+			// A URL the field already rejects never reaches the server, so the
+			// dialog-level alert cannot repeat the same message.
+			const form = container.querySelector(
+				"form",
+			) as unknown as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(posts).toHaveLength(0);
+		});
+	});
+
+	test("a valid URL clears the error and the input carries the git remote attributes", async () => {
+		await withAdd(async ({ container }) => {
+			const urlInput = await typeUrl(container, "git@github.com:o/r.git");
+			expect(urlInput.getAttribute("aria-invalid")).toBeNull();
+			expect(urlInput.getAttribute("aria-describedby")).toBeNull();
+			expect(container.querySelector("#add-git-url-error")).toBeNull();
+			// A Git remote field: git@host:path is no type="url" value, so the
+			// input keyboard comes from inputMode, and spell check and autofill stay off.
+			expect(urlInput.getAttribute("inputmode")).toBe("url");
+			expect(urlInput.getAttribute("spellcheck")).toBe("false");
+			expect(urlInput.getAttribute("autocomplete")).toBe("off");
+		});
+	});
+});
+
+describe("Drawer triage rank segmented control", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async (fn: () => Promise<void>) => {
+			await fn();
+			return true;
+		},
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// steering describes above.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records the
+	 * triage POSTs and answers 200, everything else 404. */
+	const withDrawer = async (
+		card: TaskCard,
+		run: (args: {
+			container: HTMLDivElement;
+			root: ReturnType<typeof createRoot>;
+			posts: { url: string; body: unknown }[];
+		}) => Promise<void>,
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/triage")) {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response("{}", { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={card} />);
+			});
+			await run({ container, root, posts });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	const segment = (container: HTMLDivElement, label: string): Element => {
+		for (const node of container.querySelectorAll(".rank-seg button"))
+			if (node.textContent === label) return node;
+		throw new Error(`no ${label} segment`);
+	};
+
+	test("five segments show the task rank pressed and no select remains", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+			priority: "P1",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container }) => {
+			const group = container.querySelector("fieldset.triage-rank");
+			expect(group).not.toBeNull();
+			const buttons = [
+				...(group as Element).querySelectorAll(".rank-seg button"),
+			];
+			expect(buttons.map((b) => b.textContent)).toEqual([
+				"Default",
+				"P0",
+				"P1",
+				"P2",
+				"P3",
+			]);
+			const pressed = buttons.map(
+				(b) => b.getAttribute("aria-pressed") === "true",
+			);
+			expect(pressed).toEqual([false, false, true, false, false]);
+			// Five fixed options show all at once; the select is gone.
+			expect(container.querySelector(".triage-row select")).toBeNull();
+		});
+	});
+
+	test("clicking a rank shows the pick at once and POSTs the triage priority", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+			priority: "P1",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container, posts }) => {
+			await act(async () => {
+				onClickOf(segment(container, "P2"))({});
+			});
+			// The Optimistic-Tap Rule: the pick leads, the POST follows.
+			expect(segment(container, "P2").getAttribute("aria-pressed")).toBe(
+				"true",
+			);
+			expect(segment(container, "P1").getAttribute("aria-pressed")).toBe(
+				"false",
+			);
+			expect(posts).toHaveLength(1);
+			expect(posts[0]?.url).toBe("/api/projects/proj/tasks/t1/triage");
+			expect(posts[0]?.body).toEqual({ priority: "P2" });
+		});
+	});
+});
+
+describe("Confirm dialogs name their target", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async (fn: () => Promise<void>) => {
+			await fn();
+			return true;
+		},
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// describes above. confirmDialog mounts into document.body, so the dialogs
+	// live outside the rendered container and this describe reads them there.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	/** A dialog button's handler reads `e.currentTarget` to close its dialog, so
+	 * the stubbed event carries the node (React's SyntheticEvent would too). */
+	const press = (node: Element): void => {
+		onClickOf(node)({ currentTarget: node });
+	};
+
+	/** The confirm dialog's title: the question text up to the first "?". */
+	const question = (): string => {
+		const h2 = window.document.querySelector(
+			"dialog.confirm-dialog .dialog-head h2",
+		);
+		if (h2 === null) throw new Error("no confirm dialog open");
+		return h2.textContent ?? "";
+	};
+
+	/** A button in the open dialog whose label ends with `label`. */
+	const dialogButton = (label: string): Element => {
+		for (const node of window.document.querySelectorAll(
+			"dialog.confirm-dialog .dialog-actions button",
+		))
+			if (node.textContent?.includes(label)) return node as unknown as Element;
+		throw new Error(`no ${label} button in the dialog`);
+	};
+
+	/** Lets the confirm flow's promises settle before the next dialog renders. */
+	const settle = async (): Promise<void> => {
+		await act(async () => {
+			await Bun.sleep(20);
+		});
+	};
+
+	/** Closes the open dialog through its safe button (the actions row leads with
+	 * it) and waits for the unmount. */
+	const dismiss = async (): Promise<void> => {
+		const safe = window.document.querySelector(
+			"dialog.confirm-dialog .dialog-actions button",
+		) as Element | null;
+		if (safe === null) throw new Error("no button in the dialog");
+		await act(async () => {
+			press(safe);
+		});
+		await settle();
+	};
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records cancel,
+	 * stop and triage POSTs, answers `cancelBody` on the cancel route (a kept
+	 * worktree re-asks), and 404s everything else. */
+	const withDrawer = async (
+		card: TaskCard,
+		run: (args: {
+			container: HTMLDivElement;
+			root: ReturnType<typeof createRoot>;
+			posts: { url: string; body: unknown }[];
+		}) => Promise<void>,
+		cancelBody: Record<string, unknown> = {},
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (
+				(u.endsWith("/cancel") || u.endsWith("/stop")) &&
+				(init?.method ?? "GET") === "POST"
+			) {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response(
+					JSON.stringify(u.endsWith("/cancel") ? cancelBody : {}),
+					{ status: 200 },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={card} />);
+			});
+			await run({ container, root, posts });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	const actionButton = (container: HTMLDivElement, label: string): Element => {
+		for (const node of container.querySelectorAll(".drawer-actions button"))
+			if (node.textContent?.includes(label)) return node;
+		throw new Error(`no ${label} button in the drawer`);
+	};
+
+	test("the delete confirm names the done task", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container }) => {
+			await act(async () => {
+				onClickOf(actionButton(container, "Delete task"))({});
+			});
+			expect(question()).toBe(
+				'Delete the done task t1 "Task one" from the board?',
+			);
+			await dismiss();
+		});
+	});
+
+	test("the cancel confirm names the task", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container }) => {
+			await act(async () => {
+				onClickOf(actionButton(container, "Cancel task"))({});
+			});
+			expect(question()).toBe('Cancel t1 "Task one"?');
+			await dismiss();
+		});
+	});
+
+	test("the kept-worktree cancel confirm names the task too", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+		}) as TaskCard;
+		await withDrawer(
+			card,
+			async ({ container, posts }) => {
+				await act(async () => {
+					onClickOf(actionButton(container, "Cancel task"))({});
+				});
+				await settle();
+				// The cancel went through; the kept worktree asks a second yes.
+				await act(async () => {
+					press(dialogButton("Cancel task"));
+				});
+				await settle();
+				expect(question()).toBe(
+					'Delete the kept worktree and branch of t1 "Task one"?',
+				);
+				expect(
+					window.document.querySelector(".confirm-detail")?.textContent,
+				).toContain("/tmp/wt");
+				// The second yes (Delete) forces the delete through the same route.
+				await act(async () => {
+					press(dialogButton("Delete"));
+				});
+				await settle();
+				expect(
+					posts.some(
+						(p) =>
+							p.body !== null && "force" in (p.body as Record<string, unknown>),
+					),
+				).toBe(true);
+			},
+			{ kept: "/tmp/wt" },
+		);
+	});
+
+	test("the fresh-session confirm names the task", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container }) => {
+			const newSession = [...container.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("New session"),
+			);
+			if (newSession === undefined) throw new Error("no New session button");
+			await act(async () => {
+				onClickOf(newSession)({});
+			});
+			expect(question()).toBe('Start a fresh omp session for t1 "Task one"?');
+			await dismiss();
+		});
+	});
+
+	test("the stop-turn confirm names the task", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container }) => {
+			const stop = [...container.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Stop turn"),
+			);
+			if (stop === undefined) throw new Error("no Stop turn button");
+			await act(async () => {
+				onClickOf(stop)({});
+			});
+			expect(question()).toBe('Stop the running turn of t1 "Task one"?');
+			await dismiss();
+		});
+	});
+
+	test("the double-check stop confirm names the task too", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "running",
+		}) as TaskCard;
+		await withDrawer(card, async ({ container, posts }) => {
+			const stop = [...container.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Stop turn"),
+			);
+			if (stop === undefined) throw new Error("no Stop turn button");
+			await act(async () => {
+				onClickOf(stop)({});
+			});
+			await act(async () => {
+				press(dialogButton("Stop turn"));
+			});
+			await settle();
+			expect(question()).toBe('Really stop the running turn of t1 "Task one"?');
+			// The second yes (Stop turn) sends the stop.
+			await act(async () => {
+				press(dialogButton("Stop turn"));
+			});
+			await settle();
+			expect(posts.some((p) => p.url.endsWith("/stop"))).toBe(true);
+		});
+	});
+});
+
+describe("Release card re-release confirm names its target", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// ProjectBoard search-delay describe above.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	const question = (): string => {
+		const h2 = window.document.querySelector(
+			"dialog.confirm-dialog .dialog-head h2",
+		);
+		if (h2 === null) throw new Error("no confirm dialog open");
+		return h2.textContent ?? "";
+	};
+
+	const dialogButton = (label: string): Element => {
+		for (const node of window.document.querySelectorAll(
+			"dialog.confirm-dialog .dialog-actions button",
+		))
+			if (node.textContent?.includes(label)) return node as unknown as Element;
+		throw new Error(`no ${label} button in the dialog`);
+	};
+
+	/** A dialog button's handler reads `e.currentTarget` to close its dialog, so
+	 * the stubbed event carries the node (React's SyntheticEvent would too). */
+	const press = (node: Element): void => {
+		onClickOf(node)({ currentTarget: node });
+	};
+
+	const settle = async (): Promise<void> => {
+		await act(async () => {
+			await Bun.sleep(20);
+		});
+	};
+
+	const dismiss = async (): Promise<void> => {
+		const safe = window.document.querySelector(
+			"dialog.confirm-dialog .dialog-actions button",
+		) as Element | null;
+		if (safe === null) throw new Error("no button in the dialog");
+		await act(async () => {
+			press(safe);
+		});
+		await settle();
+	};
+
+	test("the kept-worktree confirm of Release again names the release card", async () => {
+		const posts: { url: string; body: unknown }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/cancel") && (init?.method ?? "GET") === "POST") {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				// The release card kept unmerged work, so the flow asks a second yes.
+				return new Response(JSON.stringify({ kept: "/tmp/wt" }), {
+					status: 200,
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			// A stalled release card: parked for the user, merges still held, every
+			// finding landed — reReleaseOf's re-release view, so the card carries
+			// the Release again chip.
+			const release = cardFixture({
+				id: "r-1",
+				title: "Release the docs",
+				sessionTitle: "Release the docs",
+				releaseVersion: "v2",
+				heldMerges: ["m-1"],
+				stage: "todo",
+				state: "needs_you",
+			}) as TaskCard;
+			const boardProject = {
+				name: "proj",
+				hasRules: true,
+				github: null,
+				gitless: false,
+				dirty: false,
+				archReview: null,
+				latestRelease: null,
+				latestImage: null,
+				settings: { setupChecklist: false },
+				sessionsDir: "/tmp/s",
+			} as unknown as ProjectView;
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={boardProject}
+						tasks={[release]}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const again = [...container.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Release again"),
+			);
+			if (again === undefined) throw new Error("no Release again chip");
+			await act(async () => {
+				// The chip keeps the click off the card's stretched link.
+				onClickOf(again)({
+					preventDefault: () => {},
+					stopPropagation: () => {},
+				});
+			});
+			// Sanity: the first ask names the release version.
+			expect(question()).toBe("Cancel release v2 and open Create release?");
+			await act(async () => {
+				press(dialogButton("Cancel release"));
+			});
+			await settle();
+			expect(question()).toBe(
+				'Delete the kept worktree and branch of r-1 "Release the docs"?',
+			);
+			await dismiss();
+			expect(posts).toHaveLength(1);
+			expect(posts[0]?.url).toBe("/api/projects/proj/tasks/r-1/cancel");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });

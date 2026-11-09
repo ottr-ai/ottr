@@ -2446,12 +2446,54 @@ describe("alate routes", () => {
 		};
 	});
 
+	test("a status-only provision answer names the request", async () => {
+		alateStatus = 503;
+		alateBody = {};
+		const res = await post("/api/alate/provision", {});
+		expect(res.status).toBe(503);
+		expect(await errorOf(res)).toBe(
+			"The alate provision request failed (unavailable): check that the alate server is up, then run Provision again",
+		);
+		alateStatus = 200;
+		alateBody = {
+			ok: true,
+			results: [
+				{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+			],
+		};
+	});
+
 	test("unreachable alate is 502", async () => {
 		await post("/api/alate", { url: "http://127.0.0.1:9" });
 		const res = await post("/api/alate/provision", {});
 		expect(res.status).toBe(502);
 		expect(await errorOf(res)).toContain("cannot reach alate server");
 		await post("/api/alate", { url: alateUrl });
+	});
+
+	test("a status-only updates pull logs the request", async () => {
+		alateStatus = 503;
+		alateBody = {};
+		const seen: unknown[] = [];
+		const origError = console.error;
+		console.error = (...args: unknown[]) => {
+			seen.push(args);
+		};
+		try {
+			await app.refreshUpdates();
+		} finally {
+			console.error = origError;
+			alateStatus = 200;
+			alateBody = {
+				ok: true,
+				results: [
+					{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+				],
+			};
+		}
+		expect(seen.map(String).join("\n")).toContain(
+			`the alate updates pull of ${alateUrl}/api/updates failed (unavailable): the board keeps the last good list and retries on the next tick`,
+		);
 	});
 
 	// AbortSignal.timeout rejects with a TimeoutError when the 110 s bound fires.
@@ -11165,6 +11207,33 @@ describe("PR review routes", () => {
 		await removeApp();
 	});
 
+	test("a status-only app post names the review post", async () => {
+		await saveApp();
+		appFetchImpl = async (url) => {
+			if (url.endsWith("/installation")) return Response.json({ id: 77 });
+			if (url.includes("/access_tokens"))
+				return Response.json({
+					token: "INSTA",
+					expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+				});
+			// An empty body: nothing to redact, so the fallback must name the post.
+			return url.endsWith("/reviews")
+				? new Response("", { status: 502 })
+				: Response.json({ message: "no route" }, { status: 404 });
+		};
+		const t = reviewed(25, H1);
+		const res = await postReview(t.id, { body: "Ship it." });
+		expect(res.status).toBe(502);
+		expect(await errorOf(res)).toBe(
+			"The review post to acme/widget#25 failed (bad gateway): check the app's or token's permissions, then post the review again",
+		);
+		// The claim is released with that error on the row.
+		expect(row(25).postError).toBe(
+			"The review post to acme/widget#25 failed (bad gateway): check the app's or token's permissions, then post the review again",
+		);
+		await removeApp();
+	});
+
 	test("github-app settings save, view and errors never expose the key", async () => {
 		await removeApp();
 		const badId = await m.call("/api/git-hosts/github-app", {
@@ -11974,6 +12043,21 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 		const error = await errorOf(res);
 		expect(error).toContain("actions:write");
 		expect(error).toContain("ottr-ai/ottr");
+	});
+
+	test("another status names the run and the next step", async () => {
+		const stub = (async () =>
+			new Response(null, { status: 500 })) as unknown as typeof fetch;
+		const { m, task } = await setup(stub);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(500);
+		expect(await errorOf(res)).toBe(
+			"The re-run of failed jobs for ottr-ai/ottr run 42313545100 failed (server error): check the board's token access, then run the re-run again",
+		);
 	});
 
 	test("a card with no run link is a 400", async () => {
@@ -13244,6 +13328,86 @@ describe("token expiry reminders", () => {
 			tokenSet: true,
 			expiresAt: EXP,
 		});
+	});
+
+	test("a failed default probe names the request and next step", async () => {
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: EXP, lastPushDay: null },
+				seed: { expiresAt: null, lastPushDay: null },
+			}),
+		);
+		// mount() injects no githubTokenExpiry, so the POST runs the default probe.
+		const m = mount();
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.github.com/repos/ottr-ai/ottr")
+				return new Response(null, { status: 503 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		const seen: unknown[] = [];
+		const origError = console.error;
+		console.error = (...args: unknown[]) => {
+			seen.push(args);
+		};
+		try {
+			await m.call("/api/settings/github-token", { token: TOKEN });
+		} finally {
+			globalThis.fetch = realFetch;
+			console.error = origError;
+		}
+		// A failed probe keeps the stored date; the log says what failed, why and what to do.
+		expect(await (await m.call("/api/settings/github-token")).json()).toEqual({
+			tokenSet: true,
+			expiresAt: EXP,
+		});
+		expect(seen.map(String).join("\n")).toContain(
+			"the token expiry probe of api.github.com failed (unavailable): check or renew the board token; the stored expiry stays until a probe succeeds",
+		);
+	});
+
+	test("the host probe's failure names the configured apiBase", async () => {
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: EXP, lastPushDay: null },
+				seed: { expiresAt: null, lastPushDay: null },
+			}),
+		);
+		const m = mount();
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.acme.ghe.com/user")
+				return new Response(null, { status: 500 });
+			return realFetch(input, init);
+		}) as typeof fetch;
+		const seen: unknown[] = [];
+		const origError = console.error;
+		console.error = (...args: unknown[]) => {
+			seen.push(args);
+		};
+		try {
+			await m.call("/api/settings/github-token", { token: TOKEN });
+		} finally {
+			globalThis.fetch = realFetch;
+			console.error = origError;
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+		}
+		expect(seen.map(String).join("\n")).toContain(
+			"the token expiry probe of https://api.acme.ghe.com/user failed (server error): check or renew the board token; the stored expiry stays until a probe succeeds",
+		);
 	});
 
 	test("on another host the default probe calls <apiBase>/user, never api.github.com", async () => {

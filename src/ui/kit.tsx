@@ -350,19 +350,81 @@ export type Act = (
 	onError?: (message: string) => void,
 ) => Promise<boolean>;
 
+/** A status code in words for an error line (e.g. 401 → "not signed in"). */
+export function httpStatusWords(status: number): string {
+	switch (status) {
+		case 400:
+			return "invalid request";
+		case 401:
+			return "not signed in";
+		case 403:
+			return "refused";
+		case 404:
+			return "not found";
+		case 409:
+			return "conflict";
+		case 413:
+			return "too large";
+		case 429:
+			return "too many requests";
+		case 500:
+			return "server error";
+		case 502:
+			return "bad gateway";
+		case 503:
+			return "unavailable";
+		case 504:
+			return "gateway timeout";
+		default:
+			return `status ${status}`;
+	}
+}
+
+/** What the user can do about a failed request with this status. */
+export function httpNextStep(status: number): string {
+	switch (status) {
+		case 401:
+			return "Sign in again.";
+		case 403:
+			return "Check the board token's access.";
+		case 404:
+			return "Refresh the board; it may be gone.";
+		case 409:
+			return "Refresh and try again.";
+		default:
+			return status >= 500 && status <= 599
+				? "Try again; if it repeats, the server log has the reason."
+				: "Check the value and try again.";
+	}
+}
+
+/** A user-ready message for a failed response; the server's `{ error }` string wins verbatim,
+ *  otherwise the request, the status in words, and a next step name it. */
+export async function httpProblem(
+	res: Response,
+	what: string,
+): Promise<string> {
+	try {
+		const data = (await res.json()) as { error?: string };
+		if (typeof data.error === "string") return data.error;
+	} catch {
+		// non-JSON error body; fall through to the status line
+	}
+	return `${what} failed: the server answered ${res.status} (${httpStatusWords(res.status)}). ${httpNextStep(res.status)}`;
+}
+
 /** Body-or-error unwrapper shared by the REST helpers; the server's `{ error }` shape wins over the status line. */
 export async function unwrap<T>(res: Response): Promise<T> {
-	if (!res.ok) {
-		let error = `HTTP ${res.status}`;
-		try {
-			const data = (await res.json()) as { error?: string };
-			if (typeof data.error === "string") error = data.error;
-		} catch {
-			// non-JSON error body; keep the HTTP status text
-		}
-		throw new Error(error);
-	}
+	if (!res.ok) throw new Error(await httpProblem(res, where(res.url)));
 	return (await res.json()) as T;
+}
+
+function where(url: string): string {
+	try {
+		return new URL(url).pathname;
+	} catch {
+		return "the request";
+	}
 }
 
 export async function post<T>(url: string, body: unknown): Promise<T> {
@@ -456,6 +518,8 @@ export type InstantSave = {
 	busy: boolean;
 	failed: boolean;
 	saved: boolean;
+	/** The message the last failed run reported via act's onError; null until then, cleared when the next run starts. */
+	reason: string | null;
 };
 
 /** One save that runs on its own (a toggle, an upload, a card's Save): busy while it runs,
@@ -463,20 +527,29 @@ export type InstantSave = {
 export function useInstantSave(act: Act): InstantSave {
 	const busy = useBusy();
 	const [saved, flash] = useFlash(1600);
+	const [reason, setReason] = useState<string | null>(null);
 	const run = (
 		send: () => Promise<unknown>,
 		onFail?: () => void,
 		onError?: (message: string) => void,
-	): void =>
+	): void => {
+		setReason(null);
 		busy.start(async () => {
-			const ok = await act(async () => {
-				await send();
-			}, onError);
+			const ok = await act(
+				async () => {
+					await send();
+				},
+				(message) => {
+					setReason(message);
+					onError?.(message);
+				},
+			);
 			if (ok) flash();
 			else onFail?.();
 			return ok;
 		});
-	return { run, busy: busy.busy, failed: busy.failed, saved };
+	};
+	return { run, busy: busy.busy, failed: busy.failed, saved, reason };
 }
 
 /** The optimistic-value pattern: a row's checkbox (or similar) leads, the server state trails.
@@ -496,6 +569,8 @@ export interface OptimisticValue<T> {
 	busy: boolean;
 	failed: boolean;
 	saved: boolean;
+	/** The message the last failed run reported via act's onError; null until then, cleared when the next run starts. */
+	reason: string | null;
 }
 
 export function useOptimisticValue<T>(
@@ -523,6 +598,7 @@ export function useOptimisticValue<T>(
 		busy: s.busy,
 		failed: s.failed,
 		saved: s.saved,
+		reason: s.reason,
 	};
 }
 

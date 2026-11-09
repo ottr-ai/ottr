@@ -122,6 +122,8 @@ const seed = {
 	expiresAt: null,
 };
 const tail = " The rows now show the current values. Make your change again.";
+const fallback = (status: number, words: string, step: string) =>
+	`the model roles save failed: the server answered ${status} (${words}). ${step}`;
 
 test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
 	const body = {
@@ -140,7 +142,7 @@ test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
 	const { seed: _, ...noSeed } = body;
 	expect(classifyRolesSave(true, 200, noSeed)).toEqual({
 		kind: "failed",
-		error: "HTTP 200",
+		error: fallback(200, "status 200", "Check the value and try again."),
 		fields: {},
 		fallbackFields: {},
 	});
@@ -213,7 +215,13 @@ test("classifyRolesSave: saved needs ok and every part", () => {
 	};
 	const failed = (status: number) => ({
 		kind: "failed" as const,
-		error: `HTTP ${status}`,
+		error: fallback(
+			status,
+			status === 500 ? "server error" : "status 200",
+			status === 500
+				? "Try again; if it repeats, the server log has the reason."
+				: "Check the value and try again.",
+		),
 		fields: {},
 		fallbackFields: {},
 	});
@@ -322,12 +330,40 @@ test("classifyRolesSave: failures keep string fields and the error", () => {
 	for (const body of [null, [1], 7, "x"])
 		expect(classifyRolesSave(false, 500, body)).toEqual({
 			kind: "failed",
-			error: "HTTP 500",
+			error: fallback(
+				500,
+				"server error",
+				"Try again; if it repeats, the server log has the reason.",
+			),
 			fields: {},
 			fallbackFields: {},
 		});
-	expect(classifyRolesSave(false, 502, { error: 5 })).toMatchObject({
-		error: "HTTP 502",
+	expect(classifyRolesSave(false, 502, { error: 5 })).toEqual({
+		kind: "failed",
+		error: fallback(
+			502,
+			"bad gateway",
+			"Try again; if it repeats, the server log has the reason.",
+		),
+		fields: {},
+	});
+});
+
+test("classifyRolesSave: failed fallback names the save, status and next step", () => {
+	expect(classifyRolesSave(false, 401, null)).toEqual({
+		kind: "failed",
+		error: fallback(401, "not signed in", "Sign in again."),
+		fields: {},
+	});
+	expect(classifyRolesSave(false, 418, { error: null, fields: "no" })).toEqual({
+		kind: "failed",
+		error: fallback(418, "status 418", "Check the value and try again."),
+		fields: {},
+	});
+	expect(classifyRolesSave(false, 500, { error: "boom" })).toEqual({
+		kind: "failed",
+		error: "boom",
+		fields: {},
 	});
 });
 

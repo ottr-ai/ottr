@@ -10,6 +10,7 @@ import {
 	noRedirectFetch,
 	readConfigYml,
 	readOnlyMountError,
+	refreshAlateSnapshot,
 	saveConfigYml,
 } from "./alate.ts";
 
@@ -103,7 +104,17 @@ describe("alateApi", () => {
 		expect(await alateApi(alate, "/x", 1000)).toEqual({
 			ok: false,
 			status: 502,
-			error: "alate returned 503",
+			error:
+				"the alate api call failed (unavailable): check that the alate server is up, then try again",
+		});
+		// A caller's label names the request in the fallback (the Error-Says-Fix rule).
+		expect(
+			await alateApi(alate, "/x", 1000, null, "the config.yml read"),
+		).toEqual({
+			ok: false,
+			status: 502,
+			error:
+				"the config.yml read failed (unavailable): check that the alate server is up, then try again",
 		});
 	});
 	test("non-object body is 502", async () => {
@@ -229,7 +240,7 @@ describe("alateHealth", () => {
 			expect(await alateHealth(alate)).toEqual({
 				ok: false,
 				status: 404,
-				error: "alate returned 404",
+				error: `the alate health check of ${alate.url}/health failed (not found): check that the alate server is running`,
 			});
 		}
 	});
@@ -331,6 +342,44 @@ describe("readConfigYml", () => {
 			ok: false,
 			status: 404,
 			error: "gone",
+		});
+	});
+});
+
+describe("status-only fallbacks name the request", () => {
+	// The Error-Says-Fix rule: each caller's label, the status in words and the next
+	// step, one line. A body without an error string takes the fallback.
+	test("each call's label reaches its fallback", async () => {
+		serve(() => new Response("nope", { status: 503 }));
+		expect(await readConfigYml(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error:
+				"the config.yml read failed (unavailable): check that the alate server is up, then try again",
+		});
+		expect(await saveConfigYml(alate, "c", "h1", "m")).toEqual({
+			ok: false,
+			status: 502,
+			error:
+				"the config.yml save failed (unavailable): check that the alate server is up, then try again",
+		});
+		expect(await loadConfigYml(alate, false)).toEqual({
+			ok: false,
+			status: 502,
+			error:
+				"the alate state read failed (unavailable): check that the alate server is up, then try again",
+		});
+		// The refresh path answers /health first: the health check passes, then the import fails.
+		serve((_req, url) =>
+			url.pathname === "/health"
+				? Response.json({ repo: "o/r" })
+				: new Response("nope", { status: 503 }),
+		);
+		expect(await refreshAlateSnapshot(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error:
+				"the snapshot import failed (unavailable): check that the alate server is up, then try again",
 		});
 	});
 });

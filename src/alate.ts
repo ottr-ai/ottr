@@ -1,4 +1,6 @@
 // Alate's file editor API and the GitHub commit path for the data repo's omp config.yml.
+
+import { requestFailed } from "./errmsg.ts";
 import type { GhFn } from "./forks.ts";
 import { redirectProxyHint } from "./proxyHint.ts";
 
@@ -59,7 +61,11 @@ export async function alateHealth(
 		const msg =
 			typeof body?.error === "string"
 				? body.error
-				: `alate returned ${res.status}`;
+				: requestFailed(
+						`the alate health check of ${alate.url}/health`,
+						res.status,
+						"check that the alate server is running",
+					);
 		return { ok: false, status: res.status, error: msg };
 	}
 	if (body === null || typeof body !== "object")
@@ -77,22 +83,31 @@ export type AlateOut<T> =
 function outError(
 	body: Record<string, unknown> | null,
 	status: number,
+	what: string,
 ): { ok: false; status: number; error: string } {
 	return {
 		ok: false,
 		// 404 and 409 keep their status; any other alate failure is 502.
 		status: status === 404 || status === 409 ? status : 502,
 		error:
-			typeof body?.error === "string" ? body.error : `alate returned ${status}`,
+			typeof body?.error === "string"
+				? body.error
+				: requestFailed(
+						what,
+						status,
+						"check that the alate server is up, then try again",
+					),
 	};
 }
 /** One bearer call to alate's file editor API. 404 and 409 keep their status; any other
- *  alate failure is 502 (docs/specs/model-roles-editor.md). */
+ *  alate failure is 502 (docs/specs/model-roles-editor.md). `what` names the request in
+ *  the status-only fallback (the Error-Says-Fix rule). */
 export async function alateApi(
 	alate: Alate,
 	path: string,
 	timeoutMs: number,
 	init: { method: string; body: unknown } | null = null,
+	what = "the alate api call",
 ): Promise<AlateOut<Record<string, unknown>>> {
 	if (alate.url === null)
 		return {
@@ -139,7 +154,7 @@ export async function alateApi(
 		string,
 		unknown
 	> | null;
-	if (!res.ok) return outError(body, res.status);
+	if (!res.ok) return outError(body, res.status, what);
 	if (body === null || typeof body !== "object")
 		return {
 			ok: false,
@@ -243,6 +258,8 @@ export async function readConfigYml(
 		alate,
 		`/api/file?path=${encodeURIComponent(CONFIG_YML)}`,
 		10_000,
+		null,
+		"the config.yml read",
 	);
 	if (!r.ok) return r;
 	const { content, hash } = r.body;
@@ -271,10 +288,16 @@ export async function saveConfigYml(
 	base: string,
 	message: string,
 ): Promise<AlateOut<{ commit: string; pushed: boolean }>> {
-	const r = await alateApi(alate, "/api/file", 60_000, {
-		method: "PUT",
-		body: { path: CONFIG_YML, content, base, message },
-	});
+	const r = await alateApi(
+		alate,
+		"/api/file",
+		60_000,
+		{
+			method: "PUT",
+			body: { path: CONFIG_YML, content, base, message },
+		},
+		"the config.yml save",
+	);
 	if (!r.ok) return r;
 	const { commit, pushed } = r.body;
 	if (typeof commit !== "string" || typeof pushed !== "boolean")
@@ -299,10 +322,16 @@ export async function refreshAlateSnapshot(
 				: null;
 	if (kind === null)
 		return { ok: false, status: 502, error: "alate has no data source" };
-	return alateApi(alate, "/api/import", 110_000, {
-		method: "POST",
-		body: { source: h.body[kind], kind },
-	});
+	return alateApi(
+		alate,
+		"/api/import",
+		110_000,
+		{
+			method: "POST",
+			body: { source: h.body[kind], kind },
+		},
+		"the snapshot import",
+	);
 }
 /** config.yml plus `base`, the data repo commit of alate's snapshot, and `repo`, its GitHub
  *  source (both null for a path source, where `path` holds the folder path). `refresh`
@@ -321,7 +350,7 @@ export async function loadConfigYml(
 > {
 	const s = refresh
 		? await refreshAlateSnapshot(alate)
-		: await alateApi(alate, "/api/state", 10_000);
+		: await alateApi(alate, "/api/state", 10_000, null, "the alate state read");
 	if (!s.ok) return s;
 	const src = (
 		(refresh ? s.body.state : s.body) as {
