@@ -86,7 +86,7 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 
 | Call | Body | Answer | Use |
 |---|---|---|---|
-| `POST /metering` | `MeteringRecord` (JSON) | any 2xx | One record for each agent run, sent at turn settle. Fire-and-forget: a failure is logged and never blocks the settle. |
+| `POST /metering` | `MeteringRecord` (JSON) | any 2xx | The cumulative usage of one agent run: interim records while the run is active, then one final record at turn settle. Fire-and-forget: a failure is logged and never blocks the run or the settle. The board does not retry. |
 | `GET /credit` | — | `{"ok": boolean}` | The pre-claim credit gate. |
 | `POST /git-token` | `{"project": string, "remote": string}` | `{"token": string, "expiresAt": ISO-8601}`, or 404 when the project has no token | The per-project git credential (section 6). |
 
@@ -96,6 +96,7 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 {
   "tenant": "t1", "project": "app", "taskId": "APP-7", "turnId": 31,
   "kind": "work", "role": "default", "model": "anthropic/claude-opus-5-5",
+  "run": 0, "final": true,
   "usage": { "input": 1200, "output": 340, "cacheRead": 9000, "cacheWrite": 0, "cost": 0.0412 }
 }
 ```
@@ -104,8 +105,21 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 - `role`: the model role that resolved the run's model. The work or merge run uses `default`
   (also when the card or session names its own model). The second-model check run uses its check role
   (`critic` or `adversary`).
-- `usage`: the sum over the run's assistant messages, from omp's `message_end` events. `cost`
-  is the USD value that omp reports, `0` when omp reports none.
+- `run`: the index of the run in its turn. The first agent run of the turn is `0`, the next
+  is `1`, and so on (a check retry is a new run). `(project, taskId, turnId, kind, role, run)`
+  names one agent run, and each record of that run has the same key.
+- `final`: `false` for an interim record, `true` for the record at turn settle.
+- `usage`: the sum over the run's assistant messages so far, from omp's `message_end` events.
+  `cost` is the USD value that omp reports, `0` when omp reports none.
+
+Interim records: while a run is active, the board sends an interim record after an assistant
+`message_end` that changed the run's usage. Each run sends at most one interim record in each
+2 seconds (`METERING_INTERVAL_MS` in `src/hosted.ts`). A change inside the interval goes out at
+the end of the interval, with the newest usage. No interim record goes out after the run ends:
+the final record at turn settle carries the last usage. A final record goes out also for a
+stopped or failed run. The control plane books only the increase over the highest cumulative
+usage that it saw for the run, so a late or repeated record never counts twice. Code:
+`interimMeter` in `src/turn.ts`, fed by the run sink's `onUsage` (`src/runner.ts`).
 
 ## 5. Credit gate and stop
 
@@ -140,6 +154,26 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.
+- Release after a top-up: the control plane calls `POST /api/hosted/release` on the tenant
+  (role `control`). The board (`creditRelease`, `src/turn.ts`):
+  1. Clears the credit hold, with the same effect as a gate answer `ok: true`. It changes no
+     other stop state.
+  2. Finds each `needs_you` card whose reason is the credit reason. The credit stop and the
+     credit gate both park cards with this reason.
+  3. Queues each of these cards as an owner `Resume` does (`replyPatch`, also used by the reply
+     route): the continue prompt `.`, and no reason or hold. A stopped card resumes the same
+     omp session on the kept worktree. A card that the gate parked starts its turn.
+  4. Writes the `.` as board text (`pendingBy: "supervisor"`), not as a user message. Thus
+     an active usage-limit hold still holds a released card. A steer that the owner queued
+     before the release keeps its author.
+
+  The answer is `{"released": <count>}`. Each queued turn still passes the credit gate. A
+  second call finds no parked card and answers `{"released": 0}`. A stopped turn that has not
+  settled yet when the release comes is not in the count: it parks after the release, and the
+  owner resumes it. A card in its credit gate when the release comes is also not in the count.
+  If its gate call started before the release and answers `ok: false`, the card does not
+  park. It goes back to the queue with no hold, and the gate asks again. With the flag off,
+  the route answers 404 like each hosted route.
 
 ## 6. Per-project git credential
 

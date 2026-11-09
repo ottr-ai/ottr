@@ -3,11 +3,19 @@
 // that the real controlPlaneHooks client calls, and a test "proxy" that signs every request.
 // The agent runs go through the real startRun and run sink: only the omp child is fake, and it
 // feeds omp-shaped JSON lines (message_end usage, report_outcome, agent_end) on its stdout.
+// The second scenario is the credit stop and release: a balance that interim metering empties
+// mid-run, the control plane's stop and release calls, and the resume of the stopped session.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -108,12 +116,21 @@ interface ControlPlane {
 	creditCount(n: number): Promise<void>;
 }
 
+/** How a fake control plane answers: the credit check and a hook on each metering record. */
+interface ControlPolicy {
+	/** The credit answer for the `calls`-th check (1-based). */
+	credit(calls: number): boolean;
+	onMetering?(record: MeteringRecord): void;
+}
+
 /**
- * The control plane answers the first credit check with ok:true and every later one with
+ * The default policy answers the first credit check with ok:true and every later one with
  * ok:false. The work turn then runs (work run + check run), and the chained merge turn parks at
  * the credit gate: the card settles in the merge column with no third agent run.
  */
-function startControlPlane(): ControlPlane {
+function startControlPlane(
+	policy: ControlPolicy = { credit: (calls) => calls === 1 },
+): ControlPlane {
 	const nonces = new NonceCache();
 	const waiters: { done: () => boolean; resolve: () => void }[] = [];
 	const wake = () => {
@@ -157,12 +174,14 @@ function startControlPlane(): ControlPlane {
 			if (req.method === "GET" && path === `${base}/credit`) {
 				cp.creditCalls += 1;
 				trace.push(`credit#${cp.creditCalls}`);
-				const ok = cp.creditCalls === 1;
+				const ok = policy.credit(cp.creditCalls);
 				queueMicrotask(wake);
 				return Response.json({ ok });
 			}
 			if (req.method === "POST" && path === `${base}/metering`) {
-				cp.metering.push((await req.json()) as MeteringRecord);
+				const record = (await req.json()) as MeteringRecord;
+				cp.metering.push(record);
+				policy.onMetering?.(record);
 				trace.push(`metering#${cp.metering.length}`);
 				queueMicrotask(wake);
 				return new Response(null, { status: 204 });
@@ -193,7 +212,8 @@ class FakeOmp extends EventEmitter {
 			setImmediate(this.onPrompt);
 		},
 	});
-	constructor(readonly pid: number) {
+	/** undefined: startRun's kill then signals no process (the credit-stop scenario). */
+	constructor(readonly pid: number | undefined) {
 		super();
 	}
 }
@@ -264,9 +284,9 @@ function assistant(
 }
 
 /** The work agent: commits in its worktree, reports ready, ends; two assistant messages. */
-function workEvents(): unknown[] {
+function workEvents(sessionId = "sess-work"): unknown[] {
 	return [
-		{ type: "session", id: "sess-work", version: 3, cwd: "." },
+		{ type: "session", id: sessionId, version: 3, cwd: "." },
 		{ type: "agent_start" },
 		...assistant(WORK_MODEL, "Adding the file.", {
 			input: 1200,
@@ -325,34 +345,123 @@ function checkEvents(selector: string): unknown[] {
 /** What every launched child saw: its argv and prompt. */
 const launches: { args: readonly string[]; prompt: string; cwd: string }[] = [];
 
+/** omp's JSON lines on the fake's stdout, in two chunks split inside a line: the sink must
+ * buffer the partial line. */
+function feed(fake: FakeOmp, events: unknown[]): void {
+	const text = `${events.map((e) => JSON.stringify(e)).join("\n")}\n`;
+	const cut = Math.floor(text.length / 2);
+	fake.stdout.emit("data", Buffer.from(text.slice(0, cut)));
+	fake.stdout.emit("data", Buffer.from(text.slice(cut)));
+}
+
+const CHECK_OPENING = "You are the second model checking a finished work card";
+
+/** The check run's events for the model it was launched with (`--model`). */
+function checkEventsFor(args: readonly string[]): unknown[] {
+	const m = args.indexOf("--model");
+	return checkEvents(m === -1 ? "unknown/none" : (args[m + 1] ?? ""));
+}
+
 const launcher: RunLauncher = (_command, args, options) => {
-	const fake = new FakeOmp(nextPid++);
-	livePids.add(fake.pid);
+	const pid = nextPid++;
+	const fake = new FakeOmp(pid);
+	livePids.add(pid);
 	const cwd = String(options.cwd);
 	fake.onPrompt = () => {
 		const prompt = fake.written.join("");
 		launches.push({ args, prompt, cwd });
-		const isCheck = prompt.startsWith(
-			"You are the second model checking a finished work card",
-		);
+		const isCheck = prompt.startsWith(CHECK_OPENING);
 		trace.push(isCheck ? "run:check" : "run:work");
 		let events: unknown[];
-		if (isCheck) {
-			const m = args.indexOf("--model");
-			events = checkEvents(m === -1 ? "unknown/none" : (args[m + 1] ?? ""));
-		} else {
+		if (isCheck) events = checkEventsFor(args);
+		else {
 			// The agent's work: one commit on the card branch in its worktree.
 			writeFileSync(join(cwd, "hello.txt"), `hello ${TENANT}\n`);
 			gitSync(cwd, "add", "hello.txt");
 			gitSync(cwd, "commit", "-qm", "feat: add hello.txt");
 			events = workEvents();
 		}
-		const text = `${events.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		// Two chunks split inside a line: the sink must buffer the partial line.
-		const cut = Math.floor(text.length / 2);
-		fake.stdout.emit("data", Buffer.from(text.slice(0, cut)));
-		fake.stdout.emit("data", Buffer.from(text.slice(cut)));
-		livePids.delete(fake.pid);
+		feed(fake, events);
+		livePids.delete(pid);
+		fake.emit("close", 0);
+	};
+	return fake as unknown as ChildProcess; // the fake stands in for Node's class
+};
+
+// ---- fake omp for the credit stop scenario -----------------------------------
+
+/** The omp session of the run that the credit stop kills; the resumed run continues it. */
+const STOP_SESSION = "sess-credit-stop";
+/** The cost the stopped run reports in its first message: more than the starting balance. */
+const STOP_COST = 0.5;
+
+interface StopLaunch {
+	args: readonly string[];
+	cwd: string;
+	/** `--resume <id>`, else null. */
+	resume: string | null;
+	/** The uncommitted wip.txt was in the worktree when the run started. */
+	wipAtStart: boolean;
+	isCheck: boolean;
+}
+
+/** The scenario's children; pidless, so a kill never signals a real process. */
+const stopChildren: FakeOmp[] = [];
+const stopLaunches: StopLaunch[] = [];
+/** Children that started and have not closed yet. */
+const liveStopRuns = new Set<FakeOmp>();
+
+/**
+ * The first work run writes an uncommitted wip.txt, writes its omp session file, reports one
+ * assistant message whose usage empties the balance, and then keeps running until killed.
+ * Every later run behaves like the plain launcher; a work run commits hello.txt and wip.txt.
+ */
+const stopLauncher: RunLauncher = (_command, args, options) => {
+	const fake = new FakeOmp(undefined);
+	stopChildren.push(fake);
+	const cwd = String(options.cwd);
+	const at = (flag: string) =>
+		args.includes(flag) ? (args[args.indexOf(flag) + 1] ?? null) : null;
+	fake.onPrompt = () => {
+		const isCheck = fake.written.join("").startsWith(CHECK_OPENING);
+		const resume = at("--resume");
+		const wip = join(cwd, "wip.txt");
+		stopLaunches.push({
+			args,
+			cwd,
+			resume,
+			wipAtStart: existsSync(wip),
+			isCheck,
+		});
+		liveStopRuns.add(fake);
+		fake.once("close", () => liveStopRuns.delete(fake));
+		if (stopLaunches.length === 1) {
+			writeFileSync(wip, "half done\n");
+			const sessionDir = at("--session-dir") ?? "";
+			mkdirSync(sessionDir, { recursive: true });
+			writeFileSync(join(sessionDir, `1_${STOP_SESSION}.jsonl`), "{}\n");
+			feed(fake, [
+				{ type: "session", id: STOP_SESSION, version: 3, cwd: "." },
+				{ type: "agent_start" },
+				...assistant(WORK_MODEL, "Starting on the file.", {
+					input: 800,
+					output: 100,
+					cacheRead: 0,
+					cacheWrite: 0,
+					cost: STOP_COST,
+				}),
+			]);
+			return; // still running: only the credit stop ends it
+		}
+		let events: unknown[];
+		if (isCheck) events = checkEventsFor(args);
+		else {
+			writeFileSync(join(cwd, "hello.txt"), `hello ${TENANT}\n`);
+			gitSync(cwd, "add", "hello.txt", ...(existsSync(wip) ? ["wip.txt"] : []));
+			gitSync(cwd, "commit", "-qm", "feat: add hello.txt");
+			events = workEvents(resume ?? `sess-${stopLaunches.length}`);
+		}
+		feed(fake, events);
 		fake.emit("close", 0);
 	};
 	return fake as unknown as ChildProcess; // the fake stands in for Node's class
@@ -379,11 +488,20 @@ function makeRepo(dir: string): void {
 	gitSync(dir, "commit", "-qm", "seed");
 }
 
-/** createTurnLoop + createApp with the hosted deps, after src/server.ts's wiring. */
-function mountBoard(hosted: Hosted): Board {
-	const g = GlobalStore.open(join(root, "global"));
+/** createTurnLoop + createApp with the hosted deps, after src/server.ts's wiring. `name` is the
+ * project folder; `startRun` replaces the real runner with the plain fake launcher. */
+function mountBoard(
+	hosted: Hosted,
+	o: {
+		name?: string;
+		maxTotalRuns?: number;
+		startRun?: TurnOps["startRun"];
+	} = {},
+): Board {
+	const name = o.name ?? "app";
+	const g = GlobalStore.open(join(root, `global-${name}`));
 	stores.push(g);
-	const projectDir = join(root, "app");
+	const projectDir = join(root, name);
 	makeRepo(projectDir);
 	const store = ProjectStore.open(projectDir);
 	stores.push(store);
@@ -405,7 +523,7 @@ function mountBoard(hosted: Hosted): Board {
 		archReview: null,
 	});
 	const shared = {
-		maxTotalRuns: 3,
+		maxTotalRuns: o.maxTotalRuns ?? 3,
 		reviewCheck: true,
 		workCheck: true,
 		idleReviews: true,
@@ -475,7 +593,9 @@ function mountBoard(hosted: Hosted): Board {
 		pidAlive: (pid) => livePids.has(pid),
 		vmTokens,
 		// The real runner: argv, stdin prompt, run sink and applyEvent; only the child is fake.
-		startRun: (o) => startRun({ ...o, launcher, memoryConfigPath: null }),
+		startRun:
+			o.startRun ??
+			((run) => startRun({ ...run, launcher, memoryConfigPath: null })),
 		ensurePackages: async () => [],
 		publishRelease: notWired("a release publish"),
 		runReleaseCommand: notWired("a release command"),
@@ -494,6 +614,7 @@ function mountBoard(hosted: Hosted): Board {
 		cancel: loop.cancel,
 		stopTurn: loop.stopTurn,
 		creditStop: loop.creditStop,
+		creditRelease: loop.creditRelease,
 		finishKept: loop.finishKept,
 		claimedPids: () => new Set<number>(),
 		schedule: loop.schedule,
@@ -514,17 +635,24 @@ function mountBoard(hosted: Hosted): Board {
 
 /**
  * The proxy: forwards with the tenant's public Host and Origin and a fresh signed owner header.
- * `identity: null` sends no header; a string sends that exact header (a replay).
+ * `identity: null` sends no header; a string sends that exact header (a replay). `role`
+ * signs another role (the control plane's own calls); `to` picks the board (default `board`).
  */
 function proxyFetch(
 	path: string,
-	init: { method?: string; body?: unknown; identity?: string | null } = {},
+	init: {
+		method?: string;
+		body?: unknown;
+		identity?: string | null;
+		role?: "owner" | "control";
+		to?: Board;
+	} = {},
 ): Promise<Response> {
 	const identity =
 		init.identity === undefined
-			? signIdentity(SECRET, TENANT, "owner")
+			? signIdentity(SECRET, TENANT, init.role ?? "owner")
 			: init.identity;
-	return fetch(new URL(path, board.url), {
+	return fetch(new URL(path, (init.to ?? board).url), {
 		method: init.method ?? (init.body === undefined ? "GET" : "POST"),
 		headers: {
 			Host: PUBLIC,
@@ -562,13 +690,30 @@ afterAll(() => {
 });
 
 /** Bounded wait for a store fact that no event exposes (the turn loop has no settle signal). */
-async function eventually(what: string, done: () => boolean): Promise<void> {
-	const deadline = Date.now() + 10_000;
+async function eventually(
+	what: string,
+	done: () => boolean,
+	ms = 10_000,
+): Promise<void> {
+	const deadline = Date.now() + ms;
 	while (!done()) {
 		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 		await Bun.sleep(10);
 	}
 }
+
+/** The run key of a metering record: equal for the interim and final records of one run. */
+const runKey = (r: MeteringRecord) => [
+	r.project,
+	r.taskId,
+	r.turnId,
+	r.kind,
+	r.role,
+	r.run,
+];
+
+const byRun = (records: MeteringRecord[]) =>
+	[...records].sort((x, y) => x.run - y.run);
 
 describe("hosted mode end to end", () => {
 	test("a proxied card runs work + check, meters each run per role, and parks at the credit gate", async () => {
@@ -592,7 +737,8 @@ describe("hosted mode end to end", () => {
 		expect(started.status).toBe(200);
 
 		// Work run -> check run -> settle at merging -> the chained merge turn hits the gate.
-		await cp.meteringCount(2);
+		// Each run sends one interim record (its first message_end) and one final record.
+		await cp.meteringCount(4);
 		await cp.creditCount(2);
 		await eventually(
 			"the merge turn to park at the credit gate",
@@ -633,9 +779,49 @@ describe("hosted mode end to end", () => {
 			kind: "work",
 		};
 		expect(CHECK_ROLE).toBe("critic");
-		expect(cp.metering).toEqual([
-			{ ...base, role: "default", model: WORK_MODEL, usage: WORK_USAGE },
-			{ ...base, role: CHECK_ROLE, model: CHECK_MODEL, usage: CHECK_USAGE },
+		expect(byRun(cp.metering.filter((r) => r.final))).toEqual([
+			{
+				...base,
+				role: "default",
+				model: WORK_MODEL,
+				run: 0,
+				final: true,
+				usage: WORK_USAGE,
+			},
+			{
+				...base,
+				role: CHECK_ROLE,
+				model: CHECK_MODEL,
+				run: 1,
+				final: true,
+				usage: CHECK_USAGE,
+			},
+		]);
+		// The interim records: the cumulative usage after the run's first assistant message. The
+		// work run's second message comes inside the 2 s interval, so only its final record has it.
+		expect(byRun(cp.metering.filter((r) => !r.final))).toEqual([
+			{
+				...base,
+				role: "default",
+				model: WORK_MODEL,
+				run: 0,
+				final: false,
+				usage: {
+					input: 1200,
+					output: 300,
+					cacheRead: 9000,
+					cacheWrite: 10,
+					cost: 0.25,
+				},
+			},
+			{
+				...base,
+				role: CHECK_ROLE,
+				model: CHECK_MODEL,
+				run: 1,
+				final: false,
+				usage: CHECK_USAGE,
+			},
 		]);
 		// Every control-plane call carried a valid tenant identity, and none failed.
 		expect(cp.refused).toEqual([]);
@@ -672,4 +858,197 @@ describe("hosted mode end to end", () => {
 			false,
 		);
 	});
+});
+
+describe("hosted credit stop and release end to end", () => {
+	/** USD paid in; the first work run's first message costs more than the start balance. */
+	const funds = { paid: 0.25 };
+	/** The ledger: the highest cumulative cost seen for each run key. A repeated or late record
+	 * of a run never counts twice. */
+	const spent = new Map<string, number>();
+	const balance = () =>
+		funds.paid - [...spent.values()].reduce((sum, c) => sum + c, 0);
+	let cp2: ControlPlane;
+	let board2: Board;
+	let stopCall: Promise<Response> | null = null;
+	/** Live fake omp runs at the moment the control plane called stop. */
+	let runningAtStop = -1;
+	/** Children that startRun's kill reached. */
+	const kills: FakeOmp[] = [];
+	/** A claimed merge turn. With one turn at a time, a claimed card is the one at the gate. */
+	const mergeClaimed = (t: { state: string; stage: string }) =>
+		t.state === "preparing" && t.stage === "merging";
+
+	beforeAll(() => {
+		cp2 = startControlPlane({
+			// The harness wires no merge gates, so a merge turn never gets credit: a finished work
+			// turn parks in the merge column, as in the first scenario.
+			credit: () =>
+				balance() > 0 && !board2.store.listTasks().some(mergeClaimed),
+			onMetering: (r) => {
+				const key = JSON.stringify(runKey(r));
+				spent.set(key, Math.max(spent.get(key) ?? 0, r.usage.cost));
+				if (balance() > 0 || stopCall !== null) return;
+				// Zero balance: the control plane stops the tenant, signed as itself.
+				runningAtStop = liveStopRuns.size;
+				stopCall = proxyFetch("/api/hosted/stop", {
+					method: "POST",
+					role: "control",
+					to: board2,
+				});
+			},
+		});
+		const config = readHostedConfig({
+			OTTR_HOSTED: "1",
+			OTTR_HOSTED_TENANT: TENANT,
+			OTTR_HOSTED_SECRET: SECRET,
+			OTTR_HOSTED_CONTROL_URL: cp2.url,
+		});
+		if (config === null) throw new Error("hosted config did not parse");
+		const hookLogs: string[] = [];
+		board2 = mountBoard(
+			{
+				config,
+				hooks: controlPlaneHooks(config, { log: (m) => hookLogs.push(m) }),
+			},
+			{
+				name: "credit",
+				// One turn at a time, so the credit answer can tell a merge turn's gate apart.
+				maxTotalRuns: 1,
+				// The real runner with pidless fakes: its kill only marks the run killed, and the
+				// fake then exits like a killed omp.
+				startRun: (run) => {
+					const handle = startRun({
+						...run,
+						launcher: stopLauncher,
+						memoryConfigPath: null,
+					});
+					const child = stopChildren.at(-1)!;
+					return {
+						...handle,
+						kill: async () => {
+							kills.push(child);
+							await handle.kill();
+							child.emit("close", null);
+						},
+					};
+				},
+			},
+		);
+		board2.logs = hookLogs;
+	});
+
+	test("zero credit stops the run mid-flight and keeps its work; a top-up release resumes the same session", async () => {
+		const store = board2.store;
+		const file = async (prompt: string): Promise<string> => {
+			const res = await proxyFetch(`/api/projects/${store.name}/tasks`, {
+				body: { prompt },
+				to: board2,
+			});
+			expect(res.status).toBe(200);
+			return store.listTasks().find((t) => t.prompt === prompt)!.id;
+		};
+
+		// Card A runs. Its first interim record empties the balance, and the control plane
+		// calls stop while the fake omp still runs.
+		const a = await file("Card A: add hello.txt");
+		await eventually("the control plane's stop call", () => stopCall !== null);
+		const stopped = await stopCall!;
+		expect(stopped.status).toBe(200);
+		expect(await stopped.json()).toEqual({ stopped: 1 });
+		expect(runningAtStop).toBe(1);
+		expect(kills).toEqual([stopChildren[0]!]);
+		expect(liveStopRuns.size).toBe(0);
+
+		await eventually(
+			"card A to park",
+			() => store.getTask(a)!.state === "needs_you",
+		);
+		const parked = store.getTask(a)!;
+		expect(parked.needsReason).toBe(DEFAULT_CREDIT_REASON);
+		expect(parked.sessionId).toBe(STOP_SESSION);
+		const wt = parked.worktree!;
+		expect(wt).toBe(stopLaunches[0]!.cwd);
+		expect(gitSync(wt, "status", "--porcelain")).toContain("?? wip.txt");
+		expect(store.listTurns(a).map((t) => t.error)).toEqual(["stopped"]);
+
+		// The interim record that emptied the balance and the stopped run's final record name
+		// the same run.
+		await eventually("the stopped run's final record", () =>
+			cp2.metering.some((r) => r.taskId === a && r.final),
+		);
+		const stopRecords = cp2.metering.filter((r) => r.taskId === a);
+		expect(stopRecords.map((r) => [r.final, r.usage.cost])).toEqual([
+			[false, STOP_COST],
+			[true, STOP_COST],
+		]);
+		expect(runKey(stopRecords[1]!)).toEqual(runKey(stopRecords[0]!));
+		expect(stopRecords[0]).toMatchObject({
+			role: "default",
+			run: 0,
+			turnId: store.listTurns(a)[0]!.id,
+		});
+
+		// Card B: the gate finds no credit, and the card parks before any run.
+		const b = await file("Card B: add a second file");
+		await eventually(
+			"card B to park at the gate",
+			() => store.getTask(b)!.state === "needs_you",
+		);
+		expect(store.getTask(b)!.needsReason).toBe(DEFAULT_CREDIT_REASON);
+		expect(store.getTask(b)!.worktree).toBeNull();
+		expect(stopLaunches).toHaveLength(1);
+
+		// Top-up, then the control plane releases the board.
+		funds.paid += 10;
+		const released = await proxyFetch("/api/hosted/release", {
+			method: "POST",
+			role: "control",
+			to: board2,
+		});
+		expect(released.status).toBe(200);
+		expect(await released.json()).toEqual({ released: 2 });
+
+		// Both cards finish their work turn, and each parks at its merge turn's gate.
+		await eventually(
+			"both work turns to finish",
+			() =>
+				[a, b].every((id) => {
+					const t = store.getTask(id)!;
+					return t.stage === "merging" && t.state === "needs_you";
+				}),
+			30_000,
+		);
+
+		// A resumed the same omp session on the kept worktree, with the uncommitted file there.
+		const resumed = stopLaunches.filter((l) => l.resume !== null);
+		expect(resumed).toHaveLength(1);
+		expect(resumed[0]).toMatchObject({
+			cwd: wt,
+			resume: STOP_SESSION,
+			wipAtStart: true,
+			isCheck: false,
+		});
+		const doneA = store.getTask(a)!;
+		expect(doneA.sessionId).toBe(STOP_SESSION);
+		expect(doneA.worktree).toBe(wt);
+		expect(doneA.needsReason).toBe(DEFAULT_CREDIT_REASON);
+		expect(doneA.workCheckLog.map((r) => r.outcome)).toEqual(["pass"]);
+		expect(
+			gitSync(wt, "show", "--name-only", "--format=", "HEAD").split("\n"),
+		).toContain("wip.txt");
+		expect(store.listTurns(a).map((t) => t.error)[0]).toBe("stopped");
+
+		// B, released from the gate, ran its first work turn from a fresh session.
+		const doneB = store.getTask(b)!;
+		expect(doneB.workCheckLog.map((r) => r.outcome)).toEqual(["pass"]);
+		expect(
+			stopLaunches.filter((l) => l.cwd === doneB.worktree && !l.isCheck),
+		).toMatchObject([{ resume: null, wipAtStart: false }]);
+
+		// Stopped run, then work + check for each card.
+		expect(stopLaunches).toHaveLength(5);
+		expect(cp2.refused).toEqual([]);
+		expect(board2.logs).toEqual([]);
+	}, 60_000);
 });

@@ -23,6 +23,7 @@ import type { CommitIdentity } from "./gitIdentity.ts";
 import {
 	DEFAULT_CREDIT_REASON,
 	type Hosted,
+	METERING_INTERVAL_MS,
 	type MeteringRecord,
 	type TokenUsage,
 } from "./hosted.ts";
@@ -103,7 +104,11 @@ import {
 	sessionHoldsPrompt,
 	sessionModel,
 } from "./session.ts";
-import { DEFAULT_SETTINGS, type ProjectStore } from "./store.ts";
+import {
+	DEFAULT_SETTINGS,
+	type ProjectStore,
+	type TaskPatch,
+} from "./store.ts";
 import { progressKey } from "./stryker.ts";
 import type {
 	ArchReview,
@@ -689,6 +694,8 @@ export interface TurnOps {
 	quota?: () => Promise<QuotaState>;
 	/** Hosted mode (docs/specs/hosted-mode.md): metering reports, the credit gate and hosted wording; undefined on every self-hosted board. */
 	hosted?: Hosted;
+	/** Hosted interim metering interval in ms; tests only, default METERING_INTERVAL_MS. */
+	meteringIntervalMs?: number;
 }
 
 /**
@@ -814,6 +821,124 @@ const NO_USAGE: TokenUsage = {
 	cacheWrite: 0,
 	cost: 0,
 };
+
+/** Hosted metering (docs/specs/hosted-mode.md section 4): sends one record. reportUsage is
+ * fire-and-forget; a throw is logged and never fails the run or the settle. */
+function sendMetering(
+	hosted: Hosted,
+	record: Omit<MeteringRecord, "tenant">,
+): void {
+	try {
+		hosted.hooks.reportUsage({ tenant: hosted.config.tenant, ...record });
+	} catch (err) {
+		console.log(`${record.project}: ! metering report failed: ${errmsg(err)}`);
+	}
+}
+
+/** The run key of a metering record: everything but the usage, the model and `final`. */
+type MeteringKey = Pick<
+	MeteringRecord,
+	"project" | "taskId" | "turnId" | "kind" | "role" | "run"
+>;
+
+/** One settled agent run of a turn, as its final metering record carries it. */
+type MeteredRun = Pick<MeteringRecord, "run" | "role" | "model" | "usage">;
+
+/** The interim metering of one active run (interimMeter). */
+interface InterimMeter {
+	/** startRun's onUsage: the run's cumulative usage after a change. */
+	onUsage(usage: TokenUsage, model: string | null): void;
+	/** The run ended: no interim record goes out after this. */
+	close(): void;
+}
+
+/**
+ * Hosted interim metering (docs/specs/hosted-mode.md section 4) of one active run: the run's
+ * cumulative usage as an interim record (final: false), at most one each `intervalMs`. A change
+ * inside the interval goes out when the interval ends, with the newest usage. `key` is null
+ * while the turn row does not exist yet; the send then waits one more interval. close() at the
+ * run's end drops what is pending: the run's final record at settle carries it.
+ */
+function interimMeter(
+	hosted: Hosted,
+	key: () => MeteringKey | null,
+	intervalMs: number,
+): InterimMeter {
+	let pending: { usage: TokenUsage; model: string | null } | null = null;
+	let lastAt = Number.NEGATIVE_INFINITY;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let closed = false;
+	const flush = (): void => {
+		timer = undefined;
+		if (closed || pending === null) return;
+		const k = key();
+		if (k === null) {
+			timer = setTimeout(flush, intervalMs);
+			return;
+		}
+		lastAt = Date.now();
+		const { usage, model } = pending;
+		pending = null;
+		sendMetering(hosted, { ...k, model, usage, final: false });
+	};
+	return {
+		onUsage(usage, model) {
+			if (closed) return;
+			pending = { usage, model };
+			if (timer !== undefined) return;
+			const wait = lastAt + intervalMs - Date.now();
+			if (wait <= 0) flush();
+			else timer = setTimeout(flush, wait);
+		},
+		close() {
+			closed = true;
+			pending = null;
+			clearTimeout(timer);
+			timer = undefined;
+		},
+	};
+}
+
+/** The queue text of an owner reply: under a steer queued before the park; Resume (".")
+ * sends that steer alone. */
+export function queuedReply(pending: string | null, next: string): string {
+	return pending === null
+		? next
+		: next === "."
+			? pending
+			: `${pending}\n\n${next}`;
+}
+
+/**
+ * The queue write of a plain owner reply to a needs_you card (POST .../reply), also of the
+ * hosted credit release (docs/specs/hosted-mode.md section 5), which sends Resume ("."). The
+ * next turn resumes the card's session with the text. `images`: the reply's saved images.
+ * `by`: the author when no text is queued yet; queued text keeps today's author rule. The
+ * release passes "supervisor", so its "." is not a user message that overrides the
+ * usage-limit start gate.
+ */
+export function replyPatch(
+	task: Pick<Task, "pendingPrompt" | "pendingBy" | "pendingImages">,
+	text: string,
+	images: readonly string[] = [],
+	by: "user" | "supervisor" = "user",
+): TaskPatch {
+	return {
+		pendingPrompt: queuedReply(task.pendingPrompt, text),
+		pendingBy:
+			task.pendingPrompt === null
+				? by
+				: task.pendingBy === "supervisor"
+					? "supervisor"
+					: "user",
+		pendingImages: [...task.pendingImages, ...images],
+		state: "queued",
+		holdUntil: null,
+		queuedAt: Date.now(),
+		needsReason: null,
+		asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
+	};
+}
 
 export function keptReason(unsaved: string): string {
 	return `${KEPT_PREFIX}${unsaved}. Reply to continue, or Cancel to delete it.`;
@@ -946,6 +1071,10 @@ export interface TurnLoop {
 	 * stopTurn, check runs, turns before their run), parks each card with the credit reason, and
 	 * resolves to the number stopped. */
 	creditStop(): Promise<number>;
+	/** Hosted mode: the release after a top-up. Clears the credit hold and queues every needs_you
+	 * card that the credit stop or gate parked, like an owner Resume ("."); resolves to the number
+	 * queued. */
+	creditRelease(): Promise<number>;
 	finishKept(
 		e: TurnProject,
 		id: string,
@@ -1026,7 +1155,8 @@ export function createTurnLoop(
 	 * synchronous claim and before anything spends a model token (title, run, check): an await
 	 * before the claim would let one schedule tick pass every queued card through the caps. True:
 	 * the turn starts. False: the card parked with the credit reason, or went back to the queue
-	 * held for CREDIT_RETRY_MS when the control plane gave no answer. A cancel that landed during
+	 * held for CREDIT_RETRY_MS when the control plane gave no answer, or unheld when a
+	 * creditRelease ran during a call that answered no credit. A cancel that landed during
 	 * the call owns the card and gets no write. */
 	async function creditGate(
 		hosted: Hosted,
@@ -1037,6 +1167,9 @@ export function createTurnLoop(
 		let ok: boolean;
 		// A gate call that started before a creditStop must not clear that stop's hold.
 		const stopsBefore = creditStops;
+		// A false answer that started before a creditRelease must not park the card: the
+		// release skipped it while it was preparing, and no later release comes.
+		const releasesBefore = creditReleases;
 		let failure: string | null = null;
 		try {
 			ok = await hosted.hooks.creditOk();
@@ -1063,6 +1196,16 @@ export function createTurnLoop(
 				needsReason: CREDIT_CHECK_FAILED,
 				asked: claimed.asked,
 			});
+		} else if (releasesBefore !== creditReleases) {
+			log("- credit released during the credit check: the card checks again");
+			// Back to the queue unheld, so the next schedule tick asks the gate again.
+			store.updateTask(claimed.id, {
+				state: "queued",
+				holdUntil: null,
+				holdProvider: null,
+				holdWindow: null,
+				asked: claimed.asked,
+			});
 		} else {
 			log("- turn not started: the board is out of credit");
 			store.updateTask(claimed.id, {
@@ -1071,26 +1214,6 @@ export function createTurnLoop(
 			});
 		}
 		return false;
-	}
-	/** Hosted metering (docs/specs/hosted-mode.md section 4): one record for each agent run of a
-	 * settled turn. reportUsage is fire-and-forget; a throw is logged and never fails the settle. */
-	function reportMetering(
-		hosted: Hosted,
-		turn: Pick<MeteringRecord, "project" | "taskId" | "turnId" | "kind">,
-		runs: readonly Pick<MeteringRecord, "role" | "model" | "usage">[],
-	): void {
-		for (const run of runs)
-			try {
-				hosted.hooks.reportUsage({
-					tenant: hosted.config.tenant,
-					...turn,
-					...run,
-				});
-			} catch (err) {
-				console.log(
-					`${turn.project}: ! metering report failed: ${errmsg(err)}`,
-				);
-			}
 	}
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
 	 * once startRun returns, so the cap counts distinct keys, never the two sets' summed sizes.
@@ -1107,6 +1230,9 @@ export function createTurnLoop(
 	let creditHold = false;
 	/** The number of creditStop calls, so a gate answer older than a stop keeps the hold. */
 	let creditStops = 0;
+	/** The number of creditRelease calls, so a false gate answer older than a release does not
+	 * park the card that the release skipped while it was preparing. */
+	let creditReleases = 0;
 	/** Turns ("project/id") that creditStop stopped: a work or merge run, a check run, or a turn
 	 * in its prepare or settle awaits. The turn parks with the credit reason at its next model
 	 * dispatch point or check settle; the key's next claim clears the mark. */
@@ -2008,11 +2134,39 @@ export function createTurnLoop(
 		/** Set when sweepLostTurns took over a hung check of this run: the finally must then
 		 * leave the preparing claim alone (it may belong to a replacement run already). */
 		let checkTakenOver = false;
-		/** Hosted metering: one entry for each agent run of this turn, reported in the finally. */
-		const metered: Pick<MeteringRecord, "role" | "model" | "usage">[] = [];
-		const meter = (role: string, r: RunResult) => {
-			if (ops.hosted !== undefined)
-				metered.push({ role, model: r.model, usage: r.usage ?? NO_USAGE });
+		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally. */
+		const metered: MeteredRun[] = [];
+		/** Interim metering of this turn's runs that have not settled; the finally closes them. */
+		const interims = new Set<InterimMeter>();
+		let runs = 0;
+		/** Hosted metering of one agent run, opened right before its startRun: the run's index in
+		 * the turn, its interim records while it runs (startRun's onUsage), and settle(), which
+		 * ends the interim records and queues the final record. Null on a self-hosted board. */
+		const openMeter = (role: string) => {
+			if (ops.hosted === undefined) return null;
+			const run = runs++;
+			const interim = interimMeter(
+				ops.hosted,
+				() =>
+					turn === null
+						? null
+						: { project: name, taskId: id, turnId: turn.id, kind, role, run },
+				ops.meteringIntervalMs ?? METERING_INTERVAL_MS,
+			);
+			interims.add(interim);
+			return {
+				onUsage: interim.onUsage,
+				settle(r: RunResult): void {
+					interim.close();
+					interims.delete(interim);
+					metered.push({
+						run,
+						role,
+						model: r.model,
+						usage: r.usage ?? NO_USAGE,
+					});
+				},
+			};
 		};
 		/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
 		 * hold or this turn's creditStop mark forbids the next model run. The card then parks
@@ -2607,11 +2761,15 @@ export function createTurnLoop(
 
 			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
 			const runStartedAt = Date.now();
+			// The work or merge run resolves its model from the default role, also when the card
+			// or session names its own model (docs/specs/hosted-mode.md section 4).
+			const runMeter = openMeter("default");
 			const handle = ops.startRun({
 				meter: ops.hosted !== undefined,
 				auditProvisioned: (sinceMs, rulesAtStart) =>
 					auditProvisioned(homedir(), sinceMs, rulesAtStart),
 				rulesAtStart: () => rulesDirEntries(homedir()),
+				...(runMeter !== null && { onUsage: runMeter.onUsage }),
 				cwd: wt,
 				prompt,
 				images: imagePaths,
@@ -2785,9 +2943,7 @@ export function createTurnLoop(
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
 			const result0 = (await handle.done) as RunResult;
-			// The work or merge run resolves its model from the default role, also when the card
-			// or session names its own model (docs/specs/hosted-mode.md section 4).
-			meter("default", result0);
+			runMeter?.settle(result0);
 			const runEndedAt = Date.now();
 			// sweepLostTurns proved the pid dead and settled this turn's row; a late resolution must
 			// not settle again or clobber the card the sweep requeued.
@@ -4410,11 +4566,15 @@ export function createTurnLoop(
 						// Hosted: no check attempt starts under a credit stop, the retry included.
 						if (creditBlocked()) return;
 						const startedAt = Date.now();
+						const checkMeter = openMeter(
+							selector === undefined ? "default" : checkRole,
+						);
 						const handle = ops.startRun({
 							meter: ops.hosted !== undefined,
 							auditProvisioned: (sinceMs, rulesAtStart) =>
 								auditProvisioned(homedir(), sinceMs, rulesAtStart),
 							rulesAtStart: () => rulesDirEntries(homedir()),
+							...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
 							cwd: wt,
 							prompt: input,
 							sessionDir: store.sessionsDir,
@@ -4434,7 +4594,7 @@ export function createTurnLoop(
 						const checkKey = `${key}:check`;
 						running.set(checkKey, handle);
 						const checkResult = (await handle.done) as RunResult;
-						meter(selector === undefined ? "default" : checkRole, checkResult);
+						checkMeter?.settle(checkResult);
 						// sweepLostTurns settled a lost check: its outcome owns the card now.
 						if (running.get(checkKey) !== handle) {
 							checkTakenOver = true;
@@ -4691,11 +4851,15 @@ export function createTurnLoop(
 							// Hosted: no check attempt starts under a credit stop, the retry included.
 							if (creditBlocked()) return;
 							const startedAt = Date.now();
+							const checkMeter = openMeter(
+								selector === undefined ? "default" : checkRole,
+							);
 							const handle = ops.startRun({
 								meter: ops.hosted !== undefined,
 								auditProvisioned: (sinceMs, rulesAtStart) =>
 									auditProvisioned(homedir(), sinceMs, rulesAtStart),
 								rulesAtStart: () => rulesDirEntries(homedir()),
+								...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
 								cwd: wt,
 								prompt: input,
 								sessionDir: store.sessionsDir,
@@ -4715,10 +4879,7 @@ export function createTurnLoop(
 							const checkKey = `${key}:workcheck`;
 							running.set(checkKey, handle);
 							const checkResult = (await handle.done) as RunResult;
-							meter(
-								selector === undefined ? "default" : checkRole,
-								checkResult,
-							);
+							checkMeter?.settle(checkResult);
 							// sweepLostTurns settled a lost check: its outcome owns the card now.
 							if (running.get(checkKey) !== handle) {
 								checkTakenOver = true;
@@ -4950,13 +5111,19 @@ export function createTurnLoop(
 				creditStopped.delete(key);
 			}
 			publishing.delete(key);
-			// Settle is done: report each run's usage, also of a stopped or failed run.
+			// Settle is done: report each run's usage, also of a stopped or failed run. No interim
+			// record goes out after this point, also for a run whose result never came.
+			for (const interim of interims) interim.close();
 			if (ops.hosted !== undefined && turn !== null)
-				reportMetering(
-					ops.hosted,
-					{ project: name, taskId: id, turnId: turn.id, kind },
-					metered,
-				);
+				for (const r of metered)
+					sendMetering(ops.hosted, {
+						project: name,
+						taskId: id,
+						turnId: turn.id,
+						kind,
+						...r,
+						final: true,
+					});
 			schedule();
 		}
 	}
@@ -5075,6 +5242,41 @@ export function createTurnLoop(
 		if (!preparing.has(key) || settling.has(key)) return null;
 		creditStopped.add(key);
 		return Promise.resolve(true);
+	}
+
+	/** Hosted mode (docs/specs/hosted-mode.md section 5): the control plane's release after a
+	 * top-up. It clears the credit hold, as a fresh true gate answer does, and changes no other
+	 * stop state. Then it queues every needs_you card that the credit stop or the credit gate
+	 * parked (its reason is the credit reason) like an owner Resume ("."): a stopped card resumes
+	 * its session on the kept worktree. Each queued turn still passes the credit gate. Resolves
+	 * to the number queued; a second call finds no parked card. */
+	async function creditRelease(): Promise<number> {
+		if (ops.hosted === undefined) return 0;
+		const reason = ops.hosted.config.wording.creditReason;
+		creditHold = false;
+		creditReleases += 1;
+		let released = 0;
+		for (const e of projects.values()) {
+			try {
+				for (const t of e.store.listTasks()) {
+					if (
+						t.state !== "needs_you" ||
+						t.cancelledAt !== null ||
+						t.needsReason !== reason
+					)
+						continue;
+					// Nobody typed the release's ".": a queued steer keeps its own author.
+					e.store.updateTask(t.id, replyPatch(t, ".", [], "supervisor"));
+					released += 1;
+				}
+			} catch (err) {
+				// One sick store must not keep the other projects' cards parked.
+				logStoreError(e.store.name, err);
+			}
+		}
+		if (released > 0) ops.publishSoon();
+		schedule();
+		return released;
 	}
 
 	/**
@@ -5288,6 +5490,7 @@ export function createTurnLoop(
 		cancel,
 		stopTurn,
 		creditStop,
+		creditRelease,
 		finishKept,
 		recoverRestarted,
 		running,

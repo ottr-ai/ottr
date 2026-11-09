@@ -110,6 +110,7 @@ function mount(
 		});
 	}
 	const stops: number[] = [];
+	const releases: number[] = [];
 	const app = createApp({
 		gstore: g,
 		defaultDir: root,
@@ -133,6 +134,10 @@ function mount(
 			stops.push(Date.now());
 			return 2;
 		},
+		creditRelease: async () => {
+			releases.push(Date.now());
+			return 3;
+		},
 		...extra,
 	});
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
@@ -151,7 +156,7 @@ function mount(
 			headers: { "content-type": "application/json", ...opts.headers },
 			body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
 		});
-	return { call, g, store, stops, app, projects };
+	return { call, g, store, stops, releases, app, projects };
 }
 
 const hosted: Hosted = {
@@ -287,6 +292,38 @@ describe("hosted mode request wall", () => {
 		expect(control.status).toBe(200);
 		expect(await control.json()).toEqual({ stopped: 2 });
 		expect(board.stops.length).toBe(before + 1);
+	});
+
+	test("POST /api/hosted/release: control only, answers the released count", async () => {
+		const before = board.releases.length;
+		for (const role of ["owner", "tenant"] as const) {
+			const res = await board.call("/api/hosted/release", {
+				method: "POST",
+				headers: signed(role),
+			});
+			expect(res.status).toBe(403);
+		}
+		const none = await board.call("/api/hosted/release", {
+			method: "POST",
+			headers: loopback,
+		});
+		expect(none.status).toBe(401);
+		const forged = await board.call("/api/hosted/release", {
+			method: "POST",
+			headers: signed(
+				"control",
+				signIdentity("f".repeat(40), TENANT, "control"),
+			),
+		});
+		expect(forged.status).toBe(401);
+		expect(board.releases.length).toBe(before);
+		const control = await board.call("/api/hosted/release", {
+			method: "POST",
+			headers: signed("control"),
+		});
+		expect(control.status).toBe(200);
+		expect(await control.json()).toEqual({ released: 3 });
+		expect(board.releases.length).toBe(before + 1);
 	});
 
 	test("control reaches no other route, tenant no route at all", async () => {
@@ -606,7 +643,7 @@ describe("POST /api/hosted/github-event", () => {
 describe("self-hosted board (hosted mode off)", () => {
 	const board = mount("self", undefined);
 
-	test("/api/setup stays open and /api/hosted/stop does not exist", async () => {
+	test("/api/setup stays open and /api/hosted/stop and /release do not exist", async () => {
 		const setup = await board.call("/api/setup", {
 			headers: loopback,
 			body: {},
@@ -618,6 +655,13 @@ describe("self-hosted board (hosted mode off)", () => {
 		});
 		expect(stop.status).toBe(404);
 		expect(board.stops).toEqual([]);
+		const release = await board.call("/api/hosted/release", {
+			method: "POST",
+			headers: { ...loopback, ...signed("control") },
+		});
+		expect(release.status).toBe(404);
+		expect(await release.json()).toEqual({ error: "not found" });
+		expect(board.releases).toEqual([]);
 		// The forwarded GitHub-event route joins stop behind the hosted flag.
 		const ghEvent = await board.call("/api/hosted/github-event", {
 			method: "POST",

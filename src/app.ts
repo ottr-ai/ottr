@@ -295,6 +295,8 @@ import {
 	isKeptReason,
 	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
+	queuedReply,
+	replyPatch,
 	type StopOutcome,
 	type TurnProject,
 	UPDATE_HOLD_REASON,
@@ -627,6 +629,12 @@ interface AppDeps {
 	 * the number of turns stopped.
 	 */
 	creditStop?: () => Promise<number>;
+	/**
+	 * Hosted mode's credit release (POST /api/hosted/release, docs/specs/hosted-mode.md section
+	 * 5): after a top-up, clears the credit hold and queues each card the credit stop or gate
+	 * parked, like an owner Resume; resolves to the number of cards queued.
+	 */
+	creditRelease?: () => Promise<number>;
 	/**
 	 * Hosted forwarded GitHub events (POST /api/hosted/github-event, docs/specs/hosted-mode.md
 	 * section 8): kicks the CI-watch supervisor's tick for one project. server.ts binds it after
@@ -4993,6 +5001,19 @@ export function createApp(deps: AppDeps) {
 				});
 			},
 		},
+		// Hosted credit release (docs/specs/hosted-mode.md section 5): the control plane's call after
+		// a top-up. Same wall rule as stop: only a signed control identity reaches it.
+		"/api/hosted/release": {
+			POST: (req) => {
+				if (deps.hosted === undefined)
+					return Promise.resolve(json({ error: "not found" }, 404));
+				return api(req, async () => {
+					if (deps.creditRelease === undefined)
+						throw new Error("hosted mode without a creditRelease");
+					return json({ released: await deps.creditRelease() });
+				});
+			},
+		},
 		// Hosted forwarded GitHub events (docs/specs/hosted-mode.md section 8): the control plane
 		// verified GitHub's signature and forwards the event here, so the watches that would poll
 		// GitHub on a self-hosted board kick only for the repo the event names. Same wall rule as
@@ -7878,13 +7899,6 @@ export function createApp(deps: AppDeps) {
 					// Same rule as steer/follow-up (R1-9): an empty reply would re-send the whole
 					// task prompt as the next turn, and an unbounded one can blow the session.
 					const trimmed = text.trim();
-					// A steer queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.
-					const queue = (next: string): string =>
-						task.pendingPrompt === null
-							? next
-							: next === "."
-								? task.pendingPrompt
-								: `${task.pendingPrompt}\n\n${next}`;
 					if (
 						trimmed.length > 20000 ||
 						(trimmed === "" && decoded.images.length === 0)
@@ -7913,7 +7927,9 @@ export function createApp(deps: AppDeps) {
 						if (trimmed === WORK_CHECK_ASK_SEND_BACK) {
 							const n = task.workCheckSendbacks + 1;
 							e.store.updateTask(task.id, {
-								pendingPrompt: queue(
+								// A steer queued before the stop stays: the send-back goes under it.
+								pendingPrompt: queuedReply(
+									task.pendingPrompt,
 									workCheckSendBack({
 										blockers: open,
 										attempt: n,
@@ -7979,18 +7995,9 @@ export function createApp(deps: AppDeps) {
 						return taskResponse(e, task.id);
 					}
 					e.store.updateTask(task.id, {
-						// "." keeps pendingPrompt non-null for a picture-only reply (see steer).
-						pendingPrompt: queue(trimmed || "."),
-						pendingBy:
-							task.pendingPrompt !== null && task.pendingBy === "supervisor"
-								? "supervisor"
-								: "user",
-						pendingImages: [...task.pendingImages, ...names],
-						state: "queued",
-						holdUntil: null,
-						queuedAt: Date.now(),
-						needsReason: null,
-						asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
+						// "." keeps pendingPrompt non-null for a picture-only reply (see steer). A steer
+						// queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.
+						...replyPatch(task, trimmed || ".", names),
 						// A non-approval reply never spends the parked head: the hold stays, and the
 						// settle re-parks the card after the work turn.
 					});

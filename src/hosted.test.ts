@@ -111,6 +111,8 @@ describe("controlPlaneHooks", () => {
 			kind: "work",
 			role: "default",
 			model: "a/b",
+			run: 1,
+			final: false,
 			usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 },
 		};
 		const sent = fake(() => new Response(null, { status: 204 }));

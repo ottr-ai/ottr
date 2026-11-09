@@ -158,7 +158,11 @@ export interface TokenUsage {
 	cost: number;
 }
 
-/** One metering event: one agent run (work/merge run or check run) of one turn. */
+/**
+ * One metering event: the cumulative usage of one agent run (work/merge run or check run) of
+ * one turn. (project, taskId, turnId, kind, role, run) names the run: its interim records and
+ * its final record carry the same key.
+ */
 export interface MeteringRecord {
 	tenant: string;
 	project: string;
@@ -171,8 +175,15 @@ export interface MeteringRecord {
 	role: string;
 	/** provider/model the run used; null when omp never named it. */
 	model: string | null;
+	/** Index of the run in its turn: 0 for the turn's first agent run, then 1, 2, ... */
+	run: number;
+	/** False: an interim record while the run is active. True: the record at turn settle. */
+	final: boolean;
 	usage: TokenUsage;
 }
+
+/** Hosted interim metering: at most one interim record each this many ms for each run. */
+export const METERING_INTERVAL_MS = 2_000;
 
 export interface GitToken {
 	token: string;

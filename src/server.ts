@@ -726,6 +726,7 @@ const app = createApp({
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
+	creditRelease: loop.creditRelease,
 	ciWatchTick: (opts) => supervisor.tick(opts),
 	finishKept: loop.finishKept,
 	// OTTR-454: the runners GET /api/drain lists (worker hostnames, then local) and the

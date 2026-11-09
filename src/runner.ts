@@ -975,6 +975,17 @@ function addUsage(state: EventState, raw: unknown): void {
 	};
 }
 
+/** True when two usage sums are equal; null (no usage yet) equals all zeros. */
+function sameUsage(a: TokenUsage | null, b: TokenUsage): boolean {
+	return (
+		(a?.input ?? 0) === b.input &&
+		(a?.output ?? 0) === b.output &&
+		(a?.cacheRead ?? 0) === b.cacheRead &&
+		(a?.cacheWrite ?? 0) === b.cacheWrite &&
+		(a?.cost ?? 0) === b.cost
+	);
+}
+
 interface RunHandle {
 	pid: number | null;
 	/** OTTR-454: the dispatched worker's url; absent for a local run. The turn engine
@@ -1039,6 +1050,9 @@ export function createRunSink(o: {
 	secrets?: readonly string[];
 	/** Hosted mode only: capture token usage into the result; default off keeps the self-hosted result shape. */
 	meter?: boolean;
+	/** Hosted mode only (needs `meter`): the run's cumulative usage and model after each assistant
+	 * message_end that changed the usage; turn.ts sends the interim metering records from it. */
+	onUsage?: (usage: TokenUsage, model: string | null) => void;
 }): RunSink {
 	const es = newEventState();
 	let stderrTail = "";
@@ -1101,8 +1115,11 @@ export function createRunSink(o: {
 			return;
 		}
 		log.write(renderEvent(ev));
+		const before = es.usage;
 		const { sessionStarted } = applyEvent(es, ev, o.meter === true);
 		if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
+		if (es.usage !== null && !sameUsage(before, es.usage))
+			o.onUsage?.({ ...es.usage }, es.model);
 	};
 
 	let partial = "";
@@ -1352,6 +1369,8 @@ export function startRun(o: {
 	 * audit's untracked scan compares against, so only entries the run added are
 	 * findings. Undefined keeps the scan off (tests); production passes it. */
 	rulesAtStart?: () => readonly string[];
+	/** Hosted mode only: interim usage of the active run (createRunSink). */
+	onUsage?: (usage: TokenUsage, model: string | null) => void;
 }): RunHandle {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
@@ -1366,6 +1385,7 @@ export function startRun(o: {
 		onProgress: o.onProgress,
 		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
 		meter: o.meter,
+		onUsage: o.onUsage,
 	});
 
 	// Context a no-stderr death reports (classify folds it into the failure reason): how the

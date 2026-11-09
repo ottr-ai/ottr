@@ -1,7 +1,8 @@
-// Hosted mode in the turn engine (docs/specs/hosted-mode.md sections 1, 4 and 5): metering
-// records at settle, the credit gate, the credit stop and the hosted prompt suffixes.
+// Hosted mode in the turn engine (docs/specs/hosted-mode.md sections 1, 4 and 5): interim and
+// final metering records, the credit gate, the credit stop and release, and the hosted prompt
+// suffixes.
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -379,6 +380,63 @@ describe("hosted metering capture", () => {
 		).toBe(false);
 		expect(sink.state.usage).toBeNull();
 	});
+
+	test("a run sink calls onUsage with the cumulative usage after each assistant message_end that changed it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "hosted-sink-"));
+		dirs.push(dir);
+		const seen: [TokenUsage, string | null][] = [];
+		const sink = createRunSink({
+			logPath: join(dir, "d.log"),
+			dataRoot: dir,
+			meter: true,
+			onUsage: (u, model) => seen.push([u, model]),
+		});
+		const msg = (n: number) => ({
+			role: "assistant",
+			usage: {
+				input: n,
+				output: n,
+				cacheRead: n,
+				cacheWrite: n,
+				cost: { total: n },
+			},
+		});
+		const all = (n: number) => ({
+			input: n,
+			output: n,
+			cacheRead: n,
+			cacheWrite: n,
+			cost: n,
+		});
+		sink.line(
+			JSON.stringify({
+				type: "message_start",
+				message: { role: "assistant", provider: "p", model: "m" },
+			}),
+		);
+		sink.line(JSON.stringify(end(msg(1))));
+		// No change: an assistant message without usage, one with zero usage, a user message.
+		sink.line(JSON.stringify(end({ role: "assistant" })));
+		sink.line(JSON.stringify(end(msg(0))));
+		sink.line(JSON.stringify(end({ ...msg(9), role: "user" })));
+		sink.line(JSON.stringify(end(msg(2))));
+		expect(seen).toEqual([
+			[all(1), "p/m"],
+			[all(3), "p/m"],
+		]);
+		// The callback gets a copy: changing it never changes the run's sum.
+		seen[1]![0].input = 1000;
+		expect(sink.state.usage).toEqual(all(3));
+
+		const off: TokenUsage[] = [];
+		const plain = createRunSink({
+			logPath: join(dir, "e.log"),
+			dataRoot: dir,
+			onUsage: (u) => off.push(u),
+		});
+		plain.line(JSON.stringify(end(msg(1))));
+		expect(off).toEqual([]);
+	});
 });
 
 // ---- metering at settle ----------------------------------------------------
@@ -463,14 +521,88 @@ describe("hosted metering at settle", () => {
 			kind: "work",
 		};
 		expect(reports).toEqual([
-			{ ...base, role: "default", model: "openai/gpt-6", usage: usage(10) },
+			{
+				...base,
+				role: "default",
+				model: "openai/gpt-6",
+				run: 0,
+				final: true,
+				usage: usage(10),
+			},
 			{
 				...base,
 				role: "adversary",
 				model: "zai/glm-5.3-flash",
+				run: 1,
+				final: true,
 				usage: usage(3),
 			},
 		]);
+	});
+
+	test("a check retry is a new run: each run of the turn has its own run index", async () => {
+		const { hosted, reports } = fakeHosted();
+		const results = [
+			ready("openai/gpt-6", usage(10)),
+			runResult({
+				model: "zai/glm-5.3-flash",
+				usage: usage(2),
+				exitCode: 1,
+				stderrTail: "check crashed",
+				sawTerminalEnd: false,
+			}),
+			runResult({
+				model: "zai/glm-5.3-flash",
+				usage: usage(3),
+				finalText: PASS,
+			}),
+		];
+		const record: Recorded = {
+			runs: [],
+			createWorktree: [],
+			removeWorktree: [],
+		};
+		const dir = mkdtempSync(join(tmpdir(), "hosted-turn-test-"));
+		dirs.push(dir);
+		const store = ProjectStore.open(dir);
+		stores.push(store);
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				targetSha: async () => "sha1",
+				workCheck: () => true,
+				modelRoles: () => ({
+					default: "fake/default-model",
+					adversary: "zai/glm-5.3-flash",
+				}),
+				// The runs get the three results in order: work, failed check, passing check.
+				startRun: (o) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					return {
+						pid: 4242,
+						done: Promise.resolve(results[record.runs.length - 1]!),
+						kill: async () => {},
+					};
+				},
+				hosted,
+			}),
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(3);
+		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect(reports.map((r) => [r.run, r.role, r.final, r.usage])).toEqual([
+			[0, "default", true, usage(10)],
+			[1, "adversary", true, usage(2)],
+			[2, "adversary", true, usage(3)],
+		]);
+		const keys = reports.map((r) =>
+			JSON.stringify([r.project, r.taskId, r.turnId, r.kind, r.role, r.run]),
+		);
+		expect(new Set(keys).size).toBe(3);
 	});
 
 	test("an anthropic work run's check meters as critic; a missing check role meters as default", async () => {
@@ -561,6 +693,104 @@ describe("hosted metering at settle", () => {
 		const after = store.getTask(task.id)!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
+	});
+});
+
+// ---- interim metering ------------------------------------------------------
+
+describe("hosted interim metering", () => {
+	test("an active run sends throttled interim records with its cumulative usage, under the final record's key", async () => {
+		const { hosted, reports } = fakeHosted();
+		let onUsage: StartArgs["onUsage"];
+		const done = Promise.withResolvers<RunResult>();
+		const { store, loop } = setup({
+			hosted,
+			meteringIntervalMs: 60_000,
+			commitsAhead: async () => 0,
+			startRun: (o: StartArgs) => {
+				onUsage = o.onUsage;
+				o.onSession?.("sess-1");
+				return { pid: 4242, done: done.promise, kill: async () => {} };
+			},
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		const key = `${store.name}/${task.id}`;
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		expect(onUsage).toBeDefined();
+		const sent = () => reports.map((r) => [r.final, r.usage]);
+
+		// Fake timers drive the throttle interval (60 s in this setup).
+		jest.useFakeTimers();
+		try {
+			// The first change goes out at once; two more inside the interval wait for its end.
+			onUsage!(usage(1), "m/a");
+			onUsage!(usage(2), "m/a");
+			onUsage!(usage(3), "m/a");
+			expect(sent()).toEqual([[false, usage(1)]]);
+			jest.advanceTimersByTime(60_000);
+			// One record at the end of the interval, with the newest usage only.
+			expect(sent()).toEqual([
+				[false, usage(1)],
+				[false, usage(3)],
+			]);
+
+			// A change still waiting when the run ends goes out only in the final record.
+			onUsage!(usage(4), "m/a");
+			done.resolve(answered({ model: "m/a", usage: usage(5) }));
+			await run;
+			onUsage!(usage(6), "m/a");
+			jest.advanceTimersByTime(600_000);
+			expect(sent()).toEqual([
+				[false, usage(1)],
+				[false, usage(3)],
+				[true, usage(5)],
+			]);
+		} finally {
+			jest.useRealTimers();
+		}
+		const turnId = store.listTurns(task.id)[0]!.id;
+		for (const r of reports)
+			expect(r).toMatchObject({
+				tenant: "t1",
+				project: store.name,
+				taskId: task.id,
+				turnId,
+				kind: "work",
+				role: "default",
+				run: 0,
+				model: "m/a",
+			});
+	});
+
+	test("a throwing metering hook never breaks the interim records or the run", async () => {
+		const { hosted } = fakeHosted();
+		let calls = 0;
+		hosted.hooks.reportUsage = () => {
+			calls += 1;
+			throw new Error("control plane down");
+		};
+		let onUsage: StartArgs["onUsage"];
+		const done = Promise.withResolvers<RunResult>();
+		const { store, loop } = setup({
+			hosted,
+			commitsAhead: async () => 0,
+			startRun: (o: StartArgs) => {
+				onUsage = o.onUsage;
+				return { pid: 4242, done: done.promise, kill: async () => {} };
+			},
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		const key = `${store.name}/${task.id}`;
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		expect(() => onUsage!(usage(1), "m/a")).not.toThrow();
+		done.resolve(answered({ usage: usage(1) }));
+		await run;
+		expect(calls).toBe(2);
+		expect(store.getTask(task.id)!.stage).toBe("done");
 	});
 });
 
@@ -1031,6 +1261,169 @@ describe("hosted credit stop", () => {
 		expect(t.genCalls()).toBe(2);
 		t.finish();
 		await run;
+	});
+});
+
+// ---- credit release --------------------------------------------------------
+
+describe("hosted credit release", () => {
+	test("creditRelease queues only the credit-parked needs_you cards like a Resume; a second call queues none", async () => {
+		const { hosted } = fakeHosted({ credit: async () => false });
+		// No schedule tick may claim a released card: the test reads the queue writes.
+		const { store, record, loop } = setup({ hosted, maxTotalRuns: () => 0 });
+		const gated = store.createTask("parked at the gate");
+		await loop.runTurn(store.name, gated.id);
+		expect(store.getTask(gated.id)!.needsReason).toBe(CREDIT_REASON);
+		// A card the credit stop parked, with a steer that the owner queued before the stop.
+		const stopped = store.createTask("stopped mid-run");
+		store.updateTask(stopped.id, {
+			state: "needs_you",
+			needsReason: CREDIT_REASON,
+			sessionId: "sess-9",
+			pendingPrompt: "also fix the docs",
+			pendingBy: "user",
+		});
+		const other = store.createTask("parked for another reason");
+		const otherReason =
+			"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
+		store.updateTask(other.id, {
+			state: "needs_you",
+			needsReason: otherReason,
+		});
+		const cancelled = store.createTask("cancelled while parked");
+		store.updateTask(cancelled.id, {
+			state: "needs_you",
+			needsReason: CREDIT_REASON,
+			cancelledAt: Date.now(),
+		});
+
+		await expect(loop.creditRelease()).resolves.toBe(2);
+		await flushPromises();
+
+		// The release's "." is the board's own voice, not a user message.
+		expect(store.getTask(gated.id)).toMatchObject({
+			state: "queued",
+			pendingPrompt: ".",
+			pendingBy: "supervisor",
+			needsReason: null,
+			holdUntil: null,
+		});
+		// Resume sends the queued steer alone, on the kept session.
+		expect(store.getTask(stopped.id)).toMatchObject({
+			state: "queued",
+			pendingPrompt: "also fix the docs",
+			pendingBy: "user",
+			needsReason: null,
+			sessionId: "sess-9",
+		});
+		expect(store.getTask(other.id)).toMatchObject({
+			state: "needs_you",
+			needsReason: otherReason,
+			pendingPrompt: null,
+		});
+		expect(store.getTask(cancelled.id)!.state).toBe("needs_you");
+		expect(record.runs).toHaveLength(0);
+
+		await expect(loop.creditRelease()).resolves.toBe(0);
+		expect(store.getTask(other.id)!.state).toBe("needs_you");
+	});
+
+	test("a no-credit gate answer that started before a release requeues the card instead of parking it", async () => {
+		const stale = Promise.withResolvers<boolean>();
+		let calls = 0;
+		const { hosted } = fakeHosted({
+			credit: () => (++calls === 1 ? stale.promise : Promise.resolve(true)),
+		});
+		// No schedule tick may claim the card: the test runs each turn itself.
+		const { store, record, loop } = setup({
+			hosted,
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 0,
+		});
+		const task = store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await flushPromises();
+		expect(store.getTask(task.id)!.state).toBe("preparing");
+
+		// The card is preparing, so the release skips it.
+		await expect(loop.creditRelease()).resolves.toBe(0);
+		stale.resolve(false);
+		await run;
+
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)).toMatchObject({
+			state: "queued",
+			holdUntil: null,
+		});
+		expect(store.getTask(task.id)!.needsReason).not.toBe(CREDIT_REASON);
+
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(2);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.stage).toBe("done");
+	});
+
+	test("a no-credit answer after the release still parks a card that a later gate checks", async () => {
+		const { hosted } = fakeHosted({ credit: async () => false });
+		const { store, record, loop } = setup({ hosted, maxTotalRuns: () => 0 });
+		await expect(loop.creditRelease()).resolves.toBe(0);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)).toMatchObject({
+			state: "needs_you",
+			needsReason: CREDIT_REASON,
+		});
+	});
+
+	test("a released card waits for an active usage-limit hold like any board-queued card", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		let credit = false;
+		const { hosted } = fakeHosted({ credit: async () => credit });
+		const { store, record, loop } = setup({
+			hosted,
+			maxTotalRuns: () => 0,
+			quota: async () => ({
+				limits: [
+					{
+						provider: "fake",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 100,
+						resetsAt,
+					},
+				],
+				error: null,
+				at: Date.now(),
+			}),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.needsReason).toBe(CREDIT_REASON);
+
+		credit = true;
+		await expect(loop.creditRelease()).resolves.toBe(1);
+		expect(store.getTask(task.id)!.pendingBy).toBe("supervisor");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)).toMatchObject({
+			state: "queued",
+			holdUntil: resetsAt,
+			holdProvider: "fake",
+		});
+	});
+
+	test("a self-hosted loop releases nothing", async () => {
+		const { store, loop } = setup({ maxTotalRuns: () => 0 });
+		const task = store.createTask("parked");
+		store.updateTask(task.id, {
+			state: "needs_you",
+			needsReason: CREDIT_REASON,
+		});
+		await expect(loop.creditRelease()).resolves.toBe(0);
+		expect(store.getTask(task.id)!.state).toBe("needs_you");
 	});
 });
 
