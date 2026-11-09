@@ -120,3 +120,27 @@ export function modelRoles(
 		return {}; // no config: unmarked list
 	}
 }
+
+/** Fallback chains from the same config.yml (`retry.fallbackChains`): keys whose value is a list of
+ * strings only; {} when unreadable. Same default path as modelRoles(). */
+export function modelFallbacks(
+	configPath: string = defaultRolesPath(),
+): Record<string, string[]> {
+	try {
+		const chains = (
+			Bun.YAML.parse(readFileSync(configPath, "utf8")) as {
+				retry?: { fallbackChains?: unknown } | null;
+			} | null
+		)?.retry?.fallbackChains;
+		const out: Record<string, string[]> = {};
+		if (typeof chains === "object" && chains !== null) {
+			for (const [key, list] of Object.entries(chains)) {
+				if (Array.isArray(list) && list.every((m) => typeof m === "string"))
+					out[key] = list;
+			}
+		}
+		return out;
+	} catch {
+		return {}; // no config: no chains
+	}
+}

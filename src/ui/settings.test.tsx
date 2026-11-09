@@ -2695,7 +2695,10 @@ describe("ModelRolesSection model picker", () => {
 		};
 	}
 
-	const rolesFetch = (roles: Record<string, string>): typeof fetch =>
+	const rolesFetch = (
+		roles: Record<string, string>,
+		fallbacks: Record<string, string[]> = {},
+	): typeof fetch =>
 		(async (input: RequestInfo | URL) => {
 			const ok = (body: unknown): Response =>
 				new Response(JSON.stringify(body), {
@@ -2708,8 +2711,15 @@ describe("ModelRolesSection model picker", () => {
 					base: "abc1234",
 					hash: "h1",
 					roles,
+					fallbacks,
 					signIns: ["zai", "anthropic"],
-					seed: { needed: false, commit: null, roles: null, expiresAt: null },
+					seed: {
+						needed: false,
+						commit: null,
+						roles: null,
+						fallbacks: null,
+						expiresAt: null,
+					},
 				});
 			if (url.endsWith("/api/models"))
 				return ok({
@@ -2834,6 +2844,152 @@ describe("ModelRolesSection model picker", () => {
 				});
 			});
 			expect(document.activeElement).toBe(trigger);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a role's fallbacks list in chain order; Add fallback, Move up and remove edit what Save sends", async () => {
+		resetCatalogCache();
+		const posts: Record<string, unknown>[] = [];
+		const read = rolesFetch(
+			{ plan: "zai/glm-5.3-flash", slow: "openai/gpt-5" },
+			{
+				plan: ["openai/gpt-5:high", "anthropic/claude-opus-5-5"],
+				// A model-selector key: the file keeps it, the rows never show it.
+				"zai/glm-5.3-flash": ["openai/gpt-5"],
+			},
+		);
+		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method !== "POST") return read(input, init);
+			posts.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+			return new Response(
+				JSON.stringify({
+					error: "Bad roles.",
+					fields: {},
+					fallbackFields: { plan: "fallback 3: duplicate model" },
+				}),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+		// Let the POST, its JSON read and the state updates land.
+		const settle = async (): Promise<void> => {
+			for (let i = 0; i < 3; i++)
+				await act(async () => {
+					await Bun.sleep(0);
+				});
+		};
+		const { container, unmount } = await mountRoles(fetchMock);
+		try {
+			await act(async () => {});
+			const groups = [...container.querySelectorAll(".role-fallbacks")];
+			expect(groups.length).toBe(2);
+			const [plan, slow] = groups as [Element, Element];
+			expect(plan.tagName).toBe("FIELDSET");
+			expect(plan.querySelector("legend")?.textContent).toBe(
+				"Fallbacks for plan",
+			);
+			const triggers = () => [
+				...plan.querySelectorAll(".fallback-row button.model-trigger"),
+			];
+			expect(triggers().map((t) => t.getAttribute("aria-label"))).toEqual([
+				"plan fallback 1 model",
+				"plan fallback 2 model",
+			]);
+			expect(triggers().map((t) => t.textContent)).toEqual([
+				"GPT 5 (openai/gpt-5)",
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+			]);
+			expect(
+				[...plan.querySelectorAll(".fallback-row select")].map((s) =>
+					s.getAttribute("aria-label"),
+				),
+			).toEqual(["plan fallback 1 thinking", "plan fallback 2 thinking"]);
+			// Move up shows on every entry but the first.
+			const ups = () => [...plan.querySelectorAll("button.fallback-up")];
+			expect(ups().map((b) => b.getAttribute("aria-label"))).toEqual([
+				"Move up plan fallback 2",
+			]);
+			// A role without a chain says so; the model-selector key shows nowhere.
+			expect(slow.querySelector(".fallback-row")).toBeNull();
+			expect(slow.textContent).toContain("No fallback models.");
+			expect(container.querySelectorAll(".fallback-row").length).toBe(2);
+
+			const save = container.querySelector<HTMLButtonElement>(
+				".alate-def-actions button",
+			);
+			if (save === null) throw new Error("Save button did not render");
+			expect(save.disabled).toBe(true);
+			const add = plan.querySelector<HTMLButtonElement>("button.fallback-add");
+			if (add === null) throw new Error("Add fallback did not render");
+			expect(add.textContent).toBe("Add fallback");
+			expect(add.disabled).toBe(false);
+
+			// Add fallback appends the first catalogue model by name and arms Save.
+			await act(async () => {
+				onClickOf(add)({});
+			});
+			expect(triggers().map((t) => t.textContent)).toEqual([
+				"GPT 5 (openai/gpt-5)",
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+			]);
+			expect(save.disabled).toBe(false);
+
+			// Move up swaps an entry with the one above it.
+			await act(async () => {
+				onClickOf(ups()[0]!)({});
+			});
+			expect(triggers().map((t) => t.textContent)).toEqual([
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+				"GPT 5 (openai/gpt-5)",
+				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
+			]);
+
+			// Save sends the rows' chains only, in the edited order.
+			await act(async () => {
+				onClickOf(save)({});
+			});
+			await settle();
+			expect(posts.length).toBe(1);
+			expect(posts[0]!.fallbacks).toEqual({
+				plan: [
+					"anthropic/claude-opus-5-5",
+					"openai/gpt-5:high",
+					"anthropic/claude-opus-5-5",
+				],
+			});
+
+			// The 400's fallback message shows at the group and describes its controls.
+			const message = plan.querySelector(".auth-error");
+			expect(message?.textContent).toBe("fallback 3: duplicate model");
+			for (const t of triggers()) {
+				expect(t.getAttribute("aria-invalid")).toBe("true");
+				expect(t.getAttribute("aria-describedby")).toBe(message?.id ?? null);
+			}
+
+			// Removing every entry clears the message; the emptied chain sends no key.
+			for (let i = 0; i < 3; i++) {
+				const remove = plan.querySelector("button.fallback-remove");
+				if (remove === null) throw new Error("remove button did not render");
+				expect(remove.getAttribute("aria-label")).toBe(
+					"Remove plan fallback 1",
+				);
+				await act(async () => {
+					onClickOf(remove)({});
+				});
+			}
+			expect(plan.querySelector(".auth-error")).toBeNull();
+			expect(plan.querySelector(".fallback-row")).toBeNull();
+			expect(plan.textContent).toContain("No fallback models.");
+			// The focus leaves the removed entry for Add fallback.
+			expect(document.activeElement).toBe(add);
+			await act(async () => {
+				onClickOf(save)({});
+			});
+			await settle();
+			expect(posts.length).toBe(2);
+			expect(posts[1]!.fallbacks).toEqual({});
 		} finally {
 			await unmount();
 		}

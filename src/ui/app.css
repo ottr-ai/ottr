@@ -8099,6 +8099,73 @@ button.log-mode[aria-pressed="true"] {
 	vertical-align: -2px;
 	margin-right: 6px;
 }
+/* A role's fallbacks: under the row, indented behind a soft rule and headed by a small dim
+   label, so the chain reads as part of its role. The entries share one set of columns
+   through the list's subgrid. */
+.role-fallbacks {
+	grid-column: 1 / -1;
+	display: grid;
+	justify-items: start;
+	gap: 6px;
+	margin-inline-start: 24px;
+	min-inline-size: 0;
+	margin-block: 0;
+	margin-inline-end: 0;
+	padding-block: 0;
+	padding-inline-end: 0;
+	padding-inline-start: 12px;
+	border: 0;
+	border-inline-start: 1px solid var(--line-soft);
+}
+.role-fallbacks > p {
+	margin: 0;
+}
+.role-fallbacks > legend {
+	padding: 0;
+	margin-block-end: 6px;
+}
+.role-fallbacks-head {
+	color: var(--dim);
+	font-size: 12px;
+}
+.fallback-list {
+	justify-self: stretch;
+	display: grid;
+	/* number | Move up | model | thinking | remove: the thinking and remove tracks match the
+	   role row's, so the fallback controls line up under the role's. Move up keeps its
+	   track on the first entry too. */
+	grid-template-columns: auto 28px minmax(0, 1fr) minmax(100px, 140px) auto;
+	gap: 6px 12px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.fallback-row {
+	grid-column: 1 / -1;
+	display: grid;
+	grid-template-columns: subgrid;
+	row-gap: 6px;
+	align-items: center;
+}
+.fallback-num {
+	min-width: 1.5ch;
+	color: var(--dim);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	text-align: end;
+}
+.fallback-up {
+	grid-column: 2;
+}
+.fallback-row > .model-trigger {
+	grid-column: 3;
+}
+.fallback-row > select {
+	grid-column: 4;
+}
+.fallback-remove {
+	grid-column: 5;
+}
 @media (pointer: coarse) {
 	.role-add input {
 		min-height: 44px;
@@ -8115,6 +8182,25 @@ button.log-mode[aria-pressed="true"] {
 	.role-row .role-remove {
 		grid-row: 1;
 		grid-column: 2;
+	}
+	/* The number, Move up and remove share the first line; each picker takes a full line. */
+	.role-fallbacks {
+		margin-inline-start: 4px;
+		padding-inline-start: 10px;
+	}
+	.fallback-list {
+		grid-template-columns: auto 28px minmax(0, 1fr) auto;
+	}
+	.fallback-up {
+		grid-row: 1;
+	}
+	.fallback-row > .model-trigger,
+	.fallback-row > select {
+		grid-column: 1 / -1;
+	}
+	.fallback-remove {
+		grid-row: 1;
+		grid-column: 4;
 	}
 }
 

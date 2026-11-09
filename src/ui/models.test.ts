@@ -6,6 +6,7 @@ import {
 	addRoleError,
 	classifyRolesSave,
 	displayModel,
+	fallbacksDirty,
 	fetchCatalog,
 	loadCatalog,
 	missingCheckRoles,
@@ -16,6 +17,7 @@ import {
 	reviewModel,
 	rolesDirty,
 	roleWarnings,
+	rowChains,
 	seedStep,
 	stepIndex,
 } from "./models.ts";
@@ -70,6 +72,36 @@ test("rolesDirty compares rows with the roles in order", () => {
 	).toBe(true);
 });
 
+test("fallbacksDirty compares each row's chain with its loaded chain, presence included", () => {
+	const names = ["plan", "slow"];
+	const loaded = { plan: ["a/x", "b/y"], judge: ["c/z"], "a/x": ["d/w"] };
+	const dirty = (chains: Record<string, string[]>) =>
+		fallbacksDirty(names, chains, loaded);
+	// Keys outside the rows (another role, a model-selector key) do not count.
+	expect(dirty({ plan: ["a/x", "b/y"] })).toBe(false);
+	expect(dirty({ plan: ["b/y", "a/x"] })).toBe(true);
+	expect(dirty({ plan: ["a/x"] })).toBe(true);
+	expect(dirty({ plan: ["a/x", "b/y", "c/z"] })).toBe(true);
+	expect(dirty({ plan: ["a/x", "b/z"] })).toBe(true);
+	expect(dirty({})).toBe(true);
+	// An explicit empty chain differs from no chain, both ways.
+	expect(dirty({ plan: ["a/x", "b/y"], slow: [] })).toBe(true);
+	expect(fallbacksDirty(["slow"], {}, { slow: [] })).toBe(true);
+	expect(fallbacksDirty(["slow"], { slow: [] }, { slow: [] })).toBe(false);
+	// A role named "constructor" never reads an inherited member as its chain.
+	expect(fallbacksDirty(["constructor"], {}, {})).toBe(false);
+});
+
+test("rowChains keeps the named roles' chains as copies; a role without one gets no key", () => {
+	const fallbacks = { plan: ["a/x"], judge: [], "a/x": ["b/y"] };
+	const chains = rowChains(["plan", "judge", "slow", "constructor"], fallbacks);
+	expect(chains).toEqual({ plan: ["a/x"], judge: [] });
+	expect(Object.hasOwn(chains, "slow")).toBe(false);
+	expect(Object.hasOwn(chains, "constructor")).toBe(false);
+	// Edits on a row's chain never touch the loaded chain.
+	expect(chains.plan).not.toBe(fallbacks.plan);
+});
+
 test("addRoleError gives the first failing reason, or null", () => {
 	const rows = [["default", "a/x"]] as const;
 	expect(addRoleError("", rows, undefined)).toBe("Type a role name.");
@@ -82,7 +114,13 @@ test("addRoleError gives the first failing reason, or null", () => {
 	expect(addRoleError("new", rows, "a/x")).toBeNull();
 });
 
-const seed = { needed: true, commit: null, roles: null, expiresAt: null };
+const seed = {
+	needed: true,
+	commit: null,
+	roles: null,
+	fallbacks: null,
+	expiresAt: null,
+};
 const tail = " The rows now show the current values. Make your change again.";
 
 test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
@@ -93,16 +131,76 @@ test("classifyRolesSave: saved needs commit, hash, roles and seed", () => {
 		roles: { a: "b/c" },
 		seed,
 	};
+	// An answer without fallbacks holds no chains.
 	expect(classifyRolesSave(true, 200, body)).toEqual({
 		kind: "saved",
 		...body,
+		fallbacks: {},
 	});
 	const { seed: _, ...noSeed } = body;
 	expect(classifyRolesSave(true, 200, noSeed)).toEqual({
 		kind: "failed",
 		error: "HTTP 200",
 		fields: {},
+		fallbackFields: {},
 	});
+});
+
+test("classifyRolesSave: saved and conflict keep only string-list chains", () => {
+	const fallbacks = {
+		plan: ["openai-codex/gpt-6.1-sol"],
+		judge: [],
+		"openai-codex/gpt-6.1-sol": ["zai/glm-5.3:max"],
+		bad: ["a/b", 3],
+		text: "a/b",
+		none: null,
+	};
+	const kept = {
+		plan: ["openai-codex/gpt-6.1-sol"],
+		judge: [],
+		"openai-codex/gpt-6.1-sol": ["zai/glm-5.3:max"],
+	};
+	const body = { commit: "c1", hash: "h1", roles: {}, fallbacks, seed };
+	const saved = classifyRolesSave(true, 200, body);
+	expect(saved.kind === "saved" && saved.fallbacks).toEqual(kept);
+	const conflict = classifyRolesSave(false, 409, {
+		hash: "h",
+		roles: {},
+		fallbacks,
+	});
+	expect(conflict.kind === "conflict" && conflict.fallbacks).toEqual(kept);
+	for (const junk of [null, [["a/b"]], "a/b", 7]) {
+		const r = classifyRolesSave(false, 409, {
+			hash: "h",
+			roles: {},
+			fallbacks: junk,
+		});
+		expect(r.kind === "conflict" && r.fallbacks).toEqual({});
+	}
+});
+
+test("classifyRolesSave: a 400 keeps the string fallbackFields", () => {
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "Bad roles.",
+			fields: {},
+			fallbackFields: { plan: "fallback 2: unknown model x/y", slow: 4 },
+		}),
+	).toEqual({
+		kind: "failed",
+		error: "Bad roles.",
+		fields: {},
+		fallbackFields: { plan: "fallback 2: unknown model x/y" },
+	});
+	// JSON.parse makes "__proto__" an own key; the parse keeps it as a message.
+	const r = classifyRolesSave(
+		false,
+		400,
+		JSON.parse('{"fallbackFields":{"__proto__":"bad"}}'),
+	);
+	expect(
+		r.kind === "failed" && Object.hasOwn(r.fallbackFields, "__proto__"),
+	).toBe(true);
 });
 
 test("classifyRolesSave: saved needs ok and every part", () => {
@@ -117,6 +215,7 @@ test("classifyRolesSave: saved needs ok and every part", () => {
 		kind: "failed" as const,
 		error: `HTTP ${status}`,
 		fields: {},
+		fallbackFields: {},
 	});
 	expect(classifyRolesSave(false, 500, body)).toEqual(failed(500));
 	expect(classifyRolesSave(true, 200, { ...body, commit: "" })).toEqual(
@@ -139,13 +238,23 @@ test("classifyRolesSave: 400 read-only: folder source with a path is readonly", 
 	).toEqual({ kind: "readonly", path: "/data" });
 	expect(
 		classifyRolesSave(false, 400, { error: "read-only: folder source" }),
-	).toEqual({ kind: "failed", error: "read-only: folder source", fields: {} });
+	).toEqual({
+		kind: "failed",
+		error: "read-only: folder source",
+		fields: {},
+		fallbackFields: {},
+	});
 	expect(
 		classifyRolesSave(false, 400, {
 			error: "read-only: folder source",
 			path: 7,
 		}),
-	).toEqual({ kind: "failed", error: "read-only: folder source", fields: {} });
+	).toEqual({
+		kind: "failed",
+		error: "read-only: folder source",
+		fields: {},
+		fallbackFields: {},
+	});
 	expect(
 		classifyRolesSave(false, 400, {
 			error: "Bad roles.",
@@ -155,6 +264,7 @@ test("classifyRolesSave: 400 read-only: folder source with a path is readonly", 
 		kind: "failed",
 		error: "Bad roles.",
 		fields: { a: "Unknown model." },
+		fallbackFields: {},
 	});
 });
 
@@ -164,6 +274,7 @@ test("classifyRolesSave: 409 with hash and roles is a conflict", () => {
 		base: null,
 		hash: "h",
 		roles: {},
+		fallbacks: {},
 		error: `The model roles changed in the data repo.${tail}`,
 	});
 	expect(
@@ -178,6 +289,7 @@ test("classifyRolesSave: 409 with hash and roles is a conflict", () => {
 		kind: "failed",
 		error: "x",
 		fields: {},
+		fallbackFields: {},
 	});
 });
 
@@ -191,12 +303,14 @@ test("classifyRolesSave: failures keep string fields and the error", () => {
 		kind: "failed",
 		error: "Bad roles.",
 		fields: { a: "Unknown model." },
+		fallbackFields: {},
 	});
 	for (const body of [null, [1], 7, "x"])
 		expect(classifyRolesSave(false, 500, body)).toEqual({
 			kind: "failed",
 			error: "HTTP 500",
 			fields: {},
+			fallbackFields: {},
 		});
 	expect(classifyRolesSave(false, 502, { error: 5 })).toMatchObject({
 		error: "HTTP 502",
@@ -569,38 +683,82 @@ test("roleWarnings warns when the board has no active sign-in for the provider",
 	expect(roleWarnings("/model", [])).toEqual([]);
 });
 
+/** A needed seed state: the board copy holds `roles` and `fallbacks`. */
+const seedOf = (
+	commit: string | null,
+	roles: Record<string, string> | null,
+	fallbacks: Record<string, string[]> | null = {},
+) => ({ needed: true, commit, roles, fallbacks });
+
 test("seedStep: a later seed that holds the save ends the wait; a replaced save is not stuck", () => {
 	const after = { default: "c/d:max" };
-	const seed = (
-		commit: string | null,
-		roles: Record<string, string> | null,
-	) => ({
-		needed: true,
-		commit,
-		roles,
-	});
 	expect(
-		seedStep({ needed: false, commit: null, roles: null }, null, after),
+		seedStep(
+			{ needed: false, commit: null, roles: null, fallbacks: null },
+			null,
+			after,
+			{},
+		),
 	).toBe("copy");
-	expect(seedStep(seed(null, {}), null, after)).toBe("wait");
-	expect(seedStep(seed("s1", { default: "a/b" }), "s1", after)).toBe("wait");
-	expect(seedStep(seed("s2", { ...after }), "s1", after)).toBe("done");
-	expect(seedStep(seed("s2", { default: "e/f" }), "s1", after)).toBe(
+	expect(seedStep(seedOf(null, {}), null, after, {})).toBe("wait");
+	expect(seedStep(seedOf("s1", { default: "a/b" }), "s1", after, {})).toBe(
+		"wait",
+	);
+	expect(seedStep(seedOf("s2", { ...after }), "s1", after, {})).toBe("done");
+	expect(seedStep(seedOf("s2", { default: "e/f" }), "s1", after, {})).toBe(
 		"replaced",
 	);
-	expect(seedStep(seed("s1", {}), null, after)).toBe("replaced");
-	expect(seedStep(seed("s2", { ...after, plan: "e/f" }), "s1", after)).toBe(
-		"replaced",
-	);
+	expect(seedStep(seedOf("s1", {}), null, after, {})).toBe("replaced");
+	expect(
+		seedStep(seedOf("s2", { ...after, plan: "e/f" }), "s1", after, {}),
+	).toBe("replaced");
 });
 
 test("seedStep: two saves before one seed wait, the board holds neither save's roles", () => {
 	// Save 1 A→B, save 2 B→C, the hourly seed has not run: the board still holds A.
 	const board = { default: "a/a" };
 	const c = { default: "c/c" };
-	expect(seedStep({ needed: true, commit: "s1", roles: board }, "s1", c)).toBe(
-		"wait",
+	expect(seedStep(seedOf("s1", board), "s1", c, {})).toBe("wait");
+});
+
+test("seedStep: the board copy holds the save only with the saved roles' chains", () => {
+	const after = { plan: "a/x", slow: "b/y" };
+	// The saved file: plan has a chain, slow has none, a model-selector key has one too.
+	const saved = { plan: ["c/z", "d/w:max"], "a/x": ["e/v"] };
+	const done = (board: Record<string, string[]> | null) =>
+		seedStep(seedOf("s2", { ...after }, board), "s1", after, saved);
+	expect(done({ plan: ["c/z", "d/w:max"] })).toBe("done");
+	// Keys outside the saved roles do not count, on either side.
+	expect(done({ plan: ["c/z", "d/w:max"], "f/u": ["g/t"] })).toBe("done");
+	// A missing, reordered, shorter or extra chain is not the save.
+	expect(done({})).toBe("replaced");
+	expect(done({ plan: ["d/w:max", "c/z"] })).toBe("replaced");
+	expect(done({ plan: ["c/z"] })).toBe("replaced");
+	expect(done({ plan: ["c/z", "d/w:max"], slow: ["c/z"] })).toBe("replaced");
+	// An explicit empty chain differs from no chain.
+	expect(done({ plan: ["c/z", "d/w:max"], slow: [] })).toBe("replaced");
+	expect(
+		seedStep(seedOf("s2", { ...after }, { plan: [] }), "s1", after, {
+			plan: [],
+		}),
+	).toBe("done");
+	// A board copy without chains (null) holds a save without chains.
+	expect(seedStep(seedOf("s2", { ...after }, null), "s1", after, {})).toBe(
+		"done",
 	);
+	// Before the next seed, the old chains keep the line waiting.
+	expect(
+		seedStep(seedOf("s1", { ...after }, { plan: ["c/z"] }), "s1", after, saved),
+	).toBe("wait");
+	// A role named "constructor" never reads an inherited member as its chain.
+	expect(
+		seedStep(
+			seedOf("s2", { constructor: "a/x" }),
+			"s1",
+			{ constructor: "a/x" },
+			{},
+		),
+	).toBe("done");
 });
 
 test("ownField reads only own keys: __proto__ and constructor never get an inherited message", () => {

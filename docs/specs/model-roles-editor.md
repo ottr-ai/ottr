@@ -1,6 +1,6 @@
 # Model roles editor
 
-Settings gets a **Model roles** section. The user edits the omp `modelRoles` map from a desktop or a phone. A save commits the data repo's `user/omp/agent/config.yml`. Alate provisions the workers, and the board seed brings the change to the board's own copy.
+Settings gets a **Model roles** section. The user edits the omp `modelRoles` map and the fallback models of each role (`retry.fallbackChains.<role>`) from a desktop or a phone. A save commits the data repo's `user/omp/agent/config.yml`. Alate provisions the workers, and the board seed brings the change to the board's own copy.
 
 ## Data path
 
@@ -31,38 +31,45 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
   "base": "<data repo commit of Alate's snapshot, or null for a path source>",
   "hash": "<sha256 hex of config.yml>",
   "roles": { "default": "zai/glm-5.3-flash:max", "slow": "anthropic/claude-opus-5-5:medium" },
+  "fallbacks": { "plan": ["openai-codex/gpt-6.1-sol"], "openai-codex/gpt-6.1-sol": ["zai/glm-5.3:max"] },
   "signIns": ["anthropic", "zai"],
-  "seed": { "needed": true, "commit": "<sha or null>", "roles": { "default": "..." } }
+  "seed": { "needed": true, "commit": "<sha or null>", "roles": { "default": "..." }, "fallbacks": { "plan": ["..."] } }
 }
 ```
 
 - `roles` keeps the file order. Only nonempty string values count.
+- `fallbacks` is `retry.fallbackChains` in file order: every key whose value is a list of nonempty strings (also an empty list). omp keys a chain by a role name or by a model selector. The UI shows only the chains of its role rows.
 - `signIns`: the providers with an active sign-in in the board store (`signIns()`): one sign-in serves the board and the workers (docs/specs/provider-credentials.md). `signIns` is null when the store cannot be read.
 - `base` comes from `GET /api/state` (no re-import, so the read stays fast). When Alate's snapshot is behind the branch head, the first save gets a conflict and then shows the current values.
-- `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent. `seed.roles` is the board copy's `modelRoles` (`{}` when the board copy is not seeded). Both are null without `seed.needed`.
+- `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent. `seed.roles` is the board copy's `modelRoles` (`{}` when the board copy is not seeded), and `seed.fallbacks` is its `retry.fallbackChains` (string lists only, `{}` when absent). All three are null without `seed.needed`.
 
 Errors (`{ error }`): 400 when the Alate URL or key is not set. 404 when the data repo has no `user/omp/agent/config.yml`. 502 when Alate cannot be reached or gives an error. 422 when the file has a `modelRoles` layout that the editor does not support.
 
 ### `POST /api/model-roles`
 
-Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles": { "<role>": "<selector>" } }`. The object order is the order for new roles.
+Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles": { "<role>": "<selector>" }, "fallbacks": { "<role>": ["<selector>", "..."] } }`. The object order is the order for new roles.
 
-1. Ottr re-imports Alate's snapshot (`POST /api/import`) and reads the file. When the head commit differs from the body `base`, or the file hash differs from the body `hash`, the route returns 409 `{ error, base, hash, roles }` with the current values, and commits nothing. A commit on main that leaves `config.yml` alone is a conflict too. This check runs before validation, so a stale form gets the current values also when they already hold the requested ones.
-2. Validation. On a failure the route returns 400 `{ error, fields }` and commits nothing. `fields` maps a role name to its message.
+`fallbacks` is optional. It holds the full chain of each role in `roles` that has a chain. A role in `roles` without a `fallbacks` key gets no chain. An empty list stays an explicit empty chain (omp then uses no fallback for that role). Without `fallbacks`, each role in `roles` keeps its current chain. A removed role loses its chain. A `retry.fallbackChains` key that is not a current or a requested role (for example a model selector key) stays byte for byte.
+
+1. Ottr re-imports Alate's snapshot (`POST /api/import`) and reads the file. When the head commit differs from the body `base`, or the file hash differs from the body `hash`, the route returns 409 `{ error, base, hash, roles, fallbacks }` with the current values, and commits nothing. A commit on main that leaves `config.yml` alone is a conflict too. This check runs before validation, so a stale form gets the current values also when they already hold the requested ones.
+2. Validation. On a failure the route returns 400 `{ error, fields, fallbackFields }` and commits nothing. `fields` maps a role name to its message. `fallbackFields` maps a role name to the message for its fallback list.
    - A new role name must match `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. A name that the file already holds stays editable.
    - `roles` must hold at least one role.
    - Each value must be `<catalog selector>` or `<catalog selector>:<level>`. This applies to every value, also to an unchanged value. The catalog is `omp models --json` (the `/api/models` list). The level is one of `THINKING_LEVELS` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`). A value with a known model and an unknown suffix gets "unknown thinking level".
-   - A save that changes nothing gives 400 `nothing to save`.
+   - `fallbacks` must be an object. Each key must be a role in `roles`. Each value must be a list. Each entry follows the value rule above, and the message names the entry ("fallback 2: unknown model x/y").
+   - A chain must not hold one selector twice, and must not hold the role's own value.
+   - A save that changes no role and no chain gives 400 `nothing to save`.
 3. Ottr writes the new text (see "Text edit") as a GitHub commit with the loaded `base` as its parent (see "Data path").
-4. When GitHub refuses the fast-forward, the data repo moved after the re-import. Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles }`. Ottr never retries the write by itself. When the refresh fails, the route returns the refresh error. Other GitHub errors (no write access, no token, gh missing) return 502 with GitHub's message.
+4. When GitHub refuses the fast-forward, the data repo moved after the re-import. Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles, fallbacks }`. Ottr never retries the write by itself. When the refresh fails, the route returns the refresh error. Other GitHub errors (no write access, no token, gh missing) return 502 with GitHub's message.
 5. When Alate cannot import the new commit, the route returns 502 with an error that names the commit. The commit stays in the data repo.
-6. Success: 200 `{ commit, base, hash, roles, seed }`. `commit` and `base` are the created commit, `hash` is the sha256 of the written content, and `roles` are the written roles. The answer never takes values from Alate's import after the commit: another commit can land on main in that time. The next save then meets that commit as a 409 conflict. The UI keeps these values for the rows. Its 60 s seed poll takes only `seed`.
+6. Success: 200 `{ commit, base, hash, roles, fallbacks, seed }`. `commit` and `base` are the created commit, `hash` is the sha256 of the written content, and `roles` and `fallbacks` are the written values. The answer never takes values from Alate's import after the commit: another commit can land on main in that time. The next save then meets that commit as a 409 conflict. The UI keeps these values for the rows. Its 60 s seed poll takes only `seed`.
 
 The commit message is a Conventional Commit of at most 500 characters:
 
 - One role added or changed: `chore: set the <role> model role to <value>`.
 - One role removed: `chore: remove the <role> model role`.
-- Other cases: `chore: update the <role>, <role> model roles`. A long list ends in `…` before the 500-character cap.
+- Only the chain of one role changed: `chore: set the <role> model role fallbacks to <a>, <b>`, `chore: set the <role> model role fallbacks to none` for an empty list, or `chore: remove the <role> model role fallbacks` when the chain goes.
+- Other cases: `chore: update the <role>, <role> model roles`, with each role that has a changed value or chain. A long list ends in `…` before the 500-character cap.
 
 ## Text edit
 
@@ -76,10 +83,23 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - Any other layout (a flow map, a multi-line value, an anchor, a nested key) gives the 422 error. Ottr then edits nothing.
 - A check after the edit parses both texts. The new `modelRoles` must equal the requested map, and every other key must equal its old value. A failed check is an error, and nothing is committed.
 
+### Fallback chains
+
+The edit changes only the managed keys of `retry.fallbackChains`: the current roles and the requested roles. Every other byte stays, also the other keys of `retry` and the unmanaged chain keys with their comments.
+
+- `retry` is a column-0 block `retry:` (a trailing comment is allowed). `fallbackChains:` is one line at the indent of the first child of `retry`, with an optional trailing comment. Its block holds the lines with a deeper indent, and blank and comment lines.
+- Each chain key is one line at one shared indent. A managed key holds `<key>:` with block list items `- <value>` on the next lines (at a deeper indent or at the key's indent), or `<key>: []`. Each item is one plain or quoted scalar with an optional trailing comment. An unmanaged key can have any layout.
+- A changed chain replaces the item lines of its key. An unchanged chain keeps its lines exactly. A chain that goes loses its key line and its item lines. A new chain follows the last line of the block, with the key indent and the item indent of the block (or two more spaces). An empty list is written `<key>: []`.
+- Without `fallbackChains`, the edit adds it at the end of the `retry` block. Without `retry`, the edit appends a `retry:` block at the end of the file. A chain block that loses its last key keeps its `fallbackChains:` line (YAML null, which omp reads as no chains).
+- Item values follow the value rule above (plain or a JSON string).
+- Any other layout of `retry` or of a managed key (a flow map, a flow list with entries, a multi-line value, an anchor, two `fallbackChains` keys) gives the 422 error, also on the read.
+- The check after the edit also requires: each managed key holds exactly the requested chain (no key when no chain is requested), every unmanaged chain key and every other `retry` key equals its old value.
+
 ## UI
 
 - The General Settings page shows **Model roles** after **Provider sign-in**.
 - One row for each role: the role name, a model `<select>` with the `/api/models` catalog, and a thinking `<select>` (Default, then each level). A current value that is not in the catalog shows as an extra option "<value> (not in the catalog)".
+- Under each row, the role's **Fallbacks** in chain order. Each fallback has the same model and thinking pickers, a **Move up** button (not on the first one) and a remove button. **Add fallback** appends the first catalog model. A new role starts with the chain that the file holds for that key, or with none. A `fallbackFields` message shows at the row's fallback list.
 - A remove button for each row. An add form with a role name, then the new row takes the first catalog model.
 - **Save** is off while nothing changed or a save runs. A 400 shows each `fields` message at its row (`aria-describedby`, `aria-invalid`). A 409 with `roles` loads the current values and shows the conflict message. Other errors show in an alert.
 - A row warns when its provider (the selector text before `/`) has no active sign-in on the board: "No active sign-in for <provider> on the board". A store with `active: null` gives no warning.
@@ -87,7 +107,7 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - After a commit, the section shows each step and its result:
   1. "Committed <short sha> to the data repo."
   2. The provision: running, then success, or the failed scripts and their error. A failure keeps the commit and says so.
-  3. The board copy: with `seed.needed`, the section keeps `seed.commit` from the save answer. It compares `seed.roles` (the board copy) with the saved roles, and the current `seed.commit` with the kept one. The section reads again each 60 s while it waits.
+  3. The board copy: with `seed.needed`, the section keeps `seed.commit` from the save answer. It compares `seed.roles` and the chains of the saved roles in `seed.fallbacks` (the board copy) with the saved values, and the current `seed.commit` with the kept one. The section reads again each 60 s while it waits.
      - The board copy holds the saved roles: "The board copy has the saved roles".
      - `seed.commit` is the same as at the save: "Waiting for the hourly deploy to seed <short sha>". The board copy can hold the roles of an earlier save, because two saves can come before one seed.
      - `seed.commit` changed after the save, and the board copy holds other roles: "The board copy has other roles: a later change replaced this save". The wait ends.
@@ -97,6 +117,8 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 ## Acceptance
 
 - A test: a save changes only the `modelRoles` values and keeps every other byte of `config.yml`.
+- A test: a fallback save changes only the managed chain lines and keeps every other byte, also the unmanaged chain keys and their comments.
+- A test: an unknown fallback model, a duplicate, and a fallback for a role that is not in `roles` are refused, and no write reaches GitHub.
 - A test: an unknown model or level is refused, and no write reaches GitHub (`gh api` git trees, commits, or refs).
 - A test: a moved data repo gives a 409 conflict with the current roles and no write: a commit on main that leaves `config.yml` alone, a changed `config.yml`, and a move between the re-import and the ref update (GitHub refuses the fast-forward, no second write).
 - Screenshots of the section at desktop width and at phone width.

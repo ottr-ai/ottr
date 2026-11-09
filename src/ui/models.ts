@@ -19,12 +19,12 @@ export function reviewModel(
 	return null;
 }
 
-/** A role's field error from the save's 400 body: own keys only, so a role named "__proto__" or
-    "constructor" never reads an inherited Object member as its message. */
-export function ownField(
-	fields: Readonly<Record<string, string>>,
+/** A role's own value in a server map (a 400 body's messages, a chain map): own keys only, so a
+    role named "__proto__" or "constructor" never reads an inherited Object member. */
+export function ownField<T>(
+	fields: Readonly<Record<string, T>>,
 	role: string,
-): string | undefined {
+): T | undefined {
 	return Object.hasOwn(fields, role) ? fields[role] : undefined;
 }
 
@@ -51,41 +51,86 @@ export function missingCheckRoles(roles: readonly string[]): string[] {
 }
 
 /** Board seed state after a save: "copy" when the board reads the provisioned copy (no seed),
-    "done" when the board copy holds the saved roles, "replaced" when a seed ran after the save
-    (its commit differs from `seedAtSave`) and left other roles, else "wait". Roles alone cannot
-    tell: two saves before one seed leave the board with the roles of neither. */
+    "done" when the board copy holds the saved roles and the saved roles' fallback chains,
+    "replaced" when a seed ran after the save (its commit differs from `seedAtSave`) and left
+    other values, else "wait". Values alone cannot tell: two saves before one seed leave the
+    board with the values of neither. */
 export function seedStep(
 	seed: {
 		needed: boolean;
 		commit: string | null;
 		roles: Record<string, string> | null;
+		fallbacks: Record<string, string[]> | null;
 	},
 	seedAtSave: string | null,
 	after: Record<string, string>,
+	afterFallbacks: Record<string, string[]>,
 ): "copy" | "done" | "wait" | "replaced" {
 	if (!seed.needed) return "copy";
 	const board = seed.roles;
+	const boardChains = seed.fallbacks ?? {};
 	const done =
 		board !== null &&
 		Object.keys(after).length === Object.keys(board).length &&
-		Object.entries(after).every(([r, v]) => board[r] === v);
+		Object.entries(after).every(([r, v]) => ownField(board, r) === v) &&
+		Object.keys(after).every((r) =>
+			sameChain(ownField(boardChains, r), ownField(afterFallbacks, r)),
+		);
 	if (done) return "done";
 	return seed.commit === seedAtSave ? "wait" : "replaced";
 }
 
-/** GET /api/model-roles: omp's modelRoles in the data repo, the sign-ins, and the board seed state. */
+/** Two chains match when both are absent, or both hold the same entries in order;
+    an explicit empty chain differs from no chain. */
+function sameChain(
+	a: readonly string[] | undefined,
+	b: readonly string[] | undefined,
+): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/** The fallback chains of the named roles; a role without a chain gets no key. */
+export function rowChains(
+	names: readonly string[],
+	fallbacks: Readonly<Record<string, string[]>>,
+): Record<string, string[]> {
+	return Object.fromEntries(
+		names.flatMap((n) => {
+			const chain = ownField(fallbacks, n);
+			return chain === undefined ? [] : [[n, [...chain]]];
+		}),
+	);
+}
+
+/** True when a row's edited chain differs from its loaded chain; absent and empty differ. */
+export function fallbacksDirty(
+	names: readonly string[],
+	chains: Readonly<Record<string, string[]>>,
+	loaded: Readonly<Record<string, string[]>>,
+): boolean {
+	return names.some(
+		(n) => !sameChain(ownField(chains, n), ownField(loaded, n)),
+	);
+}
+
+/** GET /api/model-roles: omp's modelRoles and fallback chains in the data repo, the sign-ins,
+    and the board seed state. */
 export type RolesState = {
 	/** The data repo commit the roles come from; a save sends it back as its base. */
 	base: string | null;
 	hash: string;
 	roles: Record<string, string>;
+	/** retry.fallbackChains in file order: role keys and model-selector keys alike. */
+	fallbacks: Record<string, string[]>;
 	/** The providers with an active sign-in on the board; null when the board cannot read its store. */
 	signIns: string[] | null;
-	/** `roles`: the board copy's roles, which tell whether the seed holds a save. */
+	/** `roles` and `fallbacks`: the board copy's values, which tell whether the seed holds a save. */
 	seed: {
 		needed: boolean;
 		commit: string | null;
 		roles: Record<string, string> | null;
+		fallbacks: Record<string, string[]> | null;
 		expiresAt: string | null;
 	};
 };
@@ -111,7 +156,7 @@ export function addRoleError(
 	return null;
 }
 
-/** The result of POST /api/model-roles. */
+/** The result of POST /api/model-roles. `fallbacks` is the file's whole retry.fallbackChains. */
 export type RolesSave =
 	| {
 			kind: "saved";
@@ -119,6 +164,7 @@ export type RolesSave =
 			base: string | null;
 			hash: string;
 			roles: Record<string, string>;
+			fallbacks: Record<string, string[]>;
 			seed: RolesState["seed"];
 	  }
 	| {
@@ -130,9 +176,16 @@ export type RolesSave =
 			base: string | null;
 			hash: string;
 			roles: Record<string, string>;
+			fallbacks: Record<string, string[]>;
 			error: string;
 	  }
-	| { kind: "failed"; error: string; fields: Record<string, string> };
+	| {
+			kind: "failed";
+			error: string;
+			fields: Record<string, string>;
+			/** A role's message for its fallback list. */
+			fallbackFields: Record<string, string>;
+	  };
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj =>
@@ -156,6 +209,20 @@ export function classifyRolesSave(
 		const v = own(k);
 		return isObj(v) ? v : undefined;
 	};
+	// fromEntries defines own keys, so a "__proto__" role keeps its entry instead of
+	// setting the prototype.
+	const strings = (k: string): Record<string, string> =>
+		Object.fromEntries(
+			Object.entries(obj(k) ?? {}).filter(
+				(e): e is [string, string] => typeof e[1] === "string",
+			),
+		);
+	const fallbacks: Record<string, string[]> = Object.fromEntries(
+		Object.entries(obj("fallbacks") ?? {}).filter(
+			(e): e is [string, string[]] =>
+				Array.isArray(e[1]) && e[1].every((s) => typeof s === "string"),
+		),
+	);
 	const commit = str("commit");
 	const base = own("base");
 	const baseOrNull = typeof base === "string" ? base : null;
@@ -171,19 +238,30 @@ export function classifyRolesSave(
 	)
 		return { kind: "readonly", path };
 	if (ok && commit && hash && roles && seed)
-		return { kind: "saved", commit, base: baseOrNull, hash, roles, seed };
+		return {
+			kind: "saved",
+			commit,
+			base: baseOrNull,
+			hash,
+			roles,
+			fallbacks,
+			seed,
+		};
 	if (status === 409 && hash && roles)
 		return {
 			kind: "conflict",
 			base: str("base") ?? null,
 			hash,
 			roles,
+			fallbacks,
 			error: `${error ?? "The model roles changed in the data repo."} The rows now show the current values. Make your change again.`,
 		};
-	const fields: Record<string, string> = {};
-	for (const [k, v] of Object.entries(obj("fields") ?? {}))
-		if (typeof v === "string") fields[k] = v;
-	return { kind: "failed", error: error ?? `HTTP ${status}`, fields };
+	return {
+		kind: "failed",
+		error: error ?? `HTTP ${status}`,
+		fields: strings("fields"),
+		fallbackFields: strings("fallbackFields"),
+	};
 }
 
 /** Case-insensitive quick search over the selector and the display name. */

@@ -4184,6 +4184,7 @@ extensions:
 				default: "zai/glm-5.3-flash:max",
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
+			fallbacks: {},
 		});
 		expect(head).toBe(ORIGINAL);
 		expect(headSha).toBe(OTHER);
@@ -4282,6 +4283,7 @@ extensions:
 				default: "zai/glm-5.3-flash:max",
 				slow: "zai/glm-5.3-flash:max",
 			},
+			fallbacks: {},
 			seed: expect.anything(),
 		});
 		// The save went through alate's editor PUT with the hash the editor loaded.
@@ -4357,6 +4359,153 @@ extensions:
 				"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
 		});
 		expect(puts).toEqual([]);
+		expect(ghCalls).toEqual([]);
+	});
+
+	// The real-world shape: role chains next to an exact-model key with its comment.
+	const CHAINS = `${ORIGINAL}retry:
+  fallbackChains:
+    default:
+      - anthropic/claude-opus-5-5:high
+    # Exact-model key comment
+    zai/glm-5.3-flash:
+      - anthropic/claude-opus-5-5
+cycleOrder:
+  - smol
+`;
+	const loadChains = () => {
+		reset();
+		head = snapshot = CHAINS;
+	};
+
+	test("GET returns the fallback chains in file order", async () => {
+		loadChains();
+		const res = await m.call("/api/model-roles");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { fallbacks: Record<string, string[]> };
+		expect(Object.entries(b.fallbacks)).toEqual([
+			["default", ["anthropic/claude-opus-5-5:high"]],
+			["zai/glm-5.3-flash", ["anthropic/claude-opus-5-5"]],
+		]);
+	});
+
+	test("a fallback save changes only the managed chain lines", async () => {
+		loadChains();
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: sha(CHAINS),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+			fallbacks: {
+				default: [
+					"anthropic/claude-opus-5-5:medium",
+					"anthropic/claude-opus-5-5",
+				],
+			},
+		});
+		expect(res.status).toBe(200);
+		const want = CHAINS.replace(
+			"      - anthropic/claude-opus-5-5:high\n",
+			"      - anthropic/claude-opus-5-5:medium\n      - anthropic/claude-opus-5-5\n",
+		);
+		expect(head).toBe(want);
+		expect(await res.json()).toMatchObject({
+			commit: NEW,
+			hash: sha(want),
+			fallbacks: {
+				default: [
+					"anthropic/claude-opus-5-5:medium",
+					"anthropic/claude-opus-5-5",
+				],
+				"zai/glm-5.3-flash": ["anthropic/claude-opus-5-5"],
+			},
+		});
+	});
+
+	test("a role save without fallbacks keeps every chain byte for byte", async () => {
+		loadChains();
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: sha(CHAINS),
+			roles: {
+				default: "anthropic/claude-opus-5-5",
+				slow: "anthropic/claude-opus-5-5:medium",
+			},
+		});
+		expect(res.status).toBe(200);
+		expect(head).toBe(
+			CHAINS.replace(
+				"default: zai/glm-5.3-flash:max",
+				"default: anthropic/claude-opus-5-5",
+			),
+		);
+	});
+
+	test("a bad fallback list is refused and nothing reaches GitHub", async () => {
+		const roles = {
+			default: "zai/glm-5.3-flash:max",
+			slow: "anthropic/claude-opus-5-5:medium",
+		};
+		for (const fallbacks of [
+			{ default: ["nope/model"] },
+			{ default: ["anthropic/claude-opus-5-5", "anthropic/claude-opus-5-5"] },
+			{ ghost: ["anthropic/claude-opus-5-5"] },
+		]) {
+			loadChains();
+			const res = await m.call("/api/model-roles", {
+				base: BASE,
+				hash: sha(CHAINS),
+				roles,
+				fallbacks,
+			});
+			expect(res.status).toBe(400);
+			const b = (await res.json()) as {
+				fallbackFields: Record<string, string>;
+			};
+			expect(Object.keys(b.fallbackFields)).toEqual(Object.keys(fallbacks));
+			expect(ghCalls).toEqual([]);
+			expect(head).toBe(CHAINS);
+		}
+		loadChains();
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: sha(CHAINS),
+			roles,
+			fallbacks: { default: ["nope/model"] },
+		});
+		const b = (await res.json()) as { fallbackFields: Record<string, string> };
+		expect(b.fallbackFields.default).toContain("unknown model nope/model");
+	});
+
+	test("a non-object fallbacks body is refused", async () => {
+		loadChains();
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: sha(CHAINS),
+			roles: { default: "zai/glm-5.3-flash:max" },
+			fallbacks: ["x"],
+		});
+		expect(res.status).toBe(400);
+		expect(ghCalls).toEqual([]);
+	});
+
+	test("a 409 carries the current fallback chains", async () => {
+		loadChains();
+		const res = await m.call("/api/model-roles", {
+			base: BASE,
+			hash: "stale",
+			roles: { default: "anthropic/claude-opus-5-5" },
+		});
+		expect(res.status).toBe(409);
+		expect(await res.json()).toMatchObject({
+			hash: sha(CHAINS),
+			fallbacks: {
+				default: ["anthropic/claude-opus-5-5:high"],
+				"zai/glm-5.3-flash": ["anthropic/claude-opus-5-5"],
+			},
+		});
 		expect(ghCalls).toEqual([]);
 	});
 });
@@ -12515,6 +12664,25 @@ describe("token expiry reminders", () => {
 			seed: { expiresAt: string | null };
 		};
 		expect(withNone.seed.expiresAt).toBeNull();
+		// seed.fallbacks is the board copy's retry.fallbackChains.
+		const agent = mkdtempSync(join(tmpdir(), "ottr-seed-chains-"));
+		writeFileSync(
+			join(agent, "config.yml"),
+			"modelRoles:\n  plan: a/b\nretry:\n  fallbackChains:\n    plan:\n      - c/d:max\n    bad: x\n",
+		);
+		const savedPin = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agent;
+		try {
+			const withChains = (await (await call("/api/model-roles")).json()) as {
+				seed: { roles: unknown; fallbacks: unknown };
+			};
+			expect(withChains.seed.roles).toEqual({ plan: "a/b" });
+			expect(withChains.seed.fallbacks).toEqual({ plan: ["c/d:max"] });
+		} finally {
+			if (savedPin === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedPin;
+			rmSync(agent, { recursive: true, force: true });
+		}
 		fake.stop(true);
 	});
 });

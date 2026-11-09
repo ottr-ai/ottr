@@ -60,6 +60,7 @@ import {
 import {
 	addRoleError,
 	classifyRolesSave,
+	fallbacksDirty,
 	type ModelRow,
 	missingCheckRoles,
 	modelMatches,
@@ -67,6 +68,7 @@ import {
 	type RolesState,
 	rolesDirty,
 	roleWarnings,
+	rowChains,
 	seedStep,
 	useModels,
 } from "./models.ts";
@@ -3305,10 +3307,11 @@ type ProvisionStep =
 
 const shortSha = (sha: string): string => sha.slice(0, 7);
 
-/** One Model roles row's model picker: the shared search popover over the catalogue.
-    The picker sets the row's base model; the row keeps its own thinking select. */
+/** One Model roles value's model picker: the shared search popover over the catalogue.
+    The picker sets the value's base model; the row keeps its own thinking select.
+    `label` names the picker ("Model for plan", "plan fallback 2 model"). */
 function RoleModelPicker({
-	role,
+	label: name,
 	base,
 	level,
 	models,
@@ -3317,11 +3320,11 @@ function RoleModelPicker({
 	invalid,
 	describedBy,
 }: {
-	role: string;
+	label: string;
 	base: string;
 	level: string;
 	models: readonly ModelOption[];
-	setValue: (name: string, value: string) => void;
+	setValue: (value: string) => void;
 	disabled: boolean;
 	invalid: boolean;
 	describedBy?: string;
@@ -3340,7 +3343,7 @@ function RoleModelPicker({
 		<>
 			<ModelMenuTrigger
 				menu={menu}
-				label={`Model for ${role}`}
+				label={name}
 				invalid={invalid}
 				describedBy={describedBy}
 				disabled={disabled}
@@ -3362,7 +3365,7 @@ function RoleModelPicker({
 				shown={filtered.length}
 				total={models.length}
 				onPick={(selector) => {
-					setValue(role, joinLevel(selector, level));
+					setValue(joinLevel(selector, level));
 					menu.close();
 				}}
 			/>
@@ -3370,22 +3373,215 @@ function RoleModelPicker({
 	);
 }
 
-/** Settings "Model roles" section: edits omp's modelRoles in the data repo through Alate, then provisions. */
+/** A Model roles value's thinking select: Default (no level), then each level. */
+function ThinkingSelect({
+	label,
+	base,
+	level,
+	setValue,
+	disabled,
+	invalid,
+	describedBy,
+}: {
+	label: string;
+	base: string;
+	level: string;
+	setValue: (value: string) => void;
+	disabled: boolean;
+	invalid: boolean;
+	describedBy?: string;
+}) {
+	return (
+		<select
+			value={level}
+			onChange={(e) => setValue(joinLevel(base, e.target.value))}
+			aria-label={label}
+			aria-invalid={invalid}
+			aria-describedby={describedBy}
+			disabled={disabled}
+		>
+			<option value="">Default</option>
+			{THINKING_LEVELS.map((l) => (
+				<option key={l} value={l}>
+					{l}
+				</option>
+			))}
+		</select>
+	);
+}
+
+/** `map` without `key`; fromEntries keeps every other key an own key. */
+function withoutKey<T>(
+	map: Readonly<Record<string, T>>,
+	key: string,
+): Record<string, T> {
+	return Object.fromEntries(Object.entries(map).filter(([k]) => k !== key));
+}
+
+/** A role's fallback chain under its row: one model and thinking pair per entry in chain
+    order, Move up (not on the first), remove, and Add fallback with the first catalog model.
+    `chain` is undefined when the role has no chain key; `edit` maps the current chain. */
+function RoleFallbacks({
+	role,
+	chain,
+	models,
+	first,
+	edit,
+	disabled,
+	error,
+	errorId,
+}: {
+	role: string;
+	chain: readonly string[] | undefined;
+	models: readonly ModelOption[];
+	first: string | undefined;
+	edit: (fn: (chain: string[]) => string[]) => void;
+	disabled: boolean;
+	error: string | undefined;
+	errorId: string;
+}) {
+	const list = useRef<HTMLOListElement>(null);
+	const addButton = useRef<HTMLButtonElement>(null);
+	// Entries render by position, so after a move or a removal of the last entry the focus
+	// goes where the moved entry or the nearest control now is.
+	const [focusAt, setFocusAt] = useState<number | null>(null);
+	useEffect(() => {
+		if (focusAt === null) return;
+		setFocusAt(null);
+		const row = list.current?.children[focusAt];
+		const target =
+			row?.querySelector<HTMLElement>(".fallback-up") ??
+			row?.querySelector<HTMLElement>(".fallback-remove") ??
+			addButton.current;
+		target?.focus();
+	}, [focusAt]);
+	const entries = chain ?? [];
+	const describedBy = error !== undefined ? errorId : undefined;
+	return (
+		<fieldset className="role-fallbacks">
+			<legend className="role-fallbacks-head">
+				Fallbacks<span className="sr"> for {role}</span>
+			</legend>
+			{entries.length === 0 ? (
+				<p className="hint">No fallback models.</p>
+			) : (
+				<ol className="fallback-list" ref={list}>
+					{entries.map((value, i) => {
+						const [base, level] = splitLevel(value);
+						const n = i + 1;
+						const setEntry = (next: string): void =>
+							edit((c) => c.map((v, j) => (j === i ? next : v)));
+						return (
+							// biome-ignore lint/suspicious/noArrayIndexKey: a chain can hold one selector twice; entries are positions
+							<li className="fallback-row" key={i}>
+								<span className="fallback-num" aria-hidden="true">
+									{n}
+								</span>
+								{i > 0 && (
+									<button
+										type="button"
+										className="icon fallback-up"
+										aria-label={`Move up ${role} fallback ${n}`}
+										title="Move up"
+										onClick={() => {
+											edit((c) => {
+												const moved = [...c];
+												moved.splice(i - 1, 0, ...moved.splice(i, 1));
+												return moved;
+											});
+											setFocusAt(i - 1);
+										}}
+										disabled={disabled}
+									>
+										<Icon name="chevron-up" />
+									</button>
+								)}
+								<RoleModelPicker
+									label={`${role} fallback ${n} model`}
+									base={base}
+									level={level}
+									models={models}
+									setValue={setEntry}
+									disabled={disabled}
+									invalid={error !== undefined}
+									describedBy={describedBy}
+								/>
+								<ThinkingSelect
+									label={`${role} fallback ${n} thinking`}
+									base={base}
+									level={level}
+									setValue={setEntry}
+									disabled={disabled}
+									invalid={error !== undefined}
+									describedBy={describedBy}
+								/>
+								<button
+									type="button"
+									className="icon fallback-remove"
+									aria-label={`Remove ${role} fallback ${n}`}
+									title="Remove fallback"
+									onClick={() => {
+										edit((c) => c.filter((_, j) => j !== i));
+										// The entry below takes this position and keeps the focus;
+										// the last entry hands it up, or to Add fallback.
+										if (i === entries.length - 1) setFocusAt(i - 1);
+									}}
+									disabled={disabled}
+								>
+									<Icon name="x" />
+								</button>
+							</li>
+						);
+					})}
+				</ol>
+			)}
+			{error !== undefined && (
+				<p className="auth-error" id={errorId}>
+					{error}
+				</p>
+			)}
+			<button
+				type="button"
+				className="fallback-add"
+				ref={addButton}
+				aria-label={`Add fallback for ${role}`}
+				aria-describedby={describedBy}
+				onClick={() => {
+					if (first !== undefined) edit((c) => [...c, first]);
+				}}
+				disabled={disabled || first === undefined}
+			>
+				<Icon name="plus" />
+				Add fallback
+			</button>
+		</fieldset>
+	);
+}
+
+/** Settings "Model roles" section: edits omp's modelRoles and each role's fallback chain in the
+    data repo through Alate, then provisions. */
 export function ModelRolesSection() {
 	const catalog = useModels();
 	const [state, setState] = useState<RolesState | null>(null);
 	const [loadErr, setLoadErr] = useState<string | null>(null);
 	const [rows, setRows] = useState<Array<[string, string]>>([]);
 	const [fields, setFields] = useState<Record<string, string>>({});
+	// The rows' fallback chains; a role without a chain has no key.
+	const [chains, setChains] = useState<Record<string, string[]>>({});
+	const [fallbackFields, setFallbackFields] = useState<Record<string, string>>(
+		{},
+	);
 	const [error, setError] = useState<string | null>(null);
 	const [ro, setRo] = useState<string | null>(null);
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
-	// The saved roles and the board's seed commit at the save: the seed step compares the board copy with both.
+	// The saved roles and chains and the board's seed commit at the save: the seed step
+	// compares the board copy with them.
 	const [saved, setSaved] = useState<{
 		seedAtSave: string | null;
 		after: Record<string, string>;
+		afterFallbacks: Record<string, string[]>;
 	} | null>(null);
 	const [prov, setProv] = useState<ProvisionStep | null>(null);
 	/** When this page's provision call started; the running line ticks its elapsed time. */
@@ -3404,6 +3600,7 @@ export function ModelRolesSection() {
 				if (!live) return;
 				setState(s);
 				setRows(Object.entries(s.roles));
+				setChains(rowChains(Object.keys(s.roles), s.fallbacks));
 			},
 			(err: unknown) => {
 				if (live) setLoadErr(err instanceof Error ? err.message : String(err));
@@ -3417,7 +3614,7 @@ export function ModelRolesSection() {
 	const step =
 		seed === null || saved === null
 			? null
-			: seedStep(seed, saved.seedAtSave, saved.after);
+			: seedStep(seed, saved.seedAtSave, saved.after, saved.afterFallbacks);
 	const seedWaits = commit !== null && step === "wait";
 	// The hourly deploy seeds the board copy: read the seed state each minute until it holds the save.
 	useEffect(() => {
@@ -3436,23 +3633,48 @@ export function ModelRolesSection() {
 	const models = [...(catalog?.models ?? [])].sort((a, b) =>
 		a.name.localeCompare(b.name),
 	);
-	const dirty = state !== null && rolesDirty(rows, state.roles);
+	const first = models[0]?.selector;
+	const dirty =
+		state !== null &&
+		(rolesDirty(rows, state.roles) ||
+			fallbacksDirty(
+				rows.map(([name]) => name),
+				chains,
+				state.fallbacks,
+			));
 	// The check roles the board would fall back from: without them a check runs on the
 	// default model, which is often the model it checks.
 	const missing = missingCheckRoles(rows.map(([name]) => name));
 	const setValue = (name: string, value: string): void => {
 		setRows((rs) => rs.map((r) => (r[0] === name ? [name, value] : r)));
-		setFields((f) =>
-			Object.fromEntries(Object.entries(f).filter(([k]) => k !== name)),
-		);
+		setFields((f) => withoutKey(f, name));
+	};
+	const editChain = (name: string, fn: (chain: string[]) => string[]): void => {
+		setChains((c) => {
+			const next = fn(ownField(c, name) ?? []);
+			// Removing the last entry drops the key, so the save sends no explicit empty chain.
+			return next.length === 0
+				? withoutKey(c, name)
+				: { ...withoutKey(c, name), [name]: next };
+		});
+		setFallbackFields((f) => withoutKey(f, name));
+	};
+	const removeRole = (name: string): void => {
+		setRows((rs) => rs.filter(([n]) => n !== name));
+		setChains((c) => withoutKey(c, name));
+		setFallbackFields((f) => withoutKey(f, name));
 	};
 	const add = (): void => {
 		const name = newName.trim();
-		const first = models[0]?.selector;
 		const err = addRoleError(name, rows, first);
 		setAddErr(err);
 		if (err === null && first !== undefined) {
 			setRows((rs) => [...rs, [name, first]]);
+			// A new role starts with the chain the file holds for its key.
+			const loaded =
+				state !== null ? ownField(state.fallbacks, name) : undefined;
+			if (loaded !== undefined)
+				setChains((c) => ({ ...c, [name]: [...loaded] }));
 			setNewName("");
 		}
 	};
@@ -3492,6 +3714,7 @@ export function ModelRolesSection() {
 			if (state === null) return false;
 			setError(null);
 			setFields({});
+			setFallbackFields({});
 			setCommit(null);
 			setSaved(null);
 			setProv(null);
@@ -3504,6 +3727,10 @@ export function ModelRolesSection() {
 						base: state.base,
 						hash: state.hash,
 						roles: Object.fromEntries(rows),
+						fallbacks: rowChains(
+							rows.map(([name]) => name),
+							chains,
+						),
 					}),
 				});
 				const r = classifyRolesSave(
@@ -3514,15 +3741,24 @@ export function ModelRolesSection() {
 				if (r.kind === "readonly") {
 					setRo(r.path);
 					setRows(Object.entries(state.roles));
+					setChains(rowChains(Object.keys(state.roles), state.fallbacks));
 					setError(null);
 					setFields({});
+					setFallbackFields({});
 					return false;
 				}
 				if (r.kind === "saved") {
-					const { commit: sha, base, hash, roles, seed } = r;
-					setState((old) => old && { ...old, base, hash, roles, seed });
+					const { commit: sha, base, hash, roles, fallbacks, seed } = r;
+					setState(
+						(old) => old && { ...old, base, hash, roles, fallbacks, seed },
+					);
 					setRows(Object.entries(roles));
-					setSaved({ seedAtSave: seed.commit, after: roles });
+					setChains(rowChains(Object.keys(roles), fallbacks));
+					setSaved({
+						seedAtSave: seed.commit,
+						after: roles,
+						afterFallbacks: fallbacks,
+					});
 					setCommit(sha);
 					// The commit stands even when the provision fails; the steps list says so.
 					await provision();
@@ -3530,13 +3766,15 @@ export function ModelRolesSection() {
 				}
 				if (r.kind === "conflict") {
 					// The data repo moved: load its current values, so the next save starts from them.
-					const { base, hash, roles } = r;
-					setState((old) => old && { ...old, base, hash, roles });
+					const { base, hash, roles, fallbacks } = r;
+					setState((old) => old && { ...old, base, hash, roles, fallbacks });
 					setRows(Object.entries(roles));
+					setChains(rowChains(Object.keys(roles), fallbacks));
 					setError(r.error);
 					return false;
 				}
 				setFields(r.fields);
+				setFallbackFields(r.fallbackFields);
 				setError(r.error);
 				return false;
 			} catch (err) {
@@ -3563,9 +3801,9 @@ export function ModelRolesSection() {
 			}
 			hint={
 				<>
-					omp runs each role with its model. Save commits{" "}
-					<code>user/omp/agent/config.yml</code> to Alate's data repo with the
-					board's GitHub token, then Alate provisions the workers.
+					omp runs each role with its model, then with its fallbacks in order.
+					Save commits <code>user/omp/agent/config.yml</code> to Alate's data
+					repo with the board's GitHub token, then Alate provisions the workers.
 				</>
 			}
 		>
@@ -3597,40 +3835,30 @@ export function ModelRolesSection() {
 								<div className="alate-def-row role-row" key={name}>
 									<b className="role-name">{name}</b>
 									<RoleModelPicker
-										role={name}
+										label={`Model for ${name}`}
 										base={base}
 										level={level}
 										models={models}
-										setValue={setValue}
+										setValue={(v) => setValue(name, v)}
 										disabled={save.busy || ro !== null}
 										invalid={field !== undefined}
 										describedBy={notesId}
 									/>
-									<select
-										value={level}
-										onChange={(e) =>
-											setValue(name, joinLevel(base, e.target.value))
-										}
-										aria-label={`Thinking for ${name}`}
-										aria-invalid={field !== undefined}
-										aria-describedby={notesId}
+									<ThinkingSelect
+										label={`Thinking for ${name}`}
+										base={base}
+										level={level}
+										setValue={(v) => setValue(name, v)}
 										disabled={save.busy || ro !== null}
-									>
-										<option value="">Default</option>
-										{THINKING_LEVELS.map((l) => (
-											<option key={l} value={l}>
-												{l}
-											</option>
-										))}
-									</select>
+										invalid={field !== undefined}
+										describedBy={notesId}
+									/>
 									<button
 										type="button"
 										className="icon role-remove"
 										aria-label={`Remove role ${name}`}
 										title="Remove role"
-										onClick={() =>
-											setRows((rs) => rs.filter(([n]) => n !== name))
-										}
+										onClick={() => removeRole(name)}
 										disabled={save.busy || ro !== null}
 									>
 										<Icon name="x" />
@@ -3648,6 +3876,16 @@ export function ModelRolesSection() {
 											))}
 										</div>
 									)}
+									<RoleFallbacks
+										role={name}
+										chain={ownField(chains, name)}
+										models={models}
+										first={first}
+										edit={(fn) => editChain(name, fn)}
+										disabled={save.busy || ro !== null}
+										error={ownField(fallbackFields, name)}
+										errorId={`${uid}-${i}-fallbacks`}
+									/>
 								</div>
 							);
 						})}

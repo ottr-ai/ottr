@@ -126,11 +126,18 @@ import {
 import {
 	commitMessage,
 	editModelRoles,
+	type Fallbacks,
 	RolesLayoutError,
+	readFallbacks,
 	readRoles,
 	validateRoles,
 } from "./modelRoles.ts";
-import { type ModelOption, modelList, modelRoles } from "./models.ts";
+import {
+	type ModelOption,
+	modelFallbacks,
+	modelList,
+	modelRoles,
+} from "./models.ts";
 import {
 	ALERT_CLASSES,
 	ALL_CLASSES_ON,
@@ -1956,26 +1963,36 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 	/** Compose seeds the board's omp copy hourly and records the commit next to its home.
-	 *  `roles` is the board copy's modelRoles: the UI compares them with the saved roles. */
+	 *  `roles` is the board copy's modelRoles and `fallbacks` its retry.fallbackChains: the UI
+	 *  compares them with the saved values. */
 	function seedView(): {
 		needed: boolean;
 		commit: string | null;
 		roles: Record<string, string> | null;
+		fallbacks: Record<string, string[]> | null;
 		expiresAt: string | null;
 	} {
 		const needed = !!process.env.OTTR_BOARD_OMP_HOME?.trim();
-		if (!needed) return { needed, commit: null, roles: null, expiresAt: null };
+		if (!needed)
+			return {
+				needed,
+				commit: null,
+				roles: null,
+				fallbacks: null,
+				expiresAt: null,
+			};
 		const roles = modelRoles();
+		const fallbacks = modelFallbacks();
 		const expiresAt = readSeedTokenExpires();
 		try {
 			const commit = readFileSync(
 				join(dirname(boardOmpHome()), "seed-commit"),
 				"utf8",
 			).trim();
-			return { needed, commit: commit || null, roles, expiresAt };
+			return { needed, commit: commit || null, roles, fallbacks, expiresAt };
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			return { needed, commit: null, roles, expiresAt };
+			return { needed, commit: null, roles, fallbacks, expiresAt };
 		}
 	}
 	/** The deferred server restart the update script records next to the board home: a notice
@@ -5631,6 +5648,7 @@ export function createApp(deps: AppDeps) {
 							base: f.body.base,
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
+							fallbacks: readFallbacks(f.body.content),
 							// One sign-in, on the board (docs/specs/provider-credentials.md): the
 							// board store's active providers; null when it cannot be read.
 							signIns: (() => {
@@ -5651,18 +5669,22 @@ export function createApp(deps: AppDeps) {
 					layout422(async () => {
 						const r = await readJson(req);
 						if ("error" in r) return r.error;
-						const { base, hash, roles } = r.body;
+						const { base, hash, roles, fallbacks } = r.body;
 						if (
 							(typeof base !== "string" && base !== null) ||
 							typeof hash !== "string" ||
 							typeof roles !== "object" ||
 							roles === null ||
-							Array.isArray(roles)
+							Array.isArray(roles) ||
+							(fallbacks !== undefined &&
+								(typeof fallbacks !== "object" ||
+									fallbacks === null ||
+									Array.isArray(fallbacks)))
 						)
 							return json(
 								{
 									error:
-										"body must be { base: string | null, hash: string, roles: object }",
+										"body must be { base: string | null, hash: string, roles: object, fallbacks?: object }",
 								},
 								400,
 							);
@@ -5672,6 +5694,7 @@ export function createApp(deps: AppDeps) {
 						const f = await loadConfigYml(alate, true);
 						if (!f.ok) return json({ error: f.error }, f.status);
 						const current = readRoles(f.body.content);
+						const currentFallbacks = readFallbacks(f.body.content);
 						if (f.body.base !== base || f.body.hash !== hash)
 							return json(
 								{
@@ -5680,20 +5703,39 @@ export function createApp(deps: AppDeps) {
 									base: f.body.base,
 									hash: f.body.hash,
 									roles: current,
+									fallbacks: currentFallbacks,
 								},
 								409,
 							);
 						const catalog = new Set(
 							(await (deps.models ?? modelList)()).map((m) => m.selector),
 						);
+						// Without `fallbacks`, each requested role keeps its current chain.
+						const fb: Record<string, unknown> =
+							fallbacks === undefined
+								? Object.fromEntries(
+										Object.keys(roles)
+											.filter((k) => Object.hasOwn(currentFallbacks, k))
+											.map((k) => [k, currentFallbacks[k]]),
+									)
+								: (fallbacks as Record<string, unknown>);
 						const bad = validateRoles(
 							roles as Record<string, unknown>,
 							current,
 							catalog,
+							fb,
+							currentFallbacks,
 						);
 						if (bad !== null) return json(bad, 400);
 						const next = roles as Record<string, string>;
-						const content = editModelRoles(f.body.content, next);
+						const nextFallbacks = fb as Fallbacks;
+						const content = editModelRoles(f.body.content, next, nextFallbacks);
+						const message = commitMessage(
+							current,
+							next,
+							currentFallbacks,
+							nextFallbacks,
+						);
 						const { repo, base: parent, path } = f.body;
 						if (repo === null || parent === null) {
 							// A folder source saves through alate's editor PUT: alate checks `base`
@@ -5705,7 +5747,7 @@ export function createApp(deps: AppDeps) {
 								alate,
 								content,
 								f.body.hash,
-								commitMessage(current, next),
+								message,
 							);
 							if (!w.ok) return json({ error: w.error }, w.status);
 							if (w.body.commit === "") {
@@ -5735,19 +5777,14 @@ export function createApp(deps: AppDeps) {
 								base: null,
 								hash,
 								roles: readRoles(content),
+								fallbacks: readFallbacks(content),
 								seed: seedView(),
 							});
 						}
 						// The commit's parent is the commit the user loaded, and the branch moves only
 						// as a fast-forward: a commit on main at any time since the read gives 409.
 						// Never retried: a refused write goes back to the user.
-						const w = await commitConfigYml(
-							gh,
-							repo,
-							parent,
-							content,
-							commitMessage(current, next),
-						);
+						const w = await commitConfigYml(gh, repo, parent, content, message);
 						if (!w.ok) {
 							if (w.status !== 409) return json({ error: w.error }, w.status);
 							// The data repo moved: show the user its current roles.
@@ -5760,6 +5797,7 @@ export function createApp(deps: AppDeps) {
 									base: again.body.base,
 									hash: again.body.hash,
 									roles: readRoles(again.body.content),
+									fallbacks: readFallbacks(again.body.content),
 								},
 								409,
 							);
@@ -5784,6 +5822,7 @@ export function createApp(deps: AppDeps) {
 								.update(content)
 								.digest("hex"),
 							roles: readRoles(content),
+							fallbacks: readFallbacks(content),
 							seed: seedView(),
 						});
 					}),

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { modelRoles } from "./models.ts";
+import { modelFallbacks, modelRoles } from "./models.ts";
 
 const dir = join(tmpdir(), `ottr-modelroles-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -79,6 +79,37 @@ other: {x: "y"}
 		expect(modelRoles(join(dir, "missing.yml"))).toEqual({});
 		expect(modelRoles(config("symbolPreset: unicode\n"))).toEqual({});
 		expect(modelRoles(config("modelRoles:\n  tiny:\n"))).toEqual({});
+	});
+});
+
+describe("modelFallbacks", () => {
+	test("parses string lists in file order and drops other values", () => {
+		const chains = modelFallbacks(
+			config(`retry:
+  fallbackChains:
+    plan:
+      - openai-codex/gpt-6.1-sol
+    none: []
+    # Exact-model key comment
+    openai-codex/gpt-6.1-sol:
+      - zai/glm-5.3:max
+    scalar: a/b
+    mixed: [a/b, 3]
+cycleOrder:
+  - smol
+`),
+		);
+		expect(Object.entries(chains)).toEqual([
+			["plan", ["openai-codex/gpt-6.1-sol"]],
+			["none", []],
+			["openai-codex/gpt-6.1-sol", ["zai/glm-5.3:max"]],
+		]);
+	});
+
+	test("yields {} without a file, retry, or chains", () => {
+		expect(modelFallbacks(join(dir, "missing.yml"))).toEqual({});
+		expect(modelFallbacks(config("modelRoles: {default: a/b}\n"))).toEqual({});
+		expect(modelFallbacks(config("retry:\n  fallbackChains:\n"))).toEqual({});
 	});
 });
 
