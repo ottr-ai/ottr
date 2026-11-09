@@ -6233,6 +6233,24 @@ describe("hindsight settings", () => {
 	// A getter: after an assignment, TypeScript narrows a direct read for good.
 	const token = (): string | undefined => process.env.HINDSIGHT_API_TOKEN;
 	const set = (t: string) => post("/api/settings/hindsight", { token: t });
+	// Only this endpoint fails; the board's HTTP requests still use the real fetch.
+	const withHindsightDown = async <T>(fn: () => Promise<T>): Promise<T> => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const target = String(input instanceof Request ? input.url : input);
+			if (target === `${url}/v1/default/banks`)
+				throw new TypeError("fetch failed");
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			return await fn();
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	};
 	// A restarted server: a fresh app on the same store, with its own HTTP surface so tests
 	// can read its view and state frame (the outer get/post hit the long-lived app instead).
 	// Returns its request fn and an awaited memory health tick.
@@ -6312,9 +6330,14 @@ describe("hindsight settings", () => {
 		// A server that does not answer keeps the last good key.
 		process.env.HINDSIGHT_API_URL = url;
 		process.env.HINDSIGHT_API_TOKEN = "key-two";
-		hindsight.stop(true);
-		expect((await set("key-three")).status).toBe(502);
-		expect(token()).toBe("key-two");
+		await withHindsightDown(async () => {
+			const res = await set("key-three");
+			expect(res.status).toBe(502);
+			expect(await res.json()).toEqual({
+				error: expect.stringMatching(/did not answer/),
+			});
+			expect(token()).toBe("key-two");
+		});
 	});
 
 	test("Settings keeps the server URL too: a saved URL beats the env seed at boot and the key check runs against it", async () => {
@@ -6431,21 +6454,23 @@ describe("hindsight settings", () => {
 
 	test("an unreachable server surfaces its reason in the view and the state warnings", async () => {
 		clearSavedHindsight();
-		// Loopback port 1 has no listener, so the probe is refused without racing
-		// the ephemeral ports other parallel test servers bind (a freed port once
-		// answered HTTP 404 from an unrelated server).
-		process.env.HINDSIGHT_API_URL = "http://127.0.0.1:1";
-		const booted = boot();
-		await booted.tick();
-		const v = (await (await booted.call("/api/settings/hindsight")).json()) as {
-			backend: string;
-			memoryReason: string;
-		};
-		expect(v.backend).toBe("hindsight");
-		expect(v.memoryReason).toMatch(/did not answer/);
-		expect(await stateWarnings(booted.call)).toContain(
-			`omp runs with no memory: ${v.memoryReason}`,
-		);
+		process.env.HINDSIGHT_API_URL = url;
+		process.env.HINDSIGHT_API_TOKEN = "key-two";
+		await withHindsightDown(async () => {
+			const booted = boot();
+			await booted.tick();
+			const v = (await (
+				await booted.call("/api/settings/hindsight")
+			).json()) as {
+				backend: string;
+				memoryReason: string;
+			};
+			expect(v.backend).toBe("hindsight");
+			expect(v.memoryReason).toMatch(/did not answer/);
+			expect(await stateWarnings(booted.call)).toContain(
+				`omp runs with no memory: ${v.memoryReason}`,
+			);
+		});
 	});
 
 	test("a refused key surfaces a rejected-key reason that never names the key", async () => {
@@ -6497,17 +6522,20 @@ describe("hindsight settings", () => {
 
 	test("a save reports the health of the new URL immediately", async () => {
 		clearSavedHindsight();
-		const dead = Bun.serve({ port: 0, fetch: () => new Response(null) });
-		const deadEndpoint = `http://127.0.0.1:${dead.port}`;
-		dead.stop(true);
-		process.env.HINDSIGHT_API_URL = deadEndpoint;
+		process.env.HINDSIGHT_API_URL = url;
 		process.env.HINDSIGHT_API_TOKEN = "key-two";
-		const booted = boot();
-		await booted.tick();
-		const v = (await (await booted.call("/api/settings/hindsight")).json()) as {
-			memoryReason: string;
-		};
-		expect(v.memoryReason).toMatch(/did not answer/);
+		const booted = await withHindsightDown(async () => {
+			const booted = boot();
+			await booted.tick();
+			const v = (await (
+				await booted.call("/api/settings/hindsight")
+			).json()) as { memoryReason: string };
+			expect(v.memoryReason).toMatch(/did not answer/);
+			expect(await stateWarnings(booted.call)).toContain(
+				`omp runs with no memory: ${v.memoryReason}`,
+			);
+			return booted;
+		});
 		const healthy = Bun.serve({
 			port: 0,
 			fetch: () => new Response(null, { status: 200 }),
@@ -6524,6 +6552,9 @@ describe("hindsight settings", () => {
 				backend: "hindsight",
 				memoryReason: null,
 			});
+			expect(await stateWarnings(booted.call)).not.toContain(
+				expect.stringMatching(/^omp runs with no memory:/),
+			);
 		} finally {
 			healthy.stop(true);
 		}
