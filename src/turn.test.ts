@@ -19506,6 +19506,98 @@ describe("turn checkout guard (other projects)", () => {
 		expect(after.needsReason).toBeNull();
 	});
 
+	test("a merge whose push fails still discounts the head the merge agent advanced", async () => {
+		// The merge agent fast-forwards the other project's main checkout before the
+		// settle's push; a failed push must still record that advanced head, or the guard
+		// of a concurrent work turn parks on the board's own merge.
+		let workRun = false;
+		const integrated = () => ({
+			pid: 4242,
+			done: Promise.resolve(
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "landed",
+					} satisfies Outcome,
+				}),
+			),
+			kill: async () => {},
+		});
+		const { store, other, record, states, loop } = twoProjectCase({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error: "auth failed",
+			}),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (!workRun) return integrated();
+				states.set(other.path, { head: "failed9", status: "" });
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		states.set(other.path, { head: "failed9", status: "" });
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(other.name, mergeTask.id);
+		await flushPromises();
+
+		// The work turn's agent moves the other checkout to the advanced head again; the
+		// failed push's recording still discounts it.
+		states.delete(other.path);
+		workRun = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("an in-flight merge turn of the other project discounts its head advance", async () => {
+		// While the other project's own merge turn runs, its agent fast-forwards its main
+		// checkout legitimately; the guard skips the project until that turn is over.
+		const record = baseRecord();
+		const { store, other, states, loop } = twoProjectCase({
+			...changingRun(record, () => {
+				states.set(other.path, { head: "midmerge", status: "" });
+			}),
+		});
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			state: "running",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		await flushPromises();
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
 	test("an unrecorded HEAD advance with a clean tree parks needs_you", async () => {
 		const record = baseRecord();
 		const { store, other, states, loop } = twoProjectCase(

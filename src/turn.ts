@@ -498,11 +498,14 @@ async function snapshotOtherCheckouts(
 }
 
 /** OTTR-708: the cross-project checkout guard. Compares the before/after main-checkout
- * snapshots of the other projects: a new commit the board did not push, or a status change,
- * is a change made outside this turn's own worktree. A HEAD advance the board itself made
- * (boardPushedHeads, recorded at the serverMergePush call sites) with a clean tree is
- * discounted — merges of other projects run concurrently with work turns by design. Returns
- * the needs_you reason, null when every other checkout reads unchanged. */
+ * snapshots of the other projects: a new commit the board did not make, or a status change,
+ * is a change made outside this turn's own worktree. A HEAD advance the board's own merge
+ * machinery made is discounted with a clean tree: the head recorded at the merge settle's
+ * runPush whatever its outcome (the merge agent fast-forwards the main checkout before the
+ * push, so a failed or rejected push still leaves the advanced head behind), and a project
+ * whose own merge turn is in flight is skipped outright — its main checkout belongs to that
+ * turn right now. Merges of other projects run concurrently with work turns by design.
+ * Returns the needs_you reason, null when every other checkout reads unchanged. */
 async function checkoutGuardReason(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -512,6 +515,13 @@ async function checkoutGuardReason(
 ): Promise<string | null> {
 	for (const other of projects.values()) {
 		if (other.name === self || other.gitless) continue;
+		// The other project's own merge turn is mid-flight: its agent fast-forwards its
+		// main checkout legitimately, and the settle records the head it advanced. Skip
+		// the project until that turn is over.
+		const mergingInFlight = other.store
+			.listTasks()
+			.some((t) => t.stage === "merging" && t.state === "running");
+		if (mergingInFlight) continue;
 		const was = before.get(other.name);
 		if (was === undefined) continue;
 		const now = await ops.checkoutState(other.path).catch(() => null);
@@ -1174,10 +1184,14 @@ export function createTurnLoop(
 ): TurnLoop {
 	notifyHook = ops.notifyLog;
 	const running = new Map<string, RunEntry>();
-	// OTTR-708: the main-checkout heads the board itself advanced (serverMergePush), per
-	// project. The cross-project checkout guard discounts a HEAD change whose new value is
-	// recorded here and leaves the tree clean: merges of other projects run concurrently
-	// with this project's work turns by design.
+	// OTTR-708: the main-checkout heads the board's own merge machinery advanced, per
+	// project — recorded at the merge settle's runPush whatever its outcome (the merge
+	// agent fast-forwards the main checkout before the push, so a failed or rejected
+	// push still leaves the advanced head behind) and at the sync-commit push. The
+	// cross-project checkout guard discounts a HEAD change whose new value is recorded
+	// here and leaves the tree clean, and skips a project whose own merge turn is in
+	// flight: merges of other projects run concurrently with this project's work turns
+	// by design.
 	const boardPushedHeads = new Map<string, string>();
 	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
 	async function usageHold(model: string | null): Promise<UsageHold | null> {
@@ -3432,16 +3446,16 @@ export function createTurnLoop(
 									: p,
 							)
 							.then((p) => {
-								if (p.status === "pushed")
-									// OTTR-708: this settle legitimately moves the project's main
-									// checkout; record the head so the checkout guard of a
-									// concurrent work turn (another project) discounts it.
-									void ops
-										.checkoutState(e.path)
-										.then((s) => {
-											if (s.head !== null) boardPushedHeads.set(name, s.head);
-										})
-										.catch(() => {});
+								// OTTR-708: this settle legitimately moves the project's main
+								// checkout — the merge agent fast-forwarded it before the push, so
+								// the advanced head must discount even when the push itself fails,
+								// is rejected, or skips. Record whatever the checkout reads now.
+								void ops
+									.checkoutState(e.path)
+									.then((s) => {
+										if (s.head !== null) boardPushedHeads.set(name, s.head);
+									})
+									.catch(() => {});
 								return p;
 							})
 							.catch((err: unknown) => ({
