@@ -500,12 +500,12 @@ async function snapshotOtherCheckouts(
 /** OTTR-708: the cross-project checkout guard. Compares the before/after main-checkout
  * snapshots of the other projects: a new commit the board did not make, or a status change,
  * is a change made outside this turn's own worktree. A HEAD advance the board's own merge
- * machinery made is discounted with a clean tree: the head recorded at the merge settle's
- * runPush whatever its outcome (the merge agent fast-forwards the main checkout before the
- * push, so a failed or rejected push still leaves the advanced head behind), and a project
- * whose own merge turn is in flight is skipped outright — its main checkout belongs to that
- * turn right now. Merges of other projects run concurrently with work turns by design.
- * Returns the needs_you reason, null when every other checkout reads unchanged. */
+ * machinery made is discounted with a clean tree: the merge settle records the head it left
+ * behind whatever path it took (pushed, failed, rejected, skipped, refused, hold park with
+ * a branch reset), and a project whose own merge turn is in flight is skipped outright —
+ * its main checkout belongs to that turn right now. Merges of other projects run
+ * concurrently with work turns by design. Returns the needs_you reason, null when every
+ * other checkout reads unchanged. */
 async function checkoutGuardReason(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -1185,13 +1185,13 @@ export function createTurnLoop(
 	notifyHook = ops.notifyLog;
 	const running = new Map<string, RunEntry>();
 	// OTTR-708: the main-checkout heads the board's own merge machinery advanced, per
-	// project — recorded at the merge settle's runPush whatever its outcome (the merge
-	// agent fast-forwards the main checkout before the push, so a failed or rejected
-	// push still leaves the advanced head behind) and at the sync-commit push. The
-	// cross-project checkout guard discounts a HEAD change whose new value is recorded
-	// here and leaves the tree clean, and skips a project whose own merge turn is in
-	// flight: merges of other projects run concurrently with this project's work turns
-	// by design.
+	// project — recorded once at the end of a merge settle, whatever path it took (the
+	// merge agent fast-forwards the main checkout before the push; the settle may reset
+	// the branch on a hold park; the push can fail, be rejected, be skipped, or be
+	// refused by a held merge). The cross-project checkout guard discounts a HEAD change
+	// whose new value is recorded here and leaves the tree clean, and skips a project
+	// whose own merge turn is in flight: merges of other projects run concurrently with
+	// this project's work turns by design.
 	const boardPushedHeads = new Map<string, string>();
 	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
 	async function usageHold(model: string | null): Promise<UsageHold | null> {
@@ -3445,24 +3445,13 @@ export function createTurnLoop(
 										}
 									: p,
 							)
-							.then((p) => {
-								// OTTR-708: this settle legitimately moves the project's main
-								// checkout — the merge agent fast-forwarded it before the push, so
-								// the advanced head must discount even when the push itself fails,
-								// is rejected, or skips. Record whatever the checkout reads now.
-								void ops
-									.checkoutState(e.path)
-									.then((s) => {
-										if (s.head !== null) boardPushedHeads.set(name, s.head);
-									})
-									.catch(() => {});
-								return p;
-							})
 							.catch((err: unknown) => ({
 								status: "failed" as const,
 								error: errmsg(err),
 							}));
-			if (kind === "merge" && !interview && !grill && !releaseCard) {
+			const mergeMachinery =
+				kind === "merge" && !interview && !grill && !releaseCard;
+			if (mergeMachinery) {
 				// PR mode ships the card branch itself: the server pushes the branch and opens the
 				// pull request, so nothing local is ever pushed to the target — the merge-hold
 				// machinery and serverMergePush of the target must not run for these cards.
@@ -4100,6 +4089,16 @@ export function createTurnLoop(
 					state: "needs_you",
 					needsReason: holdMismatch,
 				};
+			if (mergeMachinery) {
+				// OTTR-708: the merge machinery has done all it will do to the main checkout —
+				// the merge agent fast-forwarded it before the push, the settle may have reset
+				// the branch (resetBranchTo on a hold park), and the push attempt ended pushed,
+				// failed, rejected, or skipped, or was refused outright, or never ran. Record
+				// the head it left behind, whatever the path took, so the checkout guard of a
+				// concurrent work turn in another project discounts the board's own advance.
+				const s = await ops.checkoutState(e.path).catch(() => null);
+				if (s !== null && s.head !== null) boardPushedHeads.set(name, s.head);
+			}
 			if (
 				fromMain &&
 				!facts.integrated &&

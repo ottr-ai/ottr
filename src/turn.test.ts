@@ -19598,6 +19598,227 @@ describe("turn checkout guard (other projects)", () => {
 		expect(after.needsReason).toBeNull();
 	});
 
+	test("a refused push after the merge agent's fast-forward still records the head", async () => {
+		// A parked held merge pins the branch tip: the settle refuses the push outright
+		// (runPush returns failed before any server call). The merge agent already
+		// fast-forwarded the main checkout, so the end-of-settle record must still
+		// capture the head it left behind.
+		let workRun = false;
+		const integrated = () => ({
+			pid: 4242,
+			done: Promise.resolve(
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "landed",
+					} satisfies Outcome,
+				}),
+			),
+			kill: async () => {},
+		});
+		const { store, other, record, states, loop } = twoProjectCase({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			serverMergePush: async () => ({
+				status: "pushed" as const,
+				output: "",
+			}),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (!workRun) return integrated();
+				states.set(other.path, { head: "refused9", status: "" });
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		// The merge agent's fast-forward result, plus a parked held merge whose holdHead
+		// pins the branch tip the settle reads.
+		states.set(other.path, { head: "refused9", status: "" });
+		const parked = other.createTask("held please");
+		other.updateTask(parked.id, {
+			state: "needs_you",
+			holdHead: "sha-pushed",
+			needsReason: MERGE_HOLD_MISMATCH_REASON,
+		});
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(other.name, mergeTask.id);
+		await flushPromises();
+		// The refusal path ran: the merge card parked on the held merge, not on a push.
+		const mergeAfter = other.getTask(mergeTask.id)!;
+		expect(mergeAfter.needsReason).toContain("parks a held merge");
+
+		states.delete(other.path);
+		workRun = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a merge-hold park that resets the branch still records the head the settle left", async () => {
+		// The merge agent fast-forwarded the main checkout beyond the approved head; the
+		// settle parks on the mismatch and resetBranchTo moves the main checkout back to
+		// the audited tip. No push runs at all, and the reset's head must still be
+		// recorded.
+		let workRun = false;
+		const integrated = () => ({
+			pid: 4242,
+			done: Promise.resolve(
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "landed",
+					} satisfies Outcome,
+				}),
+			),
+			kill: async () => {},
+		});
+		const { store, other, record, states, loop } = twoProjectCase({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			mergeHoldMismatch: async () => ({
+				mismatch: true,
+				pushDiff: null,
+				auditedTip: "audited9",
+			}),
+			resetBranchTo: async () => {
+				// The settle reset the checked-out branch in the main checkout: HEAD moved
+				// back to the audited tip.
+				states.set(other.path, { head: "audited9", status: "" });
+				return true;
+			},
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (!workRun) return integrated();
+				states.set(other.path, { head: "audited9", status: "" });
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		// The merge agent's fast-forward left the main checkout at its own head before
+		// the settle judged it against the approved head.
+		states.set(other.path, { head: "mismatch9", status: "" });
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+			updateMergeHead: "approved9",
+		});
+		await loop.runTurn(other.name, mergeTask.id);
+		await flushPromises();
+		// The mismatch park ran and the reset moved the head to the audited tip.
+		const mergeAfter = other.getTask(mergeTask.id)!;
+		expect(mergeAfter.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
+		expect(mergeAfter.holdHead).toBe("sha-pushed");
+
+		states.delete(other.path);
+		workRun = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a throwing serverMergePush still records the head the merge agent advanced", async () => {
+		// serverMergePush rejects (the push chain jumps to its catch); the merge agent's
+		// fast-forward still left the advanced head behind, and the end-of-settle record
+		// must capture it.
+		let workRun = false;
+		const integrated = () => ({
+			pid: 4242,
+			done: Promise.resolve(
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "landed",
+					} satisfies Outcome,
+				}),
+			),
+			kill: async () => {},
+		});
+		const { store, other, record, states, loop } = twoProjectCase({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			serverMergePush: async () => {
+				throw new Error("remote hung up");
+			},
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (!workRun) return integrated();
+				states.set(other.path, { head: "threw9", status: "" });
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		states.set(other.path, { head: "threw9", status: "" });
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(other.name, mergeTask.id);
+		await flushPromises();
+
+		states.delete(other.path);
+		workRun = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
 	test("an unrecorded HEAD advance with a clean tree parks needs_you", async () => {
 		const record = baseRecord();
 		const { store, other, states, loop } = twoProjectCase(
