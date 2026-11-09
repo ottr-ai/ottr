@@ -100,6 +100,9 @@ describe.skipIf(!posix)("hosted release boundary", () => {
 			network: async () => {
 				throw new Error("no network git in this test");
 			},
+			pending: async () => {
+				throw new Error("no pending clone in this test");
+			},
 			ghToken: async (cwd, remote) => {
 				asked.push(`${cwd} ${remote}`);
 				return "minted-project";
@@ -125,9 +128,47 @@ describe.skipIf(!posix)("hosted release boundary", () => {
 		} finally {
 			setHostedGitAuth(null);
 		}
-		expect(asked).toEqual([`${repo} ${REMOTE}`]);
+		// hostedGh mints per gh call, so publishRelease's two gh calls ask the hook twice.
+		expect(asked).toEqual([`${repo} ${REMOTE}`, `${repo} ${REMOTE}`]);
 		expect(readFileSync(record, "utf8")).toBe(
 			"minted-project release view\nminted-project release create\n",
+		);
+	}, 60_000);
+
+	test("hostedGh re-mints per call: stale token replaced by the second mint", async () => {
+		writeFileSync(record, "");
+		const asked: string[] = [];
+		let mint = 0;
+		// First mint is already inside HOSTED_TOKEN_MARGIN_MS (5 min before expiry), so the
+		// second gh call must re-mint rather than reuse the near-stale token.
+		setHostedGitAuth({
+			network: async () => {
+				throw new Error("no network git in this test");
+			},
+			pending: async () => {
+				throw new Error("no pending clone in this test");
+			},
+			ghToken: async (cwd, remote) => {
+				asked.push(`${cwd} ${remote}`);
+				mint += 1;
+				return mint === 1 ? "minted-one" : "minted-two";
+			},
+		});
+		try {
+			await withEnv(
+				{ GH_TOKEN: "global-board", PATH: `${bin}:${process.env.PATH}` },
+				async () => {
+					const gh = await hostedGh(repo, REMOTE);
+					await gh(["release", "view", "v1.0.2"]);
+					await gh(["release", "create", "v1.0.2"]);
+				},
+			);
+		} finally {
+			setHostedGitAuth(null);
+		}
+		expect(asked).toEqual([`${repo} ${REMOTE}`, `${repo} ${REMOTE}`]);
+		expect(readFileSync(record, "utf8")).toBe(
+			"minted-one release view\nminted-two release create\n",
 		);
 	}, 60_000);
 

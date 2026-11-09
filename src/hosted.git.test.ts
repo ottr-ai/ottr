@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { execSync } from "node:child_process";
 import {
 	chmodSync,
 	mkdirSync,
@@ -9,7 +10,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp, type Entry } from "./app.ts";
+import { type AppServeOptions, createApp, type Entry } from "./app.ts";
+import { signIdentity } from "./auth.ts";
 import { createHostedGitAuth, HOSTED_TOKEN_MARGIN_MS } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
 import type { GitToken, Hosted, HostedHooks } from "./hosted.ts";
@@ -155,6 +157,39 @@ describe("hosted network git credential (createHostedGitAuth)", () => {
 		expect(out).toContain("password=minted-a-1");
 		// The helper answers the remote's host only.
 		expect(await credentialFill(env, "gitlab.com")).not.toContain("password=");
+	});
+
+	test("pending mints for a name that owns no cwd yet, on the same cache and redaction set", async () => {
+		clock = 0;
+		const t = unitAuth("pending-name", (project, n) =>
+			project === "void"
+				? null
+				: { token: `minted-${project}-${n}`, expiresAt: clock + HOUR },
+		);
+		const a = await t.auth.pending("new", URL_A);
+		expect(t.calls).toEqual([["new", URL_A]]);
+		expect(await credentialFill(a.env, "github.com")).toContain(
+			"password=minted-new-1",
+		);
+		// The env is network's exactly: no board-global token name, no ssh key.
+		expect(a.env.GH_TOKEN).toBe("");
+		expect(a.env.GITHUB_TOKEN).toBe("");
+		expect(a.env).toHaveProperty("OTTR_GIT_TOKEN_0");
+		expect(a.env).not.toHaveProperty("OTTR_GIT_TOKEN_1");
+		expect(a.env.GIT_SSH_COMMAND).not.toContain(" -i ");
+		expect(a.secrets).toEqual(["minted-new-1"]);
+		// A second ask for the same (name, remote) shares the cached mint.
+		const again = await t.auth.pending("new", URL_A);
+		expect(t.calls).toHaveLength(1);
+		expect(again.secrets).toEqual(["minted-new-1"]);
+		// A null token (the control plane's 404) runs credential-less, without throwing.
+		const z = await t.auth.pending("void", URL_B);
+		expect(z.env).not.toHaveProperty("OTTR_GIT_TOKEN_0");
+		expect(z.secrets).toEqual([]);
+		expect(t.calls).toEqual([
+			["new", URL_A],
+			["void", URL_B],
+		]);
 	});
 
 	test("project B gets B's token and never A's; each redaction list holds its own tokens only", async () => {
@@ -533,7 +568,7 @@ describe("hosted push credential line and auth hint", () => {
 		await withEnv("GH_TOKEN", GLOBAL, async () => {
 			const line = b.app.pushAuthKind(URL_A);
 			expect(line).toBe(
-				"a GitHub App installation token from the control plane",
+				"the control-plane token for the project, when it has one",
 			);
 			expect(line).not.toContain("board-stored");
 			expect(line).not.toContain("GH_TOKEN");
@@ -566,4 +601,139 @@ describe("hosted push credential line and auth hint", () => {
 		await b.app.githubAuthHint(URL_A);
 		expect(p.auths.some((a) => a.includes(GLOBAL))).toBe(true);
 	});
+});
+
+// The Add-project clone (cloneGit in app.ts) of a project that is not registered yet:
+// hosted mode asks the hook for the name being added and the remote (pending()), and the
+// clone goes out with only that token. A real https git server stands in for the remote:
+// its 401 makes git run the hosted credential helper, so the Authorization of the retry
+// is the wire proof of which credential the git child carried.
+describe("hosted Add-project clone", () => {
+	const tlsDir = mkdtempSync(join(tmpdir(), "hosted-clone-tls-"));
+	execSync(
+		`openssl req -x509 -newkey rsa:2048 -keyout ${join(tlsDir, "key.pem")} -out ${join(tlsDir, "cert.pem")} -days 1 -nodes -subj "/CN=localhost"`,
+	);
+	const auths: (string | null)[] = [];
+	// 401 until a credential arrives, 403 after: git must fetch and use the hosted token,
+	// and the failure then classifies as an auth failure (needsToken).
+	const remoteSrv = Bun.serve({
+		port: 0,
+		tls: {
+			cert: readFileSync(join(tlsDir, "cert.pem")),
+			key: readFileSync(join(tlsDir, "key.pem")),
+		},
+		fetch: (req) => {
+			auths.push(req.headers.get("authorization"));
+			return new Response("denied", {
+				status: req.headers.get("authorization") === null ? 401 : 403,
+				headers: { "WWW-Authenticate": 'Basic realm="ottr"' },
+			});
+		},
+	});
+	const cloneUrl = `https://localhost:${remoteSrv.port}/org/repo.git`;
+
+	afterAll(() => {
+		remoteSrv.stop(true);
+		rmSync(tlsDir, { recursive: true, force: true, maxRetries: 5 });
+	});
+
+	/** POST /api/projects on a served hosted board: owner identity, the git url. */
+	async function add(
+		serveOptions: AppServeOptions,
+		url = cloneUrl,
+	): Promise<{
+		status: number;
+		body: { error?: string; needsToken?: string };
+	}> {
+		const srv = Bun.serve({ port: 0, ...serveOptions });
+		try {
+			const res = await fetch(`http://127.0.0.1:${srv.port}/api/projects`, {
+				method: "POST",
+				headers: {
+					"x-ottr-identity": signIdentity(
+						"hosted-secret-".repeat(4),
+						"acme",
+						"owner",
+					),
+					"content-type": "application/json",
+				},
+				body: JSON.stringify({ url }),
+			});
+			return { status: res.status, body: await res.json() };
+		} finally {
+			srv.stop(true);
+		}
+	}
+
+	test("the hosted clone mints for the name being added and goes out with only that token", async () => {
+		if (process.platform === "win32") return; // the credential helper is a sh function
+		const { hooks, calls } = fakeHooks((project, n) => ({
+			token: `minted-${project}-${n}`,
+			expiresAt: Date.now() + HOUR,
+		}));
+		const b = board("clone-hosted", hostedCfg(hooks));
+		auths.length = 0;
+		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>
+			withEnv("GH_TOKEN", GLOBAL, async () => {
+				const { status, body } = await add(b.app.serveOptions);
+				expect(status).toBe(400);
+				// The hook was asked for the pending project name and the remote.
+				expect(calls).toEqual([["repo", cloneUrl]]);
+				// Every credential git put on the wire was the minted token, never the
+				// board-global one (GH_TOKEN or the stored github.com token).
+				const sent = auths.filter((a): a is string => a !== null);
+				expect(sent.length).toBeGreaterThan(0);
+				for (const a of sent) {
+					expect(a.startsWith("Basic ")).toBe(true);
+					const pair = Buffer.from(a.slice(6), "base64").toString();
+					expect(pair.endsWith(":minted-repo-1")).toBe(true);
+					expect(pair).not.toContain(GLOBAL);
+				}
+				expect(body.error).toContain("git clone failed");
+				expect(body.error).not.toContain("minted-repo-1");
+				expect(body.needsToken).toBe(`localhost:${remoteSrv.port}`);
+			}),
+		);
+	}, 60_000);
+
+	test("a null token (hook 404) runs the hosted clone credential-less", async () => {
+		if (process.platform === "win32") return; // the credential helper is a sh function
+		const { hooks, calls } = fakeHooks(() => null);
+		const b = board("clone-hosted-null", hostedCfg(hooks));
+		auths.length = 0;
+		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>
+			withEnv("GH_TOKEN", GLOBAL, async () => {
+				const { status, body } = await add(b.app.serveOptions);
+				expect(status).toBe(400);
+				expect(calls).toEqual([["repo", cloneUrl]]);
+				// Nothing was minted, so nothing rode the wire: git ran bare and its own
+				// credential failure reaches the card log verbatim.
+				expect(auths.every((a) => a === null)).toBe(true);
+				expect(body.error).toContain("git clone failed");
+				expect(body.error).toContain("could not read Username");
+				expect(body.error).not.toContain("[REDACTED]");
+				expect(body.needsToken).toBe(`localhost:${remoteSrv.port}`);
+			}),
+		);
+	}, 60_000);
+
+	test("the hosted clone failure redacts the token minted for the added project", async () => {
+		if (process.platform === "win32") return; // the credential helper is a sh function
+		const { hooks, calls } = fakeHooks(() => ({
+			token: "leaked-token-1",
+			expiresAt: Date.now() + HOUR,
+		}));
+		const b = board("clone-hosted-leak", hostedCfg(hooks));
+		auths.length = 0;
+		// The url echoes the minted token (as a git error does for an authed remote), so
+		// the redaction list of the clone must hold the token pending() minted.
+		const leakUrl = `https://localhost:${remoteSrv.port}/org/leaked-token-1.git`;
+		await withEnv("GIT_SSL_NO_VERIFY", "1", async () => {
+			const { body } = await add(b.app.serveOptions, leakUrl);
+			expect(calls).toEqual([["leaked-token-1", leakUrl]]);
+			expect(body.error).toContain("git clone failed");
+			expect(body.error).toContain("[REDACTED]");
+			expect(body.error).not.toContain("leaked-token-1");
+		});
+	}, 60_000);
 });

@@ -140,11 +140,12 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 ## 6. Per-project git credential
 
 When hosted mode is on, the network-git credential resolver asks `POST /git-token` for the
-project that owns the command's directory. It caches each token until 5 minutes before
-`expiresAt`. It does not use the board-global host tokens, the server SSH key, or the global
-`GH_TOKEN`. The secret-redaction list holds only the tokens that the board minted for the
-project of that command. Workers still get no git credential, and `checkPinnedRemote` still
-refuses a changed push URL.
+project that owns the command's directory. The Add-project clone does the same before the
+project exists: it asks for the project name being added, with the remote it clones. It
+caches each token until 5 minutes before `expiresAt`. It does not use the board-global host
+tokens, the server SSH key, or the global `GH_TOKEN`. The secret-redaction list holds only
+the tokens that the board minted for the project of that command. Workers still get no git
+credential, and `checkPinnedRemote` still refuses a changed push URL.
 
 ## 7. Settings and System
 

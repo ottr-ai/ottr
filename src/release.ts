@@ -560,9 +560,9 @@ export async function hostedGh(
 	remote: string | null,
 ): Promise<typeof runGh> {
 	const auth = hostedGitAuth();
-	const token =
-		auth === null || remote === null ? null : await auth.ghToken(cwd, remote);
 	return async (args, timeoutMs = 2 * 60_000) => {
+		const token =
+			auth === null || remote === null ? null : await auth.ghToken(cwd, remote);
 		const env: Record<string, string | undefined> = { ...process.env };
 		for (const k of [
 			"GH_TOKEN",

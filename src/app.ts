@@ -329,6 +329,7 @@ import {
 	git,
 	githubUrl,
 	hasRules,
+	hostedGitAuth,
 	isGitRepoWithCommit,
 	originRemoteUrl,
 	remoteUrl,
@@ -876,6 +877,9 @@ export function reconcileLayerUse(
 		rebuildLayerUse(home, ids);
 	}
 }
+
+/** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
+export type AppServeOptions = ReturnType<typeof createApp>["serveOptions"];
 
 export function createApp(deps: AppDeps) {
 	const gh = deps.gh ?? runGh;
@@ -3768,12 +3772,24 @@ export function createApp(deps: AppDeps) {
 			);
 			if ("error" in t) return { error: t.error };
 		}
-		const authEnv = gitAuthEnv({
+		let authEnv = gitAuthEnv({
 			ambientHelpers,
 			tokens: gitTokens,
 			key,
 			knownHosts: paths.knownHosts,
 		});
+		// Hosted mode (docs/specs/hosted-mode.md section 6): the project being added is not
+		// registered yet, so the resolver cannot serve the clone — it asks the hook for this
+		// name and remote itself and carries only that token, never the board-global one.
+		let hostedSecrets: readonly string[] = [];
+		if (deps.hosted !== undefined && remote.scheme === "https") {
+			const auth = hostedGitAuth();
+			if (auth !== null) {
+				const a = await auth.pending(name, url);
+				authEnv = a.env;
+				hostedSecrets = a.secrets;
+			}
+		}
 		// A large repository can outlive git()'s 10-minute default ceiling (R5-4); the URL
 		// always runs after "--" so an option-looking value cannot leak into git's argv.
 		const r = await git(
@@ -3789,7 +3805,10 @@ export function createApp(deps: AppDeps) {
 		if (r.code !== 0) {
 			const line =
 				r.stderr.trim().split("\n").filter(Boolean).pop() ?? "git clone failed";
-			let error = `git clone failed: ${redact(line, gitSecrets()).slice(0, 300)}`;
+			let error = `git clone failed: ${redact(line, [
+				...gitSecrets(),
+				...hostedSecrets,
+			]).slice(0, 300)}`;
 			// A bare 401/403 from a GitHub host hides the real cause (SAML enforcement, an IP
 			// allow list, a token policy); the REST API names it under the git error.
 			if (remote.scheme === "https" && GIT_HTTP_AUTH_STATUS.test(r.stderr))
@@ -3798,14 +3817,17 @@ export function createApp(deps: AppDeps) {
 						configuredHost: githubHost().host,
 						tokens: gitTokens,
 						envToken: process.env.GH_TOKEN ?? null,
-						secrets: gitSecrets(),
+						secrets: [...gitSecrets(), ...hostedSecrets],
 						fetchImpl: deps.githubAuthProbe?.fetchImpl,
 						timeoutMs: deps.githubAuthProbe?.timeoutMs,
 					})) ?? "";
 			// Classify the failure only after a failed clone: an auth answer has the form offer
 			// the token step for that host (spec: needsToken).
 			if (remote.scheme === "https") {
-				const t = await testRemote(url, authEnv, gitSecrets());
+				const t = await testRemote(url, authEnv, [
+					...gitSecrets(),
+					...hostedSecrets,
+				]);
 				if ("error" in t && t.auth)
 					return { error, needsToken: remote.hostKey };
 			}
@@ -8258,7 +8280,8 @@ export function createApp(deps: AppDeps) {
 		// card log; never a value. A missing App installation on a repo shows as a permission
 		// failure, and this line is what names the installation token the push went out with.
 		// Hosted mode: git goes out with the per-project token the control plane mints, never
-		// a board-global token, helper or key, so the line names that credential instead.
+		// a board-global token, helper or key; hooks.gitToken may answer none, so the line
+		// names that credential only where the project has one.
 		pushAuthKind: (url: string): string | null => {
 			if (deps.hosted === undefined)
 				return pushAuthKind(url, {
@@ -8271,7 +8294,7 @@ export function createApp(deps: AppDeps) {
 			const remote = parseGitUrl(url);
 			if ("error" in remote) return null;
 			return remote.scheme === "https"
-				? "a GitHub App installation token from the control plane"
+				? "the control-plane token for the project, when it has one"
 				: "no credential the board knows of";
 		},
 		// The git 401/403 hint for the merge push and the origin fetches on the card: same

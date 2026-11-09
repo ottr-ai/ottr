@@ -15,7 +15,12 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { configuredGithubHostname, defaultGitUsername } from "./githubHost.ts";
 import type { HostedHooks, GitToken as MintedToken } from "./hosted.ts";
-import { git, type HostedGitAuth, redact } from "./worktree.ts";
+import {
+	git,
+	type HostedGitAuth,
+	type HostedNetworkAuth,
+	redact,
+} from "./worktree.ts";
 
 export const GIT_URL_ERROR =
 	"url must be a git repository URL (https://…, git@host:…, ssh://…)";
@@ -678,40 +683,60 @@ export function createHostedGitAuth(o: {
 		const r = parseGitUrl(remote);
 		return "error" in r || r.scheme !== "https" ? null : r.hostKey;
 	};
+	// One network call's auth: the hosted env git() starts from (never a board-global token
+	// name) and the redaction list of the project the tokens were minted for (null: a call
+	// no project owns). network() and pending() share it.
+	const envAndSecrets = (
+		tokens: GitToken[],
+		project: string | null,
+	): HostedNetworkAuth => ({
+		env: {
+			...gitAuthEnv({
+				tokens,
+				key: null,
+				knownHosts: o.knownHosts,
+				ambientHelpers: [],
+			}),
+			// git() starts from the board's env: blank its global token names, so no
+			// helper or hook of the call can reach them.
+			GH_TOKEN: "",
+			GITHUB_TOKEN: "",
+		},
+		secrets: project === null ? [] : [...(minted.get(project) ?? [])],
+	});
+	// The credential for one (project, remote) mint. A null token (hook error, a remote
+	// that is not https) runs the call without a credential, so git fails auth the normal way.
+	const mintedAuth = async (
+		project: string,
+		remote: string | null,
+	): Promise<HostedNetworkAuth> => {
+		if (remote === null) return envAndSecrets([], project);
+		const host = httpsHost(remote);
+		const t = host === null ? null : await token(project, remote);
+		return envAndSecrets(
+			t === null || host === null
+				? []
+				: [
+						{
+							host,
+							username: defaultGitUsername(host, configuredGithubHostname()),
+							token: t,
+						},
+					],
+			project,
+		);
+	};
 	return {
 		async network(cwd, args) {
 			const p = o.projectFor(cwd);
-			const remote = p === null ? null : hostedRemote(args, p.originUrl);
-			const host = remote === null ? null : httpsHost(remote);
-			const t =
-				p === null || remote === null || host === null
-					? null
-					: await token(p.name, remote);
-			const tokens: GitToken[] =
-				t === null || host === null
-					? []
-					: [
-							{
-								host,
-								username: defaultGitUsername(host, configuredGithubHostname()),
-								token: t,
-							},
-						];
-			return {
-				env: {
-					...gitAuthEnv({
-						tokens,
-						key: null,
-						knownHosts: o.knownHosts,
-						ambientHelpers: [],
-					}),
-					// git() starts from the board's env: blank its global token names, so no
-					// helper or hook of the call can reach them.
-					GH_TOKEN: "",
-					GITHUB_TOKEN: "",
-				},
-				secrets: p === null ? [] : [...(minted.get(p.name) ?? [])],
-			};
+			return p === null
+				? envAndSecrets([], null)
+				: mintedAuth(p.name, hostedRemote(args, p.originUrl));
+		},
+		// The Add-project clone of a project that is not registered yet: minted for the name
+		// being added and the remote it clones (docs/specs/hosted-mode.md section 6).
+		async pending(name, remote) {
+			return mintedAuth(name, remote);
 		},
 		async ghToken(cwd, remote) {
 			const p = o.projectFor(cwd);

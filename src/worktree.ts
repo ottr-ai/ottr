@@ -164,6 +164,8 @@ export interface HostedNetworkAuth {
 /** Hosted mode's per-project git credential; createHostedGitAuth in gitHosts.ts builds it. */
 export interface HostedGitAuth {
 	network(cwd: string, args: readonly string[]): Promise<HostedNetworkAuth>;
+	/** The auth for a clone of a project that is not registered yet: minted for (name, remote). */
+	pending(name: string, remote: string): Promise<HostedNetworkAuth>;
 	/** The token for a gh call of the project that owns cwd; null when there is none. */
 	ghToken(cwd: string, remote: string): Promise<string | null>;
 }

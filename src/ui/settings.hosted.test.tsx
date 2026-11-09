@@ -344,7 +344,10 @@ describe("hosted settings page render", () => {
 
 // --- app shell --------------------------------------------------------------
 
-const boardState = (hosted: boolean): StateResponse =>
+const boardState = (
+	hosted: boolean,
+	extra: Record<string, unknown> = {},
+): StateResponse =>
 	({
 		projects: [
 			{
@@ -379,6 +382,8 @@ const boardState = (hosted: boolean): StateResponse =>
 		updates: null,
 		alatePendingSince: null,
 		deadSignIns: [],
+		// Per-test state (a drain hold, a restart wait, advisories); the hosted flag wins.
+		...extra,
 		...(hosted ? { hosted: true } : {}),
 	}) as unknown as StateResponse;
 
@@ -386,7 +391,14 @@ const boardState = (hosted: boolean): StateResponse =>
 const requested: string[] = [];
 
 /** The server as the board sees it: /api/boot and /api/state carry `hosted` only when on. */
-const serverFor = (hosted: boolean): typeof fetch =>
+const serverFor = (
+	hosted: boolean,
+	extra: {
+		state?: Record<string, unknown>;
+		update?: { behind: number; commits: string[] };
+		ghStatus?: Record<string, unknown>;
+	} = {},
+): typeof fetch =>
 	(async (input: RequestInfo | URL) => {
 		const url = String(input);
 		requested.push(url);
@@ -398,8 +410,10 @@ const serverFor = (hosted: boolean): typeof fetch =>
 				live: false,
 				...(hosted ? { hosted: true } : {}),
 			};
-		else if (url === "/api/state") body = boardState(hosted);
-		else if (url === "/api/update") body = { behind: 0, commits: [] };
+		else if (url === "/api/state") body = boardState(hosted, extra.state);
+		else if (url === "/api/update")
+			body = extra.update ?? { behind: 0, commits: [] };
+		else if (url === "/api/gh-status") body = extra.ghStatus;
 		else if (url === "/api/system")
 			body = {
 				at: 1,
@@ -457,9 +471,10 @@ async function withApp(
 	path: string,
 	hosted: boolean,
 	until: () => boolean,
-	check: () => void,
+	check: () => void | Promise<void>,
+	server?: Parameters<typeof serverFor>[1],
 ): Promise<void> {
-	host.fetch = serverFor(hosted);
+	host.fetch = serverFor(hosted, server);
 	window.history.replaceState(null, "", path);
 	const container = window.document.createElement(
 		"div",
@@ -471,7 +486,7 @@ async function withApp(
 			root.render(<App />);
 		});
 		await waitFor(until);
-		check();
+		await check();
 	} finally {
 		await act(async () => {
 			root.unmount();
@@ -567,6 +582,159 @@ describe("hosted app shell", () => {
 			expect(detail).toContain("Provider quota");
 			expect(detail).toContain("Checking omp usage");
 		});
+	});
+
+	// The Add dialog probes /api/gh-status on open; unauthenticated, so the hint branch runs.
+	const ghUnauthed = {
+		authed: false,
+		user: null,
+		free: null,
+		dir: "/tmp",
+		host: "github.com",
+	};
+	const openAddDialog = async (): Promise<HTMLElement> => {
+		await act(async () => {
+			document
+				.querySelector<HTMLButtonElement>('button[aria-label="Add project"]')
+				?.click();
+		});
+		const dialog = document.querySelector<HTMLElement>(
+			'dialog[aria-label="Add project"]',
+		);
+		if (dialog === null) throw new Error("Add project dialog did not open");
+		// The repo box is checked by default off; check it to reach the unauthed hint.
+		await act(async () => {
+			dialog.querySelector<HTMLInputElement>(".add-check input")?.click();
+		});
+		return dialog;
+	};
+
+	test("hosted: the Add dialog's unauthed hint names only the repo box, no settings link", async () => {
+		await withApp(
+			"/projects/proj",
+			true,
+			boardShown,
+			async () => {
+				const dialog = await openAddDialog();
+				await waitFor(() =>
+					(dialog.textContent ?? "").includes("No Git host is signed in"),
+				);
+				const hint =
+					dialog.querySelector("p.hint.trust-warn")?.textContent ?? "";
+				expect(hint).toContain("Uncheck the box for a local repo only");
+				expect(hint).not.toContain("Open settings");
+				expect(dialog.querySelector("button.notif-link")).toBeNull();
+			},
+			{ ghStatus: ghUnauthed },
+		);
+	});
+
+	test("flag off: the Add dialog's unauthed hint links to the Git hosts settings", async () => {
+		await withApp(
+			"/projects/proj",
+			false,
+			boardShown,
+			async () => {
+				const dialog = await openAddDialog();
+				await waitFor(() =>
+					(dialog.textContent ?? "").includes("No Git host is signed in"),
+				);
+				const hint =
+					dialog.querySelector("p.hint.trust-warn")?.textContent ?? "";
+				expect(hint).toContain("Add a token in Settings → Git hosts");
+				expect(hint).toContain("Open settings");
+				expect(dialog.querySelector("button.notif-link")).not.toBeNull();
+			},
+			{ ghStatus: ghUnauthed },
+		);
+	});
+
+	// The update-available notice arrives only over the live socket (onUpdate), which this
+	// harness does not open, so these tests cover the two state-driven notices.
+	const updateServer = {
+		state: {
+			drainUntil: 1_700_000_000_000,
+			drainCommits: ["drain-commit-1"],
+			restartWait: {
+				running: "aaaaaaa",
+				commit: "bbbbbbb",
+				commits: 2,
+				since: 1_700_000_000_000,
+				turns: ["task-1"],
+				command: "docker compose up -d",
+			},
+		},
+	};
+
+	test("hosted: the inbox shows no update-hold or restart-wait notice", async () => {
+		await withApp(
+			"/",
+			true,
+			boardLoaded,
+			() => {
+				const text = document.body.textContent ?? "";
+				expect(text).not.toContain("An Ottr update is ready");
+				expect(text).not.toContain("The board runs aaaaaaa");
+			},
+			updateServer,
+		);
+	});
+
+	test("flag off: the inbox shows the update-hold and restart-wait notices", async () => {
+		await withApp(
+			"/",
+			false,
+			boardLoaded,
+			() => {
+				const text = document.body.textContent ?? "";
+				expect(text).toContain("An Ottr update is ready");
+				expect(text).toContain("drain-commit-1");
+				expect(text).toContain(
+					"The board runs aaaaaaa; the image holds bbbbbbb",
+				);
+			},
+			updateServer,
+		);
+	});
+
+	const advisoryState = {
+		alatePendingSince: Date.now() - 3_600_000,
+		deadSignIns: [
+			{
+				provider: "anthropic",
+				cause: "sign-in disabled by the operator",
+				roles: ["plan"],
+			},
+		],
+	};
+
+	test("hosted: the inbox shows no Alate import or provider sign-in notice", async () => {
+		await withApp(
+			"/",
+			true,
+			boardLoaded,
+			() => {
+				const text = document.body.textContent ?? "";
+				expect(text).not.toContain("waiting to provision an import");
+				expect(text).not.toContain("sign-in is disabled");
+			},
+			{ state: advisoryState },
+		);
+	});
+
+	test("flag off: the inbox shows the Alate import and provider sign-in notices", async () => {
+		await withApp(
+			"/",
+			false,
+			boardLoaded,
+			() => {
+				const text = document.body.textContent ?? "";
+				expect(text).toContain("waiting to provision an import");
+				expect(text).toContain("anthropic's sign-in is disabled");
+				expect(document.querySelectorAll("button.notif-link").length).toBe(2);
+			},
+			{ state: advisoryState },
+		);
 	});
 
 	const boardShown = (): boolean =>
