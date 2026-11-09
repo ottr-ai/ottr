@@ -29,6 +29,8 @@ import {
 	SessionSection,
 	SettingsPage,
 	updatesChip,
+	userLayerEmpty,
+	userLayerLine,
 } from "./settings.tsx";
 import { stamp } from "./time.ts";
 
@@ -3632,5 +3634,95 @@ describe("ProjectSetupSteps rules action", () => {
 		const html = renderSteps({});
 		expect(html).toContain("Discuss rules");
 		expect(html).not.toContain("Open rules task");
+	});
+});
+
+describe("AlateSection user layer", () => {
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	const server = {
+		url: "http://127.0.0.1:4570",
+		keySet: true,
+		lastError: null,
+		health: {
+			state: "ok",
+			version: "1.2.3",
+			behind: false,
+			pending: false,
+			running: false,
+		},
+	};
+
+	const fetchMockFor = (userLayer: Record<string, unknown>): typeof fetch => {
+		const mock = (async (
+			input: RequestInfo | URL,
+			_init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url === "/api/alate")
+				return ok({
+					url: "http://127.0.0.1:4570",
+					keySet: true,
+					lastProvisionError: null,
+				});
+			if (url === "/api/alate/health")
+				return ok({
+					version: "1.2.3",
+					update: { behind: false },
+					pending: false,
+					running: false,
+				});
+			if (url === "/api/provisioning")
+				return ok({ server, workers: [], userLayer });
+			return new Response(JSON.stringify({ error: "not found" }), {
+				status: 404,
+			});
+		}) as typeof fetch;
+		return mock;
+	};
+
+	test("a filled layer shows one line with counts and MCP names", async () => {
+		const { container, unmount } = await mountAlate(
+			fetchMockFor({
+				skills: ["blast-radius", "correct"],
+				plugins: ["caveman-installer"],
+				mcp: ["chrome-devtools", "context-mode"],
+			}),
+		);
+		try {
+			expect(container.textContent).toContain(
+				"User layer: 2 skills, 1 plugin, MCP servers: chrome-devtools, context-mode",
+			);
+			expect(container.textContent).not.toContain("User layer is empty");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an empty layer shows the callout with the sync hint", async () => {
+		const { container, unmount } = await mountAlate(
+			fetchMockFor({ skills: [], plugins: [], mcp: [] }),
+		);
+		try {
+			expect(container.textContent).toContain("User layer is empty");
+			expect(container.textContent).toContain("sync-user.mjs --data");
+			expect(container.textContent).not.toContain("User layer: ");
+			const callout = container.querySelector(".prov-callout");
+			expect(callout).not.toBeNull();
+			expect(callout?.getAttribute("role")).toBe("status");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the line helpers pluralize counts and treat MCP-only layers as empty", () => {
+		expect(userLayerLine({ skills: ["a"], plugins: [], mcp: [] })).toBe(
+			"User layer: 1 skill, 0 plugins, MCP servers: none",
+		);
+		expect(userLayerEmpty({ skills: [], plugins: [], mcp: ["x"] })).toBe(true);
+		expect(userLayerEmpty({ skills: ["a"], plugins: [], mcp: [] })).toBe(false);
 	});
 });

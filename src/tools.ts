@@ -34,6 +34,65 @@ export function layerHome(home: string): string {
 	return resolveAgentLayer(home)?.dir ?? home;
 }
 
+/** Skill folders of an agent home; `.agents/skills` mirrors `.omp/agent/skills` (the bridge), so names dedupe. */
+const USER_SKILL_DIRS = [
+	".omp/agent/skills",
+	".omp/agent/managed-skills",
+	".agents/skills",
+];
+
+function readJsonObject(path: string): Record<string, unknown> | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		return typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+const objectKeys = (value: unknown): string[] =>
+	typeof value === "object" && value !== null && !Array.isArray(value)
+		? Object.keys(value)
+		: [];
+
+/** The user layer a provisioned home holds: names, sorted. Each piece reads fail-soft:
+ *  alate installs an item only when the data repo has it, so a missing dir or file is an
+ *  empty list, never an error. A skill is a folder with a SKILL.md; plugins come from
+ *  omp-plugins.lock.json's `plugins` map; MCP servers from mcp.json's `mcpServers`. */
+export function readUserLayer(home: string): {
+	skills: string[];
+	plugins: string[];
+	mcp: string[];
+} {
+	const skills = new Set<string>();
+	for (const dir of USER_SKILL_DIRS) {
+		let names: string[];
+		try {
+			names = readdirSync(join(home, dir));
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (name.startsWith(".")) continue;
+			if (!existsSync(join(home, dir, name, "SKILL.md"))) continue;
+			skills.add(name);
+		}
+	}
+	const lock = readJsonObject(
+		join(home, ".omp", "plugins", "omp-plugins.lock.json"),
+	);
+	const mcpFile = readJsonObject(join(home, ".omp", "agent", "mcp.json"));
+	return {
+		skills: [...skills].sort(),
+		plugins: objectKeys(lock?.plugins).sort(),
+		mcp: objectKeys(mcpFile?.mcpServers).sort(),
+	};
+}
+
 // PATH command names, unique within one file; a list entry can never escape its target dir.
 const NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;

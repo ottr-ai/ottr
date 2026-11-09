@@ -266,6 +266,7 @@ import {
 	envListPath,
 	layerHome,
 	listedEnvNames,
+	readUserLayer,
 	toolsListPath,
 } from "./tools.ts";
 import {
@@ -6041,7 +6042,11 @@ export function createApp(deps: AppDeps) {
 							env: existsSync(envListPath(name, workersHome)),
 						}),
 					);
-					return json({ server, workers } satisfies ProvisioningResponse);
+					return json({
+						server,
+						workers,
+						userLayer: readUserLayer(layerHome(workersHome)),
+					} satisfies ProvisioningResponse);
 				}),
 		},
 		"/api/model-roles": {

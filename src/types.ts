@@ -1025,6 +1025,8 @@ export interface ProvisioningResponse {
 		requirements: boolean;
 		env: boolean;
 	}[];
+	/** The user layer the provisioned home holds; empty lists mean the data repo carries none of it (Settings → Alate shows it). */
+	userLayer: { skills: string[]; plugins: string[]; mcp: string[] };
 }
 
 export interface OrphanProcess {

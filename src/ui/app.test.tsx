@@ -1176,12 +1176,23 @@ describe("setupHints", () => {
 		},
 	} as const;
 	test("a missing server, a failed provision and a failed fetch each give one row", () => {
-		expect(setupHints({ server: null, workers: [] }, null)).toEqual([
-			{ text: "Agent server: not configured.", kind: "warn" },
-		]);
 		expect(
 			setupHints(
-				{ server: { ...server, lastError: "boom" }, workers: [] },
+				{
+					server: null,
+					workers: [],
+					userLayer: { skills: [], plugins: [], mcp: [] },
+				},
+				null,
+			),
+		).toEqual([{ text: "Agent server: not configured.", kind: "warn" }]);
+		expect(
+			setupHints(
+				{
+					server: { ...server, lastError: "boom" },
+					workers: [],
+					userLayer: { skills: [], plugins: [], mcp: [] },
+				},
 				null,
 			),
 		).toEqual([
@@ -1192,7 +1203,16 @@ describe("setupHints", () => {
 		]);
 	});
 	test("a healthy server and a load still in flight give no row", () => {
-		expect(setupHints({ server, workers: [] }, null)).toEqual([]);
+		expect(
+			setupHints(
+				{
+					server,
+					workers: [],
+					userLayer: { skills: [], plugins: [], mcp: [] },
+				},
+				null,
+			),
+		).toEqual([]);
 		expect(setupHints(null, null)).toEqual([]);
 	});
 });

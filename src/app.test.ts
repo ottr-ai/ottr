@@ -3312,6 +3312,7 @@ describe("alate routes", () => {
 						env: true,
 					},
 				],
+				userLayer: { skills: [], plugins: [], mcp: [] },
 			});
 		} finally {
 			provCleanup();
@@ -3363,11 +3364,76 @@ describe("alate routes", () => {
 						env: true,
 					},
 				],
+				userLayer: { skills: [], plugins: [], mcp: [] },
 			});
 		} finally {
 			alateStatus = 200;
 			alateBody = prev;
 			provCleanup();
+		}
+	});
+
+	test("the user layer sums skills, plugins and MCP servers from the workers' home", async () => {
+		// server's shape stays whatever the surrounding tests configured; this test
+		// reads only userLayer and workers, so it never touches the alate config.
+		const skill = "---\nname: x\n---\nbody\n";
+		for (const dir of [
+			join(root, ".omp", "agent", "skills", "blast-radius"),
+			join(root, ".omp", "agent", "skills", "correct"),
+			join(root, ".omp", "agent", "managed-skills", "blast-radius"),
+			join(root, ".agents", "skills", "correct"),
+		]) {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "SKILL.md"), skill);
+		}
+		mkdirSync(join(root, ".omp", "agent", "skills", ".hidden"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(root, ".omp", "agent", "skills", ".hidden", "SKILL.md"),
+			skill,
+		);
+		mkdirSync(join(root, ".omp", "agent", "skills", "not-a-skill"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(root, ".omp", "agent", "skills", "not-a-skill", "README.md"),
+			"x\n",
+		);
+		mkdirSync(join(root, ".omp", "plugins"), { recursive: true });
+		writeFileSync(
+			join(root, ".omp", "plugins", "omp-plugins.lock.json"),
+			'{"plugins":{"caveman-installer":{"version":"4.0.1"},"@dietrichgebert/ponytail":{"version":"5.3.3"}}}',
+		);
+		mkdirSync(join(root, ".omp", "agent"), { recursive: true });
+		writeFileSync(
+			join(root, ".omp", "agent", "mcp.json"),
+			'{"mcpServers":{"chrome-devtools":{"command":"npx"},"context-mode":{"command":"node"}}}',
+		);
+		try {
+			const res = await get("/api/provisioning");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toMatchObject({
+				workers: [],
+				userLayer: {
+					skills: ["blast-radius", "correct"],
+					plugins: ["@dietrichgebert/ponytail", "caveman-installer"],
+					mcp: ["chrome-devtools", "context-mode"],
+				},
+			});
+			// A malformed mcp.json reads as an empty list; the other pieces stay.
+			writeFileSync(join(root, ".omp", "agent", "mcp.json"), "not json");
+			const bad = await get("/api/provisioning");
+			expect(await bad.json()).toMatchObject({
+				userLayer: {
+					skills: ["blast-radius", "correct"],
+					plugins: ["@dietrichgebert/ponytail", "caveman-installer"],
+					mcp: [],
+				},
+			});
+		} finally {
+			rmSync(join(root, ".omp"), { recursive: true, force: true });
+			rmSync(join(root, ".agents"), { recursive: true, force: true });
 		}
 	});
 

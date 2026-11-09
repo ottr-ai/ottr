@@ -23,6 +23,7 @@ import type {
 	GitHubAppView,
 	GithubFacts,
 	ProjectView,
+	ProvisioningResponse,
 	TaskCard,
 	TrendingStatus,
 } from "../types.ts";
@@ -4364,6 +4365,23 @@ export function alateHint(h: AlateHealthState): string {
 	return flags.length > 0 ? flags.join(" · ") : "up to date";
 }
 
+/** One line for the provisioned user layer: counts, then the MCP server names. */
+export function userLayerLine(
+	layer: ProvisioningResponse["userLayer"],
+): string {
+	const count = (n: number, word: string): string =>
+		`${n} ${word}${n === 1 ? "" : "s"}`;
+	const mcp = layer.mcp.length === 0 ? "none" : layer.mcp.join(", ");
+	return `User layer: ${count(layer.skills.length, "skill")}, ${count(layer.plugins.length, "plugin")}, MCP servers: ${mcp}`;
+}
+
+/** True when the layer carries neither skill nor plugin: the workers got none of the user layer. */
+export function userLayerEmpty(
+	layer: ProvisioningResponse["userLayer"],
+): boolean {
+	return layer.skills.length === 0 && layer.plugins.length === 0;
+}
+
 /** Consecutive `down` health probes (15 s apart) after which Settings stops following a provision. */
 export const ALATE_WATCH_MAX_DOWN = 4;
 /** Longest time Settings follows a provision that alate keeps reporting as running. */
@@ -4533,6 +4551,9 @@ export function AlateSection() {
 	const [watchSince, setWatchSince] = useState<number | null>(null);
 	// False until GET /api/alate answers: the chip must not claim "Not configured" before it knows.
 	const [loaded, setLoaded] = useState(false);
+	const [layer, setLayer] = useState<ProvisioningResponse["userLayer"] | null>(
+		null,
+	);
 	const awaiting = watchSince !== null;
 	// Consecutive `down` probes during the watch.
 	const watchDowns = useRef(0);
@@ -4560,6 +4581,13 @@ export function AlateSection() {
 		},
 		[],
 	);
+	const loadLayer = useCallback(() => {
+		// A failed read keeps the line hidden; the endpoint's health/state errors surface on the Setup tab and the section chip.
+		fetch("/api/provisioning")
+			.then((res) => unwrap<ProvisioningResponse>(res))
+			.then((r) => setLayer(r.userLayer))
+			.catch(() => {});
+	}, []);
 	// Follow a known in-flight provision with the health probe until it converges.
 	useEffect(() => {
 		if (!awaiting) return;
@@ -4582,6 +4610,7 @@ export function AlateSection() {
 					? "Provisioning ended, but alate still holds an unprovisioned import — check the alate dashboard for script output."
 					: "Provisioning finished successfully.",
 			);
+			loadLayer();
 			return;
 		}
 		setStatus("Provisioning state unknown.");
@@ -4590,7 +4619,7 @@ export function AlateSection() {
 				? "The alate server stopped answering while it provisioned. Check the alate dashboard, then provision again."
 				: `alate still reports a running provision after ${ALATE_WATCH_DEADLINE_MS / 60_000} minutes. Check the alate dashboard.`,
 		);
-	}, [watchSince, health]);
+	}, [loadLayer, watchSince, health]);
 	useEffect(() => {
 		let live = true;
 		fetch("/api/alate")
@@ -4609,6 +4638,7 @@ export function AlateSection() {
 				setLoaded(true);
 				setLastErr(cfg.lastProvisionError);
 				loadHealth(cfg.url ?? "", () => live);
+				loadLayer();
 			})
 			.catch((err: unknown) => {
 				if (live) setError(err instanceof Error ? err.message : String(err));
@@ -4616,7 +4646,7 @@ export function AlateSection() {
 		return () => {
 			live = false;
 		};
-	}, [loadHealth]);
+	}, [loadHealth, loadLayer]);
 	const submit = (): void =>
 		save.start(async () => {
 			setError(null);
@@ -4673,11 +4703,13 @@ export function AlateSection() {
 					watchDowns.current = 0;
 					setWatchSince(Date.now());
 					loadHealth(conn);
+					loadLayer();
 					return true;
 				}
 				const rows = res.results ?? [];
 				setResults(rows);
 				loadHealth(conn);
+				loadLayer();
 				if (res.ok) setLastErr(null);
 				const failed = rows.filter((r) => r.code !== 0);
 				setStatus(
@@ -4865,6 +4897,28 @@ export function AlateSection() {
 			<p className="hint" aria-live="polite">
 				{status}
 			</p>
+			{layer !== null &&
+				(userLayerEmpty(layer) ? (
+					<>
+						{layer.mcp.length > 0 && (
+							<p className="hint">{userLayerLine(layer)}</p>
+						)}
+						<div className="prov-callout" role="status">
+							<Mark kind="needs" />
+							<span className="prov-callout-text">
+								<b>User layer is empty</b>
+								<small>
+									Workers get none of your skills or plugins. In a checkout of
+									the alate repo run{" "}
+									<code>node sync-user.mjs --data &lt;data-repo&gt;</code>, then
+									provision again.
+								</small>
+							</span>
+						</div>
+					</>
+				) : (
+					<p className="hint">{userLayerLine(layer)}</p>
+				))}
 			{results.map((r) => (
 				<div key={r.script}>
 					<p className={r.code === 0 ? "hint" : "auth-error"}>
