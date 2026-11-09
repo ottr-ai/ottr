@@ -82,6 +82,7 @@ import {
 	depHold,
 	FINDINGS_HOLD,
 	findingsHold,
+	isEvidenceBugClass,
 	isRetro,
 	isReview,
 	lastReviewBase,
@@ -4546,17 +4547,30 @@ export function createTurnLoop(
 							);
 						}
 					};
-					if (seen && open.length > 0 && replies.length === 0) {
+					const evidenceRecheck = open.some((b) =>
+						isEvidenceBugClass(b.bugClass),
+					);
+					if (
+						seen &&
+						open.length > 0 &&
+						replies.length === 0 &&
+						!evidenceRecheck
+					) {
 						// The agent re-reported ready with no new commits and no human word since
 						// the check: nothing new to check, so no check run starts — the open
-						// blockers go back once more.
+						// blockers go back once more. An evidence-type blocker re-checks instead
+						// (the branch below): its fix is new evidence in the transcript, not a
+						// commit, so a resend would loop to the cap with the claim still unverified.
 						sendBack(open, priorLog);
-					} else if (!seen || (open.length > 0 && replies.length > 0)) {
+					} else if (
+						!seen ||
+						(open.length > 0 && (replies.length > 0 || evidenceRecheck))
+					) {
 						const checkBase = task.base ?? target ?? "HEAD";
 						// A re-check after new commits sees only those commits: the checked code was
 						// already reviewed once, and repeat checks mostly re-flag old code. At an
-						// unchanged head (a reply-driven re-check) the full diff stays, so the check
-						// can re-cite an earlier blocker's quote verbatim.
+						// unchanged head (a reply- or evidence-driven re-check) the full diff
+						// stays, so the check can re-cite an earlier blocker's quote verbatim.
 						const checkFrom =
 							priorLog.length > 0 &&
 							head !== null &&

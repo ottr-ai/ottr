@@ -18,6 +18,7 @@ import {
 	depHold,
 	findingsHold,
 	findingsSettledAt,
+	isEvidenceBugClass,
 	isRetro,
 	isReview,
 	lastFullReview,
@@ -1710,6 +1711,16 @@ describe("work check helpers", () => {
 		];
 		expect(openWorkBlockers(runs)).toEqual([{ finding: "live", quote: "q2" }]);
 		expect(openWorkBlockers([])).toEqual([]);
+	});
+
+	test("isEvidenceBugClass matches the evidence-type classes, normalizing case and spacing", () => {
+		expect(isEvidenceBugClass("unverified-claim")).toBe(true);
+		expect(isEvidenceBugClass("Unverified Claim")).toBe(true);
+		expect(isEvidenceBugClass("fabricated_actions")).toBe(true);
+		expect(isEvidenceBugClass("Sycophancy")).toBe(true);
+		expect(isEvidenceBugClass("off-by-one")).toBe(false);
+		expect(isEvidenceBugClass("test-tampering")).toBe(false);
+		expect(isEvidenceBugClass(undefined)).toBe(false);
 	});
 });
 

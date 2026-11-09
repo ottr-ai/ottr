@@ -11255,10 +11255,13 @@ describe("work card check", () => {
 		runResult({
 			finalText: JSON.stringify({ blockers: [], fixed: [], notes }),
 		});
-	const block = (finding: string, quote: string) =>
+	const block = (finding: string, quote: string, bugClass?: string) =>
 		runResult({
 			finalText: JSON.stringify({
-				blockers: [{ finding, quote }],
+				blockers:
+					bugClass === undefined
+						? [{ finding, quote }]
+						: [{ finding, quote, bugClass }],
 				fixed: [],
 				notes: [],
 			}),
@@ -11599,6 +11602,137 @@ describe("work card check", () => {
 			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
 		);
 		expect(parked.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS);
+	});
+
+	test("a re-ready at an unchanged head with an open unverified-claim blocker reruns the check, and the cap still holds", async () => {
+		const head = { sha: "sha1" };
+		const stillUnverified = block(
+			"still no check run backs the ready report",
+			"const x = 1;",
+			"unverified-claim",
+		);
+		const { store, record, loop } = workCheckCase(
+			head,
+			[
+				block(
+					"no check run backs the ready report",
+					"const x = 1;",
+					"unverified-claim",
+				),
+				stillUnverified,
+				stillUnverified,
+				stillUnverified,
+				stillUnverified,
+			],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+
+		// Ready again with no new commits: an unverified claim is fixed by new evidence
+		// in the transcript, not by a commit, so a fresh check runs instead of a resend.
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(4); // two work runs, two checks
+		const rerun = record.runs[3]!;
+		// The rerun sees the earlier blockers and, at the unchanged head, the full
+		// branch diff; the transcript path carries the turns since the last check.
+		expect(rerun.prompt).toContain("This is a re-check");
+		expect(rerun.prompt).toContain("no check run backs the ready report");
+		expect(rerun.prompt).toContain("Diff of the branch");
+		expect(rerun.prompt).toContain("Work transcript");
+		const rerunState = store.getTask(task.id)!;
+		expect(rerunState.stage).toBe("in_progress");
+		expect(rerunState.state).toBe("queued");
+		expect(rerunState.workCheckSendbacks).toBe(2);
+		expect(rerunState.pendingPrompt).toContain("[unverified-claim]");
+		expect(rerunState.workCheckLog).toHaveLength(2);
+		expect(rerunState.workCheckLog[1]!.outcome).toBe("blockers");
+		// The rerun re-cited the quote, so the first blocker stays open.
+		expect(rerunState.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+
+		// The reruns count against the send-back cap like resends: the block past the
+		// cap parks the card, so the unchanged-head loop stays bounded.
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(3);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
+			WORK_CHECK_MAX_SENDBACKS,
+		);
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(10); // five work runs, five checks
+		const parked = store.getTask(task.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.needsReason).toContain(
+			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
+		);
+		expect(parked.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS);
+		expect(parked.asked![0]!.options.map((o) => o.label)).toEqual([
+			"Send it back",
+			"Merge anyway",
+		]);
+	});
+
+	test("a re-ready at an unchanged head with a code-defect blocker still resends with no check run", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = workCheckCase(
+			head,
+			[block("off by one", "const x = 1;", "off-by-one")],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+
+		// A code defect only clears with a commit, which changes the head and re-checks:
+		// the same-head ready resends the blocker, and no second check run starts.
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(3); // the second turn added only its work run
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckSendbacks).toBe(2);
+		expect(after.pendingPrompt).toContain("off by one");
+		expect(after.pendingPrompt).toContain("[off-by-one]");
+		expect(after.workCheckLog).toHaveLength(1);
+	});
+
+	test("an evidence rerun that passes at the unchanged head resolves the blocker", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = workCheckCase(
+			head,
+			[
+				block(
+					"no check run backs the ready report",
+					"const x = 1;",
+					"unverified-claim",
+				),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [],
+						fixed: [{ id: 1, reason: "the transcript shows the command ran" }],
+						notes: [],
+					}),
+				}),
+			],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+
+		// The agent produced the missing evidence; the same-head rerun confirms it.
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(4); // two work runs, two checks
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckHead).toBe("sha1");
+		expect(after.workCheckSendbacks).toBe(1);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[1]!.outcome).toBe("pass");
+		expect(after.workCheckLog[0]!.blockers[0]!.status).toBe("fixed");
+		expect(after.workCheckLog[0]!.blockers[0]!.statusReason).toBe(
+			"the transcript shows the command ran",
+		);
 	});
 
 	test("a human reply at an unchanged head reruns the check with the reply in its input", async () => {

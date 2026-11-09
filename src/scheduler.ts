@@ -790,6 +790,25 @@ export function openWorkBlockers(
 	return [];
 }
 
+/** The evidence-type bug classes of the work-check prompt: "fabricated actions" and
+ * "sycophancy" — a claim with no run behind it, or more than the evidence shows — plus the
+ * "unverified-claim" name the check wrote in the field. Their fix is new evidence in the work
+ * transcript (a real command run), not a commit, so an unchanged head re-runs the check on the
+ * new transcript instead of resending; a resend would only loop to the cap with nothing new
+ * to verify. Class names are free-form, so the match normalizes case and spacing. */
+export const EVIDENCE_BUG_CLASSES: readonly string[] = [
+	"unverified-claim",
+	"fabricated-actions",
+	"sycophancy",
+];
+
+/** True when a blocker's bugClass names an evidence-type class (EVIDENCE_BUG_CLASSES). Pure. */
+export function isEvidenceBugClass(bugClass: string | undefined): boolean {
+	if (bugClass === undefined) return false;
+	const norm = bugClass.trim().toLowerCase();
+	return EVIDENCE_BUG_CLASSES.includes(norm.replace(/[\s_]+/g, "-"));
+}
+
 /** Opening of the needs_you reason the work-check block at the send-back cap sets; the reply
  * route reads the ask answers below only on a card parked with it. The count derives from
  * WORK_CHECK_MAX_SENDBACKS so the wording cannot drift from the cap. */
