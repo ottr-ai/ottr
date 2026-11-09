@@ -2203,6 +2203,63 @@ describe("settings routes", () => {
 		expect(await errorOf(dup)).toBe("path already exists");
 	});
 
+	// OTTR-682: the add-project wizard accepts a task ID prefix. Validation mirrors the
+	// settings PATCH and fires before any disk write (R1-5); a set prefix must land before
+	// the rules interview so the project's first tasks already use it.
+	test("adding a project stores taskIdPrefix and validates it before any disk write", async () => {
+		const res = await post("/api/projects", {
+			name: "prefixed",
+			taskIdPrefix: "fix",
+		});
+		expect(res.status).toBe(200);
+		// The view echoes the stored prefix; the store has it too, not the derived default.
+		const added = (await res.json()) as {
+			project: { settings: { taskIdPrefix: string | null } };
+		};
+		expect(added.project.settings.taskIdPrefix).toBe("FIX");
+		expect(projects.get("prefixed")?.store.getSettings().taskIdPrefix).toBe(
+			"FIX",
+		);
+
+		// Guards: same messages as the settings PATCH, and no folder or board entry.
+		const bad = await post("/api/projects", {
+			name: "bad-prefix",
+			taskIdPrefix: "a-b",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe(
+			"taskIdPrefix must be 1 to 8 letters and digits",
+		);
+		const long = await post("/api/projects", {
+			name: "bad-prefix",
+			taskIdPrefix: "abcdefghi",
+		});
+		expect(long.status).toBe(400);
+		expect(await errorOf(long)).toBe(
+			"taskIdPrefix must be 1 to 8 letters and digits",
+		);
+		const wrongType = await post("/api/projects", {
+			name: "bad-prefix",
+			taskIdPrefix: 7,
+		});
+		expect(wrongType.status).toBe(400);
+		expect(await errorOf(wrongType)).toBe(
+			"taskIdPrefix must be a string or null",
+		);
+		expect(existsSync(join(root, "bad-prefix"))).toBe(false);
+		expect(projects.has("bad-prefix")).toBe(false);
+
+		// Empty string: no prefix stored, the folder-derived default stays.
+		const empty = await post("/api/projects", {
+			name: "derived",
+			taskIdPrefix: "",
+		});
+		expect(empty.status).toBe(200);
+		expect(
+			projects.get("derived")?.store.getSettings().taskIdPrefix,
+		).toBeNull();
+	});
+
 	test("cloning a url lands under the default dir", async () => {
 		makeFixture("clone-me");
 		writeFileSync(join(fixtureRepos, "clone-me", "AGENTS.md"), "rules");

@@ -14,6 +14,7 @@ import { mkdirBelow, writeBelow } from "./confine.ts";
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
+import { derivedTaskPrefix } from "./prefix.ts";
 import {
 	ARCH_REVIEW_MARKER,
 	FORK_PROPOSED_REASON_PREFIX,
@@ -89,15 +90,6 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	pushSyncCommits: false,
 	taskIdPrefix: null,
 };
-
-/** Uppercase alphanumeric fallback handle, max 4 chars, from the folder name; TASK when nothing survives. */
-export function derivedTaskPrefix(folderName: string): string {
-	const p = folderName
-		.replaceAll(/[^A-Za-z0-9]/g, "")
-		.toUpperCase()
-		.slice(0, 4);
-	return p === "" ? "TASK" : p;
-}
 
 /** The tasks table DDL, kept separate so the CHECK migration below reuses the exact shape. */
 const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (

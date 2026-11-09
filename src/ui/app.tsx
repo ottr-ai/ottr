@@ -23,6 +23,7 @@ import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { DeadSignIn } from "../login.ts";
 import type { ModelOption } from "../models.ts";
 import { shortKey, taskEntryKey } from "../notifications.ts";
+import { derivedTaskPrefix } from "../prefix.ts";
 import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
@@ -7092,12 +7093,14 @@ function GhRepoHint({
 function addGitProjectRequest(req: {
 	url: string;
 	name: string;
+	taskIdPrefix: string;
 	sshKey: string | undefined;
 	trust: string[] | undefined;
 }): ReturnType<typeof gitReq> {
 	return gitReq("POST", "/api/projects", {
 		url: req.url,
 		name: req.name === "" ? undefined : req.name,
+		taskIdPrefix: req.taskIdPrefix,
 		sshKey: req.sshKey,
 		trust: req.trust,
 	});
@@ -7129,6 +7132,7 @@ async function addGitProject(
 	req: {
 		url: string;
 		name: string;
+		taskIdPrefix: string;
 		sshKey: string | undefined;
 		trust: string[] | undefined;
 	},
@@ -7165,6 +7169,7 @@ async function addGitProjectTrusted(
 	req: {
 		url: string;
 		name: string;
+		taskIdPrefix: string;
 		sshKey: string | undefined;
 		trust: string[] | undefined;
 	},
@@ -7187,6 +7192,49 @@ async function addGitProjectTrusted(
 	}
 	if (t !== null) return t;
 	return { error: asError(data, status, "adding the project") };
+}
+
+/** Empty keeps the server's derived default; otherwise 1 to 8 letters and digits. */
+function prefixUsable(prefixOut: string): boolean {
+	return prefixOut === "" || /^[A-Z0-9]{1,8}$/.test(prefixOut);
+}
+
+/** The task ID prefix field with its duplicate-handle warning; shared by both source tabs. */
+function AddPrefixField({
+	prefix,
+	setPrefix,
+	prefixOut,
+	projects,
+}: {
+	prefix: string;
+	setPrefix: (v: string) => void;
+	prefixOut: string;
+	projects: ProjectView[];
+}) {
+	const clash =
+		prefixOut !== "" && projects.some((p) => p.taskPrefix === prefixOut);
+	return (
+		<>
+			<label>
+				Task ID prefix
+				<input
+					maxLength={8}
+					value={prefix}
+					aria-label="Task ID prefix"
+					onChange={(e) => {
+						setPrefix(e.target.value);
+					}}
+				/>
+				<code>1 to 8 letters and digits</code>
+			</label>
+			{clash && (
+				<p className="hint trust-warn" role="status">
+					The task ID prefix {prefixOut} is already in use. Pick another prefix,
+					or tasks from both projects will look shared.
+				</p>
+			)}
+		</>
+	);
 }
 
 /** The tab strip of the Add-project dialog. */
@@ -7338,12 +7386,14 @@ export function AddProjectModal({
 	onClose,
 	onAdded,
 	openTask,
+	projects,
 }: {
 	act: Act;
 	onClose: () => void;
 	onAdded: (interview: string) => void;
 	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
+	projects: ProjectView[];
 }) {
 	const [mode, setMode] = useState<"url" | "new">("url");
 	const [url, setUrl] = useState("");
@@ -7354,6 +7404,9 @@ export function AddProjectModal({
 	// Git-URL flow: a client-side name mirror, the hosts view, the SSH key choice and
 	// the token step the server demands on a 400 needsToken.
 	const [nameTouched, setNameTouched] = useState(false);
+	// The task ID prefix: follows the derived value from the name until the user edits it.
+	const [prefix, setPrefix] = useState("");
+	const [prefixTouched, setPrefixTouched] = useState(false);
 	const [hosts, setHosts] = useState<GitHostsView | null>(null);
 	const [sshMode, setSshMode] = useState<"global" | "new">("global");
 	const [pendingKey, setPendingKey] = useState<PendingKeyInfo | null>(null);
@@ -7371,6 +7424,8 @@ export function AddProjectModal({
 	}, [needsTokenHost, hosts]);
 	const [tokToken, setTokToken] = useState("");
 	const repoName = name.trim();
+	// The effective handle: uppercase, and empty keeps the server's derived default.
+	const prefixOut = prefix.trim().toUpperCase();
 	const trimmedUrl = url.trim();
 	// The URL field's own error (The Error-Says-Fix Rule): shown while the URL tab
 	// holds a value that cannot parse, under the field it names.
@@ -7410,22 +7465,39 @@ export function AddProjectModal({
 		};
 	}, []);
 	// The name mirror: propose the URL's last path segment until the user edits it.
+	const onName = (n: string): void => {
+		setName(n);
+		if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
+	};
 	const onUrl = (u: string): void => {
 		setUrl(u);
 		if (!nameTouched) {
 			const seg = (
 				u.trim().replace(/\/+$/, "").split(/[:/]/).pop() ?? ""
 			).replace(/\.git$/, "");
-			setName(seg);
+			onName(seg);
 		}
 	};
+	// The prefix must stay a short handle of letters and digits; the server
+	// normalizes case itself, but the client rejects other characters early.
+	const prefixValid = prefixUsable(prefixOut);
 	// The Add call: ssh URLs carry the key choice; the server answers with trust or token steps.
 	const addProject = (trust?: string[]): void => {
+		if (!prefixValid) {
+			setErr("The task ID prefix must be 1 to 8 letters and digits.");
+			return;
+		}
 		add.start(() =>
 			act(
 				async () =>
 					await addGitProject(
-						{ url: trimmedUrl, name: repoName, sshKey, trust },
+						{
+							url: trimmedUrl,
+							name: repoName,
+							taskIdPrefix: prefixOut,
+							sshKey,
+							trust,
+						},
 						{
 							onAdded,
 							setAdded,
@@ -7558,10 +7630,15 @@ export function AddProjectModal({
 								addProject(trusted);
 								return;
 							}
+							if (!prefixValid) {
+								setErr("The task ID prefix must be 1 to 8 letters and digits.");
+								return;
+							}
 							add.start(() =>
 								act(async () => {
 									const r = await post<AddProjectResponse>("/api/projects", {
 										name: name.trim(),
+										taskIdPrefix: prefixOut,
 										github: ghRepo,
 									});
 									onAdded(r.interview);
@@ -7584,6 +7661,7 @@ export function AddProjectModal({
 							onName={(n) => {
 								setNameTouched(true);
 								setName(n);
+								if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
 							}}
 							ssh={ssh}
 							sshMode={sshMode}
@@ -7608,13 +7686,22 @@ export function AddProjectModal({
 						<AddNewPanel
 							mode={mode}
 							name={name}
-							setName={setName}
+							setName={(n) => onName(n)}
 							ghRepo={ghRepo}
 							setGhRepo={setGhRepo}
 							gh={gh}
 							free={free}
 							repoName={repoName}
 							onClose={onClose}
+						/>
+						<AddPrefixField
+							prefix={prefix}
+							setPrefix={(v) => {
+								setPrefixTouched(true);
+								setPrefix(v);
+							}}
+							prefixOut={prefixOut}
+							projects={projects}
 						/>
 						{err !== null && (
 							<p className="auth-error" role="alert">
@@ -7627,7 +7714,13 @@ export function AddProjectModal({
 								success="Project added"
 								send={(trust) =>
 									addGitProjectTrusted(
-										{ url: trimmedUrl, name: repoName, sshKey, trust },
+										{
+											url: trimmedUrl,
+											name: repoName,
+											taskIdPrefix: prefixOut,
+											sshKey,
+											trust,
+										},
 										{
 											onAdded,
 											setAdded,
@@ -14887,6 +14980,7 @@ function AppOverlays(p: {
 			{showAdd && (
 				<AddProjectModal
 					act={act}
+					projects={state?.projects ?? []}
 					onClose={() => setShowAdd(false)}
 					onAdded={(i) => setNotice(interviewMsg(i))}
 					openTask={openTask}

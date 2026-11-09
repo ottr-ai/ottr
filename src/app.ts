@@ -209,6 +209,7 @@ import {
 } from "./orphans.ts";
 import { perfMetrics, turnMedianKey, turnMedians } from "./perf.ts";
 import { type ProcessInfo, platform } from "./platform/index.ts";
+import { derivedTaskPrefix } from "./prefix.ts";
 import {
 	type ParsedReview,
 	parseReviewDraft,
@@ -276,11 +277,7 @@ import {
 	WORK_CHECK_ASK_SEND_BACK,
 } from "./scheduler.ts";
 import { sessionContext } from "./session.ts";
-import {
-	type BoardTurnFacts,
-	derivedTaskPrefix,
-	ProjectStore,
-} from "./store.ts";
+import { type BoardTurnFacts, ProjectStore } from "./store.ts";
 import {
 	createSystemSampler,
 	fetchWorkerStats,
@@ -4996,7 +4993,7 @@ export function createApp(deps: AppDeps) {
 		return { p: n.p };
 	}
 	/** Registers the finished project directory on the board: store entry, persistence, remote refresh, origin pin. */
-	async function registerProject(p: string): Promise<Response> {
+	async function registerProject(p: string, prefix: string): Promise<Response> {
 		const gitless = !(await isGitRepoWithCommit(p));
 		const key = basename(p);
 
@@ -5040,8 +5037,12 @@ export function createApp(deps: AppDeps) {
 		if (pin !== null && e.store.getSettings().originUrl === null)
 			e.store.setSettings({ originUrl: pin });
 
-		// The wizard/checklist opens for every newly added project.
-		e.store.setSettings({ setupChecklist: true });
+		// The wizard/checklist opens for every newly added project; a set prefix must land
+		// before the interview so its first tasks already use it.
+		e.store.setSettings({
+			setupChecklist: true,
+			taskIdPrefix: prefix === "" ? null : prefix,
+		});
 		// A gitless project has no HEAD to create a worktree from; the turn machinery would
 		// crash, so the rules interview waits for POST /init.
 		if (e.gitless)
@@ -5051,6 +5052,17 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function addProject(body: Record<string, unknown>): Promise<Response> {
+		// Same validation as the settings PATCH: a bad prefix must 400 before any
+		// disk write (R1-5), and an empty one keeps the folder-derived default.
+		const tp = body.taskIdPrefix;
+		if (tp !== undefined && tp !== null && typeof tp !== "string")
+			return json({ error: "taskIdPrefix must be a string or null" }, 400);
+		const prefix = typeof tp === "string" ? tp.trim().toUpperCase() : "";
+		if (prefix !== "" && !/^[A-Z0-9]{1,8}$/.test(prefix))
+			return json(
+				{ error: "taskIdPrefix must be 1 to 8 letters and digits" },
+				400,
+			);
 		// One folder name per board entry (it keys deps.projects and, under OTTR_DATA_DIR, the
 		// data dir): a taken basename must 409 BEFORE any clone or git init leaves a repo on
 		// disk with no board entry (R1-5).
@@ -5068,7 +5080,7 @@ export function createApp(deps: AppDeps) {
 			return json({ error: "provide a git URL or a project name" }, 400);
 		}
 		if (!("p" in added)) return added;
-		return registerProject(added.p);
+		return registerProject(added.p, prefix);
 	}
 
 	/** 409 while any task is queued/preparing/running — removing or re-homing the project's

@@ -7199,7 +7199,7 @@ function ProjectIdentitySection({
 						</DefRow>
 						<DefRow
 							name="Task ID prefix"
-							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
+							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle. Cards that already exist keep their ids."
 							shape="empty = from folder name"
 						>
 							<div className="alate-field-stack">

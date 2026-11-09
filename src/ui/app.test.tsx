@@ -6444,7 +6444,10 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		return new Response("{}", { status: 404 });
 	}
 
-	async function mountAdd(githubTokenSet: boolean): Promise<{
+	async function mountAdd(
+		githubTokenSet: boolean,
+		projects: ProjectView[] = [],
+	): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
 		posts: { url: string; body: Record<string, unknown> }[];
@@ -6489,6 +6492,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				root.render(
 					<AddProjectModal
 						act={actProp}
+						projects={projects}
 						onClose={() => {}}
 						onAdded={(interview: string) => added.push(interview)}
 						openTask={() => {}}
@@ -6584,6 +6588,147 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					(b) => b.textContent === "Use the board GitHub token",
 				),
 			).toBe(false);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("the prefix field mirrors the name segment until edited", async () => {
+		const { container, root, restore } = await mountAdd(false);
+		try {
+			const urlInput = container.querySelector(
+				"input[data-autofocus]",
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
+				onChangeOf(urlInput)({
+					target: urlInput,
+					currentTarget: urlInput,
+				});
+			});
+			const prefixInput = container.querySelector(
+				'input[aria-label="Task ID prefix"]',
+			) as unknown as HTMLInputElement;
+			expect(prefixInput.value).toBe("CMIS");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("a typed prefix reaches the Add request body", async () => {
+		const { container, root, posts, restore } = await mountAdd(false);
+		try {
+			const urlInput = container.querySelector(
+				"input[data-autofocus]",
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
+				onChangeOf(urlInput)({
+					target: urlInput,
+					currentTarget: urlInput,
+				});
+			});
+			const prefixInput = container.querySelector(
+				'input[aria-label="Task ID prefix"]',
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(prefixInput, "fix");
+				onChangeOf(prefixInput)({
+					target: prefixInput,
+					currentTarget: prefixInput,
+				});
+			});
+			const form = container.querySelector(
+				"form",
+			) as unknown as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// The mocked answer is the 400 needsToken step; the harness still records the body.
+			expect(posts[0]?.body.taskIdPrefix).toBe("FIX");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("a prefix that another project uses warns, a free one does not", async () => {
+		const clash = { ...project, taskPrefix: "FIX" } as unknown as ProjectView;
+		const { container, root, restore } = await mountAdd(false, [clash]);
+		try {
+			const prefixInput = container.querySelector(
+				'input[aria-label="Task ID prefix"]',
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(prefixInput, "FIX");
+				onChangeOf(prefixInput)({
+					target: prefixInput,
+					currentTarget: prefixInput,
+				});
+			});
+			expect(container.querySelector('p[role="status"]')).not.toBeNull();
+			await act(async () => {
+				typeInto(prefixInput, "XYZ");
+				onChangeOf(prefixInput)({
+					target: prefixInput,
+					currentTarget: prefixInput,
+				});
+			});
+			expect(container.querySelector('p[role="status"]')).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("an invalid prefix blocks the submit with an inline error and no request", async () => {
+		const { container, root, posts, restore } = await mountAdd(false);
+		try {
+			const urlInput = container.querySelector(
+				"input[data-autofocus]",
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
+				onChangeOf(urlInput)({
+					target: urlInput,
+					currentTarget: urlInput,
+				});
+			});
+			const prefixInput = container.querySelector(
+				'input[aria-label="Task ID prefix"]',
+			) as unknown as HTMLInputElement;
+			await act(async () => {
+				typeInto(prefixInput, "A-B");
+				onChangeOf(prefixInput)({
+					target: prefixInput,
+					currentTarget: prefixInput,
+				});
+			});
+			const form = container.querySelector(
+				"form",
+			) as unknown as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			const errText = container.querySelector(".auth-error")?.textContent;
+			expect(errText).toBe(
+				"The task ID prefix must be 1 to 8 letters and digits.",
+			);
+			expect(posts.filter((p) => p.url.endsWith("/api/projects"))).toEqual([]);
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -7912,6 +8057,7 @@ describe("AddProjectModal Git URL field error", () => {
 						onClose={() => {}}
 						onAdded={() => {}}
 						openTask={() => {}}
+						projects={[]}
 					/>,
 				);
 			});
