@@ -339,6 +339,81 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("OTTR-743: a cannot-lock-ref failure whose head origin already holds lands as pushed", async () => {
+		const f = fixture();
+		try {
+			// The OTTR-712 race replay: while the push runs, a parallel writer lands the
+			// exact head this push carries (the hook's fetch below), and the remote then
+			// refuses the update with the race wording. The clone's tracking ref still
+			// names the old tip, so the skip check does not skip.
+			const local = run(f.main, "rev-parse", "refs/heads/main");
+			const expected = run(f.main, "rev-parse", "refs/remotes/origin/main");
+			writeFileSync(
+				join(f.bare, "hooks", "pre-receive"),
+				// The receive-pack quarantine forbids ref updates inside the hook, so the
+				// hook drops the quarantine env before it lands the head.
+				`#!/bin/sh\nunset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\ngit fetch "${f.main}" refs/heads/main:refs/heads/main\nprintf "cannot lock ref 'refs/heads/main': is at ${local} but expected ${expected}\\n" >&2\nexit 1\n`,
+				{ mode: 0o755 },
+			);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			// The hook landed the head: origin already holds what this push carried.
+			expect(run(f.bare, "rev-parse", "main")).toBe(local);
+			if (r.status !== "pushed")
+				throw new Error(
+					`expected a recovered push, got ${r.status}${"error" in r ? `: ${r.error}` : ""}`,
+				);
+			// The reason line names the recovery for the card log.
+			expect(r.output).toContain("push landed on origin before this attempt");
+			expect(r.output).toContain("cannot lock ref");
+			expect(r.output).toContain(local);
+			// The same bookkeeping a successful push runs: the tracking ref names the
+			// remote's tip and the branch tracks it.
+			expect(run(f.main, "rev-parse", "refs/remotes/origin/main")).toBe(local);
+			expect(run(f.main, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe(
+				"origin/main",
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("OTTR-743: a cannot-lock-ref failure whose head origin does not hold stays failed", async () => {
+		const f = fixture();
+		try {
+			// The remote refuses with the race wording but holds only the old base: the
+			// pushed head is not on origin, so today's failed park stands.
+			const local = run(f.main, "rev-parse", "refs/heads/main");
+			const base = run(f.bare, "rev-parse", "main");
+			writeFileSync(
+				join(f.bare, "hooks", "pre-receive"),
+				`#!/bin/sh\nprintf "cannot lock ref 'refs/heads/main': is at ${base} but expected ${base}\\n" >&2\nexit 1\n`,
+				{ mode: 0o755 },
+			);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			if (r.status !== "failed")
+				throw new Error(`expected a failed push, got ${r.status}`);
+			expect(r.error).toContain("cannot lock ref");
+			expect(run(f.bare, "rev-parse", "main")).toBe(base);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(local);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("rebaseTargetBranch rebases a clean divergence onto the moved origin tip", async () => {
 		const f = fixture();
 		try {

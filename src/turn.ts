@@ -176,6 +176,7 @@ import type {
 } from "./worktree.ts";
 import {
 	commitSubjects,
+	PUSH_LANDED_BEFORE_ATTEMPT,
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
@@ -3739,6 +3740,10 @@ export function createTurnLoop(
 								// at once instead of waiting for the tick's branchUnpushed refresh.
 								e.mainUnpushed = false;
 								log(`- pushed ${target} from the server`);
+								// OTTR-743: a "cannot lock ref" failure whose head the remote already
+								// holds lands as pushed; name the recovery in the card log.
+								if (p.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
+									log(`- ${p.output}`);
 								// The agent's own push has no credentials (D6). A merge agent that stopped at
 								// needs_you on that authentication failure did integrate: the server push landed
 								// it, so the report becomes integrated with the push output in details.
@@ -4077,6 +4082,9 @@ export function createTurnLoop(
 									log(
 										`- pushed ${target} from the server after the automatic rebase`,
 									);
+									// OTTR-743: the same recovery reason line rides a retry push.
+									if (p2.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
+										log(`- ${p2.output}`);
 								} else if (p2.status === "skipped") {
 									pushError = null;
 									pushOutput = null;

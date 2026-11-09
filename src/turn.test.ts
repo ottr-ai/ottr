@@ -88,6 +88,7 @@ import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun } from "./workers.ts";
 import {
 	isClean as gitIsClean,
+	PUSH_LANDED_BEFORE_ATTEMPT,
 	resolveTarget as realResolveTarget,
 	statusFiles as realStatusFiles,
 	trackedFiles as realTrackedFiles,
@@ -5013,6 +5014,42 @@ describe("turn ci watch pinning", () => {
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).not.toContain("PR mode");
+	});
+
+	test("OTTR-743: a cannot-lock-ref push the remote already held lands as done with the recovery reason", async () => {
+		const { store, record, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "pushed" as const,
+				output: `${PUSH_LANDED_BEFORE_ATTEMPT}: the remote ref moved while the push ran ("cannot lock ref"), and the fetched main already contains the pushed head`,
+			}),
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		// Same state as a successful push: the card lands, no needs_you, the worktree goes.
+		expect(t.stage).toBe("done");
+		expect(t.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+		// One log line names the reason.
+		expect(logText(store, task.id)).toContain(
+			"- push landed on origin before this attempt",
+		);
+	});
+
+	test("OTTR-743: a cannot-lock-ref push whose head origin lacks parks as today", async () => {
+		const { store, loop, task } = mergeDoneSetup({
+			serverMergePush: async () => ({
+				status: "failed" as const,
+				error:
+					"! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at ba8b25e but expected 1b467ba)",
+			}),
+		});
+		await loop.runTurn(store.name, task.id);
+		const t = store.getTask(task.id)!;
+		expect(t.stage).toBe("merging");
+		expect(t.state).toBe("needs_you");
+		expect(t.needsReason).toBe(
+			"Server push to origin failed: ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at ba8b25e but expected 1b467ba)",
+		);
 	});
 
 	test("a rejected server push fetches origin and queues a rebase merge turn, not needs_you", async () => {

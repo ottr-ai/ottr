@@ -1385,6 +1385,11 @@ export function redactUrlCredentials(text: string): string {
 
 /** stderr lines that name a push failure's cause; hint lines stay out of needsReason. */
 const PUSH_REASON_LINE = /^\s*(?:!\s*\[|error:|fatal:|remote:)/;
+/** OTTR-743: the remote's race wording — the ref moved between the push's negotiation and its update. */
+const CANNOT_LOCK_REF_RE = /cannot lock ref/;
+/** Output prefix of a failed push whose head the remote already holds; turn.ts logs it as the done reason. */
+export const PUSH_LANDED_BEFORE_ATTEMPT =
+	"push landed on origin before this attempt";
 /** Card-log cap for a push's full output; the reason lines stay complete above it (same shape as the hold diff cap). */
 const PUSH_OUTPUT_MAX = 200_000;
 
@@ -1530,6 +1535,36 @@ export async function serverMergePush(
 		)
 	)
 		return { status: "rejected", error, output };
+	// OTTR-743: a "cannot lock ref" rejection is the remote's race wording — another writer
+	// moved the ref between this push's negotiation and its update (an earlier attempt of
+	// the same push landed, or a parallel push carried the head). When the fetched target
+	// already contains the pushed head, the push's goal is already met: run the same
+	// bookkeeping a successful push runs and land the card instead of parking it. A fetch
+	// that fails, or a remote tip that does not contain the head, keeps today's
+	// retry-then-park behavior with the full output.
+	if (CANNOT_LOCK_REF_RE.test(r.stderr)) {
+		const fetchError = await fetchOriginBranch(mainPath, branch, originUrl);
+		if (fetchError === null) {
+			const remoteTip = await sha(`refs/remotes/origin/${branch}`);
+			if (remoteTip !== null) {
+				const landed = await git(
+					["merge-base", "--is-ancestor", local, remoteTip],
+					mainPath,
+				);
+				if (landed.code === 0) {
+					await git(
+						["update-ref", `refs/remotes/origin/${branch}`, remoteTip],
+						mainPath,
+					);
+					await git(["branch", "-u", `origin/${branch}`, branch], mainPath);
+					return {
+						status: "pushed",
+						output: `${PUSH_LANDED_BEFORE_ATTEMPT}: the remote ref moved while the push ran ("cannot lock ref"), and the fetched ${branch} already contains the pushed head ${local}`,
+					};
+				}
+			}
+		}
+	}
 	return { status: "failed", error, output };
 }
 
