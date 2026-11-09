@@ -327,10 +327,14 @@ async function pullData(
 /** Longest comment body kept: the budget cut drops whole comments long before this binds. */
 const MAX_COMMENT_BODY = 4000;
 
+/** Pages read at most for one posted review's inline comments (100 comments a page). */
+const MAX_INLINE_PAGES = 30;
+
 /**
- * The inline comments of the board's posted review `reviewId`, each as a marker block. GitHub
- * data stays untrusted: entries without a usable path and line are skipped. A failed read gives
- * none, so the re-review keeps the review body alone.
+ * The inline comments of the board's posted review `reviewId`, each as a marker block, read over
+ * every page. GitHub data stays untrusted: entries without a usable path and line are skipped.
+ * A failed or malformed read throws: the re-review must check every earlier finding, so it
+ * stops and a later tick retries, never running without them.
  */
 async function postedInlineComments(
 	gh: GhFn,
@@ -338,18 +342,30 @@ async function postedInlineComments(
 	number: number,
 	reviewId: number,
 ): Promise<string[]> {
-	const r = await gh([
-		"api",
-		`repos/${repo}/pulls/${number}/reviews/${reviewId}/comments?per_page=100`,
-	]);
-	if (r.code !== 0) return [];
-	let list: unknown;
-	try {
-		list = JSON.parse(r.stdout);
-	} catch {
-		return [];
+	const list: unknown[] = [];
+	for (let page = 1; ; page++) {
+		if (page > MAX_INLINE_PAGES)
+			throw new Error(
+				`review comments: more than ${MAX_INLINE_PAGES} pages for review ${reviewId}`,
+			);
+		const r = await gh([
+			"api",
+			`repos/${repo}/pulls/${number}/reviews/${reviewId}/comments?per_page=100&page=${page}`,
+		]);
+		if (r.code !== 0)
+			throw new Error(
+				`review comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			);
+		let body: unknown;
+		try {
+			body = JSON.parse(r.stdout);
+		} catch {
+			throw new Error("review comments: bad JSON");
+		}
+		if (!Array.isArray(body)) throw new Error("review comments: not a list");
+		list.push(...body);
+		if (body.length < 100) break;
 	}
-	if (!Array.isArray(list)) return [];
 	const lineOf = (v: unknown): number | null =>
 		typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
 	const out: string[] = [];

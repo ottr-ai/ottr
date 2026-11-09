@@ -450,27 +450,37 @@ describe("review prompt and draft", () => {
 			}),
 		).toBeNull();
 	});
-	test("fetchReReviewContext reads the inline comments of a review matched by commit; a failed read keeps the body", async () => {
-		let commentsFail = false;
+	test("fetchReReviewContext reads the inline comments of a review matched by commit; a failed or malformed read rejects", async () => {
+		let answer: { code: number; stdout: string; stderr: string } = {
+			code: 0,
+			stdout: JSON.stringify([
+				{ path: "src/a.ts", line: 4, body: "Check this." },
+			]),
+			stderr: "",
+		};
 		const paths: string[] = [];
 		const gh: GhFn = async (args) => {
 			const path = args.at(-1) ?? "";
 			paths.push(path);
-			if (path.includes("/reviews/5/comments"))
-				return commentsFail
-					? { code: 1, stdout: "", stderr: "HTTP 500" }
-					: {
-							code: 0,
-							stdout: JSON.stringify([
-								{ path: "src/a.ts", line: 4, body: "Check this." },
-							]),
-							stderr: "",
-						};
+			if (path.includes("/reviews/5/comments")) return answer;
 			if (path.includes("/reviews"))
 				return {
 					code: 0,
 					stdout: JSON.stringify([
 						ghReview(5, sha("a"), "earlier", "2026-01-01T00:00:00Z"),
+					]),
+					stderr: "",
+				};
+			if (path.includes("/pulls/1/comments"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([
+						{
+							user: { login: "bot" },
+							created_at: "2026-01-02T00:00:00Z",
+							body: "Unfixed null dereference.",
+							pull_request_review_id: 5,
+						},
 					]),
 					stderr: "",
 				};
@@ -493,10 +503,68 @@ describe("review prompt and draft", () => {
 			"earlier\n\n<!-- inline src/a.ts:4 -->\nCheck this.\n<!-- /inline -->",
 		);
 		expect(paths).toContain(
-			"repos/o/r/pulls/1/reviews/5/comments?per_page=100",
+			"repos/o/r/pulls/1/reviews/5/comments?per_page=100&page=1",
 		);
-		commentsFail = true;
-		expect((await fetchReReviewContext(o))?.review).toBe("earlier");
+		// Without the review's inline findings the re-review must not run: it would drop
+		// them from both the earlier review and the comment list.
+		for (const bad of [
+			{ code: 1, stdout: "", stderr: "HTTP 500" },
+			{ code: 0, stdout: "not json", stderr: "" },
+			{ code: 0, stdout: '{"message":"x"}', stderr: "" },
+		]) {
+			answer = bad;
+			await expect(fetchReReviewContext(o)).rejects.toThrow(/review comments/);
+		}
+	});
+	test("fetchReReviewContext reads every page of the posted review's inline comments", async () => {
+		const all = Array.from({ length: 101 }, (_, i) => ({
+			path: "src/a.ts",
+			line: i + 1,
+			body: `Finding ${i + 1}.`,
+		}));
+		const paths: string[] = [];
+		const gh: GhFn = async (args) => {
+			const path = args.at(-1) ?? "";
+			paths.push(path);
+			const m = /\/reviews\/5\/comments\?per_page=100&page=(\d+)$/.exec(path);
+			if (m !== null) {
+				const page = Number(m[1]);
+				return {
+					code: 0,
+					stdout: JSON.stringify(all.slice((page - 1) * 100, page * 100)),
+					stderr: "",
+				};
+			}
+			if (path.includes("/reviews"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([
+						ghReview(5, sha("a"), "earlier", "2026-01-01T00:00:00Z"),
+					]),
+					stderr: "",
+				};
+			return { code: 0, stdout: "[]", stderr: "" };
+		};
+		const ctx = await fetchReReviewContext({
+			repo: "o/r",
+			number: 1,
+			gh,
+			postedHead: sha("a"),
+			postedUrl: null,
+			postedLogin: null,
+			reviewedHead: sha("a"),
+			head: sha("a"),
+			draftBody: null,
+			draftAt: null,
+		});
+		expect(ctx?.review).toContain("Finding 1.");
+		expect(ctx?.review).toContain(
+			"<!-- inline src/a.ts:101 -->\nFinding 101.\n<!-- /inline -->",
+		);
+		expect(paths.filter((p) => p.includes("/reviews/5/comments"))).toEqual([
+			"repos/o/r/pulls/1/reviews/5/comments?per_page=100&page=1",
+			"repos/o/r/pulls/1/reviews/5/comments?per_page=100&page=2",
+		]);
 	});
 	test("a same-head re-review renders the no-code-change line; a null range renders the unavailable line", () => {
 		const same = reviewUserMessage({
@@ -726,7 +794,7 @@ describe("createPrWatcher", () => {
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		expect(s.calls).toContain(
-			"repos/o/r/pulls/22/reviews/1/comments?per_page=100",
+			"repos/o/r/pulls/22/reviews/1/comments?per_page=100&page=1",
 		);
 		const msg = s.prompts.at(-1)!;
 		expect(msg).toContain(

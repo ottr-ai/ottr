@@ -107,7 +107,8 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - The system prompt tells the model to put a finding that belongs to diff lines into an inline block, with a suggestion fence for a concrete fix of exactly those lines, and to keep other findings in the summary.
 - Before `savePrDraft`, `fitDraftToDiff(draft, diff)` checks each block against the diff. GitHub accepts a comment only on a line that the diff shows (an added or context line) and a range only inside one hunk. A block that does not fit moves into the body as `` **`<path>:<line>`** `` and its text, so no finding is lost and the draft never fails the post for that reason. A user edit after the save is not checked: GitHub's error then shows as `post_error`.
 - The post sends each comment as `{ path, line, side: "RIGHT", body }`, plus `start_line` and `start_side: "RIGHT"` for a range.
-- A re-review keeps the earlier inline findings: when the posted review is found, `fetchReReviewContext` reads `repos/{repo}/pulls/N/reviews/<id>/comments` and appends each comment to the earlier review as an inline block. The comments list of the re-review skips comments of that review.
+- A re-review keeps the earlier inline findings: when the posted review is found, `fetchReReviewContext` reads every page of `repos/{repo}/pulls/N/reviews/<id>/comments` (100 for each page, at most 30 pages) and appends each comment to the earlier review as an inline block. The comments list of the re-review skips comments of that review.
+- A failed read, invalid JSON, a body that is not a list, or more than 30 pages stops the re-review with an error. The watcher logs `review skipped`, takes no cap slot, and a later tick tries again. The re-review never runs without the earlier inline findings.
 - The drawer shows the number of inline comments in the draft under the text box and explains the marker format.
 
 ## Boundaries
