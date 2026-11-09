@@ -4174,3 +4174,58 @@ describe("hold provider columns", () => {
 		store.close();
 	});
 });
+
+describe("turn log offset", () => {
+	test("open adds log_offset to a database created before it", () => {
+		const dir = join(root, "log-offset-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
+			create: true,
+		});
+		// The turns schema as it was before the log offset existed.
+		legacy.exec(
+			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, input TEXT, input_by TEXT, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT, model TEXT, layer TEXT, ran_on TEXT)",
+		);
+		legacy.close();
+		const store = open(dir);
+		const task = store.createTask("legacy offset");
+		// The offset path runs against the freshly added column without throwing.
+		const turn = store.startTurn(task.id, "work", "p", null);
+		expect(turn.logOffset).toBeNull();
+		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const cols = raw
+			.query<{ name: string; notnull: number }, []>("PRAGMA table_info(turns)")
+			.all()
+			.filter((c) => c.name === "log_offset");
+		raw.close();
+		expect(cols).toHaveLength(1);
+		expect(cols[0]?.notnull).toBe(0);
+	});
+
+	test("startTurn stores the passed offset and the default stays null", () => {
+		const store = open(join(root, "turn-log-offset-basic"));
+		const task = store.createTask("offset things");
+		const plain = store.startTurn(task.id, "work", "p", null);
+		expect(plain.logOffset).toBeNull();
+		const placed = store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			null,
+			null,
+			null,
+			42,
+		);
+		expect(placed.logOffset).toBe(42);
+		// The read-back row carries it: a fresh list sees the stored offset too.
+		expect(store.listTurns(task.id).map((t) => t.logOffset)).toEqual([
+			null,
+			42,
+		]);
+		store.close();
+	});
+});

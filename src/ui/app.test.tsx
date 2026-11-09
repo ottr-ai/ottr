@@ -8651,3 +8651,108 @@ describe("Release card re-release confirm names its target", () => {
 		}
 	});
 });
+describe("LogView fetch start offset (client)", () => {
+	// The same happy-dom swap as the ProjectBoard block above: installed after
+	// app.tsx's import (its browser mount guard reads document at module load).
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of Object.entries(originals)) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const project = { name: "proj", settings: {} } as unknown as ProjectView;
+
+	/** Mount LogView with a mocked fetch that records every log URL and serves one chunk. */
+	async function mountLogView(props: {
+		startedAt: number;
+		logOffset?: number | null;
+	}): Promise<{ urls: string[]; unmount: () => Promise<void> }> {
+		const urls: string[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes("/log?")) {
+				urls.push(url);
+				const res = new Response("chunk", {
+					headers: { "X-Log-Size": String(5) },
+				});
+				return res;
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<LogView project={project} taskId="t1" {...props} />);
+		});
+		return {
+			urls,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("with logOffset set, the first fetch starts at the turn's byte offset", async () => {
+		const { urls, unmount } = await mountLogView({
+			startedAt: 1_000,
+			logOffset: 4096,
+		});
+		try {
+			expect(urls[0]).toContain("/tasks/t1/log?from=4096");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("with logOffset absent, the first fetch starts at 0", async () => {
+		const { urls, unmount } = await mountLogView({ startedAt: 1_000 });
+		try {
+			expect(urls[0]).toContain("/tasks/t1/log?from=0");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("with logOffset null, the first fetch starts at 0", async () => {
+		const { urls, unmount } = await mountLogView({
+			startedAt: 1_000,
+			logOffset: null,
+		});
+		try {
+			expect(urls[0]).toContain("/tasks/t1/log?from=0");
+		} finally {
+			await unmount();
+		}
+	});
+});

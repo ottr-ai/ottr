@@ -13917,6 +13917,22 @@ describe("turn survivor round 5 — run setup", () => {
 		);
 	});
 
+	test("the settled turn records its logOffset at the turn header", async () => {
+		const { store, loop } = setup();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const turn = store.listTurns(task.id).at(-1)!;
+		const log = logText(store, task.id);
+		// The offset points at the turn's own header line in the card log.
+		expect(turn.logOffset).not.toBeNull();
+		expect(log.slice(turn.logOffset!)).toMatch(/^== (work|merge) turn /);
+		// The header was the last line before the turn's own output: the bytes before it
+		// are whole earlier lines (or nothing at all — a fresh card's header opens the file).
+		const before = log.slice(0, turn.logOffset!);
+		expect(before === "" || before.endsWith("\n")).toBe(true);
+		expect(before).not.toMatch(/== (work|merge) turn $/);
+	});
+
 	test("a resolveTarget warning reaches the card log", async () => {
 		const { store, loop } = setup({
 			resolveTarget: async () => ({

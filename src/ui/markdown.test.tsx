@@ -151,7 +151,7 @@ describe("Markdown", () => {
 		// Only same-origin (root-relative) srcs render; react-dom/server prepends
 		// <link rel="preload"> for images, so assert the rendered subtree.
 		expect(render("![logo](/api/projects/p/tasks/t/images/a.png)")).toContain(
-			'<p><img src="/api/projects/p/tasks/t/images/a.png" alt="logo"/></p>',
+			'<p><img src="/api/projects/p/tasks/t/images/a.png" alt="logo" loading="lazy"/></p>',
 		);
 		const raw = render(
 			'<img src="/api/projects/p/tasks/t/images/b.png" alt="box" width="220">',
@@ -159,6 +159,18 @@ describe("Markdown", () => {
 		expect(raw).toContain('src="/api/projects/p/tasks/t/images/b.png"');
 		expect(raw).toContain('alt="box"');
 		expect(raw).toContain('width="220"');
+	});
+
+	test("same-origin img elements load lazily", () => {
+		// Reports embed many shots; the browser fetches only the ones near the viewport.
+		expect(render("![logo](/api/projects/p/tasks/t/images/a.png)")).toContain(
+			'loading="lazy"',
+		);
+		const raw = render('<img src="/x.png" alt="box">');
+		expect(raw).toContain('loading="lazy"');
+		// The anchor fallback for remote srcs gains no img and no lazy marker.
+		const link = render("![logo](https://x.test/a.png)");
+		expect(link).not.toContain('loading="lazy"');
 	});
 
 	test("remote images render as links, never as img", () => {

@@ -5715,22 +5715,31 @@ export function LogView({
 	project,
 	taskId,
 	startedAt,
+	logOffset,
 }: {
 	project: ProjectView;
 	taskId: string;
 	/** The expanded turn's startedAt: the view starts at this turn's own log section. */
 	startedAt: number;
+	/** Byte offset in the card log where the expanded turn's own section starts (its `== turn`
+	 *  header); null keeps the old whole-log fetch and the client-side turnLogStart slice. */
+	logOffset?: number | null;
 }) {
 	const [text, setText] = useState("");
 	const [full, setFull] = useState(false);
 	const offset = useRef(0);
 	const stick = useRef(true);
 	const pre = useRef<HTMLPreElement | null>(null);
+	// Fetch base: "Full log" always refetches the whole card log from 0; the turn view starts
+	// at the turn's stored byte offset when known, else at 0 (the header slice still trims).
+	const base = full ? 0 : (logOffset ?? 0);
 	useEffect(() => {
 		let alive = true;
 		let fetching = false;
 		let dirty = false; // a trigger during a fetch marks this; exactly one more fetch runs after
 		const decoder = new TextDecoder();
+		offset.current = base;
+		setText("");
 		const tick = async (): Promise<void> => {
 			if (fetching) {
 				dirty = true;
@@ -5778,7 +5787,7 @@ export function LogView({
 			liveEvents.removeEventListener("open", onLive);
 		};
 		// decoder lives inside the effect so its streaming state survives across coalesced ticks
-	}, [project.name, taskId]);
+	}, [project.name, taskId, base]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run pins the log to the bottom on new text
 	useEffect(() => {
@@ -9884,6 +9893,7 @@ export function Drawer({
 													project={project}
 													taskId={sub ?? task.id}
 													startedAt={t.startedAt}
+													logOffset={t.logOffset}
 												/>
 											)}
 										</div>

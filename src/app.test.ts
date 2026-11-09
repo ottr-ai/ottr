@@ -426,6 +426,8 @@ function mount(
 		githubTokenExpiryTimeoutMs?: Parameters<
 			typeof createApp
 		>[0]["githubTokenExpiryTimeoutMs"];
+		/** OTTR-715 slow-request log ceiling; defaults to 500 inside createApp. */
+		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
 	} = {},
 ) {
 	const g =
@@ -483,6 +485,7 @@ function mount(
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
 		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
+		slowApiMs: input.slowApiMs,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -14586,5 +14589,68 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		expect(releaseUsageHolds(full, [a], NOW)).toBe(0);
 		expect(a.store.getTask(t.id)?.holdUntil).toBe(NOW + 86_400_000);
 		a.store.close();
+	});
+});
+
+describe("slow api log and clone idle exemption (OTTR-715)", () => {
+	test("a guarded handler past slowApiMs logs one line with the route pattern, no query, no ids", async () => {
+		const m = mount({ slowApiMs: 0 });
+		const warns: string[] = [];
+		const orig = console.warn;
+		console.warn = (...parts: unknown[]) => warns.push(parts.join(" "));
+		try {
+			const res = await m.call("/api/projects/p1/tasks/nope1234/log?from=0");
+			expect(res.status).toBe(404);
+		} finally {
+			console.warn = orig;
+		}
+		const lines = warns.filter((w) => w.includes("api slow:"));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain(
+			"api slow: GET /api/projects/:project/tasks/:id/log took ",
+		);
+		expect(lines[0]).toMatch(/took \d+ms$/);
+		// The query string and the request's ids never reach the log line.
+		expect(lines[0]).not.toContain("?");
+		expect(lines[0]).not.toContain("from=0");
+		expect(lines[0]).not.toContain("nope1234");
+		expect(lines[0]).not.toContain("/p1/");
+	});
+
+	test("a request under the default threshold logs nothing", async () => {
+		const m = mount();
+		const warns: string[] = [];
+		const orig = console.warn;
+		console.warn = (...parts: unknown[]) => warns.push(parts.join(" "));
+		try {
+			const res = await m.call("/api/projects/p1/tasks/nope1234/log");
+			expect(res.status).toBe(404);
+		} finally {
+			console.warn = orig;
+		}
+		expect(warns.some((w) => w.includes("api slow:"))).toBe(false);
+	});
+
+	test("clone-on-add lifts the idle timeout for its request only", async () => {
+		const m = mount();
+		const srv = m.server;
+		const timeouts: number[] = [];
+		const orig = srv.timeout.bind(srv);
+		srv.timeout = (req: Request, seconds: number): void => {
+			timeouts.push(seconds);
+			orig(req, seconds);
+		};
+		try {
+			// A POST on another route first: it must not lift anything.
+			const order = await m.call("/api/projects/order", { order: [] });
+			expect(order.status).toBe(200);
+			expect(timeouts).toEqual([]);
+			// The add-project POST (name path: a local git init, no network) lifts once.
+			const add = await m.call("/api/projects", { name: "ottr715-exempt" });
+			expect(add.status).toBe(200);
+		} finally {
+			srv.timeout = orig;
+		}
+		expect(timeouts).toEqual([0]);
 	});
 });

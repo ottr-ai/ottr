@@ -535,6 +535,10 @@ export interface Turn {
 	 * for a worker dispatch, `board (<server hostname>)` for a local spawn; null when unrecorded
 	 * (the run is still going, a lost worker never started, or the row predates the column). */
 	ranOn: string | null;
+	/** Byte offset in the card log where this turn's own section starts (the `== turn`
+	 *  header line); null for rows recorded before the field or when the offset could not
+	 *  be captured. */
+	logOffset: number | null;
 }
 
 /** One finding a review recorded with propose_task. Ottr checks the best-ranked ones with a

@@ -171,7 +171,8 @@ CREATE TABLE IF NOT EXISTS turns (
   tokens_out INTEGER,
   cache_read INTEGER,
   cache_write INTEGER,
-  cost REAL
+  cost REAL,
+  log_offset INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_turns_task_id ON turns (task_id);
 CREATE TABLE IF NOT EXISTS events (
@@ -389,6 +390,7 @@ interface TurnRow {
 	dispatched_model: string | null;
 	layer: string | null;
 	ran_on: string | null;
+	log_offset: number | null;
 }
 
 function toListedTask(
@@ -627,6 +629,7 @@ function toTurn(r: TurnRow): Turn {
 		dispatchedModel: r.dispatched_model,
 		layer: r.layer,
 		ranOn: r.ran_on,
+		logOffset: r.log_offset,
 	};
 }
 
@@ -724,6 +727,7 @@ const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	inputBy: "input_by",
 	layer: "layer",
 	ranOn: "ran_on",
+	logOffset: "log_offset",
 };
 
 /**
@@ -1397,6 +1401,9 @@ export class ProjectStore {
 		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
 		if (!turnCols.includes("input_by"))
 			db.exec("ALTER TABLE turns ADD COLUMN input_by TEXT");
+		// Byte offset in the card log where the turn's own section starts; null for pre-field rows.
+		if (!turnCols.includes("log_offset"))
+			db.exec("ALTER TABLE turns ADD COLUMN log_offset INTEGER");
 		// Cost capture columns: nullable, so plain ADD COLUMN converges like the
 		// tasks columns above; the backfill below fills what the transcripts still allow.
 		for (const col of [
@@ -2585,11 +2592,12 @@ export class ProjectStore {
 		model: string | null = null,
 		inputBy: "user" | "supervisor" | null = null,
 		layer: string | null = null,
+		logOffset: number | null = null,
 	): Turn {
 		const now = Date.now();
 		const { lastInsertRowid } = this.db.run(
-			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			[taskId, kind, prompt, input, inputBy, now, pid, model, layer],
+			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer, log_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			[taskId, kind, prompt, input, inputBy, now, pid, model, layer, logOffset],
 		);
 		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 		const row = this.db

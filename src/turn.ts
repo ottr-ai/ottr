@@ -1949,6 +1949,9 @@ export function createTurnLoop(
 		)
 			return;
 		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
+		// Byte offset of this turn's own log section: captured just before the header write
+		// and stored on the turn row so the board can fetch only the turn's part of the log.
+		let turnLogOffset = 0;
 		// OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
 		// the card stays queued, and the next schedule tick retries. The board-wide gate
 		// (ops.drained() in schedule()) is unchanged; its board-check exception does not apply
@@ -2037,6 +2040,10 @@ export function createTurnLoop(
 			)
 				return;
 			const settings = store.getSettings();
+			// Capture must stay adjacent to the header write: the offset is the header's byte
+			// position in the card log. A missing file is a fresh card, so the header starts at 0.
+			turnLogOffset =
+				statSync(store.logPath(id), { throwIfNoEntry: false })?.size ?? 0;
 			log(`== ${kind} turn ${new Date().toISOString()}`);
 			// A new worktree starts from a freshly fetched target; an existing one keeps its base.
 			const { target, sha, warning } = await ops.resolveTarget(
@@ -2772,6 +2779,8 @@ export function createTurnLoop(
 				turnInput !== null ? live.pendingBy : null,
 				// The layer this run pinned at start (null = flat home); a record only, clean-up reads in-use.json.
 				handle.layerId ?? null,
+				// The card-log byte offset captured with the header write; the drawer fetches the turn's section from it.
+				turnLogOffset,
 			);
 
 			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.

@@ -42,7 +42,19 @@
     </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Paints before the bundle loads and React mounts; React replaces the content on mount.
+           Same bones as the board's initial Skeleton (kit.tsx: list, 6 rows, same label), so the
+           wait looks identical and the screen is never blank on a slow load. -->
+      <div class="skeleton" data-shape="list" role="status" aria-label="Loading the board">
+        <span class="skeleton-bone" aria-hidden="true"></span>
+        <span class="skeleton-bone" aria-hidden="true"></span>
+        <span class="skeleton-bone" aria-hidden="true"></span>
+        <span class="skeleton-bone" aria-hidden="true"></span>
+        <span class="skeleton-bone" aria-hidden="true"></span>
+        <span class="skeleton-bone" aria-hidden="true"></span>
+      </div>
+    </div>
     <script type="module" src="./app.tsx"></script>
   </body>
 </html>

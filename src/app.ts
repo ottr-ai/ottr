@@ -627,6 +627,13 @@ interface AppDeps {
 	 * createSupervisor; a hosted board without it throws like the missing creditStop.
 	 */
 	ciWatchTick?: (opts?: { manual?: string }) => Promise<void>;
+	/**
+	 * OTTR-715: a guarded handler that runs at least this long logs one line
+	 * (`api slow: <method> <route pattern> took <ms>ms`) via console.warn, so a slow
+	 * endpoint shows up in the board log without ids or query values. Tests inject 0
+	 * (always log) or a large value (never log). Defaults to 500.
+	 */
+	slowApiMs?: number;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -1019,6 +1026,8 @@ export function createApp(deps: AppDeps) {
 	// and tests inject a fixed clock. It initializes at createApp, so a board restart
 	// counts as input and never starts a review right after boot.
 	const now = deps.now ?? Date.now;
+	// OTTR-715: the slow-request log ceiling (see api()).
+	const slowApiMs = deps.slowApiMs ?? 500;
 	let lastInputAt = now();
 	const prod = deps.prod === true;
 	// Server-only ssh material: a data dir outside every checkout.
@@ -2840,9 +2849,24 @@ export function createApp(deps: AppDeps) {
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
 	function api(req: Request, fn: () => Promise<Response>): Promise<Response> {
+		// OTTR-715: a handler that runs at least slowApiMs logs one line with its route
+		// pattern (`api slow: GET /api/projects/:project/tasks/:id/log took 612ms`), so a
+		// slow endpoint shows up in the board log without ids or query values. The wall
+		// refusals below run no handler and stay untimed; guarded's own catch/finally
+		// (error 500, publishSoon) is chained onto unchanged.
+		const timed = () => {
+			const started = performance.now();
+			return guarded(req, fn).finally(() => {
+				const ms = performance.now() - started;
+				if (ms >= slowApiMs)
+					console.warn(
+						`api slow: ${req.method} ${routePattern(new URL(req.url).pathname)} took ${Math.round(ms)}ms`,
+					);
+			});
+		};
 		if (deps.hosted !== undefined) {
 			const refused = hostedRefusal(deps.hosted, req);
-			return refused !== null ? Promise.resolve(refused) : guarded(req, fn);
+			return refused !== null ? Promise.resolve(refused) : timed();
 		}
 		// Mutations pass the Origin wall first (R1-2): a cross-site POST must never reach a
 		// handler, and a request that fails both checks answers "forbidden origin".
@@ -2872,7 +2896,7 @@ export function createApp(deps: AppDeps) {
 					return Promise.resolve(json({ error: "unauthorized" }, 401));
 			}
 		}
-		return guarded(req, fn);
+		return timed();
 	}
 
 	/** Runs a handler whose request passed the walls (see api()); unexpected errors become 500. */
@@ -5855,12 +5879,16 @@ export function createApp(deps: AppDeps) {
 				}),
 		},
 		"/api/projects": {
-			POST: (req) =>
-				api(req, async () => {
+			// OTTR-715: a clone-on-add request runs a real `git clone` that can stay quiet
+			// past the 120 s idle cut (see vmRoute): lift it for this request before readJson.
+			POST: (req, server) => {
+				server.timeout(req, 0);
+				return api(req, async () => {
 					const r = await readJson(req);
 					if ("error" in r) return r.error;
 					return addProject(r.body);
-				}),
+				});
+			},
 		},
 		"/api/projects/:project/init": {
 			POST: (req) =>
@@ -8713,6 +8741,47 @@ export function createApp(deps: AppDeps) {
 				}),
 		},
 	});
+
+	/**
+	 * OTTR-715: the route pattern matching a request path (`/api/p/x/tasks/7` ->
+	 * `/api/p/:project/tasks/:id`), for the slow-request log: patterns keep ids and query
+	 * values out of the board log. A pattern matches on equal segment counts, a `:` segment
+	 * matching any non-empty segment and the rest literally; the pattern with the most
+	 * literal segments wins (ties: first in routes order); none matches keeps the raw
+	 * pathname. Callers pass pathname only, so a query string never enters here.
+	 */
+	function routePattern(pathname: string): string {
+		const parts = pathname.split("/");
+		let best: string | null = null;
+		let bestLiterals = -1;
+		for (const pattern of Object.keys(routes)) {
+			const segments = pattern.split("/");
+			if (segments.length !== parts.length) continue;
+			let literals = 0;
+			let matches = true;
+			for (const [i, segment] of segments.entries()) {
+				const part = parts[i] ?? "";
+				if (segment.startsWith(":")) {
+					// A param segment matches any non-empty path segment.
+					if (part === "") {
+						matches = false;
+						break;
+					}
+				} else if (segment === part) {
+					literals++;
+				} else {
+					matches = false;
+					break;
+				}
+			}
+			// Strict > keeps the earlier pattern on a literal-count tie.
+			if (matches && literals > bestLiterals) {
+				best = pattern;
+				bestLiterals = literals;
+			}
+		}
+		return best ?? pathname;
+	}
 
 	return {
 		serveOptions: {

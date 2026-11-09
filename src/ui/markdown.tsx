@@ -52,8 +52,10 @@ function imageNode(
 	// Root-relative only: "//host" and "/\host" are protocol-relative, and browsers strip
 	// tab/newline from URLs, so "/\t/host" resolves the same way — reject them all; any of
 	// these fetches a remote server the moment the card is viewed.
+	// loading="lazy": reports can embed many same-origin shots; the browser then only
+	// fetches the ones near the viewport instead of the whole report at once.
 	if (/^\/[^\s/\\]/.test(src))
-		return <img key={key} src={src} alt={alt} width={width} />;
+		return <img key={key} src={src} alt={alt} width={width} loading="lazy" />;
 	if (safeHref(src) !== null)
 		return (
 			<a key={key} href={src} target="_blank" rel="noreferrer">
