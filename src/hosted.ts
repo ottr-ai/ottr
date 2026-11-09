@@ -180,6 +180,13 @@ export interface MeteringRecord {
 	/** False: an interim record while the run is active. True: the record at turn settle. */
 	final: boolean;
 	usage: TokenUsage;
+	/** M10, on the work/merge run's record only (ottr-cloud tenant-proxy-contract section 4):
+	 * the card outcome the board shows after the settle (ready, answered, integrated,
+	 * needs_you). The control plane answers 400 invalid_record for a value outside
+	 * /^[a-z_]{1,40}$/, so the settle validates before it sends. */
+	outcome?: string;
+	/** M10, same record: the card prompt's first line, trimmed, cut to 200 characters. */
+	title?: string;
 }
 
 /** Hosted interim metering: at most one interim record each this many ms for each run. */

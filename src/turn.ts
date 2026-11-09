@@ -937,8 +937,11 @@ type MeteringKey = Pick<
 	"project" | "taskId" | "turnId" | "kind" | "role" | "run"
 >;
 
-/** One settled agent run of a turn, as its final metering record carries it. */
-type MeteredRun = Pick<MeteringRecord, "run" | "role" | "model" | "usage">;
+/** One settled agent run of a turn, as its final metering record carries it. `main` marks the
+ * turn's own work/merge run, whose final record also carries the card outcome and title (M10). */
+type MeteredRun = Pick<MeteringRecord, "run" | "role" | "model" | "usage"> & {
+	main?: boolean;
+};
 
 /** The interim metering of one active run (interimMeter). */
 interface InterimMeter {
@@ -1320,6 +1323,7 @@ export function createTurnLoop(
 		}
 		return false;
 	}
+
 	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
 	 * once startRun returns, so the cap counts distinct keys, never the two sets' summed sizes.
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
@@ -2253,15 +2257,20 @@ export function createTurnLoop(
 		/** Set when sweepLostTurns took over a hung check of this run: the finally must then
 		 * leave the preparing claim alone (it may belong to a replacement run already). */
 		let checkTakenOver = false;
-		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally. */
+		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally.
+		 * `main` marks the turn's own work/merge run — the default-role run that carries the
+		 * card outcome and title at the settle (check runs, also one that meters as `default`
+		 * when no check role is set, never carry them). */
 		const metered: MeteredRun[] = [];
 		/** Interim metering of this turn's runs that have not settled; the finally closes them. */
 		const interims = new Set<InterimMeter>();
 		let runs = 0;
 		/** Hosted metering of one agent run, opened right before its startRun: the run's index in
 		 * the turn, its interim records while it runs (startRun's onUsage), and settle(), which
-		 * ends the interim records and queues the final record. Null on a self-hosted board. */
-		const openMeter = (role: string) => {
+		 * ends the interim records and queues the final record. Null on a self-hosted board.
+		 * `main` marks the turn's own work/merge run: its final record carries the card outcome
+		 * and title (ottr-cloud M10); check runs never carry them. */
+		const openMeter = (role: string, main = false) => {
 			if (ops.hosted === undefined) return null;
 			const run = runs++;
 			const interim = interimMeter(
@@ -2283,6 +2292,7 @@ export function createTurnLoop(
 						role,
 						model: r.model,
 						usage: r.usage ?? NO_USAGE,
+						main,
 					});
 				},
 			};
@@ -2904,8 +2914,9 @@ export function createTurnLoop(
 				: null;
 			const runStartedAt = Date.now();
 			// The work or merge run resolves its model from the default role, also when the card
-			// or session names its own model (docs/specs/hosted-mode.md section 4).
-			const runMeter = openMeter("default");
+			// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
+			// turn's main run: its final record carries the card outcome and title (M10).
+			const runMeter = openMeter("default", true);
 			const handle = ops.startRun({
 				meter: ops.hosted !== undefined,
 				auditProvisioned: (sinceMs, rulesAtStart) =>
@@ -5296,8 +5307,22 @@ export function createTurnLoop(
 			// Settle is done: report each run's usage, also of a stopped or failed run. No interim
 			// record goes out after this point, also for a run whose result never came.
 			for (const interim of interims) interim.close();
-			if (ops.hosted !== undefined && turn !== null)
-				for (const r of metered)
+			if (ops.hosted !== undefined && turn !== null) {
+				// M10: the outcome is the state the board shows after this settle. A parked card
+				// (credit stop, Esc stop, tracker error, check blockers) reads needs_you even when
+				// the run reported none; otherwise the settled turn row's outcome. A value outside
+				// /^[a-z_]{1,40}$/ (null included) sends nothing. The title is the card prompt's
+				// first line, trimmed and cut to 200 characters; an empty line sends nothing.
+				let outcome: string | null = null;
+				if (store.getTask(id)?.state === "needs_you") outcome = "needs_you";
+				else {
+					const row = store.listTurns(id).at(-1)?.outcome ?? null;
+					if (row !== null && /^[a-z_]{1,40}$/.test(row)) outcome = row;
+				}
+				const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
+				const title = firstLine === "" ? null : firstLine.slice(0, 200);
+				for (const entry of metered) {
+					const { main, ...r } = entry;
 					sendMetering(ops.hosted, {
 						project: name,
 						taskId: id,
@@ -5305,7 +5330,11 @@ export function createTurnLoop(
 						kind,
 						...r,
 						final: true,
+						...(main === true && outcome !== null ? { outcome } : {}),
+						...(main === true && title !== null ? { title } : {}),
 					});
+				}
+			}
 			schedule();
 		}
 	}

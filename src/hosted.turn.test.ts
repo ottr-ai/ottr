@@ -529,6 +529,8 @@ describe("hosted metering at settle", () => {
 				run: 0,
 				final: true,
 				usage: usage(10),
+				outcome: "ready",
+				title: "work please",
 			},
 			{
 				...base,
@@ -662,6 +664,64 @@ describe("hosted metering at settle", () => {
 			cacheWrite: 0,
 			cost: 0,
 		});
+		// M10: the settled work turn's card outcome and the card title ride this record.
+		expect(reports[0]!.outcome).toBe("answered");
+		expect(reports[0]!.title).toBe("work please");
+	});
+
+	test("a merge turn that integrates reports the integrated outcome and the card title", async () => {
+		const { hosted, reports } = fakeHosted();
+		const { store, record, loop } = setup({
+			hosted,
+			commitsAhead: async () => 0,
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							model: "openai/gpt-6",
+							usage: usage(4),
+							outcome: {
+								status: "integrated",
+								summary: "landed",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("merge the card please");
+		store.updateTask(task.id, { stage: "merging" });
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect(reports).toEqual([
+			{
+				tenant: "t1",
+				project: store.name,
+				taskId: task.id,
+				turnId: store.listTurns(task.id)[0]!.id,
+				kind: "merge",
+				role: "default",
+				model: "openai/gpt-6",
+				usage: usage(4),
+				outcome: "integrated",
+				title: "merge the card please",
+			},
+		]);
+	});
+
+	test("the title is the card prompt's first line, trimmed and cut to 200 characters", async () => {
+		const { hosted, reports } = fakeHosted();
+		const { store, loop } = setup({ hosted, commitsAhead: async () => 0 });
+		const task = store.createTask(`   ${"x".repeat(300)}\nsecond line   `);
+		await loop.runTurn(store.name, task.id);
+
+		expect(reports).toHaveLength(1);
+		expect(reports[0]!.title).toBe("x".repeat(200));
 	});
 
 	test("a self-hosted loop reports nothing and never asks for credit", async () => {
@@ -922,9 +982,11 @@ describe("hosted credit stop", () => {
 		expect(after.worktree).not.toBeNull();
 		expect(existsSync(after.worktree!)).toBe(true);
 		expect(store.listTurns(task.id)[0]!.error).toBe("stopped");
-		// The stopped run's usage so far is still metered.
+		// The stopped run's usage so far is still metered, with the parked card's outcome.
 		expect(reports).toHaveLength(1);
 		expect(reports[0]!.usage).toEqual(usage(7));
+		expect(reports[0]!.outcome).toBe("needs_you");
+		expect(reports[0]!.title).toBe("work please");
 	});
 
 	test("creditStop with nothing running stops nothing", async () => {

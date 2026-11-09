@@ -789,6 +789,8 @@ describe("hosted mode end to end", () => {
 				run: 0,
 				final: true,
 				usage: WORK_USAGE,
+				outcome: "ready",
+				title: WORK_PROMPT,
 			},
 			{
 				...base,

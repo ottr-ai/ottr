@@ -97,7 +97,8 @@ Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
   "tenant": "t1", "project": "app", "taskId": "APP-7", "turnId": 31,
   "kind": "work", "role": "default", "model": "anthropic/claude-opus-5-5",
   "run": 0, "final": true,
-  "usage": { "input": 1200, "output": 340, "cacheRead": 9000, "cacheWrite": 0, "cost": 0.0412 }
+  "usage": { "input": 1200, "output": 340, "cacheRead": 9000, "cacheWrite": 0, "cost": 0.0412 },
+  "outcome": "ready", "title": "Add a hello.txt file"
 }
 ```
 
@@ -120,6 +121,14 @@ the final record at turn settle carries the last usage. A final record goes out 
 stopped or failed run. The control plane books only the increase over the highest cumulative
 usage that it saw for the run, so a late or repeated record never counts twice. Code:
 `interimMeter` in `src/turn.ts`, fed by the run sink's `onUsage` (`src/runner.ts`).
+- `outcome` (M10, optional): the card outcome the board shows after the settle (`ready`,
+  `answered`, `integrated`, `needs_you`). It rides the work/merge run's record only; a check
+  run's record carries neither this field nor `title`. A parked card (credit stop, stop,
+  tracker error, check blockers) sends `needs_you` even when the run reported none. The
+  control plane answers 400 `invalid_record` for a value outside `/^[a-z_]{1,40}$/`, so the
+  settle sends no outcome when no valid value exists.
+- `title` (M10, optional): the card prompt's first line, trimmed and cut to 200 characters,
+  on the same record. An empty line sends nothing.
 
 ## 5. Credit gate and stop
 
