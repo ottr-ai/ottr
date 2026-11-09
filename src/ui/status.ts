@@ -96,16 +96,22 @@ export function queuePosition(
 }
 
 /** "held · 12m left" for a card the tracker parked until a future holdUntil (a usage
- * limit): the countdown replaces the raw reset stamp the reason names. The last minute
- * reads "<1m", since until() floors and would say "now" while the hold still stands.
- * null once past. */
+ * limit): the countdown replaces the raw reset stamp the reason names. The board writes
+ * the reason itself ("The <provider> usage limit is reached. ..."), so a match names the
+ * holder: "held · zai limit · 12m left". The last minute reads "<1m", since until()
+ * floors and would say "now" while the hold still stands. null once past. */
 export function holdLeft(
 	holdUntil: number,
 	now: number = Date.now(),
+	/** The card's needsReason, when the caller has it: a usage-limit sentence names the provider. */
+	reason: string | null = null,
 ): string | null {
 	const left = holdUntil - now;
 	if (left <= 0) return null;
-	return `held · ${left < 60_000 ? "<1m" : until(holdUntil, now)} left`;
+	const time = left < 60_000 ? "<1m" : until(holdUntil, now);
+	const named =
+		reason === null ? null : /^The (\S+) usage limit is reached/.exec(reason);
+	return `held · ${named === null ? "" : `${named[1]!} limit · `}${time} left`;
 }
 
 export function statusLine(
@@ -142,7 +148,7 @@ export function statusLine(
 				? // A future holdUntil holds the card (a usage limit): count down instead of
 					// the raw reset stamp the reason carries.
 					t.holdUntil !== null && t.holdUntil > Date.now()
-					? (holdLeft(t.holdUntil) ?? t.needsReason)
+					? (holdLeft(t.holdUntil, Date.now(), t.needsReason) ?? t.needsReason)
 					: "resuming"
 				: t.pendingPrompt !== null
 					? drain

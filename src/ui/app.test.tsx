@@ -858,21 +858,51 @@ describe("LaneCol backlog divider", () => {
 		expect(html).not.toContain(">queued<");
 	});
 
-	test("a held card counts down instead of showing the raw hold stamp", () => {
+	test("a held card counts down, names the provider, and carries the reason for hover and readers", () => {
+		const reason =
+			"The openai-codex usage limit is reached. The board starts the task again after the limit resets at 2026-11-10 11:51 UTC. Send a message to run it now, or cancel the card.";
 		const held = cardFixture({
 			id: "h1",
 			stage: "todo",
 			state: "queued",
-			needsReason: "usage limit: openai-codex resets 14:00",
+			needsReason: reason,
 			// Half a minute inside the 13m bucket: the floor survives the render's Date.now.
 			holdUntil: Date.now() + 13 * 60_000 + 30_000,
 		});
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="todo" tasks={[held]} projectTasks={[held]} />,
 		).replaceAll("<!-- -->", "");
+		expect(html).toContain("held · openai-codex limit · 13m left");
+		// The hover title and the sr line carry the full reason.
+		expect(html).toContain(`title="${reason}"`);
+		expect(html).toContain(`<span class="sr">${reason}</span>`);
+		// The raw reset stamp stays off the visible face: it rides only in the title
+		// attribute and the sr line.
+		const visible = html
+			.replace(/ title="[^"]*"/g, "")
+			.replace(/<span class="sr">[^<]*<\/span>/g, "");
+		expect(visible).toContain("held · openai-codex limit · 13m left");
+		expect(visible).not.toContain("resets at 2026-11-10");
+	});
+
+	test("a held card with an unnamed cause keeps the bare countdown", () => {
+		const held = cardFixture({
+			id: "h2",
+			stage: "todo",
+			state: "queued",
+			needsReason: "An open prompt edit holds the card.",
+			holdUntil: Date.now() + 13 * 60_000 + 30_000,
+		});
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[held]} projectTasks={[held]} />,
+		).replaceAll("<!-- -->", "");
 		expect(html).toContain("held · 13m left");
-		// The raw reset stamp stays off the card face.
-		expect(html).not.toContain("resets 14:00");
+		expect(html).not.toContain("limit · 13m left");
+		// The reason still reaches hover and readers on the plain label.
+		expect(html).toContain('title="An open prompt edit holds the card."');
+		expect(html).toContain(
+			'<span class="sr">An open prompt edit holds the card.</span>',
+		);
 	});
 });
 

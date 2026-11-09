@@ -212,6 +212,7 @@ import {
 	alarmLabel,
 	cardMark,
 	holdFor,
+	holdLeft,
 	reReleaseOf,
 	splitAlarms,
 	statusLine,
@@ -663,6 +664,16 @@ function Card({
 		task.silentSince !== undefined
 			? `No output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
 			: null;
+	// A usage-limit hold names its holder on the face ("held · zai limit · 1d 0h left") and
+	// keeps the full reason one hover away; the sr line reads it out. null = not held now.
+	const held =
+		sp === null &&
+		task.runStartedAt === undefined &&
+		task.state === "queued" &&
+		task.needsReason !== null &&
+		task.holdUntil !== null
+			? holdLeft(task.holdUntil, Date.now(), task.needsReason)
+			: null;
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
@@ -812,9 +823,19 @@ function Card({
 					) : (
 						age(task.createdAt)
 					)}{" "}
-					{sp === null && task.runStartedAt === undefined && (
-						<>· {statusLine(task, hasRules, hold, drain, tasks)}</>
-					)}
+					{sp === null &&
+						task.runStartedAt === undefined &&
+						(held !== null && task.needsReason !== null ? (
+							// One flex item (.card-meta wraps between items): the separator rides
+							// inside the label, so a wrap never strands a lone "·" at a line end.
+							<span title={task.needsReason}>
+								{"·\u00A0"}
+								{held}
+								<span className="sr">{task.needsReason}</span>
+							</span>
+						) : (
+							<>· {statusLine(task, hasRules, hold, drain, tasks)}</>
+						))}
 					{commits !== null && (
 						<span
 							className="commits"

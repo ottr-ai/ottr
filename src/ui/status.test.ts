@@ -344,6 +344,18 @@ test("statusLine queued with a future holdUntil counts down instead of the raw s
 			true,
 		),
 	).toBe("held · 13m left");
+	// The board's own usage-limit sentence names the provider on the label.
+	expect(
+		statusLine(
+			t({
+				stage: "in_progress",
+				needsReason:
+					"The zai usage limit is reached. The board starts the task again after the limit resets at 2026-11-10 11:51 UTC. Send a message to run it now, or cancel the card.",
+				holdUntil: Date.now() + 13 * 60_000 + 30_000,
+			}),
+			true,
+		),
+	).toBe("held · zai limit · 13m left");
 	// The last minute reads "<1m", not until()'s "now".
 	expect(
 		statusLine(
@@ -373,6 +385,26 @@ test("holdLeft counts down in the shared until format, null once due", () => {
 	expect(holdLeft(now + 60_000, now)).toBe("held · 1m left");
 	expect(holdLeft(now, now)).toBeNull();
 	expect(holdLeft(now - 1, now)).toBeNull();
+});
+
+test("holdLeft names the provider the board's usage-limit reason carries", () => {
+	const now = 1_790_683_200_000;
+	const zai =
+		"The zai usage limit is reached. The board starts the task again after the limit resets at 2026-11-10 11:51 UTC. Send a message to run it now, or cancel the card.";
+	expect(holdLeft(now + 90 * 60_000, now, zai)).toBe(
+		"held · zai limit · 1h 30m left",
+	);
+	// The last minute keeps the name.
+	expect(holdLeft(now + 30_000, now, zai)).toBe("held · zai limit · <1m left");
+	// A cause the board did not write as a usage-limit sentence stays unnamed.
+	expect(
+		holdLeft(
+			now + 90 * 60_000,
+			now,
+			"An open prompt edit holds the card and every close path releases it.",
+		),
+	).toBe("held · 1h 30m left");
+	expect(holdLeft(now + 90 * 60_000, now, null)).toBe("held · 1h 30m left");
 });
 
 test("queuePosition reads the card's queueOrder slot", () => {
