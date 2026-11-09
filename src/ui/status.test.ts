@@ -31,6 +31,8 @@ const t = (
 	kind: "work",
 	releaseVersion: null,
 	doneAt: null,
+	prNumber: null,
+	pushSha: null,
 	...overrides,
 });
 
@@ -126,6 +128,47 @@ test("statusLine non-queued states", () => {
 	).toBe("waiting for the review's findings to be implemented");
 	// Plain idle is the only other RunState; it always renders "done".
 	expect(statusLine(t({ state: "idle" }), false)).toBe("done");
+});
+
+test("statusLine parked PR-mode card names its open pull request, never done", () => {
+	// The settle park (turn.ts): stage merging, state idle, no reason, PR open.
+	expect(
+		statusLine(t({ state: "idle", stage: "merging", prNumber: 53 }), true),
+	).toBe("PR #53 open · waiting for merge");
+	// pushSha is the CI watch's pin on the PR head: the verdict is pending.
+	expect(
+		statusLine(
+			t({ state: "idle", stage: "merging", prNumber: 53, pushSha: "abc" }),
+			true,
+		),
+	).toBe("PR #53 open · waiting for CI");
+	// A park that carries a reason keeps it; the PR number alone is no reason.
+	expect(
+		statusLine(
+			t({
+				state: "idle",
+				stage: "merging",
+				prNumber: 53,
+				needsReason: "waiting for the review's findings to be implemented",
+			}),
+			true,
+		),
+	).toBe("waiting for the review's findings to be implemented");
+});
+
+test("statusLine done card still says done, with or without a merged PR", () => {
+	// A normal done card.
+	expect(statusLine(t({ state: "idle", stage: "done" }), true)).toBe("done");
+	// finishPrMerge keeps prNumber on the card after the PR merged: stage done wins.
+	expect(
+		statusLine(t({ state: "idle", stage: "done", prNumber: 53 }), true),
+	).toBe("done");
+});
+
+test("cardMark: a parked PR-mode card waits, it never earns the done check", () => {
+	expect(cardMark(t({ state: "idle", stage: "merging", prNumber: 53 }))).toBe(
+		"queued",
+	);
 });
 
 test("cardMark: only a done card earns the check; a parked release waits", () => {

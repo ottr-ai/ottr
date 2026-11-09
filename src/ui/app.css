@@ -3010,6 +3010,30 @@ a.release {
 a.release:hover {
 	border-color: var(--accent);
 }
+/* PR chip: the pull request a PR-mode card waits on (fix list #35). On the card it mirrors
+   the release chip; in the drawer's sub line it drops the box, because that line carries
+   no chip boxes. Steel text marks the link (One-Edge); the label text is the name. */
+.pr-link {
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	font-variant-numeric: tabular-nums;
+}
+a.pr-link {
+	color: var(--accent);
+	text-decoration: none;
+}
+a.pr-link:hover {
+	border-color: var(--accent);
+	color: var(--accent-hover);
+}
+.drawer-sub .pr-link {
+	padding: 0;
+	border: 0;
+}
 /* Hold chip inside .card-tags: the held queued merge names the release card that parks it, and
    a stalled release card carries the re-release action; same voice as the star toggle. */
 .card-tags .hold-link {

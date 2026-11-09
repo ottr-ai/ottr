@@ -875,10 +875,28 @@ function Card({
 					</span>
 				)}
 			</a>
-			{(release !== null ||
+			{(task.prNumber !== null ||
+				release !== null ||
 				holdRelease != null ||
 				onRerelease !== undefined) && (
 				<span className="card-tags">
+					{task.prNumber !== null &&
+						(task.prUrl !== null ? (
+							<a
+								className="pr-link"
+								href={task.prUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								title={`Open PR #${task.prNumber} on GitHub`}
+								aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
+							>
+								PR #{task.prNumber}
+							</a>
+						) : (
+							<span className="pr-link" title={`PR #${task.prNumber}`}>
+								PR #{task.prNumber}
+							</span>
+						))}
 					{holdRelease != null && onOpenTask !== undefined && (
 						<a
 							className="hold-link"
@@ -8747,6 +8765,26 @@ export function Drawer({
 							<span>
 								{COLUMNS.find((c) => c.key === task.stage)?.label ?? task.stage}
 							</span>
+							{/* PR mode: the pull request this card waits on, beside the stage in the
+							    head line; the Meta block keeps the full row. */}
+							{task.prNumber !== null && (
+								<span>
+									{task.prUrl !== null ? (
+										<a
+											className="pr-link"
+											href={task.prUrl}
+											target="_blank"
+											rel="noopener noreferrer"
+											title={`Open PR #${task.prNumber} on GitHub`}
+											aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
+										>
+											PR #{task.prNumber}
+										</a>
+									) : (
+										<span className="pr-link">PR #{task.prNumber}</span>
+									)}
+								</span>
+							)}
 							<span
 								className="sub-dim"
 								title={new Date(task.createdAt).toLocaleString()}

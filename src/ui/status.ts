@@ -129,6 +129,8 @@ export function statusLine(
 		| "releaseVersion"
 		| "doneAt"
 		| "id"
+		| "prNumber"
+		| "pushSha"
 	>,
 	hasRules: boolean,
 	hold?: string | null,
@@ -170,8 +172,19 @@ export function statusLine(
 	if (t.state === "needs_you")
 		return t.asked !== null ? "question asked" : "action required";
 	// A review card parked while its findings land: the reason is the status.
-	if (t.state === "idle")
-		return t.stage === "backlog" ? "in backlog" : (t.needsReason ?? "done");
+	if (t.state === "idle") {
+		if (t.stage === "backlog") return "in backlog";
+		// PR mode parks the card here while its pull request waits for review and merge
+		// (fix list #35): never "done". pushSha is the CI watch's pin on the PR head, so a
+		// set sha names the pending CI verdict; a cleared one leaves the plain merge wait.
+		if (t.stage === "merging" && t.prNumber !== null) {
+			if (t.needsReason !== null) return t.needsReason;
+			return t.pushSha !== null
+				? `PR #${t.prNumber} open · waiting for CI`
+				: `PR #${t.prNumber} open · waiting for merge`;
+		}
+		return t.needsReason ?? "done";
+	}
 	return "done";
 }
 
