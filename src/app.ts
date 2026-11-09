@@ -3810,8 +3810,13 @@ export function createApp(deps: AppDeps) {
 				...hostedSecrets,
 			]).slice(0, 300)}`;
 			// A bare 401/403 from a GitHub host hides the real cause (SAML enforcement, an IP
-			// allow list, a token policy); the REST API names it under the git error.
-			if (remote.scheme === "https" && GIT_HTTP_AUTH_STATUS.test(r.stderr))
+			// allow list, a token policy); the REST API names it under the git error. The probe
+			// uses the board-global tokens, which hosted mode never uses, so hosted skips it.
+			if (
+				deps.hosted === undefined &&
+				remote.scheme === "https" &&
+				GIT_HTTP_AUTH_STATUS.test(r.stderr)
+			)
 				error +=
 					(await githubAuthHint(url, {
 						configuredHost: githubHost().host,

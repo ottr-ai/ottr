@@ -177,4 +177,29 @@ describe("takeHostedConfig", () => {
 		expect(() => takeHostedConfig(env)).toThrow("OTTR_HOSTED_CONTROL_URL");
 		expect("OTTR_HOSTED_SECRET" in env).toBe(false);
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"the real env: a child process cannot read the key from /proc/<server>/environ",
+		() => {
+			const mod = new URL("./hosted.ts", import.meta.url).pathname;
+			// The "server" takes its config, then a child (a repository check) reads the
+			// server's startup env block, as any same-user process can.
+			const script = `
+				const { takeHostedConfig } = await import(${JSON.stringify(mod)});
+				const cfg = takeHostedConfig();
+				const r = Bun.spawnSync(["cat", "/proc/" + process.pid + "/environ"]);
+				const leaked = r.stdout.toString().includes(${JSON.stringify(SECRET)});
+				console.log(JSON.stringify({ secret: cfg?.secret, leaked, inEnv: "OTTR_HOSTED_SECRET" in process.env }));
+			`;
+			const r = Bun.spawnSync(["bun", "-e", script], {
+				env: { ...process.env, ...BASE },
+			});
+			expect(r.stderr.toString()).toBe("");
+			expect(JSON.parse(r.stdout.toString())).toEqual({
+				secret: SECRET,
+				leaked: false,
+				inEnv: false,
+			});
+		},
+	);
 });

@@ -48,6 +48,10 @@ sig = base64url(HMAC-SHA256(secret, "ottr-identity.v1.<tenant>.<role>.<ts>.<nonc
   nonce cache holds at most 100 000 live nonces. When it is full, the board refuses new
   headers (fail closed).
 - Code: `signIdentity`, `verifyIdentity`, `NonceCache` in `src/auth.ts`.
+- At boot the server removes `OTTR_HOSTED_SECRET` from its env. It also writes zeros over the
+  secret's entry in its startup env block, which `/proc/<pid>/environ` shows to every
+  same-user process (repository checks included). If the entry is still readable after that,
+  the boot stops (`takeHostedConfig`, `scrubProcEnviron` in `src/hosted.ts`).
 
 Proxy obligations (the board relies on them):
 
@@ -146,6 +150,9 @@ caches each token until 5 minutes before `expiresAt`. It does not use the board-
 tokens, the server SSH key, or the global `GH_TOKEN`. The secret-redaction list holds only
 the tokens that the board minted for the project of that command. Workers still get no git
 credential, and `checkPinnedRemote` still refuses a changed push URL.
+gh calls (releases, pull requests) use the same minted token and run with an empty
+`GH_CONFIG_DIR`, so gh never falls back to a stored board login. A 401 or 403 on the
+Add-project clone gets no GitHub API diagnostic: that probe uses only board-global tokens.
 
 ## 7. Settings and System
 

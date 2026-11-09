@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
@@ -550,10 +553,14 @@ async function spawnGh(
 	}
 }
 
+/** Hosted gh's config dir: empty and private to this process, made on first use. */
+let hostedGhConfigDir: string | null = null;
+
 /**
  * Hosted mode's gh for one project (docs/specs/hosted-mode.md section 6): it authenticates
  * with the token the control plane minted for the project that owns cwd and its remote,
- * never the board's GH_TOKEN. No token: gh runs without one. The token never leaves raw.
+ * never the board's GH_TOKEN and never a credential gh stored (hosts.yml, keyring): gh runs
+ * with an empty GH_CONFIG_DIR. No token: gh runs without any. The token never leaves raw.
  */
 export async function hostedGh(
 	cwd: string,
@@ -571,6 +578,8 @@ export async function hostedGh(
 			"GITHUB_ENTERPRISE_TOKEN",
 		])
 			delete env[k];
+		hostedGhConfigDir ??= mkdtempSync(join(tmpdir(), "ottr-hosted-gh-"));
+		env.GH_CONFIG_DIR = hostedGhConfigDir;
 		const r = await spawnGh(args, timeoutMs, {
 			...env,
 			...ghEnvFor(githubHost(), token ?? undefined),

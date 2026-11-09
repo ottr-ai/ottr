@@ -1,6 +1,8 @@
 // Hosted mode (docs/specs/hosted-mode.md): one env flag read once at boot. Off (the default and
 // every self-hosted board), nothing here is constructed and every hook stays a no-op.
 
+import { type Pointer, toBuffer } from "bun:ffi";
+import { readFileSync } from "node:fs";
 import { type IdentityRole, signIdentity, validTenantId } from "./auth.ts";
 
 /** Hosted text the control plane injects; ottr's checked-in prompts never change. */
@@ -64,7 +66,9 @@ export const HOSTED_SECRET_ENV = "OTTR_HOSTED_SECRET";
 
 /**
  * The boot read: readHostedConfig, then the secret leaves env (always, also on flag off or a
- * throw), so no child process the server spawns later can inherit it.
+ * throw), so no child process the server spawns later can inherit it. On the real process
+ * env it also leaves /proc/<pid>/environ: that file shows the env the process started with,
+ * and any same-user process (repository checks included) can read it.
  */
 export function takeHostedConfig(
 	env: Record<string, string | undefined> = process.env,
@@ -73,7 +77,52 @@ export function takeHostedConfig(
 		return readHostedConfig(env);
 	} finally {
 		delete env[HOSTED_SECRET_ENV];
+		if (env === process.env) scrubProcEnviron(HOSTED_SECRET_ENV);
 	}
+}
+
+/**
+ * Zeroes every `<name>=...` entry in this process's startup env block, which
+ * /proc/self/environ reads from the stack (env_start..env_end, /proc/self/stat fields 50-51).
+ * Deleting from process.env never touches that block. Throws when the entry is still visible
+ * afterwards, so a hosted board never boots with a readable signing key. No /proc (macOS,
+ * Windows): nothing to scrub.
+ */
+export function scrubProcEnviron(name: string): void {
+	let raw: Buffer;
+	let stat: string;
+	try {
+		raw = readFileSync("/proc/self/environ");
+		stat = readFileSync("/proc/self/stat", "utf8");
+	} catch {
+		return;
+	}
+	const key = Buffer.from(`${name}=`);
+	let at = entryIndex(raw, key, 0);
+	if (at < 0) return;
+	// Fields after the ")" of the comm field start at field 3; env_start is field 50.
+	const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+	const envStart = Number(fields[47]);
+	const envEnd = Number(fields[48]);
+	if (Number.isSafeInteger(envStart) && envEnd - envStart === raw.length) {
+		while (at >= 0) {
+			const stop = raw.indexOf(0, at);
+			const len = (stop < 0 ? raw.length : stop) - at;
+			toBuffer(envStart as Pointer, at, len).fill(0);
+			at = entryIndex(raw, key, at + len);
+		}
+	}
+	if (entryIndex(readFileSync("/proc/self/environ"), key, 0) >= 0)
+		throw new Error(
+			`${name} is still readable in /proc/self/environ; refusing to boot`,
+		);
+}
+
+/** Index of an env entry that starts with key (at the block start or after a NUL), or -1. */
+function entryIndex(raw: Buffer, key: Buffer, from: number): number {
+	let at = raw.indexOf(key, from);
+	while (at > 0 && raw[at - 1] !== 0) at = raw.indexOf(key, at + 1);
+	return at;
 }
 
 /** https only, except plain http to a loopback host (tests, a same-machine control plane). */

@@ -172,6 +172,53 @@ describe.skipIf(!posix)("hosted release boundary", () => {
 		);
 	}, 60_000);
 
+	test("hostedGh with no project token never reaches gh's stored board login", async () => {
+		// The board's gh login: a config dir whose hosts.yml holds a stored token.
+		const boardCfg = join(root, "board-gh-config");
+		mkdirSync(boardCfg, { recursive: true });
+		writeFileSync(
+			join(boardCfg, "hosts.yml"),
+			"github.com:\n    oauth_token: stored-board-token\n",
+		);
+		const bin2 = join(root, "bin-cfg");
+		mkdirSync(bin2, { recursive: true });
+		const seen = join(root, "gh-cfg.log");
+		writeFileSync(
+			join(bin2, "gh"),
+			`#!/bin/sh\nprintf '%s|%s|%s\\n' "\${GH_TOKEN:-none}" "\${GH_CONFIG_DIR:-unset}" "$(cat "\${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null)" > "${seen}"\n`,
+		);
+		chmodSync(join(bin2, "gh"), 0o755);
+		setHostedGitAuth({
+			network: async () => {
+				throw new Error("no network git in this test");
+			},
+			pending: async () => {
+				throw new Error("no pending clone in this test");
+			},
+			ghToken: async () => null,
+		});
+		try {
+			await withEnv(
+				{
+					GH_TOKEN: "global-board",
+					GH_CONFIG_DIR: boardCfg,
+					PATH: `${bin2}:${process.env.PATH}`,
+				},
+				async () => {
+					const gh = await hostedGh(repo, REMOTE);
+					await gh(["release", "create", "v1.0.3"]);
+				},
+			);
+		} finally {
+			setHostedGitAuth(null);
+		}
+		const [token, dir, hosts] = readFileSync(seen, "utf8").trim().split("|");
+		expect(token).toBe("none");
+		expect(dir).not.toBe("unset");
+		expect(dir).not.toBe(boardCfg);
+		expect(hosts).toBe("");
+	}, 60_000);
+
 	test("flag off: publishRelease keeps the board GH_TOKEN", async () => {
 		writeFileSync(record, "");
 		await withEnv(

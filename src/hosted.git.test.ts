@@ -736,4 +736,29 @@ describe("hosted Add-project clone", () => {
 			expect(body.error).not.toContain("leaked-token-1");
 		});
 	}, 60_000);
+
+	test("a hosted clone's 401/403 sends no GitHub diagnostic with a board-global token", async () => {
+		if (process.platform === "win32") return; // the credential helper is a sh function
+		const { hooks } = fakeHooks((project, n) => ({
+			token: `minted-${project}-${n}`,
+			expiresAt: Date.now() + HOUR,
+		}));
+		const probes: string[] = [];
+		const probe = (async (url: string, init?: RequestInit) => {
+			probes.push(`${url} ${new Headers(init?.headers).get("authorization")}`);
+			return new Response("{}", { status: 404 });
+		}) as typeof globalThis.fetch;
+		const b = board("clone-hosted-hint", hostedCfg(hooks), probe);
+		// The remote counts as the configured GitHub host and GH_TOKEN is set, so the
+		// self-host diagnostic would probe the REST API with the global token.
+		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>
+			withEnv("OTTR_GITHUB_HOST", "localhost", () =>
+				withEnv("GH_TOKEN", GLOBAL, async () => {
+					const { body } = await add(b.app.serveOptions);
+					expect(body.error).toContain("git clone failed");
+					expect(probes).toEqual([]);
+				}),
+			),
+		);
+	}, 60_000);
 });
