@@ -148,6 +148,80 @@ export async function alateApi(
 		};
 	return { ok: true, body };
 }
+/**
+ * Rotate the alate API key (POST /api/key with the current bearer). Alate kills the old
+ * key the moment it answers, so a failure here must surface the new key to the user
+ * (the board route handles that handoff). Every non-ok alate answer keeps its status:
+ * the caller forwards it to the browser.
+ */
+export async function alateRotateKey(
+	alate: Alate,
+): Promise<AlateOut<{ key: string }>> {
+	if (alate.url === null)
+		return {
+			ok: false,
+			status: 400,
+			error: "alate server url is not configured",
+		};
+	if (alate.key === null)
+		return {
+			ok: false,
+			status: 400,
+			error: "alate api key is not configured",
+		};
+	let res: Response;
+	try {
+		res = await noRedirectFetch(
+			`${alate.url}/api/key`,
+			{
+				method: "POST",
+				headers: { authorization: `Bearer ${alate.key}` },
+				signal: AbortSignal.timeout(10_000),
+			},
+			{ proxyHint: true },
+		);
+	} catch (err) {
+		if ((err as Error).name === "TimeoutError")
+			return {
+				ok: false,
+				status: 504,
+				error: "alate did not answer /api/key within 10 s",
+			};
+		return {
+			ok: false,
+			status: 502,
+			error: `cannot reach alate server: ${(err as Error).message}`,
+		};
+	}
+	const body = (await res.json().catch(() => null)) as Record<
+		string,
+		unknown
+	> | null;
+	if (!res.ok) {
+		// Unlike alateApi, every status keeps its own code: the caller forwards it.
+		return {
+			ok: false,
+			status: res.status,
+			error:
+				typeof body?.error === "string"
+					? body.error
+					: `alate returned ${res.status}`,
+		};
+	}
+	if (body === null || typeof body !== "object")
+		return {
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid response",
+		};
+	if (typeof body.key !== "string" || body.key === "")
+		return {
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid key response",
+		};
+	return { ok: true, body: { key: body.key } };
+}
 export const CONFIG_YML = "user/omp/agent/config.yml";
 // Alate's source fields reach gh api paths: only plain names, hex commits and safe branches.
 // GitHub owners hold no dots, and a repo is never "." or "..": no segment can climb the path.

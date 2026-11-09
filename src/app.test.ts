@@ -2450,6 +2450,208 @@ describe("alate routes", () => {
 		expect((await (await get("/api/alate")).json()).keySet).toBe(true);
 	});
 
+	// GET /api/settings/alate-key and POST (rotate): the one place the stored alate key
+	// reaches a response body, so every answer goes out with Cache-Control: no-store.
+	test("GET reveals the stored key only here, with no-store", async () => {
+		// The shared closure holds a key from earlier tests; clear it to test the empty case.
+		await post("/api/alate", { url: null, key: null });
+		const before = await get("/api/settings/alate-key");
+		expect(before.status).toBe(200);
+		expect(await before.json()).toEqual({ apiKey: null });
+		expect(before.headers.get("cache-control")).toBe("no-store");
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+		const res = await get("/api/settings/alate-key");
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ apiKey: "alate_secret" });
+		expect(res.headers.get("cache-control")).toBe("no-store");
+	});
+
+	test("rotate success swaps the key, and provision uses the new one", async () => {
+		alateBody = { key: "rotated_key" };
+		const res = await post("/api/settings/alate-key", {});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ apiKey: "rotated_key" });
+		expect(lastAlateReq).toEqual({
+			method: "POST",
+			url: "/api/key",
+			auth: "Bearer alate_secret",
+		});
+		expect(await (await get("/api/settings/alate-key")).json()).toEqual({
+			apiKey: "rotated_key",
+		});
+		// The next provision must carry the rotated key.
+		alateBody = {
+			ok: true,
+			results: [
+				{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+			],
+		};
+		const prov = await post("/api/alate/provision", {});
+		expect(prov.status).toBe(200);
+		expect(lastAlateReq).toEqual({
+			method: "POST",
+			url: "/provision",
+			auth: "Bearer rotated_key",
+		});
+		expect((await get("/api/alate/health")).status).toBe(200);
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+	});
+
+	test("a refused rotation keeps the old key", async () => {
+		alateStatus = 401;
+		alateBody = { error: "unauthorized" };
+		try {
+			const res = await post("/api/settings/alate-key", {});
+			expect(res.status).toBe(401);
+			expect(await errorOf(res)).toBe("unauthorized");
+			expect(await (await get("/api/settings/alate-key")).json()).toEqual({
+				apiKey: "alate_secret",
+			});
+		} finally {
+			alateStatus = 200;
+			alateBody = {
+				ok: true,
+				results: [
+					{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+				],
+			};
+		}
+	});
+
+	test("an invalid rotate answer is 502 and keeps the old key", async () => {
+		alateBody = {};
+		try {
+			const res = await post("/api/settings/alate-key", {});
+			expect(res.status).toBe(502);
+			expect(await errorOf(res)).toBe("alate returned an invalid key response");
+			expect(await (await get("/api/settings/alate-key")).json()).toEqual({
+				apiKey: "alate_secret",
+			});
+		} finally {
+			alateBody = {
+				ok: true,
+				results: [
+					{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+				],
+			};
+		}
+	});
+
+	test("a failed save hands the new key back with 500", async () => {
+		const g = GlobalStore.open(
+			join(root, `g-alate-key-${Math.random().toString(36).slice(2)}`),
+		);
+		const realSet = g.set.bind(g);
+		let arm = false;
+		const wrapped = new Proxy(g, {
+			get(target, prop) {
+				if (prop === "set")
+					return (k: string, v: unknown) => {
+						if (arm && k === "config") throw new Error("disk full");
+						return realSet(k as never, v);
+					};
+				// Methods stay bound to the real store: proxies must not change `this`.
+				const v = Reflect.get(target, prop);
+				return typeof v === "function" ? v.bind(target) : v;
+			},
+		}) as GlobalStore;
+		const m = mount({ gstore: wrapped });
+		await m.call("/api/alate", { url: alateUrl, key: "alate_secret" });
+		alateBody = { key: "rotated_key" };
+		arm = true;
+		try {
+			const res = await m.call("/api/settings/alate-key", {});
+			expect(res.status).toBe(500);
+			const b = (await res.json()) as { error: string; apiKey: string };
+			expect(b.error).toMatch(/could not save it/);
+			expect(b.apiKey).toBe("rotated_key");
+			// The board closure kept the old key: a plain GET still shows it.
+			const held = await m.call("/api/settings/alate-key");
+			expect(await held.json()).toEqual({ apiKey: "alate_secret" });
+		} finally {
+			arm = false;
+			alateBody = {
+				ok: true,
+				results: [
+					{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+				],
+			};
+		}
+	});
+
+	test("rotate and reveal without a url or key are 400", async () => {
+		await post("/api/alate", { url: null });
+		const noUrl = await post("/api/settings/alate-key", {});
+		expect(noUrl.status).toBe(400);
+		expect(await errorOf(noUrl)).toBe("alate server url is not configured");
+		await post("/api/alate", { url: alateUrl, key: null });
+		const noKey = await post("/api/settings/alate-key", {});
+		expect(noKey.status).toBe(400);
+		expect(await errorOf(noKey)).toBe("alate api key is not configured");
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+	});
+
+	test("the key never leaks into /api/state or /api/alate", async () => {
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+		alateBody = { key: "rotated_key" };
+		await post("/api/settings/alate-key", {});
+		alateBody = {
+			ok: true,
+			results: [
+				{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+			],
+		};
+		const state = await (await get("/api/state")).text();
+		const view = await (await get("/api/alate")).text();
+		expect(state).not.toContain("alate_secret");
+		expect(state).not.toContain("rotated_key");
+		expect(view).not.toContain("alate_secret");
+		expect(view).not.toContain("rotated_key");
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+	});
+
+	// The secret routes sit behind the same wall as every other API route on a
+	// public-facing peer; the shared loopback mounts above skip that guard.
+	test("alate-key routes need the login or the API key on a walled mount", async () => {
+		const g = GlobalStore.open(
+			join(root, `g-alate-wall-${Math.random().toString(36).slice(2)}`),
+		);
+		g.set("config", {
+			admin: { name: "ada", passHash: hashPassword("correct horse") },
+			apiKey: "wall-key",
+			sessionSecret: "wall-secret",
+		});
+		const m = mount({ gstore: g });
+		await m.call("/api/alate", { url: alateUrl, key: "alate_secret" });
+		const gateway = spyOn(m.server, "requestIP").mockReturnValue({
+			address: "172.18.0.1",
+			family: "IPv4",
+			port: 1,
+		});
+		try {
+			expect((await m.call("/api/settings/alate-key")).status).toBe(401);
+			expect(
+				(
+					await m.call("/api/settings/alate-key", undefined, {
+						"x-api-key": "wall-key",
+					})
+				).status,
+			).toBe(200);
+			expect((await m.call("/api/settings/alate-key", {})).status).toBe(401);
+			expect(
+				(
+					await m.call(
+						"/api/settings/alate-key",
+						{},
+						{ "x-api-key": "wall-key" },
+					)
+				).status,
+			).toBe(502); // the fake answers the rotate with the provision-shaped body
+		} finally {
+			gateway.mockRestore();
+		}
+	});
+
 	// Shares the fake alate and the get/post helpers: /api/updates is one more path the
 	// fake answers, and the updates flow reuses this describe's config round-trips.
 	describe("updates routes", () => {

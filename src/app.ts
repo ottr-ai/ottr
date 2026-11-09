@@ -17,6 +17,7 @@ import type { Serve, Server, ServerWebSocket } from "bun";
 import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import {
 	alateHealth,
+	alateRotateKey,
 	commitConfigYml,
 	loadConfigYml,
 	noRedirectFetch,
@@ -2416,7 +2417,8 @@ export function createApp(deps: AppDeps) {
 	// boot seeds the Alate URL and key from ALATE_URL and ALATE_API_KEY, the way
 	// HINDSIGHT_API_URL seeds the memory backend. A value saved under Settings -> Alate
 	// wins at every boot, and a saved null clears the seed until the next boot. The key
-	// never reaches a log or a view: alateView reports keySet only.
+	// never reaches a log or a view: alateView reports keySet only; GET /api/settings/alate-key
+	// is the one route that returns it.
 	if (alate.url === null) {
 		const seedUrl = process.env.ALATE_URL?.trim();
 		if (seedUrl) alate.url = seedUrl.replace(/\/+$/, "");
@@ -2513,6 +2515,18 @@ export function createApp(deps: AppDeps) {
 		return new Response(JSON.stringify(v), {
 			status,
 			headers: { "Content-Type": "application/json", Connection: "close" },
+		});
+	}
+
+	/** Like json(), but with Cache-Control: no-store — for responses that carry a secret. */
+	function secretJson(v: unknown, status = 200): Response {
+		return new Response(JSON.stringify(v), {
+			status,
+			headers: {
+				"Content-Type": "application/json",
+				"Cache-Control": "no-store",
+				Connection: "close",
+			},
 		});
 	}
 
@@ -4614,6 +4628,38 @@ export function createApp(deps: AppDeps) {
 					apiKey = newSecret();
 					saveConfig();
 					return json({ apiKey });
+				}),
+		},
+		// Alate key reveal/rotate: GET hands back the stored key, POST asks alate to rotate
+		// it (alate kills the old key immediately, so a failed save must hand the new key back).
+		"/api/settings/alate-key": {
+			GET: (req) => api(req, async () => secretJson({ apiKey: alate.key })),
+			POST: (req) =>
+				api(req, async () => {
+					if (alate.url === null)
+						return json({ error: "alate server url is not configured" }, 400);
+					if (alate.key === null)
+						return json({ error: "alate api key is not configured" }, 400);
+					const r = await alateRotateKey(alate);
+					if (!r.ok) return json({ error: r.error }, r.status);
+					const prev = alate;
+					try {
+						alate = { url: alate.url, key: r.body.key };
+						saveConfig();
+					} catch (err) {
+						// The assignment mutated the closure before saveConfig read it, so a failed
+						// save must restore the old value: store and live config stay equal. The
+						// 500 still hands the new key back so the user can paste it.
+						alate = prev;
+						return secretJson(
+							{
+								error: `alate rotated the key, but the board could not save it (${(err as Error).message}). The key in apiKey is the new one: paste it into the Alate API key field and save.`,
+								apiKey: r.body.key,
+							},
+							500,
+						);
+					}
+					return secretJson({ apiKey: r.body.key });
 				}),
 		},
 		// Rotation invalidates every signed session at once: the lost-device kill switch

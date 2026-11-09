@@ -11,6 +11,7 @@ import type {
 } from "../types.ts";
 import { resetCatalogCache } from "./models.ts";
 import {
+	AlateSection,
 	AppCheckLines,
 	fmtCost,
 	fmtCount,
@@ -3140,6 +3141,321 @@ describe("ModelRolesSection model picker", () => {
 			expect(posts[1]!.fallbacks).toEqual({});
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+/** Mounts AlateSection against `fetchMock`, same cleanup as mountSessions. */
+async function mountAlate(fetchMock: typeof fetch): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchMock;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(<AlateSection />);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		},
+	};
+}
+
+function alateFetchMock(handlers: {
+	config?: {
+		url: string | null;
+		keySet: boolean;
+		lastProvisionError?: string | null;
+	};
+	// A Response is handed out on every fetch; a factory builds a fresh one per call
+	// and can count the calls it serves.
+	keyGet?: Response | (() => Response);
+	keyPost?: Response | (() => Response);
+}): typeof fetch {
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	return (async (
+		input: RequestInfo | URL,
+		init?: RequestInit,
+	): Promise<Response> => {
+		const url = String(input);
+		if (url.endsWith("/api/alate") && init?.method === undefined)
+			return ok({
+				url: null,
+				keySet: false,
+				lastProvisionError: null,
+				...handlers.config,
+			});
+		if (url.endsWith("/api/alate/health")) throw new Error("no server");
+		if (url.endsWith("/api/settings/alate-key")) {
+			if (init?.method === "POST") {
+				const h = handlers.keyPost;
+				return typeof h === "function" ? h() : (h ?? ok({}));
+			}
+			const h = handlers.keyGet;
+			return typeof h === "function" ? h() : (h ?? ok({ apiKey: null }));
+		}
+		throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+	}) as typeof fetch;
+}
+
+describe("AlateSection stored API key", () => {
+	test("the stored key row shows the reveal, copy and regenerate controls", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+			}),
+		);
+		try {
+			const card = container.querySelector("#alate-section");
+			expect(card).not.toBeNull();
+			expect(card?.textContent).toContain("Stored API key");
+			expect(
+				card?.querySelector('button[aria-label="Reveal Alate API key"]'),
+			).not.toBeNull();
+			expect(
+				card?.querySelector('button[aria-label="Copy Alate API key"]'),
+			).not.toBeNull();
+			expect(
+				card?.querySelector('button[aria-label="Regenerate Alate API key"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the stored key row hides when no key is set or the URL is empty", async () => {
+		const noKey = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: false },
+			}),
+		);
+		try {
+			expect(noKey.container.textContent).not.toContain("Stored API key");
+		} finally {
+			await noKey.unmount();
+		}
+		const noUrl = await mountAlate(
+			alateFetchMock({ config: { url: null, keySet: true } }),
+		);
+		try {
+			expect(noUrl.container.textContent).not.toContain("Stored API key");
+		} finally {
+			await noUrl.unmount();
+		}
+	});
+
+	test("reveal fetches the key once, then toggles between shown and masked", async () => {
+		let gets = 0;
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				keyGet: () => {
+					gets += 1;
+					return new Response(JSON.stringify({ apiKey: "alate_secret_1" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				},
+			}),
+		);
+		try {
+			const eye = container.querySelector<HTMLButtonElement>(
+				'button[aria-label="Reveal Alate API key"]',
+			);
+			if (eye === null) throw new Error("reveal button missing");
+			await act(async () => {
+				eye.click();
+			});
+			expect(gets).toBe(1);
+			expect(container.textContent).toContain("alate_secret_1");
+			expect(
+				container.querySelector('button[aria-label="Hide Alate API key"]'),
+			).not.toBeNull();
+			const hidden = container.querySelector<HTMLButtonElement>(
+				'button[aria-label="Hide Alate API key"]',
+			);
+			if (hidden === null) throw new Error("hide button missing");
+			await act(async () => {
+				hidden.click();
+			});
+			expect(gets).toBe(1);
+			expect(container.textContent).not.toContain("alate_secret_1");
+			expect(container.textContent).toContain("••••••••••••");
+			expect(
+				container.querySelector('button[aria-label="Reveal Alate API key"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("regenerate replaces the shown key after the dialog confirms", async () => {
+		let posts = 0;
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				keyPost: () => {
+					posts += 1;
+					return new Response(JSON.stringify({ apiKey: "rotated_key" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				},
+			}),
+		);
+		try {
+			const regen = container.querySelector<HTMLButtonElement>(
+				'button[aria-label="Regenerate Alate API key"]',
+			);
+			if (regen === null) throw new Error("regenerate button missing");
+			await act(async () => {
+				regen.click();
+			});
+			const ok = [...window.document.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Regenerate"),
+			);
+			if (ok === undefined) throw new Error("confirm dialog missing");
+			await act(async () => {
+				ok.click();
+			});
+			expect(posts).toBe(1);
+			expect(container.textContent).toContain("rotated_key");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed save after rotation still shows the new key with the error", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				keyPost: new Response(
+					JSON.stringify({
+						error:
+							"alate rotated the key, but the board could not save it (disk full). The key in apiKey is the new one: paste it into the Alate API key field and save.",
+						apiKey: "rotated_key",
+					}),
+					{ status: 500, headers: { "Content-Type": "application/json" } },
+				),
+			}),
+		);
+		try {
+			const regen = container.querySelector<HTMLButtonElement>(
+				'button[aria-label="Regenerate Alate API key"]',
+			);
+			if (regen === null) throw new Error("regenerate button missing");
+			await act(async () => {
+				regen.click();
+			});
+			const ok = [...window.document.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Regenerate"),
+			);
+			if (ok === undefined) throw new Error("confirm dialog missing");
+			await act(async () => {
+				ok.click();
+			});
+			const alert = container.querySelector('p[role="alert"]');
+			expect(alert?.textContent).toContain("disk full");
+			expect(container.textContent).toContain("rotated_key");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a refused rotate shows the error and leaves the key masked", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				keyPost: new Response(JSON.stringify({ error: "unauthorized" }), {
+					status: 401,
+					headers: { "Content-Type": "application/json" },
+				}),
+			}),
+		);
+		try {
+			const regen = container.querySelector<HTMLButtonElement>(
+				'button[aria-label="Regenerate Alate API key"]',
+			);
+			if (regen === null) throw new Error("regenerate button missing");
+			await act(async () => {
+				regen.click();
+			});
+			const ok = [...window.document.querySelectorAll("button")].find((b) =>
+				b.textContent?.includes("Regenerate"),
+			);
+			if (ok === undefined) throw new Error("confirm dialog missing");
+			await act(async () => {
+				ok.click();
+			});
+			expect(container.querySelector('p[role="alert"]')?.textContent).toContain(
+				"unauthorized",
+			);
+			expect(container.textContent).toContain("••••••••••••");
+			expect(container.textContent).not.toContain("rotated_key");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("copy fetches the key when needed and flashes Copied", async () => {
+		let written: string | undefined;
+		const realClipboard = Object.getOwnPropertyDescriptor(
+			window.navigator,
+			"clipboard",
+		)?.value;
+		Object.defineProperty(window.navigator, "clipboard", {
+			configurable: true,
+			value: {
+				writeText: async (t: string) => {
+					written = t;
+				},
+			},
+		});
+		try {
+			const { container, unmount } = await mountAlate(
+				alateFetchMock({
+					config: { url: "http://127.0.0.1:4570", keySet: true },
+					keyGet: new Response(JSON.stringify({ apiKey: "alate_secret_2" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				}),
+			);
+			try {
+				const copy = container.querySelector<HTMLButtonElement>(
+					'button[aria-label="Copy Alate API key"]',
+				);
+				if (copy === null) throw new Error("copy button missing");
+				await act(async () => {
+					copy.click();
+				});
+				expect(written).toBe("alate_secret_2");
+				expect(
+					container.querySelector('button[aria-label="Copied"]'),
+				).not.toBeNull();
+			} finally {
+				await unmount();
+			}
+		} finally {
+			Object.defineProperty(window.navigator, "clipboard", {
+				configurable: true,
+				value: realClipboard,
+			});
 		}
 	});
 });

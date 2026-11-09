@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import {
 	alateApi,
 	alateHealth,
+	alateRotateKey,
 	CONFIG_YML,
 	commitConfigYml,
 	ghApi,
@@ -813,4 +814,69 @@ describe("commitConfigYml", () => {
 			error: "GitHub: Update is not a fast forward",
 		});
 	});
+});
+
+describe("alateRotateKey", () => {
+	test("posts bearer auth to /api/key with no body and returns the key", async () => {
+		serve(() => Response.json({ key: "rotated" }));
+		expect(await alateRotateKey(alate)).toEqual({
+			ok: true,
+			body: { key: "rotated" },
+		});
+		expect(hits).toEqual([
+			{
+				method: "POST",
+				path: "/api/key",
+				auth: "Bearer k1",
+				type: null,
+				body: "",
+			},
+		]);
+	});
+	test("alate error status and message are kept", async () => {
+		serve(() => Response.json({ error: "nope" }, { status: 401 }));
+		expect(await alateRotateKey(alate)).toEqual({
+			ok: false,
+			status: 401,
+			error: "nope",
+		});
+	});
+	test("a body without a key is 502", async () => {
+		serve(() => Response.json({}));
+		expect(await alateRotateKey(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid key response",
+		});
+	});
+	test("a non-JSON body is 502", async () => {
+		serve(() => new Response("not json"));
+		expect(await alateRotateKey(alate)).toEqual({
+			ok: false,
+			status: 502,
+			error: "alate returned an invalid response",
+		});
+	});
+	test("url or key missing gives 400", async () => {
+		expect(await alateRotateKey({ url: null, key: "k" })).toEqual({
+			ok: false,
+			status: 400,
+			error: "alate server url is not configured",
+		});
+		expect(await alateRotateKey({ url: alate.url, key: null })).toEqual({
+			ok: false,
+			status: 400,
+			error: "alate api key is not configured",
+		});
+	});
+	test("an unreachable server is 502", async () => {
+		expect(
+			await alateRotateKey({ url: "http://127.0.0.1:9", key: "k" }),
+		).toEqual({
+			ok: false,
+			status: 502,
+			error: expect.stringContaining("cannot reach alate server"),
+		});
+	});
+	// The 10 s timeout case is skipped: it would wait the real 10 s.
 });

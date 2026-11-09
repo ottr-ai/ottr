@@ -4305,7 +4305,7 @@ export function openSettingsSection(
 }
 
 /** Settings "Alate" section: provisioning config + one-shot provision trigger. */
-function AlateSection() {
+export function AlateSection() {
 	const [url, setUrl] = useState("");
 	const [conn, setConn] = useState("");
 	const [health, setHealth] = useState<AlateHealthState | null>(null);
@@ -4318,6 +4318,97 @@ function AlateSection() {
 	const [results, setResults] = useState<
 		Array<{ script: string; code: number; output: string; truncated: boolean }>
 	>([]);
+	const [storedKey, setStoredKey] = useState<string | null>(null);
+	const [reveal, setReveal] = useState(false);
+	const [copied, flashCopied] = useFlash(1500);
+	// The row's own error state: the section-level error paragraph would print a
+	// key failure twice (here and below the form).
+	const [keyError, setKeyError] = useState<string | null>(null);
+	const keyBusy = useBusy();
+	const revealKey = (): void => {
+		if (keyBusy.busy) return;
+		setKeyError(null);
+		if (storedKey !== null) {
+			setReveal(!reveal);
+			return;
+		}
+		setReveal(true);
+		keyBusy.start(async () => {
+			try {
+				setStoredKey(
+					(
+						await unwrap<{ apiKey: string }>(
+							await fetch("/api/settings/alate-key"),
+						)
+					).apiKey,
+				);
+				return true;
+			} catch (err) {
+				setReveal(false);
+				setKeyError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	};
+	const copyKey = (): void => {
+		if (keyBusy.busy) return;
+		setKeyError(null);
+		if (storedKey !== null) {
+			copyText(storedKey).then(flashCopied, (err) =>
+				setKeyError(err instanceof Error ? err.message : String(err)),
+			);
+			return;
+		}
+		keyBusy.start(async () => {
+			try {
+				const k = (
+					await unwrap<{ apiKey: string }>(
+						await fetch("/api/settings/alate-key"),
+					)
+				).apiKey;
+				setStoredKey(k);
+				await copyText(k);
+				flashCopied();
+				return true;
+			} catch (err) {
+				setKeyError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	};
+	const regenerateKey = async (): Promise<void> => {
+		if (
+			!(await confirmDialog(
+				"Regenerate the Alate API key? The board switches to the new key and alate dashboard sessions end.",
+				{ ok: "Regenerate", danger: true },
+			))
+		)
+			return;
+		setKeyError(null);
+		keyBusy.start(async () => {
+			// Raw read: a failed rotate may still carry the new key in the body.
+			try {
+				const res = await fetch("/api/settings/alate-key", { method: "POST" });
+				const body = await res.json().catch(() => ({}));
+				if (typeof body.apiKey === "string" && body.apiKey !== "") {
+					setStoredKey(body.apiKey);
+					setReveal(true);
+				}
+				if (!res.ok) {
+					setKeyError(
+						typeof body.error === "string"
+							? body.error
+							: `Regenerate failed (HTTP ${res.status}).`,
+					);
+					return false;
+				}
+				return true;
+			} catch (err) {
+				setKeyError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	};
 	const save = useBusy();
 	const prov = useBusy();
 	// Start time of the watch on a provision that alate reported running when the board's
@@ -4559,6 +4650,74 @@ function AlateSection() {
 							/>
 						</label>
 					</div>
+					{conn !== "" && keySet && (
+						<div className="alate-def-row">
+							<div className="alate-def-name">
+								<b>
+									Stored API key
+									<Help
+										label="Stored API key"
+										text="This is the key the board stores for alate. Reveal or copy it to sign in to the alate dashboard. Regenerate rotates it on the alate server, and dashboard sessions end."
+									/>
+								</b>
+								<code>secret · hidden until revealed</code>
+							</div>
+							<div className="access-row">
+								<div className="access-key">
+									<code>
+										{reveal && storedKey !== null ? storedKey : "••••••••••••"}
+									</code>
+									<button
+										type="button"
+										className="icon"
+										aria-pressed={reveal}
+										aria-label={
+											reveal ? "Hide Alate API key" : "Reveal Alate API key"
+										}
+										title={
+											reveal ? "Hide Alate API key" : "Reveal Alate API key"
+										}
+										onClick={revealKey}
+										disabled={keyBusy.busy}
+									>
+										{keyBusy.busy && storedKey === null ? (
+											<span className="spinner" aria-hidden="true" />
+										) : (
+											<Icon name={reveal ? "eye-off" : "eye"} />
+										)}
+									</button>
+								</div>
+								<button
+									type="button"
+									className="icon"
+									aria-label={copied ? "Copied" : "Copy Alate API key"}
+									title={copied ? "Copied" : "Copy Alate API key"}
+									onClick={copyKey}
+								>
+									<Icon name={copied ? "check" : "copy"} />
+								</button>
+								<button
+									type="button"
+									className="icon danger"
+									aria-label="Regenerate Alate API key"
+									title="Regenerate Alate API key"
+									onClick={regenerateKey}
+									disabled={keyBusy.busy}
+								>
+									{keyBusy.busy ? (
+										<span className="spinner" aria-hidden="true" />
+									) : (
+										<Icon name="refresh-cw" />
+									)}
+								</button>
+							</div>
+							{keyError !== null && (
+								<p className="auth-error" role="alert">
+									{keyError}
+								</p>
+							)}
+						</div>
+					)}
 				</div>
 				<div className="alate-def-actions">
 					<button
