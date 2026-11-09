@@ -10,7 +10,8 @@ interface LiveHandlers {
 	onState(state: StateResponse): void;
 	onUpdate(behind: number, commits: string[]): void;
 	onOnline(): void;
-	onOffline(): void;
+	/** `status` rides when the caller knows it (the poll's failed /api/state); a dead socket passes none. */
+	onOffline(status?: number): void;
 }
 
 /** Narrow one text frame; null for anything the guards reject, so a bad frame never reaches the UI. */
@@ -222,12 +223,25 @@ export function connectPolling(h: LiveHandlers): () => void {
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let updateTimer: ReturnType<typeof setTimeout> | undefined;
 
+	let inFlight = false;
+	let dirty = false;
 	const poll = (): void => {
 		if (disposed) return;
-		void fetch("/api/state")
+		// Overlap guard: a tick or a mutation-driven refresh during a running poll only
+		// marks dirty; the flight's end then runs exactly one follow-up poll.
+		if (inFlight) {
+			dirty = true;
+			return;
+		}
+		inFlight = true;
+		// State and system ride in parallel: the system snapshot no longer waits for
+		// the state response, and a failed state poll never skips it.
+		const stateReq = fetch("/api/state")
 			.then(async (r) => {
 				if (!r.ok) {
-					h.onOffline();
+					// The failed /api/state carries its status, so onOffline can gate on it
+					// without fetching /api/state a second time.
+					h.onOffline(r.status);
 					return;
 				}
 				const state = (await r.json()) as StateResponse;
@@ -236,22 +250,23 @@ export function connectPolling(h: LiveHandlers): () => void {
 				h.onState(state);
 				h.onOnline();
 				liveEvents.dispatchEvent(new Event("open"));
-				void fetch("/api/system")
-					.then(async (sr) => {
-						if (!sr.ok) return;
-						const system = (await sr.json()) as SystemSnapshot;
-						lastSystem = system;
-						liveEvents.dispatchEvent(
-							new CustomEvent("system", { detail: system }),
-						);
-					})
-					.catch(() => {});
 			})
 			.catch(() => h.onOffline());
+		const systemReq = fetch("/api/system")
+			.then(async (sr) => {
+				if (!sr.ok) return;
+				const system = (await sr.json()) as SystemSnapshot;
+				lastSystem = system;
+				liveEvents.dispatchEvent(new CustomEvent("system", { detail: system }));
+			})
+			.catch(() => {});
+		void Promise.all([stateReq, systemReq]).then(() => {
+			inFlight = false;
+			if (disposed || !dirty) return;
+			dirty = false;
+			poll();
+		});
 		// Reschedule at call time: the cadence stays fixed even when a response is slow.
-		// ponytail: no overlap guard — a localhost fetch outliving 5 s means a dead server,
-		// and the browser's per-origin connection cap bounds any pile-up. Add a skip flag
-		// if a real deployment ever shows stacking requests.
 		pollTimer = setTimeout(poll, POLL_MS);
 	};
 

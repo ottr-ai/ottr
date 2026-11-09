@@ -473,8 +473,8 @@ describe("connectPolling", () => {
 		fetch: g.fetch,
 	};
 
-	/** Stub fetch keyed by URL path; handlers return Response objects or throw. */
-	let routes: Record<string, () => Response>;
+	/** Stub fetch keyed by URL path; handlers return a Response or a promise of one, or throw. */
+	let routes: Record<string, () => Response | Promise<Response>>;
 	const calls: string[] = [];
 	const fakeFetch = (input: string | URL | Request): Promise<Response> => {
 		const path = new URL(String(input), "http://poll.test").pathname;
@@ -541,12 +541,14 @@ describe("connectPolling", () => {
 			commits: string[];
 			online: number;
 			offline: number;
+			offlineStatus: number | null;
 		} = {
 			state: null,
 			behind: -1,
 			commits: [],
 			online: 0,
 			offline: 0,
+			offlineStatus: null,
 		};
 		const h: Parameters<typeof connectPolling>[0] = {
 			onState: (s) => {
@@ -559,8 +561,9 @@ describe("connectPolling", () => {
 			onOnline: () => {
 				seen.online++;
 			},
-			onOffline: () => {
+			onOffline: (status?: number) => {
 				seen.offline++;
+				seen.offlineStatus = status ?? null;
 			},
 		};
 		return { h, seen };
@@ -583,8 +586,13 @@ describe("connectPolling", () => {
 		expect(seen.offline).toBe(0);
 		expect(systemEvents).toEqual([SYSTEM]);
 
-		advance(300_000);
-		await drain();
+		// The overlap guard holds each tick's chain open, so every tick drains before
+		// the next one fires; 60 ticks at 5 s plus the boot poll make 61 state polls.
+		// The first update poll lands at the 300 s mark.
+		for (let i = 0; i < 60; i++) {
+			advance(5000);
+			await drain();
+		}
 		// every 5 s poll plus the first update poll at the 300 s mark
 		expect(calls.filter((p) => p === "/api/state")).toHaveLength(61);
 		expect(calls.filter((p) => p === "/api/system")).toHaveLength(61);
@@ -617,12 +625,64 @@ describe("connectPolling", () => {
 
 	test("dispose stops all polling", () => {
 		routes["/api/state"] = () => ok(STATE);
+		routes["/api/system"] = () => ok(SYSTEM);
 		const { h } = makeHandlers();
 		const dispose = connectPolling(h);
-		expect(calls).toEqual(["/api/state"]);
+		// state and system go out together with the boot poll
+		expect(calls).toEqual(["/api/state", "/api/system"]);
 		dispose();
 		advance(5000 * 3);
-		expect(calls).toEqual(["/api/state"]);
+		expect(calls).toEqual(["/api/state", "/api/system"]);
+	});
+
+	test("a tick during a slow poll marks dirty and runs one follow-up", async () => {
+		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+		routes["/api/state"] = async () => {
+			await gate;
+			return ok(STATE);
+		};
+		routes["/api/system"] = () => ok(SYSTEM);
+		const { h, seen } = makeHandlers();
+		const dispose = connectPolling(h);
+		await drain();
+		const states = (): number => calls.filter((p) => p === "/api/state").length;
+		expect(states()).toBe(1);
+		// system went out while the state response still hangs: requested together
+		expect(calls.filter((p) => p === "/api/system").length).toBe(1);
+		expect(seen.online).toBe(0);
+
+		// The 5 s tick during the flight is guarded: no overlapping request.
+		advance(5000);
+		await drain();
+		expect(states()).toBe(1);
+		expect(calls.filter((p) => p === "/api/system").length).toBe(1);
+
+		// The flight's end runs exactly one follow-up poll, then restates the cadence.
+		release();
+		await drain();
+		expect(states()).toBe(2);
+		// both polls succeeded; the guarded tick never went offline
+		expect(seen.online).toBe(2);
+		expect(seen.offline).toBe(0);
+		advance(4999);
+		expect(states()).toBe(2);
+		advance(1);
+		await drain();
+		expect(states()).toBe(3);
+		dispose();
+	});
+
+	test("an offline state response carries its status to onOffline", async () => {
+		routes["/api/state"] = () => new Response("{}", { status: 401 });
+		routes["/api/system"] = () => ok(SYSTEM);
+		const { h, seen } = makeHandlers();
+		const dispose = connectPolling(h);
+		await drain();
+		expect(seen.offline).toBe(1);
+		expect(seen.offlineStatus).toBe(401);
+		// system went out in parallel with the failed state poll
+		expect(calls).toEqual(["/api/state", "/api/system"]);
+		dispose();
 	});
 
 	test("refreshState polls at once and restarts the cadence from the refresh", async () => {

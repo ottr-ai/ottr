@@ -6398,10 +6398,10 @@ describe("hindsight settings", () => {
 
 	test("an unreachable server surfaces its reason in the view and the state warnings", async () => {
 		clearSavedHindsight();
-		const dead = Bun.serve({ port: 0, fetch: () => new Response(null) });
-		const deadUrl = `http://127.0.0.1:${dead.port}`;
-		dead.stop(true);
-		process.env.HINDSIGHT_API_URL = deadUrl;
+		// Loopback port 1 has no listener, so the probe is refused without racing
+		// the ephemeral ports other parallel test servers bind (a freed port once
+		// answered HTTP 404 from an unrelated server).
+		process.env.HINDSIGHT_API_URL = "http://127.0.0.1:1";
 		const booted = boot();
 		await booted.tick();
 		const v = (await (await booted.call("/api/settings/hindsight")).json()) as {

@@ -5708,11 +5708,13 @@ function fmtTokens(n: number): string {
 			: String(n);
 }
 
-/** Session context usage for a task; polled every 5 s while the drawer is open, null when unknown or failing. */
+/** Session context usage for a task: one snapshot fetch when the drawer opens, re-polled every
+ * 5 s only while the card is running; null when unknown or failing. */
 function useSessionContext(
 	project: string,
 	taskId: string,
 	reloadKey: string,
+	running: boolean,
 ): SessionContext | null {
 	const [ctx, setCtx] = useState<SessionContext | null>(null);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey is a refetch trigger, not a body input
@@ -5731,12 +5733,17 @@ function useSessionContext(
 			}
 		};
 		void load();
+		// A done or idle card's context is static: only a live turn earns the 5 s poll.
+		if (!running)
+			return () => {
+				alive = false;
+			};
 		const timer = setInterval(() => void load(), 5000);
 		return () => {
 			alive = false;
 			clearInterval(timer);
 		};
-	}, [project, taskId, reloadKey]);
+	}, [project, taskId, reloadKey, running]);
 	return ctx;
 }
 
@@ -8314,7 +8321,12 @@ export function Drawer({
 	// Every turn start/finish is written in the same synchronous block as a task-row update (runTurn), so a
 	// row change is the exact signal that turns or the report changed; no interval needed.
 	const rowKey = JSON.stringify(row);
-	const ctx = useSessionContext(row.project, row.id, rowKey);
+	const ctx = useSessionContext(
+		row.project,
+		row.id,
+		rowKey,
+		row.state === "running",
+	);
 	// ponytail: local cast, an old server's catalog lacks contextWindow
 	const windowTok =
 		ctx === null || ctx.model === null
@@ -11586,10 +11598,9 @@ export function App() {
 				if (b.hosted === true) setBootHosted(true);
 				else if (b.onboarding) setGate("setup");
 				else if (localStorage.getItem(LOGOUT_KEY) !== null) setGate("login");
-				else
-					void fetch("/api/state").then((r) => {
-						if (sessionLost(r.status)) setGate(gateAfterLostSession);
-					});
+				// A lost session needs no boot probe of its own: the poll's failed
+				// /api/state (or the live socket's refusal) reaches onOffline with the
+				// status and gates the board.
 			})
 			.catch(() => {
 				// unreachable server: poll mode self-heals via its own 5 s poll
@@ -11734,10 +11745,16 @@ export function App() {
 			onUpdate: (behind: number, commits: string[]) =>
 				setUpdate({ behind, commits }),
 			onOnline: () => setOffline(false),
-			// A dead socket cannot show the HTTP status, so ask once per drop: an expired or
-			// revoked session lands on the login page instead of an endless "Retrying…".
-			onOffline: () => {
+			// A dead socket cannot show the HTTP status, so live mode asks once per drop: an
+			// expired or revoked session lands on the login page instead of an endless
+			// "Retrying…". Polling already carries the failed /api/state's status here,
+			// so it never refetches.
+			onOffline: (status?: number) => {
 				setOffline(true);
+				if (status !== undefined) {
+					if (sessionLost(status)) setGate(gateAfterLostSession);
+					return;
+				}
 				void fetch("/api/state")
 					.then((r) => {
 						if (sessionLost(r.status)) setGate(gateAfterLostSession);

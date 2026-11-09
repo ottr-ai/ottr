@@ -677,3 +677,124 @@ test("a project without openPrs data renders no pull-request chips", async () =>
 		await unmountApp();
 	}
 });
+
+// --- polling-mode request hygiene (OTTR-662/OTTR-712) ------------------------
+
+test("boot requests /api/state once, with /api/system alongside it", async () => {
+	const realFetch = host.fetch;
+	const seen: string[] = [];
+	host.fetch = (async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url === "/api/state" || url === "/api/system") seen.push(url);
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountAt("/projects/alpha");
+		// The poll's boot frame is the only /api/state request: the removed boot
+		// probe would fetch it a second time, and system no longer waits for state.
+		expect(seen.filter((u) => u === "/api/state")).toHaveLength(1);
+		expect(seen).toContain("/api/system");
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+/** Swaps the global interval functions for recording fakes and returns the restore pair. */
+function fakeIntervals(): {
+	ticks: Array<() => void>;
+	restore: () => void;
+} {
+	const realSetInterval = host.setInterval;
+	const realClearInterval = host.clearInterval;
+	const ticks: Array<() => void> = [];
+	host.setInterval = ((fn: () => void) => {
+		ticks.push(fn);
+		return 0;
+	}) as typeof setInterval;
+	host.clearInterval = (() => {}) as typeof clearInterval;
+	return {
+		ticks,
+		restore: () => {
+			host.setInterval = realSetInterval;
+			host.clearInterval = realClearInterval;
+		},
+	};
+}
+
+test("a non-running card's session context is fetched once, never polled", async () => {
+	const realFetch = host.fetch;
+	const intervals = fakeIntervals();
+	let contextCalls = 0;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input).endsWith("/context")) contextCalls++;
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	state.tasks.push(
+		card({
+			id: "DO-9",
+			title: "Done card",
+			sessionTitle: "Done card",
+			stage: "done",
+			state: "idle",
+			doneAt: 1000,
+		}),
+	);
+	try {
+		await mountAt("/projects/alpha/tasks/DO-9");
+		await waitFor(drawerOpen);
+		await waitFor(() => contextCalls > 0);
+		expect(contextCalls).toBe(1); // the snapshot fetch on open
+		await act(async () => {
+			for (const fire of intervals.ticks) fire(); // every interval the page scheduled
+			await Promise.resolve();
+		});
+		expect(contextCalls).toBe(1); // a done card earns no 5 s poll
+	} finally {
+		intervals.restore();
+		host.fetch = realFetch;
+		state.tasks.pop();
+		await unmountApp();
+	}
+});
+
+test("a running card's session context re-polls on the 5 s interval", async () => {
+	const realFetch = host.fetch;
+	const intervals = fakeIntervals();
+	let contextCalls = 0;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input).endsWith("/context")) contextCalls++;
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	state.tasks.push(
+		card({
+			id: "RU-9",
+			title: "Running card",
+			sessionTitle: "Running card",
+			stage: "in_progress",
+			state: "running",
+		}),
+	);
+	try {
+		await mountAt("/projects/alpha/tasks/RU-9");
+		await waitFor(drawerOpen);
+		await waitFor(() => contextCalls > 0);
+		const before = contextCalls;
+		await act(async () => {
+			for (const fire of intervals.ticks) fire();
+			await Promise.resolve();
+		});
+		await waitFor(() => contextCalls > before);
+	} finally {
+		intervals.restore();
+		host.fetch = realFetch;
+		state.tasks.pop();
+		await unmountApp();
+	}
+});
