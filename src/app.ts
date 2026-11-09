@@ -178,7 +178,6 @@ import {
 	type OmpStatsSource,
 	scanSessionUsage,
 } from "./ompStats.ts";
-import { createOmpWatcher } from "./ompWatch.ts";
 import {
 	forwardToDashboard,
 	type OmpStatsDashboard,
@@ -186,6 +185,7 @@ import {
 	startingPage,
 } from "./ompStatsDashboard.ts";
 import { type MirrorSource, mirrorFolderName } from "./ompStatsMirror.ts";
+import { createOmpWatcher } from "./ompWatch.ts";
 import {
 	type OrphanProject,
 	orphanCache,
