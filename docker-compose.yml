@@ -126,6 +126,11 @@ services:
       # stack runs, `omp login openai-codex` on the host cannot bind it.
       - "127.0.0.1:54545:${OTTR_PORT:-8080}"
       - "127.0.0.1:1455:${OTTR_PORT:-8080}"
+      # Settings -> omp usage -> Launch omp stats dashboard: the board-guarded proxy to
+      # `omp stats`. Same port on both sides for its host guard. Like the board port, it
+      # asks for the admin login. Keep a real port number here: to disable the proxy, set
+      # the server's OTTR_OMP_STATS_PORT below to off and delete this line.
+      - "127.0.0.1:${OTTR_OMP_STATS_PORT:-3848}:${OTTR_OMP_STATS_PORT:-3848}"
     restart: unless-stopped
     volumes:
       - workspace:/workspace
@@ -156,6 +161,9 @@ services:
       OTTR_VM_RUNNER_URL: ${OTTR_VM_RUNNER_URL:-}
       OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
       PORT: ${OTTR_PORT:-8080}
+      # The omp stats dashboard proxy port (docs/specs/omp-stats-dashboard.md); 0/off disables.
+      # Recreate the stack once after a change, so Docker publishes the new port.
+      OTTR_OMP_STATS_PORT: ${OTTR_OMP_STATS_PORT:-3848}
       # Where turns file cards (create_task). Loopback in a worker is the worker itself; the
       # board opens this host to card filing only, with the token it gives each turn.
       OTTR_BOARD_URL: http://ottr:${OTTR_PORT:-8080}

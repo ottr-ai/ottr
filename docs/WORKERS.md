@@ -450,6 +450,22 @@ installs only. The image carries no JDK and no Maven; it carries `python3` and
   never logs the key, and the runner strips it from every turn's env, since
   no turn calls alate. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
+- Server: `OTTR_OMP_STATS_PORT` is the port of the omp stats dashboard proxy
+  (**Settings → omp usage → Launch omp stats dashboard**). The default is
+  `3848`. The value `0` or `off` disables the proxy. Compose publishes the
+  port on `127.0.0.1` with the same port number in the container, because
+  the host guard accepts only its own port. After you change the value,
+  recreate the stack once, so Docker publishes the new port. To disable the
+  proxy in compose, also delete its line under `ports:`. Refer to
+  docs/specs/omp-stats-dashboard.md.
+
+  The board starts omp's own dashboard (`omp stats`) when the first request
+  arrives, and stops it after 30 minutes without requests. The proxy port has
+  the same walls as the board: the Host guard, the admin login, and the Origin
+  check on changes. The dashboard reads a mirror copy of all board session
+  transcripts under the board home (`<board home>/.omp/ottr-stats-dashboard`).
+  This copy uses disk space equal to the transcripts. The dashboard has no
+  provider sign-in, so omp's "Frustration" judge does not run there.
 
 ## Scaling
 

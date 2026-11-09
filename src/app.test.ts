@@ -49,6 +49,7 @@ import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import { modelRoles } from "./models.ts";
 import { ALL_CLASSES_ON, taskEntryKey } from "./notifications.ts";
 import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
+import type { DashboardState, OmpStatsDashboard } from "./ompStatsDashboard.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -13467,5 +13468,241 @@ describe("restart wait notice", () => {
 		rmSync(join(home, "restart-wait"));
 		rmSync(join(home, "build-commit"));
 		expect((await state()).restartWait).toBeNull();
+	});
+});
+
+describe("omp stats dashboard proxy (docs/specs/omp-stats-dashboard.md)", () => {
+	// The proxy's own port as the Host/Origin guards see it; the test sockets connect to a
+	// random port and send this Host, like the existing wall tests send 127.0.0.1:0.
+	const PROXY = 3848;
+	const g = GlobalStore.open(join(root, "g-omp-stats-proxy"));
+	g.set("config", {
+		admin: { name: "ada", passHash: hashPassword("correct horse") },
+		apiKey: "stats-key",
+		sessionSecret: "stats-secret",
+	});
+	// Fake omp stats child: echoes what reached it.
+	const upstream = Bun.serve({
+		port: 0,
+		fetch: async (req) => {
+			const u = new URL(req.url);
+			return Response.json({
+				method: req.method,
+				path: u.pathname,
+				search: u.search,
+				cookie: req.headers.get("cookie"),
+				apiKey: req.headers.get("x-api-key"),
+				body: await req.text(),
+			});
+		},
+	});
+	let dashState: DashboardState = { phase: "stopped", port: null, error: null };
+	const ensure = mock((): DashboardState => dashState);
+	const dashboard: OmpStatsDashboard = {
+		ensure,
+		state: () => dashState,
+		tick: async () => {},
+		stop: () => {},
+	};
+	const app = createApp({
+		gstore: g,
+		defaultDir: root,
+		projects: new Map(),
+		...loopStubs(),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared: {
+			maxTotalRuns: 3,
+			reviewCheck: true,
+			workCheck: true,
+			idleReviews: true,
+			trendingScan: true,
+			removedPaths: [],
+			envValues: {},
+			projectPaths: [],
+			projectOrder: [],
+		},
+		serverRef: { current: undefined },
+		ompStats: { info: { port: PROXY, error: null }, dashboard },
+	});
+	const board = Bun.serve({ port: 0, ...app.serveOptions });
+	app.serverRef.current = board;
+	const proxy = Bun.serve({ port: 0, fetch: app.ompStatsFetch });
+	afterAll(() => {
+		proxy.stop(true);
+		board.stop(true);
+		upstream.stop(true);
+		g.close();
+	});
+	beforeEach(() => {
+		ensure.mockClear();
+		dashState = { phase: "running", port: upstream.port ?? null, error: null };
+	});
+	const call = (
+		path: string,
+		headers: Record<string, string> = {},
+		init: { method?: string; body?: string } = {},
+	) =>
+		fetch(new URL(path, proxy.url), {
+			method: init.method ?? "GET",
+			headers: { Host: `127.0.0.1:${PROXY}`, ...headers },
+			body: init.body,
+		});
+	/** A peer that is not direct loopback (compose's Docker gateway), as the wall tests fake it. */
+	const fromGateway = () =>
+		spyOn(proxy, "requestIP").mockReturnValue({
+			address: "172.18.0.1",
+			family: "IPv4",
+			port: 1,
+		});
+
+	test("a foreign Host gets 403 and never starts the dashboard", async () => {
+		for (const host of ["evil.example", "127.0.0.1:0", "localhost:3847"]) {
+			const res = await call("/", { Host: host });
+			expect(res.status).toBe(403);
+		}
+		expect(ensure).not.toHaveBeenCalled();
+		// localhost on the proxy port passes like 127.0.0.1.
+		expect((await call("/", { Host: `localhost:${PROXY}` })).status).toBe(200);
+	});
+
+	test("a walled request without a session gets 401 with the board sign-in link", async () => {
+		const peer = fromGateway();
+		try {
+			const res = await call("/", { cookie: "ottr.session=forged.1.x" });
+			expect(res.status).toBe(401);
+			expect(res.headers.get("content-type")).toContain("text/html");
+			expect(await res.text()).toContain('href="http://127.0.0.1:0/"');
+			// A loopback peer carrying proxy headers is walled too (tailscale serve shape).
+			peer.mockReturnValue({ address: "127.0.0.1", family: "IPv4", port: 1 });
+			expect(
+				(await call("/", { "x-forwarded-for": "100.64.0.7" })).status,
+			).toBe(401);
+			expect(ensure).not.toHaveBeenCalled();
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("a walled request with the API key or a session cookie is forwarded without them", async () => {
+		const peer = fromGateway();
+		try {
+			const keyed = await call("/k", { "x-api-key": "stats-key" });
+			expect(keyed.status).toBe(200);
+			expect(await keyed.json()).toMatchObject({ path: "/k", apiKey: null });
+			const token = signSession("stats-secret", "ada", Date.now() + 60_000);
+			const signed = await call("/s", { cookie: `ottr.session=${token}` });
+			expect(signed.status).toBe(200);
+			expect(await signed.json()).toMatchObject({ path: "/s", cookie: null });
+			expect((await call("/", { "x-api-key": "wrong-key" })).status).toBe(401);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("the auth wall reads the proxy listener's peer, not the board's", async () => {
+		// A direct loopback peer of the proxy stays zero-auth like the board's own port, even
+		// when the board listener would call the peer remote: the proxy's requestIP decides.
+		const boardPeer = spyOn(board, "requestIP").mockReturnValue({
+			address: "172.18.0.1",
+			family: "IPv4",
+			port: 1,
+		});
+		try {
+			const res = await call("/open");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toMatchObject({ path: "/open" });
+		} finally {
+			boardPeer.mockRestore();
+		}
+	});
+
+	test("a POST needs the proxy's own Origin", async () => {
+		for (const origin of [
+			"http://evil.example",
+			"http://127.0.0.1:0",
+			"http://localhost:3847",
+		]) {
+			const res = await call(
+				"/api/sync",
+				{ Origin: origin },
+				{ method: "POST", body: "{}" },
+			);
+			expect(res.status).toBe(403);
+		}
+		expect(
+			(await call("/api/sync", {}, { method: "POST", body: "{}" })).status,
+		).toBe(403);
+		expect(ensure).not.toHaveBeenCalled();
+		const ok = await call(
+			"/api/sync",
+			{ Origin: `http://localhost:${PROXY}` },
+			{ method: "POST", body: '{"a":1}' },
+		);
+		expect(ok.status).toBe(200);
+		expect(await ok.json()).toMatchObject({
+			method: "POST",
+			path: "/api/sync",
+			body: '{"a":1}',
+		});
+	});
+
+	test("an authorized GET reaches the child with path and query, without the cookie", async () => {
+		const res = await call("/api/stats/models?range=24h&x=a%20b", {
+			cookie: "ottr.session=whatever; other=1",
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			method: "GET",
+			path: "/api/stats/models",
+			search: "?range=24h&x=a%20b",
+			cookie: null,
+			apiKey: null,
+			body: "",
+		});
+		expect(ensure).toHaveBeenCalledTimes(1);
+	});
+
+	test("while the dashboard starts or after a failed start, the proxy answers the 503 page", async () => {
+		dashState = { phase: "starting", port: null, error: null };
+		const starting = await call("/");
+		expect(starting.status).toBe(503);
+		expect(await starting.text()).toContain('http-equiv="refresh"');
+		dashState = { phase: "failed", port: null, error: "omp: <not found>" };
+		const failed = await call("/");
+		expect(failed.status).toBe(503);
+		expect(await failed.text()).toContain("omp: &#60;not found&#62;");
+		expect(ensure).toHaveBeenCalledTimes(2);
+	});
+
+	test("the info endpoint answers the listener port, and the bind error once set", async () => {
+		const info = () =>
+			fetch(new URL("/api/settings/omp-stats/dashboard", board.url), {
+				headers: { Host: "127.0.0.1:0" },
+			});
+		expect(await (await info()).json()).toEqual({ port: PROXY, error: null });
+		app.setOmpStatsListener({ port: null, error: "address in use" });
+		try {
+			expect(await (await info()).json()).toEqual({
+				port: null,
+				error: "address in use",
+			});
+			// No listener: the proxy serves nothing and never starts the child.
+			expect((await call("/")).status).toBe(404);
+			expect(ensure).not.toHaveBeenCalled();
+		} finally {
+			app.setOmpStatsListener({ port: PROXY, error: null });
+		}
+	});
+
+	test("without the dashboard dep the info endpoint has no port and says why", async () => {
+		const { call: bare } = mount();
+		const body = (await (
+			await bare("/api/settings/omp-stats/dashboard")
+		).json()) as { port: number | null; error: string | null };
+		expect(body.port).toBeNull();
+		expect(body.error).toBeTruthy();
 	});
 });

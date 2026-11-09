@@ -177,6 +177,13 @@ import {
 	scanSessionUsage,
 } from "./ompStats.ts";
 import {
+	forwardToDashboard,
+	type OmpStatsDashboard,
+	type OmpStatsDashboardInfo,
+	startingPage,
+} from "./ompStatsDashboard.ts";
+import { type MirrorSource, mirrorFolderName } from "./ompStatsMirror.ts";
+import {
 	type OrphanProject,
 	orphanCache,
 	orphanView,
@@ -489,6 +496,12 @@ interface AppDeps {
 	/** Only for tests: the transcript usage scan GET /api/settings/omp-stats runs instead of
 	 * scanSessionUsage, so a test can count reads and serve fixture stores. */
 	scanSessionUsage?: (sessionsDir: string) => OmpStatsAnswer;
+	/**
+	 * Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
+	 * the proxy listener's port (null + error when disabled) and the on-demand dashboard that
+	 * ompStatsFetch forwards to. Absent = no dashboard; the info endpoint says so.
+	 */
+	ompStats?: { info: OmpStatsDashboardInfo; dashboard: OmpStatsDashboard };
 	/** Server-only ssh key + known_hosts dir; no worker mounts it. */
 	sshDir?: string;
 	/** Base home of the env.txt name lists (<home>/.ottr/workers); defaults to boardOmpHome() (R5-1). */
@@ -583,6 +596,39 @@ export function storedProjectPaths(gstore: GlobalStore): {
 		projectPaths: strs(c?.projects).map((p) => resolve(p)),
 		projectOrder: strs(c?.projectOrder),
 	};
+}
+
+/** One transcript store of the board, named for the omp usage card. */
+export interface OmpSessionStore extends MirrorSource {
+	name: string;
+}
+
+/**
+ * Every session transcript store of the board: the board's own default store, the workers'
+ * default store when it is another dir, and each project's sessions dir. The omp usage card
+ * and the stats dashboard mirror both read this one list, so they cannot drift apart.
+ * Stores keep their folder layout (folder null); a flat project dir maps to its own folder.
+ */
+export function ompSessionStores(
+	projects: ReadonlyMap<string, Entry>,
+): OmpSessionStore[] {
+	const board = join(boardOmpHome(), ".omp", "agent", "sessions");
+	const stores: OmpSessionStore[] = [
+		{ name: "board store", dir: board, folder: null },
+	];
+	// The workers' shared home default store, when it is another directory (compose:
+	// home:/root is shared, the board home is server-only). Its sessions are the
+	// manual and stray runs; turn usage lives in the project dirs below.
+	const workerStore = join(homedir(), ".omp", "agent", "sessions");
+	if (resolve(workerStore) !== resolve(board))
+		stores.push({ name: "workers' store", dir: workerStore, folder: null });
+	for (const [name, e] of projects)
+		stores.push({
+			name,
+			dir: e.store.sessionsDir,
+			folder: mirrorFolderName(name),
+		});
+	return stores;
 }
 
 /**
@@ -2786,15 +2832,16 @@ export function createApp(deps: AppDeps) {
 	 * walled, and so is any peer whose connection is not direct loopback. tailscale serve
 	 * forwards from 127.0.0.1 with X-Forwarded-For/-Host set (R2-1), and compose's published
 	 * port arrives from the Docker gateway, so neither counts as loopback, whatever Host header
-	 * it sends. An unknown peer counts as remote.
+	 * it sends. An unknown peer counts as remote. `server` is the listener the request came
+	 * in on: the omp stats proxy port passes its own, since requestIP knows only its own sockets.
 	 */
-	function walled(req: Request): boolean {
+	function walled(
+		req: Request,
+		server: Server<undefined> | undefined = deps.serverRef.current,
+	): boolean {
 		return (
 			viaPublicHost(req) ||
-			!directLoopback(
-				deps.serverRef.current?.requestIP(req)?.address,
-				req.headers,
-			)
+			!directLoopback(server?.requestIP(req)?.address, req.headers)
 		);
 	}
 
@@ -4168,23 +4215,9 @@ export function createApp(deps: AppDeps) {
 			return ompStatsCache.report;
 		const build = (async () => {
 			const scan = deps.scanSessionUsage ?? scanSessionUsage;
-			const sources: OmpStatsSource[] = [
-				{
-					name: "board store",
-					answer: scan(join(boardOmpHome(), ".omp", "agent", "sessions")),
-				},
-			];
-			// The workers' shared home default store, when it is another directory (compose:
-			// home:/root is shared, the board home is server-only). Its sessions are the
-			// manual and stray runs; turn usage lives in the project dirs below.
-			const workerStore = join(homedir(), ".omp", "agent", "sessions");
-			if (
-				resolve(workerStore) !==
-				resolve(boardOmpHome(), ".omp", "agent", "sessions")
-			)
-				sources.push({ name: "workers' store", answer: scan(workerStore) });
-			for (const [name, e] of deps.projects)
-				sources.push({ name, answer: scan(e.store.sessionsDir) });
+			const sources: OmpStatsSource[] = ompSessionStores(deps.projects).map(
+				(s) => ({ name: s.name, answer: scan(s.dir) }),
+			);
 			const report = buildOmpStatsReport(sources, Date.now());
 			ompStatsCache = { at: report.at, report };
 			return report;
@@ -4193,6 +4226,54 @@ export function createApp(deps: AppDeps) {
 			ompStatsRead = null;
 		});
 		return ompStatsRead;
+	}
+
+	// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md).
+	// The proxy listener's port as the server bound it; setOmpStatsListener corrects it after
+	// a bind failure, so the info endpoint never offers a port that nothing serves.
+	let ompStatsListener: OmpStatsDashboardInfo = deps.ompStats?.info ?? {
+		port: null,
+		error: "the omp stats dashboard is not configured",
+	};
+	/**
+	 * Every request on the omp stats proxy port. The same walls as /api run first (Host, auth
+	 * wall with the proxy server's own peer address, Origin on mutations), and only a request
+	 * past them starts the dashboard or counts as activity for its idle clock.
+	 */
+	async function ompStatsFetch(
+		req: Request,
+		server: Server<undefined>,
+	): Promise<Response> {
+		const port = ompStatsListener.port;
+		const dashboard = deps.ompStats?.dashboard;
+		if (port === null || dashboard === undefined)
+			return json({ error: "not found" }, 404);
+		const refusal = hostRefusal(req.headers.get("host"), port, []);
+		if (refusal !== null) return json({ error: refusal }, 403);
+		const url = new URL(req.url);
+		if (walled(req, server) && !authorized(req)) {
+			// The board's session cookie is per host, not per port: a sign-in on the board's
+			// own port under the same hostname unlocks this port too.
+			const signIn = Bun.escapeHTML(`http://${url.hostname}:${deps.port}/`);
+			return new Response(
+				`<!doctype html><meta charset="utf-8"><title>Sign in</title><p>Sign in to the board first: <a href="${signIn}">${signIn}</a>. Then reload this page.</p>`,
+				{
+					status: 401,
+					headers: { "Content-Type": "text/html; charset=utf-8" },
+				},
+			);
+		}
+		if (
+			req.method !== "GET" &&
+			req.method !== "HEAD" &&
+			originRefusal(req.headers.get("origin"), port, []) !== null
+		)
+			return json({ error: "forbidden origin" }, 403);
+		const st = dashboard.ensure();
+		if (st.phase !== "running" || st.port === null) return startingPage(st);
+		// Server-sent events stay open for as long as the page does.
+		if (url.pathname === "/api/events") server.timeout(req, 0);
+		return forwardToDashboard(req, st.port);
 	}
 	let behind = 0;
 	let behindCommits: string[] = [];
@@ -4988,6 +5069,9 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/settings/omp-stats": {
 			GET: (req) => api(req, async () => json(await ompStatsReportNow())),
+		},
+		"/api/settings/omp-stats/dashboard": {
+			GET: (req) => api(req, async () => json(ompStatsListener)),
 		},
 		"/api/settings/hindsight": {
 			GET: (req) => api(req, async () => json(hindsightView())),
@@ -8348,6 +8432,11 @@ export function createApp(deps: AppDeps) {
 			},
 		},
 		serverRef: deps.serverRef,
+		ompStatsFetch,
+		/** The proxy listener's bind result; a failed bind passes { port: null, error }. */
+		setOmpStatsListener: (info: OmpStatsDashboardInfo): void => {
+			ompStatsListener = info;
+		},
 		publish,
 		publishState,
 		publishSoon,

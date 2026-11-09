@@ -13,6 +13,7 @@ import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import type { AlertClass, ClassPrefs } from "../notifications.ts";
 import type { OmpStatsReport } from "../ompStats.ts";
+import type { OmpStatsDashboardInfo } from "../ompStatsDashboard.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
 import { liveCardOf } from "../scheduler.ts";
@@ -1050,12 +1051,30 @@ export const fmtCost = (usd: number): string => `$${usd.toFixed(2)}`;
 export const fmtPct = (rate: number | null): string =>
 	rate === null ? "—" : `${(rate * 100).toFixed(1)}%`;
 
-/** Settings -> omp usage: live `omp stats --json` numbers for the board's own store and
- *  every worker's shared store, fetched when the Settings page opens; a source that
- *  answers an error still lists with its error. */
+/** Where the omp stats dashboard link points: a loopback board gets the proxy URL;
+ *  any other host gets a caption, because the proxy listens on loopback only. */
+export function dashboardLink(
+	hostname: string,
+	info: OmpStatsDashboardInfo,
+): { href: string } | { caption: string } {
+	if (info.port === null)
+		return { caption: `The omp stats dashboard is off: ${info.error}` };
+	if (hostname !== "localhost" && hostname !== "127.0.0.1")
+		return {
+			caption:
+				"The omp stats dashboard opens only from the board on localhost.",
+		};
+	return { href: `http://${hostname}:${info.port}/` };
+}
+
+/** Settings -> omp usage: turn usage summed from the board's session transcripts,
+ *  fetched when the Settings page opens, plus a link to omp's own stats dashboard
+ *  (started on demand behind a board proxy). The two fetches fail independently. */
 export function OmpStatsSection() {
 	const [report, setReport] = useState<OmpStatsReport | null>(null);
 	const [loadFailed, setLoadFailed] = useState(false);
+	const [info, setInfo] = useState<OmpStatsDashboardInfo | null>(null);
+	const [infoFailed, setInfoFailed] = useState(false);
 	const load = useCallback(async (): Promise<void> => {
 		const r = await unwrap<OmpStatsReport>(
 			await fetch("/api/settings/omp-stats"),
@@ -1066,12 +1085,38 @@ export function OmpStatsSection() {
 	useEffect(() => {
 		load().catch(() => setLoadFailed(true));
 	}, [load]);
+	useEffect(() => {
+		(async () =>
+			setInfo(
+				await unwrap<OmpStatsDashboardInfo>(
+					await fetch("/api/settings/omp-stats/dashboard"),
+				),
+			))().catch(() => setInfoFailed(true));
+	}, []);
+	const link = info === null ? null : dashboardLink(location.hostname, info);
 	return (
 		<SettingsCard
 			id="omp-stats-section"
 			title="omp usage"
 			hint="Turn usage summed from the session transcripts this board can read: each project's sessions dir, plus the board's and the workers' default omp stores, fetched when this page opens. omp's own stats command misses tracker turns (they run with --session-dir), so the board sums the usage records itself. A store that answers an error still lists below with its error."
 		>
+			{infoFailed ? (
+				<p className="caption">
+					The omp stats dashboard link could not be loaded.
+				</p>
+			) : link === null ? null : "href" in link ? (
+				<div>
+					<a href={link.href} target="_blank" rel="noopener noreferrer">
+						Launch omp stats dashboard
+					</a>
+					<p className="caption">
+						omp's own dashboard with charts and session traces. The board starts
+						it on demand and stops it after 30 minutes without use.
+					</p>
+				</div>
+			) : (
+				<p className="caption">{link.caption}</p>
+			)}
 			{loadFailed ? (
 				<p className="hint" role="alert">
 					omp usage could not be loaded.

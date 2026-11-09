@@ -13,6 +13,7 @@ import { resetCatalogCache } from "./models.ts";
 import {
 	AlateSection,
 	AppCheckLines,
+	dashboardLink,
 	fmtCost,
 	fmtCount,
 	fmtPct,
@@ -1062,6 +1063,80 @@ describe("OmpStatsSection", () => {
 		} finally {
 			await unmount();
 		}
+	});
+
+	/** Report fetch fails; the dashboard info answers `info`. */
+	const dashboardFetch = (info: unknown): typeof fetch =>
+		(async (input: RequestInfo | URL): Promise<Response> =>
+			String(input).endsWith("/api/settings/omp-stats/dashboard")
+				? new Response(JSON.stringify(info))
+				: new Response(JSON.stringify({ error: "boom" }), {
+						status: 500,
+					})) as unknown as typeof fetch;
+
+	test("a bound dashboard shows the launch link, even when the report fails", async () => {
+		const { container, unmount } = await mountOmpStats(
+			dashboardFetch({ port: 3848, error: null }),
+		);
+		try {
+			const a = container.querySelector<HTMLAnchorElement>(
+				"#omp-stats-section a",
+			);
+			expect(a?.textContent).toBe("Launch omp stats dashboard");
+			expect(a?.getAttribute("href")).toBe("http://localhost:3848/");
+			expect(a?.getAttribute("target")).toBe("_blank");
+			expect(a?.getAttribute("rel")).toBe("noopener noreferrer");
+			expect(container.textContent).toContain(
+				"omp's own dashboard with charts and session traces. The board starts it on demand and stops it after 30 minutes without use.",
+			);
+			expect(container.textContent).toContain("omp usage could not be loaded.");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a disabled dashboard shows its reason and no link", async () => {
+		const { container, unmount } = await mountOmpStats(
+			dashboardFetch({ port: null, error: "disabled by OTTR_OMP_STATS_PORT" }),
+		);
+		try {
+			expect(container.querySelector("#omp-stats-section a")).toBeNull();
+			expect(container.textContent).toContain(
+				"The omp stats dashboard is off: disabled by OTTR_OMP_STATS_PORT",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed dashboard info fetch shows its own caption", async () => {
+		const { container, unmount } = await mountOmpStats(
+			(async () =>
+				new Response(JSON.stringify({ error: "boom" }), {
+					status: 500,
+				})) as unknown as typeof fetch,
+		);
+		try {
+			expect(container.textContent).toContain(
+				"The omp stats dashboard link could not be loaded.",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("dashboardLink links only on loopback hosts", () => {
+		const on = { port: 3848, error: null };
+		expect(dashboardLink("127.0.0.1", on)).toEqual({
+			href: "http://127.0.0.1:3848/",
+		});
+		expect(dashboardLink("board.example.com", on)).toEqual({
+			caption:
+				"The omp stats dashboard opens only from the board on localhost.",
+		});
+		expect(dashboardLink("localhost", { port: null, error: "x" })).toEqual({
+			caption: "The omp stats dashboard is off: x",
+		});
 	});
 
 	test("the formatters keep the readout compact and priced", () => {

@@ -5,7 +5,7 @@
 import { constants, homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
-import { createApp, storedProjectPaths } from "./app.ts";
+import { createApp, ompSessionStores, storedProjectPaths } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
 import { logError, trapCrashes } from "./crash.ts";
@@ -17,6 +17,10 @@ import { GlobalStore } from "./globalStore.ts";
 import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
+import {
+	createOmpStatsDashboard,
+	parseOmpStatsPort,
+} from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
 import { openPullRequest } from "./prs.ts";
@@ -618,6 +622,22 @@ function claimedPids(): Set<number> {
 const serverRef: { current: Server<undefined> | undefined } = {
 	current: undefined,
 };
+// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
+// omp's own `omp stats` web UI, started on demand and served behind the board's walls on a
+// second port. Its transcript mirror reads the same stores as the omp usage card.
+const ompStatsInfo = parseOmpStatsPort(process.env.OTTR_OMP_STATS_PORT);
+if (ompStatsInfo.error !== null)
+	console.log(`omp stats dashboard proxy: ${ompStatsInfo.error}`);
+const ompStatsDashboard = createOmpStatsDashboard({
+	baseDir: join(boardOmpHome(), ".omp", "ottr-stats-dashboard"),
+	sources: () => ompSessionStores(projects),
+	env: () => boardOmpEnv(),
+	log: (l) => console.log(`omp stats dashboard: ${l}`),
+});
+// The child must not outlive the board. SIGINT/SIGTERM/SIGHUP end in shutdown() ->
+// process.exit, which runs this handler too.
+process.on("exit", () => ompStatsDashboard.stop());
+setInterval(() => void ompStatsDashboard.tick(), 60_000);
 const app = createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
@@ -685,6 +705,7 @@ const app = createApp({
 	vmTokens,
 	llmGateway: () => llmGateway,
 	hosted,
+	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing
@@ -787,6 +808,26 @@ serverRef.current = Bun.serve({
 	development: process.env.NODE_ENV === "development",
 	...app.serveOptions,
 });
+
+// The omp stats dashboard proxy: a bind failure leaves the board up, and the info endpoint
+// carries the error instead of the port.
+if (ompStatsInfo.port !== null) {
+	try {
+		Bun.serve({
+			hostname: HOST,
+			port: ompStatsInfo.port,
+			idleTimeout: 120,
+			fetch: app.ompStatsFetch,
+		});
+		console.log(
+			`omp stats dashboard proxy on http://127.0.0.1:${ompStatsInfo.port}`,
+		);
+	} catch (err) {
+		const error = `omp stats dashboard proxy did not bind port ${ompStatsInfo.port}: ${err instanceof Error ? err.message : String(err)}`;
+		console.error(error);
+		app.setOmpStatsListener({ port: null, error });
+	}
+}
 
 // Advisory boot report: agent-launcher processes no running turn claims. The tracker never
 // kills them; the operator decides (also on demand via GET /api/orphans and /api/state).
