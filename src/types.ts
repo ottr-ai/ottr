@@ -167,6 +167,8 @@ export interface ProjectSettings {
 	tendChurnGlobs: string[];
 	/** Update cards park at needs_you when a work turn ends ready; a reply approves the merge (U7). */
 	holdUpdateMerges: boolean;
+	/** Fork-born cards park at needs_you before their merge; a reply approves the parked head. Default on; turning it off does not release already parked cards. */
+	forkMergeHold: boolean;
 	/** Supervisor files a retro card for each task done at or after this timestamp; null disables retros. */
 	retroSince: number | null;
 	/** Skip the retro of a smooth, cheap task (the friction filter); false gives every task a retro. */

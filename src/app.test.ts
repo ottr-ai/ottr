@@ -2092,6 +2092,22 @@ describe("trending scout routes", () => {
 		expect(store.getSettings().trendingScout).toBe(false);
 	});
 
+	test("project settings route accepts forkMergeHold and rejects non-boolean", async () => {
+		const bad = await post("/api/projects/p1/settings", {
+			forkMergeHold: "yes",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("forkMergeHold must be a boolean");
+		const off = await post("/api/projects/p1/settings", {
+			forkMergeHold: false,
+		});
+		expect(off.status).toBe(200);
+		expect(store.getSettings().forkMergeHold).toBe(false);
+		const on = await post("/api/projects/p1/settings", { forkMergeHold: true });
+		expect(on.status).toBe(200);
+		expect(store.getSettings().forkMergeHold).toBe(true);
+	});
+
 	test("a manual scan with no project opted in is a 409 and fetches nothing", async () => {
 		const fetched: string[] = [];
 		const stub = (async (input: string | URL | Request) => {

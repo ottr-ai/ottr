@@ -3988,8 +3988,17 @@ export function createTurnLoop(
 				forkBorn = anc?.topic === "fork research";
 				up = anc?.followUpOf ?? null;
 			}
-			// A read-only retro has nothing to merge; holding it blocks later retros.
-			const forkHold = readyWork && forkBorn && !retroCard;
+			// A read-only retro has nothing to merge; holding it blocks later retros. The
+			// forkMergeHold switch gates new holds (OTTR-689): with it off a fork-born card merges
+			// like any work card. A card already parked on a fork hold (a parked head, its fork
+			// approval not spent) stays held with the switch off, so it still needs an approval
+			// at its parked head; only the approving settle lifts that one.
+			const forkHold =
+				readyWork &&
+				forkBorn &&
+				!retroCard &&
+				(store.getSettings().forkMergeHold ||
+					(task.holdHead !== null && task.forkMergeHead === null));
 			const head =
 				updateHold || forkHold
 					? await ops.targetSha(wt, "HEAD").catch(() => null)

@@ -314,6 +314,7 @@ describe("settings", () => {
 			autoTendLimit: 12,
 			tendChurnGlobs: [],
 			holdUpdateMerges: false,
+			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
 			forkResearch: false,
@@ -343,6 +344,7 @@ describe("settings", () => {
 			autoTendLimit: 12,
 			tendChurnGlobs: [],
 			holdUpdateMerges: false,
+			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
 			forkResearch: false,
@@ -358,6 +360,19 @@ describe("settings", () => {
 			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
+		store.close();
+	});
+
+	test("a settings blob from before forkMergeHold reads the default on", () => {
+		const dir = join(root, "settings-pre-fork-merge-hold");
+		let store = open(dir);
+		// A project last written before the switch existed holds only the older keys:
+		// one row per key, none named forkMergeHold.
+		store.setSettings({ holdUpdateMerges: false });
+		store.close();
+		store = open(dir);
+		expect(store.getSettings().holdUpdateMerges).toBe(false);
+		expect(store.getSettings().forkMergeHold).toBe(true);
 		store.close();
 	});
 

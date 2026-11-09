@@ -10167,6 +10167,35 @@ describe("turn fork-born merge hold", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
+	test("with forkMergeHold off a fork-born card settles done like any work card", async () => {
+		const { store, record, loop, task } = forkCase();
+		store.setSettings({ forkMergeHold: false });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	test("turning forkMergeHold off does not release a card parked on a fork hold", async () => {
+		const { store, record, loop, task } = forkCase();
+		// Parked as today: the settle left a head to approve and spent no fork approval.
+		store.updateTask(task.id, {
+			state: "queued",
+			pendingPrompt: "keep going",
+			pendingBy: "user",
+			needsReason: null,
+			holdHead: "sha-1",
+			forkMergeHead: null,
+		});
+		store.setSettings({ forkMergeHold: false });
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
 	test("an approved fork-born card integrates only at the approved head", async () => {
 		const { store, record, loop, task } = forkCase();
 		store.updateTask(task.id, { forkMergeHead: "sha-1" });

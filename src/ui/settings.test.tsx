@@ -497,6 +497,7 @@ describe("ProjectSettingsForm target branch", () => {
 			autoTendLimit: 5,
 			tendChurnGlobs: [],
 			holdUpdateMerges: false,
+			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
 			forkResearch: false,
@@ -721,6 +722,58 @@ describe("ProjectSettingsForm target branch", () => {
 				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
 			});
 			expect(postBody?.pushSyncCommits).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the Updates card shows the hold fork-born merges checkbox and toggling posts it", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return ok(project);
+			}
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return ok({ own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountForm(fetchMock);
+		try {
+			const card = container.querySelector("#project-updates-section");
+			expect(card).not.toBeNull();
+			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
+				l.textContent?.includes("Hold fork-born merges"),
+			);
+			if (label === undefined)
+				throw new Error("hold fork-born merges row missing");
+			const input = card?.querySelector<HTMLInputElement>(
+				`input[id="${label.htmlFor}"]`,
+			);
+			if (input === null || input === undefined)
+				throw new Error("hold fork-born merges checkbox did not render");
+			expect(input.checked).toBe(true);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.forkMergeHold).toBe(false);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
+			});
+			expect(postBody?.forkMergeHold).toBe(true);
 		} finally {
 			await unmount();
 		}
@@ -1529,6 +1582,7 @@ describe("Updates card", () => {
 	): ProjectView["settings"] =>
 		({
 			holdUpdateMerges: false,
+			forkMergeHold: false,
 			retroSince: null,
 			retroFilter: false,
 			forkResearch: false,
@@ -1541,7 +1595,7 @@ describe("Updates card", () => {
 			...over,
 		}) as unknown as ProjectView["settings"];
 
-	test("the chip counts all ten checkboxes", () => {
+	test("the chip counts all eleven checkboxes", () => {
 		expect(
 			updatesChip(
 				settings({
@@ -1553,7 +1607,7 @@ describe("Updates card", () => {
 					issueWatch: true,
 				}),
 			),
-		).toEqual({ label: "6 of 10 on", tone: "ok" });
+		).toEqual({ label: "6 of 11 on", tone: "ok" });
 		expect(
 			updatesChip(
 				settings({
@@ -1563,12 +1617,12 @@ describe("Updates card", () => {
 					pushSyncCommits: true,
 				}),
 			).label,
-		).toBe("4 of 10 on");
+		).toBe("4 of 11 on");
 	});
 
 	test("the friction filter does not count while retro is off", () => {
 		expect(updatesChip(settings({ retroFilter: true }))).toEqual({
-			label: "0 of 10 on",
+			label: "0 of 11 on",
 			tone: "off",
 		});
 	});

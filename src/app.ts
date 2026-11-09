@@ -3491,6 +3491,13 @@ export function createApp(deps: AppDeps) {
 				return json({ error: "holdUpdateMerges must be a boolean" }, 400);
 			patch.holdUpdateMerges = hum;
 		}
+		const fmh = body.forkMergeHold;
+		if (fmh !== undefined) {
+			// OTTR-689: hold the merge of fork-born cards until a reply approves them.
+			if (typeof fmh !== "boolean")
+				return json({ error: "forkMergeHold must be a boolean" }, 400);
+			patch.forkMergeHold = fmh;
+		}
 		const rf = body.retroFilter;
 		if (rf !== undefined) {
 			if (typeof rf !== "boolean")

@@ -443,6 +443,20 @@ export function ProjectSetupSteps({
 								approves the merge.
 							</span>
 						</label>
+						<label className="add-check">
+							<input
+								type="checkbox"
+								checked={view.settings.forkMergeHold}
+								onChange={(e) => {
+									void patch({ forkMergeHold: e.target.checked });
+								}}
+							/>
+							Hold merges of fork-born cards until you approve
+							<span className="hint">
+								Fork-born cards wait at needs_you after a ready turn; your reply
+								approves the merge of the card's work.
+							</span>
+						</label>
 					</section>
 				</>
 			)}
@@ -5028,6 +5042,7 @@ export function updatesChip(s: ProjectView["settings"]): {
 	const retro = s.retroSince !== null;
 	const flags = [
 		s.holdUpdateMerges,
+		s.forkMergeHold,
 		retro,
 		retro && s.retroFilter,
 		s.forkResearch,
@@ -6278,6 +6293,14 @@ export function ProjectSettingsForm({
 								desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
 								checked={st.holdUpdateMerges}
 								save={(v) => send({ holdUpdateMerges: v })}
+								act={act}
+							/>
+							{/* OTTR-689: hold fork-born card merges at needs_you until a reply approves them. */}
+							<CheckRow
+								name="Hold fork-born merges"
+								desc="Fork-born cards wait at needs_you; your reply approves the merge of the card's work before it reaches the target branch. Turning this off does not release parked cards"
+								checked={st.forkMergeHold}
+								save={(v) => send({ forkMergeHold: v })}
 								act={act}
 							/>
 							<CheckRow
