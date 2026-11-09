@@ -664,6 +664,8 @@ export function createPrWatcher(deps: {
 					draft: p.draft,
 					title: p.title,
 					postError: null,
+					commentsAt: null,
+					commentsUnseen: false,
 				});
 				continue;
 			}
@@ -700,6 +702,25 @@ export function createPrWatcher(deps: {
 		}
 		// Converges every card to its row: a reopened PR, or a card an older build left in Done.
 		for (const row of store.listPrReviews()) store.syncPrCard(row.number);
+		// The comment watch: every posted open PR reads the comments since its cutoff.
+		if (store.getSettings().prReviewNotify === true)
+			for (const row of store.listPrReviews()) {
+				if (
+					row.state !== "open" ||
+					row.taskId === null ||
+					row.postedHead === null
+				)
+					continue;
+				// A cancelled card is the user's "never review this PR".
+				if (store.getTask(row.taskId)?.cancelledAt != null) continue;
+				try {
+					await sweepComments(project, repo, row);
+				} catch (e) {
+					deps.log(
+						`prs: ${project.name}: #${row.number} sweep failed: ${(e as Error).message}`,
+					);
+				}
+			}
 		for (const row of store.listPrReviews()) {
 			if (
 				row.state !== "open" ||
@@ -722,6 +743,71 @@ export function createPrWatcher(deps: {
 			}
 			await reviewOnce(project, repo, row, undefined);
 		}
+	}
+
+	/**
+	 * The comment watch of one row: reads the PR's newest conversation and review comments
+	 * since the row's cutoff. A null cutoff initializes to now and stays silent, so the
+	 * first sweep after a deploy never alerts. Comment data is untrusted: only a parseable
+	 * string created_at and a string user.login count, bodies are never read or stored.
+	 * No model call and no daily-cap slot: the watch only reads and writes the two columns.
+	 */
+	async function sweepComments(
+		project: ForkProject,
+		repo: string,
+		row: PrReviewRow,
+	): Promise<void> {
+		const store = project.store;
+		if (row.commentsAt === null) {
+			store.setPrComments(row.number, now(), false);
+			return;
+		}
+		const page = async (path: string): Promise<unknown[]> => {
+			const r = await gh(["api", path]);
+			if (r.code !== 0)
+				throw new Error(
+					`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+				);
+			let body: unknown;
+			try {
+				body = JSON.parse(r.stdout);
+			} catch {
+				throw new Error("comments: bad JSON");
+			}
+			if (!Array.isArray(body)) throw new Error("comments: not a list");
+			return body;
+		};
+		const entries = [
+			...(await page(
+				`repos/${repo}/issues/${row.number}/comments?per_page=100&sort=created&direction=desc`,
+			)),
+			...(await page(
+				`repos/${repo}/pulls/${row.number}/comments?per_page=100&sort=created&direction=desc`,
+			)),
+		];
+		let newest: number | null = null;
+		let count = 0;
+		for (const e of entries) {
+			if (typeof e !== "object" || e === null) continue;
+			const x = e as Record<string, unknown>;
+			const user = x.user as Record<string, unknown> | null | undefined;
+			if (typeof x.created_at !== "string" || typeof user?.login !== "string")
+				continue;
+			const ts = Date.parse(x.created_at);
+			if (
+				Number.isNaN(ts) ||
+				ts <= row.commentsAt ||
+				user.login === row.postedLogin
+			)
+				continue;
+			count++;
+			if (newest === null || ts > newest) newest = ts;
+		}
+		if (count === 0 || newest === null) return;
+		store.setPrComments(row.number, newest, true);
+		// The card may already be read: drop the mark so it wears the unread badge again.
+		if (row.taskId !== null) deps.forgetSeen?.(row.taskId);
+		deps.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
 	}
 
 	/** Runs one review attempt of `row`'s head: diff, prompt (with the re-review context), model, draft. */

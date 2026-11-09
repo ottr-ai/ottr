@@ -8434,6 +8434,195 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(state.tasks.find((c) => c.id === t.id)?.state).toBe("needs_you");
 	});
 
+	test("a comment wave pushes one pr: request event; the drawer ack clears the stamp", async () => {
+		const b = alertBoard("alert-pr-comments");
+		await b.subscribe("https://push.example/pr");
+		const s = b.s;
+		const HEAD = "c".repeat(40);
+		s.savePrReview({
+			number: 4242,
+			taskId: null,
+			head: HEAD,
+			firstSeenAt: 0,
+			reviewedHead: null,
+			postedHead: null,
+			postedUrl: null,
+			postedLogin: null,
+			state: "open",
+			draft: false,
+			title: "Fix it",
+			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
+		});
+		const run = s.startPrRun(4242, HEAD, 1);
+		const t = s.savePrDraft({
+			run,
+			number: 4242,
+			head: HEAD,
+			draft: "draft",
+			prompt: "review",
+		});
+		// The review is posted; the post baseline keeps its own comments silent.
+		s.savePrReview({ ...s.getPrReview(4242)!, postedHead: HEAD });
+		s.setPrComments(4242, 5_000, false);
+		b.m.app.publishState(); // baseline: the first frame alerts nothing
+		const from = pushSends.length;
+		s.setPrComments(4242, 6_000, true);
+		expect(b.m.app.publishState()).toBe(true);
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload).toMatchObject({
+			type: "alert",
+			tag: "request",
+			keys: [`pr:${t.id}:6000`],
+			body: "New comments after your posted review",
+		});
+		// The state frame stamps the occurrence on the card.
+		const state = (await (await b.m.call("/api/state")).json()) as {
+			tasks: Array<{
+				id: string;
+				prOccurrence?: { draft: number | null; comments: number | null };
+			}>;
+		};
+		expect(state.tasks.find((c) => c.id === t.id)?.prOccurrence).toEqual({
+			draft: run,
+			comments: 6000,
+		});
+		// Opening the drawer acks: the wave clears, the cutoff stays, the key lands in seen.
+		expect(
+			(await b.m.call("/api/inbox/seen", { taskIds: [t.id] })).status,
+		).toBe(200);
+		const r = s.getPrReview(4242)!;
+		expect(r.commentsUnseen).toBe(false);
+		expect(r.commentsAt).toBe(6000);
+		let keys = (
+			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
+		).keys;
+		expect(keys).toContain(`pr:${t.id}:6000`);
+		expect(keys).toContain(`task:${t.id}:needs-pr${run}`);
+		// The cleared stamp is over: the next publish prunes the acked key.
+		b.m.app.publishState();
+		keys = (
+			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
+		).keys;
+		expect(keys).not.toContain(`pr:${t.id}:6000`);
+	});
+
+	test("a rewritten draft is a fresh needs_you occurrence keyed by the run id", async () => {
+		const b = alertBoard("alert-pr-draft");
+		await b.subscribe("https://push.example/draft");
+		const s = b.s;
+		const HEAD = "d".repeat(40);
+		s.savePrReview({
+			number: 4243,
+			taskId: null,
+			head: HEAD,
+			firstSeenAt: 0,
+			reviewedHead: null,
+			postedHead: null,
+			postedUrl: null,
+			postedLogin: null,
+			state: "open",
+			draft: false,
+			title: "Fix it",
+			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
+		});
+		const run1 = s.startPrRun(4243, HEAD, 1);
+		const t = s.savePrDraft({
+			run: run1,
+			number: 4243,
+			head: HEAD,
+			draft: "d1",
+			prompt: "review",
+		});
+		b.needsYou(t.id);
+		b.m.app.publishState(); // baseline: the first draft is already in the frame
+		const from = pushSends.length;
+		const run2 = s.startPrRun(4243, HEAD, 2);
+		s.savePrDraft({
+			run: run2,
+			number: 4243,
+			head: HEAD,
+			draft: "d2",
+			prompt: "review",
+		});
+		b.needsYou(t.id);
+		expect(b.m.app.publishState()).toBe(true);
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload).toMatchObject({
+			tag: "request",
+			keys: [`task:${t.id}:needs-pr${run2}`],
+			body: "Review draft updated — re-read it before posting",
+		});
+	});
+
+	test("a quiet project stamps no occurrence and pushes no pr event", async () => {
+		const b = alertBoard("alert-pr-quiet");
+		await b.subscribe("https://push.example/quiet");
+		const s = b.s;
+		const HEAD = "e".repeat(40);
+		s.savePrReview({
+			number: 4244,
+			taskId: null,
+			head: HEAD,
+			firstSeenAt: 0,
+			reviewedHead: null,
+			postedHead: null,
+			postedUrl: null,
+			postedLogin: null,
+			state: "open",
+			draft: false,
+			title: "Fix it",
+			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
+		});
+		const run = s.startPrRun(4244, HEAD, 1);
+		const t = s.savePrDraft({
+			run,
+			number: 4244,
+			head: HEAD,
+			draft: "draft",
+			prompt: "review",
+		});
+		b.needsYou(t.id);
+		b.m.app.publishState(); // baseline
+		const occOf = (await (await b.m.call("/api/state")).json()) as {
+			tasks: Array<{
+				id: string;
+				prOccurrence?: { draft: number | null; comments: number | null };
+			}>;
+		};
+		expect(
+			occOf.tasks.find((c) => c.id === t.id)?.prOccurrence,
+		).toEqual({ draft: run, comments: null });
+		const from = pushSends.length;
+		expect(
+			(
+				await b.m.call(`/api/projects/alert-pr-quiet/settings`, {
+					prReviewNotify: false,
+				})
+			).status,
+		).toBe(200);
+		s.setPrComments(4244, 7_000, true);
+		expect(b.m.app.publishState()).toBe(true);
+		expect(b.sentSince(from)).toEqual([]);
+		// No stamp in the frame: the bell and the event diff see no occurrence at all.
+		const quietFrame = (await (await b.m.call("/api/state")).json()) as {
+			tasks: Array<{
+				id: string;
+				prOccurrence?: { draft: number | null; comments: number | null };
+			}>;
+		};
+		expect(
+			quietFrame.tasks.find((c) => c.id === t.id)?.prOccurrence,
+		).toBeUndefined();
+	});
+
 	test("a focused tab holds pushes for 60 s; held events are dropped, never sent later", async () => {
 		const b = alertBoard("alert-presence");
 		await b.subscribe("https://push.example/presence");
@@ -9287,6 +9476,8 @@ describe("read marks (/api/seen)", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
 		});
 		const pr = store.savePrDraft({
 			run: store.startPrRun(4700, "cafe123", Date.now()),
@@ -10543,6 +10734,8 @@ describe("PR review routes", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
 		});
 		const t = prStore.savePrDraft({
 			run: prStore.startPrRun(n, head, Date.now()),
@@ -10583,6 +10776,21 @@ describe("PR review routes", () => {
 		expect(await errorOf(bad)).toBe("prReviews must be a boolean");
 		await post("/api/projects/p1/settings", { prReviews: false });
 		expect(store.getSettings().prReviews).toBe(false);
+	});
+
+	test("project settings route accepts prReviewNotify and rejects non-boolean", async () => {
+		const ok = await post("/api/projects/p1/settings", {
+			prReviewNotify: false,
+		});
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().prReviewNotify).toBe(false);
+		const bad = await post("/api/projects/p1/settings", {
+			prReviewNotify: "yes",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("prReviewNotify must be a boolean");
+		await post("/api/projects/p1/settings", { prReviewNotify: true });
+		expect(store.getSettings().prReviewNotify).toBe(true);
 	});
 
 	test("project settings route accepts prMode and rejects non-boolean", async () => {
@@ -10760,6 +10968,19 @@ describe("PR review routes", () => {
 		);
 		expect(ghCalls).toEqual([]);
 		expect(row(43).postedHead).toBeNull();
+	});
+
+	test("a successful post sets the comment baseline at the post time", async () => {
+		const t = reviewed(51, H1);
+		const before = Date.now();
+		expect((await postReview(t.id, { body: "Looks good." })).status).toBe(
+			200,
+		);
+		const r = row(51);
+		expect(r.postedHead).toBe(H1);
+		expect(r.commentsUnseen).toBe(false);
+		expect(r.commentsAt ?? 0).toBeGreaterThanOrEqual(before);
+		expect(r.commentsAt ?? 0).toBeLessThanOrEqual(Date.now());
 	});
 
 	test("post sends one COMMENT review at the reviewed head, then refuses the same head", async () => {
@@ -11062,6 +11283,8 @@ describe("PR review routes", () => {
 				draft: false,
 				title: "Fix it",
 				postError: null,
+				commentsAt: null,
+				commentsUnseen: false,
 			});
 			return replyStore.savePrDraft({
 				run: replyStore.startPrRun(n, head, Date.now()),

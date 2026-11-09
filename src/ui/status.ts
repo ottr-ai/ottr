@@ -286,7 +286,7 @@ export function splitAlarms(tasks: readonly TaskCard[]): {
 }
 
 /** One-line alarm summary for the bell/title; "" when nothing needs attention. */
-export function alarmLabel(needs: number, asks: number): string {
+export function alarmLabel(needs: number, asks: number, pr = 0): string {
 	return [
 		needs > 0
 			? needs === 1
@@ -298,6 +298,7 @@ export function alarmLabel(needs: number, asks: number): string {
 				? "1 question asked"
 				: `${asks} questions asked`
 			: null,
+		pr === 1 ? "1 PR review has activity" : pr > 0 ? `${pr} PR reviews have activity` : null,
 	]
 		.filter(Boolean)
 		.join(" · ");

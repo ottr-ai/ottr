@@ -12041,8 +12041,20 @@ export function App() {
 	const usedTotal = SLOT_STAGES.reduce((n, s) => n + slotsAll[s], 0);
 	// One split for the bell, the popover groups and the counts (shared with the rail rows/Overview).
 	const { needs: needTasks, asks: askCards } = splitAlarms(tasks);
-	const alarmLine = alarmLabel(needTasks.length, askCards.length);
-	const alarmCount = needTasks.length + askCards.length;
+	// Projects with PR review notifications off show no PR rows in the bell.
+	const prQuiet = (t: TaskCard): boolean =>
+		t.kind === "pr_review" &&
+		projects.find((p) => p.name === t.project)?.settings.prReviewNotify === false;
+	const needsShown = needTasks.filter((t) => !prQuiet(t));
+	const prActivity = tasks.filter(
+		(t) => t.kind === "pr_review" && t.prOccurrence?.comments != null && !prQuiet(t),
+	);
+	const alarmLine = alarmLabel(
+		needsShown.length,
+		askCards.length,
+		prActivity.length,
+	);
+	const alarmCount = needsShown.length + askCards.length + prActivity.length;
 
 	// Shared notification lines: the inbox panel renders the same content the
 	// entries are keyed from, so rows and keys cannot drift apart.
@@ -12101,8 +12113,13 @@ export function App() {
 	const alarmList =
 		alarmCount > 0
 			? [
-					{ heading: "Action required", tasks: needTasks },
+					{ heading: "Action required", tasks: needsShown },
 					{ heading: "Questions", tasks: askCards },
+					{
+						heading: "PR review activity",
+						tasks: prActivity,
+						prKey: true,
+					},
 				]
 					.filter((g) => g.tasks.length > 0)
 					.map((g) => (
@@ -12113,7 +12130,9 @@ export function App() {
 							<ul className="alarm-list">
 								{g.tasks.map((t) => {
 									const owner = projects.find((p) => p.name === t.project);
-									const key = taskEntryKey(t);
+									const key = g.prKey
+										? `pr:${t.id}:${t.prOccurrence?.comments}`
+										: taskEntryKey(t);
 									return (
 										<li key={t.id} data-inbox-key={key}>
 											<a
@@ -12332,8 +12351,12 @@ export function App() {
 	];
 	const entries: InboxEntry[] = [
 		...(critKey === null ? [] : [{ key: critKey, level: "crit" as const }]),
-		...needTasks.map((t) => ({
+		...needsShown.map((t) => ({
 			key: taskEntryKey(t),
+			level: "needs" as const,
+		})),
+		...prActivity.map((t) => ({
+			key: `pr:${t.id}:${t.prOccurrence?.comments}`,
 			level: "needs" as const,
 		})),
 		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),

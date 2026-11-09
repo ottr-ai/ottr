@@ -30,6 +30,8 @@ const card = (
 	sessionTitle: null,
 	state: "running",
 	stage: "in_progress",
+	prDraft: null,
+	prComments: null,
 	asked: null,
 	answered: false,
 	needsReason: null,
@@ -420,6 +422,89 @@ describe("cancellation and error rekey", () => {
 		expect(key.length).toBeLessThan(40);
 		expect(key).not.toBe(taskEntryKey({ id: "A", asked: ask("other") }));
 		expect(key).toBe(taskEntryKey({ id: "A", asked: ask("q".repeat(5000)) }));
+	});
+});
+
+describe("PR review notifications", () => {
+	const pr = (over: Partial<AlertCardInput> = {}): AlertCardInput =>
+		card("P", {
+			kind: "pr_review",
+			title: "PR review: #12 Fix the thing",
+			...over,
+		});
+
+	test("taskEntryKey carries the draft stamp for pr_review cards only", () => {
+		expect(taskEntryKey(pr({ prDraft: 7 }))).toBe("task:P:needs-pr7");
+		expect(taskEntryKey(pr({ prDraft: null }))).toBe("task:P:needs");
+		expect(taskEntryKey({ id: "A", asked: null })).toBe("task:A:needs");
+	});
+
+	test("a first draft entering needs_you says ready to post", () => {
+		const t = pr({ state: "needs_you", prDraft: 3 });
+		expect(
+			diffEvents([card("P")], [t]).map((e) => [e.class, e.key, e.body]),
+		).toEqual([["request", "task:P:needs-pr3", "Review draft ready to post"]]);
+	});
+
+	test("a rewritten draft on a waiting card is a new occurrence", () => {
+		const old = pr({ state: "needs_you", prDraft: 3 });
+		const t = pr({ state: "needs_you", prDraft: 4 });
+		expect(diffEvents([old], [t]).map((e) => [e.class, e.key, e.body])).toEqual([
+			[
+				"request",
+				"task:P:needs-pr4",
+				"Review draft updated — re-read it before posting",
+			],
+		]);
+		expect(diffEvents([t], [t])).toEqual([]);
+	});
+
+	test("a new head after a post says ready for the new head", () => {
+		const old = pr({ state: "idle", stage: "done", prDraft: 3 });
+		const t = pr({ state: "needs_you", prDraft: 4 });
+		expect(diffEvents([old], [t]).map((e) => e.body)).toEqual([
+			"Review draft ready for the new head",
+		]);
+	});
+
+	test("a same-head re-draft on a posted card is silent", () => {
+		const old = pr({ state: "idle", stage: "done", prDraft: 3 });
+		const t = pr({ state: "idle", stage: "done", prDraft: 4 });
+		expect(diffEvents([old], [t])).toEqual([]);
+	});
+
+	test("a comment wave is one pr: request; reading it is silent", () => {
+		const old = pr({ state: "idle", stage: "done", prDraft: 3 });
+		const wave = pr({
+			state: "idle",
+			stage: "done",
+			prDraft: 3,
+			prComments: 500,
+		});
+		expect(
+			diffEvents([old], [wave]).map((e) => [e.class, e.key, e.body]),
+		).toEqual([["request", "pr:P:500", "New comments after your posted review"]]);
+		expect(diffEvents([wave], [wave])).toEqual([]);
+		const read = pr({ state: "idle", stage: "done", prDraft: 3 });
+		expect(diffEvents([wave], [read])).toEqual([]);
+	});
+
+	test("a draft rewrite outranks a same-frame comment wave", () => {
+		const old = pr({ state: "needs_you", prDraft: 3 });
+		const t = pr({ state: "needs_you", prDraft: 4, prComments: 500 });
+		expect(diffEvents([old], [t]).map((e) => e.key)).toEqual([
+			"task:P:needs-pr4",
+		]);
+	});
+
+	test("pr: alerts retract on a newer or read wave", () => {
+		const a = live("pr:P:500", "request", "P");
+		expect(clearedAlerts([a], [pr({ prComments: 600 })], new Set())).toEqual([
+			a,
+		]);
+		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set())).toEqual([]);
+		expect(clearedAlerts([a], [pr()], new Set())).toEqual([a]);
+		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set(["pr:P:500"]))).toEqual([a]);
 	});
 });
 

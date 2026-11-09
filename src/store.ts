@@ -77,6 +77,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	forkResearch: false,
 	trendingScout: false,
 	prReviews: false,
+	prReviewNotify: true,
 	prMode: false,
 	issueWatch: false,
 	issueWatchSince: null,
@@ -217,7 +218,9 @@ CREATE TABLE IF NOT EXISTS pr_review (
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
-  post_error TEXT
+  post_error TEXT,
+  comments_at INTEGER,
+  comments_unseen INTEGER NOT NULL DEFAULT 0
 );
 ${PR_REVIEW_RUNS_DDL};
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
@@ -382,6 +385,8 @@ interface PrReviewDbRow {
 	draft: number;
 	title: string;
 	post_error: string | null;
+	comments_at: number | null;
+	comments_unseen: number;
 }
 
 function toPrReview(r: PrReviewDbRow): PrReviewRow {
@@ -398,6 +403,8 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		draft: r.draft !== 0,
 		title: r.title,
 		postError: r.post_error,
+		commentsAt: r.comments_at,
+		commentsUnseen: r.comments_unseen !== 0,
 	};
 }
 
@@ -991,6 +998,7 @@ const SETTINGS_SHAPES = {
 	forkResearch: "boolean",
 	trendingScout: "boolean",
 	prReviews: "boolean",
+	prReviewNotify: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
 	issueWatchSince: "number",
@@ -1636,6 +1644,14 @@ export class ProjectStore {
 		// older database still reads and posts without a rebuild.
 		if (!prCols.includes("posted_login"))
 			db.exec("ALTER TABLE pr_review ADD COLUMN posted_login TEXT");
+		// The comment watch landed with the PR review notifications: same additive
+		// convergence, so an older database still sweeps and alerts without a rebuild.
+		if (!prCols.includes("comments_at"))
+			db.exec("ALTER TABLE pr_review ADD COLUMN comments_at INTEGER");
+		if (!prCols.includes("comments_unseen"))
+			db.exec(
+				"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
+			);
 		// pr_review_runs changed shape twice inside the first pr_review releases (head, then
 		// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
 		// prHeadReviewed and the done update then throw "no such column" and the watcher
@@ -2337,6 +2353,25 @@ export class ProjectStore {
 		);
 	}
 
+	/** Writes the two comment columns only: the sweep's cutoff and the unseen flag. */
+	setPrComments(number: number, at: number, unseen: boolean): void {
+		this.db.run(
+			"UPDATE pr_review SET comments_at = ?, comments_unseen = ? WHERE number = ?",
+			[at, unseen ? 1 : 0, number],
+		);
+	}
+
+	/** The PR's newest done review run id: the draft occurrence stamp. Null without a done run. */
+	lastPrRun(number: number): number | null {
+		return (
+			this.db
+				.query<{ id: number }, [number]>(
+					"SELECT id FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
+				)
+				.get(number)?.id ?? null
+		);
+	}
+
 	/**
 	 * Claims the post of `head` in one statement before the GitHub call: only an open PR whose
 	 * reviewed head is `head` and not yet posted wins, so two concurrent Posts send one review.
@@ -2795,6 +2830,8 @@ export class ProjectStore {
 		turns: Map<string, BoardTurnFacts>;
 		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
 		titles: Map<string, string | null>;
+		/** Per pr_review card: the draft run stamp and the unseen comment stamp. */
+		pr: Map<string, { draft: number | null; comments: number | null }>;
 	} {
 		const turns = new Map<string, BoardTurnFacts>();
 		const factsFor = (taskId: string): BoardTurnFacts => {
@@ -2843,7 +2880,25 @@ export class ProjectStore {
 			// Total over the task rows: a turn-less task reads as all-null, not missing.
 			factsFor(r.id);
 		}
-		return { turns, titles };
+		// One grouped query and one row scan per project: the occurrence stamps the board
+		// build and the alert diff read for pr_review cards.
+		const pr = new Map<string, { draft: number | null; comments: number | null }>();
+		const runs = new Map<number, number>();
+		for (const r of this.db
+			.query<{ number: number; id: number }, []>(
+				"SELECT number, MAX(id) AS id FROM pr_review_runs WHERE done = 1 GROUP BY number",
+			)
+			.all())
+			runs.set(r.number, r.id);
+		for (const row of this.listPrReviews()) {
+			if (row.taskId === null) continue;
+			pr.set(row.taskId, {
+				draft: runs.get(row.number) ?? null,
+				comments:
+					row.commentsUnseen && row.commentsAt !== null ? row.commentsAt : null,
+			});
+		}
+		return { turns, titles, pr };
 	}
 
 	/** The task's newest settled turn (id, error, reported outcome, exit code), or null; one

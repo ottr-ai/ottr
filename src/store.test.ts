@@ -425,6 +425,7 @@ describe("settings", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prReviewNotify: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -456,6 +457,7 @@ describe("settings", () => {
 			retroFilter: true,
 			forkResearch: false,
 			prReviews: false,
+			prReviewNotify: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -3614,6 +3616,8 @@ describe("pr review store methods", () => {
 		draft: false,
 		title: "Fix the thing",
 		postError: null,
+		commentsAt: null,
+		commentsUnseen: false,
 	};
 
 	test("prReviews defaults to false", () => {
@@ -3648,6 +3652,8 @@ describe("pr review store methods", () => {
 			draft: true,
 			title: "Fix it",
 			postError: "gh: 502",
+			commentsAt: null,
+			commentsUnseen: false,
 		};
 		store.savePrReview(changed);
 		store.savePrReview({ ...row, number: 3 });
@@ -3681,6 +3687,8 @@ describe("pr review store methods", () => {
 			draft: false,
 			title: "t",
 			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
 		});
 		const run1 = store.startPrRun(12, "abc", 1000);
 		store.startPrRun(12, "abc", 500);

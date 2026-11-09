@@ -178,6 +178,8 @@ export interface ProjectSettings {
 	forkResearch: boolean;
 	/** Hourly PR watch: file or requeue a read-only review card for each settled open PR (off by default). */
 	prReviews: boolean;
+	/** Bell entry and Web Push for PR review drafts, draft updates and new comments after a posted review; off keeps the badges and lanes only. */
+	prReviewNotify: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
@@ -320,6 +322,10 @@ export interface PrReviewRow {
 	draft: boolean;
 	title: string;
 	postError: string | null;
+	/** Newest comment time the watcher has surfaced (epoch ms); the comment sweep's cutoff. Null before the first sweep. */
+	commentsAt: number | null;
+	/** The current comment wave is unseen: the bell row and the `pr:` alert are live. */
+	commentsUnseen: boolean;
 }
 
 /** The PR facts a pr_review card's drawer shows. */
@@ -867,6 +873,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	worktreeFiles?: string[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
+	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */
+	prOccurrence?: { draft: number | null; comments: number | null };
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
 	lateCommits?: LateCommit[];
 	/** The retro card filed after this card (kind "retro", followUpOf this card); this card's
@@ -935,6 +943,9 @@ export type TaskCard = Omit<
 	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
+	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
+	 * the unseen comment stamp that key the bell occurrences (board build and event diff). */
+	prOccurrence?: { draft: number | null; comments: number | null };
 	/** OTTR-506: stamped on queued merges the push hold parks while local main has commits
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
 	 * gets no git, so the server derives the fact (pushHold) and stamps it. */

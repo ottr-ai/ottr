@@ -96,6 +96,39 @@ A draft that nobody posted waits for the user, so the card must not hide in Done
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
 - A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review (a new head) rewrites the draft and drops the read mark, so the updated card wears the badge again.
 
+### Notifications and the comment watch
+
+The board marks PR review activity NEW and notifies. The project setting `prReviewNotify` (default `true`) controls the bell entries and the pushes. Project settings show a "PR review notifications" checkbox under "PR reviews". When it is off, the project makes no PR review bell entry and no push: no draft event, no update event, no comment event, and the watcher reads no comments. The badges and the board lanes work the same with the setting off.
+
+#### Draft updates
+
+- `AlertCardInput` gains `prDraft: number | null`: the id of the PR's last done review run; null without a saved draft. `TaskCard` gains the optional `prOccurrence` `{ draft, comments }`; the board build stamps it on `pr_review` cards. Projects with the setting off get no stamp.
+- `taskEntryKey` of a `pr_review` card with a draft is `task:<id>:needs-pr<draft>`. A new draft is a new occurrence: a rewritten draft raises a fresh request event with a fresh bell entry, also while the card already waits at `needs_you`.
+- A same-head re-draft on a posted card (the card sits at `done/idle`) keeps the badge-only behavior: that draft cannot pass the post claim, so it raises no event.
+- The request event body of a PR review card names the draft state: `Review draft ready to post` (first draft, or a card that came back to `needs_you` after a post), `Review draft updated — re-read it before posting` (rewrite while the card waits). The event title names the project and the PR as before.
+
+#### Comment watch
+
+- Each tick, for every `pr_review` row that is `open`, has a card, has a posted review, and whose project has the setting on, the watcher reads the newest comments of the PR: `repos/{repo}/issues/N/comments` and `repos/{repo}/pulls/N/comments`, each with `per_page=100&sort=created&direction=desc`, first page only.
+- Entries are untrusted data. A comment counts when it has a parseable string `created_at`, a string `user.login`, a time strictly after the row's `comments_at`, and a login that differs from the row's `posted_login`. Comment bodies are not stored.
+- A row with a null `comments_at` initializes it to the time of the check and alerts nothing, so the first sweep after the deploy stays silent. A successful Post sets `comments_at` to the post time, so the posted review's own comments never alert.
+- A wave of new comments runs one store write: `comments_at` becomes the newest comment time and `comments_unseen` becomes 1. The watcher drops the card's read mark, so the card wears NEW again. The sweep makes no model call and takes no daily-cap slot.
+- A failed read logs and leaves `comments_at`, so a later tick retries. A failure of one PR never stops the sweep of the other PRs.
+
+#### Comment occurrence
+
+- `AlertCardInput` gains `prComments: number | null`: the row's `comments_at` while `comments_unseen` is 1, else null.
+- A stamp change raises one request event with key `pr:<taskId>:<stamp>` and body `New comments after your posted review`. The live alert retracts when the stamp clears or moves, when the card is gone or cancelled, or when the entry is acknowledged.
+- The seen prune keeps a `pr:` key only while it names the card's current unseen stamp.
+- Opening the card's drawer (the `taskIds` path of `POST /api/inbox/seen`) clears `comments_unseen`, keeps `comments_at`, and acknowledges the stamp key, so the bell row and the live alert clear like a read. The next wave is new again.
+- The bell shows a "PR review activity" group in the alarm list: one row per card with an unseen comment stamp, keyed `pr:<taskId>:<stamp>`. A click acknowledges the entry and opens the drawer. The alarm label counts the group.
+
+#### Store
+
+- `pr_review` gains `comments_at INTEGER` and `comments_unseen INTEGER NOT NULL DEFAULT 0`, in the `SCHEMA` text and additively migrated in `ProjectStore.open` (the `posted_url` pattern). `savePrReview` keeps its explicit column list and never writes the two comment columns.
+- `ProjectSettings.prReviewNotify: boolean`, default `true`, in `DEFAULT_SETTINGS` and `SETTINGS_SHAPES`. `POST /api/projects/:project/settings` accepts it; a value that is not a boolean gets 400 `prReviewNotify must be a boolean`.
+- New store calls: `setPrComments(number, at, unseen)` writes only the two comment columns; `lastPrRun(number)` returns the newest done run id of the PR; `boardCardFacts` returns the per-card PR occurrence map.
+
 ### Inline comments
 
 The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it.
@@ -141,6 +174,12 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - With the app configured and an installation found, the post call carries the installation token, and the board token's `gh` path stays unused.
 - With no app, or with an installation 404, the post uses the board token and the response reports `via: "token"`.
 - The private key never appears in any API response, log line or error text: a fixed-seed fast-check property over random error paths asserts this against the responses and the git-hosts view.
+- A rewritten draft on a waiting card raises a new request event with a new occurrence key and the update body. A first draft says `Review draft ready to post`. A new head after a post says `Review draft ready for the new head`.
+- A comment from another login after a posted review sets the unseen stamp, drops the read mark, and raises one `pr:` request event; the bell shows the activity row and the alarm label counts it.
+- A comment by the posting login, and comments at or before the cutoff, alert nothing. The first sweep after the deploy sets the cutoff and alerts nothing.
+- Opening the drawer clears the unseen stamp and acks the stamp key; the bell row and the live alert retract, and the next wave is new again.
+- With `prReviewNotify` off: the watcher polls no comments, the state ships no occurrence stamp, no PR review event pushes, and the bell shows no PR review row; badges and lanes still work.
+- A live database gains the two comment columns on open; a fresh database creates them with the table. `savePrReview` never clears a comment stamp.
 
 ## Non-goals
 
@@ -149,3 +188,5 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - GitHub webhooks.
 - A post without a click.
 - `APPROVE` or `REQUEST_CHANGES` events.
+- The comment watch starts no re-review and no model call; it reads only.
+- Comments on closed or merged PRs, and comment bodies as stored data.

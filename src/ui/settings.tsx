@@ -6779,6 +6779,15 @@ export function ProjectSettingsForm({
 								act={act}
 							/>
 							<CheckRow
+								sub
+								name="PR review notifications"
+								desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
+								checked={st.prReviewNotify}
+								disabled={!st.prReviews && !st.prReviewNotify}
+								save={(v) => send({ prReviewNotify: v })}
+								act={act}
+							/>
+							<CheckRow
 								name="PR mode"
 								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
 								checked={st.prMode}

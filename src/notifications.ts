@@ -34,12 +34,19 @@ function askHash(text: string): string {
 	return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
 
-/** Occurrence key of a needs_you card's inbox entry: a new ask round is a new entry. */
+/** Occurrence key of a needs_you card's inbox entry: a new ask round is a new entry, and a
+ * new PR review draft (a fresh run id) is one too. */
 export function taskEntryKey(t: {
 	id: string;
 	asked: AskQuestion[] | null;
+	kind?: TaskKind;
+	prOccurrence?: { draft: number | null } | null;
 }): string {
-	return `task:${t.id}:${t.asked === null ? "needs" : `ask-${askHash(JSON.stringify(t.asked))}`}`;
+	const draft =
+		t.kind === "pr_review" && t.prOccurrence?.draft != null
+			? `-pr${t.prOccurrence.draft}`
+			: "";
+	return `task:${t.id}:${t.asked === null ? `needs${draft}` : `ask-${askHash(JSON.stringify(t.asked))}`}`;
 }
 
 /** Card facts the event diff reads. Built by the server from TaskCard + its latest turn. */
@@ -51,6 +58,13 @@ export interface AlertCardInput {
 	state: string;
 	stage: string;
 	kind?: TaskKind;
+	/** Id of the PR's last done review run; null without a saved draft, or when the project
+	 * keeps PR review notifications off. Changes on every saved draft, so a rewrite is a new
+	 * needs_you occurrence. */
+	prDraft: number | null;
+	/** The card's unseen comment stamp (`pr_review.comments_at` while the wave is unseen);
+	 * null when every comment wave is read or none arrived. A change is one new occurrence. */
+	prComments: number | null;
 	asked: AskQuestion[] | null;
 	answered: boolean;
 	needsReason: string | null;
@@ -132,8 +146,27 @@ export function diffEvents(
 			const body =
 				t.asked !== null && t.asked.length > 0
 					? t.asked.map((q) => q.question).join(" · ")
-					: (t.needsReason ?? "Action required");
+					: t.kind === "pr_review"
+						? old === undefined || (old.prDraft ?? null) === null
+							? "Review draft ready to post"
+							: old.state !== "needs_you"
+								? "Review draft ready for the new head"
+								: "Review draft updated — re-read it before posting"
+						: (t.needsReason ?? "Action required");
 			out.push(ev("request", taskEntryKey(t), body));
+			continue;
+		}
+		// A new comment wave on a posted review is its own occurrence, whatever place the
+		// card sits at. It clears when the user reads it (the stamp nulls) or a newer wave
+		// replaces it, so one live `pr:` alert per card is enough.
+		if (t.prComments !== null && t.prComments !== (old?.prComments ?? null)) {
+			out.push(
+				ev(
+					"request",
+					`pr:${t.id}:${t.prComments}`,
+					"New comments after your posted review",
+				),
+			);
 			continue;
 		}
 		if (
@@ -219,6 +252,8 @@ export function clearedAlerts(
 		if (t === undefined || t.cancelled) return true;
 		if (a.key.startsWith("task:"))
 			return t.state !== "needs_you" || taskEntryKey(t) !== a.key;
+		if (a.key.startsWith("pr:"))
+			return a.key !== `pr:${t.id}:${t.prComments}`;
 		if (a.key.startsWith("done:")) {
 			// An answered question-only card completes without entering done.
 			return t.stage !== "done" && !t.answered;

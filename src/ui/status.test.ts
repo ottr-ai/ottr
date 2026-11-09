@@ -338,6 +338,15 @@ test("alarmLabel singular, plural, and empty", () => {
 	expect(alarmLabel(0, 0)).toBe("");
 });
 
+test("alarmLabel PR review segment", () => {
+	expect(alarmLabel(1, 0, 0)).toBe("1 task needs action");
+	expect(alarmLabel(0, 0, 1)).toBe("1 PR review has activity");
+	expect(alarmLabel(0, 0, 2)).toBe("2 PR reviews have activity");
+	expect(alarmLabel(1, 1, 1)).toBe(
+		"1 task needs action · 1 question asked · 1 PR review has activity",
+	);
+});
+
 test("strykerProgress splits pct, tested/total, and the stats tail", () => {
 	expect(
 		strykerProgress(

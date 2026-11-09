@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import { PROMPT_CHAR_BUDGET } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
+import type { PrReviewRow } from "./types.ts";
 import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
@@ -1410,5 +1411,155 @@ describe("createPrWatcher", () => {
 		expect(s.store.prReviewRunsSince(0)).toBe(PR_GATES.PROJECT_DAILY_RUNS);
 		expect(s.logs.some((m) => m.includes("daily cap"))).toBe(true);
 		expect(s.prompts).toHaveLength(PR_GATES.PROJECT_DAILY_RUNS);
+	});
+
+	/** Posts PR `n`'s review by hand and returns the row; the card id rides on the row. */
+	async function postRow(
+		s: {
+			store: ProjectStore;
+			watcher: { tick(): Promise<void> };
+			setOpen: (v: { number: number; head: { sha: string } }[]) => void;
+			advance: (ms: number) => void;
+		},
+		n: number,
+		extra: Partial<PrReviewRow> = {},
+	) {
+		s.setOpen([pr(n, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		s.store.savePrReview({
+			...s.store.getPrReview(n)!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", n)}#pullrequestreview-1`,
+			postedLogin: "bot",
+			...extra,
+		});
+		// savePrReview never writes the comment columns; the cutoff goes through its own call.
+		if (extra.commentsAt !== undefined && extra.commentsAt !== null)
+			s.store.setPrComments(n, extra.commentsAt, false);
+		return s.store.getPrReview(n)!;
+	}
+
+	test("the first sweep initializes the cutoff silently, without reading comments", async () => {
+		const s = setup();
+		await postRow(s, 51, { commentsAt: null });
+		s.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
+		s.setPullComments([ghComment("bob", "2026-06-02T00:00:00Z", "hi")]);
+		await s.watcher.tick();
+		const row = s.store.getPrReview(51)!;
+		expect(row.commentsAt).not.toBeNull();
+		expect(row.commentsUnseen).toBe(false);
+		expect(s.calls.every((c) => !c.includes("/comments"))).toBe(true);
+		expect(s.forgotten).toEqual([]);
+	});
+
+	test("a wave of new comments marks the card unseen, stores the newest time and unreads it", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 52, { commentsAt: cutoff });
+		const id = s.cards()[0]!.id;
+		s.setIssueComments([ghComment("alice", "2026-01-02T00:00:00Z", "hello")]);
+		s.setPullComments([ghComment("bob", "2026-01-03T00:00:00Z", "hi")]);
+		await s.watcher.tick();
+		const row = s.store.getPrReview(52)!;
+		expect(row.commentsUnseen).toBe(true);
+		expect(row.commentsAt).toBe(Date.parse("2026-01-03T00:00:00Z"));
+		expect(s.forgotten).toEqual([id]);
+		expect(s.logs.some((m) => m.includes("#52: 2 new comment(s)"))).toBe(
+			true,
+		);
+	});
+
+	test("the author's own comments, stale comments and malformed entries count nothing", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 53, { commentsAt: cutoff });
+		s.setIssueComments([
+			// The posted review's author never alerts.
+			ghComment("bot", "2026-06-01T00:00:00Z", "my own reply"),
+			// Strictly after the cutoff, not at it.
+			ghComment("alice", "2026-01-01T00:00:00Z", "at the cutoff"),
+			// Untrusted shapes without a usable date or login are skipped.
+			ghComment("alice", "not a date", "bad date"),
+			{ created_at: "2026-06-02T00:00:00Z", body: "no user here" },
+			{ user: { login: "alice" }, created_at: 42, body: "date not a string" },
+		]);
+		await s.watcher.tick();
+		const row = s.store.getPrReview(53)!;
+		expect(row.commentsUnseen).toBe(false);
+		expect(row.commentsAt).toBe(cutoff);
+		expect(s.forgotten).toEqual([]);
+		expect(s.logs.some((m) => m.includes("new comment"))).toBe(false);
+	});
+
+	test("a failed comments read logs, keeps the cutoff and retries later", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 54, { commentsAt: cutoff });
+		s.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
+		const logs: string[] = [];
+		const watcher = createPrWatcher({
+			projects: () => [
+				{ name: "p", path: s.store.serverDir, store: s.store, github: "o/r" },
+			],
+			log: (m) => logs.push(m),
+			gh: async (args) => {
+				const path = args.at(-1) ?? "";
+				if (path.includes("/comments"))
+					return { code: 1, stdout: "", stderr: "HTTP 500" };
+				return { code: 0, stdout: JSON.stringify([pr(54, sha("a"))]), stderr: "" };
+			},
+		});
+		await watcher.tick();
+		const row = s.store.getPrReview(54)!;
+		expect(row.commentsAt).toBe(cutoff);
+		expect(row.commentsUnseen).toBe(false);
+		expect(
+			logs.some((m) => m.includes("#54 sweep failed") && m.includes("HTTP 500")),
+		).toBe(true);
+	});
+
+	test("prReviewNotify false reads no comments", async () => {
+		const s = setup();
+		s.store.setSettings({ prReviewNotify: false });
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 55, { commentsAt: cutoff });
+		s.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
+		await s.watcher.tick();
+		expect(s.calls.every((c) => !c.includes("/comments"))).toBe(true);
+		expect(s.store.getPrReview(55)!.commentsUnseen).toBe(false);
+	});
+
+	test("a closed row and a row without a card read no comments", async () => {
+		const s = setup();
+		await postRow(s, 56, { commentsAt: Date.parse("2026-01-01T00:00:00Z") });
+		// The user merged the PR: the row leaves open on the next tick.
+		s.closed.set(56, { merged_at: "2026-01-01T00:00:00Z" });
+		s.setOpen([]);
+		await s.watcher.tick();
+		expect(s.calls.every((c) => !c.includes("/comments"))).toBe(true);
+		expect(s.store.getPrReview(56)!.state).toBe("merged");
+
+		const t = setup();
+		await postRow(t, 57, {
+			commentsAt: Date.parse("2026-01-01T00:00:00Z"),
+			taskId: null,
+		});
+		t.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
+		await t.watcher.tick();
+		expect(t.calls.every((c) => !c.includes("/comments"))).toBe(true);
+		expect(t.store.getPrReview(57)!.commentsUnseen).toBe(false);
+	});
+
+	test("a comment wave takes no daily-cap slot", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 58, { commentsAt: cutoff });
+		const runs = s.store.prReviewRunsSince(0);
+		s.setIssueComments([ghComment("alice", "2026-06-01T00:00:00Z", "hello")]);
+		await s.watcher.tick();
+		expect(s.store.prReviewRunsSince(0)).toBe(runs);
+		expect(s.prompts).toHaveLength(0);
 	});
 });

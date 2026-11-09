@@ -1378,6 +1378,8 @@ export function createApp(deps: AppDeps) {
 				summary: t.summary,
 				errorTurn: err.errorTurn,
 				errorText: err.errorText,
+				prDraft: t.prOccurrence?.draft ?? null,
+				prComments: t.prOccurrence?.comments ?? null,
 				cancelled: t.cancelledAt !== null,
 			};
 		});
@@ -1385,7 +1387,8 @@ export function createApp(deps: AppDeps) {
 
 	/** Drops task-derived seen keys whose occurrence is over: a `task:` key no card's current
 	 * needs_you entry carries, `done:<id>` of a card gone or out of done, `error:<id>:<turn>` of a
-	 * card gone or past that turn. Notice and crit keys stay; the client drops those itself. */
+	 * card gone or past that turn, and a `pr:<id>:<stamp>` key whose stamp is read or whose card
+	 * is gone. Notice and crit keys stay; the client drops those itself. */
 	function pruneInboxSeen(
 		seen: readonly string[],
 		inputs: readonly AlertCardInput[],
@@ -1406,6 +1409,16 @@ export function createApp(deps: AppDeps) {
 				return (
 					cut > 0 &&
 					byId.get(rest.slice(0, cut))?.errorTurn === rest.slice(cut + 1)
+				);
+			}
+			if (k.startsWith("pr:")) {
+				const rest = k.slice("pr:".length);
+				const cut = rest.lastIndexOf(":");
+				const c = cut > 0 ? byId.get(rest.slice(0, cut)) : undefined;
+				return (
+					c !== undefined &&
+					c.prComments !== null &&
+					k === `pr:${c.id}:${c.prComments}`
 				);
 			}
 			return true;
@@ -3372,7 +3385,8 @@ export function createApp(deps: AppDeps) {
 		let keptStale = 0;
 		for (const e of deps.projects.values()) {
 			try {
-				const days = e.store.getSettings().keptWorktreeDays;
+				const settings = e.store.getSettings();
+				const days = settings.keptWorktreeDays;
 				const cards: TaskCard[] = [];
 				const medians = turnMedians(e.store.turnDurations());
 				// Per-task turn facts and stored titles, batched: two queries per project
@@ -3440,6 +3454,13 @@ export function createApp(deps: AppDeps) {
 						...extra,
 						...(trendingRepos.has(t.id)
 							? { trendingRepo: trendingRepos.get(t.id) }
+							: {}),
+						// PR review occurrence stamp: the bell and the event diff read it. A project
+						// with notifications off ships no stamp, so no pr event raises at all.
+						...(t.kind === "pr_review" &&
+						settings.prReviewNotify === true &&
+						facts.pr.has(t.id)
+							? { prOccurrence: facts.pr.get(t.id) }
 							: {}),
 					});
 				}
@@ -3864,6 +3885,12 @@ export function createApp(deps: AppDeps) {
 			if (typeof pr !== "boolean")
 				return json({ error: "prReviews must be a boolean" }, 400);
 			patch.prReviews = pr;
+		}
+		const prn = body.prReviewNotify;
+		if (prn !== undefined) {
+			if (typeof prn !== "boolean")
+				return json({ error: "prReviewNotify must be a boolean" }, 400);
+			patch.prReviewNotify = prn;
 		}
 		const pm = body.prMode;
 		if (pm !== undefined) {
@@ -4732,9 +4759,21 @@ export function createApp(deps: AppDeps) {
 		// Diff the cards against the kept baseline and push out-of-band (closed phone app).
 		// Fire-and-forget: a push failure never breaks the publish.
 		try {
+			// A project with prReviewNotify off alerts nothing: strip its pr events before the
+			// push (also the first needs_you request event) — the diff never sees the quiet set.
+			const quiet = new Set(
+				inputs
+					.filter(
+						(t) =>
+							t.kind === "pr_review" &&
+							deps.projects.get(t.project)?.store.getSettings()
+								.prReviewNotify !== true,
+					)
+					.map((t) => t.id),
+			);
 			pushAlerts(
 				inputs,
-				diffEvents(lastAlertInputs, inputs),
+				diffEvents(lastAlertInputs, inputs).filter((e) => !quiet.has(e.taskId)),
 				new Set(state.inboxSeen),
 			);
 		} catch (err) {
@@ -5853,17 +5892,53 @@ export function createApp(deps: AppDeps) {
 						const added = liveAlerts
 							.filter((a) => ids.has(a.taskId))
 							.map((a) => a.key);
+						let prFlagCleared = false;
 						for (const e of deps.projects.values()) {
 							for (const id of ids) {
 								try {
 									const t = e.store.getTask(id);
-									if (t?.state === "needs_you") added.push(taskEntryKey(t));
+									if (t === null) continue;
+									if (t.kind === "pr_review") {
+										// The drawer opened on a PR review card: clear an unseen comment
+										// wave and ack its stamp key, so the bell row and the live alert
+										// retract like a read. The next wave is new again.
+										const row = e.store.getPrReviewByTask(id);
+										if (row !== null) {
+											if (row.commentsUnseen) {
+												e.store.setPrComments(
+													row.number,
+													row.commentsAt ?? Date.now(),
+													false,
+												);
+												prFlagCleared = true;
+											}
+											if (row.commentsAt !== null)
+												added.push(`pr:${id}:${row.commentsAt}`);
+										}
+										added.push(
+											taskEntryKey({
+												id: t.id,
+												asked: t.asked,
+												kind: t.kind,
+												prOccurrence: {
+													draft:
+														row !== null
+															? e.store.lastPrRun(row.number)
+															: null,
+												},
+											}),
+										);
+									} else if (t.state === "needs_you")
+										added.push(taskEntryKey(t));
 								} catch (err) {
 									logStoreError(e.store.name, err);
 								}
 							}
 						}
 						next = [...before, ...ackKeys(added, liveAlerts)];
+						// The cleared comment stamp must reach the frame even when the seen list
+						// did not change: the bell row and the live alert read the occurrence.
+						if (prFlagCleared) publishSoon();
 					}
 					const after = normalizeSeen(next);
 					if (
@@ -8834,6 +8909,8 @@ export function createApp(deps: AppDeps) {
 						// No parseable body: the drawer just shows the posted head without a link.
 					}
 					e.store.setPrPostedUrl(row.number, url, login);
+					// The posted review's own comments must never alert: the baseline is the post time.
+					e.store.setPrComments(row.number, Date.now(), false);
 					// The head is posted: the card leaves needs_you for done/idle.
 					e.store.syncPrCard(row.number);
 					return json({ ok: true, login, via, inline: draft.comments.length });
