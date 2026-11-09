@@ -222,6 +222,13 @@ export async function alateRotateKey(
 		};
 	return { ok: true, body: { key: body.key } };
 }
+
+/** True when an alate editor error says the folder's filesystem refused (EROFS) or denied
+ *  (EACCES) the write: the data folder is mounted read-only into the alate container. Alate's
+ *  health carries no writability field, so only the failed save can say it. */
+export function readOnlyMountError(error: string): boolean {
+	return /\b(?:EROFS|EACCES)\b/.test(error);
+}
 export const CONFIG_YML = "user/omp/agent/config.yml";
 // Alate's source fields reach gh api paths: only plain names, hex commits and safe branches.
 // GitHub owners hold no dots, and a repo is never "." or "..": no segment can climb the path.

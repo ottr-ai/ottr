@@ -170,6 +170,8 @@ export type RolesSave =
 	| {
 			kind: "readonly";
 			path: string;
+			/** "mount": the folder sits on a read-only mount; "plain": the folder is not a git repo. */
+			cause: "plain" | "mount";
 	  }
 	| {
 			kind: "conflict";
@@ -193,7 +195,8 @@ const isObj = (v: unknown): v is Obj =>
 
 /** Classifies the save response; `body` is untrusted JSON, so only own, well-typed fields count.
     A saved answer's `base` is the new commit for GitHub-repo sources, and null for Alate's data
-    folder, which is not a git repo; a 400 with exactly the read-only error locks the editor. */
+    folder, which is not a git repo; a 400 with exactly the read-only error locks the editor, and
+    its `cause` picks the hint (mount: the folder sits on a read-only mount; plain: no git repo). */
 export function classifyRolesSave(
 	ok: boolean,
 	status: number,
@@ -236,7 +239,11 @@ export function classifyRolesSave(
 		error === "read-only: folder source" &&
 		path !== undefined
 	)
-		return { kind: "readonly", path };
+		return {
+			kind: "readonly",
+			path,
+			cause: own("cause") === "mount" ? "mount" : "plain",
+		};
 	if (ok && commit && hash && roles && seed)
 		return {
 			kind: "saved",

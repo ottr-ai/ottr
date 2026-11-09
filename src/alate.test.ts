@@ -9,6 +9,7 @@ import {
 	loadConfigYml,
 	noRedirectFetch,
 	readConfigYml,
+	readOnlyMountError,
 	saveConfigYml,
 } from "./alate.ts";
 
@@ -520,6 +521,28 @@ describe("loadConfigYml", () => {
 			status: 404,
 			error: "no file",
 		});
+	});
+});
+
+describe("readOnlyMountError", () => {
+	test("matches alate's raw filesystem refusal codes, nothing else", () => {
+		expect(
+			readOnlyMountError(
+				"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+			),
+		).toBe(true);
+		expect(
+			readOnlyMountError(
+				"EACCES: permission denied, open '/data/user/omp/agent/config.yml'",
+			),
+		).toBe(true);
+		expect(readOnlyMountError("EROFS")).toBe(true);
+		expect(readOnlyMountError("read-only: folder source")).toBe(false);
+		expect(
+			readOnlyMountError("cannot reach alate server: connect ECONNREFUSED"),
+		).toBe(false);
+		expect(readOnlyMountError("NEROFS: not a real code")).toBe(false);
+		expect(readOnlyMountError("alate returned 500")).toBe(false);
 	});
 });
 

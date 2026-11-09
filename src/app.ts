@@ -21,6 +21,7 @@ import {
 	commitConfigYml,
 	loadConfigYml,
 	noRedirectFetch,
+	readOnlyMountError,
 	refreshAlateSnapshot,
 	saveConfigYml,
 } from "./alate.ts";
@@ -6044,7 +6045,22 @@ export function createApp(deps: AppDeps) {
 								f.body.hash,
 								message,
 							);
-							if (!w.ok) return json({ error: w.error }, w.status);
+							if (!w.ok) {
+								// A read-only mount fails alate's PUT before any byte: alate
+								// answers its raw fs error (EROFS/EACCES). Map it to the
+								// read-only answer with the mount cause, so the editor locks
+								// with the mount hint instead of showing the raw code.
+								if (readOnlyMountError(w.error))
+									return json(
+										{
+											error: "read-only: folder source",
+											path,
+											cause: "mount",
+										},
+										400,
+									);
+								return json({ error: w.error }, w.status);
+							}
 							if (w.body.commit === "") {
 								// Plain folder: alate wrote the bytes without a commit. Read-only
 								// must not leave an uncommitted write in an unversioned folder, so

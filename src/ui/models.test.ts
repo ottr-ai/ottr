@@ -235,7 +235,21 @@ test("classifyRolesSave: 400 read-only: folder source with a path is readonly", 
 			error: "read-only: folder source",
 			path: "/data",
 		}),
-	).toEqual({ kind: "readonly", path: "/data" });
+	).toEqual({ kind: "readonly", path: "/data", cause: "plain" });
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "read-only: folder source",
+			path: "/data",
+			cause: "mount",
+		}),
+	).toEqual({ kind: "readonly", path: "/data", cause: "mount" });
+	expect(
+		classifyRolesSave(false, 400, {
+			error: "read-only: folder source",
+			path: "/data",
+			cause: "other",
+		}),
+	).toEqual({ kind: "readonly", path: "/data", cause: "plain" });
 	expect(
 		classifyRolesSave(false, 400, { error: "read-only: folder source" }),
 	).toEqual({

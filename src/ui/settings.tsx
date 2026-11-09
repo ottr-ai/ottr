@@ -3668,7 +3668,10 @@ export function ModelRolesSection() {
 		{},
 	);
 	const [error, setError] = useState<string | null>(null);
-	const [ro, setRo] = useState<string | null>(null);
+	const [ro, setRo] = useState<{
+		path: string;
+		cause: "plain" | "mount";
+	} | null>(null);
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
@@ -3835,7 +3838,7 @@ export function ModelRolesSection() {
 					await res.json().catch(() => ({})),
 				);
 				if (r.kind === "readonly") {
-					setRo(r.path);
+					setRo({ path: r.path, cause: r.cause });
 					setRows(Object.entries(state.roles));
 					setChains(rowChains(Object.keys(state.roles), state.fallbacks));
 					setError(null);
@@ -3897,9 +3900,20 @@ export function ModelRolesSection() {
 			}
 			hint={
 				<>
-					omp runs each role with its model, then with its fallbacks in order.
-					Save commits <code>user/omp/agent/config.yml</code> to Alate's data
-					repo with the board's GitHub token, then Alate provisions the workers.
+					omp runs each role with its model, then with its fallbacks in order.{" "}
+					{state?.base === null ? (
+						<>
+							Save writes <code>user/omp/agent/config.yml</code> through Alate's
+							file editor: Alate commits the folder itself when it is a git repo
+							(no GitHub token), then Alate provisions the workers.
+						</>
+					) : (
+						<>
+							Save commits <code>user/omp/agent/config.yml</code> to Alate's
+							data repo with the board's GitHub token, then Alate provisions the
+							workers.
+						</>
+					)}
 				</>
 			}
 		>
@@ -3997,12 +4011,19 @@ export function ModelRolesSection() {
 					{ro !== null && (
 						<>
 							<p className="auth-error" role="alert">
-								read-only: folder source {ro}
+								read-only: folder source {ro.path}
 							</p>
 							<p className="hint">
-								Alate's data folder is not a git repo, so a save cannot commit.
-								Make the folder a git repo or point Alate at a GitHub repo, then
-								reload the settings.
+								{ro.cause === "mount" ? (
+									<>
+										The data folder is mounted read-only into Alate. Make the
+										mount writable, or edit{" "}
+										<code>user/omp/agent/config.yml</code> in the folder, then
+										run Import and Provision in Alate, and reload the settings.
+									</>
+								) : (
+									"Alate's data folder is not a git repo, so a save cannot commit. Make the folder a git repo or point Alate at a GitHub repo, then reload the settings."
+								)}
 							</p>
 						</>
 					)}

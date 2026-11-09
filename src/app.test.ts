@@ -4031,6 +4031,9 @@ extensions:
 	let pathMode = false;
 	let folderGit = true;
 	let putConflict = false;
+	// A PUT failure before any byte: alate's answer body and status (a read-only
+	// mount answers its raw fs error with a 500).
+	let putFail: { status: number; error: string } | null = null;
 	let puts: { path: string; base: string; content: string; message: string }[] =
 		[];
 	// gh api calls; `pending` holds the tree content until the ref moves.
@@ -4045,6 +4048,7 @@ extensions:
 		pathMode = false;
 		folderGit = true;
 		putConflict = false;
+		putFail = null;
 		puts = [];
 		ghCalls = [];
 		pending = null;
@@ -4087,6 +4091,11 @@ extensions:
 					content: string;
 					message: string;
 				};
+				if (putFail)
+					return Response.json(
+						{ error: putFail.error },
+						{ status: putFail.status },
+					);
 				if (putConflict || body.base !== sha(snapshot))
 					return Response.json(
 						{
@@ -4566,6 +4575,34 @@ extensions:
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
 		});
+	});
+
+	test("a read-only mounted folder maps alate's EROFS to the read-only answer", async () => {
+		reset();
+		pathMode = true;
+		putFail = {
+			status: 500,
+			error:
+				"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+		};
+		const res = await m.call("/api/model-roles", {
+			base: null,
+			hash: sha(ORIGINAL),
+			roles: {
+				default: "zai/glm-5.3-flash:max",
+				slow: "zai/glm-5.3-flash:max",
+			},
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "read-only: folder source",
+			path: "/data",
+			cause: "mount",
+		});
+		// The PUT failed before alate wrote any byte: no write, no undo write, no GitHub call.
+		expect(puts).toEqual([]);
+		expect(ghCalls).toEqual([]);
+		expect(snapshot).toBe(ORIGINAL);
 	});
 
 	test("an alate editor conflict passes through", async () => {
