@@ -1,11 +1,20 @@
 // Regenerates the README screenshot (.github/assets/screenshot.png) from the demo board.
 // `bun run readme-screenshot` in a work turn refreshes the shot a board-visible src/ui
 // change made stale (AGENTS.md work turn). The script drives headless Chrome over CDP
-// with Bun's WebSocket client, so it adds no npm dependency. Spec: docs/specs/readme-screenshot.md.
-import { mkdirSync, mkdtempSync, readdirSync } from "node:fs";
-import net from "node:net";
-import { homedir, tmpdir } from "node:os";
+// with Bun's WebSocket client, so it adds no npm dependency. The shared shot machinery
+// lives in scripts/shot-lib.ts. Spec: docs/specs/readme-screenshot.md.
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+	Cdp,
+	fail,
+	findChrome,
+	freePort,
+	PNG_SIGNATURE,
+	stopChildren,
+	withTimeout,
+} from "./shot-lib.ts";
 
 const REPO = resolve(import.meta.dir, "..");
 const OUT = resolve(REPO, ".github/assets/screenshot.png");
@@ -13,213 +22,28 @@ const WIDTH = 1440;
 const HEIGHT = 900;
 const LOCALE = "en-US";
 const SETTLE_MS = 2500;
-const PNG_SIGNATURE = "89504e470d0a1a0a";
-
-type Json = Record<string, unknown>;
-
-function asJson(value: unknown): Json {
-	return typeof value === "object" && value !== null ? (value as Json) : {};
-}
-
-function fail(message: string): never {
-	console.error(`readme-screenshot: ${message}`);
-	process.exit(1);
-}
-
-/**
- * Chrome builds found in the puppeteer caches, newest version first. The homedir cache comes
- * first, then /root's: a service HOME (/etc/ottr/home) leaves the homedir cache empty. The
- * stable sort keeps the homedir build ahead on a version tie.
- */
-function cacheBuilds(): { path: string; version: string }[] {
-	const layouts = [
-		{ re: /^linux-(\d[\d.]*)$/, exe: "chrome-linux64/chrome" },
-		{ re: /^win-(\d[\d.]*)$/, exe: "chrome-win64/chrome.exe" },
-	];
-	const roots = new Set([
-		join(homedir(), ".cache", "puppeteer"),
-		join("/root", ".cache", "puppeteer"),
-	]);
-	const cacheDirs = [...roots].flatMap((root) =>
-		["chrome", "chrome-headless-shell"].map((name) => join(root, name)),
-	);
-	const builds: { path: string; version: string }[] = [];
-	for (const cacheDir of cacheDirs) {
-		let entries: string[] = [];
-		try {
-			entries = readdirSync(cacheDir);
-		} catch {
-			continue; // cache folder absent
-		}
-		for (const entry of entries) {
-			for (const layout of layouts) {
-				const hit = entry.match(layout.re);
-				if (hit) {
-					builds.push({
-						path: join(cacheDir, entry, layout.exe),
-						version: hit[1] ?? "0",
-					});
-				}
-			}
-		}
-	}
-	return builds.sort((a, b) =>
-		b.version.localeCompare(a.version, "en", { numeric: true }),
-	);
-}
-
-/** Newest Chrome from the puppeteer cache, else PATH; OTTR_SCREENSHOT_CHROME wins up front. */
-function findChrome(): string {
-	const override = process.env.OTTR_SCREENSHOT_CHROME;
-	if (override) return override;
-	const newest = cacheBuilds()[0];
-	if (newest) return newest.path;
-	for (const name of [
-		"google-chrome",
-		"google-chrome-stable",
-		"chromium",
-		"chromium-browser",
-		"chrome",
-	]) {
-		const found = Bun.which(name);
-		if (found) return found;
-	}
-	return fail(
-		"no Chrome found; install Chrome or point OTTR_SCREENSHOT_CHROME at a chrome binary",
-	);
-}
-
-function freePort(): Promise<number> {
-	const { promise, resolve, reject } = Promise.withResolvers<number>();
-	const probe = net.createServer();
-	probe.listen(0, "127.0.0.1", () => {
-		const address = probe.address();
-		if (typeof address !== "object" || address === null) {
-			reject(new Error("probe gave no port"));
-			return;
-		}
-		resolve(address.port);
-		probe.close();
-	});
-	probe.on("error", reject);
-	return promise;
-}
-
-function withTimeout<T>(
-	promise: Promise<T>,
-	ms: number,
-	label: string,
-): Promise<T> {
-	const { promise: timedOut, reject } = Promise.withResolvers<never>();
-	const timer = setTimeout(
-		() => reject(new Error(`${label} timed out after ${ms} ms`)),
-		ms,
-	);
-	return Promise.race([promise, timedOut]).finally(() => clearTimeout(timer));
-}
-
-/** Minimal CDP client over Bun's WebSocket: id-matched replies, event waiters. */
-class Cdp {
-	#ws: WebSocket;
-	#nextId = 1;
-	#pending = new Map<
-		number,
-		{ resolve: (value: Json) => void; reject: (error: Error) => void }
-	>();
-	#events: {
-		method: string;
-		sessionId: string | undefined;
-		resolve: (value: Json) => void;
-		reject: (error: Error) => void;
-	}[] = [];
-
-	constructor(ws: WebSocket) {
-		this.#ws = ws;
-	}
-
-	/** Pipes every CDP message into handle(); call once after open(). */
-	listen(): void {
-		this.#ws.addEventListener("message", (ev) => {
-			try {
-				this.handle(JSON.parse(String(ev.data)) as unknown);
-			} catch {
-				// not JSON: nothing to dispatch
-			}
-		});
-	}
-
-	open(): Promise<void> {
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		this.#ws.addEventListener("open", () => resolve(), { once: true });
-		this.#ws.addEventListener(
-			"error",
-			() => reject(new Error("the CDP socket failed to open")),
-			{ once: true },
-		);
-		return promise;
-	}
-
-	send(method: string, params?: Json, sessionId?: string): Promise<Json> {
-		const { promise, resolve, reject } = Promise.withResolvers<Json>();
-		const id = this.#nextId++;
-		this.#pending.set(id, { resolve, reject });
-		this.#ws.send(JSON.stringify({ id, method, params, sessionId }));
-		return promise;
-	}
-
-	waitEvent(method: string, sessionId?: string): Promise<Json> {
-		const { promise, resolve, reject } = Promise.withResolvers<Json>();
-		this.#events.push({ method, sessionId, resolve, reject });
-		return promise;
-	}
-
-	handle(raw: unknown): void {
-		const msg = asJson(raw);
-		if (typeof msg.id === "number") {
-			const wait = this.#pending.get(msg.id);
-			this.#pending.delete(msg.id);
-			if (!wait) return;
-			if (msg.error !== undefined) {
-				wait.reject(
-					new Error(
-						`CDP error: ${String(asJson(msg.error).message ?? "unknown")}`,
-					),
-				);
-			} else {
-				wait.resolve(asJson(msg.result));
-			}
-			return;
-		}
-		if (typeof msg.method !== "string") return;
-		const sessionId =
-			typeof msg.sessionId === "string" ? msg.sessionId : undefined;
-		const index = this.#events.findIndex(
-			(e) => e.method === msg.method && e.sessionId === sessionId,
-		);
-		if (index >= 0) {
-			const [entry] = this.#events.splice(index, 1);
-			entry?.resolve(asJson(msg.params));
-		}
-	}
-}
 
 function verifyPng(png: Buffer): void {
 	if (png.subarray(0, 8).toString("hex") !== PNG_SIGNATURE) {
 		fail(
+			"readme-screenshot",
 			`output is not a PNG (first bytes ${png.subarray(0, 8).toString("hex")})`,
 		);
 	}
 	const width = png.readUInt32BE(16);
 	const height = png.readUInt32BE(20);
 	if (width !== WIDTH || height !== HEIGHT) {
-		fail(`wrong size ${width}x${height}, expected ${WIDTH}x${HEIGHT}`);
+		fail(
+			"readme-screenshot",
+			`wrong size ${width}x${height}, expected ${WIDTH}x${HEIGHT}`,
+		);
 	}
 	console.log(
 		`readme-screenshot: wrote ${OUT} (${width}x${height}, ${png.length} bytes)`,
 	);
 }
 
-const chromePath = findChrome();
+const chromePath = findChrome("readme-screenshot");
 const port = await freePort();
 const boardUrl = `http://127.0.0.1:${port}/#lumen`;
 
@@ -356,24 +180,6 @@ async function capture(): Promise<void> {
 	verifyPng(png);
 }
 
-/** SIGTERM to the children this script spawned, SIGKILL when a child ignores it. */
-async function stopChildren(): Promise<void> {
-	const stop = async (proc: {
-		exitCode: number | null;
-		exited: Promise<number>;
-		kill: (signal?: number) => void;
-	}) => {
-		if (proc.exitCode === null) proc.kill();
-		const escalation = setTimeout(() => {
-			if (proc.exitCode === null) proc.kill(9);
-		}, 5_000);
-		await proc.exited;
-		clearTimeout(escalation);
-	};
-	await stop(chrome);
-	await stop(board);
-}
-
 let failure: Error | null = null;
 const run = capture();
 try {
@@ -390,8 +196,8 @@ try {
 } catch (err) {
 	failure = err instanceof Error ? err : new Error(String(err));
 } finally {
-	await stopChildren();
+	await stopChildren(chrome, board);
 }
 // A deadline win can leave capture() pending; keep its rejection from crashing the exit.
 run.catch(() => {});
-if (failure) fail(failure.message);
+if (failure) fail("readme-screenshot", failure.message);

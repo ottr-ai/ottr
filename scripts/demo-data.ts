@@ -29,7 +29,7 @@ const POOL_VERSION = 5;
 type Stage = "todo" | "in_progress" | "merging" | "done";
 type RunState = "queued" | "preparing" | "running" | "needs_you" | "idle";
 
-interface Spec {
+export interface Spec {
 	/** Prompt override; review cards use the architecture-review marker. */
 	prompt?: string;
 	title: string;
@@ -58,7 +58,7 @@ interface Spec {
 	review?: boolean;
 }
 
-interface ProjectSpec {
+export interface ProjectSpec {
 	name: string;
 	displayName: string;
 	rules: boolean;
@@ -360,7 +360,7 @@ function git(cwd: string, ...args: string[]): void {
 }
 
 /** Lifecycle event row; the specialized inserts below keep the original SQL literals. */
-function insertEvent(
+export function insertEvent(
 	db: Database,
 	id: string,
 	kind: string,
@@ -407,7 +407,7 @@ interface TaskSeed {
 	spec: Spec;
 }
 
-function insertTaskRow(
+export function insertTaskRow(
 	db: Database,
 	project: ProjectSpec,
 	t: Spec,
@@ -557,7 +557,7 @@ function seedMergeEvents(
 	// plain queued merge: held or waiting for a slot, no merge turn yet
 }
 
-function seedTaskEvents(db: Database, seed: TaskSeed): void {
+export function seedTaskEvents(db: Database, seed: TaskSeed): void {
 	const { spec: t, id, prompt, createdAt, isDone } = seed;
 	insertEvent(db, id, "create", null, "todo", createdAt);
 	if (t.work === undefined) return; // todo or review card: nothing ran yet
