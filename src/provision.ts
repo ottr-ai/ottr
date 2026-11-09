@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, statSync } from "node:fs";
+import {
+	type Dirent,
+	lstatSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+} from "node:fs";
 import { join } from "node:path";
 
 /** Alate's content fingerprint for one provisioned file: sha256 over CRLF-normalized
@@ -49,11 +55,13 @@ function withoutDeploymentBlocks(text: string): string {
 }
 
 /** Drift of the provisioned agent layer in `home`, one line per finding, [] when clean.
- * Lines: `<.rel> changed` | `<.rel> missing` | `<.rel> unreadable`,
- * then a final `… +N more` line when more than 40 findings. Never throws.
+ * Lines: `<.rel> changed` | `<.rel> missing` | `<.rel> unreadable` | `<.rel> untracked`
+ * (untracked only for rule files planted in the rules dir), then a final `… +N more` line
+ * when more than 40 findings. Never throws.
  * Files the manifest never recorded are machine state or unrecorded extras — they make
  * no finding, because an added file neither changes what alate provisions nor makes the
- * next provision refuse. */
+ * next provision refuse. Rules audit through their own record, the rules dir's
+ * `.alate-installed.json` (sync.mjs rewrites it from the snapshot every provision). */
 export function auditProvisioned(home: string, sinceMs?: number): string[] {
 	try {
 		// Layer mode: a pinned turn writes its own layer by design, and alate no longer
@@ -62,57 +70,149 @@ export function auditProvisioned(home: string, sinceMs?: number): string[] {
 			return [];
 
 		const manifestPath = join(home, ".alate", "installed.json");
-		let manifest: Record<string, string>;
+		let manifest: Record<string, string> | null = null;
 		try {
-			manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+			const parsed: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+			if (
+				typeof parsed === "object" &&
+				parsed !== null &&
+				!Array.isArray(parsed)
+			)
+				manifest = parsed as Record<string, string>;
 		} catch {
-			return [];
+			// No manifest or an unreadable one: no install-user baseline for those
+			// files; the rules record below still audits on its own.
 		}
-		// A manual provision rewrote the home inside the run's window; its writes are not
-		// this run's drift.
-		if (sinceMs !== undefined && statSync(manifestPath).mtimeMs > sinceMs)
-			return [];
-
-		// A hostile manifest must never send the walk outside home.
-		const valid: string[] = [];
-		for (const rel of Object.keys(manifest)) {
-			if (rel.startsWith("/")) continue;
-			const segs = rel.split("/");
-			if (segs.some((s) => s === "" || s === ".." || s.includes("\\")))
-				continue;
-			valid.push(rel);
+		if (
+			manifest !== null &&
+			sinceMs !== undefined &&
+			statSync(manifestPath).mtimeMs > sinceMs
+		) {
+			// A manual provision rewrote the home inside the run's window; its writes
+			// are not this run's drift.
+			manifest = null;
 		}
 
 		const tracked: string[] = [];
-		for (const rel of valid) {
-			const p = join(home, `.${rel}`);
-			try {
-				lstatSync(p);
-			} catch {
-				tracked.push(`.${rel} missing`);
-				continue;
+		if (manifest !== null) {
+			// A hostile manifest must never send the walk outside home.
+			const valid: string[] = [];
+			for (const rel of Object.keys(manifest)) {
+				if (rel.startsWith("/")) continue;
+				const segs = rel.split("/");
+				if (segs.some((s) => s === "" || s === ".." || s.includes("\\")))
+					continue;
+				valid.push(rel);
 			}
-			let bytes: Buffer;
-			try {
-				bytes = readFileSync(p);
-			} catch {
-				tracked.push(`.${rel} unreadable`);
-				continue;
+			for (const rel of valid) {
+				const p = join(home, `.${rel}`);
+				try {
+					lstatSync(p);
+				} catch {
+					tracked.push(`.${rel} missing`);
+					continue;
+				}
+				let bytes: Buffer;
+				try {
+					bytes = readFileSync(p);
+				} catch {
+					tracked.push(`.${rel} unreadable`);
+					continue;
+				}
+				// config.yml's deployment blocks are target-local; alate records and compares
+				// the config without them, so the audit must strip the same blocks.
+				if (rel === "omp/agent/config.yml")
+					bytes = Buffer.from(
+						withoutDeploymentBlocks(bytes.toString("utf8")),
+						"utf8",
+					);
+				if (provisionFingerprint(rel, bytes) !== manifest[rel])
+					tracked.push(`.${rel} changed`);
 			}
-			// config.yml's deployment blocks are target-local; alate records and compares
-			// the config without them, so the audit must strip the same blocks.
-			if (rel === "omp/agent/config.yml")
-				bytes = Buffer.from(
-					withoutDeploymentBlocks(bytes.toString("utf8")),
-					"utf8",
-				);
-			if (provisionFingerprint(rel, bytes) !== manifest[rel])
-				tracked.push(`.${rel} changed`);
 		}
 
 		// Everything the manifest never recorded is machine state (agent.db, sessions,
 		// caches) that alate itself creates, or an unrecorded extra: neither changes what
 		// alate provisions nor makes the next provision refuse, so neither is a finding.
+
+		// Rules install through sync.mjs, whose own record (.alate-installed.json in the
+		// rules dir) is their manifest — the install-user manifest holds no rule keys. The
+		// record maps a flat rule name to the same alate fingerprint; the next provision
+		// overwrites snapshot-covered rules, keeps an edited dropped rule, and rewrites
+		// this record from the snapshot every run.
+		const rulesRecordPath = join(
+			home,
+			".omp",
+			"agent",
+			"rules",
+			".alate-installed.json",
+		);
+		let recorded: Record<string, string> | null = null;
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(rulesRecordPath, "utf8"));
+			if (typeof parsed === "object" && parsed !== null) {
+				recorded = {};
+				for (const [k, v] of Object.entries(parsed))
+					if (typeof v === "string") recorded[k] = v;
+			}
+		} catch {
+			// No record or an unreadable one: no rules baseline, no rules findings.
+		}
+		// The same run-window rule as the manifest: a mid-run sync rewrote the record,
+		// and its writes are not this run's drift.
+		let fresh = true;
+		try {
+			fresh = statSync(rulesRecordPath).mtimeMs <= (sinceMs ?? Infinity);
+		} catch {
+			fresh = false; // the record vanished between the read and the stat
+		}
+		if (recorded !== null && fresh) {
+			const rulesDir = join(home, ".omp", "agent", "rules");
+			for (const [name, sha] of Object.entries(recorded)) {
+				if (
+					name.startsWith("/") ||
+					name
+						.split("/")
+						.some((s) => s === "" || s === ".." || s.includes("\\"))
+				)
+					continue;
+				const p = join(rulesDir, name);
+				try {
+					lstatSync(p);
+				} catch {
+					tracked.push(`.omp/agent/rules/${name} missing`);
+					continue;
+				}
+				let bytes: Buffer;
+				try {
+					bytes = readFileSync(p);
+				} catch {
+					tracked.push(`.omp/agent/rules/${name} unreadable`);
+					continue;
+				}
+				if (provisionFingerprint(name, bytes) !== sha)
+					tracked.push(`.omp/agent/rules/${name} changed`);
+			}
+			// The rules dir holds exactly the record and the snapshot's rules — a flat,
+			// sync-managed dir with no machine state — so an unrecorded entry is a
+			// planted rule: the one place an add is a finding.
+			let entries: Dirent[];
+			try {
+				entries = readdirSync(rulesDir, { withFileTypes: true });
+			} catch {
+				entries = [];
+			}
+			for (const e of [...entries].sort((a, b) =>
+				a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+			)) {
+				if (
+					e.name === ".alate-installed.json" ||
+					recorded[e.name] !== undefined
+				)
+					continue;
+				tracked.push(`.omp/agent/rules/${e.name} untracked`);
+			}
+		}
 
 		if (tracked.length > 40)
 			tracked.splice(40, tracked.length, `… +${tracked.length - 40} more`);

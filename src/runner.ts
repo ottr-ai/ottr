@@ -476,13 +476,14 @@ export function classify(o: {
 	});
 
 	// The provision guard outweighs every other rule: a run that left the alate-provisioned
-	// agent layer drifted parks even on a received receipt — the next provision refuses the
-	// changed files, and the only fix is a data-repo commit (docs/specs/turn-provision-guard.md).
+	// agent layer drifted parks even on a received receipt — the next provision refuses or
+	// overwrites the changed files, and the only fix is a data-repo commit
+	// (docs/specs/turn-provision-guard.md).
 	if (result.provisionDrift?.length) {
 		const shown = result.provisionDrift.slice(0, 4);
 		const more = result.provisionDrift.length - shown.length;
 		return needs(
-			`A turn changed the alate-provisioned agent layer: ${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+			`A turn changed the alate-provisioned agent layer: ${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}. The next provision refuses or overwrites these files — do not edit the installed copies; change it in agent-data, then reply.`,
 		);
 	}
 

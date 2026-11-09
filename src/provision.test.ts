@@ -49,6 +49,30 @@ const write = (rel: string, content: string): void => {
 	writeFileSync(p, content);
 };
 
+// Provisions one rule through sync.mjs's own record: writes the file into the rules
+// dir and records its fingerprint in `.alate-installed.json`, the record the audit
+// reads for rules (the install-user manifest holds no rule keys).
+const provisionRule = (name: string, content: string): void => {
+	const p = join(home, ".omp", "agent", "rules", name);
+	mkdirSync(join(p, ".."), { recursive: true });
+	writeFileSync(p, content);
+	const recordPath = join(
+		home,
+		".omp",
+		"agent",
+		"rules",
+		".alate-installed.json",
+	);
+	let record: Record<string, string> = {};
+	try {
+		record = JSON.parse(readFileSync(recordPath, "utf8"));
+	} catch {
+		// first provision: the record does not exist yet
+	}
+	record[name] = provisionFingerprint(name, Buffer.from(content));
+	writeFileSync(recordPath, JSON.stringify(record, null, 2));
+};
+
 describe("provisionFingerprint", () => {
 	test("normalizes CRLF to LF", () => {
 		expect(provisionFingerprint("x/f.md", Buffer.from("a\r\nb\r\n"))).toBe(
@@ -255,6 +279,87 @@ describe("auditProvisioned", () => {
 		expect(auditProvisioned(home)).toEqual([
 			".b/second.md changed",
 			".a/first.md changed",
+		]);
+	});
+
+	test("a matching rules record audits clean", () => {
+		setup();
+		provisionRule("GUARDRAILS.md", "# rules\n");
+		provisionRule("asd-ste100.md", "# ste\n");
+		expect(auditProvisioned(home)).toEqual([]);
+	});
+
+	test("an edited rule flags changed, a deleted one missing", () => {
+		setup();
+		provisionRule("guard.md", "# v1\n");
+		provisionRule("gone.md", "# v1\n");
+		write("omp/agent/rules/guard.md", "# v2\n");
+		rmSync(join(home, ".omp", "agent", "rules", "gone.md"));
+		expect(auditProvisioned(home)).toEqual([
+			".omp/agent/rules/guard.md changed",
+			".omp/agent/rules/gone.md missing",
+		]);
+	});
+
+	test("a planted rule file and dir flag untracked, sorted", () => {
+		setup();
+		provisionRule("real.md", "# real\n");
+		write("omp/agent/rules/planted.md", "# planted\n");
+		write("omp/agent/rules/sub/nested.md", "# nested\n");
+		expect(auditProvisioned(home)).toEqual([
+			".omp/agent/rules/planted.md untracked",
+			".omp/agent/rules/sub untracked",
+		]);
+	});
+
+	test("a corrupt rules record skips the rules audit", () => {
+		setup();
+		write("omp/agent/rules/planted.md", "x\n");
+		writeFileSync(
+			join(home, ".omp", "agent", "rules", ".alate-installed.json"),
+			"{oops",
+		);
+		expect(auditProvisioned(home)).toEqual([]);
+	});
+
+	test("no rules record skips the rules audit", () => {
+		setup();
+		write("omp/agent/rules/plain.md", "# no record\n");
+		expect(auditProvisioned(home)).toEqual([]);
+	});
+
+	test("a rules record rewritten inside the run window skips rules findings", () => {
+		setup();
+		provisionRule("guard.md", "# v1\n");
+		write("omp/agent/rules/guard.md", "# v2\n");
+		utimesSync(
+			join(home, ".omp", "agent", "rules", ".alate-installed.json"),
+			new Date(3e15),
+			new Date(3e15),
+		);
+		expect(auditProvisioned(home, 1e12)).toEqual([]);
+		expect(auditProvisioned(home, 4e15)).toEqual([
+			".omp/agent/rules/guard.md changed",
+		]);
+	});
+
+	test("layer mode stays silent with a rules record present", () => {
+		setup();
+		provisionRule("guard.md", "# v1\n");
+		write("omp/agent/rules/guard.md", "# drift\n");
+		writeFileSync(join(home, ".alate", "current"), "layer");
+		expect(auditProvisioned(home)).toEqual([]);
+	});
+
+	test("rules findings follow the manifest findings", () => {
+		setup();
+		provision("omp/agent/skills/x/SKILL.md", "# hi\n");
+		provisionRule("guard.md", "# v1\n");
+		write("omp/agent/skills/x/SKILL.md", "# drift\n");
+		write("omp/agent/rules/guard.md", "# drift\n");
+		expect(auditProvisioned(home)).toEqual([
+			".omp/agent/skills/x/SKILL.md changed",
+			".omp/agent/rules/guard.md changed",
 		]);
 	});
 });

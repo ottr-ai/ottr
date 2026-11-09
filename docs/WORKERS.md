@@ -1180,11 +1180,14 @@ guard does not cover them.
 Alate provisions the agent layer (skills, rules, managed skills, config.yml) into the shared
 home from the data repo. The home copy takes no hand edits: the only path for a layer change
 is agent-data -> import -> provision. When a run settles, its container audits the files that
-alate's manifest records, `~/.alate/installed.json` (src/provision.ts,
-docs/specs/turn-provision-guard.md). A provisioned file that changed or went missing fails
-the turn: the card parks at needs_you and names the files. The audit only reads; it never
-blocks a write. It stays off when `.alate/current` exists (layer mode): a pinned turn writes
-its own layer, and alate no longer maintains the flat trees.
+alate's manifest records, `~/.alate/installed.json`, plus the rules through their own record,
+`.omp/agent/rules/.alate-installed.json` (src/provision.ts, docs/specs/turn-provision-guard.md).
+A provisioned file that changed or went missing fails the turn: the card parks at needs_you
+and names the files. A rule file planted in the rules dir fails it too. Extensions are not
+recorded anywhere, so a turn that edits an installed extension produces no finding today.
+The audit only reads; it never blocks a write. It stays off when `.alate/current` exists
+(layer mode): a pinned turn writes its own layer, and alate no longer maintains the flat
+trees.
 
 ## Crash recovery
 

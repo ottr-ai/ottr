@@ -39,26 +39,45 @@ alate's own manifest, `<home>/.alate/installed.json`. Drift fails the turn.
   `omp/marketplaces.json` without the `updatedAt` key. This matches alate's
   `install-user.mjs` record check; verified against this deployment's real
   manifest (469 entries, 0 false drift).
-- Drift lines: `<path> changed`, `<path> missing`, `<path> unreadable`. The
-  audit compares manifest entries only. Files the manifest never records are
-  machine state (agent.db, sessions, node_modules) or unrecorded extras; they
-  make no finding, because an added file neither changes what alate
-  provisions nor makes the next provision refuse. Verified against the real
-  home: a structural untracked-file check flagged `agent.db`, `sessions` and
-  plugin `node_modules`, so it does not ship. Rules installed by sync.mjs
-  keep their own `.alate-installed.json` record in the rules dir and sit
-  outside this audit; extensions are not manifest-covered either. The list
-  caps at 40 lines, then one `… +N more` line.
+- Drift lines: `<path> changed`, `<path> missing`, `<path> unreadable`, and
+  `<path> untracked` for the rules dir only. The audit compares manifest
+  entries only; files the manifest never records elsewhere are machine state
+  (agent.db, sessions, node_modules) or unrecorded extras; they make no
+  finding, because an added file neither changes what alate provisions nor
+  makes the next provision refuse. Verified against the real home: a
+  structural untracked-file check over all trees flagged `agent.db`,
+  `sessions` and plugin `node_modules`, so it does not ship.
+- Rules audit through their own record: sync.mjs installs the rules into
+  `.omp/agent/rules/` and writes `.omp/agent/rules/.alate-installed.json`,
+  one flat rule name per sha256 fingerprint, with the same alate
+  fingerprint formula. Every recorded rule must exist and match; the rules
+  dir holds exactly the record and the snapshot's rules, so an unrecorded
+  entry there flags as untracked (a planted rule, the rules-injection
+  class). The install-user manifest holds no rule keys. The next provision
+  overwrites snapshot-covered rules, keeps an edited dropped rule, deletes a
+  dropped rule nobody edited, and rewrites the record from the snapshot, so
+  a record tamper self-heals. Residual: a run that edits a rule and the
+  record in the same breath escapes until that rewrite.
+- Extensions stay outside the audit: nothing records them (no manifest
+  keys, no per-dir record), so a turn that edits an installed extension
+  produces no finding today.
+- The list caps at 40 lines, then one `… +N more` line.
 - Skips (the audit returns no drift, never throws):
-  - no manifest or an unparsable one: alate never provisioned this home;
+  - no manifest or an unparsable one: no install-user baseline for those
+    files; the rules record still audits on its own (and the mirror case:
+    no rules record or an unreadable one skips the rules only);
   - an `.alate/current` entry exists (layer mode): pinned turns write their
-    own layer by design, and alate no longer maintains the flat trees;
-  - the manifest's mtime sits inside the run's window: a manual provision
-    rewrote the home mid-run, and its writes are not this run's drift.
+    own layer by design, and alate no longer maintains the flat trees —
+    this skip covers both sources;
+  - a record's mtime sits inside the run's window: a manual provision or
+    sync rewrote that source mid-run, and its writes are not this run's
+    drift. The two sources skip independently.
 - Failure: the run result carries `provisionDrift`; `classify` parks the card
   at needs_you before every other rule. The reason names the files and says
   to change it in agent-data. A turn that reported ready still parks: drift
-  defeats the receipt.
+  defeats the receipt. The next provision refuses install-user-manifest
+  files, and overwrites or keeps rules; either way a hand edit never reaches
+  the layer through a turn.
 
 ## Error cases
 
@@ -83,7 +102,10 @@ alate's own manifest, `<home>/.alate/installed.json`. Drift fails the turn.
 - A test changes a provisioned file's bytes and proves the run settles with
   `provisionDrift` naming it, and `classify` returns needs_you with the file
   name and "change it in agent-data".
-- A test proves the skips: layer mode, no manifest, mid-run provision.
+- A test edits a rule and proves the audit flags it through the rules dir's
+  `.alate-installed.json` record, and a planted rule file flags untracked.
+- A test proves the skips: layer mode, no manifest, mid-run provision, for
+  both the manifest and the rules record.
 - A test proves a clean home audits empty, machine state included
   (agent.db, sessions, node_modules produce no finding).
 - `bun run check` and `bun test` pass.

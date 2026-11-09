@@ -943,7 +943,7 @@ describe("classify", () => {
 		).toEqual({
 			stage: "in_progress",
 			state: "needs_you",
-			needsReason: `A turn changed the alate-provisioned agent layer: ${drift[0]}. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+			needsReason: `A turn changed the alate-provisioned agent layer: ${drift[0]}. The next provision refuses or overwrites these files — do not edit the installed copies; change it in agent-data, then reply.`,
 		});
 		// A received ready report cannot outweigh drift: the next provision refuses the files.
 		expect(
@@ -961,7 +961,7 @@ describe("classify", () => {
 		).toEqual({
 			stage: "in_progress",
 			state: "needs_you",
-			needsReason: `A turn changed the alate-provisioned agent layer: .agents/x.md changed, .ottr/workers/y.json missing. The next provision refuses these files — do not edit the installed copies; change it in agent-data, then reply.`,
+			needsReason: `A turn changed the alate-provisioned agent layer: .agents/x.md changed, .ottr/workers/y.json missing. The next provision refuses or overwrites these files — do not edit the installed copies; change it in agent-data, then reply.`,
 		});
 		// The reason names at most four files, then counts the rest.
 		expect(
