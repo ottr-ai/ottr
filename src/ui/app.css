@@ -5213,8 +5213,11 @@ dialog.confirm-dialog {
 .settings-field textarea {
 	width: 100%;
 }
+/* Number answers are short (the wizard's Runner cap holds one digit): the field sizes
+   to its answer, not to the row. 7ch fits max=8 beside the native spin buttons. */
 .settings-field input[type="number"] {
 	font-variant-numeric: tabular-nums;
+	width: 7ch;
 }
 /* Read-only identity values (folder path, GitHub link): wrap instead of overflow. */
 .settings-field > code,
@@ -8018,6 +8021,46 @@ button.log-mode[aria-pressed="true"] {
    keeps its own height and lines up with the input. */
 .settings-sec .alate-def-row > .alate-def-actions:has(.alate-field-stack) {
 	align-items: flex-start;
+}
+/* Number answers are short (a cap, a day count, an interval): the label stops
+   stretching and the field hugs its answer. Width follows the input's max —
+   when a max changes, revisit its width. Fields with no max (the runner caps,
+   max images) hold two digits. */
+.settings-sec
+	.alate-def-row
+	> .alate-def-actions
+	> label:has(> input[type="number"]) {
+	flex: 0 0 auto;
+}
+.settings-sec
+	.alate-def-row
+	> .alate-def-actions
+	> label
+	> input[type="number"] {
+	width: 8ch;
+}
+.settings-sec
+	.alate-def-row
+	> .alate-def-actions
+	> label
+	> input[type="number"][max="365"] {
+	width: 9ch;
+}
+.settings-sec
+	.alate-def-row
+	> .alate-def-actions
+	> label
+	> input[type="number"][max="10000"] {
+	width: 12ch;
+}
+/* A DefRow without a Save on its row renders the value bare in the grid, where the
+   width: 100% rule above stretches it: number answers hug the answer here too,
+   with the same width-follows-max scheme as the actions rows. */
+.settings-sec .alate-def-row > label > input[type="number"] {
+	width: 8ch;
+}
+.settings-sec .alate-def-row > label > input[type="number"][max="365"] {
+	width: 9ch;
 }
 /* Usage windows inside a sign-in row: span both columns of the row grid. */
 .settings-sec .alate-def-row .quota {
