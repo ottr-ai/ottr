@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "../src/globalStore.ts";
+import { RETRO_MARKER } from "../src/prompts.ts";
 import { mergeHold } from "../src/scheduler.ts";
 import { ProjectStore } from "../src/store.ts";
 import type { RunState, Stage, TaskKind } from "../src/types.ts";
@@ -255,15 +256,18 @@ test("seed covers every display shape with clean checkouts", () => {
 test("the seeded retro files a proposal that waits for a decision", () => {
 	const lookup = byId(firstBoard);
 	const lumen = firstBoard.lumen!;
-	const source = lumen.tasks.find((t) =>
-		/heatmap legend contrast/.test(t.title),
+	const source = lumen.tasks.find(
+		(t) => t.title === "Fix the heatmap legend contrast the review flagged",
 	)!;
 	const retro = lookup.get(`${source.id}-retro`)!;
 	expect(retro.kind).toBe("retro");
 	expect(retro.stage).toBe("done");
 	expect(retro.state).toBe("idle");
 	expect(retro.follow_up_of).toBe(source.id);
-	expect(retro.prompt).toMatch(/^Retro of /);
+	// The marker rides once over the source title, in the prompt and the title alike
+	// (src/prompts.ts retroPrompt): a doubled "Retro of Retro of" is the defect this pins.
+	expect(retro.prompt).toBe(`${RETRO_MARKER}${source.title}`);
+	expect(retro.title).toBe(`${RETRO_MARKER}${source.title}`);
 	expect(retro.done_at).not.toBeNull();
 	expect(retro.commits).toBeNull();
 	// The source card's Work steps show the retro's turn, so the retro has one.

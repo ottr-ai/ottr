@@ -188,7 +188,7 @@ const POOL: ProjectSpec[] = [
 				research: true,
 			},
 			{
-				title: "Retro of Fix the heatmap legend contrast the review flagged",
+				title: "Fix the heatmap legend contrast the review flagged",
 				retro: true,
 				stage: "done",
 				state: "idle",
@@ -454,8 +454,10 @@ export function insertTaskRow(
 	const id = t.retro
 		? `${prefix}-${(t.followUpOf ?? 0) + 1}-retro`
 		: `${prefix}-${project.tasks.slice(0, i).filter((x) => !x.retro).length + 1}`;
-	const prompt =
-		t.prompt ?? (t.retro ? `${RETRO_MARKER}${t.title}` : `fix: ${t.title}`);
+	// A retro's prompt and title carry the marker once, over the source card's title
+	// (src/prompts.ts retroPrompt); the pool spec's title stays bare.
+	const retroPrompt = `${RETRO_MARKER}${t.title}`;
+	const prompt = t.prompt ?? (t.retro ? retroPrompt : `fix: ${t.title}`);
 	const createdAt = now - t.age * DAY - i * 7 * MIN;
 	const isDone = t.stage === "done";
 	const doneAt = taskDoneAt(t, now);
@@ -490,7 +492,7 @@ export function insertTaskRow(
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			id,
-			t.title.slice(0, 80),
+			t.retro ? retroPrompt.slice(0, 80) : t.title.slice(0, 80),
 			prompt,
 			t.stage,
 			t.state,
@@ -509,7 +511,7 @@ export function insertTaskRow(
 			doneAt,
 			commits,
 			`demo-${id}`,
-			t.title.slice(0, 60),
+			(t.retro ? retroPrompt : t.title).slice(0, 60),
 			t.review === true ? "review" : t.retro === true ? "retro" : "work",
 		],
 	);
