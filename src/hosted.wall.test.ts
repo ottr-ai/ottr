@@ -51,6 +51,14 @@ function mount(
 	name: string,
 	hosted: Hosted | undefined,
 	extra: Partial<Parameters<typeof createApp>[0]> = {},
+	opts: {
+		gh?: (
+			args: string[],
+			timeoutMs?: number,
+		) => Promise<{ code: number; stdout: string; stderr: string }>;
+		ciWatchTick?: (opts?: { manual?: string }) => Promise<void>;
+		projects?: { name: string; github: string }[];
+	} = {},
 ) {
 	const g = GlobalStore.open(join(root, `g-${name}`));
 	stores.push(g);
@@ -77,6 +85,27 @@ function mount(
 		latestImage: null,
 		archReview: null,
 	});
+	for (const p of opts.projects ?? []) {
+		const dir = join(root, `p-${p.name}`);
+		mkdirSync(dir, { recursive: true });
+		const store = ProjectStore.open(dir);
+		stores.push(store);
+		projects.set(p.name, {
+			path: dir,
+			name: p.name,
+			store,
+			target: null,
+			gitless: false,
+			github: p.github,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+	}
 	const stops: number[] = [];
 	const app = createApp({
 		gstore: g,
@@ -95,6 +124,8 @@ function mount(
 		board: { url: "http://ottr:4852", token: BOOT },
 		vmTokens: new VmTokens({ file: null }),
 		hosted,
+		...(opts.gh !== undefined && { gh: opts.gh }),
+		...(opts.ciWatchTick !== undefined && { ciWatchTick: opts.ciWatchTick }),
 		creditStop: async () => {
 			stops.push(Date.now());
 			return 2;
@@ -117,7 +148,7 @@ function mount(
 			headers: { "content-type": "application/json", ...opts.headers },
 			body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
 		});
-	return { call, g, store, stops, app };
+	return { call, g, store, stops, app, projects };
 }
 
 const hosted: Hosted = {
@@ -375,6 +406,200 @@ test("hosted mode serves no omp stats dashboard proxy, also from direct loopback
 	});
 });
 
+describe("POST /api/hosted/github-event", () => {
+	const ghCalls: string[][] = [];
+	const kicks: (string | undefined)[] = [];
+	const board = mount(
+		"events",
+		hosted,
+		{
+			gh: async (args) => {
+				ghCalls.push(args);
+				return { code: 0, stdout: "[]", stderr: "" };
+			},
+			ciWatchTick: async (opts) => {
+				kicks.push(opts?.manual);
+			},
+		},
+		{
+			projects: [
+				{ name: "w1", github: "https://github.com/acme/widget" },
+				{ name: "w2", github: "https://github.com/acme/other" },
+			],
+		},
+	);
+
+	/** One webhook POST as the control plane forwards it. */
+	const event = (
+		id: string,
+		name: string,
+		body: unknown,
+		role: IdentityRole | "forged" = "control",
+	) =>
+		board.call("/api/hosted/github-event", {
+			method: "POST",
+			headers: {
+				...signed(
+					role === "forged" ? "control" : role,
+					role === "forged"
+						? signIdentity("wrong-secret", TENANT, "control")
+						: undefined,
+				),
+				"x-github-delivery": id,
+				...(name !== "" && { "x-github-event": name }),
+			},
+			body,
+		});
+
+	test("a signed control push kicks the CI watch for the matching project", async () => {
+		const res = await event("d1", "push", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		expect(kicks).toEqual(["w1"]);
+	});
+
+	test("owner, tenant, missing and forged headers never kick", async () => {
+		for (const role of ["owner", "tenant"] as const) {
+			const res = await event(
+				`d-o-${role}`,
+				"push",
+				{
+					repository: { full_name: "acme/widget" },
+				},
+				role,
+			);
+			expect(res.status).toBe(403);
+		}
+		const anon = await board.call("/api/hosted/github-event", {
+			method: "POST",
+			headers: {
+				Host: PUBLIC,
+				Origin: `https://${PUBLIC}`,
+				"x-github-delivery": "d-anon",
+			},
+			body: { repository: { full_name: "acme/widget" } },
+		});
+		expect(anon.status).toBe(401);
+		const forged = await event(
+			"d-forged",
+			"push",
+			{
+				repository: { full_name: "acme/widget" },
+			},
+			"forged",
+		);
+		expect(forged.status).toBe(401);
+		expect(kicks).toEqual(["w1"]);
+	});
+
+	test("a replayed identity header is 401 on its second use", async () => {
+		const header = signIdentity(SECRET, TENANT, "control");
+		const send = () =>
+			board.call("/api/hosted/github-event", {
+				method: "POST",
+				headers: {
+					...signed("control", header),
+					"x-github-delivery": `d-replay-${ghCalls.length}`,
+				},
+				body: { repository: { full_name: "acme/widget" } },
+			});
+		expect((await send()).status).toBe(200);
+		expect((await send()).status).toBe(401);
+		expect(kicks).toEqual(["w1"]);
+	});
+
+	test("a duplicate delivery id answers deduped without a second kick", async () => {
+		const first = await event("d2", "push", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(first.status).toBe(200);
+		expect(await first.json()).toEqual({ ok: true });
+		const kicksAfterFirst = kicks.length;
+		// Different signed header (the proxy retries with fresh identity), same delivery id.
+		const second = await event("d2", "push", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(second.status).toBe(200);
+		expect(await second.json()).toEqual({ ok: true, deduped: true });
+		expect(kicks.length).toBe(kicksAfterFirst);
+	});
+
+	test("a push for each repo kicks that project's CI watch once", async () => {
+		const w1 = kicks.filter((k) => k === "w1").length;
+		const res = await event("d3", "push", {
+			repository: { full_name: "acme/other" },
+		});
+		expect(res.status).toBe(200);
+		expect(kicks.filter((k) => k === "w1").length).toBe(w1);
+		expect(kicks).toContain("w2");
+	});
+
+	test("a pull_request event runs the PR review watch for the matching project only", async () => {
+		// The scan gates on the setting (src/prs.ts scan): enable it for both projects,
+		// then only the repo the event names may reach the gh fake.
+		for (const name of ["w1", "w2"])
+			board.projects.get(name)!.store.setSettings({ prReviews: true });
+		const callsBefore = ghCalls.length;
+		const res = await event("d4", "pull_request", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		const calls = ghCalls.slice(callsBefore).map((args) => args.join(" "));
+		expect(calls.some((a) => a.includes("acme/widget"))).toBe(true);
+		expect(calls.some((a) => a.includes("acme/other"))).toBe(false);
+		expect(kicks.filter((k) => k !== "w1" && k !== "w2")).toEqual([]);
+	});
+
+	test("an issues event runs the issue watch for the matching project only", async () => {
+		// The issue scan gates on the setting and reads issueWatchSince as its mark
+		// (src/issues.ts scanProject): set both, one shared mark per project is enough.
+		for (const name of ["w1", "w2"])
+			board.projects
+				.get(name)!
+				.store.setSettings({ issueWatch: true, issueWatchSince: 1 });
+		const callsBefore = ghCalls.length;
+		const res = await event("d5", "issues", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(res.status).toBe(200);
+		const calls = ghCalls.slice(callsBefore).map((args) => args.join(" "));
+		expect(calls.some((a) => a.includes("acme/widget"))).toBe(true);
+		expect(calls.some((a) => a.includes("acme/other"))).toBe(false);
+	});
+
+	test("an unknown repo or event is a no-op", async () => {
+		const repoCalls = ghCalls.length;
+		const kicksBefore = kicks.length;
+		const unknownRepo = await event("d-unk-repo", "push", {
+			repository: { full_name: "github.com/nobody/nowhere" },
+		});
+		expect(unknownRepo.status).toBe(200);
+		expect(await unknownRepo.json()).toEqual({ ok: true });
+		const unknownEvent = await event("d-unk-event", "fork", {
+			repository: { full_name: "acme/widget" },
+		});
+		expect(unknownEvent.status).toBe(200);
+		expect(await unknownEvent.json()).toEqual({ ok: true });
+		expect(kicks.length).toBe(kicksBefore);
+		expect(ghCalls.length).toBe(repoCalls);
+	});
+
+	test("a missing X-GitHub-Delivery header is 400", async () => {
+		const res = await board.call("/api/hosted/github-event", {
+			method: "POST",
+			headers: signed("control"),
+			body: { repository: { full_name: "acme/widget" } },
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "x-github-delivery header required",
+		});
+	});
+});
+
 describe("self-hosted board (hosted mode off)", () => {
 	const board = mount("self", undefined);
 
@@ -390,6 +615,14 @@ describe("self-hosted board (hosted mode off)", () => {
 		});
 		expect(stop.status).toBe(404);
 		expect(board.stops).toEqual([]);
+		// The forwarded GitHub-event route joins stop behind the hosted flag.
+		const ghEvent = await board.call("/api/hosted/github-event", {
+			method: "POST",
+			headers: { ...loopback, ...signed("control") },
+			body: { repository: { full_name: "acme/widget" } },
+		});
+		expect(ghEvent.status).toBe(404);
+		expect(await ghEvent.json()).toEqual({ error: "not found" });
 		// Direct loopback stays zero-auth, and the identity header means nothing.
 		expect(
 			(

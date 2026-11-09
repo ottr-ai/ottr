@@ -3019,3 +3019,35 @@ describe("CI on the PR head", () => {
 		store.close();
 	});
 });
+
+// ---- manual tick filter -------------------------------------------------------
+
+describe("manual tick filter", () => {
+	test("tick({ manual }) scopes the passes to one project and skips the sweep", async () => {
+		const a = ProjectStore.open(join(root, "mf-alpha"));
+		const b = ProjectStore.open(join(root, "mf-beta"));
+		const eA = entry(a, { name: "alpha", path: join(root, "mf-alpha-main") });
+		const eB = entry(b, { name: "beta", path: join(root, "mf-beta-main") });
+		const ops = fakeOps({ prResult: { code: 0, stdout: "[]", stderr: "" } });
+		const sv = createSupervisor(
+			new Map([
+				[eA.name, eA],
+				[eB.name, eB],
+			]),
+			ops,
+			{ urls: ["http://w-a"], token: "t" },
+		);
+		// Forwarded GitHub event kick: only beta's passes run; the shared-pool sweep
+		// is periodic maintenance, not project work an event kick should run.
+		await sv.tick({ manual: "beta" });
+		expect(ops.prCalls).toBe(1);
+		expect(ops.sweepUrls).toEqual([]);
+		// Interval-style tick: no filter touches both projects and runs the sweep. Beta's
+		// open-PR poll window (PR_POLL_MS) still holds from the kick, so only alpha polls.
+		await sv.tick();
+		expect(ops.prCalls).toBe(2);
+		expect(ops.sweepUrls).toEqual(["http://w-a"]);
+		a.close();
+		b.close();
+	});
+});

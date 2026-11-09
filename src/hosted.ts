@@ -261,3 +261,65 @@ export interface Hosted {
 	config: HostedConfig;
 	hooks: HostedHooks;
 }
+
+/** Which watch a forwarded GitHub event kicks (docs/specs/hosted-mode.md section 8). */
+export type GitHubWatchKind = "ci" | "prReviews" | "issueWatch";
+
+/**
+ * Maps a GitHub webhook event name (the X-GitHub-Event header) to the watch it kicks:
+ * push / check_suite / workflow_run -> "ci" (the supervisor's CI watch), pull_request /
+ * pull_request_review -> "prReviews", issues / issue_comment -> "issueWatch". Any other
+ * event, and a missing header, answer null: the route answers 2xx and does nothing.
+ */
+export function githubEventWatch(event: string | null): GitHubWatchKind | null {
+	switch (event) {
+		case "push":
+		case "check_suite":
+		case "workflow_run":
+			return "ci";
+		case "pull_request":
+		case "pull_request_review":
+			return "prReviews";
+		case "issues":
+		case "issue_comment":
+			return "issueWatch";
+		default:
+			return null;
+	}
+}
+
+/**
+ * The "owner/repo" of a forwarded GitHub payload's repository field; untrusted, so any
+ * other shape answers null.
+ */
+export function eventRepository(body: unknown): string | null {
+	if (typeof body !== "object" || body === null || Array.isArray(body))
+		return null;
+	const repository = (body as { repository?: unknown }).repository;
+	if (typeof repository !== "object" || repository === null) return null;
+	const fullName = (repository as { full_name?: unknown }).full_name;
+	return typeof fullName === "string" && fullName !== "" ? fullName : null;
+}
+
+/**
+ * Bounded in-memory dedupe of GitHub delivery ids (the X-GitHub-Delivery header). The
+ * control plane retries once after a failed connection or a 502/503, so a redelivered id
+ * must not kick the watches twice. add() answers false for a duplicate. When the cache
+ * is full it evicts the oldest id (insertion order) instead of refusing: dropping new
+ * events would lose them, and a forgotten old id only risks one extra watch kick.
+ */
+export class DeliveryCache {
+	private readonly seen = new Set<string>();
+
+	constructor(readonly max = 4096) {}
+
+	add(id: string): boolean {
+		if (this.seen.has(id)) return false;
+		this.seen.add(id);
+		if (this.seen.size > this.max) {
+			const oldest = this.seen.values().next();
+			if (!oldest.done) this.seen.delete(oldest.value);
+		}
+		return true;
+	}
+}

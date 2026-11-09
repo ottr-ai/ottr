@@ -104,6 +104,7 @@ import {
 } from "./githubHost.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import type { Hosted } from "./hosted.ts";
+import { DeliveryCache, eventRepository, githubEventWatch } from "./hosted.ts";
 import {
 	decodeImages,
 	MAX_IMAGE_BYTES,
@@ -353,6 +354,8 @@ import {
 } from "./worktree.ts";
 
 const MAX_BODY_BYTES = 65536;
+/** GitHub's documented webhook payload ceiling: the control plane forwards the payload as it arrived. */
+const MAX_EVENT_BODY_BYTES = 25 * 1024 * 1024;
 /** Timeout for the re-run-failed-jobs GitHub API call, mirroring the trending scan. */
 const RERUN_TIMEOUT_MS = 20_000;
 
@@ -551,6 +554,12 @@ interface AppDeps {
 	 * the number of turns stopped.
 	 */
 	creditStop?: () => Promise<number>;
+	/**
+	 * Hosted forwarded GitHub events (POST /api/hosted/github-event, docs/specs/hosted-mode.md
+	 * section 8): kicks the CI-watch supervisor's tick for one project. server.ts binds it after
+	 * createSupervisor; a hosted board without it throws like the missing creditStop.
+	 */
+	ciWatchTick?: (opts?: { manual?: string }) => Promise<void>;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -2767,6 +2776,9 @@ export function createApp(deps: AppDeps) {
 	/** Hosted mode's one nonce cache: a replayed X-Ottr-Identity header never passes twice. */
 	const identityNonces = new NonceCache();
 
+	/** Hosted forwarded GitHub events: bounded dedupe of X-GitHub-Delivery ids (section 8). */
+	const deliveries = new DeliveryCache();
+
 	/**
 	 * Hosted mode's whole wall (docs/specs/hosted-mode.md section 3), in place of the host
 	 * allowlist, Origin wall and auth wall: the control-plane proxy checks Host, Origin and the
@@ -4594,6 +4606,45 @@ export function createApp(deps: AppDeps) {
 					if (deps.creditStop === undefined)
 						throw new Error("hosted mode without a creditStop");
 					return json({ stopped: await deps.creditStop() });
+				});
+			},
+		},
+		// Hosted forwarded GitHub events (docs/specs/hosted-mode.md section 8): the control plane
+		// verified GitHub's signature and forwards the event here, so the watches that would poll
+		// GitHub on a self-hosted board kick only for the repo the event names. Same wall rule as
+		// stop: hostedRefusal lets only a signed control identity reach it.
+		"/api/hosted/github-event": {
+			POST: (req) => {
+				if (deps.hosted === undefined)
+					return Promise.resolve(json({ error: "not found" }, 404));
+				return api(req, async () => {
+					const delivery = req.headers.get("x-github-delivery");
+					if (delivery === null || delivery === "")
+						return json({ error: "x-github-delivery header required" }, 400);
+					const r = await readJson(req, MAX_EVENT_BODY_BYTES);
+					if ("error" in r) return r.error;
+					// Recorded only after the body parses: a malformed retry must not burn the id.
+					if (!deliveries.add(delivery))
+						return json({ ok: true, deduped: true });
+					const kind = githubEventWatch(req.headers.get("x-github-event"));
+					const repo = eventRepository(r.body);
+					if (kind === null || repo === null) return json({ ok: true });
+					const matches = [...deps.projects.values()].filter(
+						(e) => e.github !== null && ownerRepo(e.github) === repo,
+					);
+					if (matches.length === 0) return json({ ok: true });
+					for (const { name } of matches) {
+						if (kind === "ci") {
+							if (deps.ciWatchTick === undefined)
+								throw new Error("hosted mode without a ciWatchTick");
+							await deps.ciWatchTick({ manual: name });
+						} else if (kind === "prReviews") {
+							await prWatcher.tick({ manual: name });
+						} else {
+							await issueWatcher.tick({ manual: name });
+						}
+					}
+					return json({ ok: true });
 				});
 			},
 		},

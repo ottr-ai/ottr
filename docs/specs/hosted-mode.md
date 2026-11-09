@@ -1,6 +1,6 @@
 # Hosted mode
 
-Status: implemented (OTTC-6, hosted Ottr milestone M3). Design source: the ottr-cloud repo,
+Status: implemented (OTTC-6, hosted Ottr milestone M3); the forwarded-events route of section 8 is OTTR-661. Design source: the ottr-cloud repo,
 `docs/hosted-design.md` section 3 and section 5.1.
 
 Hosted mode lets the ottr-cloud control plane run one Ottr server for one tenant behind its
@@ -197,9 +197,50 @@ Details:
 - A lost session shows the offline banner, not the login page. The account menu has no
   "Signed in as" line and no Sign out.
 
-## 8. Non-goals
+## 8. Forwarded GitHub events
+
+The control plane calls `POST /api/hosted/github-event` on the tenant when GitHub wakes it with
+a webhook event. The control plane already verified the event's GitHub signature; the tenant
+receives the raw payload. The route exists only when hosted mode is on; with the flag off the
+route answers 404 like every other hosted route.
+
+- Identity: role `control`, verified by the section 3 wall exactly like `/api/hosted/stop`.
+  `owner` answers 403, `tenant` answers 403, a forged, expired or replayed header answers 401.
+  The route adds no check of its own.
+- Headers: `X-GitHub-Event` and `X-GitHub-Delivery` (GitHub's webhook headers, forwarded as
+  they arrived). A missing `X-GitHub-Delivery` answers 400.
+- Body: the raw GitHub JSON payload. The route reads only `repository.full_name`. A body over
+  GitHub's documented webhook ceiling (25 MiB) answers 413; the control plane's single retry
+  repeats it, so such an event drops and the next periodic poll covers it. A body that does not
+  parse as a JSON object answers 400.
+- Dedupe: the control plane retries once after a failed connection or a 502/503, so the tenant
+  dedupes on `X-GitHub-Delivery`. The cache is in-memory and bounded (4096 ids, the oldest
+  evicted). A redelivered id answers 2xx and kicks nothing. The id counts only after the body
+  parses, so a retry after a 400 is never swallowed.
+
+Watches:
+
+| Events | Watch |
+|---|---|
+| `push`, `check_suite`, `workflow_run` | CI watch: the supervisor's tick for the matching project (the periodic worker sweep does not run on a kick) |
+| `pull_request`, `pull_request_review` | PR review watch |
+| `issues`, `issue_comment` | issue watch |
+
+- Matching: a project matches when its GitHub remote's `owner/repo` equals the payload's
+  `repository.full_name`. Every matching project gets the kick. An unknown event, a payload
+  without a repository, and no matching project all answer 2xx and do nothing (no-op).
+- Timing: the kicks run before the answer; each watch runs for the matching project only (the
+  watchers' per-project `manual` scope) and each is single-flight, so a kick that lands while a
+  poll is running is a no-op and the running poll covers the event. The answer is `{"ok":true}`
+  on every handled case.
+- Self-host: with the flag off nothing changes; the per-project tick filter the kick uses is
+  additive and unused.
+
+## 9. Non-goals
 
 - No change to `src/prompts.ts`.
 - No credit ledger, prices, or balance display in ottr: the control plane owns them (M6).
 - No GitHub App install flow: the control plane mints the tokens (M4).
 - No change to the boot-token and per-turn VM token paths.
+- No payload slimming or event filtering beyond `repository.full_name` — the control plane
+  forwards GitHub's payload as it arrived and GitHub's event stream decides what kicks.

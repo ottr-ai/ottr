@@ -610,6 +610,36 @@ const loop = createTurnLoop(projects, {
 // shutdown only releases the stores opened so far.
 loopRef = loop;
 
+// Supervisor: retries locked-worktree removal after done/cancel and watches CI for merge pushes.
+// Created before createApp: the hosted GitHub-event route kicks its tick through the bound
+// ciWatchTick dep (docs/specs/hosted-mode.md section 8).
+const supervisor = createSupervisor(
+	projects,
+	{
+		appendLog,
+		schedule: loop.schedule,
+		now: Date.now,
+		sweepWorker: (url, token) =>
+			sweepWorkerRequest({ urls: [url], token }, url),
+		removeWorktree,
+		unsavedWork,
+		statusRows,
+		statusFiles,
+		gh: runGh,
+		commitsAhead,
+		isClean,
+		isIntegrated,
+		worktreeHusk,
+		worktreeLinked,
+		branchMergedOrGone,
+		quarantineUntracked,
+		targetCommits,
+		targetSha,
+		fetchOriginBranch,
+	},
+	workerTarget,
+);
+
 /** Every pid a live turn claim or a store's runningPids() row holds; orphan checks subtract these. */
 function claimedPids(): Set<number> {
 	const claimed = new Set<number>();
@@ -657,6 +687,7 @@ const app = createApp({
 	cancel: loop.cancel,
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
+	ciWatchTick: (opts) => supervisor.tick(opts),
 	finishKept: loop.finishKept,
 	// OTTR-454: the runners GET /api/drain lists (worker hostnames, then local) and the
 	// live per-runner counts from the turn loop.
@@ -719,33 +750,6 @@ await loop.recoverRestarted();
 loop.schedule();
 setInterval(loop.schedule, 5000);
 
-// Supervisor: retries locked-worktree removal after done/cancel and watches CI for merge pushes.
-const supervisor = createSupervisor(
-	projects,
-	{
-		appendLog,
-		schedule: loop.schedule,
-		now: Date.now,
-		sweepWorker: (url, token) =>
-			sweepWorkerRequest({ urls: [url], token }, url),
-		removeWorktree,
-		unsavedWork,
-		statusRows,
-		statusFiles,
-		gh: runGh,
-		commitsAhead,
-		isClean,
-		isIntegrated,
-		worktreeHusk,
-		worktreeLinked,
-		branchMergedOrGone,
-		quarantineUntracked,
-		targetCommits,
-		targetSha,
-		fetchOriginBranch,
-	},
-	workerTarget,
-);
 setInterval(() => void supervisor.tick(), 60_000);
 
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same

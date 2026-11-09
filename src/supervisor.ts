@@ -343,7 +343,7 @@ export function createSupervisor(
 	projects: Map<string, SupervisorEntry>,
 	ops: SupervisorOps,
 	workers: WorkerTarget | null = null,
-): { tick(): Promise<void> } {
+): { tick(opts?: { manual?: string }): Promise<void> } {
 	let running = false;
 	const cleanup = new Map<string, CleanupState>();
 	const ghFails = new Map<string, number>();
@@ -1441,11 +1441,13 @@ export function createSupervisor(
 	}
 
 	return {
-		async tick(): Promise<void> {
+		async tick(opts?: { manual?: string }): Promise<void> {
 			if (running) return;
 			running = true;
 			try {
 				for (const e of projects.values()) {
+					// Manual kick from a forwarded GitHub event: only the matching project.
+					if (opts?.manual !== undefined && e.name !== opts.manual) continue;
 					try {
 						const settings = e.store.getSettings();
 						const tasks = e.store.listTasks();
@@ -1463,7 +1465,8 @@ export function createSupervisor(
 						console.error(`supervisor: project ${e.name}:`, err);
 					}
 				}
-				await workerSweepPass();
+				// Periodic shared-pool maintenance, not project work an event kick should run.
+				if (opts?.manual === undefined) await workerSweepPass();
 			} finally {
 				running = false;
 			}
