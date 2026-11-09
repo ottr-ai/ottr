@@ -334,7 +334,8 @@ const MAX_INLINE_PAGES = 30;
  * The inline comments of the board's posted review `reviewId`, each as a marker block, read over
  * every page. GitHub data stays untrusted: entries without a usable path and line are skipped.
  * A failed or malformed read throws: the re-review must check every earlier finding, so it
- * stops and a later tick retries, never running without them.
+ * stops and a later tick retries, never running without them. Bodies stay whole: an earlier
+ * finding is never cut, and the prompt budget check rejects a context that does not fit.
  */
 async function postedInlineComments(
 	gh: GhFn,
@@ -389,7 +390,7 @@ async function postedInlineComments(
 				path: x.path,
 				line,
 				startLine: start !== null && start < line ? start : null,
-				body: x.body.slice(0, MAX_COMMENT_BODY),
+				body: x.body,
 			}),
 		);
 	}

@@ -516,6 +516,55 @@ describe("review prompt and draft", () => {
 			await expect(fetchReReviewContext(o)).rejects.toThrow(/review comments/);
 		}
 	});
+	test("fetchReReviewContext keeps an earlier inline comment longer than 4000 characters whole", async () => {
+		const body = `${"Context line.\n".repeat(480)}Unfixed null dereference in parse().`;
+		expect(body.length).toBeGreaterThan(4000);
+		const gh: GhFn = async (args) => {
+			const path = args.at(-1) ?? "";
+			if (path.includes("/reviews/5/comments"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([{ path: "src/a.ts", line: 4, body }]),
+					stderr: "",
+				};
+			if (path.includes("/reviews"))
+				return {
+					code: 0,
+					stdout: JSON.stringify([
+						ghReview(5, sha("a"), "earlier", "2026-01-01T00:00:00Z"),
+					]),
+					stderr: "",
+				};
+			return { code: 0, stdout: "[]", stderr: "" };
+		};
+		const ctx = await fetchReReviewContext({
+			repo: "o/r",
+			number: 1,
+			gh,
+			postedHead: sha("a"),
+			postedUrl: null,
+			postedLogin: null,
+			reviewedHead: sha("a"),
+			head: sha("a"),
+			draftBody: null,
+			draftAt: null,
+		});
+		expect(ctx?.review).toBe(
+			`earlier\n\n<!-- inline src/a.ts:4 -->\n${body}\n<!-- /inline -->`,
+		);
+		// The whole finding also reaches the model's message.
+		const msg = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			earlier: ctx,
+		});
+		expect(msg).toContain(
+			"Unfixed null dereference in parse().\n<!-- /inline -->",
+		);
+	});
 	test("fetchReReviewContext reads every page of the posted review's inline comments", async () => {
 		const all = Array.from({ length: 101 }, (_, i) => ({
 			path: "src/a.ts",
