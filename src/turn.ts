@@ -77,11 +77,15 @@ import {
 } from "./runner.ts";
 import {
 	applyCheckVerdicts,
+	badDep,
 	checkModelWarning,
 	checkRoleFor,
 	demoteUnquoted,
 	depHold,
+	depProjectOf,
+	depProjectsOf,
 	FINDINGS_HOLD,
+	findDep,
 	findingsHold,
 	isEvidenceBugClass,
 	isRetro,
@@ -145,6 +149,7 @@ import type {
 	branchUnpushed,
 	changedFiles,
 	checkedOutBranch,
+	checkoutState,
 	commitsAhead,
 	createWorktree,
 	diffStat,
@@ -473,6 +478,75 @@ function uiShotReprompt(files: string[]): string {
 	return `Your last turn changed UI files (${listed(files)}) but attached no screenshot. Run the project's UI the way its AGENTS.md or README says, capture the changed screen with the browser tool, save the image under shots/ in the worktree, and call report_outcome again with its path in the shots field. A change without a visible effect still needs a screenshot of the screen it belongs to: the card cannot finish without one.`;
 }
 
+/** OTTR-708: snapshots every other project's main checkout (HEAD + porcelain status) before a
+ * work turn's agent runs. Gitless projects and checkouts whose read fails are skipped. */
+async function snapshotOtherCheckouts(
+	projects: Map<string, TurnProject>,
+	ops: TurnOps,
+	self: string,
+): Promise<Map<string, { head: string | null; status: string }>> {
+	const snap = new Map<string, { head: string | null; status: string }>();
+	for (const other of projects.values()) {
+		if (other.name === self || other.gitless) continue;
+		try {
+			snap.set(other.name, await ops.checkoutState(other.path));
+		} catch {
+			// An unreadable checkout is skipped: the guard reports only what it can prove.
+		}
+	}
+	return snap;
+}
+
+/** OTTR-708: the cross-project checkout guard. Compares the before/after main-checkout
+ * snapshots of the other projects: a new commit the board did not push, or a status change,
+ * is a change made outside this turn's own worktree. A HEAD advance the board itself made
+ * (boardPushedHeads, recorded at the serverMergePush call sites) with a clean tree is
+ * discounted — merges of other projects run concurrently with work turns by design. Returns
+ * the needs_you reason, null when every other checkout reads unchanged. */
+async function checkoutGuardReason(
+	projects: Map<string, TurnProject>,
+	ops: TurnOps,
+	boardPushedHeads: Map<string, string>,
+	self: string,
+	before: Map<string, { head: string | null; status: string }>,
+): Promise<string | null> {
+	for (const other of projects.values()) {
+		if (other.name === self || other.gitless) continue;
+		const was = before.get(other.name);
+		if (was === undefined) continue;
+		const now = await ops.checkoutState(other.path).catch(() => null);
+		if (now === null) continue;
+		const headMoved = now.head !== null && now.head !== was.head;
+		const recorded = headMoved && boardPushedHeads.get(other.name) === now.head;
+		const files =
+			now.status !== was.status
+				? now.status
+						.split("\n")
+						.map((l) => l.slice(3).trim())
+						.filter((l) => l !== "")
+				: [];
+		if (files.length === 0 && (!headMoved || recorded)) continue;
+		const commits =
+			headMoved && was.head !== null
+				? await (ops.commitSubjects ?? commitSubjects)(
+						other.path,
+						was.head,
+						now.head!,
+					).catch(() => [] as string[])
+				: [];
+		const parts: string[] = [];
+		if (headMoved && !recorded)
+			parts.push(
+				commits.length > 0
+					? `new commits ${listed(commits)}`
+					: `HEAD moved to ${now.head!.slice(0, 7)}`,
+			);
+		if (files.length > 0) parts.push(`changed files ${listed(files)}`);
+		return `The ${other.name} main checkout changed while this turn ran (${parts.join("; ")}). Those changes do not belong to this card: file a card in ${other.name} (create_task with its project parameter) and move the commits and files there, then reply to resume this card.`;
+	}
+	return null;
+}
+
 export interface TurnProject {
 	store: ProjectStore;
 	/** Project name (the Map key); supervisor log lines and CI watch key off it. */
@@ -604,6 +678,9 @@ export interface TurnOps {
 	branchUnpushed: typeof branchUnpushed;
 	/** OTTR-531: the main checkout's checked-out branch; null on detached HEAD or git failure. */
 	checkedOutBranch: typeof checkedOutBranch;
+	/** OTTR-708: a main checkout's HEAD sha and porcelain status; the cross-project checkout
+	 * guard snapshots it before and after a work turn's agent runs. */
+	checkoutState: typeof checkoutState;
 	/** Server-side merge push for non-GitHub push remotes (git() adds the host auth, D6). */
 	serverMergePush: typeof serverMergePush;
 	/** Git 401/403 hint: asks GitHub's API why a GitHub-host push/fetch failed; null when it cannot say more. */
@@ -1097,6 +1174,11 @@ export function createTurnLoop(
 ): TurnLoop {
 	notifyHook = ops.notifyLog;
 	const running = new Map<string, RunEntry>();
+	// OTTR-708: the main-checkout heads the board itself advanced (serverMergePush), per
+	// project. The cross-project checkout guard discounts a HEAD change whose new value is
+	// recorded here and leaves the tree clean: merges of other projects run concurrently
+	// with this project's work turns by design.
+	const boardPushedHeads = new Map<string, string>();
 	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
 	async function usageHold(model: string | null): Promise<UsageHold | null> {
 		const hit = await usageResetFor(model);
@@ -1734,6 +1816,14 @@ export function createTurnLoop(
 								if (p.status === "pushed") {
 									// The hold lifts at once instead of waiting for the next tick.
 									e.mainUnpushed = false;
+									// OTTR-708: record the head this board-made push moved the
+									// main checkout to, so the checkout guard discounts it.
+									void ops
+										.checkoutState(e.path)
+										.then((s) => {
+											if (s.head !== null) boardPushedHeads.set(e.name, s.head);
+										})
+										.catch(() => {});
 									console.log(
 										`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
 									);
@@ -1782,15 +1872,19 @@ export function createTurnLoop(
 		// The dev board's fabricated cards must never start a real agent, whatever the cap says.
 		const cap = demoBoard() ? 0 : ops.maxTotalRuns();
 		const active = () => new Set([...running.keys(), ...preparing]).size;
+		// OTTR-708: the pickers resolve foreign dependsOn ids across the board's projects.
+		const depProjects = depProjectsOf(projects.values());
 		for (const e of projects.values()) {
 			try {
 				const settings = getSettingsLogged(e);
+				const ownDep = depProjectOf(e.store);
 				const runnable = pickRunnable(e.store.listTasks(), {
 					maxParallel: settings.maxParallel,
 					hasRules: ops.hasRules(e.path),
 					only: drained ? e.store.boardCheckId() : undefined,
 					mainUnpushed: e.mainUnpushed === true,
 					prMode: settings.prMode === true,
+					crossDeps: (did) => findDep(did, depProjects, ownDep),
 				});
 				for (const t of runnable) {
 					if (cap !== null && active() >= cap) return;
@@ -1822,11 +1916,13 @@ export function createTurnLoop(
 				)
 					return;
 				if (scout !== null) continue;
+				const ownDep = depProjectOf(e.store);
 				const t = pickLowPriority(tasks, {
 					maxParallel: getSettingsLogged(e).maxParallel,
 					hasRules: ops.hasRules(e.path),
 					only: drained ? e.store.boardCheckId() : undefined,
 					mainUnpushed: e.mainUnpushed === true,
+					crossDeps: (did) => findDep(did, depProjects, ownDep),
 				});
 				if (t !== null) scout = { name: e.store.name, id: t.id };
 			} catch (err) {
@@ -2467,11 +2563,19 @@ export function createTurnLoop(
 				raw === DEP_HELD_PROMPT
 					? depResumePrompt({
 							deps: live.dependsOn.map((did) => {
-								const d = all.find((t) => t.id === did);
+								// OTTR-708: a foreign dependency's title comes from its project's
+								// store; this runs once, on the dep-held restart only.
+								const d =
+									all.find((t) => t.id === did) ??
+									findDep(
+										did,
+										depProjectsOf(projects.values()),
+										depProjectOf(store),
+									);
 								return {
 									id: did,
 									title: d?.title ?? did,
-									done: d === undefined || d.stage === "done",
+									done: d === undefined || d === null || d.stage === "done",
 								};
 							}),
 						})
@@ -2760,6 +2864,21 @@ export function createTurnLoop(
 			}
 
 			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
+			// OTTR-708: work turns that receive workPrompt (work and research cards; the
+			// interview, grill, scout, board-check, release, and retro variants take other
+			// prompts) snapshot every other project's main checkout and re-check it at settle:
+			// the agent must not touch another project's checkout.
+			const checkoutGuard =
+				kind === "work" &&
+				!releaseCard &&
+				!interview &&
+				!retroCard &&
+				!boardCheck &&
+				!grill &&
+				!scout;
+			const guardBefore = checkoutGuard
+				? await snapshotOtherCheckouts(projects, ops, name)
+				: null;
 			const runStartedAt = Date.now();
 			// The work or merge run resolves its model from the default role, also when the card
 			// or session names its own model (docs/specs/hosted-mode.md section 4).
@@ -3312,6 +3431,19 @@ export function createTurnLoop(
 										}
 									: p,
 							)
+							.then((p) => {
+								if (p.status === "pushed")
+									// OTTR-708: this settle legitimately moves the project's main
+									// checkout; record the head so the checkout guard of a
+									// concurrent work turn (another project) discounts it.
+									void ops
+										.checkoutState(e.path)
+										.then((s) => {
+											if (s.head !== null) boardPushedHeads.set(name, s.head);
+										})
+										.catch(() => {});
+								return p;
+							})
 							.catch((err: unknown) => ({
 								status: "failed" as const,
 								error: errmsg(err),
@@ -4023,20 +4155,20 @@ export function createTurnLoop(
 			// The agent holds this turn on other cards (report_outcome dependsOn): valid ids are
 			// recorded on the card, and a needs_you outcome requeues it in the current stage instead
 			// of parking at needs_you — the scheduler restarts the turn when every id is done or
-			// cancelled (waitingOn). A bad id parks needs_you naming it; the ids are not recorded.
+			// cancelled (waitingOn). A bad id — this card itself, an unknown project's handle, a
+			// missing card here or abroad — parks needs_you naming it; the ids are not recorded.
 			const outcome = result.outcome;
 			const reportedDeps = outcome !== null ? outcome.dependsOn : undefined;
 			if (reportedDeps !== undefined && reportedDeps.length > 0) {
-				const known = new Set(store.listTasks().map((t) => t.id));
-				const bad = reportedDeps.find((d) => d === id || !known.has(d));
-				if (bad !== undefined)
+				// OTTR-708: ids resolve across the board's projects, this store's own cards first.
+				const depProjects = depProjectsOf(projects.values());
+				const ownDep = depProjectOf(store);
+				const bad = badDep(reportedDeps, depProjects, ownDep, id);
+				if (bad !== null)
 					next = {
 						stage: next.stage,
 						state: "needs_you",
-						needsReason:
-							bad === id
-								? `report_outcome's dependsOn names #${bad}, which is this card itself. Reply to continue, or cancel the card.`
-								: `report_outcome's dependsOn names #${bad}, which is not a card in this project. Reply to continue, or cancel the card.`,
+						needsReason: bad.reason,
 						asked: next.asked,
 					};
 				else {
@@ -4054,10 +4186,11 @@ export function createTurnLoop(
 						next = {
 							stage: next.stage,
 							state: "queued",
-							needsReason: depHold(store.listTasks(), {
-								...task,
-								dependsOn: merged,
-							}),
+							needsReason: depHold(
+								store.listTasks(),
+								{ ...task, dependsOn: merged },
+								(did) => findDep(did, depProjects, ownDep),
+							),
 							pendingPrompt: DEP_HELD_PROMPT,
 							pendingBy: "supervisor",
 						};
@@ -4197,6 +4330,28 @@ export function createTurnLoop(
 					state: "needs_you",
 					needsReason: keptReason(unsaved),
 				};
+			// OTTR-708: the cross-project checkout guard. Only a settle that would otherwise
+			// complete asks the question: a card already parked or auto-resumed keeps its own
+			// reason. A merging-bound settle (ready with commits) with a violation must park
+			// before the merge; a steered requeue (state queued, needsReason null) with a
+			// violation also parks, and the pending steering text survives the park.
+			// Note: when both a dep hold and a violation apply, the violation reason wins
+			// the park — that ordering is acceptable.
+			if (checkoutGuard && guardBefore !== null && next.needsReason === null) {
+				const violation = await checkoutGuardReason(
+					projects,
+					ops,
+					boardPushedHeads,
+					name,
+					guardBefore,
+				);
+				if (violation !== null)
+					next = {
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason: violation,
+					};
+			}
 			// The settle git reads are slow; a cancel landing inside them owns the card (its kept
 			// path already wrote the final state). Finish only the turn row and leave the card
 			// alone in that case.

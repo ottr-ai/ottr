@@ -575,6 +575,39 @@ describe("task routes", () => {
 		expect(task?.dependsOn).toEqual([other.id]);
 	});
 
+	test("create accepts a cross-project dependsOn id", async () => {
+		const foreign = projects.get("p2")!.store.createTask("foreign blocker");
+		const res = await post("/api/projects/p1/tasks", {
+			prompt: "cross dep",
+			dependsOn: [foreign.id],
+		});
+		expect(res.status).toBe(200);
+		const b: unknown = await res.json();
+		const task =
+			typeof b === "object" && b !== null && "dependsOn" in b ? b : null;
+		expect(task?.dependsOn).toEqual([foreign.id]);
+	});
+
+	test("create rejects an unknown project prefix in dependsOn naming it", async () => {
+		const res = await post("/api/projects/p1/tasks", {
+			prompt: "doomed",
+			dependsOn: ["NOPE-1"],
+		});
+		expect(res.status).toBe(404);
+		expect(await errorOf(res)).toBe(
+			"unknown project NOPE in dependsOn task: NOPE-1",
+		);
+	});
+
+	test("create rejects a missing card in a known project's prefix", async () => {
+		const res = await post("/api/projects/p1/tasks", {
+			prompt: "doomed",
+			dependsOn: ["P2-99999"],
+		});
+		expect(res.status).toBe(404);
+		expect(await errorOf(res)).toBe("unknown dependsOn task: P2-99999");
+	});
+
 	const get = async (path: string) =>
 		fetch(new URL(path, server.url), {
 			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },

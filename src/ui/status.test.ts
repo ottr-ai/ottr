@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { ARCH_REVIEW_MARKER } from "../prompts.ts";
+import { type DepIndex, type DepProject, findDep } from "../scheduler.ts";
 import type { TaskCard } from "../types.ts";
 import {
 	alarmLabel,
@@ -290,6 +291,32 @@ test("holdFor never holds a card outside todo and merging", () => {
 	expect(holdFor(release, [live, release])).toBeNull();
 	const done = card({ stage: "done", state: "idle" });
 	expect(holdFor(done, [live, done])).toBeNull();
+});
+
+test("holdFor names a foreign dependency through the cross-project lookup", () => {
+	const follower = card({ id: "f1", title: "Follower", dependsOn: ["AD-5"] });
+	const foreignCard = card({
+		id: "AD-5",
+		title: "Over there",
+		stage: "in_progress",
+		state: "running",
+	});
+	const own: DepProject = { name: "p1", prefix: "P1", getTask: () => null };
+	const foreign: DepProject = {
+		name: "ad",
+		prefix: "AD",
+		getTask: (id) => (id === foreignCard.id ? foreignCard : null),
+	};
+	const foreignDeps: DepIndex = (id) => findDep(id, [own, foreign], own);
+	expect(holdFor(follower, [follower], foreignDeps)).toBe(
+		"waiting for #AD-5 Over there",
+	);
+	// A done foreign dependency holds nothing, and an id no project has counts as done
+	// (validation is the settle block's job).
+	foreignCard.stage = "done";
+	expect(holdFor(follower, [follower], foreignDeps)).toBeNull();
+	const lost = card({ id: "f2", title: "Other", dependsOn: ["NOPE-1"] });
+	expect(holdFor(lost, [follower], foreignDeps)).toBeNull();
 });
 
 test("splitAlarms splits plain needs from asks and counts preparing as running", () => {

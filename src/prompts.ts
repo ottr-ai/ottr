@@ -63,6 +63,7 @@ A task that writes a spec or implements code is not architecture work, even when
 In a fresh worktree, run the project's dependency install in locked/frozen mode before the gates (bun: \`bun install --frozen-lockfile\`).
 When a commit replaces an earlier commit's change instead of fixing it, reference the earlier commit with a \`Supersedes: <sha>\` body line. The release notes drop the named commit's bullet.
 Do not merge, push, tag or release: the tracker runs integration as a separate turn when this project's merge slot is free.
+To change another project, file a card there with create_task (project parameter) and, if this card must wait, pass its id in dependsOn; never edit or commit in another project's checkout.
 If this task only researches a topic or answers a question — no code changes needed — do not implement: write the complete report as a markdown file named ${RESEARCH_REPORT} at the repository root of your worktree, do not commit it, do not create or modify any other file except image files you pass in report_outcome's shots field, and report answered (never ready: there is nothing to integrate). The tracker archives the report with the card and removes the worktree.
 If the report recommends steps to take, list them under a heading named exactly \`## Recommended steps\`. Leave that heading out when there is nothing to do.
 Other tasks in flight for this project:

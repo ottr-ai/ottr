@@ -69,6 +69,7 @@ import {
 	branchUnpushed,
 	changedFiles,
 	checkedOutBranch,
+	checkoutState,
 	commitsAhead,
 	createWorktree,
 	describeVersion,
@@ -582,6 +583,7 @@ const loop = createTurnLoop(projects, {
 	targetContains,
 	branchUnpushed,
 	checkedOutBranch,
+	checkoutState,
 	serverMergePush,
 	// OTTR-552 PR mode: the ship step pushes the card branch (server git credentials,
 	// force-with-lease) and adopts or opens the PR via gh; the integrated proof is a

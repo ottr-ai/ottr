@@ -245,6 +245,8 @@ import {
 } from "./requestGuards.ts";
 import {
 	archReviewDue,
+	depProjectOf,
+	depProjectsOf,
 	findingsSettledAt,
 	isRetro,
 	isReview,
@@ -257,6 +259,7 @@ import {
 	queueOrder,
 	type ReviewTask,
 	releaseHeldMerges,
+	resolveDep,
 	reviewBlocked,
 	reviewFindings,
 	silentSince,
@@ -7359,10 +7362,29 @@ export function createApp(deps: AppDeps) {
 								400,
 							);
 						dependsOn = [...new Set(r.body.dependsOn as string[])];
+						// OTTR-708: a card of this project, or by its PREFIX-n handle a card of any
+						// registered project. An unknown handle names the project in the error.
+						const depProjects = depProjectsOf(deps.projects.values());
+						const ownDep = depProjectOf(e.store);
 						for (const id of dependsOn) {
-							const dep = resolveTask(req.params.project, id);
-							if (dep instanceof Response)
-								return json({ error: `unknown dependsOn task: ${id}` }, 404);
+							if (ownDep.getTask(id) !== null) continue;
+							const dep = resolveDep(id, depProjects, ownDep);
+							if ("task" in dep) continue;
+							if (dep.why === "project")
+								return json(
+									{
+										error: `unknown project ${dep.prefix} in dependsOn task: ${id}`,
+									},
+									404,
+								);
+							if (dep.why === "ambiguous")
+								return json(
+									{
+										error: `ambiguous id prefix ${dep.prefix} in dependsOn task: ${id} (${dep.projects.join(", ")})`,
+									},
+									404,
+								);
+							return json({ error: `unknown dependsOn task: ${id}` }, 404);
 						}
 					}
 					const model = modelParam(r.body);

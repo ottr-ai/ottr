@@ -371,18 +371,158 @@ export function archReviewView(
 	};
 }
 
+/** One dependency card a hold names: the facts `waitingOn` needs, own project or foreign
+ * (OTTR-708). */
+export type DepCard = Pick<Task, "id" | "title" | "stage" | "cancelledAt">;
+
+/** Looks a dependsOn id up across every project's store; null when no project has the
+ * card (an unresolvable dep counts as satisfied, like one missing from the own list). */
+export type DepIndex = (id: string) => DepCard | null;
+
+/** One project the cross-project dependsOn resolver sees: the board's project name, its
+ * id handle (settings.taskIdPrefix or the folder-derived default), and the task lookup. */
+export interface DepProject {
+	name: string;
+	prefix: string;
+	getTask(id: string): DepCard | null;
+}
+
+/** Why one dependsOn id names no card across the board:
+ * - "own": no own card and no `PREFIX-n` shape (legacy hex, retro child, malformed);
+ * - "project": the prefix names no registered project;
+ * - "ambiguous": several registered projects share the prefix;
+ * - "task": the prefix's project has no such card. */
+export type DepMiss =
+	| { why: "own"; id: string }
+	| { why: "project"; id: string; prefix: string }
+	| { why: "ambiguous"; id: string; prefix: string; projects: string[] }
+	| { why: "task"; id: string; project: string };
+
+/** One dependsOn id resolved across projects: the card with its project, else DepMiss. */
+export type DepResolution = { task: DepCard; project: string } | DepMiss;
+
+/** The `PREFIX-n` shape a foreign dependsOn id can carry: the letter-and-digit handle the
+ * id settings accept (at most 8, like app.ts TASK_ID_RE). Legacy hex and retro children
+ * never match; own `PREFIX-n` ids are the own-store hit's job. */
+const DEP_PREFIX_RE = /^([A-Z0-9]{1,8})-(\d+)$/;
+
+/** Resolves one dependsOn id across the board's projects (OTTR-708). A card in the own
+ * project wins whatever the id looks like; otherwise the `PREFIX-n` prefix maps to a
+ * project by its id handle. Pure. */
+export function resolveDep(
+	id: string,
+	projects: Iterable<DepProject>,
+	own: DepProject,
+): DepResolution {
+	const local = own.getTask(id);
+	if (local !== null) return { task: local, project: own.name };
+	const m = DEP_PREFIX_RE.exec(id);
+	if (m === null) return { why: "own", id };
+	const prefix = m[1]!;
+	const hits = [...projects].filter((p) => p.prefix === prefix);
+	if (hits.length === 0) return { why: "project", id, prefix };
+	if (hits.length > 1)
+		return { why: "ambiguous", id, prefix, projects: hits.map((p) => p.name) };
+	const foreign = hits[0]!;
+	const task = foreign.getTask(id);
+	if (task === null) return { why: "task", id, project: foreign.name };
+	return { task, project: foreign.name };
+}
+
+/** resolveDep flattened for the hold paths: the dep card, or null when the id names no
+ * card anywhere (satisfied at scheduling; validation is the create route's and the
+ * settle block's job). */
+export function findDep(
+	id: string,
+	projects: Iterable<DepProject>,
+	own: DepProject,
+): DepCard | null {
+	const r = resolveDep(id, projects, own);
+	return "task" in r ? r.task : null;
+}
+
+/** The resolver's view of one project store: name, id handle, task lookup. */
+export function depProjectOf(store: {
+	name: string;
+	taskPrefix(): string;
+	getTask(id: string): DepCard | null;
+}): DepProject {
+	return {
+		name: store.name,
+		prefix: store.taskPrefix(),
+		getTask: (id) => store.getTask(id),
+	};
+}
+
+/** The resolver's view of the board's projects; entries only need a store. */
+export function depProjectsOf(
+	projects: Iterable<{
+		store: {
+			name: string;
+			taskPrefix(): string;
+			getTask(id: string): DepCard | null;
+		};
+	}>,
+): DepProject[] {
+	return [...projects].map((e) => depProjectOf(e.store));
+}
+
+/** The needs_you reason a settle block shows for a report_outcome dependsOn id that
+ * names no card (OTTR-708). `own` decides "this project" vs naming the foreign project. */
+export function depMissReason(id: string, miss: DepMiss, own: string): string {
+	const tail = "Reply to continue, or cancel the card.";
+	switch (miss.why) {
+		case "project":
+			return `report_outcome's dependsOn names #${id}, but no project ${miss.prefix} exists on the board. ${tail}`;
+		case "ambiguous":
+			return `report_outcome's dependsOn names #${id}, but more than one project uses the ${miss.prefix} id handle (${miss.projects.join(", ")}). ${tail}`;
+		case "task":
+			return miss.project === own
+				? `report_outcome's dependsOn names #${id}, which is not a card in this project. ${tail}`
+				: `report_outcome's dependsOn names #${id}, which is not a card in project ${miss.project}. ${tail}`;
+		default:
+			return `report_outcome's dependsOn names #${id}, which is not a card in this project. ${tail}`;
+	}
+}
+
+/** The first report_outcome dependsOn id the settle block must reject — the card itself,
+ * or an id naming no card across the board — with its needs_you reason; null records the
+ * ids and holds (OTTR-708). */
+export function badDep(
+	deps: readonly string[],
+	projects: Iterable<DepProject>,
+	own: DepProject,
+	self: string,
+): { id: string; reason: string } | null {
+	for (const id of deps) {
+		if (id === self)
+			return {
+				id,
+				reason: `report_outcome's dependsOn names #${id}, which is this card itself. Reply to continue, or cancel the card.`,
+			};
+		const r = resolveDep(id, projects, own);
+		if (!("task" in r)) return { id, reason: depMissReason(id, r, own.name) };
+	}
+	return null;
+}
+
 /** The unfinished dependency cards `t` waits for, in its dependsOn order. A cancelled dependency
  * counts as satisfied: cancelling M1 must not strand M2 in the queue forever. `tasks` must be the
- * whole project: a dependency missing from it counts as done. */
-export function waitingOn<T extends Pick<Task, "id" | "stage" | "cancelledAt">>(
+ * whole project: a dependency missing from it counts as done. `foreign` (OTTR-708) looks an id
+ * up across the board's projects; one it cannot resolve counts as done too. */
+export function waitingOn<
+	T extends Pick<Task, "id" | "stage" | "cancelledAt">,
+	F extends DepCard = never,
+>(
 	tasks: readonly T[],
 	t: Pick<Task, "dependsOn">,
-): T[] {
+	foreign?: (id: string) => F | null,
+): (T | F)[] {
 	if (t.dependsOn.length === 0) return [];
 	const byId = new Map(tasks.map((d) => [d.id, d]));
 	return t.dependsOn.flatMap((id) => {
-		const d = byId.get(id);
-		return d !== undefined && d.cancelledAt === null && d.stage !== "done"
+		const d = byId.get(id) ?? foreign?.(id) ?? null;
+		return d !== null && d.cancelledAt === null && d.stage !== "done"
 			? [d]
 			: [];
 	});
@@ -390,10 +530,11 @@ export function waitingOn<T extends Pick<Task, "id" | "stage" | "cancelledAt">>(
 
 /** Why the queued card may not start yet — unfinished dependencies — else null. */
 export function depHold(
-	tasks: readonly Pick<Task, "id" | "title" | "stage" | "cancelledAt">[],
+	tasks: readonly DepCard[],
 	t: Pick<Task, "dependsOn">,
+	foreign?: DepIndex,
 ): string | null {
-	const waiting = waitingOn(tasks, t);
+	const waiting = waitingOn(tasks, t, foreign);
 	return waiting.length === 0
 		? null
 		: `waiting for ${waiting.map((d) => `#${d.id} ${d.title}`).join(", ")}`;
@@ -416,6 +557,9 @@ export interface PickOptions {
 	/** True while the project merges via PR: a card with an open PR is never picked for
 	 * another merge turn, and mainUnpushed's hold is inert (mergeHold). */
 	prMode?: boolean;
+	/** OTTR-708: looks a dependsOn id up across every project's store (findDep); null
+	 * counts the dependency as satisfied, like one missing from the own list. */
+	crossDeps?: DepIndex;
 }
 
 /** Pick the tasks that may start an omp run right now. Pure; `tasks` is one project's tasks.
@@ -455,7 +599,7 @@ export function pickRunnable(
 					mainUnpushed: o.mainUnpushed === true,
 					prMode: o.prMode === true,
 				}) === null &&
-				depHold(live, t) === null,
+				depHold(live, t, o.crossDeps) === null,
 		);
 		if (merge) {
 			picked.push(merge);
@@ -490,7 +634,7 @@ export function pickRunnable(
 		// done, waitingOn); merging cards wait in the merge slot above.
 		if (
 			(t.stage === "todo" || t.stage === "in_progress") &&
-			depHold(live, t) !== null
+			depHold(live, t, o.crossDeps) !== null
 		)
 			continue;
 		if (t.stage !== "todo" && t.stage !== "in_progress") continue;
@@ -521,7 +665,7 @@ export function pickLowPriority(
 				(o.only === undefined || t.id === o.only) &&
 				(t.holdUntil === null || t.holdUntil <= now) &&
 				(t.stage === "todo" || t.stage === "in_progress") &&
-				depHold(live, t) === null,
+				depHold(live, t, o.crossDeps) === null,
 		) ?? null
 	);
 }

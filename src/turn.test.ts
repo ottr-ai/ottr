@@ -201,6 +201,9 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		diffText: async () => null,
 		isClean: async () => true,
 		isIntegrated: async () => true,
+		// OTTR-708: a static snapshot reads unchanged, so the checkout guard never fires
+		// unless a test scripts a before/after change.
+		checkoutState: async () => ({ head: "head0", status: "" }),
 		unsavedWork: async () => null,
 		statusFiles: async () => [],
 		quarantineUntracked: async (
@@ -1388,6 +1391,18 @@ function logText(store: ProjectStore, id: string): string {
 function saveSession(store: ProjectStore, sid: string): void {
 	mkdirSync(store.sessionsDir, { recursive: true });
 	writeFileSync(join(store.sessionsDir, `1_${sid}.jsonl`), "{}\n");
+}
+
+/** A card waiting for a reply turn on a saved session. */
+function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
+	const task = store.createTask(prompt, null, kind);
+	store.updateTask(task.id, {
+		stage: "in_progress",
+		sessionId: "s1",
+		pendingPrompt: "just finish it",
+	});
+	saveSession(store, "s1");
+	return task;
 }
 
 function setImage(store: ProjectStore, id: string, name: string, body: string) {
@@ -12438,6 +12453,82 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 		expect(prompt).toContain("call report_outcome");
 	});
 
+	test("a dependsOn id naming no project parks needs_you naming it, ids unchanged", async () => {
+		const { store, loop } = depCase(() => ["NOPE-5"]);
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("NOPE-5");
+		expect(after.needsReason).toContain("no project NOPE");
+		expect(after.dependsOn).toEqual([]);
+	});
+
+	/** Two projects on one loop: `store` (own) and `foreign` with the AD id handle, so
+	 * report_outcome may hold on the foreign project's cards. */
+	function twoProjectCase(depIds: () => string[]) {
+		const store = freshStore();
+		const foreign = freshStore();
+		foreign.setSettings({ taskIdPrefix: "AD" });
+		const foreignDep = foreign.createTask("the foreign blocker");
+		const record = baseRecord();
+		const projects = new Map([
+			[store.name, fakeProject(store)],
+			[foreign.name, fakeProject(foreign)],
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, holdingRun(record, depIds)),
+		);
+		return { store, foreign, foreignDep, record, loop };
+	}
+
+	test("a cross-project dependsOn id is recorded and holds like a local one", async () => {
+		const { store, foreignDep, loop } = twoProjectCase(() => [foreignDep.id]);
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.stage).toBe("in_progress");
+		expect(after.dependsOn).toEqual([foreignDep.id]);
+		expect(after.needsReason).toBe(
+			`waiting for #${foreignDep.id} the foreign blocker`,
+		);
+		expect(after.pendingPrompt).toBe(DEP_HELD_PROMPT);
+	});
+
+	test("a dep-held card restarts naming its foreign dependency done", async () => {
+		const store = freshStore();
+		const foreign = freshStore();
+		foreign.setSettings({ taskIdPrefix: "AD" });
+		const foreignDep = foreign.createTask("the foreign blocker");
+		const record = baseRecord();
+		const projects = new Map([
+			[store.name, fakeProject(store)],
+			[foreign.name, fakeProject(foreign)],
+		]);
+		const loop = createTurnLoop(projects, fakeOps(record));
+		const task = replyCard(store, "work please");
+		store.updateTask(task.id, {
+			pendingPrompt: DEP_HELD_PROMPT,
+			dependsOn: [foreignDep.id],
+		});
+		foreign.updateTask(foreignDep.id, { stage: "done", state: "idle" });
+
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.prompt).toContain(
+			`#${foreignDep.id} the foreign blocker: done`,
+		);
+		// The foreign store resolved the title; the own store's fallback would repeat the id.
+		expect(record.runs[0]!.prompt).not.toContain(
+			`#${foreignDep.id} ${foreignDep.id}: done`,
+		);
+	});
+
 	test("a ready outcome with dependsOn records the ids but keeps the normal next state", async () => {
 		let depId = "";
 		const { store, record, loop } = setup({
@@ -13844,18 +13935,6 @@ describe("turn survivor round 5 — run setup", () => {
 			base: "sha0",
 			worktree: "wt-x",
 		});
-		return task;
-	}
-
-	/** A card waiting for a reply turn on a saved session. */
-	function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
-		const task = store.createTask(prompt, null, kind);
-		store.updateTask(task.id, {
-			stage: "in_progress",
-			sessionId: "s1",
-			pendingPrompt: "just finish it",
-		});
-		saveSession(store, "s1");
 		return task;
 	}
 
@@ -19245,5 +19324,226 @@ describe("writeVmFiles", () => {
 		expect(logs).toHaveLength(5);
 		rmSync(wt, { recursive: true, force: true });
 		rmSync(outside, { recursive: true, force: true });
+	});
+});
+
+// OTTR-708: the cross-project checkout guard. A work turn snapshots every other project's
+// main checkout before its agent runs and re-checks it at settle; a commit the board did
+// not push, or a status change, parks the card needs_you. The card's own project and
+// gitless projects are skipped, and a HEAD advance the board itself pushed with a clean
+// tree is discounted.
+describe("turn checkout guard (other projects)", () => {
+	type Snap = { head: string | null; status: string };
+
+	/** Two-project loop whose checkoutState fake reads a mutable per-path state map. */
+	function twoProjectCase(
+		overrides: Partial<TurnOps> = {},
+		extra: TurnProject[] = [],
+	) {
+		const record = baseRecord();
+		const store = freshStore();
+		const other = freshStore();
+		const states = new Map<string, Snap>();
+		const projects = new Map<string, TurnProject>([
+			[store.name, fakeProject(store)],
+			[other.name, fakeProject(other)],
+			...extra.map((p) => [p.name, p] as const),
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				checkoutState: async (path: string) =>
+					states.get(path) ?? { head: "base0", status: "" },
+				...overrides,
+			}),
+		);
+		return { store, other, record, states, loop };
+	}
+
+	/** startRun override that changes the other checkout mid-run, then answers. */
+	function changingRun(record: Recorded, change: () => void): Partial<TurnOps> {
+		return {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				change();
+				o.onSession?.("sess-1");
+				const isFirstRun = record.runs.length === 1;
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						isFirstRun
+							? runResult({
+									outcome: {
+										status: "answered",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: // The chained merge turn (isIntegrated defaults true): reports integrated
+								// so the settle completes to done/idle instead of parking on a
+								// misreported outcome.
+								runResult({
+									outcome: {
+										status: "integrated",
+										summary: "landed",
+									} satisfies Outcome,
+								}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		};
+	}
+
+	test("a work turn whose other project gains a commit and a dirty file parks needs_you", async () => {
+		const record = baseRecord();
+		const { store, other, states, loop } = twoProjectCase({
+			commitSubjects: async () => ["abc1234 add widget"],
+			...changingRun(record, () => {
+				states.set(other.path, {
+					head: "abc1234",
+					status: " M src/widget.ts",
+				});
+			}),
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(other.name);
+		expect(after.needsReason).toContain("abc1234 add widget");
+		expect(after.needsReason).toContain("src/widget.ts");
+		expect(after.needsReason).toContain("create_task");
+	});
+
+	test("a work turn that leaves the other checkouts untouched settles without parking", async () => {
+		// Filing a card in the other project goes through the board API: no git change,
+		// so the snapshots read identical and the guard stays silent.
+		const record = baseRecord();
+		const { store, loop } = twoProjectCase(changingRun(record, () => {}));
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+		// The chained merge turn settles asynchronously; drain it before reading the row.
+		await flushPromises();
+
+		const after = store.getTask(task.id)!;
+		// The settled end state (not merely "no needs_you"): the work turn settles to
+		// merging/queued, the chained merge turn lands it, done/idle.
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("a board-made merge advance of the other project with a clean tree does not park", async () => {
+		// The merge turn reports integrated (it lands and pushes); the later work turn
+		// reports answered and moves the other checkout to the merged head mid-run.
+		let workRun = false;
+		const integrated = () => ({
+			pid: 4242,
+			done: Promise.resolve(
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "landed",
+					} satisfies Outcome,
+				}),
+			),
+			kill: async () => {},
+		});
+		const { store, other, record, states, loop } = twoProjectCase({
+			isIntegrated: async () => true,
+			targetSha: async () => "sha-pushed",
+			serverMergePush: async () => ({
+				status: "pushed" as const,
+				output: "",
+			}),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				if (!workRun) return integrated();
+				states.set(other.path, { head: "merged9", status: "" });
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		});
+		// The other project's merge turn lands first: its settle push records the head the
+		// board itself moved the main checkout to.
+		states.set(other.path, { head: "merged9", status: "" });
+		const mergeTask = other.createTask("merge please");
+		other.updateTask(mergeTask.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(other.name, mergeTask.id);
+		await flushPromises();
+
+		// Back at the pre-merge head; the work turn's agent moves it to the merged head
+		// again. The recorded board push discounts the advance.
+		states.delete(other.path);
+		workRun = true;
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
+	});
+
+	test("an unrecorded HEAD advance with a clean tree parks needs_you", async () => {
+		const record = baseRecord();
+		const { store, other, states, loop } = twoProjectCase(
+			changingRun(record, () => {
+				states.set(other.path, { head: "stealth9", status: "" });
+			}),
+		);
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(other.name);
+		expect(after.needsReason).toContain("moved to stealth");
+	});
+
+	test("own-project changes and gitless projects are skipped", async () => {
+		const gitlessStore = freshStore();
+		const record = baseRecord();
+		const { store, states, loop } = twoProjectCase(
+			changingRun(record, () => {
+				// The card's own project and the gitless project both change mid-run;
+				// the guard must stay silent for both.
+				states.set(store.path, { head: "own9", status: " M src/x.ts" });
+				states.set(gitlessStore.path, {
+					head: "git9",
+					status: "?? scratch.txt",
+				});
+			}),
+			[{ ...fakeProject(gitlessStore), gitless: true }],
+		);
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).not.toBe("needs_you");
+		expect(after.needsReason).toBeNull();
 	});
 });

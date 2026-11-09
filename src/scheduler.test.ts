@@ -14,8 +14,11 @@ import {
 	archReviewView,
 	checkModelWarning,
 	checkRoleFor,
+	type DepIndex,
+	type DepProject,
 	demoteUnquoted,
 	depHold,
+	findDep,
 	findingsHold,
 	findingsSettledAt,
 	isEvidenceBugClass,
@@ -39,6 +42,7 @@ import {
 	pushHold,
 	queueOrder,
 	releaseHeldMerges,
+	resolveDep,
 	reviewBlocked,
 	reviewFindings,
 	SILENT_LOG_MS,
@@ -984,6 +988,83 @@ describe("depHold", () => {
 		const cancelled = task({ cancelledAt: 5 });
 		const t = task({ dependsOn: [done.id, cancelled.id, "nope"] });
 		expect(depHold([done, cancelled, t], t)).toBe(null);
+	});
+});
+
+describe("cross-project dependencies (OTTR-708)", () => {
+	/** One resolver-side project: a prefix handle and its cards, addressable by id. */
+	const side = (
+		prefix: string,
+		cards: Task[],
+		name = prefix.toLowerCase(),
+	): DepProject => ({
+		name,
+		prefix,
+		getTask: (id) => cards.find((t) => t.id === id) ?? null,
+	});
+
+	test("resolveDep prefers the own project's card whatever the id looks like", () => {
+		const own = side("P1", [task({ id: "AD-1", title: "local twin" })]);
+		const other = side("AD", [task({ id: "AD-1", title: "foreign twin" })]);
+		expect(resolveDep("AD-1", [own, other], own)).toEqual({
+			task: own.getTask("AD-1")!,
+			project: "p1",
+		});
+	});
+
+	test("a foreign PREFIX-n id resolves through the id handle", () => {
+		const own = side("P1", []);
+		const other = side("AD", [task({ id: "AD-5", title: "over there" })]);
+		expect(resolveDep("AD-5", [own, other], own)).toEqual({
+			task: other.getTask("AD-5")!,
+			project: "ad",
+		});
+	});
+
+	test("an unknown prefix, a shared prefix, and a missing card are misses", () => {
+		const own = side("P1", []);
+		const other = side("AD", []);
+		expect(resolveDep("NOPE-1", [own, other], own)).toEqual({
+			why: "project",
+			id: "NOPE-1",
+			prefix: "NOPE",
+		});
+		const twin = side("AD", [task({ id: "AD-5" })], "ad2");
+		expect(resolveDep("AD-5", [own, other, twin], own)).toEqual({
+			why: "ambiguous",
+			id: "AD-5",
+			prefix: "AD",
+			projects: ["ad", "ad2"],
+		});
+		expect(resolveDep("AD-9", [own, other], own)).toEqual({
+			why: "task",
+			id: "AD-9",
+			project: "ad",
+		});
+	});
+
+	test("a cross-project dependency holds until the foreign card is done or cancelled", () => {
+		const dep = task({ id: "AD-5", title: "over there", stage: "in_progress" });
+		const t = task({ dependsOn: ["AD-5"] });
+		const own = side("P1", []);
+		const other = side("AD", [dep]);
+		const crossDeps: DepIndex = (id) => findDep(id, [own, other], own);
+		expect(pickRunnable([t], { ...opts, crossDeps })).toEqual([]);
+		expect(depHold([t], t, crossDeps)).toBe("waiting for #AD-5 over there");
+		// Done or cancelled: satisfied, like a local dependency.
+		dep.stage = "done";
+		expect(pickRunnable([t], { ...opts, crossDeps })).toEqual([t]);
+		dep.stage = "in_progress";
+		dep.cancelledAt = 5;
+		expect(pickRunnable([t], { ...opts, crossDeps })).toEqual([t]);
+	});
+
+	test("an unresolvable foreign id never holds; validation is the settle block's job", () => {
+		const t = task({ dependsOn: ["NOPE-5", "AD-404"] });
+		const own = side("P1", []);
+		const other = side("AD", []);
+		const crossDeps: DepIndex = (id) => findDep(id, [own, other], own);
+		expect(pickRunnable([t], { ...opts, crossDeps })).toEqual([t]);
 	});
 });
 

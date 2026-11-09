@@ -118,6 +118,8 @@ Notes:
 - Merge turns run local, never on a worker. The agent does not push. `serverMergePush` pushes with the server's git credentials (`src/worktree.ts`).
 - A `ready` report needs commits ahead of the base and a clean worktree. An `integrated` report needs the branch head on the upstream branch. Otherwise `classify` parks the card at `needs_you` (`src/runner.ts`).
 
+**Cross-project cards.** A card changes another project only by filing a card there: `create_task` with the `project` parameter files the card, and that card's own turns land the change. The agent never edits or commits in another project's checkout. After each work turn, the board compares every other project's main checkout (HEAD, index, working tree) with its state before the turn. A change the turn made parks the card at `needs_you`, with the project, the commits and the files named. A card can wait for the card it filed: `report_outcome` and `create_task` accept `PROJECT-N` ids of other projects in `dependsOn`, and the scheduler holds the card until those cards are done or cancelled.
+
 ## Life cycle
 
 A task has two fields. `stage` is the board column. `state` is the run state inside that column. Both are in `src/types.ts` and in the `CHECK` constraints of the `tasks` table in `src/store.ts`.

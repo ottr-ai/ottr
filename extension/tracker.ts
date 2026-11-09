@@ -493,7 +493,7 @@ export default function (pi: Pi) {
 				.array(z.string())
 				.optional()
 				.describe(
-					"Ids of cards in the same project that must be done (or cancelled) before this card's next turn starts. A needs_you outcome with dependsOn requeues the card in its current stage instead of parking at needs_you; the tracker restarts the turn when they finish. A turn that must wait for a card it filed with create_task passes that id here.",
+					"Ids of cards that must be done (or cancelled) before this card's next turn starts: this project's task ids, or another project's PROJECT-N id (its task-id prefix). A needs_you outcome with dependsOn requeues the card in its current stage instead of parking at needs_you; the tracker restarts the turn when they finish. A turn that must wait for a card it filed with create_task passes that id here.",
 				),
 		}),
 		loadMode: "essential",
@@ -667,7 +667,7 @@ export default function (pi: Pi) {
 				.array(z.string())
 				.optional()
 				.describe(
-					"Task ids of cards that must be done before this card starts; the scheduler holds the new card in the queue until then. File dependency cards first to learn their ids.",
+					"Task ids of cards that must be done before this card starts: this project's ids, or another project's PROJECT-N id (its task-id prefix); the scheduler holds the new card in the queue until then. File dependency cards first to learn their ids.",
 				),
 		}),
 		loadMode: "essential",

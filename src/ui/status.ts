@@ -1,4 +1,5 @@
 import {
+	type DepIndex,
 	depHold,
 	isReview,
 	mergeHold,
@@ -210,7 +211,8 @@ export function cardMark(
  * queued merge waits on its own mergeHold (an open review, unless the card is one of its
  * findings, as in pickRunnable) or on the push hold the server stamped (`pushHold`, OTTR-506:
  * local main has commits origin lacks; the browser gets no git), then any stage on its
- * unfinished dependencies (one missing from `tasks` counts as done); a done card is never held. */
+ * unfinished dependencies (one missing from `tasks` counts as done; `foreign` OTTR-708 looks
+ * an id up across the board's projects, unresolvable counts as done); a done card is never held. */
 export function holdFor(
 	t: Pick<
 		Task,
@@ -220,6 +222,7 @@ export function holdFor(
 		vmHold?: string;
 	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
+	foreign?: DepIndex,
 ): string | null {
 	if (t.stage === "done") return null;
 	if (t.stage === "merging") {
@@ -229,7 +232,7 @@ export function holdFor(
 	}
 	// A card waiting on its dependencies would not dispatch even with a free microVM, so the
 	// dependency hold names the real blocker first; the server stamps vmHold on queued cards.
-	return depHold(tasks, t) ?? t.vmHold ?? null;
+	return depHold(tasks, t, foreign) ?? t.vmHold ?? null;
 }
 
 /** The release card's re-release view, else null: parked for the user (needs_you or idle, not

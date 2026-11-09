@@ -2434,9 +2434,9 @@ export class ProjectStore {
 	/**
 	 * The project's task id handle: the taskIdPrefix setting or the folder-derived default.
 	 * Defensive normalization covers values stored by direct setSettings callers that bypass
-	 * the API's validation.
+	 * the API's validation. Public for the cross-project dependsOn resolver (OTTR-708).
 	 */
-	private taskPrefix(): string {
+	taskPrefix(): string {
 		const p = this.getSettings().taskIdPrefix;
 		if (p !== null) {
 			const s = p.replaceAll(/[^A-Za-z0-9]/g, "").toUpperCase();

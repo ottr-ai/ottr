@@ -112,6 +112,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		fetchOriginBranch: async () => null,
 		branchUnpushed: async () => false,
 		checkedOutBranch: async () => null,
+		checkoutState: async () => ({ head: "head0", status: "" }),
 		rebaseTargetBranch: async () => ({
 			ok: false as const,
 			conflict: true,

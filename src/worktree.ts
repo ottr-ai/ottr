@@ -2329,6 +2329,39 @@ export async function commitSubjects(
 }
 
 /**
+ * OTTR-708: a main checkout's HEAD sha and porcelain status (including untracked files), the
+ * input of the cross-project checkout guard. A missing directory or a failed git read never
+ * throws: head reads null and the status empty, and the caller skips the project then.
+ */
+export async function checkoutState(
+	mainPath: string,
+): Promise<{ head: string | null; status: string }> {
+	let head: string | null = null;
+	try {
+		const h = await git(["rev-parse", "HEAD"], mainPath);
+		if (h.code === 0) head = h.stdout.trim();
+	} catch {
+		// The checkout is missing or not a git repository: head stays null.
+	}
+	let status = "";
+	try {
+		const s = await sealedGit(
+			[
+				"status",
+				"--porcelain",
+				"--untracked-files=all",
+				"--ignore-submodules=dirty",
+			],
+			mainPath,
+		);
+		if (s.code === 0) status = s.stdout;
+	} catch {
+		// The checkout is missing: the status stays empty.
+	}
+	return { head, status };
+}
+
+/**
  * Moves every non-ignored untracked file in the worktree into `quarantineDir`, preserving repo-relative
  * paths; returns the moved paths (repo-relative, forward slashes). Ignored files and tracked files stay
  * untouched. [] when there is nothing to move. Throws when git fails. No symlink below the worktree or

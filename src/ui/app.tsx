@@ -26,7 +26,15 @@ import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
-import { liveCardOf, queueOrder, waitingOn } from "../scheduler.ts";
+import {
+	type DepIndex,
+	type DepProject,
+	findDep,
+	liveCardOf,
+	queueOrder,
+	type ReviewTask,
+	waitingOn,
+} from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
 import {
 	type AddProjectResponse,
@@ -3355,6 +3363,25 @@ export function cancelledTopic(
 	];
 }
 
+/** OTTR-708: the cross-project dependency lookup for one project's board — resolves a
+ * dependsOn id through the project's own cards first, then by the projects' id handles
+ * (resolveDep, the server's rule). undefined when the project is not among `projects`. */
+function depIndexOf(
+	projects: ProjectView[],
+	tasks: TaskCard[],
+	project: ProjectView,
+): DepIndex | undefined {
+	const cards = new Map<string, TaskCard>();
+	for (const t of tasks) cards.set(`${t.project}\u0000${t.id}`, t);
+	const deps: DepProject[] = projects.map((p) => ({
+		name: p.name,
+		prefix: p.taskPrefix,
+		getTask: (id: string) => cards.get(`${p.name}\u0000${id}`) ?? null,
+	}));
+	const own = deps.find((p) => p.name === project.name);
+	return own === undefined ? undefined : (id) => findDep(id, deps, own);
+}
+
 /** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
 export function ProjectBoard({
 	project,
@@ -3368,6 +3395,7 @@ export function ProjectBoard({
 	onNotice,
 	draining,
 	tick,
+	foreignDeps,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
@@ -3382,6 +3410,9 @@ export function ProjectBoard({
 	draining: boolean;
 	/** The board's 30 s clock tick; feeds the memoized cards so their ages keep ticking. */
 	tick?: number;
+	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
+	 * foreign card; absent before the first state frame or for an unknown project. */
+	foreignDeps?: DepIndex;
 }) {
 	const hosted = useContext(HostedContext);
 	const [showRelease, setShowRelease] = useState(false);
@@ -4067,6 +4098,7 @@ export function ProjectBoard({
 								}
 								onAddDraft={c.key === "todo" ? composeDraft : undefined}
 								projectTasks={tasks}
+								foreignDeps={foreignDeps}
 								groups={doneGroups}
 								collapsed={collapsed}
 								onToggle={(key) =>
@@ -5161,6 +5193,7 @@ export function LaneCol({
 	stage,
 	tasks,
 	projectTasks,
+	foreignDeps,
 	groups,
 	collapsed,
 	onToggle,
@@ -5194,6 +5227,9 @@ export function LaneCol({
 	onMore?: () => void;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
+	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
+	 * foreign card; absent before the first state frame or for an unknown project. */
+	foreignDeps?: DepIndex;
 	/** Done lane only: topic sections to render instead of the flat landing order;
 	 * `hidden` counts the topic's cards behind its own "Show more" button. */
 	groups:
@@ -5301,7 +5337,7 @@ export function LaneCol({
 			for (const t of list) {
 				if (done.has(t.id)) continue;
 				done.add(t.id);
-				const hold = holdFor(t, projectTasks);
+				const hold = holdFor(t, projectTasks, foreignDeps);
 				holds.set(t.id, hold);
 				statuses.set(
 					t.id,
@@ -5314,7 +5350,7 @@ export function LaneCol({
 		scan(tasks);
 		if (parked !== undefined) scan(parked);
 		return { holds, statuses, rereleases };
-	}, [projectTasks, tasks, parked, hasRules, draining]);
+	}, [projectTasks, tasks, parked, hasRules, draining, foreignDeps]);
 	// One drag wiring per queued card, rebuilt only when the drag state or the queued order
 	// changes: a fresh object on every frame would break the memoized Card's shallow compare.
 	// The handlers capture the id, never the card object, so a changed card elsewhere in the
@@ -5445,6 +5481,8 @@ export function LaneCol({
 			delta={deltas.get(t.id)}
 			hold={facts.holds.get(t.id) ?? null}
 			status={facts.statuses.get(t.id)}
+			drain={draining}
+			tasks={projectTasks}
 			fuOf={t.followUpOf}
 			onOpen={open}
 			unread={unread(t)}
@@ -12747,6 +12785,7 @@ export function App() {
 							key={project.name}
 							project={project}
 							tasks={tasks.filter((t) => t.project === project.name)}
+							foreignDeps={depIndexOf(projects, tasks, project)}
 							deltas={deltas}
 							open={openTask}
 							seenAnswers={seenAnswers}
