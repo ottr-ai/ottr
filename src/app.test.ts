@@ -422,6 +422,10 @@ function mount(
 		trendingFetch?: typeof fetch;
 		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
 		rerunFetch?: typeof fetch;
+		/** Ceiling for the default token-expiry probe; passed through to createApp. */
+		githubTokenExpiryTimeoutMs?: Parameters<
+			typeof createApp
+		>[0]["githubTokenExpiryTimeoutMs"];
 	} = {},
 ) {
 	const g =
@@ -478,6 +482,7 @@ function mount(
 		prReviewSpawn: input.prReviewSpawn,
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
+		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
 		serverRef: { current: undefined },
 	});
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
@@ -11012,6 +11017,80 @@ describe("PR review routes", () => {
 		};
 	};
 
+	test("a failed app check leaves checkingApp clear, so the next tick re-runs it", async () => {
+		// The install lookup answers 404: the check fails but settles, so saveApp
+		// returns and appCheck carries the error instead of a half-set flag.
+		appFetchImpl = async () => new Response("{}", { status: 404 });
+		// The app-check chain is fire-and-forget inside the app with no exposed
+		// completion signal, so a short real wait is the only way to let a tick
+		// settle; the stub settles on the microtask queue, so 20 ms is enough.
+		const settle = async (ms = 20) => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, ms);
+			await promise;
+		};
+		expect((await saveApp()).status).toBe(200);
+		await settle();
+		const afterSave = appCalls.length;
+		expect(afterSave).toBeGreaterThan(0);
+		// Fresh check and unchanged board repos: a tick must not re-run it.
+		void m.app.sampleStats();
+		await settle();
+		expect(appCalls.length).toBe(afterSave);
+		// A new project changes boardRepos(), so the next tick must re-run the
+		// check — the proof that the failed check left checkingApp clear.
+		makeFixture("appcheck-recheck");
+		// The AGENTS.md keeps the rules interview from queueing a task that would
+		// block the remove at the end of this test.
+		writeFileSync(
+			join(fixtureRepos, "appcheck-recheck", "AGENTS.md"),
+			"rules\n",
+		);
+		execSync("git add AGENTS.md && git commit -qm rules", {
+			cwd: join(fixtureRepos, "appcheck-recheck"),
+			stdio: "ignore",
+		});
+		const add = await m.call("/api/projects", {
+			url: "https://github.com/octo/appcheck-recheck",
+		});
+		expect(add.status).toBe(200);
+		// `git remote -v` displays insteadOf-rewritten URLs, so an origin under the
+		// rewrite prefix would show as file:// and githubUrl would see no github.com
+		// remote. Point origin outside the rewrite map; the settings save then
+		// re-reads it and boardRepos() gains the repo.
+		execSync(
+			`git -C ${join(root, "appcheck-recheck")} remote set-url origin https://github.com/other/appcheck-recheck`,
+		);
+		const saved = await m.call("/api/projects/appcheck-recheck/settings", {
+			targetBranch: "main",
+		});
+		expect(saved.status).toBe(200);
+		// Now a check that hangs until the test releases it: the first tick starts
+		// exactly one check, a second tick while it is in flight must not stack
+		// another one (the in-flight guard still holds), and the released failure
+		// must leave the flag clear for the next tick.
+		const { promise: hung, reject: release } =
+			Promise.withResolvers<Response>();
+		appFetchImpl = async () => hung;
+		const beforeHang = appCalls.length;
+		void m.app.sampleStats();
+		await settle();
+		expect(appCalls.length).toBe(beforeHang + 1);
+		void m.app.sampleStats();
+		await settle();
+		expect(appCalls.length).toBe(beforeHang + 1);
+		release(
+			Object.assign(new Error("timed out after 20s"), {
+				name: "TimeoutError",
+			}),
+		);
+		await settle();
+		expect(appCalls.length).toBe(beforeHang + 1);
+		await removeApp();
+		const rm = await m.call("/api/projects/appcheck-recheck/remove", {});
+		expect(rm.status).toBe(200);
+	});
+
 	test("no app configured: the post falls back to gh and reports the person's login", async () => {
 		await removeApp();
 		const t = reviewed(20, H1);
@@ -13409,6 +13488,45 @@ describe("token expiry reminders", () => {
 		expect(seen.map(String).join("\n")).toContain(
 			"the token expiry probe of https://api.acme.ghe.com/user failed (server error): check or renew the board token; the stored expiry stays until a probe succeeds",
 		);
+	});
+
+	test("the default probe gives up after githubTokenExpiryTimeoutMs and keeps the stored value", async () => {
+		writeFileSync(
+			remindersFile,
+			JSON.stringify({
+				board: { expiresAt: EXP, lastPushDay: null },
+				seed: { expiresAt: null, lastPushDay: null },
+			}),
+		);
+		// mount() injects no githubTokenExpiry, so the POST runs the default probe;
+		// the short ceiling must cut off a fetch that never answers.
+		const m = mount({ githubTokenExpiryTimeoutMs: 100 });
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (url === "https://api.github.com/repos/ottr-ai/ottr") {
+				const { promise, reject } = Promise.withResolvers<Response>();
+				init?.signal?.addEventListener("abort", () =>
+					reject((init.signal as AbortSignal).reason),
+				);
+				return promise;
+			}
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			const started = Date.now();
+			const save = await m.call("/api/settings/github-token", { token: TOKEN });
+			const elapsed = Date.now() - started;
+			// The aborted probe counts as a failed probe: the stored value survives.
+			expect(await save.json()).toEqual({ tokenSet: true, expiresAt: EXP });
+			// Without the ceiling this POST hangs until bun's 5 s test timeout kills it.
+			expect(elapsed).toBeLessThan(5000);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
 	});
 
 	test("on another host the default probe calls <apiBase>/user, never api.github.com", async () => {

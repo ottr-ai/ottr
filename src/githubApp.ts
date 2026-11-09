@@ -9,6 +9,18 @@ import { noRedirectFetch } from "./alate.ts";
 import { githubHost } from "./githubHost.ts";
 import type { AppCheck } from "./types.ts";
 
+/** Ceiling for every GitHub API call below; a stalled server must never hang a check. */
+const APP_FETCH_TIMEOUT_MS = 20_000;
+
+/** Text for a caught error: clear words for a fetch timeout, the message otherwise. */
+function errText(e: unknown, ms: number): string {
+	if (e instanceof Error)
+		return e.name === "TimeoutError" || e.name === "AbortError"
+			? `timed out after ${ms / 1000}s`
+			: e.message;
+	return String(e);
+}
+
 export type ParsedAppKey = { keyObject: KeyObject; fingerprint: string };
 
 /** Parse a PEM private key and fingerprint its public half (SPKI, SHA-256, unpadded base64). */
@@ -93,6 +105,8 @@ export class AppTokenSource {
 	) => Promise<Response>;
 	private readonly now: () => number;
 	private readonly apiBase: string | undefined;
+	/** Ceiling for each of the two calls a token mint makes. */
+	private readonly timeoutMs: number;
 	/** One token per "owner/repo": each mint is scoped to one repo of one installation. */
 	private readonly cached = new Map<string, CacheEntry>();
 
@@ -100,12 +114,15 @@ export class AppTokenSource {
 		appId: string;
 		keyObject: KeyObject;
 		apiBase?: string;
+		/** Ceiling in ms for each outbound call; defaults to APP_FETCH_TIMEOUT_MS. */
+		timeoutMs?: number;
 		fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 		now?: () => number;
 	}) {
 		this.appId = deps.appId;
 		this.keyObject = deps.keyObject;
 		this.apiBase = deps.apiBase;
+		this.timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
 		this.fetchImpl = deps.fetchImpl ?? noRedirectFetch;
 		this.now = deps.now ?? (() => Date.now());
 	}
@@ -117,16 +134,22 @@ export class AppTokenSource {
 		const hit = this.cached.get(key);
 		if (hit !== undefined && now < hit.until) return hit.token;
 		const { jwt } = signAppJwt(this.appId, this.keyObject, now);
-		const lookup = await this.fetchImpl(
-			`${base}/repos/${owner}/${repo}/installation`,
-			{
-				headers: {
-					authorization: `Bearer ${jwt}`,
-					accept: "application/vnd.github+json",
-					"user-agent": "Ottr",
+		let lookup: Response;
+		try {
+			lookup = await this.fetchImpl(
+				`${base}/repos/${owner}/${repo}/installation`,
+				{
+					signal: AbortSignal.timeout(this.timeoutMs),
+					headers: {
+						authorization: `Bearer ${jwt}`,
+						accept: "application/vnd.github+json",
+						"user-agent": "Ottr",
+					},
 				},
-			},
-		);
+			);
+		} catch (e) {
+			throw new Error(`github app: ${errText(e, this.timeoutMs)}`);
+		}
 		if (lookup.status === 404) return null;
 		if (!lookup.ok) {
 			throw new Error(
@@ -138,22 +161,28 @@ export class AppTokenSource {
 			throw new Error("github app: installation lookup gave no id");
 		}
 		const fresh = signAppJwt(this.appId, this.keyObject, this.now());
-		const created = await this.fetchImpl(
-			`${base}/app/installations/${installation.id}/access_tokens`,
-			{
-				method: "POST",
-				headers: {
-					authorization: `Bearer ${fresh.jwt}`,
-					accept: "application/vnd.github+json",
-					"content-type": "application/json",
-					"user-agent": "Ottr",
+		let created: Response;
+		try {
+			created = await this.fetchImpl(
+				`${base}/app/installations/${installation.id}/access_tokens`,
+				{
+					method: "POST",
+					signal: AbortSignal.timeout(this.timeoutMs),
+					headers: {
+						authorization: `Bearer ${fresh.jwt}`,
+						accept: "application/vnd.github+json",
+						"content-type": "application/json",
+						"user-agent": "Ottr",
+					},
+					body: JSON.stringify({
+						repositories: [repo],
+						permissions: { pull_requests: "write" },
+					}),
 				},
-				body: JSON.stringify({
-					repositories: [repo],
-					permissions: { pull_requests: "write" },
-				}),
-			},
-		);
+			);
+		} catch (e) {
+			throw new Error(`github app: ${errText(e, this.timeoutMs)}`);
+		}
 		if (!created.ok) {
 			throw new Error(`github app: access token answered ${created.status}`);
 		}
@@ -188,10 +217,13 @@ export async function checkAppInstalls(deps: {
 	apiBase?: string;
 	fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 	now?: () => number;
+	/** Ceiling in ms for each outbound call; defaults to APP_FETCH_TIMEOUT_MS. */
+	timeoutMs?: number;
 }): Promise<AppCheck> {
 	const base = deps.apiBase ?? githubHost().apiBase;
 	const fetchImpl = deps.fetchImpl ?? noRedirectFetch;
 	const now = deps.now ?? (() => Date.now());
+	const timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
 	const out: AppCheck = {
 		at: now(),
 		name: null,
@@ -204,6 +236,7 @@ export async function checkAppInstalls(deps: {
 	};
 	const get = (path: string) =>
 		fetchImpl(`${base}${path}`, {
+			signal: AbortSignal.timeout(timeoutMs),
 			headers: {
 				authorization: `Bearer ${signAppJwt(deps.appId, deps.keyObject, now()).jwt}`,
 				accept: "application/vnd.github+json",
@@ -224,7 +257,7 @@ export async function checkAppInstalls(deps: {
 				: null;
 	} catch (err) {
 		// Network failures only; the key never reaches an error text from here.
-		out.error = err instanceof Error ? err.message : String(err);
+		out.error = errText(err, timeoutMs);
 		return out;
 	}
 	for (const repo of deps.repos) {
@@ -239,6 +272,7 @@ export async function checkAppInstalls(deps: {
 				// private or gone one 404 — exactly what the probe must tell
 				// apart.
 				const probe = await fetchImpl(`${base}/repos/${repo}`, {
+					signal: AbortSignal.timeout(timeoutMs),
 					headers: {
 						accept: "application/vnd.github+json",
 						"user-agent": "Ottr",
@@ -272,7 +306,7 @@ export async function checkAppInstalls(deps: {
 			// message holds no key.
 			out.failed.push({
 				repo,
-				detail: err instanceof Error ? err.message : String(err),
+				detail: errText(err, timeoutMs),
 			});
 		}
 	}

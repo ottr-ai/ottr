@@ -258,6 +258,36 @@ describe("AppTokenSource", () => {
 		);
 	});
 
+	test("the init carries an AbortSignal so a stalled fetch can be cut off", async () => {
+		const { calls, source } = makeSource([
+			okResponse(INSTALLATION),
+			okResponse({ token: "t1" }),
+		]);
+		await source.tokenFor(OWNER, REPO);
+		expect(calls[0]!.init?.signal).toBeInstanceOf(AbortSignal);
+		expect(calls[1]!.init?.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	test("a stalled server makes tokenFor reject with a clear timeout error", async () => {
+		const srv = Bun.serve({
+			port: 0,
+			fetch: () => new Promise<Response>(() => {}),
+		});
+		try {
+			const source = new AppTokenSource({
+				appId: APP_ID,
+				keyObject: privateKey,
+				apiBase: `http://127.0.0.1:${srv.port}`,
+				timeoutMs: 100,
+			});
+			await expect(source.tokenFor(OWNER, REPO)).rejects.toThrow(
+				/github app: timed out/,
+			);
+		} finally {
+			srv.stop(true);
+		}
+	});
+
 	test("a cached token serves the second lookup without fetches", async () => {
 		const { calls, source } = makeSource([
 			okResponse(INSTALLATION),
@@ -578,6 +608,27 @@ describe("checkAppInstalls", () => {
 			okResponse(INSTALLATION),
 		]);
 		expect((await check).url).toBeNull();
+	});
+
+	test("a stalled server ends the check with a timeout error well before the default ceiling", async () => {
+		const srv = Bun.serve({
+			port: 0,
+			fetch: () => new Promise<Response>(() => {}),
+		});
+		try {
+			const start = Date.now();
+			const out = await checkAppInstalls({
+				appId: APP_ID,
+				keyObject: privateKey,
+				repos: [`${OWNER}/${REPO}`],
+				timeoutMs: 100,
+				apiBase: `http://127.0.0.1:${srv.port}`,
+			});
+			expect(Date.now() - start).toBeLessThan(5000);
+			expect(out.error).toMatch(/timed out/);
+		} finally {
+			srv.stop(true);
+		}
 	});
 });
 

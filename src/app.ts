@@ -366,6 +366,8 @@ const MAX_BODY_BYTES = 65536;
 const MAX_EVENT_BODY_BYTES = 25 * 1024 * 1024;
 /** Timeout for the re-run-failed-jobs GitHub API call, mirroring the trending scan. */
 const RERUN_TIMEOUT_MS = 20_000;
+/** Ceiling for the default token-expiry probe fetch, so a hung remote cannot stall a tick. */
+const TOKEN_PROBE_TIMEOUT_MS = 20_000;
 
 /** A posted list of strings within the route's entry cap. */
 function isStringList(v: unknown, max: number): v is string[] {
@@ -589,6 +591,11 @@ interface AppDeps {
 	 * the stored value (advisory; retried on the next tick).
 	 */
 	githubTokenExpiry?: (token: string) => Promise<string | null>;
+	/**
+	 * Ceiling for the default token-expiry probe fetch in ms; default TOKEN_PROBE_TIMEOUT_MS.
+	 * Tests inject a short one.
+	 */
+	githubTokenExpiryTimeoutMs?: number;
 	/**
 	 * Fetch seam for the GitHub App installation-token mint and the direct review post;
 	 * defaults to noRedirectFetch. Tests inject a stub.
@@ -1571,6 +1578,9 @@ export function createApp(deps: AppDeps) {
 						authorization: `Bearer ${token}`,
 						accept: "application/vnd.github+json",
 					},
+					signal: AbortSignal.timeout(
+						deps.githubTokenExpiryTimeoutMs ?? TOKEN_PROBE_TIMEOUT_MS,
+					),
 				},
 			);
 			// A 401/403/5xx has no expiration header; null would wrongly clear the stored date.

@@ -193,20 +193,49 @@ export function highestTag(lines: string[]): string | null {
 	return best;
 }
 
+/** Ceiling for each ghcr.io fetch inside latestImage: slow endpoints must not hold callers. */
+const GHCR_FETCH_TIMEOUT_MS = 20_000;
+
+function isTimeout(e: unknown): boolean {
+	return (
+		e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")
+	);
+}
+
+/** Clear message for a timeout; ms shapes the seconds shown. */
+function timeoutText(ms: number): string {
+	return `timed out after ${ms / 1000}s`;
+}
+
 /**
  * Latest `vX.Y.Z` tag of the repo's public ghcr.io image (the "owner/name" image, lowercased),
  * with its package page. Anonymous registry pull (the v2 API), so private or absent images
- * come back null.
+ * come back null. timeoutMs: per-fetch probe ceiling; tests inject a short one.
  */
-export async function latestImage(repo: string): Promise<LatestImage | null> {
+export async function latestImage(
+	repo: string,
+	timeoutMs: number = GHCR_FETCH_TIMEOUT_MS,
+): Promise<LatestImage | null> {
 	const [owner, name] = repo.split("/");
 	if (owner === undefined || name === undefined) return null;
 	const image = `${owner}/${name}`.toLowerCase();
 	const tokenRes = await fetch(
 		`https://ghcr.io/token?scope=repository:${image}:pull&service=ghcr.io`,
-	).catch(() => null);
+		{ signal: AbortSignal.timeout(timeoutMs) },
+	).catch((e: unknown) => {
+		if (isTimeout(e))
+			throw new Error(`ghcr token request ${timeoutText(timeoutMs)}`);
+		return null;
+	});
 	// ghcr's token endpoint: { "token": "..." }; anything else means no public pull.
-	const tokenBody: unknown = tokenRes?.ok ? await tokenRes.json() : undefined;
+	let tokenBody: unknown;
+	try {
+		tokenBody = tokenRes?.ok ? await tokenRes.json() : undefined;
+	} catch (e: unknown) {
+		if (isTimeout(e))
+			throw new Error(`ghcr token request ${timeoutText(timeoutMs)}`);
+		throw e;
+	}
 	const token =
 		typeof tokenBody === "object" &&
 		tokenBody !== null &&
@@ -222,10 +251,22 @@ export async function latestImage(repo: string): Promise<LatestImage | null> {
 	const tagsRes = await fetch(`https://ghcr.io/v2/${image}/tags/list?n=1000`, {
 		headers: { authorization: `Bearer ${token}` },
 		redirect: "manual",
-	}).catch(() => null);
+		signal: AbortSignal.timeout(timeoutMs),
+	}).catch((e: unknown) => {
+		if (isTimeout(e))
+			throw new Error(`ghcr tags request ${timeoutText(timeoutMs)}`);
+		return null;
+	});
 	// 404 without an image, 401/403 for private ones; both mean "no chip".
 	if (!tagsRes?.ok) return null;
-	const tagsBody: unknown = await tagsRes.json();
+	let tagsBody: unknown;
+	try {
+		tagsBody = await tagsRes.json();
+	} catch (e: unknown) {
+		if (isTimeout(e))
+			throw new Error(`ghcr tags request ${timeoutText(timeoutMs)}`);
+		throw e;
+	}
 	const tags =
 		typeof tagsBody === "object" &&
 		tagsBody !== null &&

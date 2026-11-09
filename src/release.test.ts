@@ -1194,6 +1194,53 @@ describe("latestImage", () => {
 			restore();
 		}
 	});
+
+	/** Stub fetch that never settles on its own, but rejects with the signal's reason on abort. */
+	function hangFetch(routes: Record<string, unknown>): { restore: () => void } {
+		const real = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			for (const [match, res] of Object.entries(routes))
+				if (url.includes(match))
+					return new Response(JSON.stringify(res), { status: 200 });
+			const { promise, reject } = Promise.withResolvers<Response>();
+			init?.signal?.addEventListener("abort", () =>
+				reject((init.signal as AbortSignal).reason),
+			);
+			return promise;
+		}) as typeof fetch;
+		return {
+			restore: () => {
+				globalThis.fetch = real;
+			},
+		};
+	}
+
+	test("hung token request: clear timeout error, not the success-shaped null", async () => {
+		const { restore } = hangFetch({});
+		try {
+			const start = Date.now();
+			await expect(latestImage("o/r", 100)).rejects.toThrow(/timed out/);
+			// The injected 100ms ceiling must fire, not the 20s default.
+			expect(Date.now() - start).toBeLessThan(5000);
+		} finally {
+			restore();
+		}
+	});
+
+	test("hung tags request: clear timeout error, not the success-shaped null", async () => {
+		const { restore } = hangFetch({ "ghcr.io/token": { token: "t" } });
+		try {
+			const start = Date.now();
+			await expect(latestImage("o/r", 100)).rejects.toThrow(/timed out/);
+			expect(Date.now() - start).toBeLessThan(5000);
+		} finally {
+			restore();
+		}
+	});
 });
 
 // A fake gh that hangs forever: the timeout must kill it (exited resolves non-zero fast)
