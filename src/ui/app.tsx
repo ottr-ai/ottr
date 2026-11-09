@@ -32,7 +32,6 @@ import {
 	findDep,
 	liveCardOf,
 	queueOrder,
-	type ReviewTask,
 	waitingOn,
 } from "../scheduler.ts";
 import { groupTopics } from "../topics.ts";
@@ -5481,8 +5480,6 @@ export function LaneCol({
 			delta={deltas.get(t.id)}
 			hold={facts.holds.get(t.id) ?? null}
 			status={facts.statuses.get(t.id)}
-			drain={draining}
-			tasks={projectTasks}
 			fuOf={t.followUpOf}
 			onOpen={open}
 			unread={unread(t)}
