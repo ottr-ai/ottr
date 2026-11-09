@@ -110,6 +110,7 @@ import type {
 	DiffFileStat,
 	GitFacts,
 	LatestImage,
+	ListedTask,
 	Next,
 	OpenPrsView,
 	Outcome,
@@ -1161,7 +1162,7 @@ export function createTurnLoop(
 	 * detached completion is not a worker failure. */
 	async function settleDetached(
 		e: TurnProject,
-		t: Task,
+		t: ListedTask,
 		turnId: number | null,
 	): Promise<void> {
 		await settleLostTurn(
@@ -1181,7 +1182,7 @@ export function createTurnLoop(
 	 * to finish. */
 	async function settleLostTurn(
 		e: TurnProject,
-		t: Task,
+		t: ListedTask,
 		turnId: number | null,
 		error: string,
 		needsReason: string,
@@ -1246,7 +1247,7 @@ export function createTurnLoop(
 	 * the card like a failed check (the verdict is unknowable) and record the lost run. */
 	async function settleLostCheck(
 		e: TurnProject,
-		t: Task,
+		t: ListedTask,
 		checkKey: string,
 		error: string,
 	): Promise<void> {
@@ -1290,7 +1291,7 @@ export function createTurnLoop(
 		// processes behind them; the restart sweep must not requeue them.
 		if (demoBoard()) return;
 		for (const e of projects.values()) {
-			let tasks: Task[];
+			let tasks: ListedTask[];
 			try {
 				tasks = e.store.listTasks();
 			} catch (err) {
@@ -1433,7 +1434,7 @@ export function createTurnLoop(
 			pid: number | null;
 		}[] = [];
 		for (const e of projects.values()) {
-			let tasks: Task[];
+			let tasks: ListedTask[];
 			try {
 				tasks = e.store.listTasks();
 			} catch (err) {
@@ -1714,7 +1715,7 @@ export function createTurnLoop(
 	 * the caller deletes it after its final card write. */
 	async function publishReleaseCard(
 		e: TurnProject,
-		task: Task,
+		task: ListedTask,
 		base: string,
 		wt: string,
 		target: string,

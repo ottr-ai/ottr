@@ -85,6 +85,7 @@ import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
 	doneReadKey,
+	type ListedTask,
 	type PrReviewRow,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
@@ -4174,7 +4175,7 @@ describe("idle auto review tick", () => {
 		return { m, e, dir, projects };
 	}
 
-	const reviewCards = (e: Entry): Task[] =>
+	const reviewCards = (e: Entry): ListedTask[] =>
 		e.store.listTasks().filter((task) => task.kind === "review");
 
 	test("files the due project's review card at exactly two hours of silence", async () => {

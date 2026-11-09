@@ -3190,7 +3190,6 @@ export function createApp(deps: AppDeps) {
 						details: _details,
 						report: _report,
 						diffFiles: _diffFiles,
-						diffText: _diffText,
 						...card
 					} = t;
 					const progress = deps.progressOf?.(e.store.name, t.id);

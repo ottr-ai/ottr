@@ -21,7 +21,7 @@ import {
 	scratchShotsTend,
 	tendFamily,
 } from "./supervisor.ts";
-import type { ProjectSettings, Task } from "./types.ts";
+import type { ListedTask, ProjectSettings, Task } from "./types.ts";
 import type { SweptProcess } from "./workers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "supervisor-"));
@@ -2051,7 +2051,7 @@ describe("retroPass", () => {
 		await tick(new Map([["proj", entry(store)]]), ops);
 	}
 
-	const kidsOf = (store: ProjectStore, t: Task): Task[] =>
+	const kidsOf = (store: ProjectStore, t: ListedTask): ListedTask[] =>
 		store.listTasks().filter((x) => x.followUpOf === t.id);
 
 	test("files one retro card with the marker prompt, followUpOf, null model, and a log line", async () => {
@@ -2273,7 +2273,7 @@ describe("Dependabot pass", () => {
 		return { code: 0, stdout: JSON.stringify(stdout), stderr: "" };
 	}
 
-	const firstLine = (t: Task): string => t.prompt.split("\n", 1)[0]!;
+	const firstLine = (t: ListedTask): string => t.prompt.split("\n", 1)[0]!;
 
 	test("files one card per new PR with the exact prompt, schedule and log", async () => {
 		const { store, e } = depProject("dep-file");

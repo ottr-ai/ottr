@@ -457,6 +457,10 @@ export interface Task {
 	closeCandidate: string | null;
 }
 
+/** A task from a list read (ProjectStore.listTasks): every field but the raw diff, which only
+ * getTask loads. Code that reads list rows takes this type, so a diffText read needs getTask. */
+export type ListedTask = Omit<Task, "diffText">;
+
 export const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 export type Priority = (typeof PRIORITIES)[number];
 

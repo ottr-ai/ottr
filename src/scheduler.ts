@@ -4,6 +4,7 @@ import { WORK_CHECK_MAX_SENDBACKS } from "./prompts.ts";
 import type {
 	ArchReview,
 	AskQuestion,
+	ListedTask,
 	RecordedFinding,
 	Task,
 	TaskKind,
@@ -419,7 +420,10 @@ export interface PickOptions {
 
 /** Pick the tasks that may start an omp run right now. Pure; `tasks` is one project's tasks.
  * A trending scout card never takes a normal slot: pickLowPriority offers it afterwards. */
-export function pickRunnable(tasks: Task[], o: PickOptions): Task[] {
+export function pickRunnable(
+	tasks: ListedTask[],
+	o: PickOptions,
+): ListedTask[] {
 	const live = tasks.filter((t) => t.cancelledAt === null);
 	const running = live.filter(
 		(t) => t.state === "running" || t.state === "preparing",
@@ -434,7 +438,7 @@ export function pickRunnable(tasks: Task[], o: PickOptions): Task[] {
 			(t.holdUntil === null || t.holdUntil <= now),
 	);
 
-	const picked: Task[] = [];
+	const picked: ListedTask[] = [];
 
 	// The merge slot: only if no merge turn is already running, take the oldest queued merge that no
 	// open review holds. An open release holds every merge but its findings', so no merge can race
@@ -500,7 +504,10 @@ export function pickRunnable(tasks: Task[], o: PickOptions): Task[] {
  * a free slot. schedule() offers it only after every project's pickRunnable picks, so a scout
  * never delays a normal card. Same holds as a work card (drain `only`, holdUntil,
  * dependencies). Pure; `tasks` is one project's tasks. */
-export function pickLowPriority(tasks: Task[], o: PickOptions): Task | null {
+export function pickLowPriority(
+	tasks: ListedTask[],
+	o: PickOptions,
+): ListedTask | null {
 	const live = tasks.filter((t) => t.cancelledAt === null);
 	const running = live.filter(
 		(t) => t.state === "running" || t.state === "preparing",

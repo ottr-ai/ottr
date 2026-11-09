@@ -692,6 +692,24 @@ describe("diff capture columns", () => {
 		reopened.close();
 	});
 
+	test("listTasks leaves out the raw diff and matches getTask on every other field", () => {
+		const store = open(join(root, "diff-list"));
+		const task = store.createTask("listed");
+		store.updateTask(task.id, {
+			diffFiles: [{ file: "a.ts", plus: 1, minus: 0 }],
+			diffText: "diff --git a/a.ts b/a.ts\n",
+			details: "the details",
+			report: "the report",
+		});
+		const [listed] = store.listTasks();
+		const { diffText, ...rest } = store.getTask(task.id)!;
+		expect(diffText).toBe("diff --git a/a.ts b/a.ts\n");
+		expect(listed).not.toHaveProperty("diffText");
+		// Strict: a column missing from the list read would show as undefined, not null.
+		expect(listed).toStrictEqual(rest);
+		store.close();
+	});
+
 	test("a corrupt stored stat list reads as null, not a partial list", () => {
 		const store = open(join(root, "diff-corrupt"));
 		const task = store.createTask("corrupt");

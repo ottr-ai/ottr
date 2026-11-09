@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { writeBelow } from "./confine.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
-import type { Task, TrendingStatus } from "./types.ts";
+import type { ListedTask, TrendingStatus } from "./types.ts";
 
 // Weekly GitHub trending pages the scan reads; their union is the week's candidate pool.
 export const TRENDING_PAGES: readonly string[] = [
@@ -144,7 +144,7 @@ function errText(e: unknown): string {
 }
 
 /** A live scout card blocks another scan for its project: not cancelled and not done. */
-function liveScout(store: ProjectStore): Task | null {
+function liveScout(store: ProjectStore): ListedTask | null {
 	return (
 		store
 			.listTasks()

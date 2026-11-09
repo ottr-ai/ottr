@@ -39,6 +39,7 @@ import type {
 	AskQuestion,
 	DiffFileStat,
 	ForkBranchState,
+	ListedTask,
 	OutcomeStatus,
 	ProjectSettings,
 	ProposalSummary,
@@ -390,7 +391,10 @@ interface TurnRow {
 	ran_on: string | null;
 }
 
-function toTask(project: string, r: TaskRow): Task {
+function toListedTask(
+	project: string,
+	r: Omit<TaskRow, "diff_text">,
+): ListedTask {
 	return {
 		id: r.id,
 		project,
@@ -445,7 +449,6 @@ function toTask(project: string, r: TaskRow): Task {
 		forkMergeHead: r.fork_merge_head,
 		holdHead: r.hold_head,
 		diffFiles: parseDiffFiles(r.diff_files),
-		diffText: r.diff_text,
 		uncommittedFiles: parseStringList(r.uncommitted_files),
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
 		workCheckSendbacks: r.work_check_sendbacks,
@@ -458,6 +461,10 @@ function toTask(project: string, r: TaskRow): Task {
 		holdWindow: r.hold_window,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 	};
+}
+
+function toTask(project: string, r: TaskRow): Task {
+	return { ...toListedTask(project, r), diffText: r.diff_text };
 }
 
 /** Parses the stored diffstat JSON; null when absent. A wrong-shaped entry drops the whole list:
@@ -689,6 +696,18 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdWindow: "hold_window",
 	proposalSummary: "proposal_summary",
 };
+
+// listTasks reads every column but the raw diff (up to 200 KB per card): the board, the
+// scheduler pass and every other list caller never read it. Derived from TASK_COLUMNS, so a
+// new Task field (a compile error there until mapped) joins the list read automatically.
+const TASK_LIST_COLUMNS = [
+	"id",
+	"created_at",
+	"updated_at",
+	"done_at",
+	"kind",
+	...Object.values(TASK_COLUMNS).filter((c) => c !== "diff_text"),
+].join(", ");
 
 const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
 	endedAt: "ended_at",
@@ -1648,7 +1667,7 @@ export class ProjectStore {
 	/** The task's own session title: the stored one, or the first title in the session
 	 * transcript; null when neither exists yet. Markdown from the titler and omp's card
 	 * prefix are stripped on read, so rows written before the cleaning also display clean. */
-	sessionTitle(task: Task): string | null {
+	sessionTitle(task: ListedTask): string | null {
 		const row = this.db
 			.query<{ session_title: string | null }, [string]>(
 				"SELECT session_title FROM tasks WHERE id = ?",
@@ -1675,7 +1694,7 @@ export class ProjectStore {
 	 * run's rename, or the tracker's prepare-phase generation), the card shows a short cut of the
 	 * prompt line — recomputed each call, never persisted.
 	 */
-	frozenTitle(task: Task): string {
+	frozenTitle(task: ListedTask): string {
 		const title = this.sessionTitle(task);
 		if (title !== null) {
 			this.nameTask(task.id, title);
@@ -2455,13 +2474,13 @@ export class ProjectStore {
 		return row ? toTask(this.name, row) : null;
 	}
 
-	listTasks(): Task[] {
+	listTasks(): ListedTask[] {
 		return this.db
-			.query<TaskRow, []>(
-				"SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC",
+			.query<Omit<TaskRow, "diff_text">, []>(
+				`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
 			)
 			.all()
-			.map((row) => toTask(this.name, row));
+			.map((row) => toListedTask(this.name, row));
 	}
 
 	updateTask(id: string, patch: TaskPatch): Task {

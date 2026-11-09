@@ -1,4 +1,4 @@
-import type { Stage, Task, Turn, TurnKind } from "./types.ts";
+import type { ListedTask, Stage, Turn, TurnKind } from "./types.ts";
 
 const STAGE_LABEL: Record<Stage, string> = {
 	todo: "todo",
@@ -432,7 +432,7 @@ ${ONE_SHOT}`;
 
 /** Markdown handed to a follow-up task so a fresh omp session can continue a completed one. */
 export function handoffMarkdown(o: {
-	task: Task;
+	task: ListedTask;
 	turns: Turn[];
 	sessionsDir: string;
 }): string {
