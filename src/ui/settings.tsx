@@ -5697,6 +5697,8 @@ export function ProjectSettingsForm({
 						</DefRow>
 					</div>
 				</SettingsCard>
+				{/* Both typed fields save through one footer Save: a prefix change renames the
+					project route, so one deliberate save for the card fits. */}
 				<SaveCard
 					id="project-identity-section"
 					act={act}
@@ -5721,64 +5723,58 @@ export function ProjectSettingsForm({
 								: { label: "Local git", tone: "off" }
 					}
 				>
-					{(save) => (
-						<>
-							<DefRow
-								name="Display name"
-								action={save}
-								optional
-								help="A friendly name for the board. The folder and the repo keep their real names."
+					<DefRow
+						name="Display name"
+						optional
+						help="A friendly name for the board. The folder and the repo keep their real names."
+					>
+						<label>
+							<input
+								type="text"
+								maxLength={60}
+								value={label}
+								onChange={(e) => setLabel(e.target.value)}
+								placeholder={project.name}
+								aria-label="Display name"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Task ID prefix"
+						help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
+						shape="empty = from folder name"
+					>
+						<label>
+							<input
+								type="text"
+								maxLength={8}
+								value={prefix}
+								onChange={(e) => setPrefix(e.target.value)}
+								placeholder={project.taskPrefix}
+								aria-label="Task ID prefix"
+							/>
+						</label>
+					</DefRow>
+					{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+					<DefRow
+						name="Folder path"
+						desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
+					>
+						<code>{project.path}</code>
+					</DefRow>
+					{project.github !== null && (
+						<DefRow
+							name="GitHub"
+							desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+						>
+							<a
+								href={project.github}
+								target="_blank"
+								rel="noopener noreferrer"
 							>
-								<label>
-									<input
-										type="text"
-										maxLength={60}
-										value={label}
-										onChange={(e) => setLabel(e.target.value)}
-										placeholder={project.name}
-										aria-label="Display name"
-									/>
-								</label>
-							</DefRow>
-							<DefRow
-								name="Task ID prefix"
-								action={save}
-								help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
-								shape="empty = from folder name"
-							>
-								<label>
-									<input
-										type="text"
-										maxLength={8}
-										value={prefix}
-										onChange={(e) => setPrefix(e.target.value)}
-										placeholder={project.taskPrefix}
-										aria-label="Task ID prefix"
-									/>
-								</label>
-							</DefRow>
-							{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-							<DefRow
-								name="Folder path"
-								desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
-							>
-								<code>{project.path}</code>
-							</DefRow>
-							{project.github !== null && (
-								<DefRow
-									name="GitHub"
-									desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
-								>
-									<a
-										href={project.github}
-										target="_blank"
-										rel="noopener noreferrer"
-									>
-										{project.github}
-									</a>
-								</DefRow>
-							)}
-						</>
+								{project.github}
+							</a>
+						</DefRow>
 					)}
 				</SaveCard>
 			</section>

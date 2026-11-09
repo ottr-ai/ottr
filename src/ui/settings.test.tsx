@@ -604,7 +604,7 @@ describe("ProjectSettingsForm target branch", () => {
 		}
 	});
 
-	test("the Identity card shows the task id prefix row and saving posts it", async () => {
+	test("the Identity card saves both fields through one footer Save", async () => {
 		let postBody: Record<string, unknown> | undefined;
 		const ok = (body: unknown): Response =>
 			new Response(JSON.stringify(body), {
@@ -633,6 +633,17 @@ describe("ProjectSettingsForm target branch", () => {
 			expect(card).not.toBeNull();
 			const row = card?.querySelector(".alate-def-row");
 			expect(row?.textContent).toContain("Display name");
+			// One Save for the card, in the footer: no save button on a row.
+			const saves = card?.querySelectorAll("button.settings-save");
+			expect(saves?.length).toBe(1);
+			expect(
+				card?.querySelector(".alate-def-row button.settings-save"),
+			).toBeNull();
+			const name = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Display name"]',
+			);
+			if (name === null || name === undefined)
+				throw new Error("display name input did not render");
 			const input = card?.querySelector<HTMLInputElement>(
 				'input[aria-label="Task ID prefix"]',
 			);
@@ -642,6 +653,8 @@ describe("ProjectSettingsForm target branch", () => {
 			expect(input.getAttribute("placeholder")).toBe("PROJ");
 			expect(input.getAttribute("maxlength")).toBe("8");
 			await act(async () => {
+				typeInto(name, "My Proj");
+				onChangeOf(name)({ target: name, currentTarget: name });
 				typeInto(input, "chs");
 				onChangeOf(input)({ target: input, currentTarget: input });
 			});
@@ -651,6 +664,7 @@ describe("ProjectSettingsForm target branch", () => {
 				form.dispatchEvent(submitEvent());
 			});
 			expect(postBody).not.toBeUndefined();
+			expect(postBody?.displayName).toBe("My Proj");
 			expect(postBody?.taskIdPrefix).toBe("chs");
 		} finally {
 			await unmount();
