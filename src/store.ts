@@ -912,6 +912,17 @@ function deriveTitle(prompt: string): string {
  */
 export { shortTitle };
 
+/** Per-task turn facts the board card build needs, batched by boardCardFacts: one scan
+ * replaces the two listTurns calls and the lastTurnModel query the build ran per card. */
+export interface BoardTurnFacts {
+	/** The task's first turn without an end, in id order (runStartedAt/etaMs); null when none is open. */
+	openTurn: { startedAt: number; kind: TurnKind; model: string | null } | null;
+	/** The newest recorded model: lastTurnModel's answer. */
+	lastModel: string | null;
+	/** The last work-kind turn's outcome, what answeredCard scans; null when no work turn ran. */
+	lastWorkOutcome: OutcomeStatus | null;
+}
+
 /** One append-only lifecycle record in the `events` table: task created, a stage or state transition, or an error. */
 export interface StatEvent {
 	at: number;
@@ -1664,19 +1675,40 @@ export class ProjectStore {
 		return this.titleHolds.has(id);
 	}
 
-	/** The task's own session title: the stored one, or the first title in the session
-	 * transcript; null when neither exists yet. Markdown from the titler and omp's card
-	 * prefix are stripped on read, so rows written before the cleaning also display clean. */
-	sessionTitle(task: ListedTask): string | null {
-		const row = this.db
-			.query<{ session_title: string | null }, [string]>(
-				"SELECT session_title FROM tasks WHERE id = ?",
-			)
-			.get(task.id);
-		if (row?.session_title) return cleanTitle(row.session_title);
+	/** The task's raw stored session title, or null; one indexed read. */
+	private storedTitle(id: string): string | null {
+		return (
+			this.db
+				.query<{ session_title: string | null }, [string]>(
+					"SELECT session_title FROM tasks WHERE id = ?",
+				)
+				.get(id)?.session_title ?? null
+		);
+	}
+
+	/** One title ladder for every caller: the stored title first, then the first title in
+	 * the session transcript, persisted once when `persist`; null when neither exists yet.
+	 * Markdown from the titler and omp's card prefix are stripped on read, so rows written
+	 * before the cleaning also display clean. A pending generation retry holds the
+	 * transcript title back. */
+	private resolveTitle(
+		task: ListedTask,
+		storedTitle: string | null,
+		persist: boolean,
+	): string | null {
+		if (storedTitle) return cleanTitle(storedTitle);
 		if (this.titleHolds.has(task.id)) return null; // a pending generation retry outraces it
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
-		return fromSession === null ? null : cleanTitle(fromSession);
+		if (fromSession === null) return null;
+		const title = cleanTitle(fromSession);
+		if (persist) this.nameTask(task.id, title);
+		return title;
+	}
+
+	/** The task's own session title: the stored one, or the first title in the session
+	 * transcript; null when neither exists yet. */
+	sessionTitle(task: ListedTask): string | null {
+		return this.resolveTitle(task, this.storedTitle(task.id), false);
 	}
 
 	/** Persists a title once: `IS NULL` keeps the first name authoritative even if two writes race. */
@@ -1695,12 +1727,15 @@ export class ProjectStore {
 	 * prompt line — recomputed each call, never persisted.
 	 */
 	frozenTitle(task: ListedTask): string {
-		const title = this.sessionTitle(task);
-		if (title !== null) {
-			this.nameTask(task.id, title);
-			return title;
-		}
-		return shortTitle(task.title);
+		return this.frozenTitleFrom(task, this.storedTitle(task.id));
+	}
+
+	/** frozenTitle for a batched caller (the board card build): the stored title arrives
+	 * from boardCardFacts instead of a per-task SELECT, and the once-only persist runs
+	 * only when the title came from the transcript — a stored title needs no write.
+	 * Same output as frozenTitle. */
+	frozenTitleFrom(task: ListedTask, storedTitle: string | null): string {
+		return this.resolveTitle(task, storedTitle, true) ?? shortTitle(task.title);
 	}
 
 	getSettings(): ProjectSettings {
@@ -2680,6 +2715,65 @@ export class ProjectStore {
 				)
 				.get(taskId)?.model ?? null
 		);
+	}
+
+	/** Batched facts for the board card build, two queries per project: per-task turn
+	 * facts (first open turn, newest model, last work outcome) and each task's raw stored
+	 * session title. Replaces the two listTurns calls, the lastTurnModel query, the
+	 * sessionTitle SELECT, and the no-op nameTask UPDATE the build ran per card. */
+	boardCardFacts(): {
+		turns: Map<string, BoardTurnFacts>;
+		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
+		titles: Map<string, string | null>;
+	} {
+		const turns = new Map<string, BoardTurnFacts>();
+		const factsFor = (taskId: string): BoardTurnFacts => {
+			let f = turns.get(taskId);
+			if (f === undefined) {
+				f = { openTurn: null, lastModel: null, lastWorkOutcome: null };
+				turns.set(taskId, f);
+			}
+			return f;
+		};
+		for (const r of this.db
+			.query<
+				{
+					task_id: string;
+					started_at: number;
+					ended_at: number | null;
+					kind: string;
+					model: string | null;
+					outcome: string | null;
+				},
+				[]
+			>(
+				"SELECT task_id, started_at, ended_at, kind, model, outcome FROM turns ORDER BY id",
+			)
+			.all()) {
+			const f = factsFor(r.task_id);
+			// The first open turn in id order is the one listTurns().find() reported.
+			if (r.ended_at === null && f.openTurn === null)
+				f.openTurn = {
+					startedAt: r.started_at,
+					kind: r.kind as TurnKind,
+					model: r.model,
+				};
+			// Ascending id: the last non-null write is the newest, like lastTurnModel.
+			if (r.model !== null) f.lastModel = r.model;
+			if (r.kind === "work")
+				f.lastWorkOutcome = r.outcome as OutcomeStatus | null;
+		}
+		const titles = new Map<string, string | null>();
+		for (const r of this.db
+			.query<{ id: string; session_title: string | null }, []>(
+				"SELECT id, session_title FROM tasks",
+			)
+			.all()) {
+			titles.set(r.id, r.session_title);
+			// Total over the task rows: a turn-less task reads as all-null, not missing.
+			factsFor(r.id);
+		}
+		return { turns, titles };
 	}
 
 	/** The task's newest settled turn (id, error, reported outcome, exit code), or null; one

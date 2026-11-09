@@ -3169,6 +3169,9 @@ export function createApp(deps: AppDeps) {
 				const days = e.store.getSettings().keptWorktreeDays;
 				const cards: TaskCard[] = [];
 				const medians = turnMedians(e.store.turnDurations());
+				// Per-task turn facts and stored titles, batched: two queries per project
+				// instead of three statements and a no-op UPDATE per card (OTTR-721).
+				const facts = e.store.boardCardFacts();
 				// The trending scout's open proposals: one map per project, not a lookup per card.
 				const trendingRepos = new Map<string, string>();
 				for (const v of e.store.listTrendingVerdicts())
@@ -3201,13 +3204,12 @@ export function createApp(deps: AppDeps) {
 						// run whose meter moves keeps a silent log from warning (OTTR-448).
 						progress?.at,
 					);
+					const tf = facts.turns.get(t.id);
 					const extra: Pick<TaskCard, "runStartedAt" | "etaMs"> = {};
 					if (t.state === "running") {
 						// Live turn facts: the client ticks elapsed from runStartedAt and counts etaMs down
 						// as "about X left". Between finish and the next poll no turn is open: neither ships.
-						const live = e.store
-							.listTurns(t.id)
-							.find((x) => x.endedAt === null);
+						const live = tf?.openTurn ?? undefined;
 						if (live !== undefined) {
 							extra.runStartedAt = live.startedAt;
 							const ms = medians.get(turnMedianKey(live.kind, live.model));
@@ -3217,15 +3219,16 @@ export function createApp(deps: AppDeps) {
 					cards.push({
 						...card,
 						steps: viewSteps(t),
-						sessionTitle: e.store.frozenTitle(t),
+						sessionTitle: e.store.frozenTitleFrom(
+							t,
+							facts.titles.get(t.id) ?? null,
+						),
 						answered:
 							t.stage === "done" &&
 							!isRetro(t) &&
-							answeredCard(e.store.listTurns(t.id)),
+							tf?.lastWorkOutcome === "answered",
 						// A default card pins no model; the chip states what the last run actually used.
-						...(t.model === null
-							? { lastModel: e.store.lastTurnModel(t.id) }
-							: {}),
+						...(t.model === null ? { lastModel: tf?.lastModel ?? null } : {}),
 						...(progress ? { progress: progress.text } : {}),
 						...(silent !== null ? { silentSince: silent } : {}),
 						...extra,

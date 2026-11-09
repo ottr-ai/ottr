@@ -26,6 +26,7 @@ import {
 	shortTitle,
 	tasksDirFor,
 } from "./store.ts";
+import { answeredCard } from "./types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
 const opened: ProjectStore[] = [];
@@ -130,6 +131,111 @@ describe("turn model", () => {
 		const turn = store.startTurn(task.id, "work", "legacy", null);
 		store.finishTurn(turn.id, { model: "openai/gpt-5" });
 		expect(store.listTurns(task.id)[0]?.model).toBe("openai/gpt-5");
+		store.close();
+	});
+});
+
+describe("boardCardFacts", () => {
+	// The batched read must return the same facts the per-task calls report, for every
+	// card shape the board shows (OTTR-721).
+	test("batched facts match the per-task reads", () => {
+		const store = open(join(root, "board-facts"));
+		// Running: a work turn is still open and carries its dispatch model.
+		const running = store.createTask("running card");
+		store.startTurn(running.id, "work", "running card", null, null, "a/live");
+		// Done and answered: the newest work turn reported "answered".
+		const answered = store.createTask("answered card");
+		const a1 = store.startTurn(answered.id, "work", "answered card", null);
+		store.finishTurn(a1.id, {
+			endedAt: Date.now(),
+			outcome: "ready",
+			model: "a/one",
+		});
+		const a2 = store.startTurn(answered.id, "work", "answered card", null);
+		store.finishTurn(a2.id, {
+			endedAt: Date.now(),
+			outcome: "answered",
+			model: "a/two",
+		});
+		store.updateTask(answered.id, { stage: "done" });
+		// Done but not answered: a later work turn replaces the answered one.
+		const notAnswered = store.createTask("not answered card");
+		const n1 = store.startTurn(notAnswered.id, "work", "not answered", null);
+		store.finishTurn(n1.id, { endedAt: Date.now(), outcome: "answered" });
+		const n2 = store.startTurn(notAnswered.id, "work", "not answered", null);
+		store.finishTurn(n2.id, {
+			endedAt: Date.now(),
+			outcome: "ready",
+			model: "a/three",
+		});
+		store.updateTask(notAnswered.id, { stage: "done" });
+		// No turns at all.
+		const silent = store.createTask("never ran");
+
+		const facts = store.boardCardFacts();
+		for (const t of store.listTasks()) {
+			const tf = facts.turns.get(t.id);
+			// The map is total over the task rows: a turn-less task reads as all-null.
+			expect(tf).toBeDefined();
+			const turns = store.listTurns(t.id);
+			const live = turns.find((x) => x.endedAt === null);
+			expect(tf?.openTurn ?? null).toEqual(
+				live === undefined
+					? null
+					: { startedAt: live.startedAt, kind: live.kind, model: live.model },
+			);
+			expect(tf?.lastModel ?? null).toBe(store.lastTurnModel(t.id));
+			expect(tf?.lastWorkOutcome === "answered").toBe(answeredCard(turns));
+			// The batched card title equals frozenTitle for every title source.
+			expect(store.frozenTitleFrom(t, facts.titles.get(t.id) ?? null)).toBe(
+				store.frozenTitle(t),
+			);
+		}
+		// Targeted reads for the four shapes the board shows.
+		expect(facts.turns.get(running.id)!.openTurn).toEqual({
+			startedAt: expect.any(Number),
+			kind: "work",
+			model: "a/live",
+		});
+		expect(facts.turns.get(running.id)!.lastWorkOutcome).toBeNull();
+		const answeredFacts = facts.turns.get(answered.id)!;
+		expect(answeredFacts.openTurn).toBeNull();
+		expect(answeredFacts.lastModel).toBe("a/two");
+		expect(answeredFacts.lastWorkOutcome).toBe("answered");
+		const notAnsweredFacts = facts.turns.get(notAnswered.id)!;
+		expect(notAnsweredFacts.lastModel).toBe("a/three");
+		expect(notAnsweredFacts.lastWorkOutcome).toBe("ready");
+		expect(facts.turns.get(silent.id)).toEqual({
+			openTurn: null,
+			lastModel: null,
+			lastWorkOutcome: null,
+		});
+		// Titles ship raw; the stored value arrives for the named task only.
+		store.nameTask(silent.id, "**Named by the tracker**");
+		expect(store.boardCardFacts().titles.get(silent.id)).toBe(
+			"**Named by the tracker**",
+		);
+		store.close();
+	});
+
+	test("a title found in the transcript persists once through frozenTitleFrom", () => {
+		const store = open(join(root, "board-facts-persist"));
+		const task = store.createTask("unnamed card");
+		const facts = store.boardCardFacts();
+		// No stored title anywhere: the fallback is the short prompt cut, never persisted.
+		expect(facts.titles.get(task.id) ?? null).toBeNull();
+		expect(store.frozenTitleFrom(task, facts.titles.get(task.id) ?? null)).toBe(
+			shortTitle("unnamed card"),
+		);
+		store.nameTask(task.id, "**Named once**");
+		// The batched read now carries the raw stored title; cleaning stays on read.
+		expect(store.boardCardFacts().titles.get(task.id)).toBe("**Named once**");
+		expect(
+			store.frozenTitleFrom(
+				store.getTask(task.id)!,
+				store.boardCardFacts().titles.get(task.id) ?? null,
+			),
+		).toBe("Named once");
 		store.close();
 	});
 });
