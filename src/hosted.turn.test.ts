@@ -707,6 +707,8 @@ describe("hosted metering at settle", () => {
 				kind: "merge",
 				role: "default",
 				model: "openai/gpt-6",
+				run: 0,
+				final: true,
 				usage: usage(4),
 				outcome: "integrated",
 				title: "merge the card please",
