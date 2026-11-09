@@ -162,6 +162,12 @@ services:
       # GitHub host pass-through (src/githubHost.ts): the board reads OTTR_GITHUB_HOST;
       # empty keeps the default github.com. README "GitHub host" has the values.
       OTTR_GITHUB_HOST: ${OTTR_GITHUB_HOST:-}
+      # Boot-report pass-through (src/server.ts logs them once at boot): a stale
+      # OTTR_IMAGE or old host path left in the shell beats .env and silently keeps the
+      # previous release (README, Podman); the boot line shows the live values.
+      OTTR_IMAGE: ${OTTR_IMAGE:-}
+      OTTR_OAUTH_DIR: ${OTTR_OAUTH_DIR:-}
+      OTTR_AGENT_DB: ${OTTR_AGENT_DB:-}
       # R5-1 config boundary: workers mount home:/root and workspace:/workspace read-write,
       # so a turn can plant /root/.gitconfig, /root/.config/gh or a main checkout's
       # .git/config for the board's own git and gh to execute (helper theft, insteadOf
