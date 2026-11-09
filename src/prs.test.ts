@@ -98,6 +98,8 @@ function setup(
 	/** Re-review opt-ins: the posted reviews, the two comment sources, and the compare diff. */
 	let reviews: unknown[] = [];
 	let issueComments: unknown[] = [];
+	/** When set, the issues-comments branch serves one list per page (oldest first), like GitHub. */
+	let issueCommentPages: unknown[][] = [];
 	let pullComments: unknown[] = [];
 	/** The inline comments of a posted review (`reviews/<id>/comments`). */
 	let reviewComments: unknown[] = [];
@@ -137,8 +139,14 @@ function setup(
 			return { code: 0, stdout: JSON.stringify(reviewComments), stderr: "" };
 		if (path.includes("/reviews"))
 			return { code: 0, stdout: JSON.stringify(reviews), stderr: "" };
-		if (path.includes("/issues/") && path.includes("/comments"))
-			return { code: 0, stdout: JSON.stringify(issueComments), stderr: "" };
+		if (path.includes("/issues/") && path.includes("/comments")) {
+			const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+			const list =
+				issueCommentPages.length > 0
+					? (issueCommentPages[page - 1] ?? [])
+					: issueComments;
+			return { code: 0, stdout: JSON.stringify(list), stderr: "" };
+		}
 		if (path.includes("/comments"))
 			return { code: 0, stdout: JSON.stringify(pullComments), stderr: "" };
 		if (path.includes("/compare/")) {
@@ -195,6 +203,9 @@ function setup(
 		},
 		setIssueComments: (v: unknown[]) => {
 			issueComments = v;
+		},
+		setIssueCommentPages: (v: unknown[][]) => {
+			issueCommentPages = v;
 		},
 		setPullComments: (v: unknown[]) => {
 			pullComments = v;
@@ -1522,6 +1533,62 @@ describe("createPrWatcher", () => {
 				(m) => m.includes("#54 sweep failed") && m.includes("HTTP 500"),
 			),
 		).toBe(true);
+	});
+
+	test("the sweep pages oldest-first issue comments and finds the newest", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 58, { commentsAt: cutoff });
+		// GitHub answers the issue comments oldest first and ignores sort there: page 1
+		// holds 100 stale comments, the short page 2 carries the new one.
+		const stale = Array.from({ length: 100 }, (_, i) =>
+			ghComment(
+				"alice",
+				new Date(cutoff - (i + 1) * 60_000).toISOString(),
+				"old",
+			),
+		);
+		s.setIssueCommentPages([
+			stale,
+			[ghComment("bob", "2026-02-01T00:00:00Z", "late answer")],
+		]);
+		await s.watcher.tick();
+		const row = s.store.getPrReview(58)!;
+		expect(row.commentsUnseen).toBe(true);
+		expect(row.commentsAt).toBe(Date.parse("2026-02-01T00:00:00Z"));
+		expect(s.forgotten).toEqual(row.taskId === null ? [] : [row.taskId]);
+		expect(s.calls.some((c) => c.includes("since="))).toBe(true);
+		expect(s.calls.some((c) => c.includes("page=2"))).toBe(true);
+	});
+
+	test("the comment sweep stops at 30 pages and counts what it read", async () => {
+		const s = setup();
+		const cutoff = Date.parse("2026-01-01T00:00:00Z");
+		await postRow(s, 61, { commentsAt: cutoff });
+		// 31 full pages: the cap stops the read after page 30, so page 31's newest
+		// comment stays unread this tick and its time never reaches the cutoff.
+		const pages = Array.from({ length: 31 }, (_, p) =>
+			Array.from({ length: 100 }, (_, i) =>
+				ghComment(
+					"carol",
+					new Date(cutoff + (p * 100 + i + 1) * 60_000).toISOString(),
+					"hot thread",
+				),
+			),
+		);
+		s.setIssueCommentPages(pages);
+		await s.watcher.tick();
+		const row = s.store.getPrReview(61)!;
+		expect(row.commentsUnseen).toBe(true);
+		expect(row.commentsAt).toBe(cutoff + 30 * 100 * 60_000);
+		expect(
+			s.logs.some(
+				(m) => m.includes("#61") && m.includes("stopped at 30 pages"),
+			),
+		).toBe(true);
+		expect(
+			s.calls.some((c) => c.includes("/comments") && c.includes("page=31")),
+		).toBe(false);
 	});
 
 	test("prReviewNotify false reads no comments", async () => {

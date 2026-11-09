@@ -109,7 +109,7 @@ The board marks PR review activity NEW and notifies. The project setting `prRevi
 
 #### Comment watch
 
-- Each tick, for every `pr_review` row that is `open`, has a card, has a posted review, and whose project has the setting on, the watcher reads the newest comments of the PR: `repos/{repo}/issues/N/comments` and `repos/{repo}/pulls/N/comments`, each with `per_page=100&sort=created&direction=desc`, first page only.
+- Each tick, for every `pr_review` row that is `open`, has a card, has a posted review, and whose project has the setting on, the watcher reads the comments of the PR: `repos/{repo}/issues/N/comments` and `repos/{repo}/pulls/N/comments`, each with `per_page=100` and `since=<ISO of comments_at>`. The issue-comments endpoint answers oldest first and ignores sort, so the sweep pages until a short page, at most 30 pages. A cap stop counts what it read and logs; the rest stays after the cutoff and a later tick reads it.
 - Entries are untrusted data. A comment counts when it has a parseable string `created_at`, a string `user.login`, a time strictly after the row's `comments_at`, and a login that differs from the row's `posted_login`. Comment bodies are not stored.
 - A row with a null `comments_at` initializes it to the time of the check and alerts nothing, so the first sweep after the deploy stays silent. A successful Post sets `comments_at` to the post time, so the posted review's own comments never alert.
 - A wave of new comments runs one store write: `comments_at` becomes the newest comment time and `comments_unseen` becomes 1. The watcher drops the card's read mark, so the card wears NEW again. The sweep makes no model call and takes no daily-cap slot.

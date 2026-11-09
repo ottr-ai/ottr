@@ -398,6 +398,8 @@ async function pullData(
 
 /** Longest comment body kept: the budget cut drops whole comments long before this binds. */
 const MAX_COMMENT_BODY = 4000;
+/** Page bound of one comment sweep: 30 pages of 100, like the posted inline read. */
+const MAX_SWEEP_PAGES = 30;
 
 /** Pages read at most for one posted review's inline comments (100 comments a page). */
 const MAX_INLINE_PAGES = 30;
@@ -762,27 +764,43 @@ export function createPrWatcher(deps: {
 			store.setPrComments(row.number, now(), false);
 			return;
 		}
-		const page = async (path: string): Promise<unknown[]> => {
-			const r = await gh(["api", path]);
-			if (r.code !== 0)
-				throw new Error(
-					`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-				);
-			let body: unknown;
-			try {
-				body = JSON.parse(r.stdout);
-			} catch {
-				throw new Error("comments: bad JSON");
+		const since = new Date(row.commentsAt).toISOString();
+		// GitHub answers the issue-comments list oldest first and ignores sort there, so the
+		// sweep never trusts the first page: it reads pages until a short page, at most
+		// MAX_SWEEP_PAGES. `since` bounds each page to the cutoff window (it filters by the
+		// updated time, so a comment edited after the cutoff still arrives; the created_at
+		// check below drops it). A cap stop counts what it read; the rest stays after the
+		// cutoff and a later tick reads it.
+		const read = async (base: string): Promise<unknown[]> => {
+			const out: unknown[] = [];
+			for (let page = 1; page <= MAX_SWEEP_PAGES; page++) {
+				const path = page === 1 ? base : `${base}&page=${page}`;
+				const r = await gh(["api", path]);
+				if (r.code !== 0)
+					throw new Error(
+						`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+					);
+				let body: unknown;
+				try {
+					body = JSON.parse(r.stdout);
+				} catch {
+					throw new Error("comments: bad JSON");
+				}
+				if (!Array.isArray(body)) throw new Error("comments: not a list");
+				out.push(...body);
+				if (body.length < 100) return out;
 			}
-			if (!Array.isArray(body)) throw new Error("comments: not a list");
-			return body;
+			deps.log(
+				`prs: ${project.name}: #${row.number}: the comment sweep stopped at ${MAX_SWEEP_PAGES} pages`,
+			);
+			return out;
 		};
 		const entries = [
-			...(await page(
-				`repos/${repo}/issues/${row.number}/comments?per_page=100&sort=created&direction=desc`,
+			...(await read(
+				`repos/${repo}/issues/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
 			)),
-			...(await page(
-				`repos/${repo}/pulls/${row.number}/comments?per_page=100&sort=created&direction=desc`,
+			...(await read(
+				`repos/${repo}/pulls/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
 			)),
 		];
 		let newest: number | null = null;
