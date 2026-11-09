@@ -724,6 +724,45 @@ describe("hosted metering at settle", () => {
 		expect(reports[0]!.title).toBe("x".repeat(200));
 	});
 
+	test("a dependency hold requeues the card: the record sends queued, never needs_you", async () => {
+		const { hosted, reports } = fakeHosted();
+		let depId = "";
+		const { store, record, loop } = setup({
+			hosted,
+			commitsAhead: async () => 0,
+			startRun: (o: StartArgs) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "needs_you",
+								summary: "holding",
+								dependsOn: [depId],
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const dep = store.createTask("the dependency");
+		depId = dep.id;
+		const task = store.createTask("held on the dependency");
+		await loop.runTurn(store.name, task.id);
+
+		// The dep hold requeued the card (no park): the board shows queued, and the record
+		// must not claim needs_you — the control plane would email the owner needlessly.
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("queued");
+		expect(after.dependsOn).toContain(dep.id);
+		expect(store.listTurns(task.id)[0]!.outcome).toBe("needs_you");
+		expect(reports[0]!.outcome).toBe("queued");
+		expect(reports[0]!.title).toBe("held on the dependency");
+	});
+
 	test("a self-hosted loop reports nothing and never asks for credit", async () => {
 		const { reports, creditCalls } = fakeHosted();
 		const { store, record, loop } = workCheckCase(

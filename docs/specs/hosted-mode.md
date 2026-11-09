@@ -122,11 +122,13 @@ stopped or failed run. The control plane books only the increase over the highes
 usage that it saw for the run, so a late or repeated record never counts twice. Code:
 `interimMeter` in `src/turn.ts`, fed by the run sink's `onUsage` (`src/runner.ts`).
 - `outcome` (M10, optional): the card outcome the board shows after the settle (`ready`,
-  `answered`, `integrated`, `needs_you`). It rides the work/merge run's record only; a check
-  run's record carries neither this field nor `title`. A parked card (credit stop, stop,
-  tracker error, check blockers) sends `needs_you` even when the run reported none. The
-  control plane answers 400 `invalid_record` for a value outside `/^[a-z_]{1,40}$/`, so the
-  settle sends no outcome when no valid value exists.
+  `answered`, `integrated`, `needs_you`, and `queued` for a card the settle requeues). It
+  rides the work/merge run's record only; a check run's record carries neither this field
+  nor `title`. A parked card (credit stop, stop, tracker error, check blockers) sends
+  `needs_you` even when the run reported none. A card the settle requeues (a dependency
+  hold, steering, a queued rebase retry) waits on the board's queue, so its `needs_you` row
+  outcome ships as `queued`. The control plane answers 400 `invalid_record` for a value
+  outside `/^[a-z_]{1,40}$/`, so the settle sends no outcome when no valid value exists.
 - `title` (M10, optional): the card prompt's first line, trimmed and cut to 200 characters,
   on the same record. An empty line sends nothing.
 

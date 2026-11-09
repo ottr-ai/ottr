@@ -5310,15 +5310,21 @@ export function createTurnLoop(
 			if (ops.hosted !== undefined && turn !== null) {
 				// M10: the outcome is the state the board shows after this settle. A parked card
 				// (credit stop, Esc stop, tracker error, check blockers) reads needs_you even when
-				// the run reported none; otherwise the settled turn row's outcome. A value outside
+				// the run reported none, and the reverse holds: a card the settle requeues (a
+				// dependency hold, steering, a queued rebase retry) waits on the board's queue, so
+				// its needs_you row outcome ships as "queued" — the control plane would otherwise
+				// email the owner about a card nobody must act on. Every other settle keeps the
+				// settled turn row's outcome (ready, answered, integrated). A value outside
 				// /^[a-z_]{1,40}$/ (null included) sends nothing. The title is the card prompt's
 				// first line, trimmed and cut to 200 characters; an empty line sends nothing.
-				let outcome: string | null = null;
-				if (store.getTask(id)?.state === "needs_you") outcome = "needs_you";
-				else {
-					const row = store.listTurns(id).at(-1)?.outcome ?? null;
-					if (row !== null && /^[a-z_]{1,40}$/.test(row)) outcome = row;
-				}
+				const settledTask = store.getTask(id);
+				const row = store.listTurns(id).at(-1)?.outcome ?? null;
+				const rowOutcome =
+					row !== null && /^[a-z_]{1,40}$/.test(row) ? row : null;
+				let outcome: string | null = rowOutcome;
+				if (settledTask?.state === "needs_you") outcome = "needs_you";
+				else if (settledTask?.state === "queued" && rowOutcome === "needs_you")
+					outcome = "queued";
 				const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
 				const title = firstLine === "" ? null : firstLine.slice(0, 200);
 				for (const entry of metered) {
