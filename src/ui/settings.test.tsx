@@ -27,8 +27,11 @@ import {
 	ProjectSettingsForm,
 	ProjectSetupSteps,
 	ProjectsOrderSection,
+	type ProvisionResult,
+	provisionChangeSummary,
 	SessionSection,
 	SettingsPage,
+	shortProvisionLines,
 	updatesChip,
 	userLayerEmpty,
 	userLayerLine,
@@ -3327,6 +3330,14 @@ function alateFetchMock(handlers: {
 	// and can count the calls it serves.
 	keyGet?: Response | (() => Response);
 	keyPost?: Response | (() => Response);
+	// The body POST /api/alate/provision answers with, or a factory for one.
+	provisionPost?:
+		| {
+				ok: boolean;
+				running?: boolean;
+				results?: ProvisionResult[];
+		  }
+		| (() => Response);
 }): typeof fetch {
 	const ok = (body: unknown): Response =>
 		new Response(JSON.stringify(body), {
@@ -3346,6 +3357,11 @@ function alateFetchMock(handlers: {
 				...handlers.config,
 			});
 		if (url.endsWith("/api/alate/health")) throw new Error("no server");
+		if (url.endsWith("/api/alate/provision") && init?.method === "POST") {
+			const h = handlers.provisionPost;
+			if (h === undefined) throw new Error(`unexpected fetch POST ${url}`);
+			return typeof h === "function" ? h() : ok(h);
+		}
 		if (url.endsWith("/api/settings/alate-key")) {
 			if (init?.method === "POST") {
 				const h = handlers.keyPost;
@@ -4130,6 +4146,261 @@ describe("Error-Says-Fix messages", () => {
 			});
 			container.remove();
 			globalThis.fetch = realFetch;
+		}
+	});
+});
+
+describe("shortProvisionLines", () => {
+	test("the example sync output keeps only the updated line and the left-in-place note", () => {
+		const output = [
+			"updated  coding-guideline.md",
+			"40 unchanged, 0 deleted in /root/.omp/agent/rules",
+			"Not from the data repo, left in place: demo-rules.md, example-rule.md",
+		].join("\n");
+		expect(shortProvisionLines(output)).toEqual([
+			"updated  coding-guideline.md",
+			"Not from the data repo, left in place: demo-rules.md, example-rule.md",
+		]);
+	});
+	test("an all-unchanged run filters to nothing", () => {
+		const output = [
+			"Scanning 0 of 74 skill snapshot(s) (74 cached) with SkillSpector abc at /bin (--no-llm, static only, shipped baselines applied)...",
+			"0 installed, 478 unchanged, 0 deleted in /root",
+			"bun install v1.4.2 (a651cf31)",
+			"Resolving dependencies",
+			"Checked 301 installs across 321 packages (no changes)",
+		].join("\n");
+		expect(shortProvisionLines(output)).toEqual([]);
+	});
+	test("a line the filter does not understand stays visible", () => {
+		expect(
+			shortProvisionLines("Something unforeseen happened\n0 unchanged"),
+		).toEqual(["Something unforeseen happened"]);
+	});
+	test("a count line with a non-zero change count stays visible", () => {
+		expect(
+			shortProvisionLines("3 added, 1 updated, 5 unchanged from /root"),
+		).toEqual(["3 added, 1 updated, 5 unchanged from /root"]);
+	});
+	test("a changed bun install keeps its package lines", () => {
+		const output =
+			"bun install v1.4.2 (a651cf31)\n+ typescript@5.6.3\n1 packages installed [104.00ms]";
+		expect(shortProvisionLines(output)).toEqual([
+			"+ typescript@5.6.3",
+			"1 packages installed [104.00ms]",
+		]);
+	});
+	test("a scan warning is not mistaken for the scan banner", () => {
+		expect(
+			shortProvisionLines(
+				"/root/.cache is malformed; scanning every skill snapshot.",
+			),
+		).toEqual(["/root/.cache is malformed; scanning every skill snapshot."]);
+	});
+});
+
+describe("provisionChangeSummary", () => {
+	test("counts the example run as one update", () => {
+		expect(
+			provisionChangeSummary([
+				{
+					script: "sync.mjs",
+					code: 0,
+					truncated: false,
+					output:
+						"updated  coding-guideline.md\n40 unchanged, 0 deleted in /root/.omp/agent/rules",
+				},
+			]),
+		).toBe("1 updated");
+	});
+	test("an all-unchanged run reports no total", () => {
+		expect(
+			provisionChangeSummary([
+				{
+					script: "install-user.mjs",
+					code: 0,
+					truncated: false,
+					output:
+						"0 installed, 478 unchanged, 0 deleted in /root\nChecked 301 installs across 321 packages (no changes)",
+				},
+			]),
+		).toBeNull();
+	});
+	test("a failed script contributes no total", () => {
+		expect(
+			provisionChangeSummary([
+				{
+					script: "sync-user.mjs",
+					code: 1,
+					truncated: false,
+					output: "updated  user/x.md",
+				},
+			]),
+		).toBeNull();
+	});
+	test("bun's plus lines and summary line do not double count", () => {
+		expect(
+			provisionChangeSummary([
+				{
+					script: "install-user.mjs",
+					code: 0,
+					truncated: false,
+					output:
+						"bun install v1.4.2 (a651cf31)\n+ typescript@5.6.3\n+ left-pad@1.3.0\n2 packages installed [104.00ms]",
+				},
+			]),
+		).toBe("2 installed");
+	});
+	test("bun plus lines count alone when no summary line follows", () => {
+		expect(
+			provisionChangeSummary([
+				{
+					script: "install-user.mjs",
+					code: 0,
+					truncated: false,
+					output: "+ typescript@5.6.3",
+				},
+			]),
+		).toBe("1 installed");
+	});
+});
+
+describe("AlateSection provision result", () => {
+	const syncChanged: ProvisionResult = {
+		script: "sync.mjs",
+		code: 0,
+		truncated: false,
+		output: [
+			"updated  coding-guideline.md",
+			"40 unchanged, 0 deleted in /root/.omp/agent/rules",
+			"Not from the data repo, left in place: demo-rules.md, example-rule.md",
+		].join("\n"),
+	};
+	const installQuiet: ProvisionResult = {
+		script: "install-user.mjs",
+		code: 0,
+		truncated: false,
+		output: [
+			"Scanning 0 of 74 skill snapshot(s) (74 cached) with SkillSpector abc at /bin (--no-llm, static only, shipped baselines applied)...",
+			"0 installed, 478 unchanged, 0 deleted in /root",
+			"bun install v1.4.2 (a651cf31)",
+			"Resolving dependencies",
+			"Checked 301 installs across 321 packages (no changes)",
+		].join("\n"),
+	};
+	const syncUserFailed: ProvisionResult = {
+		script: "sync-user.mjs",
+		code: 1,
+		truncated: false,
+		output: [
+			"Nothing synced. Fix:",
+			"  key refused",
+			"0 added, 0 updated, 3 unchanged from /root",
+		].join("\n"),
+	};
+
+	test("a finished run shows only changes, a quiet script as one line, and the raw log behind the toggle", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				provisionPost: {
+					ok: true,
+					results: [syncChanged, installQuiet],
+				},
+			}),
+		);
+		try {
+			const button = Array.from(container.querySelectorAll("button")).find(
+				(b) => b.textContent?.trim() === "Provision",
+			);
+			if (button === undefined)
+				throw new Error("Provision button did not render");
+			await act(async () => {
+				button.click();
+			});
+			const text = container.textContent ?? "";
+			// The status keeps its wording and adds the short total.
+			expect(text).toContain("Provisioned 2 scripts successfully. 1 updated.");
+			// The changed script shows its change and warning lines, not the quiet counts.
+			expect(text).toContain("sync.mjs — exit 0");
+			expect(text).toContain("updated  coding-guideline.md");
+			expect(text).toContain(
+				"Not from the data repo, left in place: demo-rules.md, example-rule.md",
+			);
+			const shortPres = Array.from(container.querySelectorAll("pre.log")).map(
+				(p) => p.textContent ?? "",
+			);
+			expect(shortPres).toContain(
+				"updated  coding-guideline.md\nNot from the data repo, left in place: demo-rules.md, example-rule.md",
+			);
+			// The quiet script collapses to one line.
+			expect(text).toContain("install-user.mjs: no changes");
+			// Both successful scripts carry the disclosure, closed by default, with the
+			// raw log inside.
+			const details = Array.from(
+				container.querySelectorAll("details.prov-log"),
+			) as HTMLDetailsElement[];
+			expect(details.length).toBe(2);
+			for (const d of details) {
+				expect(d.open).toBe(false);
+				expect(d.querySelector("summary")?.textContent).toBe("Show full log");
+			}
+			const raws = Array.from(details).map(
+				(d) => d.querySelector("pre.log")?.textContent ?? "",
+			);
+			expect(raws.some((t) => t.includes("40 unchanged, 0 deleted"))).toBe(
+				true,
+			);
+			expect(raws.some((t) => t.includes("Resolving dependencies"))).toBe(true);
+			// Expanding the disclosure shows the raw text as before.
+			const first = details[0]!;
+			await act(async () => {
+				first.querySelector("summary")?.click();
+			});
+			expect(first.open).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed script shows its full raw output open with no toggle", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://127.0.0.1:4570", keySet: true },
+				provisionPost: {
+					ok: false,
+					results: [syncChanged, syncUserFailed],
+				},
+			}),
+		);
+		try {
+			const button = Array.from(container.querySelectorAll("button")).find(
+				(b) => b.textContent?.trim() === "Provision",
+			);
+			if (button === undefined)
+				throw new Error("Provision button did not render");
+			await act(async () => {
+				button.click();
+			});
+			const text = container.textContent ?? "";
+			expect(text).toContain(
+				"Provisioning failed: 1 of 2 scripts exited non-zero.",
+			);
+			expect(text).toContain("sync-user.mjs — exit 1");
+			// The raw output, unfiltered: even a quiet count line stays visible.
+			expect(text).toContain("Nothing synced. Fix:");
+			expect(text).toContain("0 added, 0 updated, 3 unchanged from /root");
+			// The failure carries no disclosure; the successful script still does.
+			const details = container.querySelectorAll("details.prov-log");
+			expect(details.length).toBe(1);
+			const pres = Array.from(container.querySelectorAll("pre.log")).map(
+				(p) => p.textContent ?? "",
+			);
+			expect(pres).toContain(
+				"Nothing synced. Fix:\n  key refused\n0 added, 0 updated, 3 unchanged from /root",
+			);
+		} finally {
+			await unmount();
 		}
 	});
 });

@@ -3517,12 +3517,142 @@ function ProviderLoginSection() {
 }
 
 /** One script result of POST /api/alate/provision. */
-type ProvisionResult = {
+export type ProvisionResult = {
 	script: string;
 	code: number;
 	output: string;
 	truncated: boolean;
 };
+
+/** A "<n> <verb>" count token a script prints in its summary line: "40 unchanged,
+ *  0 deleted in /root/.omp/agent/rules". */
+const PROVISION_COUNT_TOKEN =
+	/(\d+) (added|updated|unchanged|installed|deleted|removed)\b/g;
+/** A count line whose every count is zero apart from "unchanged": the run touched
+ *  nothing there, so the short view drops it. Any other count line names a change and stays. */
+function isQuietCountLine(line: string): boolean {
+	const tokens = [...line.matchAll(PROVISION_COUNT_TOKEN)];
+	if (tokens.length === 0) return false;
+	return tokens.every(([, n, verb]) => verb === "unchanged" || n === "0");
+}
+/** Progress chatter a provision script prints while it works. Matched against the whole
+ *  line, so a warning that merely contains the words still shows. */
+const PROVISION_PROGRESS: RegExp[] = [
+	/^Scanning \d+ of \d+ skill snapshots?\b/, // install-user.mjs SkillSpector banner
+	/^bun install v\d/, // bun's installer banner
+	/^Resolving dependencies$/,
+	/^Checked \d+ installs across \d+ packages\b/, // bun's up-to-date summary
+	/^plugins skipped$/,
+];
+
+/** The short view of a script's output: its change, warning and error lines. The filter
+ *  may only drop a line it positively recognizes as noise — a quiet count line or a
+ *  progress line. A line it does not understand always stays visible. */
+export function shortProvisionLines(output: string): string[] {
+	const short: string[] = [];
+	for (const raw of output.split("\n")) {
+		const line = raw.trim();
+		if (line === "") continue;
+		if (isQuietCountLine(line)) continue;
+		if (PROVISION_PROGRESS.some((p) => p.test(line))) continue;
+		short.push(line);
+	}
+	return short;
+}
+/** A per-file change line: "updated  coding-guideline.md", "added    user/x.md". */
+const PROVISION_CHANGE_LINE = /^(added|updated|deleted|installed)\s+\S/;
+/** bun's own added-package marker: "+ typescript@5.6.3". */
+const PROVISION_BUN_ADD = /^\+ \S/;
+
+/** A short total of what a provision changed, for example "1 updated, 2 installed";
+ *  null when nothing changed. Counts the successful scripts' change lines and the
+ *  non-quiet count lines, so it matches what the short view shows. */
+export function provisionChangeSummary(
+	results: ProvisionResult[],
+): string | null {
+	const totals = new Map<string, number>();
+	const bump = (verb: string, n: number): void => {
+		if (verb === "unchanged") return;
+		totals.set(verb, (totals.get(verb) ?? 0) + n);
+	};
+	for (const r of results) {
+		if (r.code !== 0) continue;
+		const short = shortProvisionLines(r.output);
+		// bun names the same installs twice: once per "+ package" line and once in its
+		// "N packages installed" summary. Count the summary, and the per-package lines
+		// only when the run printed no summary.
+		const bunCounted = short.some((line) =>
+			/^\d+ packages? installed\b/.test(line),
+		);
+		for (const line of short) {
+			for (const [, n, verb] of line.matchAll(PROVISION_COUNT_TOKEN))
+				if (verb !== undefined) bump(verb, Number(n));
+			const change = PROVISION_CHANGE_LINE.exec(line);
+			if (change !== null) bump(change[1] ?? "", 1);
+			else if (PROVISION_BUN_ADD.test(line) && !bunCounted)
+				bump("installed", 1);
+			else {
+				// bun's own summary: "2 packages installed [104.00ms]" — the verb sits
+				// behind "packages", so the count token above cannot see it.
+				const bunSummary = /^(\d+) packages? installed\b/.exec(line);
+				if (bunSummary !== null) bump("installed", Number(bunSummary[1]));
+			}
+		}
+	}
+	const parts = ["added", "updated", "installed", "deleted", "removed"]
+		.map((verb) => ({ verb, n: totals.get(verb) ?? 0 }))
+		.filter((t) => t.n > 0)
+		.map((t) => `${t.n} ${t.verb}`);
+	return parts.length === 0 ? null : parts.join(", ");
+}
+
+/** One provision script's result: a failure shows its raw output open; a success shows
+ *  only the changed lines, or "<script>: no changes", with the raw log behind a
+ *  disclosure both keyboard and screen-reader users operate natively. */
+function ProvisionScriptLog({ r }: { r: ProvisionResult }) {
+	if (r.code !== 0) {
+		return (
+			<div>
+				<p className="auth-error">
+					{r.script} — exit {r.code}
+				</p>
+				<pre className="log">{r.output}</pre>
+			</div>
+		);
+	}
+	const short = shortProvisionLines(r.output);
+	return (
+		<div>
+			{short.length === 0 ? (
+				<p className="hint">{r.script}: no changes</p>
+			) : (
+				<>
+					<p className="hint">
+						{r.script} — exit {r.code}
+					</p>
+					<pre className="log">{short.join("\n")}</pre>
+				</>
+			)}
+			<details className="prov-log">
+				<summary>Show full log</summary>
+				<pre className="log">{r.output}</pre>
+			</details>
+		</div>
+	);
+}
+
+/** The provision result list: one shared renderer for the Alate section and the
+ *  model-roles save flow, so both blocks read the same. */
+export function ProvisionResults({ results }: { results: ProvisionResult[] }) {
+	return (
+		<>
+			{results.map((r) => (
+				<ProvisionScriptLog key={r.script} r={r} />
+			))}
+		</>
+	);
+}
+
 /** The provision after a commit: running, still running on Alate (202), or its result. */
 type ProvisionStep =
 	| { state: "running" }
@@ -4298,14 +4428,9 @@ export function ModelRolesSection() {
 					</ol>
 				)}
 			</div>
-			{failed.map((r) => (
-				<div key={r.script}>
-					<p className="auth-error">
-						{r.script} — exit {r.code}
-					</p>
-					<pre className="log">{r.output}</pre>
-				</div>
-			))}
+			{prov?.state === "done" && prov.results.length > 0 && (
+				<ProvisionResults results={prov.results} />
+			)}
 		</SettingsCard>
 	);
 }
@@ -4581,9 +4706,7 @@ export function AlateSection() {
 	const [saved, flashSaved] = useFlash(1500);
 	const [error, setError] = useState<string | null>(null);
 	const [status, setStatus] = useState<string | null>(null);
-	const [results, setResults] = useState<
-		Array<{ script: string; code: number; output: string; truncated: boolean }>
-	>([]);
+	const [results, setResults] = useState<ProvisionResult[]>([]);
 	const [storedKey, setStoredKey] = useState<string | null>(null);
 	const [reveal, setReveal] = useState(false);
 	const [copied, flashCopied] = useFlash(1500);
@@ -4814,12 +4937,7 @@ export function AlateSection() {
 				const res = await post<{
 					ok: boolean;
 					running?: boolean;
-					results?: Array<{
-						script: string;
-						code: number;
-						output: string;
-						truncated: boolean;
-					}>;
+					results?: ProvisionResult[];
 				}>("/api/alate/provision", {});
 				if (res.running === true) {
 					// 202 from the board: its wait hit the transport bound, and alate's
@@ -4844,9 +4962,10 @@ export function AlateSection() {
 				loadLayer();
 				if (res.ok) setLastErr(null);
 				const failed = rows.filter((r) => r.code !== 0);
+				const changed = provisionChangeSummary(rows);
 				setStatus(
 					failed.length === 0
-						? `Provisioned ${rows.length} script${rows.length === 1 ? "" : "s"} successfully.`
+						? `Provisioned ${rows.length} script${rows.length === 1 ? "" : "s"} successfully.${changed === null ? "" : ` ${changed}.`}`
 						: `Provisioning failed: ${failed.length} of ${rows.length} script${rows.length === 1 ? "" : "s"} exited non-zero.`,
 				);
 				return res.ok;
@@ -5051,14 +5170,7 @@ export function AlateSection() {
 				) : (
 					<p className="hint">{userLayerLine(layer)}</p>
 				))}
-			{results.map((r) => (
-				<div key={r.script}>
-					<p className={r.code === 0 ? "hint" : "auth-error"}>
-						{r.script} — exit {r.code}
-					</p>
-					<pre className="log">{r.output}</pre>
-				</div>
-			))}
+			<ProvisionResults results={results} />
 		</SettingsCard>
 	);
 }
