@@ -1144,6 +1144,21 @@ export function sourceIconUrl(p: ProjectView): string | null {
 	return `${u.origin}/favicon.ico`;
 }
 
+/** "owner/repo" from the project's GitHub remote URL; null when the path has no
+ * owner/repo tail, so a malformed remote falls back to the icon-only link. */
+export function repoSlug(url: string): string | null {
+	let u: URL;
+	try {
+		u = new URL(url);
+	} catch {
+		return null;
+	}
+	const segs = u.pathname.split("/").filter(Boolean);
+	if (segs.length < 2) return null;
+	const repo = segs[segs.length - 1]?.replace(/\.git$/, "") ?? "";
+	return `${segs[segs.length - 2]}/${repo}`;
+}
+
 export function ProjectTag({ project }: { project: ProjectView }) {
 	// The text marker wins over every image: its purpose is to replace whatever icon
 	// would otherwise show (docs/specs/project-icon-text.md). Then the custom upload,

@@ -68,8 +68,14 @@ const {
 	AuthPage,
 	PrReviewSection,
 } = await import("./app.tsx");
-const { monogram, sourceIconUrl, ProjectLogo, ProjectTag, windowGone } =
-	await import("./kit.tsx");
+const {
+	monogram,
+	repoSlug,
+	sourceIconUrl,
+	ProjectLogo,
+	ProjectTag,
+	windowGone,
+} = await import("./kit.tsx");
 const {
 	alateChip,
 	alateHint,
@@ -247,6 +253,26 @@ describe("sourceIconUrl", () => {
 	});
 	test("a GitHub URL without an owner: nothing to adopt from", () => {
 		expect(sourceIconUrl(p("https://github.com/"))).toBe(null);
+	});
+});
+
+describe("repoSlug", () => {
+	test("the last two path segments are the owner/repo slug", () => {
+		expect(repoSlug("https://github.com/octo/repo")).toBe("octo/repo");
+	});
+	test(".git and a trailing slash are stripped", () => {
+		expect(repoSlug("https://github.com/octo/repo.git")).toBe("octo/repo");
+		expect(repoSlug("https://github.com/octo/repo/")).toBe("octo/repo");
+	});
+	test("any host works: the slug is the URL tail", () => {
+		expect(repoSlug("https://git.example.com/team/proj")).toBe("team/proj");
+	});
+	test("a URL without an owner/repo tail: no slug", () => {
+		expect(repoSlug("https://github.com/octo")).toBe(null);
+		expect(repoSlug("https://github.com/")).toBe(null);
+	});
+	test("an invalid URL string: no slug", () => {
+		expect(repoSlug("::not a url")).toBe(null);
 	});
 });
 
@@ -6025,6 +6051,60 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).not.toContain("never to a task branch.");
 		expect(html).not.toContain("has commits origin lacks");
 		expect(html).not.toContain("GitHub features off");
+	});
+});
+
+describe("ProjectBoard repo link", () => {
+	const projectWith = (over: Record<string, unknown>): ProjectView =>
+		({
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			mainBranch: null,
+			mainUnpushed: false,
+			target: "origin/main",
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+			...over,
+		}) as unknown as ProjectView;
+
+	const renderBoard = (project: ProjectView): string =>
+		renderToStaticMarkup(
+			<ProjectBoard
+				project={project}
+				tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async () => true}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
+
+	test("the header links the repo by its owner/repo slug", () => {
+		const html = renderBoard(
+			projectWith({ github: "https://github.com/octo/repo.git" }),
+		);
+		expect(html).toContain('title="GitHub repository"');
+		expect(html).toContain('href="https://github.com/octo/repo.git"');
+		expect(html).toContain("octo/repo</a>");
+		expect(html).not.toContain('aria-label="GitHub"');
+	});
+
+	test("a remote without an owner/repo tail keeps the icon-only link", () => {
+		const html = renderBoard(
+			projectWith({ github: "https://github.com/octo" }),
+		);
+		expect(html).toContain('title="GitHub repository"');
+		expect(html).not.toContain("octo</a>");
 	});
 });
 

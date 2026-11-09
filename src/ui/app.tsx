@@ -108,6 +108,7 @@ import {
 	ProjectTag,
 	post,
 	projectLabel,
+	repoSlug,
 	Skeleton,
 	unwrap,
 	useBusy,
@@ -3602,10 +3603,10 @@ export function ProjectBoard({
 									href={project.github}
 									target="_blank"
 									rel="noopener noreferrer"
-									title="GitHub"
-									aria-label="GitHub"
+									title="GitHub repository"
 								>
 									<GhMark />
+									{repoSlug(project.github)}
 								</a>
 							)}
 						</p>
