@@ -50,14 +50,19 @@ alate's own manifest, `<home>/.alate/installed.json`. Drift fails the turn.
 - Rules audit through their own record: sync.mjs installs the rules into
   `.omp/agent/rules/` and writes `.omp/agent/rules/.alate-installed.json`,
   one flat rule name per sha256 fingerprint, with the same alate
-  fingerprint formula. Every recorded rule must exist and match; the rules
-  dir holds exactly the record and the snapshot's rules, so an unrecorded
-  entry there flags as untracked (a planted rule, the rules-injection
-  class). The install-user manifest holds no rule keys. The next provision
-  overwrites snapshot-covered rules, keeps an edited dropped rule, deletes a
-  dropped rule nobody edited, and rewrites the record from the snapshot, so
-  a record tamper self-heals. Residual: a run that edits a rule and the
-  record in the same breath escapes until that rewrite.
+  fingerprint formula. Every recorded rule must exist and match; the
+  install-user manifest holds no rule keys. The rules dir can also hold
+  unrecorded rules an older alate installed: sync keeps those by design
+  ("Not from the data repo, left in place"), so they are deployment state,
+  not drift. The audit flags an unrecorded entry only when the run itself
+  added it: each run captures the rules dir's entries when it spawns and
+  the audit compares against that capture; without a capture the scan
+  stays off, like the manifest audit, which never flags an added file.
+  The next provision overwrites snapshot-covered rules, keeps an edited
+  dropped rule, deletes a dropped rule nobody edited, and rewrites the
+  record from the snapshot, so a record tamper self-heals. Residual: a run
+  that edits a rule and the record in the same breath escapes until that
+  rewrite.
 - Extensions stay outside the audit: nothing records them (no manifest
   keys, no per-dir record), so a turn that edits an installed extension
   produces no finding today.

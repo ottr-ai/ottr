@@ -1328,7 +1328,14 @@ export function startRun(o: {
 	/** Post-run guard (docs/specs/turn-provision-guard.md): audits the shared home's provisioned
 	 * agent layer against alate's manifest when a local run settles, so a turn that edited it
 	 * settles with provisionDrift. Undefined skips the audit (tests); production passes it. */
-	auditProvisioned?: (sinceMs: number) => readonly string[];
+	auditProvisioned?: (
+		sinceMs: number,
+		rulesAtStart?: readonly string[],
+	) => readonly string[];
+	/** Captured when a local run spawns, before omp starts: the rules dir entries the
+	 * audit's untracked scan compares against, so only entries the run added are
+	 * findings. Undefined keeps the scan off (tests); production passes it. */
+	rulesAtStart?: () => readonly string[];
 }): RunHandle {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
@@ -1385,6 +1392,9 @@ export function startRun(o: {
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const startLocal = (): RunHandle => {
 		const launch: RunLauncher = o.launcher ?? spawn;
+		// The provision guard's untracked scan compares against the rules dir as it
+		// stood before omp started (docs/specs/turn-provision-guard.md).
+		const rulesAtStart = o.rulesAtStart ? o.rulesAtStart() : undefined;
 		const base = boardOmpEnv(
 			withoutGitAuth({
 				...process.env,
@@ -1434,7 +1444,7 @@ export function startRun(o: {
 			unregisterLayer();
 			// The provision guard fires after the run's writes are final; drift fails the
 			// run through classify (docs/specs/turn-provision-guard.md).
-			const drift = o.auditProvisioned?.(startedAt) ?? [];
+			const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
 			resolveDone(
 				sink.result({
 					exitCode: code,

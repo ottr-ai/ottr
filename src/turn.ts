@@ -56,7 +56,7 @@ import {
 	workCheckSendBack,
 	workPrompt,
 } from "./prompts.ts";
-import { auditProvisioned } from "./provision.ts";
+import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { openPullRequest } from "./prs.ts";
 import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
@@ -2589,7 +2589,9 @@ export function createTurnLoop(
 			const runStartedAt = Date.now();
 			const handle = ops.startRun({
 				meter: ops.hosted !== undefined,
-				auditProvisioned: (sinceMs) => auditProvisioned(homedir(), sinceMs),
+				auditProvisioned: (sinceMs, rulesAtStart) =>
+					auditProvisioned(homedir(), sinceMs, rulesAtStart),
+				rulesAtStart: () => rulesDirEntries(homedir()),
 				cwd: wt,
 				prompt,
 				images: imagePaths,
@@ -4347,8 +4349,9 @@ export function createTurnLoop(
 						const startedAt = Date.now();
 						const handle = ops.startRun({
 							meter: ops.hosted !== undefined,
-							auditProvisioned: (sinceMs) =>
-								auditProvisioned(homedir(), sinceMs),
+							auditProvisioned: (sinceMs, rulesAtStart) =>
+								auditProvisioned(homedir(), sinceMs, rulesAtStart),
+							rulesAtStart: () => rulesDirEntries(homedir()),
 							cwd: wt,
 							prompt: input,
 							sessionDir: store.sessionsDir,
@@ -4614,8 +4617,9 @@ export function createTurnLoop(
 							const startedAt = Date.now();
 							const handle = ops.startRun({
 								meter: ops.hosted !== undefined,
-								auditProvisioned: (sinceMs) =>
-									auditProvisioned(homedir(), sinceMs),
+								auditProvisioned: (sinceMs, rulesAtStart) =>
+									auditProvisioned(homedir(), sinceMs, rulesAtStart),
+								rulesAtStart: () => rulesDirEntries(homedir()),
 								cwd: wt,
 								prompt: input,
 								sessionDir: store.sessionsDir,

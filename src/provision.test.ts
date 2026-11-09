@@ -10,7 +10,11 @@ import {
 } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
-import { auditProvisioned, provisionFingerprint } from "./provision.ts";
+import {
+	auditProvisioned,
+	provisionFingerprint,
+	rulesDirEntries,
+} from "./provision.ts";
 
 let home: string;
 
@@ -301,15 +305,30 @@ describe("auditProvisioned", () => {
 		]);
 	});
 
-	test("a planted rule file and dir flag untracked, sorted", () => {
+	test("a rule entry the run added flags untracked, sorted", () => {
 		setup();
 		provisionRule("real.md", "# real\n");
+		const atStart = rulesDirEntries(home);
 		write("omp/agent/rules/planted.md", "# planted\n");
 		write("omp/agent/rules/sub/nested.md", "# nested\n");
-		expect(auditProvisioned(home)).toEqual([
+		expect(auditProvisioned(home, undefined, atStart)).toEqual([
 			".omp/agent/rules/planted.md untracked",
 			".omp/agent/rules/sub untracked",
 		]);
+	});
+
+	test("pre-existing unrecorded rules make no finding", () => {
+		setup();
+		provisionRule("real.md", "# real\n");
+		// An older alate's leftovers: sync keeps them by design ("Not from the
+		// data repo, left in place"), so they are deployment state, not drift.
+		write("omp/agent/rules/demo-rules.md", "# demo\n");
+		write("omp/agent/rules/example-rule.md", "# example\n");
+		// Without a run-start capture the scan stays off, like the manifest audit.
+		expect(auditProvisioned(home)).toEqual([]);
+		// With one, the files predate the capture, so the run added nothing.
+		const atStart = rulesDirEntries(home);
+		expect(auditProvisioned(home, undefined, atStart)).toEqual([]);
 	});
 
 	test("a corrupt rules record skips the rules audit", () => {

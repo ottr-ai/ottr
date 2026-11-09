@@ -1,11 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-	type Dirent,
-	lstatSync,
-	readdirSync,
-	readFileSync,
-	statSync,
-} from "node:fs";
+import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /** Alate's content fingerprint for one provisioned file: sha256 over CRLF-normalized
@@ -54,15 +48,36 @@ function withoutDeploymentBlocks(text: string): string {
 	return base && tail ? `${base}\n` : base;
 }
 
+/** Sorted entry names of the home's rules dir, [] when it is missing or unreadable.
+ * Captured when a run starts, so the audit can flag only the entries that run added. */
+export function rulesDirEntries(home: string): string[] {
+	try {
+		return readdirSync(join(home, ".omp", "agent", "rules"), {
+			withFileTypes: true,
+		})
+			.map((e) => e.name)
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
 /** Drift of the provisioned agent layer in `home`, one line per finding, [] when clean.
  * Lines: `<.rel> changed` | `<.rel> missing` | `<.rel> unreadable` | `<.rel> untracked`
- * (untracked only for rule files planted in the rules dir), then a final `… +N more` line
- * when more than 40 findings. Never throws.
+ * (untracked only for rule entries the run added: pass `rulesAtStart`, the rulesDirEntries
+ * capture from spawn time — without it the scan stays off, like the manifest audit, which
+ * never flags an added file), then a final `… +N more` line when more than 40 findings.
+ * Never throws.
  * Files the manifest never recorded are machine state or unrecorded extras — they make
  * no finding, because an added file neither changes what alate provisions nor makes the
- * next provision refuse. Rules audit through their own record, the rules dir's
+ * next provision refuse; pre-existing unrecorded rules are deployment state that sync
+ * keeps by design. Rules audit through their own record, the rules dir's
  * `.alate-installed.json` (sync.mjs rewrites it from the snapshot every provision). */
-export function auditProvisioned(home: string, sinceMs?: number): string[] {
+export function auditProvisioned(
+	home: string,
+	sinceMs?: number,
+	rulesAtStart?: readonly string[],
+): string[] {
 	try {
 		// Layer mode: a pinned turn writes its own layer by design, and alate no longer
 		// maintains the flat trees, so there is nothing here to prove.
@@ -193,24 +208,21 @@ export function auditProvisioned(home: string, sinceMs?: number): string[] {
 				if (provisionFingerprint(name, bytes) !== sha)
 					tracked.push(`.omp/agent/rules/${name} changed`);
 			}
-			// The rules dir holds exactly the record and the snapshot's rules — a flat,
-			// sync-managed dir with no machine state — so an unrecorded entry is a
-			// planted rule: the one place an add is a finding.
-			let entries: Dirent[];
-			try {
-				entries = readdirSync(rulesDir, { withFileTypes: true });
-			} catch {
-				entries = [];
-			}
-			for (const e of [...entries].sort((a, b) =>
-				a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
-			)) {
-				if (
-					e.name === ".alate-installed.json" ||
-					recorded[e.name] !== undefined
-				)
-					continue;
-				tracked.push(`.omp/agent/rules/${e.name} untracked`);
+			// The rules dir holds exactly the record and the snapshot's rules, but it can
+			// also hold unrecorded rules an older alate installed: sync keeps those by
+			// design ("Not from the data repo, left in place"). Only an entry the run
+			// itself added is a finding — the planted-rule class — so the scan compares
+			// against the spawn-time capture and stays off without one.
+			if (rulesAtStart !== undefined) {
+				const atStart = new Set(rulesAtStart);
+				const added = rulesDirEntries(home).filter(
+					(name) => !atStart.has(name),
+				);
+				for (const name of added) {
+					if (name === ".alate-installed.json" || recorded[name] !== undefined)
+						continue;
+					tracked.push(`.omp/agent/rules/${name} untracked`);
+				}
 			}
 		}
 

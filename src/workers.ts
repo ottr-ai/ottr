@@ -136,7 +136,14 @@ export function serveWorker(opts: {
 	/** The post-run provision guard (docs/specs/turn-provision-guard.md): the daemon audits its
 	 * container's shared home against alate's manifest when a run closes. src/worker.ts injects
 	 * the real audit; tests omit it and the audit stays off. */
-	auditProvisioned?: (sinceMs: number) => readonly string[];
+	auditProvisioned?: (
+		sinceMs: number,
+		rulesAtStart?: readonly string[],
+	) => readonly string[];
+	/** Captured when a run spawns, before omp starts: the rules dir entries the audit's
+	 * untracked scan compares against, so only entries the run added are findings.
+	 * src/worker.ts injects the real capture; tests omit it and the scan stays off. */
+	rulesAtStart?: () => readonly string[];
 	/** Only for tests: roots the /sweep scan instead of /workspace. */
 	sweepRoots?: readonly string[];
 	/** Only for tests: the SIGTERM grace period of /sweep instead of 1000ms. */
@@ -364,6 +371,9 @@ export function serveWorker(opts: {
 			// Same strip as childEnv on the server: the container env can carry a
 			// corporate proxy URL with credentials; a turn keeps host and port only.
 			stripProxyCredentials(env);
+			// The provision guard's untracked scan compares against the rules dir as it
+			// stood before omp started (docs/specs/turn-provision-guard.md).
+			const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
 			let child: ChildProcess;
 			// The tools link dir is per tool set: project pins, then _all pins, then the container
 			// PATH. The daemon's own PATH never changes, and two projects never see each
@@ -474,7 +484,7 @@ export function serveWorker(opts: {
 						// writes are final (docs/specs/turn-provision-guard.md); drift rides the
 						// result, and classify parks the turn.
 						const provisionDrift =
-							opts.auditProvisioned?.(entry.startedAt) ?? [];
+							opts.auditProvisioned?.(entry.startedAt, rulesAtStart) ?? [];
 						const driftField = provisionDrift.length
 							? { provisionDrift: [...provisionDrift] }
 							: {};

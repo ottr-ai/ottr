@@ -1183,8 +1183,9 @@ is agent-data -> import -> provision. When a run settles, its container audits t
 alate's manifest records, `~/.alate/installed.json`, plus the rules through their own record,
 `.omp/agent/rules/.alate-installed.json` (src/provision.ts, docs/specs/turn-provision-guard.md).
 A provisioned file that changed or went missing fails the turn: the card parks at needs_you
-and names the files. A rule file planted in the rules dir fails it too. Extensions are not
-recorded anywhere, so a turn that edits an installed extension produces no finding today.
+and names the files. A rule entry that the run itself added to the rules dir fails it too;
+rules that predate the run and that sync keeps by design produce no finding. Extensions are
+not recorded anywhere, so a turn that edits an installed extension produces no finding today.
 The audit only reads; it never blocks a write. It stays off when `.alate/current` exists
 (layer mode): a pinned turn writes its own layer, and alate no longer maintains the flat
 trees.
