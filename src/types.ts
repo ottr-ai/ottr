@@ -1,5 +1,6 @@
 // Shared contract for omp-task-tracker. Every module imports its types from here.
 
+import type { CommitIdentity } from "./gitIdentity.ts";
 import type { TokenUsage } from "./hosted.ts";
 import type { DeadSignIn } from "./login.ts";
 import type { VmRunnerHealth } from "./vmState.ts";
@@ -1063,6 +1064,8 @@ export interface StateResponse {
 	idleReviews: boolean;
 	/** True when the board scans GitHub trending weekly (Monday 06:00 server time) for projects with trendingScout on. */
 	trendingScan: boolean;
+	/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
+	commitIdentity: CommitIdentity | null;
 	/** Weekly trending scan state for the Settings notice and the "Scan trending now" button. */
 	trendingStatus: TrendingStatus;
 	/** Version stamp of the running server (image stamp OTTR_VERSION, release tag `vX.Y.Z`, short sha on dev, else boot time); stale tabs reload once when it changes. */

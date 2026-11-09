@@ -12475,6 +12475,7 @@ export function App() {
 							workCheck={state.workCheck}
 							idleReviews={state.idleReviews}
 							trendingScan={state.trendingScan}
+							commitIdentity={state.commitIdentity}
 							trendingStatus={state.trendingStatus}
 							act={act}
 							view={view}

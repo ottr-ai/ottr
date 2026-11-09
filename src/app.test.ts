@@ -226,6 +226,7 @@ const shared = {
 	workCheck: true,
 	idleReviews: true,
 	trendingScan: true,
+	commitIdentity: null,
 	removedPaths: [] as string[],
 	projectPaths: [] as string[],
 	projectOrder: [] as string[],
@@ -444,6 +445,7 @@ function mount(
 			workCheck: true,
 			idleReviews: true,
 			trendingScan: true,
+			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -1458,6 +1460,7 @@ describe("settings routes", () => {
 			workCheck: shared.workCheck,
 			idleReviews: shared.idleReviews,
 			trendingScan: shared.trendingScan,
+			commitIdentity: shared.commitIdentity,
 		});
 		expect(shared.reviewCheck).toBe(false);
 	});
@@ -1469,6 +1472,7 @@ describe("settings routes", () => {
 			workCheck: shared.workCheck,
 			idleReviews: shared.idleReviews,
 			trendingScan: shared.trendingScan,
+			commitIdentity: shared.commitIdentity,
 		};
 		const ok = await post("/api/settings", {});
 		expect(ok.status).toBe(200);
@@ -1490,6 +1494,7 @@ describe("settings routes", () => {
 			workCheck: false,
 			idleReviews: shared.idleReviews,
 			trendingScan: shared.trendingScan,
+			commitIdentity: shared.commitIdentity,
 		});
 		expect(shared.workCheck).toBe(false);
 	});
@@ -1507,6 +1512,7 @@ describe("settings routes", () => {
 			workCheck: true,
 			idleReviews: false,
 			trendingScan: true,
+			commitIdentity: null,
 		});
 		// The state payload exposes it for the Settings switch.
 		const state = (await (await m.call("/api/state")).json()) as {
@@ -1539,6 +1545,7 @@ describe("settings routes", () => {
 			workCheck: true,
 			idleReviews: true,
 			trendingScan: false,
+			commitIdentity: null,
 		});
 		// The state payload exposes it, with the scan status, for the Settings switch.
 		const state = (await (await m.call("/api/state")).json()) as {
@@ -1567,6 +1574,122 @@ describe("settings routes", () => {
 			trendingScan: boolean;
 		};
 		expect(state.trendingScan).toBe(true);
+	});
+
+	// OTTR-693: the Commit identity Settings pair validates, saves together, and resets.
+	describe("commit identity", () => {
+		type IdentityState = {
+			commitIdentity: { name: string; email: string } | null;
+		};
+		type Mounted = {
+			g: GlobalStore;
+			call: (path: string, body?: unknown) => Promise<Response>;
+		};
+		const stateOf = async (m: Mounted) =>
+			(await (await m.call("/api/state")).json()) as IdentityState;
+
+		test("a bad name 400s with the field name and does not persist", async () => {
+			const m = mount({ projects: new Map() });
+			const bad = await m.call("/api/settings", {
+				commitName: "a<b",
+				commitEmail: "ottr@example.invalid",
+			});
+			expect(bad.status).toBe(400);
+			expect(await errorOf(bad)).toContain("commitName");
+			expect((await stateOf(m)).commitIdentity).toBeNull();
+		});
+
+		test("a bad email 400s with the field name", async () => {
+			const m = mount({ projects: new Map() });
+			const bad = await m.call("/api/settings", {
+				commitName: "Ottr",
+				commitEmail: "not-an-email",
+			});
+			expect(bad.status).toBe(400);
+			expect(await errorOf(bad)).toContain("commitEmail");
+			expect((await stateOf(m)).commitIdentity).toBeNull();
+		});
+
+		test("one field without the other 400s: they save together", async () => {
+			const m = mount({ projects: new Map() });
+			const half = await m.call("/api/settings", { commitName: "Ottr" });
+			expect(half.status).toBe(400);
+			expect(await errorOf(half)).toBe(
+				"commitName and commitEmail must be saved together",
+			);
+		});
+
+		test("a valid pair lands in shared and round-trips through the state", async () => {
+			const m = mount({ projects: new Map() });
+			const ok = await m.call("/api/settings", {
+				commitName: "  Ada  ",
+				commitEmail: "ada@example.invalid",
+			});
+			expect(ok.status).toBe(200);
+			expect(await ok.json()).toMatchObject({
+				commitIdentity: { name: "Ada", email: "ada@example.invalid" },
+			});
+			expect((await stateOf(m)).commitIdentity).toEqual({
+				name: "Ada",
+				email: "ada@example.invalid",
+			});
+			// saveConfig persists it, and a restart reads it back.
+			const cfg = m.g.get<{ commitIdentity?: unknown }>("config");
+			expect(cfg?.commitIdentity).toEqual({
+				name: "Ada",
+				email: "ada@example.invalid",
+			});
+			const again = mount({ gstore: m.g, projects: new Map() });
+			expect((await stateOf(again)).commitIdentity).toEqual({
+				name: "Ada",
+				email: "ada@example.invalid",
+			});
+		});
+
+		test("both null resets to the built-in default", async () => {
+			const m = mount({ projects: new Map() });
+			const set = await m.call("/api/settings", {
+				commitName: "Ada",
+				commitEmail: "ada@example.invalid",
+			});
+			expect(set.status).toBe(200);
+			const reset = await m.call("/api/settings", {
+				commitName: null,
+				commitEmail: null,
+			});
+			expect(reset.status).toBe(200);
+			expect((await stateOf(m)).commitIdentity).toBeNull();
+		});
+
+		test("the git-init fallback commit uses the Settings identity", async () => {
+			// A configured global identity would win before the fallback ran, so the app's
+			// git reads an empty pinned config here and the -c args decide the author.
+			const emptyConfig = join(root, `empty-gitconfig-${Date.now()}`);
+			writeFileSync(emptyConfig, "");
+			const oldGlobal = process.env.GIT_CONFIG_GLOBAL;
+			process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+			try {
+				const dir = join(root, `identity-proj-${Date.now()}`);
+				mkdirSync(dir, { recursive: true });
+				const m = mount({ projects: new Map(), defaultDir: dir });
+				const set = await m.call("/api/settings", {
+					commitName: "Ada",
+					commitEmail: "ada@example.invalid",
+				});
+				expect(set.status).toBe(200);
+				const add = await m.call("/api/projects", { name: "identity-proj" });
+				expect(add.status).toBe(200);
+				const log = execSync("git log -1 --format=%an%n%ae", {
+					cwd: join(dir, "identity-proj"),
+				})
+					.toString()
+					.trim();
+				expect(log).toBe("Ada\nada@example.invalid");
+			} finally {
+				if (oldGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+				else process.env.GIT_CONFIG_GLOBAL = oldGlobal;
+			}
+		});
 	});
 
 	test("trendingStatus reads the stored scan state; a malformed one reads as empty", async () => {
@@ -5724,6 +5847,7 @@ describe("github token", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -5913,6 +6037,7 @@ describe("hindsight settings", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -6356,6 +6481,7 @@ describe("loopback Host from another machine or container", () => {
 			workCheck: true,
 			idleReviews: true,
 			trendingScan: true,
+			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -9235,6 +9361,7 @@ describe("sign out everywhere", () => {
 			workCheck: true,
 			idleReviews: true,
 			trendingScan: true,
+			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
 			projectPaths: [],
@@ -9357,6 +9484,7 @@ describe("session registry (OTTR-387)", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -12553,6 +12681,7 @@ describe("worker sign-in warnings", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -12672,6 +12801,7 @@ describe("GET /api/settings/omp-stats", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],
@@ -12793,6 +12923,7 @@ describe("token expiry reminders", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

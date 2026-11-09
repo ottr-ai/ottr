@@ -24,6 +24,7 @@ import {
 	trustedAnchor,
 } from "./confine.ts";
 import { githubHost, hostMatcher } from "./githubHost.ts";
+import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
 import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
@@ -1648,16 +1649,15 @@ export async function fetchOriginBranch(
 export async function rebaseTargetBranch(
 	mainPath: string,
 	branch: string,
+	/** OTTR-693: the Settings commit identity; null keeps the built-in Ottr one. */
+	identity: CommitIdentity | null = null,
 ): Promise<{ ok: true } | { ok: false; conflict: boolean; error: string }> {
 	const r = await git(
 		[
 			// The replay re-creates commits, so it needs a committer identity; pin the board's
 			// own (the same app.ts pins) so a checkout without git config cannot wedge the
 			// automatic retry.
-			"-c",
-			"user.name=Ottr",
-			"-c",
-			"user.email=ottr@localhost",
+			...identityArgs(identity),
 			"rebase",
 			`refs/remotes/origin/${branch}`,
 			branch,

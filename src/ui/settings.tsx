@@ -9,6 +9,7 @@ import {
 	useState,
 } from "react";
 import { defaultGitUsername } from "../githubHost.ts";
+import type { CommitIdentity } from "../gitIdentity.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
 import type { AlertClass, ClassPrefs } from "../notifications.ts";
@@ -762,6 +763,102 @@ function TotalRunnersForm({
 				value={`${maxTotal === null ? "no cap" : `cap ${maxTotal}`} · ${allocated} configured`}
 				band={false}
 			/>
+		</SettingsCard>
+	);
+}
+
+/** OTTR-693: the name and email git commits with when the project or the home's own git
+ *  config names none. Empty fields keep the built-in Ottr and ottr@localhost; a configured
+ *  ~/.gitconfig identity wins over the default. */
+function CommitIdentitySection({
+	commitIdentity,
+	act,
+}: {
+	commitIdentity: CommitIdentity | null;
+	act: Act;
+}) {
+	const [name, setName] = useState(commitIdentity?.name ?? "");
+	const [email, setEmail] = useState(commitIdentity?.email ?? "");
+	const s = useInstantSave(act);
+	const formId = useId();
+	// Empty inputs count as null (the built-in default); either input off the server
+	// value marks the form dirty. Both fields always go out together.
+	const dirty =
+		name.trim() !== (commitIdentity?.name ?? "") ||
+		email.trim() !== (commitIdentity?.email ?? "");
+	return (
+		<SettingsCard
+			id="commit-identity-section"
+			title="Commit identity"
+			status={
+				commitIdentity === null
+					? { label: "Default", tone: "off" }
+					: { label: commitIdentity.name, tone: "ok" }
+			}
+			hint="The name and email git commits with when the project or the home's own git config names none. Empty keeps the built-in Ottr and ottr@localhost; a configured ~/.gitconfig identity wins over the default."
+		>
+			<form
+				id={formId}
+				className="alate-def-rows"
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (!dirty) return;
+					const n = name.trim();
+					const m = email.trim();
+					s.run(() =>
+						post("/api/settings", {
+							commitName: n === "" ? null : n,
+							commitEmail: m === "" ? null : m,
+						}),
+					);
+				}}
+			>
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>
+							Commit name
+							<Help
+								label="Commit name"
+								text="Labels every commit a turn or the board makes when no other git config names an author."
+							/>
+						</b>
+						<code>empty = Ottr</code>
+					</div>
+					<div className="alate-def-actions">
+						<label>
+							<input
+								type="text"
+								value={name}
+								onChange={(e) => setName(e.target.value)}
+								aria-label="Commit name (empty = Ottr)"
+							/>
+						</label>
+					</div>
+				</div>
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>
+							Commit email
+							<Help
+								label="Commit email"
+								text="The address on every commit a turn or the board makes when no other git config names one."
+							/>
+						</b>
+						<code>empty = ottr@localhost</code>
+					</div>
+					<div className="alate-def-actions">
+						<label>
+							<input
+								type="text"
+								value={email}
+								onChange={(e) => setEmail(e.target.value)}
+								aria-label="Commit email (empty = ottr@localhost)"
+							/>
+						</label>
+						<SaveButton form={formId} s={s} dirty={dirty} />
+					</div>
+				</div>
+			</form>
 		</SettingsCard>
 	);
 }
@@ -5222,6 +5319,7 @@ export const SETTINGS_TOC = [
 					{ id: "ssh-key-block", label: "Global SSH key" },
 				],
 			},
+			{ id: "commit-identity-section", label: "Commit identity" },
 			{ id: "env-section", label: "Env" },
 		],
 	},
@@ -5311,6 +5409,7 @@ const HOSTED_HIDDEN: ReadonlySet<string> = new Set([
 	// Hosted git uses per-project control-plane tokens only (section 6), so no host token,
 	// GitHub setting or server SSH key on this card does anything there.
 	"git-hosts-section",
+	"commit-identity-section",
 	"signin-section",
 	"model-roles-section",
 	"alate-section",
@@ -5462,6 +5561,7 @@ export function SettingsPage({
 	workCheck,
 	idleReviews,
 	trendingScan,
+	commitIdentity,
 	trendingStatus,
 	act,
 	view,
@@ -5475,6 +5575,7 @@ export function SettingsPage({
 	workCheck: boolean;
 	idleReviews: boolean;
 	trendingScan: boolean;
+	commitIdentity: CommitIdentity | null;
 	trendingStatus: TrendingStatus;
 	act: Act;
 	view: string;
@@ -5695,6 +5796,12 @@ export function SettingsPage({
 									Git and secrets
 								</h2>
 								{shown("git-hosts-section") && <GitHostsSection />}
+								{shown("commit-identity-section") && (
+									<CommitIdentitySection
+										commitIdentity={commitIdentity}
+										act={act}
+									/>
+								)}
 								<EnvSection />
 							</section>
 						)}

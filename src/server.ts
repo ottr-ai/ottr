@@ -13,6 +13,7 @@ import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { defaultSshDir } from "./gitHosts.ts";
 import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
+import type { CommitIdentity } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
@@ -147,6 +148,8 @@ const shared: {
 	idleReviews: boolean;
 	/** Default on; POST /api/settings writes it, the weekly trending tick reads it. */
 	trendingScan: boolean;
+	/** OTTR-693: the commit identity Settings names for board and turn commits; null keeps the built-in Ottr default. */
+	commitIdentity: CommitIdentity | null;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 	/** Project names in board order, persisted via /api/projects/order. */
@@ -163,6 +166,7 @@ const shared: {
 	workCheck: true,
 	idleReviews: true,
 	trendingScan: true,
+	commitIdentity: null,
 	envValues: {},
 	...storedProjectPaths(gstore),
 };
@@ -587,7 +591,10 @@ const loop = createTurnLoop(projects, {
 	pushAuthKind: (url) => app.pushAuthKind(url),
 	githubAuthHint: (url) => app.githubAuthHint(url),
 	fetchOriginBranch,
-	rebaseTargetBranch,
+	rebaseTargetBranch: (mainPath, branch) =>
+		rebaseTargetBranch(mainPath, branch, shared.commitIdentity),
+	// OTTR-693: the commit identity every turn falls back to when its home names none.
+	commitIdentity: () => shared.commitIdentity,
 	runMergeGates,
 	mergeHoldMismatch,
 	resetBranchTo,

@@ -399,6 +399,7 @@ const shared = () => ({
 	workCheck: true,
 	idleReviews: true,
 	trendingScan: true,
+	commitIdentity: null,
 	removedPaths: [] as string[],
 	envValues: {} as Record<string, string>,
 	projectPaths: [] as string[],

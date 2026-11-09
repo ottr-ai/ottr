@@ -7,6 +7,13 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import {
+	type CommitIdentity,
+	commitIdentityEnv,
+	DEFAULT_COMMIT_EMAIL,
+	DEFAULT_COMMIT_NAME,
+	probeGitIdent,
+} from "./gitIdentity.ts";
 import type { TokenUsage } from "./hosted.ts";
 import {
 	addLayerUse,
@@ -1314,6 +1321,10 @@ export function startRun(o: {
 	/** Set: a local child runs without the board's GitHub token (GH_TOKEN, GITHUB_TOKEN), as a
 	 * worker child always does. A run that reads third-party text (the trending scout) sets it. */
 	stripGithubToken?: boolean;
+	/** OTTR-693: the Settings commit identity for this turn; null keeps the built-in Ottr default (src/gitIdentity.ts). */
+	commitIdentity?: CommitIdentity | null;
+	/** Test seam: replaces the git config probe. */
+	gitProbe?: (home: string | null) => { name: boolean; email: boolean };
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
 	tools?: string | null;
 	config?: string | null;
@@ -1389,6 +1400,28 @@ export function startRun(o: {
 		? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
 		: null;
 
+	// OTTR-693: the ident env beats every git config scope, so it is set only for the fields
+	// the turn's git config leaves empty (a user ~/.gitconfig, the pinned /etc/ottr/gitconfig
+	// keep winning). Worker containers ship no gitconfig, so without this the first commit in
+	// a worker turn died with "no author identity". A VM guest seeds the clone's own config
+	// (src/vmGuest.ts) and shares no home, so only an explicit Settings identity rides the VM env.
+	let identityEnv: Record<string, string>;
+	if (o.vm) {
+		identityEnv =
+			o.commitIdentity != null
+				? commitIdentityEnv(o.commitIdentity, { name: false, email: false })
+				: {};
+	} else {
+		const identity = o.commitIdentity ?? {
+			name: DEFAULT_COMMIT_NAME,
+			email: DEFAULT_COMMIT_EMAIL,
+		};
+		const probe = (o.gitProbe ?? probeGitIdent)(
+			layerEnv?.HOME ?? process.env.HOME ?? null,
+		);
+		identityEnv = commitIdentityEnv(identity, probe);
+	}
+
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const startLocal = (): RunHandle => {
 		const launch: RunLauncher = o.launcher ?? spawn;
@@ -1405,6 +1438,7 @@ export function startRun(o: {
 			}),
 		);
 		if (layerEnv !== null) Object.assign(base, layerEnv);
+		Object.assign(base, identityEnv);
 		const child = launch("omp", args, {
 			cwd: o.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -1519,7 +1553,7 @@ export function startRun(o: {
 				cwd: o.cwd,
 				stdin: o.prompt,
 				env: vmEnv({
-					env: o.env,
+					env: { ...o.env, ...identityEnv },
 					secrets: o.secrets,
 					sessionName: o.sessionName,
 					board: o.board ?? null,
@@ -1601,6 +1635,7 @@ export function startRun(o: {
 		OTTR_BOARD_OMP_HOME: undefined,
 	});
 	if (layerEnv !== null) Object.assign(workerBase, layerEnv);
+	Object.assign(workerBase, identityEnv);
 	const env = childEnv({
 		sessionName: o.sessionName,
 		board: o.board ?? null,

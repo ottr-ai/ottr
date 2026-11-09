@@ -19,6 +19,7 @@ import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
+import type { CommitIdentity } from "./gitIdentity.ts";
 import {
 	DEFAULT_CREDIT_REASON,
 	type Hosted,
@@ -639,6 +640,8 @@ export interface TurnOps {
 		id: string,
 	) => Promise<void>;
 	startRun: typeof startRun;
+	/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
+	commitIdentity?: () => CommitIdentity | null;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
 	/**
@@ -2595,6 +2598,8 @@ export function createTurnLoop(
 				cwd: wt,
 				prompt,
 				images: imagePaths,
+				// OTTR-693: the identity this turn's git commits with when its home config names none.
+				commitIdentity: ops.commitIdentity?.() ?? null,
 				sessionDir: store.sessionsDir,
 				extensionPath: ops.extensionPath,
 				board: retroCard ? null : { ...ops.board, project: name, taskId: id },

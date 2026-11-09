@@ -370,6 +370,41 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("rebaseTargetBranch replays commits with the identity the board pins", async () => {
+		const f = fixture();
+		try {
+			// The Settings identity reaches the automatic push retry: the replayed local
+			// commit carries its committer, even though the fixture repo has no gitconfig.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(twin, "move.txt"), "moved");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			writeFileSync(join(f.main, "local.txt"), "local");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "local work");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			expect(
+				await rebaseTargetBranch(f.main, "main", {
+					name: "Board Bot",
+					email: "board@ottr.dev",
+				}),
+			).toEqual({ ok: true });
+			const who = run(
+				f.main,
+				"log",
+				"--format=%cn %ce",
+				"-1",
+				"refs/heads/main",
+			);
+			expect(who).toBe("Board Bot board@ottr.dev");
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("rebaseTargetBranch reports a conflict and restores the branch", async () => {
 		const f = fixture();
 		try {

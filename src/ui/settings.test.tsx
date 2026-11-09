@@ -2178,6 +2178,7 @@ async function mountPage(
 				workCheck={false}
 				idleReviews={false}
 				trendingScan={true}
+				commitIdentity={null}
 				trendingStatus={trendingStatus}
 				act={async () => true}
 				view="settings"

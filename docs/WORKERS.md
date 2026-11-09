@@ -864,7 +864,12 @@ Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` to
 it. The volume survives each container recreate, for example the hourly auto-deploy.
 The entry script never copies from the shared home (`/root`). When the git config is
 absent, the entry script writes only the fixed Ottr identity (`user.name = Ottr`,
-`user.email = ottr@localhost`). gh starts empty on purpose, because gh config can name
+`user.email = ottr@localhost`). Worker containers get no pinned git config, so every
+turn carries a default commit identity in its env (git author and committer
+`Ottr <ottr@localhost>`), set only for the fields the turn's git config leaves empty,
+so a configured `~/.gitconfig` identity wins. Settings → "Git and secrets" →
+"Commit identity" changes it for the board's git calls and every turn.
+gh starts empty on purpose, because gh config can name
 commands. When a pinned path is inside `$HOME`, the entry script refuses to start. It
 writes each refusal and warning to stderr as a line that starts with `ottr-entry: R5-1:`.
 A config planted in the shared home never reaches the board's git or gh. The system-level

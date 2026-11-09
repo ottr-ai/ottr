@@ -3615,6 +3615,7 @@ describe("turn release cards", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
 				projectPaths: [],

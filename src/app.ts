@@ -102,6 +102,11 @@ import {
 	githubHost,
 	parseGithubHost,
 } from "./githubHost.ts";
+import {
+	type CommitIdentity,
+	identityArgs,
+	parseCommitField,
+} from "./gitIdentity.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import type { Hosted } from "./hosted.ts";
 import { DeliveryCache, eventRepository, githubEventWatch } from "./hosted.ts";
@@ -511,6 +516,8 @@ interface AppDeps {
 		idleReviews: boolean;
 		/** Default on; POST /api/settings writes it, the weekly trending tick reads it. */
 		trendingScan: boolean;
+		/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
+		commitIdentity: CommitIdentity | null;
 		removedPaths: string[];
 		projectPaths: string[];
 		/** Project names in board order; names not listed keep discovery order after them. */
@@ -2371,6 +2378,7 @@ export function createApp(deps: AppDeps) {
 			workCheck: deps.shared.workCheck,
 			idleReviews: deps.shared.idleReviews,
 			trendingScan: deps.shared.trendingScan,
+			commitIdentity: deps.shared.commitIdentity,
 			removed: deps.shared.removedPaths,
 			projects: deps.shared.projectPaths,
 			projectOrder: deps.shared.projectOrder,
@@ -2396,6 +2404,7 @@ export function createApp(deps: AppDeps) {
 		workCheck?: unknown;
 		idleReviews?: unknown;
 		trendingScan?: unknown;
+		commitIdentity?: unknown;
 		removed?: unknown;
 		projects?: unknown;
 		admin?: unknown;
@@ -2433,6 +2442,30 @@ export function createApp(deps: AppDeps) {
 		}
 		if (typeof parsed.trendingScan === "boolean") {
 			deps.shared.trendingScan = parsed.trendingScan;
+		}
+		// null keeps the built-in Ottr identity; a { name, email } mapping is accepted only
+		// when both fields pass validation. Anything else keeps the default (null).
+		if (parsed.commitIdentity === null) {
+			deps.shared.commitIdentity = null;
+		} else if (
+			typeof parsed.commitIdentity === "object" &&
+			parsed.commitIdentity !== null &&
+			"name" in parsed.commitIdentity &&
+			"email" in parsed.commitIdentity
+		) {
+			const name = parseCommitField(parsed.commitIdentity.name, "commitName");
+			const email = parseCommitField(
+				parsed.commitIdentity.email,
+				"commitEmail",
+			);
+			if (
+				name.ok &&
+				email.ok &&
+				typeof name.value === "string" &&
+				typeof email.value === "string"
+			) {
+				deps.shared.commitIdentity = { name: name.value, email: email.value };
+			}
 		}
 		if (
 			typeof parsed.admin === "object" &&
@@ -3261,6 +3294,7 @@ export function createApp(deps: AppDeps) {
 			workCheck: deps.shared.workCheck,
 			idleReviews: deps.shared.idleReviews,
 			trendingScan: deps.shared.trendingScan,
+			commitIdentity: deps.shared.commitIdentity,
 			trendingStatus: trendingScanner.status(),
 			serverVersion: deps.serverVersion,
 			quota,
@@ -4017,13 +4051,11 @@ export function createApp(deps: AppDeps) {
 			p,
 		);
 		if (c.code !== 0)
-			// No configured git identity: commit once as Ottr rather than failing the add.
+			// No configured git identity: commit once with the Settings identity, falling
+			// back to the built-in Ottr identity, rather than failing the add.
 			c = await git(
 				[
-					"-c",
-					"user.name=Ottr",
-					"-c",
-					"user.email=ottr@localhost",
+					...identityArgs(deps.shared.commitIdentity),
 					"commit",
 					"-q",
 					"--allow-empty",
@@ -5800,6 +5832,8 @@ export function createApp(deps: AppDeps) {
 						workCheck?: unknown;
 						idleReviews?: unknown;
 						trendingScan?: unknown;
+						commitName?: unknown;
+						commitEmail?: unknown;
 					};
 					const maxTotal = body.maxTotal;
 					if (maxTotal !== undefined) {
@@ -5844,6 +5878,35 @@ export function createApp(deps: AppDeps) {
 						}
 						deps.shared.trendingScan = trendingScan;
 					}
+					if (body.commitName !== undefined || body.commitEmail !== undefined) {
+						// The pair saves together: one field without the other is a 400 before
+						// any value lands in shared.
+						if (
+							body.commitName === undefined ||
+							body.commitEmail === undefined
+						) {
+							return json(
+								{ error: "commitName and commitEmail must be saved together" },
+								400,
+							);
+						}
+						const name = parseCommitField(body.commitName, "commitName");
+						if (!name.ok) return json({ error: name.error }, 400);
+						const email = parseCommitField(body.commitEmail, "commitEmail");
+						if (!email.ok) return json({ error: email.error }, 400);
+						if ((name.value === null) !== (email.value === null)) {
+							return json(
+								{ error: "commitName and commitEmail must be saved together" },
+								400,
+							);
+						}
+						// Past the 400s both values are a string or null (undefined cannot
+						// occur: both fields were required above), so the pair is complete.
+						deps.shared.commitIdentity =
+							typeof name.value === "string" && typeof email.value === "string"
+								? { name: name.value, email: email.value }
+								: null;
+					}
 					saveConfig();
 					deps.schedule();
 					return json({
@@ -5852,6 +5915,7 @@ export function createApp(deps: AppDeps) {
 						workCheck: deps.shared.workCheck,
 						idleReviews: deps.shared.idleReviews,
 						trendingScan: deps.shared.trendingScan,
+						commitIdentity: deps.shared.commitIdentity,
 					});
 				}),
 		},

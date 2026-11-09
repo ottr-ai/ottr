@@ -4136,4 +4136,170 @@ describe("startRun microVM dispatch", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("the default commit identity does not ride the VM env; an explicit identity does", async () => {
+		// The guest seeds the clone's own git config (src/vmGuest.ts), so the automatic
+		// Ottr default must stay out of the dispatch; the Settings identity is opt-in.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-ident-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		try {
+			const { memoryConfigPath: _omit, ...opts } = vmOpts(dir, tokens, url);
+			await startRun(opts).done;
+			const env = seen[0]!.body.env ?? {};
+			expect(env.GIT_AUTHOR_NAME).toBeUndefined();
+			expect(env.GIT_COMMITTER_EMAIL).toBeUndefined();
+
+			seen.length = 0;
+			await startRun({
+				...opts,
+				commitIdentity: { name: "Acme", email: "ci@acme.dev" },
+			}).done;
+			const custom = seen[0]!.body.env ?? {};
+			expect(custom.GIT_AUTHOR_NAME).toBe("Acme");
+			expect(custom.GIT_AUTHOR_EMAIL).toBe("ci@acme.dev");
+			expect(custom.GIT_COMMITTER_NAME).toBe("Acme");
+			expect(custom.GIT_COMMITTER_EMAIL).toBe("ci@acme.dev");
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("startRun commit identity env", () => {
+	function localLauncher(seen: Parameters<RunLauncher>[2][]): RunLauncher {
+		return (_c, _a, options) => {
+			seen.push(options);
+			const fake = new FakeOmp();
+			queueMicrotask(() => fake.emit("close", 0));
+			return fake as unknown as ChildProcess;
+		};
+	}
+
+	const IDENT_VARS = [
+		"GIT_AUTHOR_NAME",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_COMMITTER_NAME",
+		"GIT_COMMITTER_EMAIL",
+	] as const;
+
+	test("an unset identity applies the Ottr default for every field the probe leaves empty", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-default-"));
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher: localLauncher(seen),
+				gitProbe: () => ({ name: false, email: false }),
+			});
+			await handle.done;
+			expect(seen[0]!.env).toMatchObject({
+				GIT_AUTHOR_NAME: "Ottr",
+				GIT_AUTHOR_EMAIL: "ottr@localhost",
+				GIT_COMMITTER_NAME: "Ottr",
+				GIT_COMMITTER_EMAIL: "ottr@localhost",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a fully configured git identity injects nothing", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-set-"));
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher: localLauncher(seen),
+				gitProbe: () => ({ name: true, email: true }),
+			});
+			await handle.done;
+			for (const k of IDENT_VARS) expect(seen[0]!.env).not.toHaveProperty(k);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an explicit Settings identity wins over the Ottr default", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-custom-"));
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const handle = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher: localLauncher(seen),
+				gitProbe: () => ({ name: false, email: false }),
+				commitIdentity: { name: "Acme", email: "ci@acme.dev" },
+			});
+			await handle.done;
+			expect(seen[0]!.env).toMatchObject({
+				GIT_AUTHOR_NAME: "Acme",
+				GIT_AUTHOR_EMAIL: "ci@acme.dev",
+				GIT_COMMITTER_NAME: "Acme",
+				GIT_COMMITTER_EMAIL: "ci@acme.dev",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a worker dispatch POSTs the default identity to the worker", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-worker-"));
+		// A compiled omp stand-in that echoes the ident vars it received, so the
+		// board's run.log proves what the worker env carried.
+		const identOmp = compiledFakeOmp(
+			"ottr-ident-omp-",
+			"fake-omp-ident.exe",
+			[
+				`for (const k of ${JSON.stringify([...IDENT_VARS])})`,
+				'\tprocess.stdout.write("IDENT " + k + "=" + String(process.env[k]) + "\\n");',
+				'process.stdout.write(JSON.stringify({ type: "session", id: "sess-ident" }) + "\\n");',
+				'process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");',
+				"process.exit(0);",
+			].join("\n"),
+		);
+		const server = serveWorker({ port: 0, ompPath: identOmp });
+		try {
+			const logPath = join(dir, "run.log");
+			const { done } = startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath,
+				dataRoot: dir,
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				gitProbe: () => ({ name: false, email: false }),
+			});
+			const r = await done;
+			expect(r.exitCode).toBe(0);
+			const log = readFileSync(logPath, "utf8");
+			expect(log).toContain("IDENT GIT_AUTHOR_NAME=Ottr");
+			expect(log).toContain("IDENT GIT_AUTHOR_EMAIL=ottr@localhost");
+			expect(log).toContain("IDENT GIT_COMMITTER_NAME=Ottr");
+			expect(log).toContain("IDENT GIT_COMMITTER_EMAIL=ottr@localhost");
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });

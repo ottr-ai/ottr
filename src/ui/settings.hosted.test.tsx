@@ -156,6 +156,7 @@ const page = (view: string, hosted?: boolean) => (
 		workCheck={false}
 		idleReviews={false}
 		trendingScan={true}
+		commitIdentity={null}
 		trendingStatus={{ lastRunAt: null, lastError: null, running: false }}
 		act={async () => true}
 		view={view}

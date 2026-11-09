@@ -87,6 +87,8 @@ A release card that waits for you with every finding done shows the held merges 
 
 Docker Compose is the preferred way to run Ottr: the board and its worker containers share one image, so every turn gets the same pinned toolchain, and a restart of the host machine brings the whole stack back. The stack is one file, [`docker-compose.yml`](docker-compose.yml).
 
+Every turn and the board's own git calls commit with a default identity (`Ottr <ottr@localhost>`) when the project or the home's git config names none. Change it under **Settings → Git and secrets → Commit identity**; a configured `~/.gitconfig` identity wins over the default.
+
 ### Latest release (no clone, no build)
 
 Each GitHub release publishes the image as `ghcr.io/ottr-ai/ottr` (amd64), with the tags `<version>`, `v<version>` and `latest`. The image is public, so the pull needs no login. These lines fetch the compose file of the latest release and run that release's image.

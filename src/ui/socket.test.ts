@@ -23,6 +23,7 @@ describe("parseServerMessage", () => {
 						workCheck: true,
 						idleReviews: true,
 						trendingScan: true,
+						commitIdentity: null,
 						trendingStatus: {
 							lastRunAt: null,
 							lastError: null,
@@ -58,6 +59,7 @@ describe("parseServerMessage", () => {
 				workCheck: true,
 				idleReviews: true,
 				trendingScan: true,
+				commitIdentity: null,
 				trendingStatus: { lastRunAt: null, lastError: null, running: false },
 				serverVersion: "v1",
 				quota: null,

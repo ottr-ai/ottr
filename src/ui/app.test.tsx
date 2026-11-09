@@ -1810,7 +1810,7 @@ describe("settings TOC", () => {
 		expect(SETTINGS_TOC.map((g) => g.sections.map((s) => s.label))).toEqual([
 			["Runners", "Projects", "Notifications"],
 			["API key", "Session", "omp usage"],
-			["Git hosts", "Env"],
+			["Git hosts", "Commit identity", "Env"],
 			["Provider sign-in", "Model roles", "Alate", "Hindsight"],
 		]);
 	});
@@ -1824,6 +1824,7 @@ describe("settings TOC", () => {
 				workCheck={false}
 				idleReviews={true}
 				trendingScan={true}
+				commitIdentity={null}
 				trendingStatus={{ lastRunAt: null, lastError: null, running: false }}
 				act={async () => true}
 				view="settings"
