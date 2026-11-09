@@ -10081,20 +10081,26 @@ export function Drawer({
 													New session
 												</BusyButton>
 											)}
-											<BusyButton
-												title={
-													editOpen
-														? editGuardTitle
-														: proposal
-															? "Start the proposed task"
-															: "Continue the interrupted session (sends '.')"
-												}
-												disabled={editOpen}
-												run={() => sendReply(".")}
-											>
-												<Icon name="play" />
-												{proposal ? "Accept" : "Resume"}
-											</BusyButton>
+											{/* The Decide section owns Accept while its panel shows (proposal,
+										    needs_you, not cancelled); the composer keeps the button only
+										    when the panel is hidden, so a proposal never offers Accept
+										    twice. */}
+											{(!proposal || cancelled) && (
+												<BusyButton
+													title={
+														editOpen
+															? editGuardTitle
+															: proposal
+																? "Start the proposed task"
+																: "Continue the interrupted session (sends '.')"
+													}
+													disabled={editOpen}
+													run={() => sendReply(".")}
+												>
+													<Icon name="play" />
+													{proposal ? "Accept" : "Resume"}
+												</BusyButton>
+											)}
 										</>
 									}
 									primary={

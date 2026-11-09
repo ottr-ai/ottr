@@ -5681,6 +5681,55 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain('id="drawer-prompt"');
 	});
 
+	test("a proposal card in needs_you renders exactly one Accept button", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "Rework the wording",
+			proposalSummary: summary,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		// The Decide panel owns the one Accept; the composer's twin is gone.
+		const accepts = html.match(/title="Start the proposed task"/g) ?? [];
+		expect(accepts).toHaveLength(1);
+		expect(html.match(/>Accept<\/button>/g) ?? []).toHaveLength(1);
+		// The composer itself stays: Reply keeps rendering under it.
+		expect(html).toContain('id="drawer-reply"');
+	});
+
+	test("a cancelled proposal hides the panel and keeps the composer's Accept", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			prompt: "Rework the wording",
+			cancelledAt: 1760000000000,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain('id="drawer-decide"');
+		expect(html).toContain('id="drawer-reply"');
+		const accepts = html.match(/title="Start the proposed task"/g) ?? [];
+		expect(accepts).toHaveLength(1);
+		expect(html.match(/>Accept<\/button>/g) ?? []).toHaveLength(1);
+	});
+
+	test("a non-proposal interrupted card still renders Resume", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-reply"');
+		expect(html).toContain(">Resume</button>");
+		expect(html).not.toContain(">Accept</button>");
+		expect(html).not.toContain('id="drawer-decide"');
+	});
+
 	test("a proposal card on the board shows the Decide chip; an ordinary needs_you card does not", () => {
 		const laneBase = {
 			projectTasks: [] as TaskCard[],
