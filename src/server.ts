@@ -625,7 +625,12 @@ const serverRef: { current: Server<undefined> | undefined } = {
 // Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
 // omp's own `omp stats` web UI, started on demand and served behind the board's walls on a
 // second port. Its transcript mirror reads the same stores as the omp usage card.
-const ompStatsInfo = parseOmpStatsPort(process.env.OTTR_OMP_STATS_PORT);
+// Hosted mode has no proxy: its wall admits only signed control-plane identities, and a
+// second loopback port would bypass it (docs/specs/hosted-mode.md §3).
+const ompStatsInfo =
+	hosted === undefined
+		? parseOmpStatsPort(process.env.OTTR_OMP_STATS_PORT)
+		: { port: null, error: "not available in hosted mode" };
 if (ompStatsInfo.error !== null)
 	console.log(`omp stats dashboard proxy: ${ompStatsInfo.error}`);
 const ompStatsDashboard = createOmpStatsDashboard({

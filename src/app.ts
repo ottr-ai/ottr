@@ -4231,10 +4231,15 @@ export function createApp(deps: AppDeps) {
 	// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md).
 	// The proxy listener's port as the server bound it; setOmpStatsListener corrects it after
 	// a bind failure, so the info endpoint never offers a port that nothing serves.
-	let ompStatsListener: OmpStatsDashboardInfo = deps.ompStats?.info ?? {
-		port: null,
-		error: "the omp stats dashboard is not configured",
-	};
+	// Hosted mode never serves it: the hosted wall (hostedRefusal) has no loopback or cookie
+	// grant, and this port would offer both (docs/specs/hosted-mode.md §3).
+	let ompStatsListener: OmpStatsDashboardInfo =
+		deps.hosted !== undefined
+			? { port: null, error: "not available in hosted mode" }
+			: (deps.ompStats?.info ?? {
+					port: null,
+					error: "the omp stats dashboard is not configured",
+				});
 	/**
 	 * Every request on the omp stats proxy port. The same walls as /api run first (Host, auth
 	 * wall with the proxy server's own peer address, Origin on mutations), and only a request

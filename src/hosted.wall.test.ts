@@ -47,7 +47,11 @@ const shared = () => ({
 });
 
 /** One board on a random port; hosted undefined mounts a self-hosted board. */
-function mount(name: string, hosted: Hosted | undefined) {
+function mount(
+	name: string,
+	hosted: Hosted | undefined,
+	extra: Partial<Parameters<typeof createApp>[0]> = {},
+) {
 	const g = GlobalStore.open(join(root, `g-${name}`));
 	stores.push(g);
 	// Every self-host credential is set, so a pass would show it still counts in hosted mode.
@@ -95,6 +99,7 @@ function mount(name: string, hosted: Hosted | undefined) {
 			stops.push(Date.now());
 			return 2;
 		},
+		...extra,
 	});
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	app.serverRef.current = srv;
@@ -112,7 +117,7 @@ function mount(name: string, hosted: Hosted | undefined) {
 			headers: { "content-type": "application/json", ...opts.headers },
 			body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
 		});
-	return { call, g, store, stops };
+	return { call, g, store, stops, app };
 }
 
 const hosted: Hosted = {
@@ -332,6 +337,41 @@ describe("hosted mode request wall", () => {
 		expect(
 			(await board.call("/api/state", { headers: turnsHost })).status,
 		).toBe(403);
+	});
+});
+
+// docs/specs/omp-stats-dashboard.md: the omp stats proxy would offer the loopback and cookie
+// grants the hosted wall removes, so a hosted board never serves it.
+test("hosted mode serves no omp stats dashboard proxy, also from direct loopback", async () => {
+	let ensured = 0;
+	const PROXY = 3848;
+	const board = mount("hosted-omp-stats", hosted, {
+		ompStats: {
+			info: { port: PROXY, error: null },
+			dashboard: {
+				ensure: () => {
+					ensured++;
+					return { phase: "running", port: 9, error: null };
+				},
+				state: () => ({ phase: "stopped", port: null, error: null }),
+				tick: async () => {},
+				stop: () => {},
+			},
+		},
+	});
+	const proxy = Bun.serve({ port: 0, fetch: board.app.ompStatsFetch });
+	servers.push(proxy);
+	const res = await fetch(new URL("/", proxy.url), {
+		headers: { Host: `127.0.0.1:${PROXY}` },
+	});
+	expect(res.status).toBe(404);
+	expect(ensured).toBe(0);
+	const info = await board.call("/api/settings/omp-stats/dashboard", {
+		headers: signed("owner"),
+	});
+	expect(await info.json()).toEqual({
+		port: null,
+		error: "not available in hosted mode",
 	});
 });
 

@@ -135,7 +135,10 @@ mirror under `<base>/agent/sessions`:
 
 ## Non-goals
 
-- The dashboard on public hosts (`OMP_TRACKER_PUBLIC_HOSTS`).
+- The dashboard on public hosts (`OMP_TRACKER_PUBLIC_HOSTS`) and in hosted mode
+  (`OTTR_HOSTED`). A hosted board binds no proxy, and the info endpoint answers
+  `{ port: null, error: "not available in hosted mode" }`: the hosted wall has no loopback
+  or cookie grant, and the proxy port would offer both.
 - Provider sign-in for omp's Frustration judge inside the dashboard, and removing provider
   API keys from the dashboard env.
 - Removing mirror files for deleted transcripts.
