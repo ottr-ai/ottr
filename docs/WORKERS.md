@@ -464,8 +464,11 @@ installs only. The image carries no JDK and no Maven; it carries `python3` and
   the same walls as the board: the Host guard, the admin login, and the Origin
   check on changes. The dashboard reads a mirror copy of all board session
   transcripts under the board home (`<board home>/.omp/ottr-stats-dashboard`).
-  This copy uses disk space equal to the transcripts. The dashboard has no
-  provider sign-in, so omp's "Frustration" judge does not run there.
+  This copy uses disk space equal to the transcripts. The dashboard gets the
+  server env, so a provider API key in that env (for example
+  `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) lets omp's "Frustration" judge run.
+  Each judge run is paid with that key. Only a user who passes the board walls
+  can start a run, and omp asks for its `X-Omp-Stats-Action` header first.
 
 ## Scaling
 

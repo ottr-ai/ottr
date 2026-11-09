@@ -64,8 +64,10 @@ through its own login, gives it every session transcript of the board, and stops
 - An unexpected child exit sets the state to stopped (exit code 0) or failed (other codes).
   The next request starts it again.
 - omp keeps its stats database at `<HOME>/.omp/stats.db` (the board home). The dashboard
-  agent dir has no provider sign-in, so omp's paid "Frustration" judge cannot run there.
-  omp shows its own error for that action.
+  agent dir has no provider sign-in, but the child gets the server env. A provider API key
+  in that env (for example `ANTHROPIC_API_KEY`, which compose passes to the server) lets
+  omp's paid "Frustration" judge run, paid with that key. Only a request that passes the
+  proxy guards can start it, and omp also demands its `X-Omp-Stats-Action` header.
 
 ### Idle stop
 
@@ -134,6 +136,7 @@ mirror under `<base>/agent/sessions`:
 ## Non-goals
 
 - The dashboard on public hosts (`OMP_TRACKER_PUBLIC_HOSTS`).
-- Provider sign-in for omp's Frustration judge inside the dashboard.
+- Provider sign-in for omp's Frustration judge inside the dashboard, and removing provider
+  API keys from the dashboard env.
 - Removing mirror files for deleted transcripts.
 - Changes to the omp usage numbers that the card itself shows.
