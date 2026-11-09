@@ -521,6 +521,8 @@ How the tracker works: every task runs in its own git worktree in two turns.
 1. Work turn: plan, implement, verify, and commit on the task branch. No merge, push, tag or release.
 2. Merge turn, one at a time per project: rebase onto the upstream branch, resolve conflicts keeping both intents, re-run verification, integrate, and push the upstream branch right after the merge. That push is the only push an agent ever makes.
 
+On a project whose PR mode is on, the server pushes the card branch and opens the pull request itself; an agent never pushes to the target and never runs gh, because turns get no GitHub credentials. When this project's target branch requires pull requests (a GitHub branch rule), tell me, so I turn PR mode on there; never propose that an agent opens pull requests or pushes a protected branch.
+
 Reviews are separate read-only turns: the board's Review button and every release review a frozen commit, run the project's full verification including the review gates the rules name, never edit code, tests or thresholds, never commit, and file each finding as a tracker card.
 
 Agents report each turn's outcome with a tool; questions for me end the turn.
