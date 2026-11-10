@@ -20269,4 +20269,288 @@ describe("turn checkout guard (other projects)", () => {
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
+
+	// OTTR-763: attribution. The guard parks a card only when its turn window alone
+	// overlaps the change it saw in another project's checkout. When two or more turns
+	// overlap the change, neither card parks: the board logs the change once and rings
+	// one notice that names the commit and the running cards. A work turn whose change
+	// touches only its own project's provisioned copies (projects/<project>/) is the
+	// AGENTS.md sync rule's commit and is exempt outright.
+
+	/** Three-project case for attribution: `store` (innocent), `guilty` (the turn that
+	 * changes the watched checkout), and `shared` (the watched checkout both guards
+	 * read, like agent-data on the real board). Pass `record` when the overrides need
+	 * the same Recorded the loop's fakes write to. */
+	function threeProjectCase(
+		overrides: Partial<TurnOps> = {},
+		record: Recorded = baseRecord(),
+	) {
+		const store = freshStore();
+		const guilty = freshStore();
+		const shared = freshStore();
+		const states = new Map<string, Snap>();
+		const projects = new Map<string, TurnProject>([
+			[store.name, fakeProject(store)],
+			[guilty.name, fakeProject(guilty)],
+			[shared.name, fakeProject(shared)],
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				checkoutState: async (path: string) =>
+					states.get(path) ?? { head: "base0", status: "" },
+				...overrides,
+			}),
+		);
+		return { store, guilty, shared, record, states, loop };
+	}
+
+	/** Two overlapping work runs. Each project's first run is its work run: both work
+	 * runs wait until both are live, then the second one fires `change` while both turn
+	 * windows hold. The chained merge run of a settled card reports integrated. */
+	function overlappingRuns(
+		record: Recorded,
+		change: (at: number) => void,
+	): Partial<TurnOps> {
+		const seen = new Set<string>();
+		let entered = 0;
+		const bothIn = Promise.withResolvers<void>();
+		const changed = Promise.withResolvers<void>();
+		return {
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess-1");
+				const key = o.board?.project ?? o.cwd;
+				if (seen.has(key)) {
+					return {
+						pid: 4243,
+						done: Promise.resolve(
+							runResult({
+								outcome: {
+									status: "integrated",
+									summary: "landed",
+								} satisfies Outcome,
+							}),
+						),
+						kill: async () => {
+							record.killed = true;
+						},
+					};
+				}
+				seen.add(key);
+				entered += 1;
+				const second = entered === 2;
+				const done = (async () => {
+					if (second) {
+						bothIn.resolve();
+						change(Date.now());
+						changed.resolve();
+					} else {
+						await changed.promise;
+					}
+				})();
+				return {
+					pid: 4242,
+					done: done.then(() =>
+						runResult({
+							outcome: {
+								status: "answered",
+								summary: "did it",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		};
+	}
+
+	test("overlapping turns: no card parks and one notice names the commit and the cards", async () => {
+		// Fails before OTTR-763: the innocent card parked needs_you with the guard
+		// reason, because the guard compared snapshots without asking which turn made
+		// the change.
+		const changeTime = { t: 0 };
+		const record = baseRecord();
+		const { store, guilty, shared, states, loop } = threeProjectCase(
+			{
+				commitMeta: async () => [
+					{
+						sha: "abc1234",
+						subject: "sync: add parallel-work check",
+						time: changeTime.t,
+						files: ["src/widget.ts"],
+					},
+				],
+				...overlappingRuns(record, (at) => {
+					changeTime.t = at;
+					states.set(shared.path, {
+						head: "abc1234",
+						status: " M src/widget.ts",
+					});
+				}),
+			},
+			record,
+		);
+		const a = store.createTask("work please");
+		const b = guilty.createTask("work please");
+
+		await Promise.all([
+			loop.runTurn(store.name, a.id),
+			loop.runTurn(guilty.name, b.id),
+		]);
+		await flushPromises();
+
+		const afterA = store.getTask(a.id)!;
+		const afterB = guilty.getTask(b.id)!;
+		expect(afterA.stage).toBe("done");
+		expect(afterA.state).toBe("idle");
+		expect(afterA.needsReason).toBeNull();
+		expect(afterB.stage).toBe("done");
+		expect(afterB.state).toBe("idle");
+		expect(afterB.needsReason).toBeNull();
+		// One bell notice for the change: it names the commit and both running cards.
+		const notices = loop.checkoutNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("abc1234 sync: add parallel-work check");
+		expect(notices[0]).toContain(`${store.name}#${a.id}`);
+		expect(notices[0]).toContain(`${guilty.name}#${b.id}`);
+	});
+
+	test("a lone turn that commits in the shared checkout still parks needs_you", async () => {
+		// Pins OTTR-708 under attribution: no other turn window overlaps the change,
+		// so the settling turn is the change's only blameable turn and parks as today.
+		const changeTime = { t: 0 };
+		const record = baseRecord();
+		const { store, shared, states, loop } = threeProjectCase({
+			commitMeta: async () => [
+				{
+					sha: "abc1234",
+					subject: "sneak edit",
+					time: changeTime.t,
+					files: ["src/widget.ts"],
+				},
+			],
+			...changingRun(record, () => {
+				changeTime.t = Date.now();
+				states.set(shared.path, {
+					head: "abc1234",
+					status: " M src/widget.ts",
+				});
+			}),
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+		await flushPromises();
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(shared.name);
+		expect(after.needsReason).toContain("abc1234 sneak edit");
+		expect(after.needsReason).toContain("src/widget.ts");
+		expect(after.needsReason).toContain("create_task");
+		expect(loop.checkoutNotices()).toHaveLength(0);
+	});
+
+	test("this project's provisioned-copy sync commit in the shared checkout is exempt", async () => {
+		// Fails before OTTR-763: the ottr AGENTS.md sync rule says to commit the
+		// data-repo copy of this project's context files in the same turn, but the
+		// guard parked the card for exactly that commit.
+		const changeTime = { t: 0 };
+		const record = baseRecord();
+		const { store, shared, states, loop } = threeProjectCase({
+			commitMeta: async () => [
+				{
+					sha: "def5678",
+					subject: `sync: capture ${store.name} AGENTS.md`,
+					time: changeTime.t,
+					files: [`projects/${store.name}/AGENTS.md`],
+				},
+			],
+			...changingRun(record, () => {
+				changeTime.t = Date.now();
+				states.set(shared.path, { head: "def5678", status: "" });
+			}),
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+		await flushPromises();
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(loop.checkoutNotices()).toHaveLength(0);
+	});
+
+	test("a sync commit that also touches an unrelated file still parks", async () => {
+		// The exemption covers only the provisioned-copy file set: one extra file puts
+		// the change back under the guard, and the lone turn is its only blameable turn.
+		const changeTime = { t: 0 };
+		const record = baseRecord();
+		const { store, shared, states, loop } = threeProjectCase({
+			commitMeta: async () => [
+				{
+					sha: "def5678",
+					subject: `sync: capture ${store.name} AGENTS.md`,
+					time: changeTime.t,
+					files: [`projects/${store.name}/AGENTS.md`, "README.md"],
+				},
+			],
+			...changingRun(record, () => {
+				changeTime.t = Date.now();
+				states.set(shared.path, {
+					head: "def5678",
+					status: " M README.md",
+				});
+			}),
+		});
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+		await flushPromises();
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("README.md");
+		expect(loop.checkoutNotices()).toHaveLength(0);
+	});
+
+	test("a file-only change under overlapping turns parks neither and rings one notice", async () => {
+		// No commit meta: the change carries no timestamp, so the guard falls back to
+		// the turn windows themselves. Fails before OTTR-763: the innocent card parked.
+		const record = baseRecord();
+		const { store, guilty, shared, states, loop } = threeProjectCase(
+			{
+				...overlappingRuns(record, () => {
+					states.set(shared.path, {
+						head: "base0",
+						status: "?? stray.txt",
+					});
+				}),
+			},
+			record,
+		);
+		const a = store.createTask("work please");
+		const b = guilty.createTask("work please");
+
+		await Promise.all([
+			loop.runTurn(store.name, a.id),
+			loop.runTurn(guilty.name, b.id),
+		]);
+		await flushPromises();
+
+		const afterA = store.getTask(a.id)!;
+		const afterB = guilty.getTask(b.id)!;
+		expect(afterA.needsReason).toBeNull();
+		expect(afterB.needsReason).toBeNull();
+		const notices = loop.checkoutNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("changed files stray.txt");
+		expect(notices[0]).toContain(`${store.name}#${a.id}`);
+		expect(notices[0]).toContain(`${guilty.name}#${b.id}`);
+	});
 });

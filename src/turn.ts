@@ -177,6 +177,7 @@ import type {
 	worktreeLinked,
 } from "./worktree.ts";
 import {
+	type commitMeta,
 	commitSubjects,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	parseKeptChoices,
@@ -509,16 +510,80 @@ async function snapshotOtherCheckouts(
 	return snap;
 }
 
-/** OTTR-708: the cross-project checkout guard. Compares the before/after main-checkout
- * snapshots of the other projects: a new commit the board did not make, or a status change,
- * is a change made outside this turn's own worktree. A HEAD advance the board's own merge
- * machinery made is discounted with a clean tree: the merge settle records the head it left
- * behind whatever path it took (pushed, failed, rejected, skipped, refused, hold park with
- * a branch reset), and a project whose own merge turn is in flight is skipped outright —
- * its main checkout belongs to that turn right now. Merges of other projects run
- * concurrently with work turns by design. Returns the needs_you reason, null when every
- * other checkout reads unchanged. */
-/** OTTR-708: the change parts one other project's checkout shows against its before
+/** OTTR-763: one commit the guard saw land in another project's main checkout. */
+type GuardCommit = {
+	sha: string;
+	subject: string;
+	/** Committer time (ms); the fact that attributes the commit to a turn window. */
+	time: number;
+	/** Repo-relative files the commit touched. */
+	files: string[];
+};
+
+/** OTTR-763: one change another project's main checkout shows against its before
+ * snapshot. Null: nothing to report — nothing changed, or a HEAD advance the board's
+ * own merge machinery recorded. */
+type GuardChange = {
+	/** The new commits with their metadata; empty when only the tree changed. */
+	commits: GuardCommit[];
+	/** The status-diff files (modified or untracked), repo-relative. */
+	files: string[];
+	/** The needs_you display parts, worded exactly as before OTTR-763. */
+	parts: string[];
+};
+
+/** OTTR-763: one bell notice for a change whose blame is ambiguous. No card parks. */
+type GuardNotice = { at: number; text: string };
+
+/** OTTR-763: how long a bell notice for an ambiguous cross-checkout change stays. */
+const GUARD_NOTICE_TTL_MS = 24 * 60 * 60_000;
+/** OTTR-763: most bell notices the guard keeps; a burst of ambiguous changes cannot flood the bell. */
+const GUARD_NOTICE_MAX = 20;
+
+/** OTTR-763: commitMeta fallback for test fakes that predate it: the commitSubjects
+ * stubs answer `sha subject` lines with no time and no file list, so the display stays
+ * identical and the time defaults to now (every live turn window holds it). */
+async function fallbackCommitMeta(
+	ops: TurnOps,
+	path: string,
+	from: string,
+	head: string,
+): Promise<GuardCommit[]> {
+	const now = Date.now();
+	const lines = await (ops.commitSubjects ?? commitSubjects)(
+		path,
+		from,
+		head,
+	).catch(() => [] as string[]);
+	return lines.map((line) => {
+		const sep = line.indexOf(" ");
+		return {
+			sha: sep === -1 ? line : line.slice(0, sep),
+			subject: sep === -1 ? line : line.slice(sep + 1),
+			time: now,
+			files: [] as string[],
+		};
+	});
+}
+
+/** OTTR-763: the unrecorded new commits between the guard's before head and now, with
+ * metadata. Empty when either head is unreadable; a HEAD advance the board recorded
+ * never contributes commits: its own machinery made that change. */
+async function guardNewCommits(
+	ops: TurnOps,
+	other: TurnProject,
+	was: { head: string | null },
+	now: { head: string | null },
+): Promise<GuardCommit[]> {
+	if (now.head === null || was.head === null) return [];
+	return (
+		ops.commitMeta
+			? ops.commitMeta(other.path, was.head, now.head)
+			: fallbackCommitMeta(ops, other.path, was.head, now.head)
+	).catch(() => [] as GuardCommit[]);
+}
+
+/** OTTR-708/OTTR-763: the change one other project's checkout shows against its before
  * snapshot. Null: nothing to report — nothing changed, or a HEAD advance the board's
  * own merge machinery recorded. */
 async function checkoutGuardChangeParts(
@@ -527,7 +592,7 @@ async function checkoutGuardChangeParts(
 	boardPushedHeads: Map<string, string>,
 	was: { head: string | null; status: string },
 	now: { head: string | null; status: string },
-): Promise<string[] | null> {
+): Promise<GuardChange | null> {
 	const head = now.head;
 	const headMoved = head !== null && head !== was.head;
 	const recorded = headMoved && boardPushedHeads.get(other.name) === head;
@@ -540,70 +605,159 @@ async function checkoutGuardChangeParts(
 			: [];
 	if (files.length === 0 && (!headMoved || recorded)) return null;
 	const commits =
-		headMoved && head !== null && was.head !== null
-			? await (ops.commitSubjects ?? commitSubjects)(
-					other.path,
-					was.head,
-					head,
-				).catch(() => [] as string[])
-			: [];
+		headMoved && !recorded ? await guardNewCommits(ops, other, was, now) : [];
 	const parts: string[] = [];
 	if (headMoved && !recorded)
 		parts.push(
 			commits.length > 0
-				? `new commits ${listed(commits)}`
+				? `new commits ${listed(commits.map((c) => `${c.sha} ${c.subject}`))}`
 				: `HEAD moved to ${head.slice(0, 7)}`,
 		);
 	if (files.length > 0) parts.push(`changed files ${listed(files)}`);
-	return parts;
+	if (parts.length === 0) return null;
+	return { commits, files, parts };
 }
 
-/** One other project's checkout-guard read. Null: skip the project (its own merge turn
- * is mid-flight, no before snapshot, an unreadable checkout) or nothing changed. */
-async function checkoutGuardProjectReason(
-	other: TurnProject,
+/** OTTR-763: every other turn whose window can hold the change, as `project#task`.
+ * The settling turn's own window always holds the change (its before snapshot read the
+ * old state), so the candidates that matter are the other turns. The evidence interval
+ * is the commit times when the change carries commits, the settling turn's whole guard
+ * window otherwise (a file-only change carries no timestamp). A turn whose window ended
+ * before the guard window start is never a candidate. */
+function blameCandidates(
+	projects: Map<string, TurnProject>,
+	st: TurnSettle,
+	change: GuardChange,
+): string[] {
+	const windowStart = st.dispatch.runStartedAt;
+	const windowEnd = st.now;
+	const times = change.commits.map((c) => c.time);
+	const evStart = times.length > 0 ? Math.min(...times) : windowStart;
+	const evEnd = times.length > 0 ? Math.max(...times) : windowEnd;
+	const others: string[] = [];
+	for (const p of projects.values()) {
+		for (const t of p.store.openOrRecentTurns(windowStart)) {
+			if (p.name === st.name && t.id === st.dispatch.turn.id) continue;
+			const end = t.endedAt ?? Number.POSITIVE_INFINITY;
+			if (t.startedAt <= evEnd && end >= evStart)
+				others.push(`${p.name}#${t.taskId}`);
+		}
+	}
+	return others;
+}
+
+/** OTTR-763: one other project's checkout-guard verdict. */
+type GuardVerdict =
+	| { kind: "none" }
+	| { kind: "park"; reason: string }
+	| { kind: "notice"; key: string; notice: GuardNotice };
+
+/** OTTR-708/OTTR-763: one other project's checkout read and verdict. Skips the project
+ * (its own merge turn is mid-flight, no before snapshot, an unreadable checkout) or
+ * answers "none" when nothing changed, the AGENTS.md sync rule's file set changed, or
+ * the change's blame is not ambiguous (that verdict parks instead). */
+async function checkoutGuardProjectVerdict(
+	projects: Map<string, TurnProject>,
 	ops: TurnOps,
 	boardPushedHeads: Map<string, string>,
-	before: Map<string, { head: string | null; status: string }>,
-): Promise<string | null> {
+	st: TurnSettle,
+	other: TurnProject,
+): Promise<GuardVerdict> {
 	// The other project's own merge turn is mid-flight: its agent fast-forwards its
 	// main checkout legitimately, and the settle records the head it advanced. Skip
 	// the project until that turn is over.
 	const mergingInFlight = other.store
 		.listTasks()
 		.some((t) => t.stage === "merging" && t.state === "running");
-	if (mergingInFlight) return null;
-	const was = before.get(other.name);
-	if (was === undefined) return null;
+	if (mergingInFlight) return { kind: "none" };
+	const before = st.mx.guardBefore;
+	const was = before?.get(other.name);
+	if (was === undefined) return { kind: "none" };
 	const now = await ops.checkoutState(other.path).catch(() => null);
-	if (now === null) return null;
-	const parts = await checkoutGuardChangeParts(
+	if (now === null) return { kind: "none" };
+	const change = await checkoutGuardChangeParts(
 		other,
 		ops,
 		boardPushedHeads,
 		was,
 		now,
 	);
-	if (parts === null) return null;
-	return `The ${other.name} main checkout changed while this turn ran (${parts.join("; ")}). Those changes do not belong to this card: file a card in ${other.name} (create_task with its project parameter) and move the commits and files there, then reply to resume this card.`;
+	if (change === null) return { kind: "none" };
+	const allFiles = [
+		...new Set([...change.commits.flatMap((c) => c.files), ...change.files]),
+	];
+	// OTTR-763: the AGENTS.md sync rule tells a work turn to commit its own project's
+	// provisioned copies (projects/<project>/) to the agent-data main checkout in the
+	// same turn. Every file under that prefix is that commit.
+	if (
+		allFiles.length > 0 &&
+		allFiles.every(
+			(f) =>
+				f === `projects/${st.name}` || f.startsWith(`projects/${st.name}/`),
+		)
+	) {
+		console.log(
+			`checkout guard: ${other.name} change is ${st.name}'s provisioned-copy sync (${listed(allFiles)}) — allowed by the AGENTS.md sync rule`,
+		);
+		return { kind: "none" };
+	}
+	const others = blameCandidates(projects, st, change);
+	if (others.length === 0)
+		return {
+			kind: "park",
+			reason: `The ${other.name} main checkout changed while this turn ran (${change.parts.join("; ")}). Those changes do not belong to this card: file a card in ${other.name} (create_task with its project parameter) and move the commits and files there, then reply to resume this card.`,
+		};
+	// OTTR-763: two or more turns overlap the change, so the guard cannot say which
+	// turn made it: park neither card; log the change and ring one notice that names
+	// the commit and the running cards.
+	const cards = [`${st.name}#${st.id}`, ...others].join(", ");
+	console.log(
+		`checkout guard: ${other.name} changed during overlapping turns (${cards}); parked no card: ${change.parts.join("; ")}`,
+	);
+	return {
+		kind: "notice",
+		key: `${other.name}|${now.head ?? ""}|${allFiles.join(",")}`,
+		notice: {
+			at: Date.now(),
+			text: `${other.name} main checkout changed while several cards were running (${cards}): ${change.parts.join("; ")}. No card was parked.`,
+		},
+	};
 }
 
+/** OTTR-708: the cross-project checkout guard. Compares the before/after main-checkout
+ * snapshots of the other projects: a new commit the board did not make, or a status change,
+ * is a change made outside this turn's own worktree. A HEAD advance the board's own merge
+ * machinery made is discounted with a clean tree: the merge settle records the head it left
+ * behind whatever path it took (pushed, failed, rejected, skipped, refused, hold park with
+ * a branch reset), and a project whose own merge turn is in flight is skipped outright —
+ * its main checkout belongs to that turn right now. Merges of other projects run
+ * concurrently with work turns by design.
+ * OTTR-763: the guard blames a change only when this turn's window alone overlaps it. A
+ * change that also sits inside another turn's window is ambiguous: no card parks, the
+ * board logs the change once and rings one bell notice that names the commit and the
+ * running cards. A change whose files all sit under projects/<this project>/ is the
+ * AGENTS.md sync rule's provisioned-copy commit and is allowed outright. Returns the
+ * needs_you reason, null when every other checkout reads unchanged or no change is
+ * this turn's alone. */
 async function checkoutGuardReason(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
 	boardPushedHeads: Map<string, string>,
-	self: string,
-	before: Map<string, { head: string | null; status: string }>,
+	st: TurnSettle,
+	recordNotice: (key: string, notice: GuardNotice) => void,
 ): Promise<string | null> {
+	if (st.mx.guardBefore === null) return null;
 	for (const other of projects.values()) {
-		if (other.name === self || other.gitless) continue;
-		const reason = await checkoutGuardProjectReason(
-			other,
+		if (other.name === st.name || other.gitless) continue;
+		const verdict = await checkoutGuardProjectVerdict(
+			projects,
 			ops,
 			boardPushedHeads,
-			before,
+			st,
+			other,
 		);
-		if (reason !== null) return reason;
+		if (verdict.kind === "park") return verdict.reason;
+		if (verdict.kind === "notice") recordNotice(verdict.key, verdict.notice);
 	}
 	return null;
 }
@@ -698,6 +852,11 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
 	commitSubjects?: typeof commitSubjects;
+	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
+	 * cross-project checkout guard uses to attribute a change to a turn window and to
+	 * exempt the AGENTS.md sync rule's provisioned-copy commits by their file set.
+	 * Absent in test fakes that predate it: the guard falls back to commitSubjects. */
+	commitMeta?: typeof commitMeta;
 	/** True while an update holds new turns (POST /api/drain): running turns finish, nothing new starts. */
 	drained(): boolean;
 	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
@@ -1280,6 +1439,9 @@ export interface TurnLoop {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-763: the cross-project checkout guard's ambiguous-change notices for the bell
+	 * (one per change; names the commit and the running cards), oldest first. */
+	checkoutNotices(): string[];
 	/** Boot restart sweep: settle open rows left by a dead tracker process and requeue. */
 	recoverRestarted(): Promise<void>;
 }
@@ -1470,6 +1632,28 @@ export function createTurnLoop(
 	// whose own merge turn is in flight: merges of other projects run concurrently with
 	// this project's work turns by design.
 	const boardPushedHeads = new Map<string, string>();
+	// OTTR-763: the ambiguous cross-checkout changes the guard saw (no card parked):
+	// the bell shows one notice per change, deduped by the change key, bounded and
+	// expiring. The state response reads them through checkoutNotices().
+	const guardNotices: Array<{ at: number; text: string; key: string }> = [];
+	function recordGuardNotice(key: string, notice: GuardNotice): void {
+		if (guardNotices.some((n) => n.key === key)) return;
+		for (;;) {
+			const oldest = guardNotices[0];
+			if (
+				oldest === undefined ||
+				(notice.at - oldest.at <= GUARD_NOTICE_TTL_MS &&
+					guardNotices.length < GUARD_NOTICE_MAX)
+			)
+				break;
+			guardNotices.shift();
+		}
+		guardNotices.push({ ...notice, key });
+	}
+	/** The bell's notice lines for the guard's ambiguous changes, oldest first. */
+	function checkoutNotices(): string[] {
+		return guardNotices.map((n) => n.text);
+	}
 	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
 	async function usageHold(model: string | null): Promise<UsageHold | null> {
 		const hit = await usageResetFor(model);
@@ -6594,8 +6778,8 @@ export function createTurnLoop(
 				projects,
 				ops,
 				boardPushedHeads,
-				st.name,
-				st.mx.guardBefore,
+				st,
+				recordGuardNotice,
 			);
 			if (violation !== null)
 				planned = {
@@ -8447,5 +8631,6 @@ export function createTurnLoop(
 		recoverRestarted,
 		running,
 		runnerTurns,
+		checkoutNotices,
 	};
 }

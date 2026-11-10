@@ -2582,6 +2582,60 @@ export async function commitSubjects(
 	}
 }
 
+/** One commit's guard metadata: short sha, subject, committer time (ms) and files. */
+export interface CommitMeta {
+	sha: string;
+	subject: string;
+	time: number;
+	files: string[];
+}
+
+/**
+ * OTTR-763: per-commit metadata for the cross-project checkout guard: the committer
+ * time attributes a change to the turn window that holds it, and the file list carries
+ * the AGENTS.md sync rule's provisioned-copy exemption. A failed git read answers
+ * empty and never throws, like commitSubjects: the guard proves only what it read.
+ */
+export async function commitMeta(
+	mainPath: string,
+	from: string,
+	target: string,
+): Promise<CommitMeta[]> {
+	try {
+		const r = await git(
+			[
+				"log",
+				"--format=%x1e%h%x1f%cI%x1f%s",
+				"--name-only",
+				"--no-renames",
+				"-n",
+				"200",
+				`${from}..${target}`,
+			],
+			mainPath,
+		);
+		if (r.code !== 0) return [];
+		const out: CommitMeta[] = [];
+		for (const record of r.stdout.split("\x1e")) {
+			const nl = record.indexOf("\n");
+			const head = nl === -1 ? record : record.slice(0, nl);
+			const [sha, iso, subject] = head.split("\x1f");
+			if (sha === undefined || iso === undefined || subject === undefined)
+				continue;
+			const time = new Date(iso.trim()).getTime();
+			if (!Number.isFinite(time)) continue;
+			const files = (nl === -1 ? "" : record.slice(nl + 1))
+				.split("\n")
+				.map((l) => l.trim())
+				.filter((l) => l !== "");
+			out.push({ sha: sha.trim(), subject: subject.trim(), time, files });
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
 /**
  * OTTR-708: a main checkout's HEAD sha and porcelain status (including untracked files), the
  * input of the cross-project checkout guard. A missing directory or a failed git read never

@@ -3128,6 +3128,17 @@ export class ProjectStore {
 			.map(toTurn);
 	}
 
+	/** Every turn whose window [startedAt, endedAt or open] can overlap `since` or later:
+	 * the cross-project checkout guard's attribution candidates (OTTR-763). */
+	openOrRecentTurns(since: number): Turn[] {
+		return this.db
+			.query<TurnRow, [number]>(
+				"SELECT * FROM turns WHERE ended_at IS NULL OR ended_at >= ? ORDER BY id",
+			)
+			.all(since)
+			.map(toTurn);
+	}
+
 	/** Layers of turns that never ended (boot reconcile source for in-use.json); distinct, null-free. */
 	listOpenTurnLayers(): string[] {
 		return this.db

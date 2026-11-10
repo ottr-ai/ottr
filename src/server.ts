@@ -764,6 +764,8 @@ const app = createApp({
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
 	workerTarget,
 	runnerTurns: () => loop.runnerTurns(),
+	// OTTR-763: the checkout guard's ambiguous-change notices for the bell.
+	checkoutNotices: () => loop.checkoutNotices(),
 	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
 	liveRuns: () =>
 		[...loop.running].map(([key, e]) => {

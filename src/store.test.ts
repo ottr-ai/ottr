@@ -100,6 +100,25 @@ describe("turn model", () => {
 		store.close();
 	});
 
+	test("openOrRecentTurns keeps open turns and turns that ended after the cutoff", () => {
+		// OTTR-763: the checkout guard's attribution candidates. A turn whose window
+		// [startedAt, endedAt or open] cannot overlap the cutoff and later times is out.
+		const store = open(join(root, "open-or-recent"));
+		const task = store.createTask("do things");
+		const cutoff = Date.now();
+		const ended = store.startTurn(task.id, "work", "ended after", null);
+		store.finishTurn(ended.id, { endedAt: cutoff + 1000 });
+		const openTurn = store.startTurn(task.id, "work", "still open", null);
+		const old = store.startTurn(task.id, "work", "ended earlier", null);
+		store.finishTurn(old.id, { endedAt: cutoff - 60_000 });
+
+		const ids = store.openOrRecentTurns(cutoff).map((t) => t.id);
+		expect(ids).toContain(ended.id);
+		expect(ids).toContain(openTurn.id);
+		expect(ids).not.toContain(old.id);
+		store.close();
+	});
+
 	test("lastTurnModel returns the newest turn that recorded a model", () => {
 		const store = open(join(root, "last-model"));
 		const task = store.createTask("snapshot");

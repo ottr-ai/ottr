@@ -576,6 +576,9 @@ interface AppDeps {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-763: the cross-project checkout guard's ambiguous-change bell notices (one per
+	 * change; names the commit and the running cards); absent = none. */
+	checkoutNotices?: () => string[];
 	/** The board's live runs (project, id, runner hostname or "server", Stryker progress), so the
 	 * /system view can name the runs waiting on a runner's mutation lock; absent = none. */
 	liveRuns?: () => LiveRun[];
@@ -4431,6 +4434,9 @@ export function createApp(deps: AppDeps) {
 				// OTTR-754: one bell warning per runner whose /tmp is below the free-space
 				// limit; recomputed per poll, so it disappears when space returns.
 				...workerTmpWarnings(workerSignInReports, tmpDiskSpace()),
+				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
+				// naming the commit and the running cards; bounded and expiring in the loop.
+				...(deps.checkoutNotices?.() ?? []),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),

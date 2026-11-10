@@ -27,6 +27,7 @@ import {
 	branchUnpushed,
 	changedFiles,
 	checkedOutBranch,
+	commitMeta,
 	createWorktree,
 	describeVersion,
 	diffStat,
@@ -4645,6 +4646,50 @@ describe("pushBranch destination ref (OTTR-760)", () => {
 			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// OTTR-763: the cross-project checkout guard's commit metadata: sha, subject, committer
+// time and changed files per commit since a base, so the guard can attribute a change
+// and exempt the AGENTS.md sync rule's provisioned-copy commits by their file set.
+describe("commitMeta (OTTR-763)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+
+	test("reads sha, subject, committer time and files per commit, oldest first", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-commit-meta-"));
+		try {
+			run(dir, "init", "-q", "-b", "main");
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(dir, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+			writeFileSync(join(dir, "a.txt"), "one");
+			run(dir, "add", "a.txt");
+			run(dir, ...id, "commit", "-q", "-m", "add a");
+			writeFileSync(join(dir, "b.txt"), "two");
+			run(dir, "add", "b.txt");
+			run(dir, ...id, "commit", "-q", "-m", "add b");
+			const base = run(dir, "rev-parse", "HEAD~2");
+
+			const meta = await commitMeta(dir, base, "main");
+			// git log's own order: newest commit first.
+			expect(meta.map((c) => c.subject)).toEqual(["add b", "add a"]);
+			expect(meta[0]?.files).toEqual(["b.txt"]);
+			expect(meta[1]?.files).toEqual(["a.txt"]);
+			expect(meta[0]?.sha).not.toBe("");
+			expect(Number.isFinite(meta[0]?.time)).toBe(true);
+			// A failed read answers empty and never throws: the guard proves only what it read.
+			expect(await commitMeta(dir, "does-not-exist", "main")).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

@@ -280,6 +280,9 @@ let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
 // Live progress the /api/state silent tests set ({ text, at }); null is the default:
 // no progress at all, the log-only warning rule.
 let fakeProgress: { text: string; at?: number } | null = null;
+// OTTR-763: the cross-project checkout guard's bell notices; the tests swap the impl
+// per case and the shared app reads it per state build.
+let checkoutNoticesImpl: () => string[] = () => [];
 // OTTR-675: the branch-rules probe seam; tests swap branchRulesImpl per case. The
 // default answers 404, so an unstubbed probe keeps the advisory off.
 let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
@@ -298,6 +301,7 @@ const app = createApp({
 	...loopStubs(),
 	deepen: (prompt, model) => deepenImpl(prompt, model),
 	progressOf: () => fakeProgress,
+	checkoutNotices: () => checkoutNoticesImpl(),
 	schedule: () => {
 		calls++;
 	},
@@ -13096,6 +13100,26 @@ describe("git-host ssh keys", () => {
 		const env = networkGitAuth(join(root, "keyed", ".worktrees", "x"));
 		expect(env.GIT_SSH_COMMAND).not.toContain(" -i ");
 		expect(env.GIT_SSH_COMMAND).toContain("StrictHostKeyChecking=yes");
+	});
+});
+
+describe("checkout guard notices (OTTR-763)", () => {
+	test("the state warnings surface the loop's bell notices", async () => {
+		checkoutNoticesImpl = () => [
+			"agent-data main checkout changed while several cards were running (ottr#748, alate#104): new commits abc1234 sync: add parallel-work check. No card was parked.",
+		];
+		try {
+			const warnings = (
+				(await (await get("/api/state")).json()) as {
+					warnings: string[];
+				}
+			).warnings;
+			expect(warnings).toContain(
+				"agent-data main checkout changed while several cards were running (ottr#748, alate#104): new commits abc1234 sync: add parallel-work check. No card was parked.",
+			);
+		} finally {
+			checkoutNoticesImpl = () => [];
+		}
 	});
 });
 
