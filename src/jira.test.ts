@@ -629,6 +629,23 @@ describe("assertAllowedHost", () => {
 		});
 		expect(pins).toEqual([null]);
 	});
+
+	test("hosted: a stalled resolver hits the same request deadline", async () => {
+		let calls = 0;
+		const e = await jiraError(
+			testConnection(dc, {
+				hosted: true,
+				timeoutMs: 50,
+				lookup: () => new Promise(() => {}),
+				fetch: (url, init) => {
+					calls++;
+					return toStub(url, init);
+				},
+			}),
+		);
+		expect(e.kind).toBe("timeout");
+		expect(calls).toBe(0);
+	});
 });
 
 describe("pinnedFetch", () => {

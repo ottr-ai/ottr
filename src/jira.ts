@@ -300,9 +300,25 @@ async function send(
 	body: unknown,
 	net: JiraNet,
 ): Promise<unknown> {
-	const pin = await assertAllowedHost(site, net);
+	// One deadline covers the hosted DNS check and the request: a stalled resolver times out too.
 	const timeoutMs = net.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const signal = AbortSignal.timeout(timeoutMs);
+	const timedOut = () =>
+		new JiraError(
+			`Jira did not answer within ${timeoutMs / 1000} s`,
+			null,
+			"timeout",
+		);
+	const { promise: aborted, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(timedOut());
+	signal.addEventListener("abort", onAbort, { once: true });
+	let pin: string | null;
+	try {
+		pin = await Promise.race([assertAllowedHost(site, net), aborted]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		aborted.catch(() => {});
+	}
 	const headers: Record<string, string> = { Accept: "application/json" };
 	if (body !== undefined) headers["Content-Type"] = "application/json";
 	if (c) headers.Authorization = authHeader(c);
@@ -322,12 +338,7 @@ async function send(
 		);
 		text = await res.text();
 	} catch (err) {
-		if (signal.aborted)
-			throw new JiraError(
-				`Jira did not answer within ${timeoutMs / 1000} s`,
-				null,
-				"timeout",
-			);
+		if (signal.aborted) throw timedOut();
 		throw new JiraError(
 			`could not reach Jira: ${err instanceof Error ? err.message : String(err)}`,
 			null,
