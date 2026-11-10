@@ -878,11 +878,12 @@ export interface EventState {
 	sawTerminalEnd: boolean;
 	finalText: string;
 	providerError: string | null;
-	/** toolCallId -> args of report_outcome calls awaiting their tool_execution_end. */
+	/** toolCallId -> args of report_outcome and propose_task calls awaiting their tool_execution_end. */
 	remembered: Map<string, unknown>;
 	/** The agent's last ask call, normalized; null while none. */
 	asked: AskQuestion[] | null;
-	/** First valid `propose_task` call of a retro run; null while none (the extension refuses a second). */
+	/** First succeeded `propose_task` call of a retro run; null while none (the extension
+	 * refuses a second, and a refused call never records — the retry counts). */
 	proposed: {
 		prompt: string;
 		model: string | null;
@@ -896,7 +897,7 @@ export interface EventState {
 		/** The board project the card files on; null files on the retro's own project. */
 		project: string | null;
 	} | null;
-	/** Every valid `propose_task` call, in order: a retro records at most one, a review one per finding. */
+	/** Every succeeded `propose_task` call, in order: a retro records at most one, a review one per finding. */
 	recorded: RecordedFinding[];
 	/** Token usage summed over the assistant message_end events; null until one carried usage. */
 	usage: TokenUsage | null;
@@ -976,9 +977,22 @@ function proposedSummary(
 	return { whatChanges, why, gain, risk: part("risk") ?? "none found", check };
 }
 
-function applyProposeTask(state: EventState, e: AnyRec): void {
-	const args =
-		typeof e.args === "object" && e.args !== null ? (e.args as AnyRec) : {};
+/** A propose_task call's args wait on the shared remembered map until the end event
+ * decides the call: a refused call (the extension answers refusals as "Error: " text,
+ * never a throw) must not land in recorded or become the proposal — the agent's
+ * retry after a refused project is the call that counts (OTTR-787). */
+function applyProposeStart(state: EventState, e: AnyRec): void {
+	const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
+	if (id === null) return;
+	state.remembered.set(
+		id,
+		typeof e.args === "object" && e.args !== null ? e.args : {},
+	);
+}
+
+/** The recorded facts of one succeeded propose_task call: the review finding, and —
+ * retro semantics — the first succeeded call as the proposal. */
+function recordProposal(state: EventState, args: AnyRec): void {
 	if (typeof args.prompt !== "string" || args.prompt === "") return;
 	const call: RecordedFinding = {
 		prompt: args.prompt,
@@ -995,7 +1009,8 @@ function applyProposeTask(state: EventState, e: AnyRec): void {
 				: null,
 	};
 	state.recorded.push(call);
-	// Retro semantics: the first valid call is the proposal (the extension refuses a second).
+	// Retro semantics: the first succeeded call is the proposal (the extension
+	// refuses a second, and a refused call never records).
 	if (state.proposed === null)
 		state.proposed = {
 			prompt: call.prompt,
@@ -1006,6 +1021,22 @@ function applyProposeTask(state: EventState, e: AnyRec): void {
 					? args.project.trim()
 					: null,
 		};
+}
+
+/** The end of one propose_task call: record only a succeeded one. The extension's
+ * refusals ride as "Error: " text in a normal result, so the text decides with the
+ * isError flag. */
+function applyProposeEnd(state: EventState, e: AnyRec): void {
+	const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
+	if (id === null || !state.remembered.has(id)) return;
+	const args = state.remembered.get(id) as AnyRec;
+	state.remembered.delete(id);
+	const result =
+		typeof e.result === "object" && e.result !== null
+			? (e.result as AnyRec)
+			: {};
+	if (e.isError !== true && !textParts(result.content).startsWith("Error: "))
+		recordProposal(state, args);
 }
 
 function applyReportStart(state: EventState, e: AnyRec): void {
@@ -1050,6 +1081,10 @@ function applyToolEnd(state: EventState, e: AnyRec): void {
 		textParts(result.content).includes(APPROVAL_REFUSAL)
 	)
 		state.approvalRefused = true;
+	if (e.toolName === "propose_task") {
+		applyProposeEnd(state, e);
+		return;
+	}
 	const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
 	if (id !== null && state.remembered.has(id)) {
 		const args = state.remembered.get(id);
@@ -1078,7 +1113,7 @@ function applyAgentEnd(state: EventState, e: AnyRec): void {
 function applyToolStart(state: EventState, e: AnyRec): void {
 	if (typeof e.toolName !== "string") return;
 	if (ASK_TOOL.test(e.toolName)) applyAsk(state, e);
-	else if (e.toolName === "propose_task") applyProposeTask(state, e);
+	else if (e.toolName === "propose_task") applyProposeStart(state, e);
 	else if (e.toolName.endsWith("report_outcome")) applyReportStart(state, e);
 }
 

@@ -601,7 +601,7 @@ export interface RunResult {
 	outcome: Outcome | null;
 	/** The agent's outstanding `ask` call (last one seen), or null. */
 	asked: AskQuestion[] | null;
-	/** A retro run's first valid `propose_task` call (proposal held for approval), or null.
+	/** A retro run's first succeeded `propose_task` call (proposal held for approval), or null.
 	 * summary holds the five decision fields the call carried, or null when it sent none.
 	 * project names the board project the card files on; null files on the retro's own. */
 	proposed: {

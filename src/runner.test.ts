@@ -1875,45 +1875,100 @@ describe("applyEvent", () => {
 		isError,
 		result: { content: [{ type: "text", text }] },
 	});
+	const proposeStart = (id: string, args: unknown) => ({
+		type: "tool_execution_start",
+		toolName: "propose_task",
+		toolCallId: id,
+		args,
+	});
+	const RETRO_RECORDED =
+		"Recorded. Ottr files it as a held card when this retro ends.";
+	const proposeEnd = (id: string, isError = false, text = RETRO_RECORDED) => ({
+		type: "tool_execution_end",
+		toolName: "propose_task",
+		toolCallId: id,
+		isError,
+		result: { content: [{ type: "text", text }] },
+	});
 
-	test("a propose_task start is captured with its model; the first valid call wins", () => {
+	test("a propose_task call is captured with its model when it ends; the first succeeded call wins", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "Add tests for X", model: "zai/glm" },
-		});
+		// A start alone records nothing: the end event decides the call.
+		feed(
+			s,
+			proposeStart("p1", { prompt: "Add tests for X", model: "zai/glm" }),
+		);
+		expect(s.proposed).toBeNull();
+		feed(s, proposeEnd("p1"));
 		expect(s.proposed).toEqual({
 			prompt: "Add tests for X",
 			model: "zai/glm",
 			summary: null,
 			project: null,
 		});
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: { prompt: "Second proposal" },
-		});
+		feed(s, proposeStart("p2", { prompt: "Second proposal" }));
+		feed(s, proposeEnd("p2"));
 		expect(s.proposed?.prompt).toBe("Add tests for X");
+	});
+
+	test("a refused propose_task call never records; the retry after an unknown project does", () => {
+		const s = newEventState();
+		feed(
+			s,
+			proposeStart("p1", { prompt: "Fix it", project: "no-such-project" }),
+			proposeEnd(
+				"p1",
+				false,
+				'Error: unknown project "no-such-project". Known projects: alate, agent-data. Propose again with one of these projects, or without one.',
+			),
+		);
+		expect(s.proposed).toBeNull();
+		expect(s.recorded).toHaveLength(0);
+		// The extension's retry with a listed project is the call that counts.
+		feed(
+			s,
+			proposeStart("p2", { prompt: "Fix it", project: " agent-data " }),
+			proposeEnd("p2"),
+		);
+		expect(s.proposed).toEqual({
+			prompt: "Fix it",
+			model: null,
+			summary: null,
+			project: "agent-data",
+		});
+		// An errored end refuses the call even without the Error: text.
+		const t = newEventState();
+		feed(t, proposeStart("p1", { prompt: "Fix it" }), proposeEnd("p1", true));
+		expect(t.proposed).toBeNull();
+		expect(t.recorded).toHaveLength(0);
+	});
+
+	test("a blank-project refusal drops the call; the retry without a project files on the own project", () => {
+		const s = newEventState();
+		feed(
+			s,
+			proposeStart("p1", { prompt: "Fix it", project: "   " }),
+			proposeEnd(
+				"p1",
+				false,
+				"Error: project must be a non-empty string when given.",
+			),
+		);
+		expect(s.proposed).toBeNull();
+		feed(s, proposeStart("p2", { prompt: "Fix it" }), proposeEnd("p2"));
+		expect(s.proposed).toEqual({
+			prompt: "Fix it",
+			model: null,
+			summary: null,
+			project: null,
+		});
 	});
 
 	test("propose_task without a non-empty prompt or before any call leaves proposed null; a bad call does not block a later good one", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "" },
-		});
+		feed(s, proposeStart("p1", { prompt: "" }), proposeEnd("p1"));
 		expect(s.proposed).toBeNull();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: { prompt: "Good" },
-		});
+		feed(s, proposeStart("p2", { prompt: "Good" }), proposeEnd("p2"));
 		expect(s.proposed).toEqual({
 			prompt: "Good",
 			model: null,
@@ -1924,12 +1979,11 @@ describe("applyEvent", () => {
 
 	test("a propose_task project names the filing project; blank or non-string stays null", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "P", project: "  agent-data  " },
-		});
+		feed(
+			s,
+			proposeStart("p1", { prompt: "P", project: "  agent-data  " }),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed).toEqual({
 			prompt: "P",
 			model: null,
@@ -1937,23 +1991,13 @@ describe("applyEvent", () => {
 			project: "agent-data",
 		});
 		const t = newEventState();
-		feed(t, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "P", project: 42 },
-		});
+		feed(t, proposeStart("p1", { prompt: "P", project: 42 }), proposeEnd("p1"));
 		expect(t.proposed?.project).toBeNull();
 	});
 
 	test("a model-less or non-string model propose becomes null", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "P", model: 42 },
-		});
+		feed(s, proposeStart("p1", { prompt: "P", model: 42 }), proposeEnd("p1"));
 		expect(s.proposed).toEqual({
 			prompt: "P",
 			model: null,
@@ -1964,19 +2008,18 @@ describe("applyEvent", () => {
 
 	test("all five summary fields are captured, trimmed", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: {
+		feed(
+			s,
+			proposeStart("p1", {
 				prompt: "P",
 				whatChanges: "  edit src/prompts.ts  ",
 				why: " OTTR-1 duplicated text ",
 				gain: " 200 characters per card ",
 				risk: " none found ",
 				check: " bun test ",
-			},
-		});
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed?.summary).toEqual({
 			whatChanges: "edit src/prompts.ts",
 			why: "OTTR-1 duplicated text",
@@ -1988,19 +2031,18 @@ describe("applyEvent", () => {
 
 	test("an absent or non-string risk defaults to none found", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: {
+		feed(
+			s,
+			proposeStart("p1", {
 				prompt: "P",
 				whatChanges: "w",
 				why: "y",
 				gain: "g",
 				check: "c",
 				risk: 42,
-			},
-		});
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed?.summary).toEqual({
 			whatChanges: "w",
 			why: "y",
@@ -2012,71 +2054,70 @@ describe("applyEvent", () => {
 
 	test("a missing or empty required summary field yields summary null", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "P", whatChanges: "w", why: "y", gain: "g" },
-		});
+		feed(
+			s,
+			proposeStart("p1", {
+				prompt: "P",
+				whatChanges: "w",
+				why: "y",
+				gain: "g",
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed?.summary).toBeNull();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: {
+		feed(
+			s,
+			proposeStart("p2", {
 				prompt: "Q",
 				whatChanges: "w",
 				why: "  ",
 				gain: "g",
 				check: "c",
-			},
-		});
-		// The first valid call stays the proposal; its summary stays null.
+			}),
+			proposeEnd("p2"),
+		);
+		// The first succeeded call stays the proposal; its summary stays null.
 		expect(s.proposed?.summary).toBeNull();
 	});
 
 	test("a summary field over 400 characters is capped at 399 plus an ellipsis", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: {
+		feed(
+			s,
+			proposeStart("p1", {
 				prompt: "P",
 				whatChanges: "w",
 				why: "y",
 				gain: "g".repeat(500),
 				check: "c",
-			},
-		});
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed?.summary?.gain).toBe(`${"g".repeat(399)}…`);
 		expect(s.proposed?.summary?.gain).toHaveLength(400);
 	});
 
 	test("a non-string required summary field counts as absent", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: {
+		feed(
+			s,
+			proposeStart("p1", {
 				prompt: "P",
 				whatChanges: "w",
 				why: { note: "y" },
 				gain: "g",
 				check: "c",
-			},
-		});
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.proposed?.summary).toBeNull();
 	});
 
 	test("review-mode recorded findings carry no summary", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: {
+		feed(
+			s,
+			proposeStart("p1", {
 				prompt: "F",
 				rank: 1,
 				whatChanges: "w",
@@ -2084,8 +2125,9 @@ describe("applyEvent", () => {
 				gain: "g",
 				risk: "r",
 				check: "c",
-			},
-		});
+			}),
+			proposeEnd("p1"),
+		);
 		expect(s.recorded).toEqual([
 			{ prompt: "F", model: null, rank: 1, security: null },
 		]);
@@ -2093,18 +2135,15 @@ describe("applyEvent", () => {
 
 	test("a review's propose_task calls all land in recorded, with rank and security", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "First", rank: 1, security: "critical" },
-		});
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: { prompt: "Second", rank: 2 },
-		});
+		const REVIEW_RECORDED =
+			"Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.";
+		feed(
+			s,
+			proposeStart("p1", { prompt: "First", rank: 1, security: "critical" }),
+			proposeEnd("p1", false, REVIEW_RECORDED),
+			proposeStart("p2", { prompt: "Second", rank: 2 }),
+			proposeEnd("p2", false, REVIEW_RECORDED),
+		);
 		expect(s.recorded).toEqual([
 			{ prompt: "First", model: null, rank: 1, security: "critical" },
 			{ prompt: "Second", model: null, rank: 2, security: null },
@@ -2120,18 +2159,13 @@ describe("applyEvent", () => {
 
 	test("a bad rank, a fractional rank, and an unknown security fall back to null", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "P", rank: 0, security: "low" },
-		});
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: { prompt: "Q", rank: 1.5 },
-		});
+		feed(
+			s,
+			proposeStart("p1", { prompt: "P", rank: 0, security: "low" }),
+			proposeEnd("p1"),
+			proposeStart("p2", { prompt: "Q", rank: 1.5 }),
+			proposeEnd("p2"),
+		);
 		expect(s.recorded).toEqual([
 			{ prompt: "P", model: null, rank: null, security: null },
 			{ prompt: "Q", model: null, rank: null, security: null },
@@ -2140,18 +2174,17 @@ describe("applyEvent", () => {
 
 	test("a bad prompt call records nothing, a later good one still lands", () => {
 		const s = newEventState();
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p1",
-			args: { prompt: "" },
-		});
-		feed(s, {
-			type: "tool_execution_start",
-			toolName: "propose_task",
-			toolCallId: "p2",
-			args: { prompt: "Good", rank: 3 },
-		});
+		feed(
+			s,
+			proposeStart("p1", { prompt: "" }),
+			proposeEnd(
+				"p1",
+				false,
+				"Error: prompt must be a string of 1-20000 characters (trimmed).",
+			),
+			proposeStart("p2", { prompt: "Good", rank: 3 }),
+			proposeEnd("p2"),
+		);
 		expect(s.recorded).toEqual([
 			{ prompt: "Good", model: null, rank: 3, security: null },
 		]);
@@ -2174,6 +2207,22 @@ describe("applyEvent", () => {
 					args: { prompt: "First", model: "", rank: 1, security: "critical" },
 				}),
 			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "p1",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "text",
+								text: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+							},
+						],
+					},
+				}),
+			);
 			// An unrelated event line between findings must not change the order.
 			sink.line(
 				JSON.stringify({
@@ -2192,6 +2241,22 @@ describe("applyEvent", () => {
 					args: { prompt: "Second", model: "m2", rank: 0, security: "low" },
 				}),
 			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "p2",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "text",
+								text: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+							},
+						],
+					},
+				}),
+			);
 			// An empty prompt and a missing prompt fire nothing.
 			sink.line(
 				JSON.stringify({
@@ -2199,6 +2264,22 @@ describe("applyEvent", () => {
 					toolName: "propose_task",
 					toolCallId: "p3",
 					args: { prompt: "" },
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "p3",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "text",
+								text: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+							},
+						],
+					},
 				}),
 			);
 			sink.line(
@@ -2211,10 +2292,42 @@ describe("applyEvent", () => {
 			);
 			sink.line(
 				JSON.stringify({
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "p4",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "text",
+								text: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+							},
+						],
+					},
+				}),
+			);
+			sink.line(
+				JSON.stringify({
 					type: "tool_execution_start",
 					toolName: "propose_task",
 					toolCallId: "p5",
 					args: { prompt: "Third", rank: 1.5 },
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "p5",
+					isError: false,
+					result: {
+						content: [
+							{
+								type: "text",
+								text: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+							},
+						],
+					},
 				}),
 			);
 			sink.line(
