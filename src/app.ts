@@ -111,6 +111,7 @@ import {
 	githubHost,
 	parseGithubHost,
 } from "./githubHost.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 import {
 	type CommitIdentity,
 	identityArgs,
@@ -637,6 +638,11 @@ interface AppDeps {
 	 * Tests inject a short one.
 	 */
 	githubTokenExpiryTimeoutMs?: number;
+	/**
+	 * Sleep seam for the default token-expiry probe's retry waits (OTTR-792); tests inject
+	 * a no-op so a stubbed rate-limited or 5xx answer does not wait.
+	 */
+	githubTokenExpirySleep?: (ms: number) => Promise<void>;
 	/**
 	 * Fetch seam for the GitHub App installation-token mint and the direct review post;
 	 * defaults to noRedirectFetch. Tests inject a stub.
@@ -1754,7 +1760,9 @@ function createAppNetworkDefaults(deps: AppDeps): {
 		// The chip's and the release dialog's latest-GitHub-release fact; the seam keeps tests off gh.
 		latestReleaseOf: deps.latestRelease ?? cachedLatestGhRelease,
 		// GitHub App mint and review post; the seam keeps both off the real network in tests.
-		githubAppFetch: deps.githubAppFetch ?? noRedirectFetch,
+		// Wrapped with the bounded GitHub retry: the mint's GETs retry a 429/5xx, the
+		// review POST passes through untouched (a POST that creates something never retries).
+		githubAppFetch: withGithubRetry(deps.githubAppFetch ?? noRedirectFetch),
 		// Re-run-failed-jobs GitHub API call; the seam keeps tests off the real network.
 		rerunFetch: deps.rerunFetch ?? fetch,
 	};
@@ -2407,11 +2415,14 @@ export function createApp(deps: AppDeps) {
 		else process.env[GITHUB_HOST_ENV] = bootGithubHostEnv;
 	}
 	/** Default probe: the board's own repo answers with the expiry header when the token expires. */
+	const githubExpiryFetch = withGithubRetry(noRedirectFetch, {
+		sleep: deps.githubTokenExpirySleep,
+	});
 	const githubTokenExpiry =
 		deps.githubTokenExpiry ??
 		(async (token: string): Promise<string | null> => {
 			const h = githubHost();
-			const res = await noRedirectFetch(
+			const res = await githubExpiryFetch(
 				h.isDefault
 					? "https://api.github.com/repos/ottr-ai/ottr"
 					: `${h.apiBase}/user`,

@@ -4,6 +4,8 @@
 // (ADR 0008): merge turns would fail on push. The probe is advisory only — every failure
 // reports { ok: false } and the board shows nothing.
 
+import { withGithubRetry } from "./githubRetry.ts";
+
 /** True when `body` — a `GET /repos/{o}/{r}/rules/branches/{branch}` response body — holds
  * a rule whose `type` is "pull_request". Untrusted JSON: false on anything else, never
  * throws. */
@@ -47,7 +49,7 @@ export async function lookupBranchRules(
 		// await races the fetch against the timer; the loser's late rejection is already
 		// answered — swallow it.
 		const gate = Promise.withResolvers<never>();
-		const pending = (o.fetchImpl ?? fetch)(
+		const pending = withGithubRetry(o.fetchImpl ?? fetch)(
 			`${o.apiBase}/repos/${encodeURIComponent(o.owner)}/${encodeURIComponent(o.repo)}/rules/branches/${encodeURIComponent(o.branch)}`,
 			{
 				headers: {

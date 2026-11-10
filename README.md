@@ -371,6 +371,8 @@ Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`,
 
 Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. The board token also serves the board's own git fetches and pushes on `github.com` itself: the worker image's git credential helper is pinned to `https://github.com` (`Dockerfile.worker`). Git on every other host — a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or any non-GitHub git host — needs its own per-host token under **Settings → Git hosts**.
 
+The server's GitHub API fetches (GitHub App, trending scan, releases watch, branch-rule and auth probes, expiry probe) retry a `429`, a `502`/`503`/`504`, or a `403` that carries `Retry-After` or `x-ratelimit-remaining: 0`. The wait follows `Retry-After` or `x-ratelimit-reset`, capped at 4 seconds, with jittered exponential backoff and 3 attempts at most. Only repeat-safe requests (GET, HEAD) retry; a POST that creates something never retries. A wait above the cap stops, and the caller's next poll handles the error.
+
 ### Recommended token
 
 Use a fine-grained personal access token:

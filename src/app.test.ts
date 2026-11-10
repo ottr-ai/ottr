@@ -453,6 +453,10 @@ function mount(
 		githubTokenExpiryTimeoutMs?: Parameters<
 			typeof createApp
 		>[0]["githubTokenExpiryTimeoutMs"];
+		/** Sleep seam for the default token-expiry probe's retry waits; tests inject a no-op. */
+		githubTokenExpirySleep?: Parameters<
+			typeof createApp
+		>[0]["githubTokenExpirySleep"];
 		/** OTTR-715 slow-request log ceiling; defaults to 500 inside createApp. */
 		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
 		/** Live-run seam for the system sampler (OTTR-793); tests inject to force a sample failure. */
@@ -514,6 +518,7 @@ function mount(
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
 		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
+		githubTokenExpirySleep: input.githubTokenExpirySleep,
 		slowApiMs: input.slowApiMs,
 		liveRuns: input.liveRuns,
 		runnerTurns: input.runnerTurns,
@@ -15122,8 +15127,9 @@ describe("token expiry reminders", () => {
 				seed: { expiresAt: null, lastPushDay: null },
 			}),
 		);
-		// mount() injects no githubTokenExpiry, so the POST runs the default probe.
-		const m = mount();
+		// mount() injects no githubTokenExpiry, so the POST runs the default probe;
+		// the no-op sleep keeps the probe's bounded retry from really waiting.
+		const m = mount({ githubTokenExpirySleep: async () => {} });
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (
 			input: RequestInfo | URL,

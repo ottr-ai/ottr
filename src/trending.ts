@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { writeBelow } from "./confine.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
 import type { ListedTask, TrendingStatus } from "./types.ts";
@@ -202,7 +203,7 @@ export function createTrendingScanner(deps: {
 	>;
 	status(): TrendingStatus;
 } {
-	const doFetch = deps.fetch ?? fetch;
+	const doFetch = withGithubRetry(deps.fetch ?? fetch);
 	const now = deps.now ?? Date.now;
 	// Shared by tick and scanNow: one scan at a time board-wide.
 	let inFlight = false;

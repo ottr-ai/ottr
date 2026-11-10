@@ -5,6 +5,7 @@
 // failure path returns null: the git error then stands alone.
 import { type GitToken, parseGitUrl, redact } from "./gitHosts.ts";
 import { isGithubRepoHost, parseGithubHost } from "./githubHost.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 
 /** git's stderr/response marker for an HTTP 401/403 from the remote ("... returned error: 403"). */
 export const GIT_HTTP_AUTH_STATUS = / 401| 403/;
@@ -77,7 +78,7 @@ async function probeRepo(
 ): Promise<Response> {
 	const ac = new AbortController();
 	const gate = Promise.withResolvers<never>();
-	const pending = (o.fetchImpl ?? fetch)(
+	const pending = withGithubRetry(o.fetchImpl ?? fetch)(
 		`${target.apiBase}/repos/${target.owner}/${target.repo}`,
 		{
 			headers: {

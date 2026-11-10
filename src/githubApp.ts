@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import { noRedirectFetch } from "./alate.ts";
 import { githubHost } from "./githubHost.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 import type { AppCheck } from "./types.ts";
 
 /** Ceiling for every GitHub API call below; a stalled server must never hang a check. */
@@ -123,7 +124,7 @@ export class AppTokenSource {
 		this.keyObject = deps.keyObject;
 		this.apiBase = deps.apiBase;
 		this.timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
-		this.fetchImpl = deps.fetchImpl ?? noRedirectFetch;
+		this.fetchImpl = withGithubRetry(deps.fetchImpl ?? noRedirectFetch);
 		this.now = deps.now ?? (() => Date.now());
 	}
 
@@ -326,7 +327,7 @@ export async function checkAppInstalls(deps: {
 	timeoutMs?: number;
 }): Promise<AppCheck> {
 	const base = deps.apiBase ?? githubHost().apiBase;
-	const fetchImpl = deps.fetchImpl ?? noRedirectFetch;
+	const fetchImpl = withGithubRetry(deps.fetchImpl ?? noRedirectFetch);
 	const now = deps.now ?? (() => Date.now());
 	const timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
 	const out: AppCheck = {

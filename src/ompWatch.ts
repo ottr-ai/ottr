@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { clean, runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import type { ForkProject } from "./forks.ts";
 import { githubHost } from "./githubHost.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
 	ompBumpCardPrompt,
@@ -304,7 +305,7 @@ export function createOmpWatcher(deps: {
 	/** Test seam only; production uses UPSTREAM_API_BASE. */
 	apiBase?: () => string;
 }): { tick(): Promise<void> } {
-	const doFetch = deps.fetch ?? fetch;
+	const doFetch = withGithubRetry(deps.fetch ?? fetch);
 	const now = deps.now ?? Date.now;
 
 	async function getJson(
