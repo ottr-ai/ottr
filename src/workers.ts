@@ -16,6 +16,7 @@ import { ensureProjectPython } from "./python.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
 import { readCgroup } from "./systemStats.ts";
+import { tmpDiskSpace } from "./tmpsweep.ts";
 import { buildToolsPath, ensureProjectTools } from "./tools.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
@@ -163,7 +164,7 @@ export function serveWorker(opts: {
 	lockPath?: string;
 	/** Only for tests: the /proc tree GET /stats reads the runs' usage from instead of the real one. */
 	statsProcRoot?: string;
-}): Bun.Server<never> {
+}): Bun.Server<never> & { runStarts(): number[] } {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
 	// ends in " (deleted)" while the turn still has to push and report. Removed on close.
@@ -198,11 +199,17 @@ export function serveWorker(opts: {
 					if (!existsSync(dbPath)) throw new Error(`${dbPath} does not exist`);
 					return signIns(dbPath);
 				});
-			return Response.json({ signIns: read() });
+			// OTTR-754: the board's /tmp gate reads the worker's self-reported space on
+			// both response shapes; null only when statfs itself failed.
+			return Response.json({
+				signIns: read(),
+				tmp: tmpDiskSpace("/tmp"),
+			});
 		} catch (err) {
 			return Response.json({
 				signIns: null,
 				error: `${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
+				tmp: tmpDiskSpace("/tmp"),
 			});
 		}
 	};
@@ -447,13 +454,19 @@ export function serveWorker(opts: {
 			return handleDetach(request);
 		return handleRun(request);
 	};
-	return Bun.serve({
+	// OTTR-754: the sweep reads the startedAt of every live entry (attached and
+	// detached — detached work is still live) so it never deletes a turn's own /tmp scratch.
+	const runStarts = (): number[] => [
+		...[...active.values(), ...detached.values()].map((e) => e.startedAt),
+	];
+	const server = Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
 		// Long silent turns must not be cut by an idle timeout.
 		idleTimeout: 0,
 		fetch: (request) => route(request),
 	});
+	return Object.assign(server, { runStarts });
 }
 
 /** A /run request is well-formed when argv is all strings and cwd is an existing absolute directory. */

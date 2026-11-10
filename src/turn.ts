@@ -701,6 +701,14 @@ export interface TurnOps {
 	drained(): boolean;
 	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
 	drainedRunner(id: string): boolean;
+	/** OTTR-754: the /tmp free-space warning phrase for this runner (a worker hostname or
+	 *  "local"), null when space is fine or unknown. Absent in test fakes: the gate never
+	 *  blocks on it, matching an old board. */
+	tmpFullLine?: (runner: string) => string | null;
+	/** OTTR-754: the /tmp free-space line for this runner, always reported when the space
+	 *  is known (an apt disk failure must name the runner's free space even after the
+	 *  sweep recovered it); null when unknown. Absent in test fakes appends nothing. */
+	tmpSpaceLine?: (runner: string) => string | null;
 	publishSoon(): void;
 	notifyLog(project: string, id: string): void;
 	refreshRelease(e: TurnProject): Promise<void>;
@@ -889,6 +897,46 @@ export function writeVmFiles(
 export function appendLog(store: ProjectStore, id: string, line: string): void {
 	writeBelow(store.dataRoot, store.logPath(id), `${line}\n`, "append");
 	notifyHook(store.name, id);
+}
+
+/**
+ * OTTR-754: append the runner's /tmp warning phrase to a failed run's reason when the
+ * reason carries one of apt's disk-failure signatures (OTTR-753's evidence: "is not
+ * signed" or "Splitting up" from a full /tmp during apt). The runner comes from the
+ * dispatch record — never parsed out of the reason text, whose stderr path carries no
+ * dispatch token. Null runner = local. No phrase (space fine or unknown): the reason
+ * stays as it is. Exported so tests hit the matcher and the append directly.
+ */
+export function tmpEnrichNeedsReason(
+	needsReason: string,
+	runner: string | null,
+	tmpFullLine: ((runner: string) => string | null) | undefined,
+): string {
+	const APT_DISK_SIGNATURES = ["is not signed", "Splitting up"];
+	if (!APT_DISK_SIGNATURES.some((s) => needsReason.includes(s)))
+		return needsReason;
+	const line = tmpFullLine?.(runner ?? "local");
+	return line === null || line === undefined
+		? needsReason
+		: `${needsReason}; ${line}`;
+}
+
+/**
+ * OTTR-754: stamps the runner's /tmp warning onto a settled reason. The runner comes from
+ * the dispatch record's url (undefined = a local run); a reason without an apt disk-failure
+ * signature, or a runner with unknown or fine space, stays as it is.
+ */
+function enrichTmpReason(
+	settled: Next,
+	url: string | undefined,
+	tmpSpaceLine: ((runner: string) => string | null) | undefined,
+): Next {
+	if (settled.needsReason === null) return settled;
+	const runner = url === undefined ? null : new URL(url).hostname;
+	const line = tmpEnrichNeedsReason(settled.needsReason, runner, tmpSpaceLine);
+	return line === settled.needsReason
+		? settled
+		: { ...settled, needsReason: line };
 }
 
 /** Longest provider error a check failure message shows; a gateway can return a whole JSON body. */
@@ -3035,10 +3083,16 @@ export function createTurnLoop(
 		const target = ops.workerTarget ?? null;
 		const toWorker =
 			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+		// OTTR-754: a runner whose /tmp is below the free-space limit holds like a drain.
+		// The microVM gate (vmStartGateHolds) stays untouched: a vm turn runs in a fresh VM.
 		const runnerDrained =
 			toWorker && target !== null
-				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
-				: ops.drainedRunner("local");
+				? target.urls.every(
+						(u) =>
+							ops.drainedRunner(new URL(u).hostname) ||
+							ops.tmpFullLine?.(new URL(u).hostname) != null,
+					)
+				: ops.drainedRunner("local") || ops.tmpFullLine?.("local") != null;
 		return runnerDrained;
 	}
 
@@ -3963,8 +4017,13 @@ export function createTurnLoop(
 			worker === null
 				? null
 				: {
+						// OTTR-754: a runner whose /tmp is below the free-space limit drops out
+						// like a drained one; the free-space limit keeps new turns off a
+						// runner that cannot hold the run's temp writes.
 						urls: worker.urls.filter(
-							(u) => !ops.drainedRunner(new URL(u).hostname),
+							(u) =>
+								!ops.drainedRunner(new URL(u).hostname) &&
+								ops.tmpFullLine?.(new URL(u).hostname) == null,
 						),
 						token: worker.token,
 					};
@@ -3984,7 +4043,7 @@ export function createTurnLoop(
 				id,
 				vmTurn
 					? "The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry."
-					: "Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
+					: "Every worker is unavailable, so the turn did not start: a runner is drained for an image update, or a runner's /tmp is below the free-space limit (OTTR-754). The update undrains the worker when its roll ends, and the /tmp warning clears when space returns; reply to retry.",
 				log,
 			);
 			return null;
@@ -5959,6 +6018,14 @@ export function createTurnLoop(
 			settled.needsReason.includes(" (dispatch ")
 		)
 			appendLog(st.store, st.id, settled.needsReason);
+		// OTTR-754: an apt disk-failure signature names the runner's /tmp free space (the
+		// apt error itself never says "no space"); the runner comes from the dispatch
+		// record's url, undefined = a local run.
+		settled = enrichTmpReason(
+			settled,
+			st.dispatch.handle.url,
+			ops.tmpSpaceLine,
+		);
 		settled = await quarantineTurnImages(st, settled);
 		settled = await requeueModelRestore(st, settled);
 		// A run that could not restore its model never delivered this turn's reply: the retry

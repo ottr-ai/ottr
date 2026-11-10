@@ -38,7 +38,10 @@ import {
 	pickEncoding,
 	reconcileLayerUse,
 	storedProjectPaths,
+	tmpFull,
+	type WorkerSignInReport,
 	workerSignInWarnings,
+	workerTmpWarnings,
 } from "./app.ts";
 import { hashPassword, signSession } from "./auth.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
@@ -77,6 +80,8 @@ import {
 } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
+import type { TmpDiskSpace } from "./tmpsweep.ts";
+import { formatBytes } from "./tmpsweep.ts";
 import {
 	cancelKeptReason,
 	FORK_HOLD_REASON,
@@ -13330,10 +13335,17 @@ describe("worker sign-in warnings", () => {
 	const report = (
 		signIns: SignIn[] | null,
 		error: string | null = null,
-	): { signIns: SignIn[] | null; error: string | null; at: number } => ({
+		tmp: TmpDiskSpace | null = null,
+	): {
+		signIns: SignIn[] | null;
+		error: string | null;
+		at: number;
+		tmp: TmpDiskSpace | null;
+	} => ({
 		signIns,
 		error,
 		at: 1_762_000_000_000,
+		tmp,
 	});
 	const ZAI_ACTIVE: SignIn = {
 		provider: "zai",
@@ -13561,6 +13573,132 @@ describe("worker sign-in warnings", () => {
 			if (savedKey === undefined) delete process.env.ZAI_API_KEY;
 			else process.env.ZAI_API_KEY = savedKey;
 			rmSync(agentTmp, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("worker /tmp full warnings (OTTR-754)", () => {
+	const report = (
+		signIns: SignIn[] | null,
+		error: string | null = null,
+		tmp: TmpDiskSpace | null = null,
+	): WorkerSignInReport => ({
+		signIns,
+		error,
+		at: 1_762_000_000_000,
+		tmp,
+	});
+	// 512 MiB free of 4 GiB: under the 1 GiB floor AND the 5% ratio? 12.5% keeps the
+	// ratio check green, so this isolates the byte floor; the ample case clears both.
+	const LOW: TmpDiskSpace = {
+		freeBytes: 512 * 1024 * 1024,
+		totalBytes: 4 * 1024 ** 3,
+	};
+	const AMPLE: TmpDiskSpace = {
+		freeBytes: 20 * 1024 ** 3,
+		totalBytes: 40 * 1024 ** 3,
+	};
+
+	test("tmpFull holds under the byte floor or the ratio, formatBytes stays human", () => {
+		expect(tmpFull(512 * 1024 * 1024, 4 * 1024 ** 3)).toBe(true);
+		// 2 GiB of 4 GiB clears both the byte floor and the ratio: it passes.
+		expect(tmpFull(2 * 1024 ** 3, 4 * 1024 ** 3)).toBe(false);
+		// 100 MiB of 4 GiB fails both rules; 2.1 GiB of 45 GiB (4.7%) fails only the ratio.
+		expect(tmpFull(100 * 1024 * 1024, 4 * 1024 ** 3)).toBe(true);
+		expect(tmpFull(2.1 * 1024 ** 3, 45 * 1024 ** 3)).toBe(true);
+		expect(tmpFull(20 * 1024 ** 3, 40 * 1024 ** 3)).toBe(false);
+		expect(formatBytes(512 * 1024 * 1024)).toBe("512 MiB");
+		expect(formatBytes(5 * 1024 ** 3)).toBe("5 GiB");
+		expect(formatBytes(999)).toBe("999 B");
+	});
+
+	test("one warning per full runner, none for unknown or ample space", () => {
+		const reports = new Map([
+			["worker-a", report([], null, LOW)],
+			["worker-b", report([], null, AMPLE)],
+			["worker-c", report([], null, null)], // An old worker: unknown space.
+			["worker-d", null], // A failed probe.
+		]);
+		expect(workerTmpWarnings(reports, AMPLE)).toEqual([
+			"/tmp of worker-a is full (512 MiB)",
+		]);
+		// The local runner joins when its own statfs reads full; never a duplicate.
+		expect(workerTmpWarnings(reports, LOW)).toEqual([
+			"/tmp of worker-a is full (512 MiB)",
+			"/tmp of local is full (512 MiB)",
+		]);
+	});
+
+	test("stateResponse warns on a low worker report and clears when space returns", async () => {
+		let answer: {
+			signIns: unknown;
+			error?: string;
+			tmp?: { freeBytes: number; totalBytes: number };
+		} = { signIns: [], tmp: LOW };
+		const fakeWorker = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				if (new URL(req.url).pathname !== "/signins")
+					return new Response("not found", { status: 404 });
+				if (req.headers.get("x-otwr-token") !== "tok")
+					return new Response("unauthorized", { status: 401 });
+				return Response.json(answer);
+			},
+		});
+		const workerApp = createApp({
+			gstore,
+			defaultDir: root,
+			projects: new Map(),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				idleReviews: true,
+				trendingScan: true,
+				commitIdentity: null,
+				removedPaths: [],
+				envValues: {},
+				projectPaths: [],
+				projectOrder: [],
+			},
+			serverRef: { current: undefined },
+			workerTarget: {
+				urls: [`http://127.0.0.1:${fakeWorker.port}`],
+				token: "tok",
+			},
+		});
+		const srv = Bun.serve({ port: 0, ...workerApp.serveOptions });
+		workerApp.serverRef.current = srv;
+		mounted.push(srv);
+		const state = async () =>
+			(await (
+				await fetch(new URL("/api/state", srv.url), {
+					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+				})
+			).json()) as { warnings: string[] };
+		try {
+			await workerApp.workerSignInTick();
+			let warnings = (await state()).warnings;
+			expect(warnings).toContain("/tmp of 127.0.0.1 is full (512 MiB)");
+
+			// Space returns: the advisory warning recomputes away on the next tick.
+			answer = { signIns: [], tmp: AMPLE };
+			await workerApp.workerSignInTick();
+			warnings = (await state()).warnings;
+			expect(warnings.some((w) => w.includes("is full"))).toBe(false);
+
+			// A worker without the tmp field (an old worker) warns nothing.
+			answer = { signIns: [] };
+			await workerApp.workerSignInTick();
+			warnings = (await state()).warnings;
+			expect(warnings.some((w) => w.includes("is full"))).toBe(false);
+		} finally {
+			fakeWorker.stop(true);
 		}
 	});
 });

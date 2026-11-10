@@ -286,6 +286,7 @@ import {
 	readCgroup,
 	readVm,
 } from "./systemStats.ts";
+import { formatBytes, type TmpDiskSpace, tmpDiskSpace } from "./tmpsweep.ts";
 import {
 	ENV_NAME,
 	envListPath,
@@ -1057,6 +1058,9 @@ export interface WorkerSignInReport {
 	signIns: SignIn[] | null;
 	error: string | null;
 	at: number;
+	/** OTTR-754: the worker's self-reported /tmp space; null when the worker omitted it (an
+	 *  old worker) or statfs failed on its side. */
+	tmp: TmpDiskSpace | null;
 }
 
 /** One worker's per-role warnings: the worker's store lacks a sign-in a model role uses, the
@@ -1123,6 +1127,51 @@ export function workerSignInWarnings(
 			report.signIns.filter((s) => s.active).map((s) => s.provider),
 		);
 		out.push(...workerProviderWarnings(id, roles, active, lent, env));
+	}
+	return out;
+}
+
+// OTTR-754: the /tmp free-space rule in one place. A runner whose /tmp holds less than
+// 1 GiB or less than 5% of its size is too full for a new turn: apt, mktemp, and the
+// run scripts all write /tmp, and a disk-full failure names none of this.
+export const TMP_MIN_FREE_BYTES = 1024 ** 3;
+export const TMP_MIN_FREE_RATIO = 0.05;
+
+/** True when /tmp is below the free-space limit: under the byte floor OR under the ratio. */
+export function tmpFull(freeBytes: number, totalBytes: number): boolean {
+	return (
+		freeBytes < TMP_MIN_FREE_BYTES ||
+		freeBytes / totalBytes < TMP_MIN_FREE_RATIO
+	);
+}
+
+/**
+ * OTTR-754: one bell warning per runner whose /tmp is below the free-space limit — worker
+ * hostnames from the sign-ins tick's cache, the local runner from a statfs probe. Advisory:
+ * recompute per poll, so the warning disappears by itself once space returns. A report of
+ * null (an old worker, a failed fetch) warns nothing, like workerSignInWarnings.
+ */
+export function workerTmpWarnings(
+	reports: ReadonlyMap<string, WorkerSignInReport | null>,
+	localSpace: TmpDiskSpace | null,
+): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const [host, report] of reports) {
+		if (!report?.tmp) continue; // Unknown /tmp space warns nothing.
+		if (!tmpFull(report.tmp.freeBytes, report.tmp.totalBytes)) continue;
+		const line = `/tmp of ${host} is full (${formatBytes(report.tmp.freeBytes)})`;
+		if (!seen.has(line)) {
+			seen.add(line);
+			out.push(line);
+		}
+	}
+	if (
+		localSpace !== null &&
+		tmpFull(localSpace.freeBytes, localSpace.totalBytes)
+	) {
+		const line = `/tmp of local is full (${formatBytes(localSpace.freeBytes)})`;
+		if (!seen.has(line)) out.push(line);
 	}
 	return out;
 }
@@ -2451,14 +2500,29 @@ export function createApp(deps: AppDeps) {
 			const body = (await res.json()) as {
 				signIns?: unknown;
 				error?: unknown;
+				tmp?: unknown;
 			};
+			// OTTR-754: a worker that omits tmp (an old worker) or sends a malformed
+			// object reports unknown space — the gate then never blocks on it. Parsed
+			// before the branches: the worker reports its space on both answer shapes.
+			const tmp =
+				body.tmp &&
+				typeof body.tmp === "object" &&
+				typeof (body.tmp as TmpDiskSpace).freeBytes === "number" &&
+				typeof (body.tmp as TmpDiskSpace).totalBytes === "number"
+					? {
+							freeBytes: (body.tmp as TmpDiskSpace).freeBytes,
+							totalBytes: (body.tmp as TmpDiskSpace).totalBytes,
+						}
+					: null;
 			if (typeof body.error === "string")
-				return { signIns: null, error: body.error, at: Date.now() };
+				return { signIns: null, error: body.error, at: Date.now(), tmp };
 			if (Array.isArray(body.signIns))
 				return {
 					signIns: body.signIns as SignIn[],
 					error: null,
 					at: Date.now(),
+					tmp,
 				};
 			throw new Error("sent a body without signIns");
 		} catch {
@@ -4355,6 +4419,9 @@ export function createApp(deps: AppDeps) {
 				...boardWarnings(list, roles, undefined, undefined, tasks, now),
 				// OTTR-548: the workers' self-reported sign-ins; reads only the tick's cache.
 				...workerSignInWarnings(workerSignInReports, list, roles),
+				// OTTR-754: one bell warning per runner whose /tmp is below the free-space
+				// limit; recomputed per poll, so it disappears when space returns.
+				...workerTmpWarnings(workerSignInReports, tmpDiskSpace()),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),
@@ -10665,6 +10732,28 @@ export function createApp(deps: AppDeps) {
 					}),
 		// OTTR-454: a per-runner hold gates new turns on one runner only.
 		drainedRunner: (id: string) => Date.now() < (runnerDrains.get(id) ?? 0),
+		// OTTR-754: the /tmp free-space warning phrase for this runner ("local" or a worker
+		// hostname), or null when space is fine or unknown; the turn start gate holds on it.
+		tmpFullLine: (runner: string): string | null => {
+			const space =
+				runner === "local"
+					? tmpDiskSpace()
+					: (workerSignInReports.get(runner)?.tmp ?? null);
+			if (space === null || !tmpFull(space.freeBytes, space.totalBytes))
+				return null;
+			return `/tmp of ${runner} is full (${formatBytes(space.freeBytes)})`;
+		},
+		// OTTR-754: the free space itself, for an apt disk-failure reason; known space
+		// always reports, so a recovered sweep still explains the failure it caused.
+		tmpSpaceLine: (runner: string): string | null => {
+			const space =
+				runner === "local"
+					? tmpDiskSpace()
+					: (workerSignInReports.get(runner)?.tmp ?? null);
+			return space === null
+				? null
+				: `/tmp of ${runner} has ${formatBytes(space.freeBytes)} free`;
+		},
 		socketCount: () => sockets,
 		sampleStats,
 		alateProvisionTick,

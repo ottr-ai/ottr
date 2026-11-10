@@ -802,25 +802,30 @@ describe("GET /signins", () => {
 			headers: { "x-otwr-token": "tok" },
 		});
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({
-			signIns: [
-				// Sorted by provider; lent only for a LENT_ENV provider (src/login.ts).
-				{
-					provider: "anthropic",
-					kind: "oauth",
-					active: true,
-					cause: null,
-					lent: true,
-				},
-				{
-					provider: "cursor",
-					kind: "oauth",
-					active: true,
-					cause: null,
-					lent: false,
-				},
-			],
-		});
+		const body = (await res.json()) as {
+			signIns: unknown[];
+			tmp: { freeBytes: number; totalBytes: number };
+		};
+		expect(body.signIns).toEqual([
+			// Sorted by provider; lent only for a LENT_ENV provider (src/login.ts).
+			{
+				provider: "anthropic",
+				kind: "oauth",
+				active: true,
+				cause: null,
+				lent: true,
+			},
+			{
+				provider: "cursor",
+				kind: "oauth",
+				active: true,
+				cause: null,
+				lent: false,
+			},
+		]);
+		// OTTR-754: the success branch carries the worker's real /tmp statfs numbers.
+		expect(body.tmp.freeBytes).toBeGreaterThan(0);
+		expect(body.tmp.totalBytes).toBeGreaterThan(body.tmp.freeBytes);
 	});
 
 	test("an unreadable store answers 200 {signIns: null, error} naming the path", async () => {
@@ -836,13 +841,31 @@ describe("GET /signins", () => {
 				headers: { "x-otwr-token": "tok" },
 			});
 			expect(res.status).toBe(200);
-			const body = (await res.json()) as { signIns: null; error: string };
+			const body = (await res.json()) as {
+				signIns: null;
+				error: string;
+				tmp: { freeBytes: number; totalBytes: number } | null;
+			};
 			expect(body.signIns).toBeNull();
 			expect(body.error).toContain(join(home, ".omp", "agent", "agent.db"));
+			// OTTR-754: the store-error branch still carries the /tmp numbers.
+			expect(body.tmp).not.toBeNull();
+			expect(body.tmp?.freeBytes).toBeGreaterThan(0);
 		} finally {
 			if (saved === undefined) delete process.env.HOME;
 			else process.env.HOME = saved;
 		}
+	});
+});
+
+describe("serveWorker handle", () => {
+	// OTTR-754: the sweep reads this to protect a live turn's /tmp scratch.
+	test("the handle exposes runStarts returning numbers", () => {
+		const server = serveWorker({ port: 0, token: "tok" });
+		servers.push(server);
+		const starts = server.runStarts();
+		expect(Array.isArray(starts)).toBe(true);
+		for (const s of starts) expect(typeof s).toBe("number");
 	});
 });
 

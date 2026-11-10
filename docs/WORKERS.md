@@ -188,6 +188,13 @@ omp. Two parts do the work:
    holds and the detach before the server step mean no undetached turn runs on an
    old worker while the new server boots.
 
+   OTTR-754: the worker sweep deletes every top-level `/tmp` entry whose newest
+   file time is older than 24 h, but keeps an entry that a live process holds
+   open and an entry whose newest write happened after a live turn started. Each
+   worker self-reports its `/tmp` space on `GET /signins` (`tmp`); a runner below
+   the free-space limit (1 GiB or 5%) gets no new turn, and the bell shows one
+   `/tmp of <runner> is full (<free>)` notice until the space is back.
+
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule: it holds new turns on the
    whole board, waits for at most 1 hour, and restarts the stack at once with

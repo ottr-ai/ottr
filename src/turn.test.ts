@@ -69,6 +69,7 @@ import {
 	modelSwap,
 	parseReleaseVersion,
 	parseTopicReport,
+	tmpEnrichNeedsReason,
 	turnModel,
 	UI_SHOT_WARNING,
 	UPDATE_HOLD_REASON,
@@ -85,7 +86,7 @@ import type {
 } from "./types.ts";
 import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
-import type { DetachedRun } from "./workers.ts";
+import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
 	PUSH_LANDED_BEFORE_ATTEMPT,
@@ -118,7 +119,7 @@ interface Recorded {
 		extensionPath?: string | null;
 		model?: string | null;
 		maxTime?: string | null;
-		worker?: unknown;
+		worker?: WorkerTarget | null;
 		board?: {
 			url: string;
 			token: string;
@@ -17834,7 +17835,7 @@ describe("per-runner drain gates (OTTR-454)", () => {
 		expect(record.runs).toHaveLength(0);
 		const card = store.getTask(task.id);
 		expect(card?.state).toBe("needs_you");
-		expect(card?.needsReason).toContain("Every worker is drained");
+		expect(card?.needsReason).toContain("Every worker is unavailable");
 	});
 
 	test("a local drain defers a merge turn but a worker turn still starts", async () => {
@@ -17905,6 +17906,136 @@ describe("per-runner drain gates (OTTR-454)", () => {
 			workers: { "worker-a": 2 },
 			preparing: 3,
 		});
+	});
+});
+
+describe("/tmp free-space gates (OTTR-754)", () => {
+	/** The ops override whose /tmp rule holds only `runner` (the worker hostname or "local"). */
+	const tmpHolds = (...runners: string[]): Partial<TurnOps> => ({
+		tmpFullLine: (r) =>
+			runners.includes(r) ? `/tmp of ${r} is full (512 MiB)` : null,
+	});
+
+	test("a tmp-full worker gets no dispatch while the other still does", async () => {
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: {
+				urls: ["http://worker-a:8787", "http://worker-b:8787"],
+			},
+			...tmpHolds("worker-a"),
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(1);
+		expect(record.runs[0]!.worker?.urls).toEqual(["http://worker-b:8787"]);
+	});
+
+	test("every worker tmp-full leaves the card queued and starts no run", async () => {
+		const { store, record, loop } = setup({
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			...tmpHolds("worker-a"),
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)?.state).toBe("queued");
+	});
+
+	test("a tmp-full local runner defers the board check", async () => {
+		const { store, record, loop } = setup({
+			...tmpHolds("local"),
+		});
+		const check = store.createTask(BOARD_CHECK_PROMPT);
+		store.setBoardCheckId(check.id);
+		await loop.runTurn(store.name, check.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(check.id)?.state).toBe("queued");
+	});
+
+	test("an apt disk-failure reason names the free /tmp of the runner it ran on", async () => {
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => ({
+				pid: 4242,
+				// The dispatch record the settle reads the runner from; the reason text
+				// itself carries no dispatch token to parse.
+				url: o.worker?.urls[0],
+				done: Promise.resolve(
+					runResult({
+						exitCode: 1,
+						stderrTail:
+							"E: Some packages could not be authenticated... Splitting up /var/lib/apt/lists/extended_states",
+					}),
+				),
+				kill: async () => {},
+			}),
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(
+			after.needsReason?.endsWith("/tmp of worker-a has 512 MiB free"),
+		).toBe(true);
+	});
+
+	test("a failed run without the apt signature stays unenriched", async () => {
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => ({
+				pid: 4242,
+				url: o.worker?.urls[0],
+				done: Promise.resolve(runResult({ exitCode: 1 })),
+				kill: async () => {},
+			}),
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+
+		expect(store.getTask(task.id)!.needsReason).toBe(
+			"omp exited with code 1 before finishing.",
+		);
+	});
+
+	test("tmpEnrichNeedsReason appends only on an apt signature, only with a phrase", () => {
+		const space = (r: string) =>
+			r === "worker-a" || r === "local"
+				? `/tmp of ${r} has 512 MiB free`
+				: null;
+		expect(
+			tmpEnrichNeedsReason(
+				"omp exited with code 1 before finishing: Splitting up failed",
+				"worker-a",
+				space,
+			),
+		).toBe(
+			"omp exited with code 1 before finishing: Splitting up failed; /tmp of worker-a has 512 MiB free",
+		);
+		// "is not signed" is the other apt disk-failure signature; a local run passes null.
+		expect(
+			tmpEnrichNeedsReason(
+				"omp exited with code 1: package X is not signed",
+				null,
+				space,
+			),
+		).toBe(
+			"omp exited with code 1: package X is not signed; /tmp of local has 512 MiB free",
+		);
+		// No signature, or a null line (space unknown): the reason stays.
+		expect(
+			tmpEnrichNeedsReason(
+				"omp exited with code 1 before finishing",
+				"worker-a",
+				space,
+			),
+		).toBe("omp exited with code 1 before finishing");
+		expect(
+			tmpEnrichNeedsReason("apt: Splitting up failed", "worker-b", space),
+		).toBe("apt: Splitting up failed");
 	});
 });
 

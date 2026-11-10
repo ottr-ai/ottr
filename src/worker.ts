@@ -1,8 +1,8 @@
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { ensureAllPackages } from "./apt.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import { ensureAllPython } from "./python.ts";
-import { sweepTmpDirs } from "./tmpsweep.ts";
+import { formatBytes, sweepTmpDirs } from "./tmpsweep.ts";
 import { ensureAllTools } from "./tools.ts";
 import { serveWorker } from "./workers.ts";
 
@@ -19,9 +19,8 @@ if (import.meta.main) {
 		process.exit(1);
 	}
 
-	sweepTmpDirs();
-	setInterval(() => sweepTmpDirs(), 60 * 60 * 1000);
-
+	// OTTR-754: build the server first so serving starts at once and the sweep can see
+	// this worker's live turn start times before it deletes anything.
 	const server = serveWorker({
 		port: Number(process.env.WORKER_PORT) || 8787,
 		token,
@@ -32,6 +31,18 @@ if (import.meta.main) {
 			auditProvisioned(homedir(), sinceMs, rulesAtStart),
 		rulesAtStart: () => rulesDirEntries(homedir()),
 	});
+
+	// OTTR-754: the sweep passes the live turn starts so a running turn's /tmp
+	// scratch survives, and logs each removal line for the worker's own console.
+	const sweep = (): void => {
+		for (const { name, bytes } of sweepTmpDirs(tmpdir(), {
+			liveTurnStarts: server.runStarts(),
+		})) {
+			console.log(`sweep: removed ${name} (${formatBytes(bytes)})`);
+		}
+	};
+	sweep();
+	setInterval(sweep, 60 * 60 * 1000);
 
 	// Serving starts at once: a turn that arrives during the install queues behind it (src/apt.ts).
 	Promise.all([
