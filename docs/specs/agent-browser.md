@@ -13,7 +13,9 @@ Agent-browser serves locked-MCP cases and screenshot proofs.
 - The npm release date is November 1, 2026. The release meets the seven-day age rule.
 - The package uses Apache-2.0, which the existing license policy permits.
 - Reuse the image's Chrome at `/opt/google/chrome/chrome`.
-- Chrome libraries remain in the existing project package lists.
+- Chrome libraries come from agent-data's `workers/<project>/apt.txt`, not the bare image.
+- Root worker launches need `AGENT_BROWSER_ARGS=--no-sandbox`, which disables Chrome's sandbox.
+- Keep Chrome's sandbox active for non-root launches.
 - Run the image acceptance checks on a build host. This worker has no container builder.
 
 ## Image contract

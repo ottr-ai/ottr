@@ -70,8 +70,14 @@ The image sets `AGENT_BROWSER_EXECUTABLE_PATH=/opt/google/chrome/chrome` to reus
 The image also links `/usr/local/bin/google-chrome` to that binary.
 The pinned doctor uses PATH, not `AGENT_BROWSER_EXECUTABLE_PATH`.
 
+Chrome needs the libraries from the project's `workers/<project>/apt.txt` in agent-data.
+Ottr uses `workers/ottr/apt.txt`.
+Workers install these packages before each turn.
+The bare image cannot launch Chrome without them.
+
 Do not run `agent-browser install` or `agent-browser upgrade` in a worker.
-Do not download another browser or add sandbox or TLS bypass flags.
+Do not download another browser.
+Do not add other sandbox bypass flags or any TLS bypass flags.
 See the [source spec](specs/agent-browser.md).
 
 Before the first browser command, read the output of `agent-browser skills get core`.
@@ -83,10 +89,16 @@ Open the URL before `snapshot -i`.
 Use refs from the latest snapshot for element actions.
 Use `--json` when a script needs structured output.
 
+Root worker containers need `AGENT_BROWSER_ARGS=--no-sandbox` before the first browser launch.
+This flag disables Chrome's sandbox.
+Do not use this flag for non-root launches.
+The example below assumes a root worker container.
+
 ```sh
 agent-browser skills get core
 agent-browser --version
 agent-browser doctor --offline --quick
+export AGENT_BROWSER_ARGS=--no-sandbox
 session="ottr-turn-$(cat /proc/sys/kernel/random/uuid)"
 agent-browser --session "$session" open "http://127.0.0.1:$port/"
 agent-browser --session "$session" snapshot -i
@@ -96,6 +108,7 @@ agent-browser --session "$session" close
 ```
 
 Use the demo board and fresh port from the [screenshot proof policy](../README.md#screenshot-proofs-for-ui-cards).
+Use the board URL, not the omp stats URL, from the dev log.
 Write the screenshot directly to its final PNG path.
 Never pass image bytes through agent text.
 The first eight bytes must be `89 50 4e 47 0d 0a 1a 0a`.
