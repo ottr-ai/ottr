@@ -50,6 +50,7 @@ import {
 	parseKeptChoices,
 	parseNumstat,
 	planKeptFinish,
+	pushBranch,
 	quarantineUntracked,
 	rebaseTargetBranch,
 	redact,
@@ -4533,6 +4534,115 @@ describe("fetchPrHead (OTTR-755)", () => {
 				"invalid PR number: 1.5",
 			);
 			expect(() => run(f.main, "rev-parse", "refs/ottr/pr/0")).toThrow();
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("pushBranch destination ref (OTTR-760)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-pbr-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		return { dir, bare, main };
+	};
+
+	test("pushes the card branch to a different ref on origin and updates its tracking ref", async () => {
+		const f = fixture();
+		try {
+			// The source PR's head branch sits at the base; the card branch is the head
+			// plus a fix commit — a fast-forward by construction.
+			run(f.main, "branch", "contrib/fix-branch", "origin/main");
+			run(f.main, "switch", "-q", "-c", "ott/card");
+			writeFileSync(join(f.main, "fix.txt"), "f");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "the fix");
+			const tip = run(f.main, "rev-parse", "HEAD");
+
+			const res = await pushBranch(
+				f.main,
+				"ott/card",
+				f.bare,
+				"contrib/fix-branch",
+			);
+			expect(res.status).toBe("pushed");
+			// The destination moved to the card tip; the branch's own name stayed absent.
+			expect(
+				run(f.main, "ls-remote", f.bare, "refs/heads/contrib/fix-branch"),
+			).toBe(`${tip}\trefs/heads/contrib/fix-branch`);
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).toBe("");
+			// The tracking ref follows the destination, so a retry leases against it.
+			expect(
+				run(f.main, "rev-parse", "refs/remotes/origin/contrib/fix-branch"),
+			).toBe(tip);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a moved destination ref rejects the push instead of overwriting it", async () => {
+		const f = fixture();
+		try {
+			// The remote head branch moved beyond the card branch (the PR author rebased):
+			// the card branch does not descend from it, so the plain push must reject.
+			run(f.main, "switch", "-q", "-c", "contrib/fix-branch", "origin/main");
+			writeFileSync(join(f.main, "theirs.txt"), "t");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "author rebase");
+			run(f.main, "push", "-q", "origin", "contrib/fix-branch");
+			run(f.main, "switch", "-q", "-c", "ott/card", "origin/main");
+			writeFileSync(join(f.main, "fix.txt"), "f");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "the fix");
+
+			const res = await pushBranch(
+				f.main,
+				"ott/card",
+				f.bare,
+				"contrib/fix-branch",
+			);
+			expect(res.status).toBe("rejected");
+			// The author's commit survived untouched.
+			const theirs = run(f.main, "rev-parse", "contrib/fix-branch");
+			expect(
+				run(f.main, "ls-remote", f.bare, "refs/heads/contrib/fix-branch"),
+			).toContain(theirs);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the default still pushes the branch to its own name", async () => {
+		const f = fixture();
+		try {
+			run(f.main, "switch", "-q", "-c", "ott/card");
+			writeFileSync(join(f.main, "fix.txt"), "f");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "the fix");
+			const tip = run(f.main, "rev-parse", "HEAD");
+			const res = await pushBranch(f.main, "ott/card", f.bare);
+			expect(res.status).toBe("pushed");
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).toContain(
+				tip,
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}

@@ -1021,29 +1021,115 @@ describe("keptFiles", () => {
 		expect(task.prNumber).toBe(null);
 		expect(task.prUrl).toBe(null);
 		expect(task.prHeadSha).toBe(null);
+		expect(task.sourcePrNumber).toBe(null);
+		expect(task.sourcePrUrl).toBe(null);
+		expect(task.sourcePrHeadRef).toBe(null);
+		expect(task.sourcePrHeadSha).toBe(null);
+		expect(task.sourcePrCrossRepo).toBe(false);
+		expect(task.sourcePrDependabot).toBe(false);
 		const updated = store.updateTask(task.id, {
 			prNumber: 7,
 			prUrl: "https://github.com/octo/repo/pull/7",
 			prHeadSha: "def67890",
+			sourcePrNumber: 20,
+			sourcePrUrl: "https://github.com/octo/repo/pull/20",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "abc12300",
+			sourcePrCrossRepo: true,
+			sourcePrDependabot: true,
 		});
 		expect(updated.prNumber).toBe(7);
 		expect(updated.prUrl).toBe("https://github.com/octo/repo/pull/7");
 		expect(updated.prHeadSha).toBe("def67890");
+		expect(updated.sourcePrNumber).toBe(20);
+		expect(updated.sourcePrUrl).toBe("https://github.com/octo/repo/pull/20");
+		expect(updated.sourcePrHeadRef).toBe("dependabot/npm_and_yarn/vite-7.1.2");
+		expect(updated.sourcePrHeadSha).toBe("abc12300");
+		expect(updated.sourcePrCrossRepo).toBe(true);
+		expect(updated.sourcePrDependabot).toBe(true);
 		store.close();
 		const reopened = open(join(root, "pr-task-fields"));
 		const back = reopened.getTask(task.id)!;
 		expect(back.prNumber).toBe(7);
 		expect(back.prUrl).toBe("https://github.com/octo/repo/pull/7");
 		expect(back.prHeadSha).toBe("def67890");
+		expect(back.sourcePrNumber).toBe(20);
+		expect(back.sourcePrUrl).toBe("https://github.com/octo/repo/pull/20");
+		expect(back.sourcePrHeadRef).toBe("dependabot/npm_and_yarn/vite-7.1.2");
+		expect(back.sourcePrHeadSha).toBe("abc12300");
+		expect(back.sourcePrCrossRepo).toBe(true);
+		expect(back.sourcePrDependabot).toBe(true);
 		const cleared = reopened.updateTask(task.id, {
 			prNumber: null,
 			prUrl: null,
 			prHeadSha: null,
+			sourcePrNumber: null,
+			sourcePrUrl: null,
+			sourcePrHeadRef: null,
+			sourcePrHeadSha: null,
+			sourcePrCrossRepo: false,
+			sourcePrDependabot: false,
 		});
 		expect(cleared.prNumber).toBe(null);
 		expect(cleared.prUrl).toBe(null);
 		expect(cleared.prHeadSha).toBe(null);
+		expect(cleared.sourcePrNumber).toBe(null);
+		expect(cleared.sourcePrUrl).toBe(null);
+		expect(cleared.sourcePrHeadRef).toBe(null);
+		expect(cleared.sourcePrHeadSha).toBe(null);
+		expect(cleared.sourcePrCrossRepo).toBe(false);
+		expect(cleared.sourcePrDependabot).toBe(false);
 		reopened.close();
+	});
+
+	test("a database from before OTTR-760 converges to the source PR columns", () => {
+		const dir = join(root, "pre-ottr-760-columns");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		// The pre-OTTR-760 shape (the ALTER-only columns absent), as the migration
+		// fixture's OLD_TASKS_DDL holds it.
+		db.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done')),
+			state TEXT NOT NULL CHECK (state IN ('queued','running','needs_you','idle')),
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			queued_at INTEGER,
+			cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]',
+			pending_images TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT,
+			release_notes TEXT,
+			session_title TEXT,
+			asked TEXT,
+			model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]',
+			follow_up_of TEXT,
+			commits INTEGER,
+			done_at INTEGER
+		)`);
+		db.exec(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('t1', 'old', 'p', 'merging', 'idle', 1, 1)",
+		);
+		db.close();
+		const store = open(dir);
+		const back = store.getTask("t1")!;
+		expect(back.sourcePrNumber).toBe(null);
+		expect(back.sourcePrCrossRepo).toBe(false);
+		expect(back.sourcePrDependabot).toBe(false);
+		store.updateTask("t1", { sourcePrNumber: 20, sourcePrDependabot: true });
+		expect(store.getTask("t1")!.sourcePrNumber).toBe(20);
+		store.close();
 	});
 
 	test("updateTask stores mergeHead and it survives a reopen", () => {

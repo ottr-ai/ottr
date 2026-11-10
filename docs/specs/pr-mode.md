@@ -117,6 +117,33 @@ run for PR-mode cards: nothing local is pushed to the target. The
 does not gate PR-mode cards either — the local target branch is never
 written.
 
+### Cards filed from an existing pull request
+
+A Dependabot PR becomes a card that carries the PR as its source (OTTR-760):
+`source_pr_number`, `source_pr_url`, the head ref and head sha at filing
+time, whether the head lives in a fork, and the Dependabot flag — additive
+columns migrated in `ProjectStore.open` like the PR fields above. The ship
+step checks the source before it ever opens a PR:
+
+- A clean bump — the card branch holds exactly the source PR's content
+  (same tip, or an identical tree after a cherry-pick) — adopts the source
+  PR: `pr_number`/`pr_url`/`pr_head_sha` take its values, the card waits in
+  `merging`/`idle`, and the PR pass finishes it when GitHub merges. No
+  second pull request is ever opened, and `pushSha` stays empty: the board
+  watches the PR, not a sha the author can rebase away.
+- Fixes beyond the PR head land on the PR's own head branch only when that
+  branch lives on origin and Dependabot does not own it: the push is a plain
+  fast-forward (a moved remote branch rejects instead of overwriting the
+  author's commits) and the card adopts the PR afterwards.
+- Everything else — a fork head, a Dependabot branch (the bot abandons a PR
+  once someone else pushes to it), a diverged branch — comments on the
+  source PR (`@dependabot rebase` for Dependabot, a note about the parked
+  fixes otherwise) and parks the card `merging`/`needs_you` with a reason
+  that names the PR and the card branch.
+
+Cards without a source PR keep the adopt-or-create ship step above; the
+ff-only merge flow is untouched.
+
 ## While the PR is open
 
 - Stage Merging, state idle (no `!` badge). The drawer shows the PR link
@@ -162,10 +189,12 @@ per-PR `gh api repos/{repo}/pulls/N` call to read its settled state.
 ## Store
 
 - Additive task columns: `pr_number INTEGER`, `pr_url TEXT`,
-  `pr_head_sha TEXT`, all nullable — added to the `CREATE TABLE` text in
-  src/store.ts and migrated in `ProjectStore.open` with the column-backfill
-  pattern in the same commit (ADR 0003). No new `stage` or `state` enum
-  value, so no CHECK-constraint rebuild.
+  `pr_head_sha TEXT`, plus the OTTR-760 source-PR columns
+  (`source_pr_number`, `source_pr_url`, `source_pr_head_ref`,
+  `source_pr_head_sha`, `source_pr_cross_repo`, `source_pr_dependabot`),
+  all nullable or defaulting to 0/false — migrated in `ProjectStore.open`
+  with the column-backfill pattern in the same commit (ADR 0003). No new
+  `stage` or `state` enum value, so no CHECK-constraint rebuild.
 - `TaskView` carries the PR fields; the drawer links the PR.
 
 ## ADR

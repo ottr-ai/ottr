@@ -24,7 +24,12 @@ import {
 } from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
-import { listPulls, openPrsView, openPullRequest } from "./prs.ts";
+import {
+	commentOnPullRequest,
+	listPulls,
+	openPrsView,
+	openPullRequest,
+} from "./prs.ts";
 import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
@@ -103,6 +108,7 @@ import {
 	targetCommits,
 	targetContains,
 	trackedFiles,
+	treesEqual,
 	unsavedWork,
 	worktreeHusk,
 	worktreeLinked,
@@ -586,6 +592,7 @@ const loop = createTurnLoop(projects, {
 	targetCommits,
 	targetSha,
 	targetContains,
+	treesEqual,
 	branchUnpushed,
 	checkedOutBranch,
 	checkoutState,
@@ -595,6 +602,9 @@ const loop = createTurnLoop(projects, {
 	// clean worktree with origin/<target> an ancestor of HEAD.
 	pushBranch,
 	openPr: openPullRequest,
+	// OTTR-760: the ship step comments on a card's source PR ("@dependabot rebase", or the
+	// fixes note) when the work cannot ride a push to the PR's head branch.
+	prComment: commentOnPullRequest,
 	prIntegrated,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),

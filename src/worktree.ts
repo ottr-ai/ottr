@@ -1755,6 +1755,8 @@ export async function pushBranch(
 	mainPath: string,
 	branch: string,
 	originUrl: string,
+	/** Push to a different ref name on origin (OTTR-760: a source PR's head branch); default the branch's own name. */
+	dstBranch: string = branch,
 ): Promise<
 	| { status: "pushed"; output: string }
 	| { status: "failed" | "rejected"; error: string; output?: string }
@@ -1768,17 +1770,20 @@ export async function pushBranch(
 	};
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
-	const tip = await sha(`refs/remotes/origin/${branch}`);
+	const tip = await sha(`refs/remotes/origin/${dstBranch}`);
 	const r = await git(
 		[
 			"push",
 			// Absent a remote-tracking tip (first push of the branch) there is nothing to lease
-			// against: the push itself establishes the branch on origin.
-			...(tip !== null
-				? [`--force-with-lease=refs/heads/${branch}:${tip}`]
+			// against: the push itself establishes the branch on origin. A different
+			// destination (OTTR-760: a source PR's head branch) never forces — the push must
+			// be the fast-forward the ancestor check proved, and a moved remote branch
+			// rejects instead of overwriting someone else's new commits.
+			...(tip !== null && dstBranch === branch
+				? [`--force-with-lease=refs/heads/${dstBranch}:${tip}`]
 				: []),
 			originUrl,
-			`refs/heads/${branch}:refs/heads/${branch}`,
+			`refs/heads/${branch}:refs/heads/${dstBranch}`,
 		],
 		mainPath,
 	);
@@ -1786,7 +1791,7 @@ export async function pushBranch(
 		const local = await sha(`refs/heads/${branch}`);
 		if (local !== null)
 			await git(
-				["update-ref", `refs/remotes/origin/${branch}`, local],
+				["update-ref", `refs/remotes/origin/${dstBranch}`, local],
 				mainPath,
 			);
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
@@ -2340,6 +2345,17 @@ export async function targetContains(
 	target: string,
 ): Promise<boolean> {
 	const r = await git(["merge-base", "--is-ancestor", sha, target], mainPath);
+	return r.code === 0;
+}
+
+/** OTTR-760: true when two commits hold identical trees — a cherry-picked PR head landed
+ * unchanged, so the card branch carries exactly the source PR's content. */
+export async function treesEqual(
+	mainPath: string,
+	a: string,
+	b: string,
+): Promise<boolean> {
+	const r = await git(["diff", "--quiet", "--no-ext-diff", a, b], mainPath);
 	return r.code === 0;
 }
 

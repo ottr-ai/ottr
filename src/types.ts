@@ -429,6 +429,17 @@ export interface Task {
 	prNumber: number | null;
 	prUrl: string | null;
 	prHeadSha: string | null;
+	/** OTTR-760: the pull request this card was filed from (a Dependabot PR); null for every other card. The ship step adopts it instead of opening a second PR. */
+	sourcePrNumber: number | null;
+	sourcePrUrl: string | null;
+	/** The source PR's head branch name at filing time; the push target when the card's fixes land on the PR. */
+	sourcePrHeadRef: string | null;
+	/** The source PR's head sha at filing time; the base the ship step compares the card branch against. */
+	sourcePrHeadSha: string | null;
+	/** True when the source PR's head lives in another repository (a fork): the board can never push fixes there. */
+	sourcePrCrossRepo: boolean;
+	/** True when the source PR came from Dependabot: the bot stops updating a branch someone else pushed to, so the board comments "@dependabot rebase" instead of pushing. */
+	sourcePrDependabot: boolean;
 	/** OTTR-394: automatic rebase retries a rejected server push has spent (budget 2 per card). */
 	pushRetries: number;
 	/** Integration target head when the task finished (stamped with `commits`); the anchor that attributes a release's late commits to the card that merged them. null when unmeasured or not done. */

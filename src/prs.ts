@@ -210,6 +210,44 @@ export async function openPullRequest(o: {
 	return { ok: true, pr };
 }
 
+/**
+ * OTTR-760: posts one comment on a pull request (PRs are issues, so the comment endpoint
+ * is the issues one). The response is untrusted: ok only when gh exits 0 and the body
+ * parses to a comment with an id. A failed gh call returns the failure for the caller's
+ * park reason.
+ */
+export async function commentOnPullRequest(o: {
+	repo: string;
+	number: number;
+	body: string;
+	gh?: GhFn;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+	const gh = o.gh ?? runGh;
+	const r = await gh([
+		"api",
+		`repos/${o.repo}/issues/${o.number}/comments`,
+		"-X",
+		"POST",
+		"-f",
+		`body=${o.body}`,
+	]);
+	if (r.code !== 0) {
+		const err = r.stderr.trim().split("\n").filter(Boolean).pop() ?? "";
+		return {
+			ok: false,
+			error:
+				err !== "" ? err.slice(0, 300) : `gh comment create exited ${r.code}`,
+		};
+	}
+	try {
+		const j = JSON.parse(r.stdout) as { id?: unknown };
+		if (typeof j.id === "number") return { ok: true };
+	} catch {
+		// unreadable body: fall through
+	}
+	return { ok: false, error: "gh comment create returned an unreadable body" };
+}
+
 /** The repo's open pull requests, newest first, every field parsed as untrusted. Shared by
  * the review watcher and the header chip refresh (server.ts). */
 export async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {

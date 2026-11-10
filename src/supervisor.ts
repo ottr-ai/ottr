@@ -195,12 +195,25 @@ export function dependabotPrompt(
 	].join("\n");
 }
 
-/** Open PRs from `gh pr list --json number,title,createdAt`. The JSON is untrusted: only entries with a
- * positive safe-integer number, a string title and a parseable createdAt (epoch ms) pass. A string
- * result is the error. Pure. */
-function dependabotPrs(
-	stdout: string,
-): { n: number; title: string; createdAt: number }[] | string {
+/** One open Dependabot PR the poll accepted; every field already validated by dependabotPrs. */
+interface DependabotPr {
+	n: number;
+	title: string;
+	createdAt: number;
+	/** The PR's head branch name at poll time (sanitized); the push target for the card's fixes. */
+	headRefName: string;
+	/** The PR head sha at poll time; the base the ship step compares the card branch against. */
+	headSha: string;
+	/** True when the head lives in a fork: the board can never push fixes there. */
+	crossRepo: boolean;
+}
+
+/** Open PRs from `gh pr list --json number,title,createdAt,headRefName,headRefOid,
+ * isCrossRepository`. The JSON is untrusted: only entries with a positive safe-integer
+ * number, a string title, a parseable createdAt (epoch ms), a non-empty sanitized string
+ * head ref, a hex head sha and a boolean isCrossRepository pass. A string result is the
+ * error. Pure. */
+function dependabotPrs(stdout: string): DependabotPr[] | string {
 	let prs: unknown;
 	try {
 		prs = JSON.parse(stdout);
@@ -213,18 +226,45 @@ function dependabotPrs(
 			number: n,
 			title,
 			createdAt,
+			headRefName,
+			headRefOid,
+			isCrossRepository,
 		} = (raw ?? {}) as {
 			number?: unknown;
 			title?: unknown;
 			createdAt?: unknown;
+			headRefName?: unknown;
+			headRefOid?: unknown;
+			isCrossRepository?: unknown;
 		};
 		const ms = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
+		const ref =
+			typeof headRefName === "string"
+				? headRefName
+						.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ")
+						.trim()
+						.slice(0, 200)
+				: "";
+		const shaHex = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 		return typeof n === "number" &&
 			Number.isSafeInteger(n) &&
 			n > 0 &&
 			typeof title === "string" &&
-			!Number.isNaN(ms)
-			? [{ n, title, createdAt: ms }]
+			!Number.isNaN(ms) &&
+			ref !== "" &&
+			typeof headRefOid === "string" &&
+			shaHex.test(headRefOid) &&
+			typeof isCrossRepository === "boolean"
+			? [
+					{
+						n,
+						title,
+						createdAt: ms,
+						headRefName: ref,
+						headSha: headRefOid,
+						crossRepo: isCrossRepository,
+					},
+				]
 			: [];
 	});
 }
@@ -1530,7 +1570,7 @@ export function createSupervisor(
 	async function dependabotFileCards(
 		e: SupervisorEntry,
 		repo: string,
-		prs: { n: number; title: string; createdAt: number }[],
+		prs: DependabotPr[],
 	): Promise<void> {
 		// A stored card blocks only when it is at least as new as the PR: a repo can restart
 		// its PR numbers, so an older card with the same number must not skip the new PR.
@@ -1539,7 +1579,7 @@ export function createSupervisor(
 			head: x.prompt.split("\n", 1)[0] ?? "",
 			createdAt: x.createdAt,
 		}));
-		for (const { n, title, createdAt } of prs) {
+		for (const { n, title, createdAt, headRefName, crossRepo } of prs) {
 			const head = dependabotHead(n, repo);
 			if (
 				cards.some((c) => c.head.startsWith(head) && c.createdAt >= createdAt)
@@ -1554,8 +1594,29 @@ export function createSupervisor(
 				);
 				continue;
 			}
+			// The head sha must sit on the fetched ref before the card names it: the
+			// card's turn reads refs/ottr/pr/N from the main checkout with no fetch.
+			const sha = await ops
+				.targetSha(e.path, `refs/ottr/pr/${n}`)
+				.catch(() => null);
+			if (sha === null) {
+				console.error(
+					`supervisor: project ${e.name}: Dependabot PR #${n} head sha unreadable; skipped`,
+				);
+				continue;
+			}
 			cards.push({ head, createdAt });
 			const child = e.store.createTask(dependabotPrompt(n, repo, title));
+			// OTTR-760: the card carries its source PR, so the ship step adopts that PR
+			// instead of opening a second one.
+			e.store.updateTask(child.id, {
+				sourcePrNumber: n,
+				sourcePrUrl: `${githubHost().webBase}/${repo}/pull/${n}`,
+				sourcePrHeadRef: headRefName,
+				sourcePrHeadSha: sha,
+				sourcePrCrossRepo: crossRepo,
+				sourcePrDependabot: true,
+			});
 			ops.schedule();
 			ops.appendLog(
 				e.store,
@@ -1587,7 +1648,7 @@ export function createSupervisor(
 				"--state",
 				"open",
 				"--json",
-				"number,title,createdAt",
+				"number,title,createdAt,headRefName,headRefOid,isCrossRepository",
 				"--limit",
 				"100",
 			])

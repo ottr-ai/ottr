@@ -286,6 +286,12 @@ interface TaskRow {
 	pr_number: number | null;
 	pr_url: string | null;
 	pr_head_sha: string | null;
+	source_pr_number: number | null;
+	source_pr_url: string | null;
+	source_pr_head_ref: string | null;
+	source_pr_head_sha: string | null;
+	source_pr_cross_repo: number;
+	source_pr_dependabot: number;
 	topic: string | null;
 	depends_on: string;
 	update_ids: string;
@@ -474,6 +480,12 @@ function toListedTask(
 		prNumber: r.pr_number,
 		prUrl: r.pr_url,
 		prHeadSha: r.pr_head_sha,
+		sourcePrNumber: r.source_pr_number,
+		sourcePrUrl: r.source_pr_url,
+		sourcePrHeadRef: r.source_pr_head_ref,
+		sourcePrHeadSha: r.source_pr_head_sha,
+		sourcePrCrossRepo: r.source_pr_cross_repo === 1,
+		sourcePrDependabot: r.source_pr_dependabot === 1,
 		topic: r.topic,
 		dependsOn: parseStringList(r.depends_on),
 		updateIds: parseStringList(r.update_ids),
@@ -730,6 +742,12 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	prNumber: "pr_number",
 	prUrl: "pr_url",
 	prHeadSha: "pr_head_sha",
+	sourcePrNumber: "source_pr_number",
+	sourcePrUrl: "source_pr_url",
+	sourcePrHeadRef: "source_pr_head_ref",
+	sourcePrHeadSha: "source_pr_head_sha",
+	sourcePrCrossRepo: "source_pr_cross_repo",
+	sourcePrDependabot: "source_pr_dependabot",
 	topic: "topic",
 	dependsOn: "depends_on",
 	updateIds: "update_ids",
@@ -1749,6 +1767,45 @@ export class ProjectStore {
 			cols,
 			"pr_head_sha",
 			"ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT",
+		);
+		// OTTR-760: the pull request a card was filed from (a Dependabot PR). The ship step
+		// adopts it instead of opening a second PR. ALTER-only after both CHECK rebuilds,
+		// same reason as pr_number above — a rebuild's explicit column list would drop them.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_number",
+			"ALTER TABLE tasks ADD COLUMN source_pr_number INTEGER",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_url",
+			"ALTER TABLE tasks ADD COLUMN source_pr_url TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_head_ref",
+			"ALTER TABLE tasks ADD COLUMN source_pr_head_ref TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_head_sha",
+			"ALTER TABLE tasks ADD COLUMN source_pr_head_sha TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_cross_repo",
+			"ALTER TABLE tasks ADD COLUMN source_pr_cross_repo INTEGER NOT NULL DEFAULT 0",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"source_pr_dependabot",
+			"ALTER TABLE tasks ADD COLUMN source_pr_dependabot INTEGER NOT NULL DEFAULT 0",
 		);
 		const turnCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")

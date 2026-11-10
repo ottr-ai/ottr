@@ -18990,6 +18990,186 @@ describe("turn PR-mode merge settle", () => {
 		expect(record.runs[0]!.prompt).not.toContain("git merge --ff-only");
 	});
 
+	/** OTTR-760 source fields for a Dependabot PR #20; spread overrides per case. */
+	function sourcePr(
+		over: Record<string, unknown> = {},
+	): Record<string, unknown> {
+		return {
+			sourcePrNumber: 20,
+			sourcePrUrl: "https://github.com/acme/repo/pull/20",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "pr-head",
+			sourcePrCrossRepo: false,
+			sourcePrDependabot: true,
+			...over,
+		};
+	}
+
+	test("a clean Dependabot bump adopts its PR: no second PR opens (OTTR-760)", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "pr-head" : "sha-old",
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a clean source bump");
+			},
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prNumber).toBe(20);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/20");
+		expect(after.prHeadSha).toBe("pr-head");
+		// The PR's CI runs on a head its author can rebase; the board watches the PR.
+		expect(after.pushSha).toBe(null);
+		expect(logText(store, task.id)).toContain(
+			"- source PR #20 stays the card's PR",
+		);
+	});
+
+	test("a cherry-picked clean bump with the same tree adopts its PR too (OTTR-760)", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-cherry" : "sha-old",
+			treesEqual: async (_m: string, a: string, b: string) =>
+				a === "pr-head" && b === "sha-cherry",
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.prNumber).toBe(20);
+		expect(after.prHeadSha).toBe("pr-head");
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+	});
+
+	test("fixes on a cross-repo source PR park with the PR named and never open a PR (OTTR-760)", async () => {
+		const comments: { repo: string; number: number; body: string }[] = [];
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a cross-repo source PR");
+			},
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+		});
+		store.updateTask(
+			task.id,
+			sourcePr({ sourcePrCrossRepo: true, sourcePrDependabot: false }),
+		);
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("source PR #20");
+		expect(after.needsReason).toContain("https://github.com/acme/repo/pull/20");
+		expect(after.prNumber).toBe(null);
+		expect(comments).toEqual([
+			{
+				repo: "acme/repo",
+				number: 20,
+				body: expect.stringContaining("ott/m"),
+			},
+		]);
+	});
+
+	test("fixes on a Dependabot PR comment @dependabot rebase instead of pushing (OTTR-760)", async () => {
+		const comments: { repo: string; number: number; body: string }[] = [];
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => {
+				throw new Error("pushBranch must never push to a Dependabot branch");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run for a source-PR card");
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("@dependabot");
+		expect(comments).toEqual([
+			{ repo: "acme/repo", number: 20, body: "@dependabot rebase" },
+		]);
+	});
+
+	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
+		const pushes: unknown[][] = [];
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(
+			task.id,
+			sourcePr({
+				sourcePrDependabot: false,
+				sourcePrHeadRef: "contrib/fix-branch",
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		expect(pushes).toEqual([
+			[
+				store.path,
+				"ott/m",
+				"https://github.com/acme/repo.git",
+				"contrib/fix-branch",
+			],
+		]);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(20);
+		expect(after.prHeadSha).toBe("sha-fixed");
+	});
+
 	test("a failed branch push parks merging/needs_you and never opens the PR", async () => {
 		let opened = false;
 		const { store, loop, task } = prMergeSetup({

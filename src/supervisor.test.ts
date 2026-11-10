@@ -109,6 +109,9 @@ function ghApi(
 	return r;
 }
 
+/** The PR head sha fakeOps reports for a fetched refs/ottr/pr/N ref (OTTR-760). */
+const DEP_PR_SHA = "e".repeat(40);
+
 function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 	const ops: FakeOps = {
 		calls: {
@@ -188,7 +191,10 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			return [];
 		},
 		targetCommits: async () => 3,
-		targetSha: async (_mainPath, ref) => ops.targetShas[ref] ?? null,
+		targetSha: async (_mainPath, ref) =>
+			ops.targetShas[ref] ??
+			// OTTR-760: a successful dependabot fetch leaves the PR head ref readable.
+			(ref.startsWith("refs/ottr/pr/") ? DEP_PR_SHA : null),
 		fetchOriginBranch: async (_mainPath, branch) => {
 			ops.calls.fetches.push(branch);
 			return ops.fetchErr;
@@ -2293,6 +2299,24 @@ describe("Dependabot pass", () => {
 		return { store, e: entry(store, p) };
 	}
 
+	/** One well-shaped Dependabot PR list entry: the head fields OTTR-760 requires. */
+	function depPr(
+		n: number,
+		title: string,
+		createdAt: string,
+		over: Record<string, unknown> = {},
+	): Record<string, unknown> {
+		return {
+			number: n,
+			title,
+			createdAt,
+			headRefName: `dependabot/npm_and_yarn/pkg-${n}`,
+			headRefOid: DEP_PR_SHA,
+			isCrossRepository: false,
+			...over,
+		};
+	}
+
 	function ghOk(stdout: unknown): {
 		code: number;
 		stdout: string;
@@ -2307,11 +2331,7 @@ describe("Dependabot pass", () => {
 		const { store, e } = depProject("dep-file");
 		const ops = fakeOps({
 			prResult: ghOk([
-				{
-					number: 7,
-					title: "Bump vite from 5.0.0 to 6.0.0",
-					createdAt: "2026-10-30T00:00:00Z",
-				},
+				depPr(7, "Bump vite from 5.0.0 to 6.0.0", "2026-10-30T00:00:00Z"),
 			]),
 		});
 		await tick(new Map([["proj", e]]), ops);
@@ -2334,15 +2354,96 @@ describe("Dependabot pass", () => {
 		store.close();
 	});
 
+	test("files the card with its source PR fields (OTTR-760)", async () => {
+		const { store, e } = depProject("dep-source-fields");
+		const ops = fakeOps({
+			prResult: ghOk([
+				depPr(20, "Bump vite from 5.0.0 to 6.0.0", "2026-11-01T00:00:00Z", {
+					headRefName: "dependabot/npm_and_yarn/vite-7.1.2",
+				}),
+			]),
+		});
+		await tick(new Map([["proj", e]]), ops);
+		const card = store.listTasks()[0]!;
+		expect(card.sourcePrNumber).toBe(20);
+		expect(card.sourcePrUrl).toBe("https://github.com/acme/widget/pull/20");
+		expect(card.sourcePrHeadRef).toBe("dependabot/npm_and_yarn/vite-7.1.2");
+		expect(card.sourcePrHeadSha).toBe(DEP_PR_SHA);
+		expect(card.sourcePrCrossRepo).toBe(false);
+		expect(card.sourcePrDependabot).toBe(true);
+		store.close();
+	});
+
+	test("drops PR entries without a usable head (OTTR-760)", async () => {
+		const { store, e } = depProject("dep-head-shape");
+		const ops = fakeOps({
+			prResult: ghOk([
+				depPr(1, "no ref", "2026-11-01T00:00:00Z", { headRefName: undefined }),
+				depPr(2, "no sha", "2026-11-01T00:00:00Z", { headRefOid: undefined }),
+				depPr(3, "bad sha", "2026-11-01T00:00:00Z", { headRefOid: "ZZZ" }),
+				depPr(4, "no cross flag", "2026-11-01T00:00:00Z", {
+					isCrossRepository: undefined,
+				}),
+				depPr(5, "ok", "2026-11-01T00:00:00Z"),
+			]),
+		});
+		await tick(new Map([["proj", e]]), ops);
+		expect(store.listTasks().map(firstLine)).toEqual([
+			"Dependabot PR #5 (https://github.com/acme/widget/pull/5): ok",
+		]);
+		store.close();
+	});
+
+	test("a filed Dependabot card finishes done when its source PR merges (OTTR-760)", async () => {
+		const { store, e } = depProject("dep-source-merge");
+		store.setSettings({ prMode: true });
+		mkdirSync(join(root, "dep-source-merge", ".wt"), { recursive: true });
+		const ops = fakeOps({
+			prResult: ghOk([
+				depPr(20, "Bump vite from 5.0.0 to 6.0.0", "2026-11-01T00:00:00Z"),
+			]),
+			apiResult: (url) =>
+				url.endsWith("/pulls/20")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		const projects = new Map([["proj", e]]);
+		await tick(projects, ops);
+		const card = store.listTasks()[0]!;
+		expect(card.sourcePrNumber).toBe(20);
+		// The ship step's adopt stamps the source PR as the card's PR (turn.ts
+		// adoptSourcePr); the same write here puts the settle on the post-adopt shape.
+		store.updateTask(card.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 20,
+			prUrl: card.sourcePrUrl,
+			prHeadSha: card.sourcePrHeadSha,
+			worktree: join(root, "dep-source-merge", ".wt"),
+		});
+		// Past the PR poll window, so the settle pass runs again.
+		ops.time += 6 * 60_000;
+		await tick(projects, ops);
+		const after = store.getTask(card.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		store.close();
+	});
+
 	test("fetches the PR head before it files the card (OTTR-755)", async () => {
 		const { store, e } = depProject("dep-fetch-order");
 		const ops = fakeOps({
 			prResult: ghOk([
-				{
-					number: 7,
-					title: "Bump vite from 5.0.0 to 6.0.0",
-					createdAt: "2026-10-30T00:00:00Z",
-				},
+				depPr(7, "Bump vite from 5.0.0 to 6.0.0", "2026-10-30T00:00:00Z"),
 			]),
 			fetchPrHead: async (mainPath, n, url) => {
 				ops.calls.prFetches.push({ mainPath, n, url });
@@ -2364,8 +2465,8 @@ describe("Dependabot pass", () => {
 		const { store, e } = depProject("dep-fetch-fail");
 		const ops = fakeOps({
 			prResult: ghOk([
-				{ number: 3, title: "b", createdAt: "2026-10-30T00:00:00Z" },
-				{ number: 4, title: "c", createdAt: "2026-10-30T00:00:00Z" },
+				depPr(3, "b", "2026-10-30T00:00:00Z"),
+				depPr(4, "c", "2026-10-30T00:00:00Z"),
 			]),
 			fetchPrHead: async (mainPath, n, url) => {
 				ops.calls.prFetches.push({ mainPath, n, url });
@@ -2398,9 +2499,7 @@ describe("Dependabot pass", () => {
 	test("a failed PR-head fetch retries at the next poll and files the card then (OTTR-755)", async () => {
 		const { store, e } = depProject("dep-fetch-retry");
 		const ops = fakeOps({
-			prResult: ghOk([
-				{ number: 5, title: "bump", createdAt: "2026-10-30T00:00:00Z" },
-			]),
+			prResult: ghOk([depPr(5, "bump", "2026-10-30T00:00:00Z")]),
 			prFetchErr: "authentication failed",
 		});
 		const projects = new Map([["proj", e]]);
@@ -2439,9 +2538,7 @@ describe("Dependabot pass", () => {
 		await tick(projects, ops);
 		expect(ops.prCalls).toBe(1);
 		ops.time += 1000; // exactly 1 h after the first poll
-		ops.prResult = ghOk([
-			{ number: 3, title: "b", createdAt: "2026-10-30T00:00:00Z" },
-		]);
+		ops.prResult = ghOk([depPr(3, "b", "2026-10-30T00:00:00Z")]);
 		await tick(projects, ops);
 		expect(ops.prCalls).toBe(2);
 		expect(store.listTasks()).toHaveLength(1);
@@ -2457,17 +2554,13 @@ describe("Dependabot pass", () => {
 		const cancelled = store.createTask(`${head}: bump c`);
 		store.updateTask(cancelled.id, { cancelledAt: 1 });
 		const ops = fakeOps({
-			prResult: ghOk([
-				{ number: 1, title: "bump a", createdAt: "2000-01-01T00:00:00Z" },
-			]),
+			prResult: ghOk([depPr(1, "bump a", "2000-01-01T00:00:00Z")]),
 		});
 		const projects = new Map([["proj", e]]);
 		await tick(projects, ops);
 		expect(store.listTasks()).toHaveLength(3);
 		ops.time += HOUR;
-		ops.prResult = ghOk([
-			{ number: 12, title: "bump d", createdAt: "2000-01-01T00:00:00Z" },
-		]);
+		ops.prResult = ghOk([depPr(12, "bump d", "2000-01-01T00:00:00Z")]);
 		await tick(projects, ops);
 		expect(store.listTasks()).toHaveLength(4);
 		expect(store.listTasks().map(firstLine)).toContain(
@@ -2483,9 +2576,7 @@ describe("Dependabot pass", () => {
 		const cancelled = store.createTask(`${head}: old bump c`);
 		store.updateTask(cancelled.id, { cancelledAt: 1 });
 		const ops = fakeOps({
-			prResult: ghOk([
-				{ number: 3, title: "new bump", createdAt: "2999-01-01T00:00:00Z" },
-			]),
+			prResult: ghOk([depPr(3, "new bump", "2999-01-01T00:00:00Z")]),
 		});
 		await tick(new Map([["proj", e]]), ops);
 		expect(store.listTasks().map(firstLine)).toContain(
@@ -2517,7 +2608,7 @@ describe("Dependabot pass", () => {
 				{ number: 1, title: "no date" },
 				{ number: 2, title: "bad date", createdAt: "not-a-date" },
 				{ number: 3, title: "number date", createdAt: 42 },
-				{ number: 4, title: "ok", createdAt: "2026-10-30T00:00:00Z" },
+				depPr(4, "ok", "2026-10-30T00:00:00Z"),
 			]),
 		});
 		await tick(new Map([["proj", e]]), ops);
@@ -2595,9 +2686,7 @@ describe("Dependabot pass", () => {
 				expect(errs[0]![0]).toBe(c.errorLine);
 			}
 			ops.time += HOUR;
-			ops.prResult = ghOk([
-				{ number: 4, title: "x", createdAt: "2026-10-30T00:00:00Z" },
-			]);
+			ops.prResult = ghOk([depPr(4, "x", "2026-10-30T00:00:00Z")]);
 			await tick(projects, ops);
 			expect(store.listTasks()).toHaveLength(1);
 			store.close();
@@ -2615,17 +2704,10 @@ describe("Dependabot pass", () => {
 				{ number: 1.5, title: "a" },
 				{ number: "3", title: "a" },
 				{ number: 5, title: 42 },
-				{
-					number: 9,
-					title: "Bump x\nfrom 1\tto 2",
-					createdAt: "2026-10-30T00:00:00Z",
-				},
-				{
-					number: 11,
-					title: "ok",
-					createdAt: "2026-10-30T00:00:00Z",
+				depPr(9, "Bump x\nfrom 1\tto 2", "2026-10-30T00:00:00Z"),
+				depPr(11, "ok", "2026-10-30T00:00:00Z", {
 					url: "https://evil.example/pull/999",
-				},
+				}),
 			]),
 		});
 		await tick(new Map([["proj", e]]), ops);
@@ -2657,7 +2739,7 @@ describe("Dependabot pass", () => {
 			"--state",
 			"open",
 			"--json",
-			"number,title,createdAt",
+			"number,title,createdAt,headRefName,headRefOid,isCrossRepository",
 			"--limit",
 			"100",
 		]);
