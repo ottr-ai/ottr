@@ -94,6 +94,7 @@ import {
 	testRemote,
 } from "./gitHosts.ts";
 import { handleGit } from "./gitHttp.ts";
+import { githubAlertSummary } from "./githubAlerts.ts";
 import {
 	AppTokenSource,
 	appCheckWarning,
@@ -3184,6 +3185,10 @@ export function createApp(deps: AppDeps) {
 			resolved.target,
 			lastReviewBase(e.store.listTasks()),
 		).catch(() => null);
+		// Network before the guard, like the git spawns, so the guard and createTask below
+		// stay one synchronous block (R1-8). Never throws: a failed fetch lands in the
+		// prompt as "alerts unavailable: <reason>".
+		const alerts = await githubAlertSummary({ repo: e.github, gh });
 		// The git spawns run BEFORE the guard, so the guard and createTask below sit in one
 		// synchronous block: two overlapping requests cannot both pass it (R1-8).
 		const blocked = reviewBlocked(e.store.listTasks());
@@ -3209,6 +3214,7 @@ export function createApp(deps: AppDeps) {
 				sha: resolved.sha,
 				from: delta.reviewed ? delta.anchor : null,
 				commits: delta.delta,
+				alerts,
 			}),
 			model,
 			"review",
@@ -9390,6 +9396,10 @@ export function createApp(deps: AppDeps) {
 		if (planned instanceof Response) return planned;
 		const semverGate = await checkReleaseSemver(e);
 		if (semverGate instanceof Response) return semverGate;
+		// Network before the guard: resolveReleaseOverrides keeps the R1-8 ordering with no
+		// await between the guard and createTask. Never throws: a failed fetch lands in the
+		// prompt as "alerts unavailable: <reason>".
+		const alerts = await githubAlertSummary({ repo: e.github, gh });
 		const overrides = await resolveReleaseOverrides(e, planned.plan, r.body);
 		if (overrides instanceof Response) return overrides;
 		return createReleaseCard(
@@ -9398,6 +9408,7 @@ export function createApp(deps: AppDeps) {
 			overrides.version,
 			overrides.notes,
 			overrides.model,
+			alerts,
 		);
 	}
 
@@ -9407,6 +9418,7 @@ export function createApp(deps: AppDeps) {
 		version: string,
 		notes: string,
 		model: string | null,
+		alerts: string,
 	) {
 		const t = e.store.createTask(
 			releasePrompt({
@@ -9415,6 +9427,7 @@ export function createApp(deps: AppDeps) {
 				sha: plan.sha,
 				commits: plan.commits,
 				notes,
+				alerts,
 			}),
 			model,
 		);

@@ -8099,6 +8099,142 @@ describe("arch-review duplicate guard (R1-8)", () => {
 	});
 });
 
+describe("review and release cards carry the board's GitHub alerts", () => {
+	const opened: Entry[] = [];
+	afterAll(() => {
+		for (const e of opened) e.store.close();
+	});
+
+	/** A mount with one project whose remote points at octo/repo, ready for a review post. */
+	async function alertMount(gh: GhFn) {
+		const name = `alerts-${Math.random().toString(36).slice(2, 8)}`;
+		const projects = new Map<string, Entry>();
+		const m = mount({ projects, gh });
+		const add = await m.call("/api/projects", { name });
+		expect(add.status).toBe(200);
+		const e = projects.get(name)!;
+		e.target = "main";
+		e.github = "https://github.com/octo/repo.git";
+		opened.push(e);
+		return { m, e };
+	}
+
+	const reviewCard = (e: Entry): ListedTask | undefined =>
+		e.store.listTasks().find((t) => t.kind === "review");
+
+	test("a 403 from the alerts fetch still files the review card, with the unavailable note", async () => {
+		const { m, e } = await alertMount(async () => ({
+			code: 1,
+			stdout: "",
+			stderr: "gh: Forbidden (HTTP 403)",
+		}));
+		const res = await m.call(`/api/projects/${e.name}/arch-review`, {});
+		expect(res.status).toBe(200);
+		expect(reviewCard(e)?.prompt).toContain(
+			"alerts unavailable: gh: Forbidden (HTTP 403)",
+		);
+		expect(reviewCard(e)?.prompt).not.toContain(
+			"GitHub security alerts for octo/repo",
+		);
+	});
+
+	test("a good fetch lands the summary on the review card, never a secret value", async () => {
+		const { m, e } = await alertMount(async (args) => {
+			const path = args[1] ?? "";
+			const stdout = path.includes("dependabot")
+				? JSON.stringify([
+						{
+							number: 5,
+							severity: "critical",
+							dependency: { package: { name: "lodash" } },
+							security_advisory: {
+								summary: "Prototype pollution",
+								severity: "critical",
+							},
+							security_vulnerability: {
+								vulnerable_version_range: "< 4.17.21",
+							},
+							html_url: "https://github.com/octo/repo/security/dependabot/5",
+						},
+					])
+				: path.includes("code-scanning")
+					? "[]"
+					: JSON.stringify([
+							{
+								number: 2,
+								secret: "ghp_SUPERSECRETVALUE123",
+								secret_type: "github_personal_access_token",
+								secret_type_display_name: "GitHub Personal Access Token",
+								html_url:
+									"https://github.com/octo/repo/security/secret-scanning/2",
+							},
+						]);
+			return { code: 0, stdout, stderr: "" };
+		});
+		const res = await m.call(`/api/projects/${e.name}/arch-review`, {});
+		expect(res.status).toBe(200);
+		const prompt = reviewCard(e)?.prompt ?? "";
+		expect(prompt).toContain("GITHUB ALERTS");
+		expect(prompt).toContain("GitHub security alerts for octo/repo: 2 open.");
+		expect(prompt).toContain("lodash < 4.17.21 (critical)");
+		expect(prompt).toContain("GitHub Personal Access Token");
+		expect(prompt).not.toContain("ghp_SUPERSECRETVALUE123");
+	});
+
+	test("the release card carries the same summary", async () => {
+		const dir = join(
+			root,
+			`alerts-rel-${Math.random().toString(36).slice(2, 8)}`,
+		);
+		mkdirSync(dir, { recursive: true });
+		const run = (cmd: string): string =>
+			execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		run("git init -q -b main");
+		run("git config user.email t@t && git config user.name t");
+		writeFileSync(join(dir, "seed.txt"), "x");
+		run("git add seed.txt && git commit -qm 'seed'");
+		run("git tag v0.1.0");
+		writeFileSync(join(dir, "feat.txt"), "x");
+		run("git add feat.txt && git commit -qm 'feat: consolidated feature'");
+		const store = ProjectStore.open(dir);
+		const entry: Entry = {
+			path: dir,
+			name: "alerts-rel",
+			store,
+			target: "main",
+			gitless: false,
+			github: "https://github.com/octo/repo.git",
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		const m = mount({
+			projects: new Map([["alerts-rel", entry]]),
+			gh: async () => ({ code: 0, stdout: "[]", stderr: "" }),
+			latestRelease: async () => null,
+		});
+		try {
+			const res = await m.call("/api/projects/alerts-rel/release", {
+				sha: run("git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const release = store.listTasks().find((t) => t.releaseVersion !== null);
+			expect(release?.prompt).toContain("GITHUB ALERTS");
+			expect(release?.prompt).toContain(
+				"GitHub security alerts for octo/repo: 0 open.",
+			);
+		} finally {
+			store.close();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("triage route", () => {
 	test("rejects an empty patch and a bad priority", async () => {
 		const task = store.createTask("triage me");
