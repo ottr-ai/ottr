@@ -130,13 +130,22 @@ describe("default config path", () => {
 		const pinned = join(tmpdir(), `ottr-modelroles-pin-${process.pid}`);
 		mkdirSync(pinned, { recursive: true });
 		writeFileSync(join(pinned, "config.yml"), "modelRoles: {default: pin/m}\n");
-		const saved = process.env.PI_CODING_AGENT_DIR;
+		// Layer-following read (docs/specs/agent-layer-switch.md): the board home's
+		// current layer answers before the pin, so pin the board home to an empty dir
+		// and the fallback path — the R5-1 pin — is what this test reads.
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		const savedPin = process.env.PI_CODING_AGENT_DIR;
+		const home = join(dir, `flat-${Math.random().toString(36).slice(2, 8)}`);
+		mkdirSync(home, { recursive: true });
+		process.env.OTTR_BOARD_OMP_HOME = home;
 		process.env.PI_CODING_AGENT_DIR = pinned;
 		try {
 			expect(modelRoles()).toEqual({ default: "pin/m" });
 		} finally {
-			if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
-			else process.env.PI_CODING_AGENT_DIR = saved;
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+			if (savedPin === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedPin;
 		}
 		rmSync(pinned, { recursive: true, force: true });
 	});
