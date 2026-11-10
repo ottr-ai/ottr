@@ -92,7 +92,7 @@ async function fetchEndpoint(
 	id: string,
 	kind: "dependabot" | "code-scanning" | "secret-scanning",
 ): Promise<Fetch> {
-	const base = `repos/${id}/${kind}-alerts`;
+	const base = `repos/${id}/${kind}/alerts`;
 	const all: Record<string, unknown>[] = [];
 	for (let page = 1; page <= MAX_PAGES; page++) {
 		const r = await fetchPage(

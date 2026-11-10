@@ -47,11 +47,11 @@ const secret = (n: number, extra: Record<string, unknown> = {}) => ({
 });
 
 const baseRoutes = (overrides: Record<string, string | Error> = {}) => ({
-	"repos/acme/widget/dependabot-alerts?state=open&per_page=100&page=1":
+	"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
 		JSON.stringify([dep(1, "critical"), dep(2, "low"), dep(3, "critical")]),
-	"repos/acme/widget/code-scanning-alerts?state=open&per_page=100&page=1":
+	"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 		JSON.stringify([code(1, "high"), code(2, "high"), code(3, "low")]),
-	"repos/acme/widget/secret-scanning-alerts?state=open&per_page=100&page=1":
+	"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 		JSON.stringify([secret(1), secret(2, { validity: "" })]),
 	...overrides,
 });
@@ -60,7 +60,7 @@ describe("githubAlertSummary", () => {
 	test("happy path: counts, ordering, URLs, zero category", async () => {
 		const { gh, calls } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/code-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 					"[]",
 			}),
 		);
@@ -84,15 +84,20 @@ describe("githubAlertSummary", () => {
 		// second secret has empty validity: no parens
 		expect(s.match(/\(active\)/g)).toHaveLength(1);
 		expect(calls).toHaveLength(3);
-		for (const c of calls) {
-			expect(c.startsWith("api repos/acme/widget/")).toBe(true);
-		}
+		// The real REST endpoints, hyphen-free: repos/<owner>/<repo>/<kind>/alerts.
+		expect([...calls].sort()).toEqual(
+			[
+				"api repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1",
+				"api repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1",
+				"api repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1",
+			].sort(),
+		);
 	});
 
 	test("dependabot endpoint fails -> unavailable with sanitized reason", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/dependabot-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
 					"ERR:gh: Forbidden (HTTP 403)\nsecond line",
 			}),
 		);
@@ -105,7 +110,7 @@ describe("githubAlertSummary", () => {
 	test("gh runner throws -> unavailable with the error message", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/secret-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 					new Error("gh binary missing"),
 			}),
 		);
@@ -116,7 +121,7 @@ describe("githubAlertSummary", () => {
 	test("secret values never leak into the summary", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/secret-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 					JSON.stringify([secret(1, { secret: "ghp_SUPERSECRETVALUE123" })]),
 			}),
 		);
@@ -128,7 +133,7 @@ describe("githubAlertSummary", () => {
 	test("non-JSON stdout -> parse reason naming the endpoint", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/code-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 					"not json",
 			}),
 		);
@@ -159,13 +164,13 @@ describe("githubAlertSummary", () => {
 		const page = (n: number) =>
 			JSON.stringify(Array.from({ length: n }, (_, i) => dep(i + 1)));
 		const { gh, calls } = fakeGh({
-			"repos/acme/widget/dependabot-alerts?state=open&per_page=100&page=1":
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
 				page(100),
-			"repos/acme/widget/dependabot-alerts?state=open&per_page=100&page=2":
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=2":
 				page(1),
-			"repos/acme/widget/code-scanning-alerts?state=open&per_page=100&page=1":
+			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 				"[]",
-			"repos/acme/widget/secret-scanning-alerts?state=open&per_page=100&page=1":
+			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 				"[]",
 		});
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
@@ -173,7 +178,7 @@ describe("githubAlertSummary", () => {
 		expect(calls.filter((c) => c.endsWith("page=1")).length).toBe(3);
 		expect(
 			calls.some((c) =>
-				c.includes("dependabot-alerts?state=open&per_page=100&page=2"),
+				c.includes("dependabot/alerts?state=open&per_page=100&page=2"),
 			),
 		).toBe(true);
 	});
@@ -187,11 +192,11 @@ describe("githubAlertSummary", () => {
 		};
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/dependabot-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
 					JSON.stringify([bad]),
-				"repos/acme/widget/code-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 					"[]",
-				"repos/acme/widget/secret-scanning-alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 					"[]",
 			}),
 		);

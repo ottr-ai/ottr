@@ -8141,7 +8141,7 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 	test("a good fetch lands the summary on the review card, never a secret value", async () => {
 		const { m, e } = await alertMount(async (args) => {
 			const path = args[1] ?? "";
-			const stdout = path.includes("dependabot")
+			const stdout = path.includes("dependabot/alerts")
 				? JSON.stringify([
 						{
 							number: 5,
@@ -8157,7 +8157,7 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 							html_url: "https://github.com/octo/repo/security/dependabot/5",
 						},
 					])
-				: path.includes("code-scanning")
+				: path.includes("code-scanning/alerts")
 					? "[]"
 					: JSON.stringify([
 							{
