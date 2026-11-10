@@ -1567,8 +1567,9 @@ export interface JiraSearchResult {
 	total: number | null;
 }
 
-/** filed = task ids filed; skipped = issue keys already imported. */
+/** filed = task ids filed; skipped = keys already imported; unavailable = keys Jira did not return (gone or no access). */
 export interface JiraImportResult {
 	filed: string[];
 	skipped: string[];
+	unavailable: string[];
 }

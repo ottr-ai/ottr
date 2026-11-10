@@ -28,7 +28,7 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
 - Each row shows: key (link to the ticket in Jira), summary, issue type, status, priority.
 - Already imported tickets (see section 5) show as "already imported" with a link to the card, and their checkbox is disabled.
 - Errors: a JQL error from Jira (400 with `errorMessages`) shows the Jira message in the dialog. 401/403 shows "check the connection's credentials". A network error or timeout shows the cause. Zero hits shows "no tickets match".
-- Import: files one card per selected ticket in the chosen stage, in one store transaction. No count limit. A ticket that the in-transaction re-check finds already imported (a race) is skipped, and the rest are filed. After import, the dialog stays open, shows "Filed N cards" (plus "M skipped: already imported" when M > 0), and refreshes the loaded rows so the imported tickets show as already imported.
+- Import: files one card per selected ticket in the chosen stage, in one store transaction. No count limit. A ticket that the in-transaction re-check finds already imported (a race) is skipped (`skipped`), and the rest are filed. A ticket that Jira no longer returns at import time (deleted, or the credential lost access) is not filed and is reported apart (`unavailable`), never as already imported. After import, the dialog stays open, shows "Filed N cards", plus "M skipped: already imported" when M > 0 and "K not available in Jira (deleted or no access): KEY, …" when K > 0, and refreshes the loaded rows so the imported tickets show as already imported.
 
 ## 4. Card content
 - Title: `<KEY>: <summary>`, redacted and cut to 120 characters, the same way as `cardTitle` in `src/issues.ts`.

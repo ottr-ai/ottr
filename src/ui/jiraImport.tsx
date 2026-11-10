@@ -37,13 +37,17 @@ const appendRows = (rows: JiraRow[], page: JiraRow[]): JiraRow[] => {
 	return [...rows, ...page.filter((r) => !seen.has(r.key))];
 };
 
-/** "Filed N cards", plus the race-skipped count when the server skipped any. */
+/** "Filed N cards", then each skip reason: a card already exists, or Jira no longer returns the ticket. */
 function importSummary(r: JiraImportResult): string {
 	const n = r.filed.length;
-	const filed = `Filed ${n} card${n === 1 ? "" : "s"}`;
-	return r.skipped.length === 0
-		? filed
-		: `${filed}. ${r.skipped.length} skipped: already imported`;
+	const parts = [`Filed ${n} card${n === 1 ? "" : "s"}`];
+	if (r.skipped.length > 0)
+		parts.push(`${r.skipped.length} skipped: already imported`);
+	if (r.unavailable.length > 0)
+		parts.push(
+			`${r.unavailable.length} not available in Jira (deleted or no access): ${r.unavailable.join(", ")}`,
+		);
+	return parts.join(". ");
 }
 
 /**

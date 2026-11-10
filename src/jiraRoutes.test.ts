@@ -94,8 +94,16 @@ const jira = Bun.serve({
 		const inKeys = (
 			/^key in \((.*)\)$/.exec(jql)?.[1] ?? /^key = (.*)$/.exec(jql)?.[1]
 		)?.split(",");
+		// BULK-n keys exist for any n, so a large import has something to file.
+		const bulk = (key: string) => ({
+			key,
+			fields: { ...issues[0]?.fields, summary: `Summary ${key}` },
+		});
 		const hits = inKeys
-			? [...issues, ...extraIssues].filter((i) => inKeys.includes(i.key))
+			? [
+					...[...issues, ...extraIssues].filter((i) => inKeys.includes(i.key)),
+					...inKeys.filter((k) => /^BULK-\d+$/.test(k)).map(bulk),
+				]
 			: issues;
 		if (path === "/rest/api/3/search/jql")
 			return Response.json({ issues: hits, isLast: true });
@@ -432,11 +440,16 @@ describe("search and import", () => {
 		expect((await importKeys([])).status).toBe(400);
 		expect((await importKeys(["proj-1"])).status).toBe(400);
 		expect((await importKeys(["PROJ-1; drop"])).status).toBe(400);
-		expect(
-			(await importKeys(Array.from({ length: 1001 }, (_, i) => `PROJ-${i}`)))
-				.status,
-		).toBe(400);
 		expect((await importKeys(["PROJ-1"], "done")).status).toBe(400);
+	});
+
+	test("an import of more than 1000 tickets files them all", async () => {
+		const keys = Array.from({ length: 1001 }, (_, i) => `BULK-${i + 1}`);
+		const r = await importKeys(keys);
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toHaveLength(1001);
+		expect(r.json.skipped).toEqual([]);
+		expect(r.json.unavailable).toEqual([]);
 	});
 
 	test("import 3 of 5 into backlog, then search marks them, then a re-import skips them", async () => {
@@ -468,10 +481,11 @@ describe("search and import", () => {
 		expect(again.json.skipped).toEqual(["PROJ-1", "PROJ-2", "PROJ-3"]);
 	});
 
-	test("a key Jira does not return is skipped", async () => {
+	test("a key Jira does not return is unavailable, not already imported", async () => {
 		const r = await importKeys(["PROJ-99"]);
 		expect(r.json.filed).toEqual([]);
-		expect(r.json.skipped).toEqual(["PROJ-99"]);
+		expect(r.json.skipped).toEqual([]);
+		expect(r.json.unavailable).toEqual(["PROJ-99"]);
 	});
 
 	test("a key Jira rejects in the batch query is skipped and the others are filed", async () => {
@@ -479,7 +493,8 @@ describe("search and import", () => {
 		const r = await importKeys(["P-1", "GONE-1", "P-2"]);
 		expect(r.status).toBe(200);
 		expect(r.json.filed).toHaveLength(2);
-		expect(r.json.skipped).toEqual(["GONE-1"]);
+		expect(r.json.skipped).toEqual([]);
+		expect(r.json.unavailable).toEqual(["GONE-1"]);
 		expect(seen.map((s) => s.body.jql)).toEqual([
 			"key in (P-1,GONE-1,P-2)",
 			"key = P-1",

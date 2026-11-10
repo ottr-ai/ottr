@@ -344,7 +344,11 @@ describe("JiraImportDialog", () => {
 		const { container, calls, unmount } = await dialog(({ url }) => {
 			if (url === IMPORT) {
 				filed = true;
-				return json(200, { filed: ["OTTR-10", "OTTR-11"], skipped: [] });
+				return json(200, {
+					filed: ["OTTR-10", "OTTR-11"],
+					skipped: [],
+					unavailable: [],
+				});
 			}
 			return json(200, {
 				rows: [
@@ -382,7 +386,11 @@ describe("JiraImportDialog", () => {
 	test("Import into Todo sends stage todo and names race-skipped tickets", async () => {
 		const { container, calls, unmount } = await dialog(({ url }) =>
 			url === IMPORT
-				? json(200, { filed: ["OTTR-10"], skipped: ["PROJ-2"] })
+				? json(200, {
+						filed: ["OTTR-10"],
+						skipped: ["PROJ-2"],
+						unavailable: [],
+					})
 				: json(200, {
 						rows: [row("PROJ-1"), row("PROJ-2")],
 						next: null,
@@ -404,6 +412,32 @@ describe("JiraImportDialog", () => {
 			});
 			expect(status(container)).toBe(
 				"Filed 1 card. 1 skipped: already imported",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a ticket Jira no longer returns is named as unavailable, not as imported", async () => {
+		const { container, unmount } = await dialog(({ url }) =>
+			url === IMPORT
+				? json(200, {
+						filed: ["OTTR-10"],
+						skipped: [],
+						unavailable: ["PROJ-2"],
+					})
+				: json(200, {
+						rows: [row("PROJ-1"), row("PROJ-2")],
+						next: null,
+						total: 2,
+					}),
+		);
+		try {
+			await submit(q(container, "form.jira-search"));
+			await fire(q(container, ".jira-all input"), "onChange");
+			await fire(importButton(container), "onClick");
+			expect(status(container)).toBe(
+				"Filed 1 card. 1 not available in Jira (deleted or no access): PROJ-2",
 			);
 		} finally {
 			await unmount();

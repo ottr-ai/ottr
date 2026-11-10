@@ -54,7 +54,6 @@ const MAX_CUSTOM_FIELDS = 20;
 const MAX_TOKEN = 4000;
 const MAX_EMAIL = 254;
 const MAX_JQL = 2000;
-const MAX_IMPORT_KEYS = 1000;
 /** Keys per `key in (...)` query, and the page size of each. */
 const IMPORT_CHUNK = 50;
 
@@ -384,13 +383,10 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		if (
 			!Array.isArray(raw) ||
 			raw.length === 0 ||
-			raw.length > MAX_IMPORT_KEYS ||
 			raw.some((k) => typeof k !== "string" || !ISSUE_KEY.test(k))
 		)
 			return json(
-				{
-					error: `keys must be 1-${MAX_IMPORT_KEYS} Jira issue keys like PROJ-123`,
-				},
+				{ error: "keys must be one or more Jira issue keys like PROJ-123" },
 				400,
 			);
 		const stage = body.stage;
@@ -426,7 +422,8 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		if (stage === "todo" && filed.filed.length > 0) d.schedule();
 		return json({
 			filed: filed.filed.map((t) => t.id),
-			skipped: [...filed.skipped, ...missing],
+			skipped: filed.skipped,
+			unavailable: missing,
 		} satisfies JiraImportResult);
 	}
 
