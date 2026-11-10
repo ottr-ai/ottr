@@ -226,11 +226,12 @@ project has no Windows machine to verify them.
   podman run --rm -v ottr_home:/h busybox rmdir /h/.omp/agent/agent.db
   ```
 
-- From source, build with podman, not compose — `podman compose build` passes the Windows context path to the remote podman and fails — then start without building:
+- From source, build with podman, not compose — `podman compose build` passes the Windows context path to the remote podman and fails — then start without building. Check first that no turn runs, because a restart stops a running turn. podman-compose 1.6 does not recreate a container when only its image changed, so the `--force-recreate` flag is required. After the start, `podman ps --format "{{.ImageID}}"` must list the new image ID for the server and every worker, which share `ottr-worker:local`. Compare the IDs with `podman images ottr-worker:local`:
 
   ```sh
   podman build -f Dockerfile.worker -t ottr-worker:local .
-  podman compose up -d --no-build
+  podman compose up -d --no-build --force-recreate
+  podman ps --format "{{.ImageID}}"
   ```
 
 - `board-seed` under podman-compose: `COMPOSE_PROFILES=alate` leaves the `seed` profile off, so `podman compose run --rm board-seed` fails with `missing services [board-seed]`. Activate the profile (Docker Compose v2 starts the service you run without the flag):
