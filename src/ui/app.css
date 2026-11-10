@@ -1817,6 +1817,41 @@ textarea {
 	background: var(--lit);
 	border-color: var(--text-strong);
 }
+/* The arrival ring (the Ania Kubów showcase shake): one swing per unseen batch, on the
+   shared easing. AppInboxBell remounts the icon on growth (key={ring}) and sets rung on
+   that arrival only, so the animation re-plays per batch while a bell that mounts lit
+   (page load, reload) stays silent; an ack or a reorder remounts nothing. The pivot sits
+   on the hanger. */
+.inbox.lit.rung > .icon-svg {
+	transform-origin: top center;
+	animation: bell-ring 0.7s var(--ease);
+}
+@keyframes bell-ring {
+	0%,
+	100% {
+		transform: rotate(0deg);
+	}
+	14% {
+		transform: rotate(12deg);
+	}
+	30% {
+		transform: rotate(-10deg);
+	}
+	46% {
+		transform: rotate(7deg);
+	}
+	62% {
+		transform: rotate(-4deg);
+	}
+	78% {
+		transform: rotate(2deg);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.inbox.lit.rung > .icon-svg {
+		animation: none; /* the badge and the status line carry the news without motion */
+	}
+}
 .new-tag {
 	flex: none;
 	padding: 0 5px;

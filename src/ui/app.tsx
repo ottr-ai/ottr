@@ -14215,22 +14215,47 @@ function AppInboxBell({
 	inbox,
 	inboxTitle,
 	inboxName,
+	loaded,
 }: {
 	inbox: InboxSummary;
 	inboxTitle: string;
 	inboxName: string;
+	loaded: boolean;
 }) {
+	// The arrival ring: when the unseen set grows while the board is open, `ring` steps
+	// and the icon remounts (key={ring}), so the CSS bell-ring plays once per batch. An
+	// ack shrinks the set and a reorder reshuffles it — neither rings. The baseline arms
+	// on the first loaded frame, so a bell that mounts lit (page load, reload) stays
+	// silent, and the rung class keeps the animation off until an arrival: the lit fill
+	// and the badge already announce what is waiting.
+	const freshSig = inbox.fresh.map((e) => e.key).join("\n");
+	const [seenFresh, setSeenFresh] = useState<string | null>(
+		loaded ? freshSig : null,
+	);
+	const [ring, setRing] = useState(0);
+	if (loaded) {
+		if (seenFresh === null) {
+			setSeenFresh(freshSig);
+		} else if (freshSig !== seenFresh) {
+			const prev = seenFresh === "" ? [] : seenFresh.split("\n");
+			if (inbox.fresh.some((e) => !prev.includes(e.key))) setRing(ring + 1);
+			setSeenFresh(freshSig);
+		}
+	}
 	return (
 		<>
 			<button
 				type="button"
-				className={inbox.lit ? "icon inbox lit" : "icon inbox"}
+				className={
+					(inbox.lit ? "icon inbox lit" : "icon inbox") +
+					(ring > 0 ? " rung" : "")
+				}
 				data-level={inbox.level ?? undefined}
 				popoverTarget="inbox"
 				title={inboxTitle}
 				aria-label={inboxName}
 			>
-				<Icon name="bell" />
+				<Icon name="bell" key={ring} />
 				{inbox.total > 0 && (
 					<span className="inbox-n">
 						{inbox.lit ? inbox.fresh.length : inbox.total}
@@ -15885,6 +15910,7 @@ export function App() {
 					inbox={inbox}
 					inboxTitle={inboxTitle}
 					inboxName={inboxName}
+					loaded={state !== null}
 				/>
 				<AppInboxPanel
 					error={error}
